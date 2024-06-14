@@ -80,6 +80,48 @@ class OAuthView(RefreshTokenMixin, views.APIView):
             status=created and status.HTTP_201_CREATED or status.HTTP_200_OK,
         )
 
+    def get(self, request, provider):
+        """
+        Given an authorization token from an identity provider, return a Waldur API token
+        """
+        if not self.request.user.is_anonymous:
+            raise ValidationError("This view is for anonymous users only.")
+
+        if provider not in ProviderChoices.CHOICES:
+            raise ValidationError(
+                f"provider parameter is invalid. Valid choices are: {ProviderChoices.CHOICES}"
+            )
+        try:
+            self.config = models.IdentityProvider.objects.get(provider=provider)
+        except models.IdentityProvider.DoesNotExist:
+            raise AuthenticationFailed("Identity provider is not defined.")
+
+        if not self.config.is_active:
+            raise AuthenticationFailed("Identity provider is disabled.")
+
+        access_token = " ".join(request.headers["Authorization"].split()[1:])
+        refresh_token = request.headers.get("refresh_token", "")
+        user_info = self.get_user_info(access_token)
+
+        user, created = create_or_update_oauth_user(self.config.provider, user_info)
+        OAuthToken.objects.update_or_create(
+            user=user,
+            provider=self.config.provider,
+            defaults={
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+            },
+        )
+
+        token = self.refresh_token(user)
+        user.last_login = timezone.now()
+        user.save(update_fields=["last_login"])
+
+        return Response(
+            {"token": token.key},
+            status=created and status.HTTP_201_CREATED or status.HTTP_200_OK,
+        )
+
     def authenticate_user(self, validated_data):
         token_data = self.get_token_data(validated_data)
         try:
