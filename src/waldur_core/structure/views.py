@@ -1,3 +1,4 @@
+import datetime
 import logging
 from functools import partial
 
@@ -411,6 +412,54 @@ class ProjectViewSet(
                 for (value, label) in models.Project.OECD_FOS_2007_CODES
             ]
         )
+
+    @action(detail=True)
+    def cert(self, request, uuid):
+        """
+        Sign a public SSH key with the project details
+        """
+        fingerprint = request.query_params.get("fingerprint", None)
+        if fingerprint is None:
+            raise django_exceptions.ValidationError(message="Missing required fingerprint query parameter")
+        # TODO maybe accept multiple options for the fingerprint
+        fingerprint = {fingerprint}
+        # TODO Check that just picking the first match is ok
+        user_public_key_bytes = core_models.SshPublicKey.objects.filter(user=request.user, fingerprint__in=fingerprint)[0].public_key.encode("utf-8")
+
+        from cryptography.hazmat.primitives.serialization import load_ssh_public_key, load_ssh_private_key, SSHCertificateBuilder, SSHCertificateType
+        from cryptography.hazmat.primitives.asymmetric import dsa, rsa
+
+        public_key = load_ssh_public_key(user_public_key_bytes)
+        match public_key:
+            case rsa.RSAPublicKey():
+                if public_key.key_size < 3072:
+                    raise ValidationError(_("RSA keys must be at least 3072 bits long"))
+            case dsa.DSAPublicKey:
+                raise ValidationError(_("DSA keys are not supported"))
+
+        # TODO Read from secret store
+        from pathlib import Path
+        ca_private_key_bytes = Path("/home/matt/temp/isambard_ca/my-root-key.pem").read_bytes()
+        ca_private_key = load_ssh_private_key(ca_private_key_bytes, password=None)
+
+        unix_username = "matt"  # TODO get username for this project
+        service = "ai.isambard.ac.uk"
+
+        certificate = (
+            SSHCertificateBuilder()
+            .type(SSHCertificateType.USER)
+            .valid_principals([unix_username.encode("utf-8")])
+            .key_id(str({"user": unix_username, "project": uuid, "service": service}).encode("utf-8"))
+            .valid_after(datetime.datetime.now(timezone.utc).timestamp())
+            .valid_before((datetime.datetime.now(timezone.utc) + datetime.timedelta(hours=12)).timestamp())
+            .add_extension(b"permit-agent-forwarding", b"")
+            .add_extension(b"permit-port-forwarding", b"")
+            .add_extension(b"permit-pty", b"")
+            .public_key(public_key)
+            .sign(private_key=ca_private_key)
+        )
+        # TODO Return more details like the SSH connection domain and the public key
+        return Response({"certificate": certificate.public_bytes().decode("utf-8")})
 
 
 class UserViewSet(viewsets.ModelViewSet):
