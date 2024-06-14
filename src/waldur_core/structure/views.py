@@ -420,13 +420,22 @@ class ProjectViewSet(
         """
         fingerprint = request.query_params.get("fingerprint", None)
         if fingerprint is None:
-            raise django_exceptions.ValidationError(message="Missing required fingerprint query parameter")
+            raise django_exceptions.ValidationError(
+                message="Missing required fingerprint query parameter"
+            )
         # TODO maybe accept multiple options for the fingerprint
         fingerprint = {fingerprint}
         # TODO Check that just picking the first match is ok
-        user_public_key_bytes = core_models.SshPublicKey.objects.filter(user=request.user, fingerprint__in=fingerprint)[0].public_key.encode("utf-8")
+        user_public_key_bytes = core_models.SshPublicKey.objects.filter(
+            user=request.user, fingerprint__in=fingerprint
+        )[0].public_key.encode("utf-8")
 
-        from cryptography.hazmat.primitives.serialization import load_ssh_public_key, load_ssh_private_key, SSHCertificateBuilder, SSHCertificateType
+        from cryptography.hazmat.primitives.serialization import (
+            load_ssh_public_key,
+            load_ssh_private_key,
+            SSHCertificateBuilder,
+            SSHCertificateType,
+        )
         from cryptography.hazmat.primitives.asymmetric import dsa, rsa
 
         public_key = load_ssh_public_key(user_public_key_bytes)
@@ -439,7 +448,10 @@ class ProjectViewSet(
 
         # TODO Read from secret store
         from pathlib import Path
-        ca_private_key_bytes = Path("/home/matt/temp/isambard_ca/my-root-key.pem").read_bytes()
+
+        ca_private_key_bytes = Path(
+            "/home/matt/temp/isambard_ca/my-root-key.pem"
+        ).read_bytes()
         ca_private_key = load_ssh_private_key(ca_private_key_bytes, password=None)
 
         unix_username = "matt"  # TODO get username for this project
@@ -449,9 +461,17 @@ class ProjectViewSet(
             SSHCertificateBuilder()
             .type(SSHCertificateType.USER)
             .valid_principals([unix_username.encode("utf-8")])
-            .key_id(str({"user": unix_username, "project": uuid, "service": service}).encode("utf-8"))
+            .key_id(
+                str(
+                    {"user": unix_username, "project": uuid, "service": service}
+                ).encode("utf-8")
+            )
             .valid_after(datetime.datetime.now(timezone.utc).timestamp())
-            .valid_before((datetime.datetime.now(timezone.utc) + datetime.timedelta(hours=12)).timestamp())
+            .valid_before(
+                (
+                    datetime.datetime.now(timezone.utc) + datetime.timedelta(hours=12)
+                ).timestamp()
+            )
             .add_extension(b"permit-agent-forwarding", b"")
             .add_extension(b"permit-port-forwarding", b"")
             .add_extension(b"permit-pty", b"")
@@ -460,6 +480,80 @@ class ProjectViewSet(
         )
         # TODO Return more details like the SSH connection domain and the public key
         return Response({"certificate": certificate.public_bytes().decode("utf-8")})
+
+
+class AuthorisedViewSet(viewsets.ModelViewSet):
+    queryset = User.all_objects.all()
+    serializer_class = serializers.UserSerializer
+    lookup_field = "uuid"
+    permission_classes = (
+        rf_permissions.IsAuthenticated,
+        permissions.IsAdminOrOwner,
+    )
+    filter_backends = (
+        filters.CustomerUserFilter,
+        filters.ProjectUserFilter,
+        filters.UserFilterBackend,
+        DjangoFilterBackend,
+    )
+    filterset_class = filters.UserFilter
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.request.user.is_staff or self.request.user.is_support:
+            return qs
+        return qs.filter(is_active=True)
+
+    def list(self, request, *args, **kwargs):
+        """
+        User list is available to all authenticated users. To get a list,
+        issue authenticated **GET** request against */api/users/*.
+
+        User list supports several filters. All filters are set in HTTP query section.
+        Field filters are listed below. All of the filters apart from ?organization are
+        using case insensitive partial matching.
+
+        Several custom filters are supported:
+
+        - ?current - filters out user making a request. Useful for getting information about a currently logged in user.
+        - ?civil_number=XXX - filters out users with a specified civil number
+        - ?is_active=True|False - show only active (non-active) users
+
+        The user can be created either through automated process on login with SAML token, or through a REST call by a user
+        with staff privilege.
+
+        Example of a creation request is below.
+
+        .. code-block:: http
+
+            POST /api/users/ HTTP/1.1
+            Content-Type: application/json
+            Accept: application/json
+            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
+            Host: example.com
+
+            {
+                "username": "sample-user",
+                "full_name": "full name",
+                "native_name": "taisnimi",
+                "job_title": "senior cleaning manager",
+                "email": "example@example.com",
+                "civil_number": "12121212",
+                "phone_number": "",
+                "description": "",
+                "organization": "",
+            }
+
+        NB! Username field is case-insensitive. So "John" and "john" will be treated as the same user.
+        """
+        if request.user.is_identity_manager and not (
+            request.user.is_staff or request.user.is_support
+        ):
+            return Response(
+                _("Identity manager is not allowed to list users."),
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return super().list(request, *args, **kwargs)
 
 
 class UserViewSet(viewsets.ModelViewSet):
