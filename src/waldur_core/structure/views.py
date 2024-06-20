@@ -710,7 +710,7 @@ class UserViewSet(viewsets.ModelViewSet):
         if "@" not in email:
             raise ValidationError(_("A valid email address must be provided."))
 
-        qs = self.get_queryset()
+        qs = self.get_queryset().filter(email__iexact=email)
 
         is_authorised = False
         reason = None
@@ -722,14 +722,12 @@ class UserViewSet(viewsets.ModelViewSet):
         # the same email (or if there is a pending invitation for
         # that email)
         for person in qs:
-            person_email = str(person.email).lstrip().rstrip().lower()
-            if email == person_email:
-                if person.is_active:
-                    is_authorised = True
-                    email_in_waldur = person.email
-                    break
-                elif reason is None:
-                    reason = "User account is not active"
+            if person.is_active:
+                is_authorised = True
+                email_in_waldur = person.email
+                break
+            elif reason is None:
+                reason = "User account is not active"
 
         if is_authorised:
             return Response({"email": email_in_waldur, "authorised": "true"})
@@ -738,24 +736,21 @@ class UserViewSet(viewsets.ModelViewSet):
         # find in the list of pending invitations
         from waldur_core.users.models import Invitation
 
-        qs = Invitation.objects.all()
+        qs = Invitation.objects.filter(email__iexact=email)
 
         # Loop through invitations - can only break early if we find
         # a pending or requested invitation - Waldur stores old invitations
         # so we may find many for this email address
         for invitation in qs:
-            invited_email = str(invitation.email).lower().lstrip().rstrip()
-
-            if email == invited_email:
-                if invitation.state in [
-                    invitation.State.PENDING,
-                    invitation.State.REQUESTED,
-                ]:
-                    is_authorised = True
-                    email_in_waldur = invitation.email
-                    break
-                elif reason is None:
-                    reason = "Invitation to email is neither pending or requested."
+            if invitation.state in [
+                invitation.State.PENDING,
+                invitation.State.REQUESTED,
+            ]:
+                is_authorised = True
+                email_in_waldur = invitation.email
+                break
+            elif reason is None:
+                reason = "Invitation to email is neither pending or requested."
 
         if is_authorised:
             return Response({"email": email_in_waldur, "authorised": "true"})
