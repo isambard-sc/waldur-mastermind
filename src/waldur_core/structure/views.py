@@ -695,12 +695,43 @@ class UserViewSet(viewsets.ModelViewSet):
         only query email addresses for projects in which they have this
         level of access)
         """
+        user = request.user
+
+        if not user.is_authenticated:
+            return Response(status=status.HTTP_401_UNAUTHORIZED)
+
         email = request.query_params.get("email")
 
         if not email:
             raise ValidationError(_("An email address must be provided."))
 
-        return Response({"email": email, "authorised": "false"})
+        email = str(email).lstrip().rstrip().lower()
+
+        if "@" not in email:
+            raise ValidationError(_("A valid email address must be provided."))
+
+        qs = self.get_queryset()
+
+        is_authorised = False
+        reason = None
+
+        for person in qs:
+            person_email = str(person.email).lstrip().rstrip().lower()
+            if email == person_email:
+                if person.is_active:
+                    is_authorised = True
+                else:
+                    reason = "User account is not active"
+
+                break
+
+        if is_authorised:
+            return Response({"email": email, "authorised": "true"})
+        else:
+            if reason is None:
+                reason = "Email address was not found"
+
+            return Response({"email": email, "authorised": "false", "reason": reason})
 
 
 class CustomerPermissionReviewViewSet(
