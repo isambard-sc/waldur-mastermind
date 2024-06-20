@@ -666,6 +666,42 @@ class UserViewSet(viewsets.ModelViewSet):
         pull_remote_eduteams_user(user.username)
         return Response(status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=["get"])
+    def email_is_authorised(self, request):
+        """
+        Return whether the passed email address belongs to a user who is
+        either an active member of a project, a staff member, or is an
+        email address that has been invited to an active project. The aim
+        of this API call is to allow, e.g. Keycloak, to determine whether
+        an identity connected to the specified email address is authorised
+        to access Waldur, and is thus allowed to log in.
+
+        The email address to check is passed as a required `email` query
+        parameter.
+
+        For example, given request /api/users/email_is_authorised/?email=someone@example.com
+        you get a response like this:
+
+        .. code-block:: javascript
+
+            {
+                "email": "someone@example.com",
+                "authorised": "false"
+            }
+
+        Note that this is only available to authenticated users, and a user
+        can only query emails addresses for which they have access (i.e.
+        a staff user can query any email address, but a non-staff user can
+        only query email addresses for projects in which they have this
+        level of access)
+        """
+        email = request.query_params.get("email")
+
+        if not email:
+            raise ValidationError(_("An email address must be provided."))
+
+        return Response({"email": email, "authorised": "false"})
+
 
 class CustomerPermissionReviewViewSet(
     mixins.RetrieveModelMixin, mixins.ListModelMixin, viewsets.GenericViewSet
