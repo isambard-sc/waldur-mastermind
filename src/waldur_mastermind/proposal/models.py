@@ -4,6 +4,7 @@ from datetime import timedelta
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
@@ -50,6 +51,10 @@ class CallManagingOrganisation(
 
     def __str__(self):
         return str(self.customer)
+
+    @property
+    def name(self):
+        return self.customer.name
 
     @classmethod
     def get_url_name(cls):
@@ -177,6 +182,17 @@ class Round(
             (FIXED_DATE, "Fixed date"),
         )
 
+    class Statuses:
+        SCHEDULED = "scheduled"
+        OPEN = "open"
+        ENDED = "ended"
+
+        CHOICES = (
+            (SCHEDULED, "Round is scheduled"),
+            (OPEN, "Round is open."),
+            (ENDED, "Round is ended."),
+        )
+
     review_strategy = models.CharField(
         default=ReviewStrategies.AFTER_ROUND,
         choices=ReviewStrategies.CHOICES,
@@ -215,6 +231,17 @@ class Round(
     @property
     def name(self):
         return f"Round {self.start_time.strftime('%d.%m.%Y')}-{self.cutoff_time.strftime('%d.%m.%Y')}"
+
+    @property
+    def status(self):
+        now = timezone.now()
+
+        if self.start_time > now:
+            return self.Statuses.SCHEDULED
+        elif self.cutoff_time < now:
+            return self.Statuses.ENDED
+        else:
+            return self.Statuses.OPEN
 
 
 class ProposalDocumentation(

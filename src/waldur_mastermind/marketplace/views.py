@@ -63,7 +63,6 @@ from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure import utils as structure_utils
-from waldur_core.structure import views as structure_views
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_core.structure.executors import ServiceSettingsPullExecutor
 from waldur_core.structure.managers import (
@@ -85,7 +84,9 @@ from waldur_mastermind.invoices import serializers as invoice_serializers
 from waldur_mastermind.marketplace import PLUGIN_NAME as BASIC_PLUGIN_NAME
 from waldur_mastermind.marketplace import callbacks
 from waldur_mastermind.marketplace.managers import filter_offering_permissions
-from waldur_mastermind.marketplace.utils import validate_attributes
+from waldur_mastermind.marketplace.utils import (
+    validate_attributes,
+)
 from waldur_mastermind.marketplace_slurm_remote import (
     PLUGIN_NAME as SLURM_REMOTE_PLUGIN_NAME,
 )
@@ -2508,14 +2509,8 @@ class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
     unlink_permissions = [structure_permissions.is_staff]
 
 
-class ProjectChoicesViewSet(ListAPIView):
-    def get_project(self):
-        project_uuid = self.kwargs["project_uuid"]
-        if not is_uuid_like(project_uuid):
-            return Response(
-                status=status.HTTP_400_BAD_REQUEST, data="Project UUID is invalid."
-            )
-        return get_object_or_404(structure_models.Project, uuid=project_uuid)
+class ResourceOfferingsViewSet(ListAPIView):
+    serializer_class = serializers.ResourceOfferingSerializer
 
     def get_category(self):
         category_uuid = self.kwargs["category_uuid"]
@@ -2525,15 +2520,13 @@ class ProjectChoicesViewSet(ListAPIView):
             )
         return get_object_or_404(models.Category, uuid=category_uuid)
 
-
-class ResourceOfferingsViewSet(ProjectChoicesViewSet):
-    serializer_class = serializers.ResourceOfferingSerializer
-
     def get_queryset(self):
-        project = self.get_project()
+        user = self.request.user
         category = self.get_category()
         offerings = (
-            models.Resource.objects.filter(project=project, offering__category=category)
+            models.Resource.objects.all()
+            .filter_for_user(user)
+            .filter(offering__category=category)
             .exclude(state=models.Resource.States.TERMINATED)
             .values_list("offering_id", flat=True)
         )
@@ -3385,20 +3378,6 @@ class ProviderInvoiceItemsViewSet(core_views.ReadOnlyActionsViewSet):
     serializer_class = invoice_serializers.InvoiceItemSerializer
 
 
-for view in (structure_views.ProjectCountersView, structure_views.CustomerCountersView):
-
-    def inject_resources_counter(scope):
-        counters = models.AggregateResourceCount.objects.filter(scope=scope).only(
-            "count", "category"
-        )
-        return {
-            f"marketplace_category_{counter.category.uuid}": counter.count
-            for counter in counters
-        }
-
-    view.register_dynamic_counter(inject_resources_counter)
-
-
 def can_mutate_robot_account(request, view, obj=None):
     if obj and obj.backend_id:
         raise PermissionDenied("Remote robot account is synchronized.")
@@ -3471,3 +3450,23 @@ class CategoryComponentViewSet(rf_viewsets.ModelViewSet):
     serializer_class = serializers.CategoryComponentsSerializer
     filter_backends = (DjangoFilterBackend,)
     permission_classes = [rf_permissions.IsAuthenticated, core_permissions.IsStaff]
+
+
+class GlobalCategoriesViewSet(views.APIView):
+    """
+    Returns count of resource categories for all resources accessible by user.
+    """
+
+    def get(self, request):
+        # We need to reset ordering to avoid extra GROUP BY created field.
+        resources = (
+            models.Resource.objects.all()
+            .order_by()
+            .filter_for_user(request.user)
+            .exclude(state=models.Resource.States.TERMINATED)
+            .values("offering__category__uuid")
+            .annotate(count=Count("*"))
+        )
+        return Response(
+            {row["offering__category__uuid"].hex: row["count"] for row in resources}
+        )

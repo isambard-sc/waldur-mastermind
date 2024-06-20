@@ -1102,6 +1102,12 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         response = self.update_limits(self.fixture.owner, self.resource, {"vcpu": 1})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_update_limit_if_offering_is_paused(self):
+        self.resource.offering.state = models.Offering.States.PAUSED
+        self.resource.offering.save()
+        response = self.update_limits(self.fixture.owner, self.resource)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
 
 class ResourceMoveTest(test.APITransactionTestCase):
     def setUp(self):
@@ -1426,3 +1432,105 @@ class DownscalingRequestCompletedTest(test.APITransactionTestCase):
 
         response = self.client.post(self.url)
         self.assertEqual(403, response.status_code)
+
+
+@ddt
+class ResourceForceTerminateTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.resource.state = models.Resource.States.OK
+        self.resource.save()
+
+        CustomerRole.OWNER.add_permission(PermissionEnum.TERMINATE_RESOURCE)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.TERMINATE_RESOURCE)
+
+        self.url = factories.ResourceFactory.get_url(self.resource, "terminate")
+        mock_patch = mock.patch(
+            "waldur_mastermind.marketplace.utils.get_order_processor"
+        )
+        get_order_processor = mock_patch.start()
+
+        class MockProcessor:
+            def __init__(self, *args, **kwargs):
+                return
+
+            def process_order(self, *args, **kwargs):
+                raise Exception("MockProcessor exception.")
+
+            def validate_order(self, *args, **kwargs):
+                return
+
+        get_order_processor.return_value = MockProcessor
+
+    def tearDown(self):
+        super().tearDown()
+        mock.patch.stopall()
+
+    @data("staff")
+    def test_user_can_force_terminate_resource(self, user):
+        order_state, resource_state = self._terminate_order(user)
+        self.assertEqual(order_state, models.Order.States.ERRED)
+        self.assertEqual(resource_state, models.Resource.States.TERMINATED)
+
+    @data(
+        "owner",
+        "admin",
+        "service_owner",
+    )
+    def test_user_can_not_force_terminate_resource(self, user):
+        order_state, resource_state = self._terminate_order(user)
+        self.assertEqual(order_state, models.Order.States.ERRED)
+        self.assertEqual(resource_state, models.Resource.States.ERRED)
+
+    def _terminate_order(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.post(
+            self.url, {"attributes": {"action": "force_destroy"}}
+        )
+        order_uuid = response.data["order_uuid"]
+        order = models.Order.objects.get(uuid=order_uuid)
+        marketplace_utils.process_order(order, user)
+        order.refresh_from_db()
+        self.resource.refresh_from_db()
+        return order.state, self.resource.state
+
+
+@ddt
+class ResourceUpdateOptionsTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        options = {
+            "email": {
+                "type": "string",
+                "label": "email",
+                "default": "user@example.com",
+                "required": False,
+            }
+        }
+        self.fixture.offering.resource_options = {"options": options}
+        self.fixture.offering.save()
+        self.resource = self.fixture.resource
+        self.url = factories.ResourceFactory.get_url(self.resource, "update_options")
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_OPTIONS)
+
+    def make_request(self, user, payload=None):
+        self.client.force_authenticate(user)
+        payload = payload or {"options": {"email": "order@example.com"}}
+        return self.client.post(self.url, payload)
+
+    @data(
+        "staff",
+        "owner",
+    )
+    def test_user_can_update_resource_options(self, user):
+        response = self.make_request(getattr(self.fixture, user))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.options["email"], "order@example.com")
+
+    @data("admin")
+    def test_user_can_not_update_resource_options(self, user):
+        response = self.make_request(getattr(self.fixture, user))
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
