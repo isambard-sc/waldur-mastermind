@@ -714,24 +714,56 @@ class UserViewSet(viewsets.ModelViewSet):
 
         is_authorised = False
         reason = None
+        email_in_waldur = None
 
+        # Waldur stores old accounts, so can only stop searching
+        # when we find an active user - can't break early for an
+        # inactive user in case there is another active user with
+        # the same email (or if there is a pending invitation for
+        # that email)
         for person in qs:
             person_email = str(person.email).lstrip().rstrip().lower()
             if email == person_email:
                 if person.is_active:
                     is_authorised = True
-                else:
+                    email_in_waldur = person.email
+                    break
+                elif reason is None:
                     reason = "User account is not active"
 
-                break
+        if is_authorised:
+            return Response({"email": email_in_waldur, "authorised": "true"})
+
+        # could not find in the list of active users - try to
+        # find in the list of pending invitations
+        from waldur_core.users.models import Invitation
+
+        qs = Invitation.objects.all()
+
+        # Loop through invitations - can only break early if we find
+        # a pending or requested invitation - Waldur stores old invitations
+        # so we may find many for this email address
+        for invitation in qs:
+            invited_email = str(invitation.email).lower().lstrip().rstrip()
+
+            if email == invited_email:
+                if invitation.state in [
+                    invitation.State.PENDING,
+                    invitation.State.REQUESTED,
+                ]:
+                    is_authorised = True
+                    email_in_waldur = invitation.email
+                    break
+                elif reason is None:
+                    reason = "Invitation to email is neither pending or requested."
 
         if is_authorised:
-            return Response({"email": email, "authorised": "true"})
-        else:
-            if reason is None:
-                reason = "Email address was not found"
+            return Response({"email": email_in_waldur, "authorised": "true"})
 
-            return Response({"email": email, "authorised": "false", "reason": reason})
+        if reason is None:
+            reason = "Email address was not found"
+
+        return Response({"email": email, "authorised": "false", "reason": reason})
 
 
 class CustomerPermissionReviewViewSet(
