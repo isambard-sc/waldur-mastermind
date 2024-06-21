@@ -730,7 +730,9 @@ class UserViewSet(viewsets.ModelViewSet):
                 reason = "User account is not active"
 
         if is_authorised:
-            return Response({"email": email_in_waldur, "authorised": "true"})
+            return Response(
+                {"email": email_in_waldur, "authorised": "true", "active": "true"}
+            )
 
         # could not find in the list of active users - try to
         # find in the list of pending invitations
@@ -741,6 +743,8 @@ class UserViewSet(viewsets.ModelViewSet):
         # Loop through invitations - can only break early if we find
         # a pending or requested invitation - Waldur stores old invitations
         # so we may find many for this email address
+        invited_by = ""
+
         for invitation in qs:
             if invitation.state in [
                 invitation.State.PENDING,
@@ -748,17 +752,27 @@ class UserViewSet(viewsets.ModelViewSet):
             ]:
                 is_authorised = True
                 email_in_waldur = invitation.email
+                invited_by = invitation.created_by.full_name
                 break
             elif reason is None:
                 reason = "Invitation to email is neither pending or requested."
 
         if is_authorised:
-            return Response({"email": email_in_waldur, "authorised": "true"})
+            return Response(
+                {
+                    "email": email_in_waldur,
+                    "authorised": "true",
+                    "active": "false",
+                    "invited_by": invited_by,
+                }
+            )
 
         if reason is None:
             reason = "Email address was not found"
 
-        return Response({"email": email, "authorised": "false", "reason": reason})
+        return Response(
+            {"email": email, "authorised": "false", "active": "false", "reason": reason}
+        )
 
 
 class CustomerPermissionReviewViewSet(
