@@ -10,7 +10,7 @@ from rest_framework import status, test
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
-from waldur_core.structure.models import Customer, Project
+from waldur_core.structure.models import AccessSubnet, Customer, Project
 from waldur_core.structure.tests import factories, fixtures
 from waldur_core.structure.tests.utils import (
     client_add_user,
@@ -121,16 +121,15 @@ class CustomerListTest(CustomerBaseTest):
         customer = factories.CustomerFactory()
         self._check_user_direct_access_customer(customer, status.HTTP_200_OK)
 
-    def test_filtering_customers_and_project_by_query(self):
+    def test_filtering_customers_by_query(self):
         self.client.force_authenticate(user=self.fixture.staff)
         url = factories.CustomerFactory.get_list_url()
         customer_name = self.fixture.customer.name
-        project_name = self.fixture.project.name
 
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
-        self.assertEqual(len(response.data[0]["projects"]), 1)
+        self.assertEqual(len(response.data[0]["projects"]), 0)
 
         response = self.client.get(url, {"query": "abc"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -140,11 +139,6 @@ class CustomerListTest(CustomerBaseTest):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(len(response.data[0]["projects"]), 0)
-
-        response = self.client.get(url, {"query": project_name})
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 1)
-        self.assertEqual(len(response.data[0]["projects"]), 1)
 
     # Helper methods
     def _check_user_list_access_customers(self, customer, test_function):
@@ -755,78 +749,6 @@ class CustomerUsersListTest(test.APITransactionTestCase):
 
 
 @ddt
-class CustomerCountersListTest(test.APITransactionTestCase):
-    def setUp(self):
-        self.fixture = fixtures.ServiceFixture()
-        self.owner = self.fixture.owner
-        self.customer_support = self.fixture.customer_support
-        self.admin = self.fixture.admin
-        self.manager = self.fixture.manager
-        self.member = self.fixture.member
-        self.customer = self.fixture.customer
-        self.url = factories.CustomerFactory.get_url(self.customer, action="counters")
-
-    @data("owner", "customer_support")
-    def test_user_can_get_customer_counters(self, user):
-        self.client.force_authenticate(getattr(self.fixture, user))
-        response = self.client.get(self.url, {"fields": ["users", "projects"]})
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data, {"users": 5, "projects": 1})
-
-
-class UserCustomersFilterTest(test.APITransactionTestCase):
-    def setUp(self):
-        self.staff = factories.UserFactory(is_staff=True)
-        self.user1 = factories.UserFactory()
-        self.user2 = factories.UserFactory()
-
-        self.customer1 = factories.CustomerFactory()
-        self.customer2 = factories.CustomerFactory()
-
-        self.customer1.add_user(self.user1, CustomerRole.OWNER)
-        self.customer2.add_user(self.user1, CustomerRole.OWNER)
-        self.customer2.add_user(self.user2, CustomerRole.SUPPORT)
-
-    def test_staff_can_filter_customer_by_user(self):
-        self.assert_staff_can_filter_customer_by_user(
-            self.user1, {self.customer1, self.customer2}, "owner"
-        )
-        self.assert_staff_can_filter_customer_by_user(
-            self.user2, {self.customer2}, "support"
-        )
-
-    def assert_staff_can_filter_customer_by_user(self, user, customers, role):
-        self.client.force_authenticate(self.staff)
-        response = self.client.get(
-            factories.CustomerFactory.get_list_url(),
-            {"user_uuid": user.uuid.hex, "fields": ["uuid", "role"]},
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(
-            {customer["uuid"] for customer in response.data},
-            {customer.uuid.hex for customer in customers},
-        )
-
-        self.assertEqual(
-            {customer["role"] for customer in response.data},
-            {role},
-        )
-
-    def test_customer_filter_without_user_uuid_returns_current_role(self):
-        self.client.force_authenticate(self.staff)
-        response = self.client.get(
-            factories.CustomerFactory.get_list_url(), {"fields": ["uuid", "role"]}
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        print(response.data)
-        self.assertEqual(
-            {customer["role"] for customer in response.data},
-            {"staff"},
-        )
-
-
-@ddt
 class AccountingIsRunningFilterTest(test.APITransactionTestCase):
     def setUp(self):
         self.enabled_customers = factories.CustomerFactory.create_batch(2)
@@ -1030,8 +952,11 @@ class CustomerInetFilterTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
-        self.customer.inet = "128.0.0.0/16"
         self.customer.save()
+
+        self.access_subnet = AccessSubnet.objects.create(
+            customer=self.customer, inet="128.0.0.0/16"
+        )
 
         self.patcher = mock.patch("waldur_core.structure.managers.core_utils")
         self.mock = self.patcher.start()
@@ -1048,20 +973,20 @@ class CustomerInetFilterTest(test.APITransactionTestCase):
         response = self.client.get(self.url)
         self.assertEqual(len(response.data), 1)
 
-    def test_user_can_get_project_only_if_his_ip_is_contained_inet(self):
+    def test_user_can_get_project_only_if_his_ip_contains_inet(self):
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.get(self.url)
         self.assertEqual(len(response.data), 0)
 
         self.customer = self.fixture.customer
-        self.customer.inet = "127.0.0.0/16"
-        self.customer.save()
+        self.access_subnet.inet = "127.0.0.0/24"
+        self.access_subnet.save()
         response = self.client.get(self.url)
         self.assertEqual(len(response.data), 1)
 
         self.customer = self.fixture.customer
-        self.customer.inet = ""
-        self.customer.save()
+        self.access_subnet.inet = ""
+        self.access_subnet.save()
         response = self.client.get(self.url)
         self.assertEqual(len(response.data), 1)
 

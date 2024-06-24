@@ -1,6 +1,5 @@
 import datetime
 import logging
-from functools import partial
 
 from dbtemplates.models import Template
 from dbtemplates.utils.cache import remove_cached_template
@@ -12,7 +11,6 @@ from django.db.models import Count, Q
 from django.db.utils import DataError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters as rf_filters
@@ -36,7 +34,6 @@ from waldur_core.core.views import ActionsViewSet
 from waldur_core.permissions import fixtures as permission_fixtures
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.utils import (
-    count_users,
     has_permission,
     permission_factory,
     role_has_permission,
@@ -44,8 +41,6 @@ from waldur_core.permissions.utils import (
 from waldur_core.permissions.views import UserRoleMixin
 from waldur_core.structure import filters, models, permissions, serializers, utils
 from waldur_core.structure.managers import (
-    count_customer_users,
-    filter_queryset_for_user,
     get_connected_customers,
     get_connected_projects,
 )
@@ -246,6 +241,28 @@ class CustomerViewSet(UserRoleMixin, core_mixins.EagerLoadMixin, viewsets.ModelV
                 for item in serializers.CountrySerializerMixin.COUNTRIES
             ]
         )
+
+
+class AccessSubnetViewSet(core_views.ActionsViewSet):
+    queryset = models.AccessSubnet.objects.all()
+    serializer_class = serializers.AccessSubnetSerializer
+    lookup_field = "uuid"
+    filterset_class = filters.AccessSubnetFilter
+    filter_backends = (DjangoFilterBackend, filters.GenericRoleFilter)
+    destroy_permissions = [
+        permission_factory(PermissionEnum.DELETE_ACCESS_SUBNET, ["customer"])
+    ]
+    update_permissions = partial_update_permissions = [
+        permission_factory(PermissionEnum.UPDATE_ACCESS_SUBNET, ["customer"])
+    ]
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = super().get_queryset()
+        if user.is_staff or user.is_support:
+            return qs
+        connected_customers = get_connected_customers(user=user)
+        return models.AccessSubnet.objects.filter(customer__in=connected_customers)
 
 
 class ProjectTypeViewSet(viewsets.ReadOnlyModelViewSet):
@@ -743,124 +760,6 @@ class ServiceSettingsViewSet(
         "name",
         "state",
     )
-
-
-class BaseCounterView(viewsets.GenericViewSet):
-    # Fix for schema generation
-    queryset = []
-    extra_counters = {}
-    dynamic_counters = set()
-
-    @classmethod
-    def register_dynamic_counter(cls, func):
-        cls.dynamic_counters.add(func)
-
-    def get_counters(self):
-        counters = self.get_fields()
-        for name, func in self.extra_counters.items():
-            counters[name] = partial(func, self.object)
-        return counters
-
-    def list(self, request, uuid=None):
-        result = {}
-        counters = self.get_counters()
-        for field, func in counters.items():
-            result[field] = func()
-        for func in self.dynamic_counters:
-            result.update(func(self.object))
-        fields = request.query_params.getlist("fields")
-        if fields:
-            result = {k: v for k, v in result.items() if k in fields}
-        return Response(result)
-
-    def get_fields(self):
-        raise NotImplementedError()
-
-    @cached_property
-    def object(self):
-        return self.get_object()
-
-
-class CustomerCountersView(BaseCounterView):
-    """
-    Count number of entities related to customer
-
-    .. code-block:: javascript
-
-        {
-            "projects": 1,
-            "users": 3
-        }
-    """
-
-    lookup_field = "uuid"
-    extra_counters = {}
-    dynamic_counters = set()
-
-    def get_queryset(self):
-        return filter_queryset_for_user(
-            models.Customer.objects.all().only("pk", "uuid"), self.request.user
-        )
-
-    def get_fields(self):
-        return {
-            "projects": self.get_projects,
-            "users": self.get_users,
-        }
-
-    def get_users(self):
-        return count_customer_users(self.object)
-
-    def get_projects(self):
-        qs = models.Project.available_objects.filter(customer=self.object).only("pk")
-        qs = filter_queryset_for_user(qs, self.request.user)
-        return qs.count()
-
-    def _total_count(self, models):
-        return sum(self._count_model(model) for model in models)
-
-    def _count_model(self, model):
-        qs = model.objects.filter(customer=self.object).only("pk")
-        qs = filter_queryset_for_user(qs, self.request.user)
-        return qs.count()
-
-
-class ProjectCountersView(BaseCounterView):
-    """
-    Count number of entities related to project
-
-    .. code-block:: javascript
-
-        {
-            "users": 0,
-        }
-    """
-
-    lookup_field = "uuid"
-    extra_counters = {}
-    dynamic_counters = set()
-
-    def get_queryset(self):
-        return filter_queryset_for_user(
-            models.Project.objects.all().only("pk", "uuid"), self.request.user
-        )
-
-    def get_fields(self):
-        fields = {
-            "users": self.get_users,
-        }
-        return fields
-
-    def get_users(self):
-        return count_users(self.object)
-
-    def _total_count(self, models):
-        return sum(self._count_model(model) for model in models)
-
-    def _count_model(self, model):
-        qs = model.objects.filter(project=self.object).only("pk")
-        qs = filter_queryset_for_user(qs, self.request.user)
-        return qs.count()
 
 
 class BaseServicePropertyViewSet(viewsets.ReadOnlyModelViewSet):

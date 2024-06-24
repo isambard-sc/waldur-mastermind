@@ -74,6 +74,7 @@ class OfferingFilter(structure_filters.NameFilterSet, django_filters.FilterSet):
         field_name="organization_groups__uuid"
     )
     category_uuid = django_filters.UUIDFilter(field_name="category__uuid")
+    category_group_uuid = django_filters.UUIDFilter(field_name="category__group__uuid")
     billable = django_filters.BooleanFilter(widget=BooleanWidget)
     shared = django_filters.BooleanFilter(widget=BooleanWidget)
     description = django_filters.CharFilter(lookup_expr="icontains")
@@ -83,6 +84,9 @@ class OfferingFilter(structure_filters.NameFilterSet, django_filters.FilterSet):
             [structure_models.ServiceSettings]
         ),
         label="Scope UUID",
+    )
+    accessible_via_calls = django_filters.BooleanFilter(
+        label="Accessible via calls", method="filter_accessible_via_calls"
     )
     o = django_filters.OrderingFilter(
         fields=(
@@ -149,6 +153,21 @@ class OfferingFilter(structure_filters.NameFilterSet, django_filters.FilterSet):
 
             queryset = self.filters[name].filter(queryset, value)
         return queryset
+
+    def filter_accessible_via_calls(self, queryset, name, value):
+        if value is None:
+            return queryset
+
+        from waldur_mastermind.proposal.models import Call, RequestedOffering
+
+        offerings_ids = RequestedOffering.objects.filter(
+            state=RequestedOffering.States.ACCEPTED, call__state=Call.States.ACTIVE
+        ).values_list("offering_id", flat=True)
+
+        if value:
+            return queryset.filter(id__in=offerings_ids)
+        else:
+            return queryset.exclude(id__in=offerings_ids)
 
 
 class OfferingCustomersFilterBackend(BaseFilterBackend):
@@ -659,6 +678,8 @@ class CategoryFilter(django_filters.FilterSet):
     customer_uuid = django_filters.UUIDFilter(
         method="filter_customer_uuid", label="Customer UUID"
     )
+
+    group_uuid = django_filters.UUIDFilter(field_name="group__uuid")
 
     title = django_filters.CharFilter(lookup_expr="icontains")
 

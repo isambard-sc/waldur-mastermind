@@ -91,6 +91,13 @@ class ServiceProvider(
             .exists()
         )
 
+    @property
+    def offering_count(self):
+        return Offering.objects.filter(
+            customer=self.customer,
+            state__in=[Offering.States.ACTIVE, Offering.States.PAUSED],
+        ).count()
+
     def generate_api_secret_code(self):
         self.api_secret_code = core_utils.pwgen()
 
@@ -1399,24 +1406,6 @@ class ComponentUsage(
 
     def get_log_fields(self):
         return ("uuid", "description", "usage", "date", "resource", "component")
-
-
-class AggregateResourceCount(core_mixins.ScopeMixin):
-    """
-    This model allows to count current number of project or customer resources by category.
-    """
-
-    category = models.ForeignKey(
-        on_delete=models.CASCADE, to=Category, related_name="+"
-    )
-    count = models.PositiveIntegerField(default=0)
-    objects = managers.MixinManager("scope")
-
-    class Meta:
-        unique_together = ("category", "content_type", "object_id")
-
-    def __str__(self):
-        return str(self.category.title)
 
 
 class OfferingFile(

@@ -2,6 +2,8 @@ import logging
 
 from constance import config
 from django.conf import settings
+from django.db.models import Q
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 from rest_framework.reverse import reverse
@@ -12,6 +14,8 @@ from waldur_core.media.serializers import (
     ProtectedImageField,
     ProtectedMediaSerializerMixin,
 )
+from waldur_core.permissions import enums as permissions_enums
+from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.models import Role
 from waldur_core.structure.models import Project
 from waldur_mastermind.marketplace import models as marketplace_models
@@ -92,7 +96,7 @@ class NestedRequestedOfferingSerializer(serializers.HyperlinkedModelSerializer):
         read_only=True,
         source="offering.options",
     )
-    plan = BasePublicPlanSerializer(read_only=True)
+    plan_details = BasePublicPlanSerializer(read_only=True, source="plan")
     components = OfferingComponentSerializer(
         source="offering.components", many=True, read_only=True
     )
@@ -111,6 +115,7 @@ class NestedRequestedOfferingSerializer(serializers.HyperlinkedModelSerializer):
             "call_managing_organisation",
             "attributes",
             "plan",
+            "plan_details",
             "options",
             "components",
         ]
@@ -311,6 +316,7 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
             "name",
             "start_time",
             "cutoff_time",
+            "status",
             "review_strategy",
             "deciding_entity",
             "allocation_time",
@@ -333,8 +339,9 @@ class PublicCallSerializer(
 ):
     state = serializers.ReadOnlyField()
     customer_name = serializers.ReadOnlyField(source="manager.customer.name")
+    customer_uuid = serializers.ReadOnlyField(source="manager.customer.uuid")
     offerings = serializers.SerializerMethodField(method_name="get_offerings")
-    rounds = NestedRoundSerializer(many=True, read_only=True, source="round_set")
+    rounds = serializers.SerializerMethodField()
     start_date = serializers.SerializerMethodField()
     end_date = serializers.SerializerMethodField()
     documents = CallDocumentSerializer(many=True, read_only=True)
@@ -352,6 +359,7 @@ class PublicCallSerializer(
             "state",
             "manager",
             "customer_name",
+            "customer_uuid",
             "offerings",
             "rounds",
             "documents",
@@ -387,6 +395,27 @@ class PublicCallSerializer(
         )
         serializer = NestedRequestedOfferingSerializer(
             queryset,
+            many=True,
+            read_only=True,
+            context=self.context,
+        )
+        return serializer.data
+
+    def get_rounds(self, obj):
+        queryset = obj.round_set.all()
+        all_open_rounds = queryset.filter(
+            Q(start_time__lt=timezone.now()) & Q(cutoff_time__gt=timezone.now())
+        )
+
+        all_scheduled_rounds = queryset.filter(Q(start_time__gt=timezone.now()))
+
+        all_closed_rounds = queryset.filter(Q(cutoff_time__lt=timezone.now()))
+
+        sorted_queryset = (
+            list(all_open_rounds) + list(all_scheduled_rounds) + list(all_closed_rounds)
+        )
+        serializer = NestedRoundSerializer(
+            sorted_queryset,
             many=True,
             read_only=True,
             context=self.context,
@@ -630,7 +659,13 @@ class ProtectedCallSerializer(PublicCallSerializer):
     def validate_manager(self, manager: models.CallManagingOrganisation):
         user = self.context["request"].user
 
-        if manager and not user.is_staff and not manager.customer.has_user(user):
+        if (
+            manager
+            and not user.is_staff
+            and not permissions_utils.has_permission(
+                user, permissions_enums.PermissionEnum.CREATE_CALL_PERMISSION, manager
+            )
+        ):
             raise serializers.ValidationError(
                 "Current user does not belong to the selected organisation."
             )
@@ -756,6 +791,7 @@ class ProposalSerializer(
             "oecd_fos_2007_code",
             "oecd_fos_2007_label",
             "allocation_comment",
+            "created",
         ]
         read_only_fields = (
             "created_by",
@@ -788,6 +824,12 @@ class ProposalSerializer(
         if call_round.call.state != models.Call.States.ACTIVE:
             raise serializers.ValidationError(_("Call is not active."))
 
+        if call_round.status not in (
+            models.Round.Statuses.SCHEDULED,
+            models.Round.Statuses.OPEN,
+        ):
+            raise serializers.ValidationError(_("Round is not active."))
+
         attrs["round"] = call_round
         return attrs
 
@@ -818,7 +860,15 @@ class RoundSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.Round
-        fields = ["url", "uuid", "start_time", "cutoff_time", "call_uuid", "call_name"]
+        fields = [
+            "url",
+            "uuid",
+            "start_time",
+            "cutoff_time",
+            "call_uuid",
+            "call_name",
+            "status",
+        ]
 
     extra_kwargs = {
         "url": {

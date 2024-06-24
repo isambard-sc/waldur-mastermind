@@ -1,6 +1,8 @@
 import django_filters
 from django.contrib.auth import get_user_model
 from django.db.models import Q
+from django.utils import timezone
+from django_filters.widgets import BooleanWidget
 
 from waldur_core.core import filters as core_filters
 
@@ -35,10 +37,15 @@ class CallFilter(django_filters.FilterSet):
     )
     customer_uuid = django_filters.UUIDFilter(field_name="manager__customer__uuid")
     customer_keyword = django_filters.CharFilter(method="filter_customer_keyword")
+    offering_uuid = django_filters.UUIDFilter(method="filter_offering_uuid")
     state = django_filters.MultipleChoiceFilter(choices=models.Call.States.CHOICES)
     o = django_filters.OrderingFilter(
         fields=("manager__customer__name", "created", "name")
     )
+    has_active_round = django_filters.BooleanFilter(
+        widget=BooleanWidget, method="filter_has_active_round"
+    )
+    name = django_filters.CharFilter(lookup_expr="icontains")
 
     class Meta:
         model = models.Call
@@ -51,6 +58,14 @@ class CallFilter(django_filters.FilterSet):
             | Q(manager__customer__native_name__icontains=value)
         )
 
+    def filter_has_active_round(self, queryset, name, value):
+        if value:
+            return queryset.filter(round__cutoff_time__gte=timezone.now())
+        return queryset
+
+    def filter_offering_uuid(self, queryset, name, value):
+        return queryset.filter(offerings__uuid=value).distinct()
+
 
 class ProposalFilter(django_filters.FilterSet):
     round = django_filters.UUIDFilter(field_name="round__uuid")
@@ -61,12 +76,18 @@ class ProposalFilter(django_filters.FilterSet):
         field_name="round__call__manager__customer__uuid"
     )
     o = django_filters.OrderingFilter(
-        fields=("round__call__name", "round__start_time", "round__cutoff_time", "state")
+        fields=(
+            "round__call__name",
+            "round__start_time",
+            "round__cutoff_time",
+            "state",
+            "created",
+        )
     )
 
     class Meta:
         model = models.Proposal
-        fields = ["state", "name", "round", "call_uuid"]
+        fields = []
 
 
 class ReviewFilter(django_filters.FilterSet):

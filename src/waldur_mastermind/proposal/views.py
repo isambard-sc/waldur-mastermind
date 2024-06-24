@@ -2,7 +2,6 @@ import logging
 from datetime import datetime, timedelta
 
 from django.contrib import auth
-from django.contrib.contenttypes.models import ContentType
 from django.db.models import OuterRef, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone as timezone
@@ -133,11 +132,14 @@ class PublicCallViewSet(viewsets.ReadOnlyModelViewSet):
 
 class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     lookup_field = "uuid"
-    queryset = models.Call.objects.all().order_by("created")
     serializer_class = serializers.ProtectedCallSerializer
     filterset_class = filters.CallFilter
-    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filter_backends = []
     destroy_validators = [core_validators.StateValidator(models.Call.States.DRAFT)]
+
+    get_queryset = permissions_utils.queryset_factory(
+        models.Call, RoleEnum.CALL_MANAGER, ordering=["created"]
+    )
 
     @decorators.action(detail=True, methods=["get", "post"])
     def offerings(self, request, uuid=None):
@@ -283,6 +285,34 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     round_detail_serializer_class = serializers.ProtectedRoundSerializer
 
+    def close_round(self, request, uuid=None, obj_uuid=None):
+        call = self.get_object()
+
+        try:
+            call_round = call.round_set.get(uuid=obj_uuid)
+        except models.Round.DoesNotExist:
+            return response.Response(status=status.HTTP_404_NOT_FOUND)
+
+        permissions_utils.permission_factory(PermissionEnum.CLOSE_ROUNDS, "*")(
+            request, self, call
+        )
+
+        if call_round.call.state != models.Call.States.ACTIVE:
+            raise exceptions.ValidationError(_("Call is not active."))
+
+        if call_round.start_time > timezone.now():
+            call_round.start_time = timezone.now()
+
+        if call_round.cutoff_time < timezone.now():
+            call_round.cutoff_time = timezone.now()
+
+        utils.create_reviews_of_round(call_round)
+
+        return response.Response(
+            "Round has been closed.",
+            status=status.HTTP_200_OK,
+        )
+
     @decorators.action(detail=True, methods=["post"])
     def attach_documents(self, request, uuid=None):
         instance = self.get_object()
@@ -339,23 +369,9 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     disabled_actions = ["update", "partial_update"]
     model = models.Proposal
 
-    def get_queryset(self):
-        user = self.request.user
-
-        if user.is_staff:
-            return models.Proposal.objects.all()
-
-        call_ids = permissions_utils.get_scope_ids(
-            user,
-            content_type=ContentType.objects.get_for_model(models.Call),
-            role=RoleEnum.CALL_MANAGER,
-        )
-
-        return models.Proposal.objects.filter(
-            Q(round__call__manager__customer__in=get_connected_customers(user))
-            | Q(created_by=user)
-            | Q(round__call__in=call_ids)
-        ).distinct()
+    get_queryset = permissions_utils.queryset_factory(
+        models.Proposal, RoleEnum.CALL_MANAGER, "round.call", created_by=True
+    )
 
     def is_creator(request, view, obj=None):
         if not obj:
@@ -384,6 +400,15 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
         return response.Response(status=status.HTTP_200_OK)
 
+    @staticmethod
+    def validate_resource_requests_existing(proposal):
+        if not models.RequestedResource.objects.filter(proposal=proposal).exists():
+            raise exceptions.ValidationError(
+                _(
+                    "There must be at least some resource requests existing before moving to team validation."
+                )
+            )
+
     @decorators.action(detail=True, methods=["post"])
     def switch_to_team_verification(self, request, uuid=None):
         proposal = self.get_object()
@@ -392,7 +417,8 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         return response.Response(status=status.HTTP_200_OK)
 
     switch_to_team_verification_validators = [
-        core_validators.StateValidator(models.Proposal.States.DRAFT)
+        core_validators.StateValidator(models.Proposal.States.DRAFT),
+        validate_resource_requests_existing,
     ]
 
     switch_to_team_verification_permissions = [is_creator]
@@ -512,8 +538,36 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         permission_factory(PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, ["round.call"])
     ]
     reject_serializer_class = allocate_serializer_class = (
-        serializers.ProposalAllocateSerializer
-    )
+        force_approve_serializer_class
+    ) = serializers.ProposalAllocateSerializer
+
+    @decorators.action(detail=True, methods=["post"])
+    def force_approve(self, request, uuid=None):
+        proposal = self.get_object()
+        utils.allocate_proposal(proposal)
+        proposal.state = models.Proposal.States.ACCEPTED
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        proposal.allocation_comment = serializer.validated_data.get(
+            "allocation_comment", ""
+        )
+        proposal.save()
+        return response.Response(
+            "Proposal has been allocated.",
+            status=status.HTTP_200_OK,
+        )
+
+    force_approve_validators = [
+        core_validators.StateValidator(
+            models.Proposal.States.SUBMITTED,
+            models.Proposal.States.IN_REVIEW,
+            models.Proposal.States.REJECTED,
+        )
+    ]
+
+    force_approve_permissions = [
+        permission_factory(PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, ["round.call"])
+    ]
 
 
 class ReviewViewSet(ActionsViewSet):
@@ -538,10 +592,6 @@ class ReviewViewSet(ActionsViewSet):
             | Q(state=models.Review.States.SUBMITTED, proposal__created_by=user)
         )
 
-    def is_proposal_submitted(review):
-        if review.proposal.state != models.Proposal.States.SUBMITTED:
-            raise IncorrectStateException()
-
     def action_permission_check(request, view, obj: models.Review = None):
         if not obj:
             return
@@ -565,7 +615,6 @@ class ReviewViewSet(ActionsViewSet):
 
     accept_validators = [
         core_validators.StateValidator(models.Review.States.CREATED),
-        is_proposal_submitted,
     ]
 
     @decorators.action(detail=True, methods=["post"])
@@ -582,7 +631,6 @@ class ReviewViewSet(ActionsViewSet):
         core_validators.StateValidator(
             models.Review.States.CREATED, models.Review.States.IN_REVIEW
         ),
-        is_proposal_submitted,
     ]
 
     @decorators.action(detail=True, methods=["post"])
@@ -597,7 +645,6 @@ class ReviewViewSet(ActionsViewSet):
 
     submit_validators = [
         core_validators.StateValidator(models.Review.States.IN_REVIEW),
-        is_proposal_submitted,
     ]
     accept_permissions = reject_permissions = submit_permissions = (
         update_permissions
@@ -678,22 +725,9 @@ class RoundViewSet(ReadOnlyActionsViewSet):
     filterset_class = []
     filter_backends = (DjangoFilterBackend,)
 
-    def get_queryset(self):
-        user = self.request.user
-
-        if user.is_staff:
-            return models.Round.objects.all()
-
-        call_ids = permissions_utils.get_scope_ids(
-            user,
-            content_type=ContentType.objects.get_for_model(models.Call),
-            role=RoleEnum.CALL_MANAGER,
-        )
-
-        return models.Round.objects.filter(
-            Q(call__manager__customer__in=get_connected_customers(user))
-            | Q(call__in=call_ids)
-        ).distinct()
+    get_queryset = permissions_utils.queryset_factory(
+        models.Round, RoleEnum.CALL_MANAGER, "call"
+    )
 
     @decorators.action(detail=True)
     def reviewers(self, request, uuid=None):

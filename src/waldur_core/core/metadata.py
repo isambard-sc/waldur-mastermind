@@ -17,6 +17,16 @@ class WaldurCore(BaseModel):
         description="Defines whether extensions should be automatically registered.",
     )
     TOKEN_KEY = Field("x-auth-token", description="Header for token authentication.")
+    RESPONSE_HEADER_IMPERSONATOR_UUID = Field(
+        "X-impersonator-uuid",
+        description="The response header, which contains the UUID "
+        "of the user who requested the impersonation.",
+    )
+    REQUEST_HEADER_IMPERSONATED_USER_UUID = Field(
+        "HTTP_X_IMPERSONATED_USER_UUID",
+        description="The request header, which contains the user UUID "
+        "of the user to be impersonated.",
+    )
     AUTHENTICATION_METHODS: list[str] = Field(
         ["LOCAL_SIGNIN"], description="List of enabled authentication methods."
     )
@@ -71,6 +81,7 @@ class WaldurCore(BaseModel):
             "BG",
             "CH",
             "CY",
+            "CZ",
             "DE",
             "DK",
             "EE",
@@ -100,6 +111,7 @@ class WaldurCore(BaseModel):
             "RS",
             "SE",
             "SI",
+            "SK",
             "UA",
         ],
         description="It is used in organization creation dialog in order to limit country choices to predefined set.",
@@ -141,6 +153,11 @@ class WaldurCore(BaseModel):
     INVITATION_DISABLE_MULTIPLE_ROLES = Field(
         False,
         description="Do not allow user to grant multiple roles in the same project or organization using invitation.",
+    )
+    ENABLE_STRICT_CHECK_ACCEPTING_INVITATION = Field(
+        False,
+        description="If this is true and user email is pre-validated then accepting invitation to only do that if "
+        "user’s email and email of the invitation fully match.",
     )
     PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS: list[str] = Field(
         [],
