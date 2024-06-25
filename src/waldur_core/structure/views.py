@@ -454,9 +454,8 @@ class ProjectViewSet(
             case dsa.DSAPublicKey:
                 raise ValidationError(_("DSA keys are not supported"))
 
-        # TODO Read from secret store
         from pathlib import Path
-        ca_private_key_bytes = Path("/home/matt/temp/isambard_ca/my-root-key.pem").read_bytes()
+        ca_private_key_bytes = Path(django_settings.SSH_PRIVATE_SIGNING_KEY_PATH).read_bytes()
         ca_private_key = load_ssh_private_key(ca_private_key_bytes, password=None)
 
         unix_username = "matt"  # TODO get username for this project
