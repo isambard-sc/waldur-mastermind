@@ -353,6 +353,7 @@ class ProjectViewSet(
 
             {
                 "name": "Project A",
+                "short_name": "proj-a",
                 "customer": "http://example.com/api/customers/6c9b01c251c24174a6691a1f894fae31/",
             }
         """
