@@ -26,7 +26,6 @@ class SshKeyCreateExecutor(
             .si(
                 serialized_instance,
                 "init_cluster_script_directory",
-                state_transition="set_ok",
             )
             .set(countdown=5 * 60, max_retries=10, default_retry_delay=2 * 60),
         )

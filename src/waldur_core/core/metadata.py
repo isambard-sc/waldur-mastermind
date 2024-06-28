@@ -154,6 +154,13 @@ class WaldurCore(BaseModel):
         False,
         description="Do not allow user to grant multiple roles in the same project or organization using invitation.",
     )
+    INVITATION_USE_WEBHOOKS = Field(
+        False,
+        description="Allow sending of webhooks instead of sending of emails.",
+    )
+    INVITATION_WEBHOOK_URL = Field(
+        "", description="Webhook URL for sending invitations."
+    )
     ENABLE_STRICT_CHECK_ACCEPTING_INVITATION = Field(
         False,
         description="If this is true and user email is pre-validated then accepting invitation to only do that if "
@@ -262,6 +269,8 @@ class WaldurCore(BaseModel):
         description="The list of protected fields for local IdP.",
     )
 
+    DEFAULT_IDP: str = Field("", description="Triggers authentication flow at once.")
+
     OECD_FOS_2007_CODE_MANDATORY = Field(
         False,
         description="Field oecd_fos_2007_code must be required for project.",
@@ -290,6 +299,7 @@ class WaldurCore(BaseModel):
             "HOMEPORT_SENTRY_TRACES_SAMPLE_RATE",
             "HOMEPORT_URL",
             "OECD_FOS_2007_CODE_MANDATORY",
+            "DEFAULT_IDP",
         ]
 
 
