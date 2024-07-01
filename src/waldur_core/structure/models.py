@@ -9,8 +9,10 @@ from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.core.validators import (
     MaxLengthValidator,
+    MinLengthValidator,
     MaxValueValidator,
     MinValueValidator,
+    RegexValidator,
 )
 from django.db import models, transaction
 from django.db.models import Q, signals
@@ -573,6 +575,24 @@ class ProjectDetailsMixin(core_models.DescribableMixin, ProjectOECDFOS2007CodeMi
         _("name"), max_length=PROJECT_NAME_LENGTH, validators=[validate_name]
     )
 
+    short_name = models.CharField(
+        verbose_name=_("short name"),
+        max_length=50,
+        unique=True,
+        help_text=_("A short, unique name for the project used as an identifier. Should only contain lower-case letters, digits, underscores and hyphens"),
+        validators=[
+            RegexValidator(
+                regex=r"^[a-z0-9\-_]+$",
+                ),
+            RegexValidator(
+                regex=r"(-admin)|(-root)$",
+                inverse_match=True,
+                ),
+            MinLengthValidator(3),
+            MaxLengthValidator(30)
+        ]
+    )
+
     end_date = models.DateField(
         null=True,
         blank=True,
@@ -658,6 +678,17 @@ class Project(
         self.save(using=using)
 
         signals.post_delete.send(sender=self.__class__, instance=self, using=using)
+
+    def save(self, *args, **kwargs):
+        # The short_name cannot be changed after creation as external systems may already depend on it.
+        if self.tracker.has_changed("short_name"):
+            prev = self.tracker.previous("short_name")
+            new = self.short_name
+            raise ValueError(
+                _(f"Cannot change short name of project ('{prev}' → '{new}') after creation.")
+            )
+
+        super().save(*args, **kwargs)
 
     def delete(self, using=None, soft=True, *args, **kwargs):
         """Use soft delete, i.e. mark a project as 'removed'."""

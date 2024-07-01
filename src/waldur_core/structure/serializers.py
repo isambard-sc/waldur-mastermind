@@ -245,6 +245,7 @@ class ProjectSerializer(
             "url",
             "uuid",
             "name",
+            "short_name",
             "customer",
             "customer_uuid",
             "customer_name",
@@ -284,6 +285,7 @@ class ProjectSerializer(
         related_fields = (
             "uuid",
             "name",
+            "short_name",
             "created",
             "description",
             "customer__uuid",
