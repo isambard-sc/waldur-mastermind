@@ -212,6 +212,7 @@ class ProjectFilter(NameFilterSet):
         model = models.Project
         fields = [
             "name",
+            "short_name",
             "customer",
             "customer_name",
             "customer_native_name",
