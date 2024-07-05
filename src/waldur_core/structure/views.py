@@ -469,7 +469,7 @@ class ProjectViewSet(
         ca_private_key = load_ssh_private_key(ca_private_key_bytes, password=None)
 
         unix_username = "matt"  # TODO get username for this project
-        service = "ai.isambard.ac.uk"
+        service = "ai.isambard.ac.uk"  # TODO This should come from project details
 
         certificate = (
             SSHCertificateBuilder()
@@ -493,7 +493,7 @@ class ProjectViewSet(
             .sign(private_key=ca_private_key)
         )
         # TODO Return more details like the SSH connection domain and the public key
-        return Response({"certificate": certificate.public_bytes().decode("utf-8")})
+        return Response({"certificate": certificate.public_bytes().decode("utf-8"), "hostname": service})
 
 
 class UserViewSet(viewsets.ModelViewSet):
