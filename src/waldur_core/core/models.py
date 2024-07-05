@@ -269,6 +269,25 @@ class User(
     backend_id = models.CharField(max_length=255, blank=True)
     first_name = models.CharField(_("first name"), max_length=100, blank=True)
     last_name = models.CharField(_("last name"), max_length=100, blank=True)
+    unix_username = models.CharField(
+        verbose_name=_("UNIX username"),
+        max_length=50,
+        unique=True,
+        null=True,
+        help_text=_("A short, unique name for you. It will be used to form your local username on any systems. Should only contain lower-case letters and digits and must start with a letter."),
+        validators=[
+            validators.RegexValidator(
+                regex=r"^[a-z][a-z0-9]+$",
+                message="Must start with a letter and only contain numbers and letters.",
+                ),
+            validators.RegexValidator(
+                regex=r"(admin)|(root)$",
+                inverse_match=True,
+                ),
+            validators.MinLengthValidator(5),
+            validators.MaxLengthValidator(20)
+        ]
+    )
     query_field = models.CharField(max_length=300, blank=True)
     WHITELIST_FIELDS = [
         "is_superuser",
@@ -316,6 +335,15 @@ class User(
 
     def save(self, *args, **kwargs):
         self.query_field = normalize_unicode(self.full_name)
+
+        # The unix_username cannot be changed after creation as external systems may already depend on it.
+        prev = self.tracker.previous("unix_username")
+        if self.tracker.has_changed("unix_username") and prev:
+            new = self.unix_username
+            raise ValueError(
+                _(f"Cannot change unix_username of user ('{prev}' → '{new}') after creation.")
+            )
+
         super().save(*args, **kwargs)
 
     def get_log_fields(self):
