@@ -681,8 +681,8 @@ class Project(
 
     def save(self, *args, **kwargs):
         # The short_name cannot be changed after creation as external systems may already depend on it.
-        if self.tracker.has_changed("short_name"):
-            prev = self.tracker.previous("short_name")
+        prev = self.tracker.previous("short_name")
+        if self.tracker.has_changed("short_name") and prev is not None:
             new = self.short_name
             raise ValueError(
                 _(f"Cannot change short name of project ('{prev}' → '{new}') after creation.")
