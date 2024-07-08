@@ -477,7 +477,9 @@ class ProjectViewSet(
         ca_private_key = load_ssh_private_key(ca_private_key_bytes, password=None)
 
         unix_username = f"{request.user.unix_username}.{project.short_name}"
-        service = "ai.login.isambard.ac.uk"  # TODO This should come from project details
+        service = "ai.isambard.ac.uk"
+        hostname = "ai-p1.access.isambard.ac.uk"  # TODO This should come from project details
+        proxy_jump = "ai.login.isambard.ac.uk"
 
         certificate = (
             SSHCertificateBuilder()
@@ -501,7 +503,7 @@ class ProjectViewSet(
             .sign(private_key=ca_private_key)
         )
         # TODO Return more details like the the public key
-        return Response({"certificate": certificate.public_bytes().decode("utf-8"), "hostname": service})
+        return Response({"certificate": certificate.public_bytes().decode("utf-8"), "hostname": hostname, "proxy_jump": proxy_jump})
 
 
 class UserViewSet(viewsets.ModelViewSet):
