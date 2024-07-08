@@ -870,6 +870,7 @@ class UserSerializer(
             "identity_provider_management_url",
             "identity_provider_fields",
             "image",
+            "unix_username",
         )
         read_only_fields = (
             "uuid",

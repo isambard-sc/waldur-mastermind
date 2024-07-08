@@ -438,15 +438,22 @@ class ProjectViewSet(
         """
         fingerprint = request.query_params.get("fingerprint", None)
         if fingerprint is None:
-            raise django_exceptions.ValidationError(
-                message="Missing required fingerprint query parameter"
+            raise ValidationError(
+                "Missing required fingerprint query parameter"
             )
         # TODO maybe accept multiple options for the fingerprint
         fingerprint = {fingerprint}
-        # TODO Check that just picking the first match is ok
-        user_public_key_bytes = core_models.SshPublicKey.objects.filter(
+        public_keys = core_models.SshPublicKey.objects.filter(
             user=request.user, fingerprint__in=fingerprint
-        )[0].public_key.encode("utf-8")
+        )
+        # TODO Check that just picking the first match is ok
+        if not public_keys:
+            raise ValidationError("You do not have a matching public key registered.")
+        user_public_key_bytes = public_keys[0].public_key.encode("utf-8")
+
+        project = self.get_object()
+        if not request.user.unix_username:
+            raise ValidationError(_("User has not set a UNIX username."))
 
         from cryptography.hazmat.primitives.serialization import (
             load_ssh_public_key,
@@ -468,7 +475,7 @@ class ProjectViewSet(
         ca_private_key_bytes = Path(django_settings.SSH_PRIVATE_SIGNING_KEY_PATH).read_bytes()
         ca_private_key = load_ssh_private_key(ca_private_key_bytes, password=None)
 
-        unix_username = "matt"  # TODO get username for this project
+        unix_username = f"{request.user.unix_username}.{project.short_name}"
         service = "ai.isambard.ac.uk"  # TODO This should come from project details
 
         certificate = (
@@ -492,7 +499,7 @@ class ProjectViewSet(
             .public_key(public_key)
             .sign(private_key=ca_private_key)
         )
-        # TODO Return more details like the SSH connection domain and the public key
+        # TODO Return more details like the the public key
         return Response({"certificate": certificate.public_bytes().decode("utf-8"), "hostname": service})
 
 

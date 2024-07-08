@@ -217,6 +217,7 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin, VersionAdmin):
         "first_name",
         "last_name",
         "native_name",
+        "unix_username",
         "is_active",
         "is_staff",
         "is_support",
@@ -234,7 +235,7 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin, VersionAdmin):
     list_filter = ("is_active", "is_staff", "is_support", "registration_method")
     date_hierarchy = "date_joined"
     fieldsets = (
-        (None, {"fields": ("username", "password", "registration_method", "uuid")}),
+        (None, {"fields": ("username", "password", "registration_method", "uuid", "unix_username")}),
         (
             _("Personal info"),
             {
