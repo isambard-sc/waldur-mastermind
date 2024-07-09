@@ -62,7 +62,7 @@ RUN rm -rf /usr/local/src/ansible-waldur-module/.git \
            /usr/local/src/django-dbtemplates/.git
 
 # Delete all development libraries
-RUN apt-get purge -y lib*-dev
+RUN apt-get purge -y lib*-dev git
 
 ENTRYPOINT ["/app-entrypoint.sh"]
 CMD ["/bin/bash"]
