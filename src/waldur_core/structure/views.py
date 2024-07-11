@@ -765,7 +765,7 @@ class UserViewSet(viewsets.ModelViewSet):
         )
         # TODO Check that just picking the first match is ok
         if not public_keys:
-            raise ValidationError("You do not have a matching public key registered.")
+            raise ValidationError(_("You do not have a matching public key registered."))
         user_public_key_bytes = public_keys[0].public_key.encode("utf-8")
 
         if not request.user.unix_username:
@@ -794,6 +794,9 @@ class UserViewSet(viewsets.ModelViewSet):
         connected_projects = get_connected_projects(user)
         projects = models.Project.available_objects.filter(id__in=connected_projects)
         short_names = [p.short_name for p in projects]
+
+        if not short_names:
+            raise ValidationError(_("The user is not associated with any projects."))
 
         principals = [f"{user.unix_username}.{p}".encode("utf-8") for p in short_names]
         service = "ai.isambard"
