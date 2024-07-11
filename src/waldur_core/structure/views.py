@@ -837,6 +837,7 @@ class UserViewSet(viewsets.ModelViewSet):
                 ],
                 "hostname": hostname,
                 "proxy_jump": proxy_jump,
+                "user": request.user.email,
                 "version": 1,
             }
         )
