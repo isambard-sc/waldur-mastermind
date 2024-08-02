@@ -126,6 +126,7 @@ class OfferingFactory(
         model = models.Offering
 
     name = factory.Sequence(lambda n: "offering-%s" % n)
+    slug = factory.Sequence(lambda n: "offer-%s" % n)
     category = factory.SubFactory(CategoryFactory)
     customer = factory.SubFactory(structure_factories.CustomerFactory)
     type = PLUGIN_NAME
@@ -344,26 +345,6 @@ class OrderFactory(factory.django.DjangoModelFactory):
     @classmethod
     def get_list_url(cls, action=None):
         url = "http://testserver" + reverse("marketplace-order-list")
-        return url if action is None else url + action + "/"
-
-
-class CartItemFactory(factory.django.DjangoModelFactory):
-    class Meta:
-        model = models.CartItem
-
-    offering = factory.SubFactory(OfferingFactory)
-    user = factory.SubFactory(structure_factories.UserFactory)
-    project = factory.SubFactory(structure_factories.ProjectFactory)
-
-    @classmethod
-    def get_url(cls, item=None):
-        if item is None:
-            item = CartItemFactory()
-        return reverse("marketplace-cart-item-detail", kwargs={"uuid": item.uuid.hex})
-
-    @classmethod
-    def get_list_url(cls, action=None):
-        url = reverse("marketplace-cart-item-list")
         return url if action is None else url + action + "/"
 
 

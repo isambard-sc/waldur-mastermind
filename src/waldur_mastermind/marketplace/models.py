@@ -357,6 +357,7 @@ class Offering(
     core_models.BackendMixin,
     core_models.UuidMixin,
     core_models.NameMixin,
+    core_models.SlugMixin,
     core_models.DescribableMixin,
     quotas_models.QuotaModelMixin,
     structure_models.PermissionMixin,
@@ -960,31 +961,11 @@ class SafeAttributesMixin(models.Model):
         }
 
 
-class CartItem(
-    SafeAttributesMixin, core_models.UuidMixin, TimeStampedModel, RequestTypeMixin
-):
-    user = models.ForeignKey(
-        core_models.User, related_name="+", on_delete=models.CASCADE
-    )
-    project = models.ForeignKey(
-        structure_models.Project, related_name="+", on_delete=models.CASCADE
-    )
-
-    class Permissions:
-        customer_path = "project__customer"
-        project_path = "project"
-
-    class Meta:
-        ordering = ("created",)
-
-    def __str__(self):
-        return f"user: {self.user.username}, offering: {self.offering.name}"
-
-
 class ResourceDetailsMixin(
     SafeAttributesMixin,
     CostEstimateMixin,
     core_models.NameMixin,
+    core_models.SlugMixin,
     core_models.DescribableMixin,
 ):
     class Meta:
@@ -1431,19 +1412,26 @@ class OfferingFile(
 
 class OfferingUser(
     TimeStampedModel,
+    core_models.UuidMixin,
     common_mixins.BackendMetadataMixin,
+    LoggableMixin,
 ):
     offering = models.ForeignKey(Offering, on_delete=models.CASCADE)
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     username = models.CharField(max_length=100, blank=True, null=True)
     propagation_date = models.DateTimeField(blank=True, null=True)
+    is_restricted = models.BooleanField(
+        default=False,
+        help_text=_("Signal to service if the user account is restricted or not"),
+    )
+    tracker = FieldTracker()
 
     class Meta:
         unique_together = ("offering", "user")
         ordering = ["username"]
 
     def get_log_fields(self):
-        return ("offering", "user", "username")
+        return ("offering", "user", "username", "is_restricted")
 
     def set_propagation_date(self):
         now = timezone.datetime.today()

@@ -53,9 +53,14 @@ from waldur_core.core.utils import (
     month_start,
     order_with_nulls,
 )
+from waldur_core.logging.loggers import event_logger
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.models import UserRole
-from waldur_core.permissions.utils import has_permission, permission_factory
+from waldur_core.permissions.utils import (
+    get_user_ids,
+    has_permission,
+    permission_factory,
+)
 from waldur_core.permissions.views import UserRoleMixin
 from waldur_core.quotas.models import QuotaUsage
 from waldur_core.structure import filters as structure_filters
@@ -1456,6 +1461,46 @@ class ProviderOfferingViewSet(
         )
     ]
 
+    @action(detail=True, methods=["GET"])
+    def list_customer_projects(self, request, uuid=None):
+        offering = self.get_object()
+        project_ids = (
+            models.Resource.objects.filter(offering=offering)
+            .exclude(state=models.Resource.States.TERMINATED)
+            .values_list("project_id", flat=True)
+        )
+        projects = structure_models.Project.objects.filter(id__in=project_ids)
+        serializer = structure_serializers.ProjectSerializer(
+            instance=projects, many=True, context={"request": request}
+        )
+        return Response(
+            status=status.HTTP_200_OK,
+            data=serializer.data,
+        )
+
+    @action(detail=True, methods=["GET"])
+    def list_customer_users(self, request, uuid=None):
+        offering = self.get_object()
+        project_ids = (
+            models.Resource.objects.filter(offering=offering)
+            .exclude(state=models.Resource.States.TERMINATED)
+            .values_list("project_id", flat=True)
+        )
+        ctype = ContentType.objects.get_for_model(structure_models.Project)
+        user_ids = get_user_ids(ctype, project_ids)
+        users = core_models.User.objects.filter(id__in=user_ids)
+        serializer = structure_serializers.UserSerializer(
+            instance=users, many=True, context={"request": request}
+        )
+        return Response(
+            status=status.HTTP_200_OK,
+            data=serializer.data,
+        )
+
+    list_customer_projects_permissions = list_customer_users_permissions = [
+        structure_permissions.is_owner
+    ]
+
 
 class PublicOfferingViewSet(rf_viewsets.ReadOnlyModelViewSet):
     queryset = models.Offering.objects.filter()
@@ -2070,29 +2115,6 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
     ]
 
 
-class CartItemViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
-    queryset = models.CartItem.objects.all()
-    lookup_field = "uuid"
-    serializer_class = serializers.CartItemSerializer
-    filter_backends = (DjangoFilterBackend,)
-    filterset_class = filters.CartItemFilter
-
-    def get_queryset(self):
-        return self.queryset.filter(user=self.request.user)
-
-    @action(detail=False, methods=["post"])
-    def submit(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        order = serializer.save()
-        order_serializer = serializers.OrderCreateSerializer(
-            instance=order, context=self.get_serializer_context()
-        )
-        return Response(order_serializer.data, status=status.HTTP_201_CREATED)
-
-    submit_serializer_class = serializers.CartSubmitSerializer
-
-
 class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
     queryset = models.Resource.objects.all()
     filter_backends = (DjangoFilterBackend, filters.ResourceScopeFilterBackend)
@@ -2112,6 +2134,25 @@ class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
             request, models.IntegrationStatus.AgentTypes.USAGE_REPORTING
         )
         return super().list(request, *args, **kwargs)
+
+    @action(detail=False, methods=["post"])
+    def suggest_name(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        project: structure_models.Project = serializer.validated_data["project"]
+        offering: models.Offering = serializer.validated_data["offering"]
+        resource_count = models.Resource.objects.filter(
+            project=project, offering=offering
+        ).count()
+        parts = [
+            project.customer.slug,
+            project.slug,
+            offering.slug,
+        ]
+        result = "-".join(parts) + "-" + str(resource_count + 1)
+        return Response({"name": result})
+
+    suggest_name_serializer_class = serializers.ResourceSuggestNameSerializer
 
     @action(detail=True, methods=["get"])
     def details(self, request, uuid=None):
@@ -2745,6 +2786,25 @@ class OfferingUsersViewSet(
             )
         ).distinct()
         return queryset
+
+    @action(detail=True, methods=["post"])
+    def update_restricted(self, request, uuid=None):
+        offering_user = self.get_object()
+        serializer = serializers.OfferingUserUpdateRestrictionSerializer(
+            data=request.data, context={"request": request}, instance=offering_user
+        )
+        serializer.is_valid(raise_exception=True)
+        offering_user.is_restricted = serializer.validated_data["is_restricted"]
+        offering_user.save(update_fields=["is_restricted"])
+        event_logger.marketplace_offering_user.info(
+            f"Restriction status for user {offering_user.user.username} in offering {offering_user.offering.name} has been set to {offering_user.is_restricted} by {request.user.username}.",
+            event_type="marketplace_offering_user_restriction_updated",
+            event_context={"offering_user": offering_user},
+        )
+        logger.info(
+            f"Restriction status for user {offering_user.user.username} in offering {offering_user.offering.name} has been set to {offering_user.is_restricted} by {request.user.username}."
+        )
+        return Response(status=status.HTTP_200_OK)
 
 
 class OfferingUserGroupViewSet(core_views.ActionsViewSet):

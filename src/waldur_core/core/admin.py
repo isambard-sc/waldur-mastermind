@@ -145,15 +145,6 @@ class UserChangeForm(auth_forms.UserChangeForm):
         model = get_user_model()
         exclude = ("details",)
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        competences = [
-            (key, key) for key in settings.WALDUR_CORE.get("USER_COMPETENCE_LIST", [])
-        ]
-        self.fields["competence"] = OptionalChoiceField(
-            choices=competences, required=False
-        )
-
     def clean_civil_number(self):
         # Empty string should be converted to None.
         # Otherwise uniqueness constraint is violated.
@@ -246,7 +237,6 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin, VersionAdmin):
                     "native_name",
                     "email",
                     "preferred_language",
-                    "competence",
                     "phone_number",
                 )
             },
@@ -368,8 +358,21 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin, VersionAdmin):
 
 
 class SshPublicKeyAdmin(VersionAdmin):
-    list_display = ("user", "name", "fingerprint")
-    search_fields = ("user__username", "name", "fingerprint")
+    list_display = (
+        "user",
+        "name",
+        "type",
+        "fingerprint_md5",
+        "fingerprint_sha256",
+        "fingerprint_sha512",
+    )
+    search_fields = (
+        "user__username",
+        "name",
+        "fingerprint_md5",
+        "fingerprint_sha256",
+        "fingerprint_sha512",
+    )
 
 
 class ChangeEmailRequestAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):

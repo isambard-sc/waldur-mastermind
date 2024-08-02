@@ -44,6 +44,17 @@ class ResourceGetTest(test.APITransactionTestCase):
         url = factories.ResourceFactory.get_url(self.resource)
         return self.client.get(url)
 
+    def test_suggest_name(self):
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url("suggest_name")
+        response = self.client.post(
+            url, {"project": self.project.uuid.hex, "offering": self.offering.uuid.hex}
+        )
+        self.assertEqual(
+            response.data["name"],
+            f"{self.project.customer.slug}-{self.project.slug}-{self.offering.slug}-2",
+        )
+
     def test_resource_is_usage_based(self):
         factories.OfferingComponentFactory(
             offering=self.offering,

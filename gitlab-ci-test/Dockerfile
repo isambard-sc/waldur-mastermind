@@ -9,14 +9,13 @@ RUN apt-get update    &&\
     libsasl2-dev        \
     ldap-utils          \
     xmlsec1             \
+    git                 \
     lcov                \
     graphviz            \
     python3-dev
 
 RUN python3 -m pip install --upgrade pip
-RUN python3 -m pip install --upgrade setuptools==69.5.1
-RUN pip3 install poetry==1.8.2
-RUN poetry config virtualenvs.create false
+RUN pip3 install poetry==1.8.3
 
 # Copy poetry files
 COPY pyproject.toml /tmp/mnt/pyproject.toml
@@ -24,6 +23,7 @@ COPY poetry.lock /tmp/mnt/poetry.lock
 
 # Install dependencies
 # NB: `poetry update` command uses --dry-run to update commit sha in poetry.lock
+RUN poetry config virtualenvs.create false
 RUN cd /tmp/mnt && \
     poetry update --dry-run ansible-waldur-module && \
     poetry install -vvv

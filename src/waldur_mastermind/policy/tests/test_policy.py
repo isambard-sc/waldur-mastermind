@@ -27,7 +27,7 @@ class ActionsFunctionsTest(test.APITransactionTestCase):
 
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.project = self.fixture.project
-        self.policy = factories.ProjectEstimatedCostPolicyFactory(project=self.project)
+        self.policy = factories.ProjectEstimatedCostPolicyFactory(scope=self.project)
         self.estimate = billing_models.PriceEstimate.objects.get(scope=self.project)
 
     def tearDown(self):
@@ -118,7 +118,7 @@ class ActionsFunctionsTest(test.APITransactionTestCase):
                 self.block_creation_of_new_resources_mock,
             ],
         ):
-            policy_2 = factories.ProjectEstimatedCostPolicyFactory(project=self.project)
+            policy_2 = factories.ProjectEstimatedCostPolicyFactory(scope=self.project)
             self.estimate.total = self.policy.limit_cost + 100
             self.estimate.save()
             self.policy.refresh_from_db()
@@ -132,7 +132,7 @@ class GetPolicyTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.project = self.fixture.project
-        self.policy = factories.ProjectEstimatedCostPolicyFactory(project=self.project)
+        self.policy = factories.ProjectEstimatedCostPolicyFactory(scope=self.project)
         self.url = factories.ProjectEstimatedCostPolicyFactory.get_list_url()
 
     @data("staff", "owner", "customer_support", "admin", "manager")
@@ -162,7 +162,7 @@ class CreatePolicyTest(test.APITransactionTestCase):
         payload = {
             "limit_cost": 100,
             "actions": "notify_organization_owners,block_modification_of_existing_resources",
-            "project": structure_factories.ProjectFactory.get_url(self.project),
+            "scope": structure_factories.ProjectFactory.get_url(self.project),
         }
         return self.client.post(self.url, payload)
 
@@ -232,14 +232,14 @@ class DeletePolicyTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.project = self.fixture.project
-        self.policy = factories.ProjectEstimatedCostPolicyFactory(project=self.project)
+        self.policy = factories.ProjectEstimatedCostPolicyFactory(scope=self.project)
         self.url = factories.ProjectEstimatedCostPolicyFactory.get_url(self.policy)
 
     def _delete_policy(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
         return self.client.delete(self.url)
 
-    @data("staff", "owner", "customer_support")
+    @data("staff", "owner")
     def test_user_can_delete_policy(self, user):
         response = self._delete_policy(user)
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
@@ -260,14 +260,14 @@ class UpdatePolicyTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.project = self.fixture.project
-        self.policy = factories.ProjectEstimatedCostPolicyFactory(project=self.project)
+        self.policy = factories.ProjectEstimatedCostPolicyFactory(scope=self.project)
         self.url = factories.ProjectEstimatedCostPolicyFactory.get_url(self.policy)
 
     def _update_policy(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
         return self.client.patch(self.url, {"actions": "notify_organization_owners"})
 
-    @data("staff", "owner", "customer_support")
+    @data("staff", "owner")
     def test_user_can_update_policy(self, user):
         response = self._update_policy(user)
         self.assertEqual(response.status_code, status.HTTP_200_OK)

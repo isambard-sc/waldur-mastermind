@@ -2,20 +2,12 @@ import logging
 
 from django.utils import timezone
 
-from waldur_core.structure import models as structure_models
-from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.policy import models as policy_models
+from . import models
 
 logger = logging.getLogger(__name__)
 
 
-def project_estimated_cost_policy_handler(sender, instance, created=False, **kwargs):
-    if not isinstance(instance.scope, structure_models.Project):
-        return
-
-    project = instance.scope
-    policies = policy_models.ProjectEstimatedCostPolicy.objects.filter(project=project)
-
+def run_one_time_actions(policies):
     for policy in policies:
         if not policy.has_fired and policy.is_triggered():
             policy.has_fired = True
@@ -25,9 +17,9 @@ def project_estimated_cost_policy_handler(sender, instance, created=False, **kwa
             for action in policy.get_one_time_actions():
                 action(policy)
                 logger.info(
-                    "%s action has been triggered for project %s. Policy UUID: %s",
+                    "%s action has been triggered for %s. Policy UUID: %s",
                     action.__name__,
-                    policy.project.name,
+                    policy.scope.name,
                     policy.uuid.hex,
                 )
 
@@ -36,24 +28,52 @@ def project_estimated_cost_policy_handler(sender, instance, created=False, **kwa
             policy.save()
 
 
-def project_estimated_cost_policy_handler_for_observable_class(
-    sender, instance, created=False, **kwargs
-):
-    if not isinstance(instance, marketplace_models.Resource):
-        return
+def get_estimated_cost_policy_handler(klass):
+    def handler(sender, instance, created=False, **kwargs):
+        estimated_cost = instance
 
-    resource = instance
-    policies = policy_models.ProjectEstimatedCostPolicy.objects.filter(
-        project=resource.project
-    )
+        if not isinstance(estimated_cost.scope, klass.get_scope_class()):
+            return
 
-    for policy in policies:
-        if policy.is_triggered():
-            for action in policy.get_not_one_time_actions():
-                action(policy, created)
-                logger.info(
-                    "%s action has been triggered for project %s. Policy UUID: %s",
-                    action.__name__,
-                    policy.project.name,
-                    policy.uuid.hex,
-                )
+        scope = estimated_cost.scope
+        policies = klass.objects.filter(scope=scope)
+
+        run_one_time_actions(policies)
+
+    return handler
+
+
+def get_estimated_cost_policy_handler_for_observable_class(klass, observable_class):
+    def handler(sender, instance, created=False, **kwargs):
+        if not isinstance(instance, observable_class):
+            return
+
+        observable_object = instance
+        policies = klass.objects.filter(
+            scope=klass.get_scope_from_observable_object(observable_object)
+        )
+
+        for policy in policies:
+            if policy.is_triggered():
+                for action in policy.get_not_one_time_actions():
+                    action(policy, created)
+                    logger.info(
+                        "%s action has been triggered for %s. Policy UUID: %s",
+                        action.__name__,
+                        policy.scope.name,
+                        policy.uuid.hex,
+                    )
+
+    return handler
+
+
+def offering_estimated_cost_trigger_handler(sender, instance, created=False, **kwargs):
+    invoice_item = instance
+
+    if invoice_item.resource:
+        policies = models.OfferingEstimatedCostPolicy.objects.filter(
+            scope=invoice_item.resource.offering,
+            organization_groups=invoice_item.resource.project.customer.organization_group,
+        )
+
+        run_one_time_actions(policies)

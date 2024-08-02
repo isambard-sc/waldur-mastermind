@@ -350,6 +350,7 @@ CONSTANCE_CONFIG = {
         ",".join(LANGUAGE_CHOICES),
         "List of enabled languages",
     ),
+    "DISABLE_DARK_THEME": (False, "Toggler for dark theme."),
     # images, logos, favicons
     "POWERED_BY_LOGO": (
         "",
@@ -414,7 +415,7 @@ CONSTANCE_CONFIG = {
         False,
         "Toggler for mapping between waldur user and service desk agents.",
     ),
-    "ATLASSIAN_STRANGE_SETTING": (1, ""),
+    "ATLASSIAN_STRANGE_SETTING": (1, "A constant in the API path, sometimes differs"),
     "ATLASSIAN_API_URL": ("http://example.com/", "Atlassian server URL"),
     "ATLASSIAN_USERNAME": ("USERNAME", "Username for access user"),
     "ATLASSIAN_PASSWORD": ("PASSWORD", "Password for access user"),
@@ -425,6 +426,14 @@ CONSTANCE_CONFIG = {
         "Toggler for SSL verification",
     ),
     "ATLASSIAN_PROJECT_ID": ("", "Project-related settings"),
+    "ATLASSIAN_SHARED_USERNAME": (
+        False,
+        "Is Service Desk username the same as in Waldur",
+    ),
+    "ATLASSIAN_CUSTOM_ISSUE_FIELD_MAPPING_ENABLED": (
+        True,
+        "Should extra issue field mappings be applied",
+    ),
     "ATLASSIAN_DEFAULT_OFFERING_ISSUE_TYPE": ("Service Request", "Issue type"),
     "ATLASSIAN_EXCLUDED_ATTACHMENT_TYPES": ("", "List of attachment types"),
     "ATLASSIAN_PULL_PRIORITIES": (
@@ -498,6 +507,7 @@ CONSTANCE_CONFIG = {
     "SMAX_VERIFY_SSL": (True, "Toggler for SSL verification"),
     # Proposal settings
     "PROPOSAL_REVIEW_DURATION": (7, "Review duration in days."),
+    "USER_TABLE_COLUMNS": ("", "Comma-separated list of columns for users table."),
 }
 
 CONSTANCE_CONFIG_FIELDSETS = {
@@ -519,6 +529,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "COMMON_FOOTER_TEXT",
         "COMMON_FOOTER_HTML",
         "LANGUAGE_CHOICES",
+        "DISABLE_DARK_THEME",
     ),
     "Whitelabeling settings (logos, images, favicons)": (
         "SITE_LOGO",
@@ -568,6 +579,8 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ATLASSIAN_SATISFACTION_FIELD",
         "ATLASSIAN_REQUEST_FEEDBACK_FIELD",
         "ATLASSIAN_TEMPLATE_FIELD",
+        "ATLASSIAN_CUSTOM_ISSUE_FIELD_MAPPING_ENABLED",
+        "ATLASSIAN_SHARED_USERNAME",
     ),
     "Zammad settings": (
         "ZAMMAD_API_URL",
@@ -593,6 +606,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "SMAX_VERIFY_SSL",
     ),
     "Proposal settings": ("PROPOSAL_REVIEW_DURATION",),
+    "Table settings": ("USER_TABLE_COLUMNS",),
 }
 
 PUBLIC_CONSTANCE_SETTINGS = (
@@ -624,12 +638,15 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "COMMON_FOOTER_TEXT",
     "COMMON_FOOTER_HTML",
     "LANGUAGE_CHOICES",
+    "DISABLE_DARK_THEME",
     # Support plugin
     "WALDUR_SUPPORT_ENABLED",
     "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE",
     "WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE",
     # Proposal
     "PROPOSAL_REVIEW_DURATION",
+    # Tables
+    "USER_TABLE_COLUMNS",
 )
 
 for ext in WaldurExtension.get_extensions():

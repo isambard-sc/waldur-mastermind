@@ -23,7 +23,7 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core.clean_html import clean_html
 from waldur_core.core.fields import NaturalChoiceField
-from waldur_core.core.models import User, get_ssh_key_fingerprint
+from waldur_core.core.models import User, get_ssh_key_fingerprints
 from waldur_core.core.serializers import GenericRelatedField
 from waldur_core.core.validators import validate_ssh_public_key
 from waldur_core.media.serializers import (
@@ -42,8 +42,8 @@ from waldur_core.structure.executors import ServiceSettingsCreateExecutor
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.serializers import get_options_serializer_class
 from waldur_mastermind.billing.serializers import get_payment_profiles
-from waldur_mastermind.common import exceptions
 from waldur_mastermind.common import mixins as common_mixins
+from waldur_mastermind.common.exceptions import TransactionRollback
 from waldur_mastermind.common.serializers import validate_options
 from waldur_mastermind.invoices.models import InvoiceItem
 from waldur_mastermind.invoices.utils import get_billing_price_estimate_for_resources
@@ -1082,6 +1082,7 @@ class ProviderOfferingDetailsSerializer(
             "uuid",
             "created",
             "name",
+            "slug",
             "description",
             "full_description",
             "terms_of_service",
@@ -1951,170 +1952,6 @@ class OrderSetStateErredSerializer(
         protected_fields = ("error_message", "error_traceback")
 
 
-class CartItemSerializer(BaseRequestSerializer):
-    limits = serializers.DictField(child=serializers.IntegerField(), required=False)
-    estimate = serializers.ReadOnlyField(source="cost")
-    project = serializers.HyperlinkedRelatedField(
-        lookup_field="uuid",
-        view_name="project-detail",
-        queryset=structure_models.Project.available_objects.all(),
-    )
-    project_uuid = serializers.ReadOnlyField(source="project.uuid")
-    project_name = serializers.ReadOnlyField(source="project.name")
-
-    class Meta(BaseRequestSerializer.Meta):
-        model = models.CartItem
-        fields = BaseRequestSerializer.Meta.fields + (
-            "estimate",
-            "project",
-            "project_name",
-            "project_uuid",
-            "fixed_price",
-            "activation_price",
-        )
-        protected_fields = BaseRequestSerializer.Meta.protected_fields + ("project",)
-
-    def get_fields(self):
-        fields = super().get_fields()
-        if "project" in fields:
-            fields["project"].queryset = filter_queryset_for_user(
-                fields["project"].queryset, self.context["request"].user
-            )
-        return fields
-
-    def quotas_validate(self, item, project):
-        try:
-            with transaction.atomic():
-                processor_class = manager.get_processor(
-                    item.offering.type, "create_resource_processor"
-                )
-                order = models.Order(
-                    project=project,
-                    created_by=self.context["request"].user,
-                    offering=item.offering,
-                    attributes=item.attributes,
-                    plan=item.plan,
-                    limits=item.limits,
-                    type=item.type,
-                )
-
-                if issubclass(processor_class, CreateResourceProcessor):
-                    processor = processor_class(order)
-                    post_data = processor.get_post_data()
-                    serializer_class = processor.get_serializer_class()
-                    if serializer_class:
-                        serializer = serializer_class(
-                            data=post_data, context=self.context
-                        )
-                        serializer.is_valid(raise_exception=True)
-                        serializer.save()
-                        raise exceptions.TransactionRollback()
-        except exceptions.TransactionRollback:
-            pass
-
-    @transaction.atomic
-    def create(self, validated_data):
-        validated_data["user"] = self.context["request"].user
-        item = super().create(validated_data)
-        item.init_cost()
-        item.save(update_fields=["cost"])
-        self.quotas_validate(item, validated_data["project"])
-        return item
-
-    @transaction.atomic
-    def update(self, instance, validated_data):
-        instance = super().update(instance, validated_data)
-        instance.init_cost()
-        instance.save(update_fields=["cost"])
-        return instance
-
-    def validate(self, attrs):
-        attrs = super().validate(attrs)
-
-        if not self.instance:
-            plan = attrs.get("plan")
-            offering = attrs.get("offering")
-            user = self.context["request"].user
-
-            if not plan:
-                plans = utils.get_plans_available_for_user(
-                    offering=offering,
-                    user=user,
-                    without_parents_plan=True,
-                )
-                if not plans.exists():
-                    # try to lookup parent offering's plan
-                    plans = utils.get_plans_available_for_user(
-                        offering=offering,
-                        user=user,
-                    )
-
-                if len(plans) == 1:
-                    attrs["plan"] = plans[0]
-                else:
-                    raise rf_exceptions.ValidationError(
-                        {"plan": _("This field is required.")}
-                    )
-
-        return attrs
-
-
-class CartSubmitSerializer(serializers.Serializer):
-    project = serializers.HyperlinkedRelatedField(
-        queryset=structure_models.Project.available_objects.all(),
-        view_name="project-detail",
-        lookup_field="uuid",
-        required=True,
-    )
-
-    def get_fields(self):
-        fields = super().get_fields()
-        project_field = fields["project"]
-        project_field.queryset = filter_queryset_for_user(
-            project_field.queryset, self.context["request"].user
-        )
-        return fields
-
-    @transaction.atomic()
-    def create(self, validated_data):
-        request = self.context["request"]
-        project = validated_data["project"]
-        user = self.context["request"].user
-
-        items = models.CartItem.objects.filter(user=request.user, project=project)
-        if not items.exists():
-            raise serializers.ValidationError(_("Shopping cart is empty"))
-
-        for item in items:
-            resource = models.Resource(
-                project=project,
-                offering=item.offering,
-                plan=item.plan,
-                limits=item.limits,
-                attributes=item.attributes,
-                name=item.attributes.get("name") or "",
-            )
-            validate_end_date(resource, user, item.attributes.get("end_date"))
-            resource.init_cost()
-            resource.save()
-
-            order = models.Order(
-                resource=resource,
-                project=project,
-                created_by=request.user,
-                offering=item.offering,
-                attributes=item.attributes,
-                plan=item.plan,
-                limits=item.limits,
-                type=item.type,
-            )
-            validate_order(order, request)
-            order.init_cost()
-            order.save()
-            item.delete()
-        return order
-
-
 def validate_public_offering(order: models.Order):
     # Order is ok if organization groups are not defined for offering
     if not order.offering.organization_groups.count():
@@ -2216,7 +2053,6 @@ class OrderCreateSerializer(
             "state",
             "cost",
             "type",
-            "error_message",
         )
         read_only_fields = (
             "created_by",
@@ -2260,6 +2096,7 @@ class OrderCreateSerializer(
         resource.init_cost()
         attributes = validated_data.get("attributes", {})
         end_date = attributes.get("end_date")
+        validate_end_date(resource, request.user, end_date)
 
         if end_date:
             resource.end_date = end_date
@@ -2278,12 +2115,35 @@ class OrderCreateSerializer(
             type=validated_data.get("type"),
         )
         validate_order(order, request)
+        self.quotas_validate(order)
         order.init_cost()
         order.save()
         return order
 
     def get_filtered_field_names(self):
         return ("project",)
+
+    def quotas_validate(self, order):
+        if not order.offering.scope:
+            return
+        processor_class = manager.get_processor(
+            order.offering.type, "create_resource_processor"
+        )
+        if not issubclass(processor_class, CreateResourceProcessor):
+            return
+        processor = processor_class(order)
+        serializer_class = processor.get_serializer_class()
+        if not serializer_class:
+            return
+        post_data = processor.get_post_data()
+        serializer = serializer_class(data=post_data, context=self.context)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                serializer.save()
+                raise TransactionRollback()
+        except TransactionRollback:
+            pass
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -2300,6 +2160,32 @@ class OrderCreateSerializer(
             )
 
         return attrs
+
+
+class ResourceSuggestNameSerializer(serializers.ModelSerializer):
+    project = serializers.SlugRelatedField(
+        queryset=structure_models.Project.objects.all(), slug_field="uuid"
+    )
+    offering = serializers.SlugRelatedField(
+        queryset=models.Offering.objects.all(), slug_field="uuid"
+    )
+
+    class Meta:
+        model = models.Resource
+        fields = ("project", "offering")
+
+    def get_fields(self):
+        fields = super().get_fields()
+
+        request = self.context["request"]
+        user = request.user
+        fields["project"].queryset = filter_queryset_for_user(
+            fields["project"].queryset, user
+        )
+        fields["offering"].queryset = fields[
+            "offering"
+        ].queryset.filter_by_ordering_availability_for_user(user)
+        return fields
 
 
 class ResourceSerializer(BaseItemSerializer):
@@ -2330,6 +2216,7 @@ class ResourceSerializer(BaseItemSerializer):
             "is_usage_based",
             "is_limit_based",
             "name",
+            "slug",
             "current_usages",
             "can_terminate",
             "report",
@@ -2988,10 +2875,15 @@ class OfferingUserSerializer(
     user_uuid = serializers.ReadOnlyField(source="user.uuid")
     user_username = serializers.ReadOnlyField(source="user.username")
     user_full_name = serializers.ReadOnlyField(source="user.full_name")
+    customer_uuid = serializers.ReadOnlyField(source="offering.customer.uuid")
+    customer_name = serializers.ReadOnlyField(source="offering.customer.name")
+    is_restricted = serializers.ReadOnlyField()
 
     class Meta:
         model = models.OfferingUser
         fields = (
+            "url",
+            "uuid",
             "user",
             "offering",
             "username",
@@ -3003,6 +2895,9 @@ class OfferingUserSerializer(
             "created",
             "modified",
             "propagation_date",
+            "customer_uuid",
+            "customer_name",
+            "is_restricted",
         )
         extra_kwargs = dict(
             offering={
@@ -3010,6 +2905,10 @@ class OfferingUserSerializer(
                 "view_name": "marketplace-provider-offering-detail",
             },
             user={"lookup_field": "uuid", "view_name": "user-detail"},
+            url={
+                "lookup_field": "uuid",
+                "view_name": "marketplace-offering-user-detail",
+            },
         )
 
     def create(self, validated_data):
@@ -3027,6 +2926,20 @@ class OfferingUserSerializer(
             )
 
         return super().create(validated_data)
+
+
+class OfferingUserUpdateRestrictionSerializer(serializers.Serializer):
+    is_restricted = serializers.BooleanField()
+
+    def validate(self, attrs):
+        request = self.context["request"]
+        offering_user = self.instance
+        offering = offering_user.offering
+        if not has_permission(
+            request, PermissionEnum.UPDATE_OFFERING_USER_RESTRICTION, offering.customer
+        ):
+            raise rf_exceptions.PermissionDenied()
+        return attrs
 
 
 class FilterForUserField(serializers.HyperlinkedRelatedField):
@@ -3558,6 +3471,7 @@ class ProviderOfferingSerializer(serializers.ModelSerializer):
         fields = (
             "uuid",
             "name",
+            "slug",
             "category_title",
             "type",
             "state",
@@ -3607,9 +3521,14 @@ class ProviderOfferingSerializer(serializers.ModelSerializer):
 class RobotAccountSerializer(
     core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
+    url = serializers.HyperlinkedIdentityField(
+        view_name="marketplace-robot-account-detail", lookup_field="uuid"
+    )
+
     class Meta:
         model = models.RobotAccount
         fields = (
+            "url",
             "uuid",
             "created",
             "modified",
@@ -3636,7 +3555,16 @@ class RobotAccountSerializer(
     fingerprints = serializers.SerializerMethodField()
 
     def get_fingerprints(self, robot_account):
-        fingerprints = [get_ssh_key_fingerprint(key) for key in robot_account.keys]
+        fingerprints = []
+        for key in robot_account.keys:
+            md5_fp, sha256fp, sha512_fp = get_ssh_key_fingerprints(key)
+            fingerprints.append(
+                {
+                    "md5": md5_fp,
+                    "sha256": sha256fp,
+                    "sha512": sha512_fp,
+                }
+            )
         return fingerprints
 
     def validate_keys(self, keys):

@@ -273,6 +273,7 @@ class OrganizationGroup(core_models.UuidMixin, core_models.NameMixin, models.Mod
 
 CUSTOMER_DETAILS_FIELDS = (
     "name",
+    "slug",
     "native_name",
     "abbreviation",
     "contact_details",
@@ -356,6 +357,7 @@ class Customer(
     CustomerDetailsMixin,
     core_models.UuidMixin,
     core_models.DescendantMixin,
+    core_models.SlugMixin,
     quotas_models.ExtendableQuotaModelMixin,
     PermissionMixin,
     StructureLoggableMixin,
@@ -622,6 +624,7 @@ class Project(
     core_models.UuidMixin,
     core_models.DescendantMixin,
     core_models.BackendMixin,
+    core_models.SlugMixin,
     quotas_models.ExtendableQuotaModelMixin,
     PermissionMixin,
     StructureLoggableMixin,

@@ -19,7 +19,7 @@ class ActionsTest(test.APITransactionTestCase):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.project = self.fixture.project
         self.policy = factories.ProjectEstimatedCostPolicyFactory(
-            project=self.project, created_by=self.fixture.user
+            scope=self.project, created_by=self.fixture.user
         )
         self.estimate = billing_models.PriceEstimate.objects.get(scope=self.project)
         self.admin = self.fixture.admin
@@ -34,9 +34,8 @@ class ActionsTest(test.APITransactionTestCase):
         self.policy.actions = "notify_project_team"
         self.policy.save()
 
-        serialized_scope = core_utils.serialize_instance(self.policy.project)
         serialized_policy = core_utils.serialize_instance(self.policy)
-        tasks.notify_about_limit_cost(serialized_scope, serialized_policy)
+        tasks.notify_project_team(serialized_policy)
 
         mock_send_mail.assert_called_once()
 
@@ -49,9 +48,8 @@ class ActionsTest(test.APITransactionTestCase):
         self.policy.actions = "notify_organization_owners"
         self.policy.save()
 
-        serialized_scope = core_utils.serialize_instance(self.policy.project.customer)
         serialized_policy = core_utils.serialize_instance(self.policy)
-        tasks.notify_about_limit_cost(serialized_scope, serialized_policy)
+        tasks.notify_customer_owners(serialized_policy)
 
         mock_send_mail.assert_called_once()
         self.assertEqual(mock_send_mail.call_args.kwargs["to"][0], self.owner.email)
@@ -68,7 +66,7 @@ class ActionsTest(test.APITransactionTestCase):
         self.estimate.total = self.policy.limit_cost + 1
         self.estimate.save()
 
-        mock_tasks.notify_about_limit_cost.delay.assert_called_once()
+        mock_tasks.notify_customer_owners.delay.assert_called_once()
         self.assertTrue(
             logging_models.Event.objects.filter(event_type="notify_organization_owners")
         )

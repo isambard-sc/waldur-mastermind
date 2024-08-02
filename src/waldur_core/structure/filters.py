@@ -234,8 +234,8 @@ class ProjectFilter(NameFilterSet):
             queryset = queryset.filter(
                 Q(resource__name=value)
                 | Q(name__icontains=value)
-                | Q(resource__backend_id=value)
-                | Q(resource__effective_id=value)
+                | Q(resource__backend_id__iexact=value)
+                | Q(resource__effective_id__iexact=value)
             )
         return queryset.distinct()
 
@@ -468,7 +468,9 @@ class SshKeyFilter(NameFilterSet):
         model = core_models.SshPublicKey
         fields = [
             "name",
-            "fingerprint",
+            "fingerprint_md5",
+            "fingerprint_sha256",
+            "fingerprint_sha512",
             "uuid",
             "user_uuid",
             "is_shared",

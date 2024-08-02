@@ -96,6 +96,7 @@ class OfferingFilter(structure_filters.NameFilterSet, django_filters.FilterSet):
             "total_customers",
             "total_cost",
             "total_cost_estimated",
+            "state",
         )
     )
     type = LooseMultipleChoiceFilter()
@@ -271,21 +272,6 @@ class ScreenshotFilter(OfferingFilterMixin, django_filters.FilterSet):
         fields = []
 
 
-class CartItemFilter(django_filters.FilterSet):
-    customer = core_filters.URLFilter(
-        view_name="customer-detail", field_name="project__customer__uuid"
-    )
-    customer_uuid = django_filters.UUIDFilter(field_name="project__customer__uuid")
-    project = core_filters.URLFilter(
-        view_name="project-detail", field_name="project__uuid"
-    )
-    project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
-
-    class Meta:
-        model = models.CartItem
-        fields = []
-
-
 class OrderFilter(OfferingFilterMixin, django_filters.FilterSet):
     query = django_filters.CharFilter(method="filter_query")
     project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
@@ -409,8 +395,8 @@ class ResourceFilter(
 
         query = queryset.filter(
             Q(name__icontains=value)
-            | Q(backend_id=value)
-            | Q(effective_id=value)
+            | Q(backend_id__iexact=value)
+            | Q(effective_id__iexact=value)
             | Q(backend_metadata__external_ips__icontains=value)
             | Q(backend_metadata__internal_ips__icontains=value)
             | Q(backend_metadata__hypervisor_hostname__icontains=value)
@@ -640,6 +626,7 @@ class OfferingUserFilter(OfferingFilterMixin, core_filters.CreatedModifiedFilter
         field_name="propagation_date", lookup_expr="lte"
     )
     provider_uuid = django_filters.UUIDFilter(field_name="offering__customer__uuid")
+    is_restricted = django_filters.BooleanFilter(field_name="is_restricted")
     o = django_filters.OrderingFilter(
         fields=("created", "modified", "username", "propagation_date")
     )
