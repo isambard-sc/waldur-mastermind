@@ -311,19 +311,21 @@ class User(
         max_length=50,
         unique=True,
         null=True,
-        help_text=_("A short, unique name for you. It will be used to form your local username on any systems. Should only contain lower-case letters and digits and must start with a letter."),
+        help_text=_(
+            "A short, unique name for you. It will be used to form your local username on any systems. Should only contain lower-case letters and digits and must start with a letter."
+        ),
         validators=[
             validators.RegexValidator(
                 regex=r"^[a-z][a-z0-9]+$",
                 message="Must start with a letter and only contain numbers and letters.",
-                ),
+            ),
             validators.RegexValidator(
                 regex=r"(admin)|(root)$",
                 inverse_match=True,
-                ),
+            ),
             validators.MinLengthValidator(5),
-            validators.MaxLengthValidator(20)
-        ]
+            validators.MaxLengthValidator(20),
+        ],
     )
     query_field = models.CharField(max_length=300, blank=True)
     WHITELIST_FIELDS = [
@@ -377,7 +379,9 @@ class User(
         if self.tracker.has_changed("unix_username") and prev:
             new = self.unix_username
             raise ValueError(
-                _(f"Cannot change unix_username of user ('{prev}' → '{new}') after creation.")
+                _(
+                    f"Cannot change unix_username of user ('{prev}' → '{new}') after creation."
+                )
             )
 
         super().save(*args, **kwargs)

@@ -18,17 +18,9 @@ class Command(BaseCommand):
         password = options["password"]
         email = options["email"]
 
-        if username == "admin":
-            unix_username = "staff-a-user"
-        elif username == "root":
-            unix_username = "staff-r-user"
-        else:
-            unix_username = f"staff-{username}"
-
         user, created = User.objects.get_or_create(
             username=username,
             email=email,
-            unix_username=unix_username,
             defaults=dict(last_login=timezone.now(), is_staff=True),
         )
         if not created:
