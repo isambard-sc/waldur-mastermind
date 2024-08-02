@@ -645,21 +645,60 @@ class UserViewSet(viewsets.ModelViewSet):
         The email address to check is passed as a required `email` query
         parameter.
 
-        For example, given request /api/users/email_is_authorised/?email=someone@example.com
-        you get a response like this:
-
-        .. code-block:: javascript
-
-            {
-                "email": "someone@example.com",
-                "authorised": "false"
-            }
-
         Note that this is only available to authenticated users, and a user
         can only query emails addresses for which they have access (i.e.
         a staff user can query any email address, but a non-staff user can
         only query email addresses for projects in which they have this
         level of access)
+
+        There are three possible responses:
+
+        1. The email address belongs to someone who is active on at
+           least one project and is authorised to access Waldur. This
+           will return a response containing an
+           "email" field containing their email as in Waldur,
+           a "short_name" field containing their chosen short name, a
+           boolean "authorised" field set
+           to "true", a boolean "active" field set to "true", and additional
+           metadata about the user, e.g. a list of active projects they
+           belong too ("projects": ["project_short_name1", "project_short_name2"]),
+           and a list of platforms they can access
+           ("platforms": ["platform_short_name1", "platform_short_name2"]).
+
+            {
+                "email": "email_in_waldur",
+                "short_name": "user_short_name",
+                "authorised": "true",
+                "active": "true",
+                "projects": ["project_short_name1", "project_short_name2"],
+                "platforms": ["platform_short_name1", "platform_short_name2"]
+            }
+
+        2. The email address has been invited to a project in Waldur, but
+           is not yet active on any projects. This will return a response
+           containing just the email address, an "authorised" field set to
+           "true", an "active" field set to "false", and a "invited_by"
+           field containing the name of the user who invited them.
+
+            {
+                "email": "email_in_waldur",
+                "authorised": "true",
+                "active": "false",
+                "invited_by": "invited_by_user"
+            }
+
+        3. The email address does not belong to a user who is authorised to
+           access Waldur. This will return a response containing just the
+           email address, an "authorised" field set to "false", an "active"
+           field set to "false", and a "reason" field containing a reason
+           why the email address is not authorised.
+
+            {
+                "email": "email",
+                "authorised": "false",
+                "active": "false",
+                "reason": "reason"
+            }
         """
         user = request.user
 
@@ -696,8 +735,22 @@ class UserViewSet(viewsets.ModelViewSet):
                 reason = "User account is not active"
 
         if is_authorised:
+            # get the list of projects the user is active on,
+            # and the platforms they can access, plus
+            # their short name
+            projects = ["project_short_name1", "project_short_name2"]
+            platforms = ["platform_short_name1", "platform_short_name2"]
+            short_name = "my_short_name"
+
             return Response(
-                {"email": email_in_waldur, "authorised": "true", "active": "true"}
+                {
+                    "email": email_in_waldur,
+                    "short_name": short_name,
+                    "authorised": "true",
+                    "active": "true",
+                    "projects": projects,
+                    "platforms": platforms,
+                }
             )
 
         # could not find in the list of active users - try to
@@ -719,6 +772,7 @@ class UserViewSet(viewsets.ModelViewSet):
                 is_authorised = True
                 email_in_waldur = invitation.email
                 invited_by = invitation.created_by.full_name
+                reason = None
                 break
             elif reason is None:
                 reason = "Invitation to email is neither pending or requested."
@@ -755,9 +809,7 @@ class UserViewSet(viewsets.ModelViewSet):
 
         fingerprint = request.query_params.get("fingerprint", None)
         if fingerprint is None:
-            raise ValidationError(
-                "Missing required fingerprint query parameter"
-            )
+            raise ValidationError("Missing required fingerprint query parameter")
         # TODO maybe accept multiple options for the fingerprint
         fingerprint = {fingerprint}
         public_keys = core_models.SshPublicKey.objects.filter(
@@ -765,7 +817,9 @@ class UserViewSet(viewsets.ModelViewSet):
         )
         # TODO Check that just picking the first match is ok
         if not public_keys:
-            raise ValidationError(_("You do not have a matching public key registered."))
+            raise ValidationError(
+                _("You do not have a matching public key registered.")
+            )
         user_public_key_bytes = public_keys[0].public_key.encode("utf-8")
 
         if not request.user.unix_username:
@@ -788,7 +842,10 @@ class UserViewSet(viewsets.ModelViewSet):
                 raise ValidationError(_("DSA keys are not supported"))
 
         from pathlib import Path
-        ca_private_key_bytes = Path(django_settings.SSH_PRIVATE_SIGNING_KEY_PATH).read_bytes()
+
+        ca_private_key_bytes = Path(
+            django_settings.SSH_PRIVATE_SIGNING_KEY_PATH
+        ).read_bytes()
         ca_private_key = load_ssh_private_key(ca_private_key_bytes, password=None)
 
         connected_projects = get_connected_projects(user)
@@ -800,18 +857,16 @@ class UserViewSet(viewsets.ModelViewSet):
 
         principals = [f"{user.unix_username}.{p}".encode("utf-8") for p in short_names]
         service = "ai.isambard"
-        hostname = "ai-p1.access.isambard.ac.uk"  # TODO This should come from project details
+        hostname = (
+            "ai-p1.access.isambard.ac.uk"  # TODO This should come from project details
+        )
         proxy_jump = "ai.login.isambard.ac.uk"
 
         certificate = (
             SSHCertificateBuilder()
             .type(SSHCertificateType.USER)
             .valid_principals(principals)
-            .key_id(
-                str(
-                    {"service": service, "projects": short_names}
-                ).encode("utf-8")
-            )
+            .key_id(str({"service": service, "projects": short_names}).encode("utf-8"))
             .valid_after(datetime.datetime.now(timezone.utc).timestamp())
             .valid_before(
                 (
@@ -833,7 +888,8 @@ class UserViewSet(viewsets.ModelViewSet):
                     {
                         "short_name": p,
                         "username": f"{user.unix_username}.{p}",
-                    } for p in short_names
+                    }
+                    for p in short_names
                 ],
                 "hostname": hostname,
                 "proxy_jump": proxy_jump,
