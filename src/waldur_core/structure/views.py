@@ -738,9 +738,18 @@ class UserViewSet(viewsets.ModelViewSet):
             # get the list of projects the user is active on,
             # and the platforms they can access, plus
             # their short name
-            projects = ["project_short_name1", "project_short_name2"]
-            platforms = ["platform_short_name1", "platform_short_name2"]
-            short_name = "my_short_name"
+            connected_projects = get_connected_projects(user)
+            projects = models.Project.available_objects.filter(
+                id__in=connected_projects
+            )
+            projects = [p.short_name for p in projects]
+
+            if not projects:
+                projects = []
+
+            projects = projects
+            platforms = ["aip1-slurm", "aip1-jupyter"]
+            short_name = user.unix_username
 
             return Response(
                 {
