@@ -13,24 +13,50 @@ def default_short_name(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('structure', '0044_remove_customer_inet_accesssubnet'),
+        ("structure", "0045_customer_slug_project_slug"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='project',
-            name='short_name',
-            field=models.CharField(help_text='A short, unique name for the project used as an identifier. Should only contain lower-case letters, digits, underscores and hyphens', max_length=50, unique=True, validators=[django.core.validators.RegexValidator(regex='^[a-z0-9\\-_]+$'), django.core.validators.RegexValidator(inverse_match=True, regex='(-admin)|(-root)$'), django.core.validators.MinLengthValidator(3), django.core.validators.MaxLengthValidator(30)], verbose_name='short name', null=True),
+            model_name="project",
+            name="short_name",
+            field=models.CharField(
+                help_text="A short, unique name for the project used as an identifier. Should only contain lower-case letters, digits, underscores and hyphens",
+                max_length=50,
+                unique=True,
+                validators=[
+                    django.core.validators.RegexValidator(regex="^[a-z0-9\\-_]+$"),
+                    django.core.validators.RegexValidator(
+                        inverse_match=True, regex="(-admin)|(-root)$"
+                    ),
+                    django.core.validators.MinLengthValidator(3),
+                    django.core.validators.MaxLengthValidator(30),
+                ],
+                verbose_name="short name",
+                null=True,
+            ),
             preserve_default=False,
         ),
         migrations.RunPython(
             code=default_short_name,
         ),
         migrations.AlterField(
-            model_name='project',
-            name='short_name',
-            field=models.CharField(help_text='A short, unique name for the project used as an identifier. Should only contain lower-case letters, digits, underscores and hyphens', max_length=50, unique=True, validators=[django.core.validators.RegexValidator(regex='^[a-z0-9\\-_]+$'), django.core.validators.RegexValidator(inverse_match=True, regex='(-admin)|(-root)$'), django.core.validators.MinLengthValidator(3), django.core.validators.MaxLengthValidator(30)], verbose_name='short name'),
+            model_name="project",
+            name="short_name",
+            field=models.CharField(
+                help_text="A short, unique name for the project used as an identifier. Should only contain lower-case letters, digits, underscores and hyphens",
+                max_length=50,
+                unique=True,
+                validators=[
+                    django.core.validators.RegexValidator(regex="^[a-z0-9\\-_]+$"),
+                    django.core.validators.RegexValidator(
+                        inverse_match=True, regex="(-admin)|(-root)$"
+                    ),
+                    django.core.validators.MinLengthValidator(3),
+                    django.core.validators.MaxLengthValidator(30),
+                ],
+                verbose_name="short name",
+            ),
         ),
     ]
