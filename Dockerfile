@@ -64,5 +64,8 @@ RUN rm -rf /usr/local/src/ansible-waldur-module/.git \
 # Delete all development libraries
 RUN apt-get purge -y lib*-dev git
 
+# Make sure that the django cors headers package is installed!
+RUN pip install django-cors-headers
+
 ENTRYPOINT ["/app-entrypoint.sh"]
 CMD ["/bin/bash"]
