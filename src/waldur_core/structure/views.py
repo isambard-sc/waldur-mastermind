@@ -633,14 +633,16 @@ class UserViewSet(viewsets.ModelViewSet):
         logger.info(f"User {user} has been created by {self.request.user}.")
 
     @action(detail=False, methods=["get"])
-    def email_is_authorised(self, request):
+    def access_for_email(self, request):
         """
-        Return whether the passed email address belongs to a user who is
-        either an active member of a project, a staff member, or is an
-        email address that has been invited to an active project. The aim
-        of this API call is to allow, e.g. Keycloak, to determine whether
+        Return the level of access available for the passed email address.
+        The aim of this API call is to allow, e.g. Keycloak, to determine whether
         an identity connected to the specified email address is authorised
         to access Waldur, and is thus allowed to log in.
+
+        It also allows collection of access metadata, e.g. which projects
+        a user belongs to, which platform they can access, and what account
+        should be used.
 
         The email address to check is passed as a required `email` query
         parameter.
@@ -657,21 +659,21 @@ class UserViewSet(viewsets.ModelViewSet):
            least one project and is authorised to access Waldur. This
            will return a response containing an
            "email" field containing their email as in Waldur,
-           a "short_name" field containing their chosen short name, a
-           boolean "authorised" field set
+           a "unix_username" field containing their chosen short unix
+           user name, a boolean "authorised" field set
            to "true", a boolean "active" field set to "true", and additional
-           metadata about the user, e.g. a list of active projects they
-           belong too ("projects": ["project_short_name1", "project_short_name2"]),
-           and a list of platforms they can access
-           ("platforms": ["platform_short_name1", "platform_short_name2"]).
+           metadata about the user, e.g. a dictionary of active projects they
+           belong to and what platforms they can access for each project.
 
             {
                 "email": "email_in_waldur",
-                "short_name": "user_short_name",
+                "unix_username": "unix_username",
                 "authorised": "true",
                 "active": "true",
-                "projects": ["project_short_name1", "project_short_name2"],
-                "platforms": ["platform_short_name1", "platform_short_name2"]
+                "projects": {
+                  "project_1": ["platform_1", "platform_2"],
+                  "project_2": ["platform_1"]
+                }
             }
 
         2. The email address has been invited to a project in Waldur, but
@@ -742,23 +744,31 @@ class UserViewSet(viewsets.ModelViewSet):
             projects = models.Project.available_objects.filter(
                 id__in=connected_projects
             )
-            projects = [p.short_name for p in projects]
+            project_names = [p.short_name for p in projects]
 
-            if not projects:
-                projects = []
+            if not project_names:
+                project_names = []
 
-            projects = projects
-            platforms = ["aip1-slurm", "aip1-jupyter"]
-            short_name = user.unix_username
+            projects = {}
+
+            for project in project_names:
+                projects[project] = ["slurm.aip1.isambard", "jupyter.aip1.isambard"]
+
+                if project in ["benchmarking", "brics"]:
+                    projects[project].append("slurm.3.isambard")
+
+            unix_username = user.unix_username
+
+            if unix_username is not None and len(unix_username) == 0:
+                unix_username = None
 
             return Response(
                 {
                     "email": email_in_waldur,
-                    "short_name": short_name,
+                    "unix_username": unix_username,
                     "authorised": "true",
                     "active": "true",
                     "projects": projects,
-                    "platforms": platforms,
                 }
             )
 
