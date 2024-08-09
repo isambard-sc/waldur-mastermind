@@ -307,6 +307,10 @@ CONSTANCE_IGNORE_ADMIN_VERSION_CHECK = True
 CONSTANCE_ADDITIONAL_FIELDS = {
     "image_field": ["django.forms.ImageField", {"required": False}],
     "email_field": ["django.forms.EmailField", {"required": False}],
+    "color_field": ["django.forms.CharField", {"required": False}],
+    "html_field": ["django.forms.CharField", {"required": False}],
+    "text_field": ["django.forms.CharField", {"required": False}],
+    "url_field": ["django.forms.URLField", {"required": False}],
 }
 CONSTANCE_CONFIG = {
     "SITE_NAME": ("Waldur", "Human-friendly name of the Waldur deployment."),
@@ -321,7 +325,7 @@ CONSTANCE_CONFIG = {
         "EUR",
         "It is used in marketplace order details and invoices for currency formatting.",
     ),
-    "DOCS_URL": ("", "Renders link to docs in header"),
+    "DOCS_URL": ("", "Renders link to docs in header", "url_field"),
     "SHORT_PAGE_TITLE": ("Waldur", "It is used as prefix for page title."),
     "FULL_PAGE_TITLE": (
         "Waldur | Cloud Service Management",
@@ -330,22 +334,37 @@ CONSTANCE_CONFIG = {
     "BRAND_COLOR": (
         "#3a8500",
         "Hex color definition is used in HomePort landing page for login button.",
+        "color_field",
     ),
     "BRAND_LABEL_COLOR": (
         "#000000",
         "Hex color definition is used in HomePort landing page for font color of login button.",
+        "color_field",
     ),
     "HERO_LINK_LABEL": (
         "",
         "Label for link in hero section of HomePort landing page. It can be lead to support site or blog post.",
     ),
-    "HERO_LINK_URL": ("", "Link URL in hero section of HomePort landing page."),
+    "HERO_LINK_URL": (
+        "",
+        "Link URL in hero section of HomePort landing page.",
+        "url_field",
+    ),
     "SUPPORT_PORTAL_URL": (
         "",
         "Link URL to support portal. Rendered as a shortcut on dashboard",
+        "url_field",
     ),
-    "COMMON_FOOTER_TEXT": ("", "Common footer in txt format for all emails."),
-    "COMMON_FOOTER_HTML": ("", "Common footer in html format for all emails."),
+    "COMMON_FOOTER_TEXT": (
+        "",
+        "Common footer in txt format for all emails.",
+        "text_field",
+    ),
+    "COMMON_FOOTER_HTML": (
+        "",
+        "Common footer in html format for all emails.",
+        "html_field",
+    ),
     "LANGUAGE_CHOICES": (
         ",".join(LANGUAGE_CHOICES),
         "List of enabled languages",
@@ -392,7 +411,7 @@ CONSTANCE_CONFIG = {
     ),
     "WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE": (
         "atlassian",
-        "Type of support backend. Possible values: atlassian, zammad.",
+        "Type of support backend. Possible values: atlassian, zammad, smax.",
     ),
     "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE": (
         True,
@@ -416,7 +435,11 @@ CONSTANCE_CONFIG = {
         "Toggler for mapping between waldur user and service desk agents.",
     ),
     "ATLASSIAN_STRANGE_SETTING": (1, "A constant in the API path, sometimes differs"),
-    "ATLASSIAN_API_URL": ("http://example.com/", "Atlassian server URL"),
+    "ATLASSIAN_API_URL": (
+        "http://example.com/",
+        "Atlassian API server URL",
+        "url_field",
+    ),
     "ATLASSIAN_USERNAME": ("USERNAME", "Username for access user"),
     "ATLASSIAN_PASSWORD": ("PASSWORD", "Password for access user"),
     "ATLASSIAN_EMAIL": ("", "Email for access user", "email_field"),
@@ -425,7 +448,7 @@ CONSTANCE_CONFIG = {
         False,
         "Toggler for SSL verification",
     ),
-    "ATLASSIAN_PROJECT_ID": ("", "Project-related settings"),
+    "ATLASSIAN_PROJECT_ID": ("", "Service desk ID or key"),
     "ATLASSIAN_SHARED_USERNAME": (
         False,
         "Is Service Desk username the same as in Waldur",
@@ -434,34 +457,47 @@ CONSTANCE_CONFIG = {
         True,
         "Should extra issue field mappings be applied",
     ),
-    "ATLASSIAN_DEFAULT_OFFERING_ISSUE_TYPE": ("Service Request", "Issue type"),
-    "ATLASSIAN_EXCLUDED_ATTACHMENT_TYPES": ("", "List of attachment types"),
+    "ATLASSIAN_DEFAULT_OFFERING_ISSUE_TYPE": (
+        "Service Request",
+        "Issue type used for request-based item processing.",
+    ),
+    "ATLASSIAN_EXCLUDED_ATTACHMENT_TYPES": (
+        "",
+        "Comma-separated list of file extenstions not allowed for attachment.",
+    ),
     "ATLASSIAN_PULL_PRIORITIES": (
         True,
-        "Pull priorities",
+        "Toggler for pulling priorities from backend",
     ),
     "ATLASSIAN_ISSUE_TYPES": (
         "Informational, Service Request, Change Request, Incident",
-        "Issue-related settings; Issue types",
+        "Comma-separated list of enabled issue types. First type is the default one.",
     ),
-    "ATLASSIAN_AFFECTED_RESOURCE_FIELD": ("", "Affected resource field"),
-    "ATLASSIAN_DESCRIPTION_TEMPLATE": ("", "Description"),
-    "ATLASSIAN_SUMMARY_TEMPLATE": ("", "Summary"),
-    "ATLASSIAN_IMPACT_FIELD": ("Impact", "Impact field"),
-    "ATLASSIAN_ORGANISATION_FIELD": ("", "Organisation field"),
-    "ATLASSIAN_RESOLUTION_SLA_FIELD": ("", "Resolution SLA field"),
-    "ATLASSIAN_PROJECT_FIELD": ("", "Project field"),
-    "ATLASSIAN_REPORTER_FIELD": ("Original Reporter", "Reporter field"),
-    "ATLASSIAN_CALLER_FIELD": ("Caller", "Caller field"),
-    "ATLASSIAN_SLA_FIELD": ("Time to first response", "SLA field"),
-    "ATLASSIAN_LINKED_ISSUE_TYPE": ("Relates", "Type of linked issue"),
-    "ATLASSIAN_SATISFACTION_FIELD": ("Customer satisfaction", "Satisfaction field"),
-    "ATLASSIAN_REQUEST_FEEDBACK_FIELD": ("Request feedback", "Issue request feedback"),
-    "ATLASSIAN_TEMPLATE_FIELD": ("", "Template field"),
+    "ATLASSIAN_DESCRIPTION_TEMPLATE": ("", "Template for issue description"),
+    "ATLASSIAN_SUMMARY_TEMPLATE": ("", "Template for issue summary"),
+    "ATLASSIAN_AFFECTED_RESOURCE_FIELD": ("", "Affected resource field name"),
+    "ATLASSIAN_IMPACT_FIELD": ("Impact", "Impact field name"),
+    "ATLASSIAN_ORGANISATION_FIELD": ("", "Organisation field name"),
+    "ATLASSIAN_RESOLUTION_SLA_FIELD": ("", "Resolution SLA field name"),
+    "ATLASSIAN_PROJECT_FIELD": ("", "Project field name"),
+    "ATLASSIAN_REPORTER_FIELD": ("Original Reporter", "Reporter field name"),
+    "ATLASSIAN_CALLER_FIELD": ("Caller", "Caller field name"),
+    "ATLASSIAN_SLA_FIELD": ("Time to first response", "SLA field name"),
+    "ATLASSIAN_LINKED_ISSUE_TYPE": ("Relates", "Type of linked issue field name"),
+    "ATLASSIAN_SATISFACTION_FIELD": (
+        "Customer satisfaction",
+        "Customer satisfaction field name",
+    ),
+    "ATLASSIAN_REQUEST_FEEDBACK_FIELD": (
+        "Request feedback",
+        "Request feedback field name",
+    ),
+    "ATLASSIAN_TEMPLATE_FIELD": ("", "Template field name"),
     # Zammad settings
     "ZAMMAD_API_URL": (
         "",
-        "Address of Zammad server. For example <http://localhost:8080/>",
+        "Zammad API server URL. For example <http://localhost:8080/>",
+        "url_field",
     ),
     "ZAMMAD_TOKEN": ("", "Authorization token."),
     "ZAMMAD_GROUP": (
@@ -471,13 +507,13 @@ CONSTANCE_CONFIG = {
     ),
     "ZAMMAD_ARTICLE_TYPE": (
         "email",
-        "Type of a comment."
+        "Type of a comment. "
         "Default is email because it allows support to reply to tickets directly in Zammad"
         "<https://docs.zammad.org/en/latest/api/ticket/articles.html#articles/>",
     ),
     "ZAMMAD_COMMENT_MARKER": (
         "Created by Waldur",
-        "Marker for comment."
+        "Marker for comment. "
         "Used for separating comments made via Waldur from natively added "
         "comments.",
     ),
@@ -492,16 +528,23 @@ CONSTANCE_CONFIG = {
     # SMAX settings
     "SMAX_API_URL": (
         "",
-        "Address of SMAX server. For example <http://localhost:8080/>",
+        "SMAX API server URL. For example <http://localhost:8080/>",
+        "url_field",
     ),
     "SMAX_TENANT_ID": ("", "User tenant ID."),
     "SMAX_LOGIN": ("", "Authorization login."),
     "SMAX_PASSWORD": ("", "Authorization password."),
-    "SMAX_ORGANISATION_FIELD": ("", "Organisation field."),
-    "SMAX_PROJECT_FIELD": ("", "Project field."),
-    "SMAX_AFFECTED_RESOURCE_FIELD": ("", "Resource field."),
-    "SMAX_TIMES_TO_PULL": (10, "Times to pulling from backend."),
-    "SMAX_SECONDS_TO_WAIT": (1, "Duration of delay between server pull attempts."),
+    "SMAX_ORGANISATION_FIELD": ("", "Organisation field name."),
+    "SMAX_PROJECT_FIELD": ("", "Project field name."),
+    "SMAX_AFFECTED_RESOURCE_FIELD": ("", "Resource field name."),
+    "SMAX_TIMES_TO_PULL": (
+        10,
+        "The maximum number of attempts to pull user from backend.",
+    ),
+    "SMAX_SECONDS_TO_WAIT": (
+        1,
+        "Duration in seconds of delay between pull user attempts.",
+    ),
     "SMAX_CREATION_SOURCE_NAME": ("", "Creation source name."),
     "SMAX_REQUESTS_OFFERING": ("", "Requests offering code for all issues."),
     "SMAX_VERIFY_SSL": (True, "Toggler for SSL verification"),
@@ -511,32 +554,39 @@ CONSTANCE_CONFIG = {
 }
 
 CONSTANCE_CONFIG_FIELDSETS = {
-    "Whitelabeling settings (text, links, etc)": (
+    "Branding": (
         "SITE_NAME",
+        "SHORT_PAGE_TITLE",
+        "FULL_PAGE_TITLE",
         "SITE_DESCRIPTION",
+    ),
+    "Marketplace": (
         "SITE_ADDRESS",
         "SITE_EMAIL",
         "SITE_PHONE",
         "CURRENCY_NAME",
+    ),
+    "Notifications": (
+        "COMMON_FOOTER_TEXT",
+        "COMMON_FOOTER_HTML",
+    ),
+    "Links": (
         "DOCS_URL",
-        "SHORT_PAGE_TITLE",
-        "FULL_PAGE_TITLE",
-        "BRAND_COLOR",
-        "BRAND_LABEL_COLOR",
         "HERO_LINK_LABEL",
         "HERO_LINK_URL",
         "SUPPORT_PORTAL_URL",
-        "COMMON_FOOTER_TEXT",
-        "COMMON_FOOTER_HTML",
-        "LANGUAGE_CHOICES",
+    ),
+    "Theme": (
+        "SIDEBAR_STYLE",
+        "BRAND_COLOR",
+        "BRAND_LABEL_COLOR",
         "DISABLE_DARK_THEME",
     ),
-    "Whitelabeling settings (logos, images, favicons)": (
+    "Images": (
         "SITE_LOGO",
         "SIDEBAR_LOGO",
         "SIDEBAR_LOGO_MOBILE",
         "SIDEBAR_LOGO_DARK",
-        "SIDEBAR_STYLE",
         "POWERED_BY_LOGO",
         "HERO_IMAGE",
         "LOGIN_LOGO",
