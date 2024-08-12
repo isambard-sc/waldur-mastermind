@@ -702,6 +702,8 @@ class UserViewSet(viewsets.ModelViewSet):
 
         reason = None
         is_authorised = False
+        short_name = None
+        projects = None
 
         # Waldur stores old accounts, so can only stop searching
         # when we find an active user - can't break early for an
@@ -712,6 +714,29 @@ class UserViewSet(viewsets.ModelViewSet):
             if person.is_active:
                 is_authorised = True
                 email_in_waldur = person.email
+
+                connected_projects = get_connected_projects(person)
+                projects = models.Project.available_objects.filter(
+                    id__in=connected_projects
+                )
+                project_names = [p.short_name for p in projects]
+
+                if not project_names:
+                    project_names = []
+
+                projects = {}
+
+                for project in project_names:
+                    projects[project] = ["slurm.aip1.isambard", "jupyter.aip1.isambard"]
+
+                    if project in ["benchmarking", "brics"]:
+                        projects[project].append("slurm.3.isambard")
+
+                short_name = person.unix_username
+
+                if short_name is None or len(short_name) == 0:
+                    short_name = ""
+
                 break
             elif reason is None:
                 reason = "User account is not active"
@@ -720,28 +745,6 @@ class UserViewSet(viewsets.ModelViewSet):
             # get the list of projects the user is active on,
             # and the platforms they can access, plus
             # their short name
-            connected_projects = get_connected_projects(user)
-            projects = models.Project.available_objects.filter(
-                id__in=connected_projects
-            )
-            project_names = [p.short_name for p in projects]
-
-            if not project_names:
-                project_names = []
-
-            projects = {}
-
-            for project in project_names:
-                projects[project] = ["slurm.aip1.isambard", "jupyter.aip1.isambard"]
-
-                if project in ["benchmarking", "brics"]:
-                    projects[project].append("slurm.3.isambard")
-
-            short_name = user.unix_username
-
-            if short_name is None or len(short_name) == 0:
-                short_name = ""
-
             return Response(
                 {
                     "email": email_in_waldur,
