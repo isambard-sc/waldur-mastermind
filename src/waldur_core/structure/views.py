@@ -653,54 +653,35 @@ class UserViewSet(viewsets.ModelViewSet):
         only query email addresses for projects in which they have this
         level of access)
 
-        There are three possible responses:
+        This returns a JSON object as follows, with fields
 
-        1. The email address belongs to someone who is active on at
-           least one project and is authorised to access Waldur. This
-           will return a response containing an
-           "email" field containing their email as in Waldur,
-           a "unix_username" field containing their chosen short unix
-           user name, a boolean "authorised" field set
-           to "true", a boolean "active" field set to "true", and additional
-           metadata about the user, e.g. a dictionary of active projects they
-           belong to and what platforms they can access for each project.
-
-            {
-                "email": "email_in_waldur",
-                "unix_username": "unix_username",
-                "authorised": "true",
-                "active": "true",
-                "projects": {
-                  "project_1": ["platform_1", "platform_2"],
-                  "project_2": ["platform_1"]
-                }
+        {
+            "email": "email_in_waldur",
+            "status": "active | invited | unknown",
+            "short_name": "short_name",
+            "projects": {
+                "project_1": ["platform_1", "platform_2"],
+                "project_2": ["platform_1"]
             }
+            "invited_by": "invited_by_user",
+            "reason": "reason"
+        }
 
-        2. The email address has been invited to a project in Waldur, but
-           is not yet active on any projects. This will return a response
-           containing just the email address, an "authorised" field set to
-           "true", an "active" field set to "false", and a "invited_by"
-           field containing the name of the user who invited them.
+        The fields are filled in three different ways, depending on the
+        status of the email address:
 
-            {
-                "email": "email_in_waldur",
-                "authorised": "true",
-                "active": "false",
-                "invited_by": "invited_by_user"
-            }
+        Status == active:
 
-        3. The email address does not belong to a user who is authorised to
-           access Waldur. This will return a response containing just the
-           email address, an "authorised" field set to "false", an "active"
-           field set to "false", and a "reason" field containing a reason
-           why the email address is not authorised.
+        short_name and projects are filled. invited_by and reason are null
 
-            {
-                "email": "email",
-                "authorised": "false",
-                "active": "false",
-                "reason": "reason"
-            }
+        Status == invited:
+
+        invited_by filled, everything else is null
+
+        Status == unknown:
+
+        reason filled, everything else is null
+
         """
         user = request.user
 
@@ -719,9 +700,8 @@ class UserViewSet(viewsets.ModelViewSet):
 
         qs = self.get_queryset().filter(email__iexact=email)
 
-        is_authorised = False
         reason = None
-        email_in_waldur = None
+        is_authorised = False
 
         # Waldur stores old accounts, so can only stop searching
         # when we find an active user - can't break early for an
@@ -757,18 +737,19 @@ class UserViewSet(viewsets.ModelViewSet):
                 if project in ["benchmarking", "brics"]:
                     projects[project].append("slurm.3.isambard")
 
-            unix_username = user.unix_username
+            short_name = user.unix_username
 
-            if unix_username is not None and len(unix_username) == 0:
-                unix_username = None
+            if short_name is None or len(short_name) == 0:
+                short_name = ""
 
             return Response(
                 {
                     "email": email_in_waldur,
-                    "unix_username": unix_username,
-                    "authorised": "true",
-                    "active": "true",
+                    "status": "active",
+                    "short_name": short_name,
                     "projects": projects,
+                    "invited_by": "",
+                    "reason": "",
                 }
             )
 
@@ -800,9 +781,11 @@ class UserViewSet(viewsets.ModelViewSet):
             return Response(
                 {
                     "email": email_in_waldur,
-                    "authorised": "true",
-                    "active": "false",
+                    "status": "invited",
+                    "projects": {},
+                    "short_name": "",
                     "invited_by": invited_by,
+                    "reason": "",
                 }
             )
 
@@ -810,7 +793,14 @@ class UserViewSet(viewsets.ModelViewSet):
             reason = "Email address was not found"
 
         return Response(
-            {"email": email, "authorised": "false", "active": "false", "reason": reason}
+            {
+                "email": email,
+                "status": "unknown",
+                "short_name": "",
+                "projects": {},
+                "invited_by": "",
+                "reason": reason,
+            }
         )
 
     @action(detail=True)
