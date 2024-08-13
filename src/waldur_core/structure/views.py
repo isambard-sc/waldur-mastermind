@@ -712,12 +712,9 @@ class UserViewSet(viewsets.ModelViewSet):
         # that email)
         for person in qs:
             if person.is_active:
-                is_authorised = True
-
                 # get the list of projects the user is active on,
                 # and the platforms they can access, plus
                 # their short name
-
                 email_in_waldur = person.email
 
                 connected_projects = get_connected_projects(person)
@@ -737,41 +734,32 @@ class UserViewSet(viewsets.ModelViewSet):
                     if project in ["benchmarking", "brics"]:
                         projects[project].append("slurm.3.isambard")
 
-                short_name = person.unix_username
+                if len(projects) == 0:
+                    # this is not an active user
+                    reason = "User account has no active projects."
+                else:
+                    # this is an active user
+                    is_authorised = True
+                    short_name = person.unix_username
 
-                if short_name is None or len(short_name) == 0:
-                    short_name = ""
+                    if short_name is None or len(short_name) == 0:
+                        short_name = ""
 
-                break
+                    break
             elif reason is None:
                 reason = "User account is not active"
 
         if is_authorised:
-            # if they aren't in any projects, then change the status
-            # to unknown - they should not be allowed to log int
-            if projects is None or len(projects) == 0:
-                reason = "This email is not associated with any active projects."
-                return Response(
-                    {
-                        "email": email_in_waldur,
-                        "status": "unknown",
-                        "short_name": "",
-                        "projects": {},
-                        "invited_by": "",
-                        "reason": reason,
-                    }
-                )
-            else:
-                return Response(
-                    {
-                        "email": email_in_waldur,
-                        "status": "active",
-                        "short_name": short_name,
-                        "projects": projects,
-                        "invited_by": "",
-                        "reason": "",
-                    }
-                )
+            return Response(
+                {
+                    "email": email_in_waldur,
+                    "status": "active",
+                    "short_name": short_name,
+                    "projects": projects,
+                    "invited_by": "",
+                    "reason": "",
+                }
+            )
 
         # could not find in the list of active users - try to
         # find in the list of pending invitations
