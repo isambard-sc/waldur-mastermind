@@ -830,7 +830,7 @@ class UserViewSet(viewsets.ModelViewSet):
         # TODO maybe accept multiple options for the fingerprint
         fingerprint = {fingerprint}
         public_keys = core_models.SshPublicKey.objects.filter(
-            user=request.user, fingerprint__in=fingerprint
+            user=request.user, fingerprint_md5__in=fingerprint
         )
         # TODO Check that just picking the first match is ok
         if not public_keys:
