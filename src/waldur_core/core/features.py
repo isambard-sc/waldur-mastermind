@@ -59,6 +59,10 @@ class ProjectSection(FeatureSection):
 
     show_type_in_create_dialog = Feature("Show type field in project create dialog.")
 
+    show_start_date_in_create_dialog = Feature(
+        "Show start date field in project create dialog."
+    )
+
     show_end_date_in_create_dialog = Feature(
         "Show end date field in project create dialog."
     )
@@ -78,6 +82,10 @@ class UserSection(FeatureSection):
     notifications = Feature(
         "Enable email and webhook notifications management in user workspace."
     )
+
+    disable_user_termination = Feature("Disable user termination in user workspace.")
+
+    show_slug = Feature("Enable display of slug field in user summary.")
 
 
 class MarketplaceSection(FeatureSection):

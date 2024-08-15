@@ -211,15 +211,12 @@ CELERY_TASK_ROUTES = ("waldur_core.server.celery.PriorityRouter",)
 
 CACHES = {
     "default": {
-        "BACKEND": "redis_cache.RedisCache",
-        "LOCATION": "redis://localhost",
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/1",
         "OPTIONS": {
-            "DB": 1,
-            "PARSER_CLASS": "redis.connection.HiredisParser",
-            "CONNECTION_POOL_CLASS": "redis.BlockingConnectionPool",
-            "PICKLE_VERSION": -1,
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
         },
-    },
+    }
 }
 
 # Regular tasks
@@ -257,6 +254,11 @@ CELERY_BEAT_SCHEDULE = {
     "send-reminder-for-pending-invitations": {
         "task": "waldur_core.users.send_reminder_for_pending_invitations",
         "schedule": timedelta(hours=24),
+        "args": (),
+    },
+    "process-pending-project-invitations": {
+        "task": "waldur_core.users.process_pending_project_invitations",
+        "schedule": timedelta(hours=2),
         "args": (),
     },
     "structure-set-erred-stuck-resources": {
@@ -311,6 +313,7 @@ CONSTANCE_ADDITIONAL_FIELDS = {
     "html_field": ["django.forms.CharField", {"required": False}],
     "text_field": ["django.forms.CharField", {"required": False}],
     "url_field": ["django.forms.URLField", {"required": False}],
+    "secret_field": ["django.forms.CharField", {"required": False}],
 }
 CONSTANCE_CONFIG = {
     "SITE_NAME": ("Waldur", "Human-friendly name of the Waldur deployment."),
@@ -441,9 +444,9 @@ CONSTANCE_CONFIG = {
         "url_field",
     ),
     "ATLASSIAN_USERNAME": ("USERNAME", "Username for access user"),
-    "ATLASSIAN_PASSWORD": ("PASSWORD", "Password for access user"),
+    "ATLASSIAN_PASSWORD": ("PASSWORD", "Password for access user", "secret_field"),
     "ATLASSIAN_EMAIL": ("", "Email for access user", "email_field"),
-    "ATLASSIAN_TOKEN": ("", "Token for access user"),
+    "ATLASSIAN_TOKEN": ("", "Token for access user", "secret_field"),
     "ATLASSIAN_VERIFY_SSL": (
         False,
         "Toggler for SSL verification",
@@ -499,7 +502,7 @@ CONSTANCE_CONFIG = {
         "Zammad API server URL. For example <http://localhost:8080/>",
         "url_field",
     ),
-    "ZAMMAD_TOKEN": ("", "Authorization token."),
+    "ZAMMAD_TOKEN": ("", "Authorization token.", "secret_field"),
     "ZAMMAD_GROUP": (
         "",
         "The name of the group to which the ticket will be added. "
@@ -533,7 +536,7 @@ CONSTANCE_CONFIG = {
     ),
     "SMAX_TENANT_ID": ("", "User tenant ID."),
     "SMAX_LOGIN": ("", "Authorization login."),
-    "SMAX_PASSWORD": ("", "Authorization password."),
+    "SMAX_PASSWORD": ("", "Authorization password.", "secret_field"),
     "SMAX_ORGANISATION_FIELD": ("", "Organisation field name."),
     "SMAX_PROJECT_FIELD": ("", "Project field name."),
     "SMAX_AFFECTED_RESOURCE_FIELD": ("", "Resource field name."),
@@ -551,6 +554,7 @@ CONSTANCE_CONFIG = {
     # Proposal settings
     "PROPOSAL_REVIEW_DURATION": (7, "Review duration in days."),
     "USER_TABLE_COLUMNS": ("", "Comma-separated list of columns for users table."),
+    "AUTO_APPROVE_USER_TOS": (False, "Configure whether a user needs to approve TOS."),
 }
 
 CONSTANCE_CONFIG_FIELDSETS = {
@@ -599,21 +603,14 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE",
     ),
     "Atlassian settings": (
-        "ATLASSIAN_USE_OLD_API",
-        "ATLASSIAN_USE_TEENAGE_API",
-        "ATLASSIAN_USE_AUTOMATIC_REQUEST_MAPPING",
-        "ATLASSIAN_MAP_WALDUR_USERS_TO_SERVICEDESK_AGENTS",
-        "ATLASSIAN_STRANGE_SETTING",
         "ATLASSIAN_API_URL",
         "ATLASSIAN_USERNAME",
         "ATLASSIAN_PASSWORD",
         "ATLASSIAN_EMAIL",
         "ATLASSIAN_TOKEN",
-        "ATLASSIAN_VERIFY_SSL",
         "ATLASSIAN_PROJECT_ID",
         "ATLASSIAN_DEFAULT_OFFERING_ISSUE_TYPE",
         "ATLASSIAN_EXCLUDED_ATTACHMENT_TYPES",
-        "ATLASSIAN_PULL_PRIORITIES",
         "ATLASSIAN_ISSUE_TYPES",
         "ATLASSIAN_AFFECTED_RESOURCE_FIELD",
         "ATLASSIAN_DESCRIPTION_TEMPLATE",
@@ -631,6 +628,13 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ATLASSIAN_TEMPLATE_FIELD",
         "ATLASSIAN_CUSTOM_ISSUE_FIELD_MAPPING_ENABLED",
         "ATLASSIAN_SHARED_USERNAME",
+        "ATLASSIAN_VERIFY_SSL",
+        "ATLASSIAN_USE_OLD_API",
+        "ATLASSIAN_USE_TEENAGE_API",
+        "ATLASSIAN_USE_AUTOMATIC_REQUEST_MAPPING",
+        "ATLASSIAN_MAP_WALDUR_USERS_TO_SERVICEDESK_AGENTS",
+        "ATLASSIAN_STRANGE_SETTING",
+        "ATLASSIAN_PULL_PRIORITIES",
     ),
     "Zammad settings": (
         "ZAMMAD_API_URL",
@@ -657,6 +661,8 @@ CONSTANCE_CONFIG_FIELDSETS = {
     ),
     "Proposal settings": ("PROPOSAL_REVIEW_DURATION",),
     "Table settings": ("USER_TABLE_COLUMNS",),
+    "Localization": ("LANGUAGE_CHOICES",),
+    "User settings": ("AUTO_APPROVE_USER_TOS",),
 }
 
 PUBLIC_CONSTANCE_SETTINGS = (

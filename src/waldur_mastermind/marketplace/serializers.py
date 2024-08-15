@@ -1041,6 +1041,7 @@ class OfferingBackendMetadataSerializer(serializers.ModelSerializer):
 
 
 class ProviderOfferingDetailsSerializer(
+    core_serializers.SlugSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     structure_serializers.CountrySerializerMixin,
     MarketplaceProtectedMediaSerializerMixin,
@@ -1531,6 +1532,7 @@ class OfferingDescriptionUpdateSerializer(
 
 
 class OfferingOverviewUpdateSerializer(
+    core_serializers.SlugSerializerMixin,
     MarketplaceProtectedMediaSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
@@ -1555,6 +1557,7 @@ class OfferingOverviewUpdateSerializer(
             "privacy_policy_link",
             "getting_started",
             "integration_guide",
+            "slug",
         )
 
 
@@ -2084,7 +2087,7 @@ class OrderCreateSerializer(
     @transaction.atomic
     def create(self, validated_data):
         request = self.context["request"]
-        project = validated_data["project"]
+        project: structure_models.Project = validated_data["project"]
         resource = models.Resource(
             project=project,
             offering=validated_data["offering"],
@@ -2188,7 +2191,7 @@ class ResourceSuggestNameSerializer(serializers.ModelSerializer):
         return fields
 
 
-class ResourceSerializer(BaseItemSerializer):
+class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerializer):
     class Meta(BaseItemSerializer.Meta):
         model = models.Resource
         fields = BaseItemSerializer.Meta.fields + (
@@ -2484,6 +2487,12 @@ class ResourceBackendIDSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Resource
         fields = ("backend_id",)
+
+
+class ResourceSlugSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Resource
+        fields = ("slug",)
 
 
 class ResourceStateSerializer(serializers.Serializer):
@@ -3465,7 +3474,9 @@ class ProviderCustomerSerializer(serializers.ModelSerializer):
         return serializer.data
 
 
-class ProviderOfferingSerializer(serializers.ModelSerializer):
+class ProviderOfferingSerializer(
+    core_serializers.SlugSerializerMixin, serializers.ModelSerializer
+):
     class Meta:
         model = models.Offering
         fields = (

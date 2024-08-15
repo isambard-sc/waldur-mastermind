@@ -32,12 +32,10 @@ from waldur_core.core import views as core_views
 from waldur_core.core.log import event_logger
 from waldur_core.core.utils import is_uuid_like
 from waldur_core.core.views import ActionsViewSet
-from waldur_core.permissions import fixtures as permission_fixtures
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.utils import (
     has_permission,
     permission_factory,
-    role_has_permission,
 )
 from waldur_core.permissions.views import UserRoleMixin
 from waldur_core.structure import filters, models, permissions, serializers, utils
@@ -119,9 +117,6 @@ class CustomerViewSet(UserRoleMixin, core_mixins.EagerLoadMixin, viewsets.ModelV
         A new customer can only be created:
 
          - by users with staff privilege (is_staff=True);
-         - by any user if CUSTOMER.OWNER role has CUSTOMER.CREATE permission;
-
-        If user who has created new organization is not staff, he is granted owner permission.
 
         Example of a valid request:
 
@@ -169,17 +164,10 @@ class CustomerViewSet(UserRoleMixin, core_mixins.EagerLoadMixin, viewsets.ModelV
         return context
 
     def perform_create(self, serializer):
-        customer_owner_role = permission_fixtures.CustomerRole.OWNER
-        if not self.request.user.is_staff and not role_has_permission(
-            customer_owner_role, PermissionEnum.CREATE_CUSTOMER
-        ):
+        if not self.request.user.is_staff:
             raise PermissionDenied()
 
         customer = serializer.save()
-        if not self.request.user.is_staff:
-            customer.add_user(
-                self.request.user, models.CustomerRole.OWNER, self.request.user
-            )
 
         if django_settings.WALDUR_CORE.get(
             "CREATE_DEFAULT_PROJECT_ON_ORGANIZATION_CREATION", False
@@ -423,15 +411,6 @@ class ProjectViewSet(
     move_project_serializer_class = serializers.MoveProjectSerializer
     move_project_permissions = [permissions.is_staff]
 
-    @action(detail=False, methods=["get"])
-    def oecd_codes(self, request):
-        return Response(
-            [
-                {"value": value, "label": label}
-                for (value, label) in models.Project.OECD_FOS_2007_CODES
-            ]
-        )
-
 
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.all_objects.all()
@@ -591,7 +570,10 @@ class UserViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def pull_remote_user(self, request, uuid=None):
         user = self.get_object()
-        if user.registration_method != ProviderChoices.EDUTEAMS:
+        if (
+            user.identity_source != ProviderChoices.EDUTEAMS
+            and user.registration_method != ProviderChoices.EDUTEAMS
+        ):
             raise ValidationError(_("User is not managed by eduTEAMS."))
         if not django_settings.WALDUR_AUTH_SOCIAL["REMOTE_EDUTEAMS_ENABLED"]:
             raise ValidationError(

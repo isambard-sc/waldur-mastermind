@@ -214,20 +214,8 @@ class ProjectTypeSerializer(serializers.HyperlinkedModelSerializer):
         }
 
 
-class ProjectDetailsSerializerMixin(serializers.Serializer):
-    def validate_description(self, value):
-        return clean_html(value.strip())
-
-    def validate_end_date(self, end_date):
-        if end_date and end_date < timezone.datetime.today().date():
-            raise serializers.ValidationError(
-                {"end_date": _("Cannot be earlier than the current date.")}
-            )
-        return end_date
-
-
 class ProjectSerializer(
-    ProjectDetailsSerializerMixin,
+    core_serializers.SlugSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     PermissionFieldFilteringMixin,
     ProtectedMediaSerializerMixin,
@@ -258,6 +246,7 @@ class ProjectSerializer(
             "type_name",
             "type_uuid",
             "backend_id",
+            "start_date",
             "end_date",
             "end_date_requested_by",
             "oecd_fos_2007_code",
@@ -280,6 +269,37 @@ class ProjectSerializer(
             "customer": ("uuid", "name", "native_name", "abbreviation"),
             "type": ("name", "uuid"),
         }
+
+    def get_fields(self):
+        fields = super().get_fields()
+
+        # Should not be possible to edit the field after the start date has arrived.
+        if (
+            "start_date" in fields
+            and isinstance(self.instance, models.Project)
+            and self.instance.start_date
+            and self.instance.start_date >= timezone.now().date()
+        ):
+            fields["start_date"].read_only = True
+
+        return fields
+
+    def validate_start_date(self, start_date):
+        if start_date and start_date < timezone.datetime.today().date():
+            raise serializers.ValidationError(
+                {"start_date": _("Cannot be earlier than the current date.")}
+            )
+        return start_date
+
+    def validate_description(self, value):
+        return clean_html(value.strip())
+
+    def validate_end_date(self, end_date):
+        if end_date and end_date < timezone.datetime.today().date():
+            raise serializers.ValidationError(
+                {"end_date": _("Cannot be earlier than the current date.")}
+            )
+        return end_date
 
     @staticmethod
     def eager_load(queryset, request=None):
@@ -349,6 +369,7 @@ class CountrySerializerMixin(serializers.Serializer):
 
 
 class CustomerSerializer(
+    core_serializers.SlugSerializerMixin,
     ProtectedMediaSerializerMixin,
     CountrySerializerMixin,
     core_serializers.RestrictedSerializerMixin,
@@ -787,6 +808,7 @@ class ProjectPermissionLogSerializer(BasePermissionSerializer):
 
 
 class UserSerializer(
+    core_serializers.SlugSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
     ProtectedMediaSerializerMixin,
@@ -837,6 +859,7 @@ class UserSerializer(
             "url",
             "uuid",
             "username",
+            "slug",
             "full_name",
             "native_name",
             "job_title",
@@ -866,6 +889,7 @@ class UserSerializer(
             "identity_provider_fields",
             "image",
             "unix_username",
+            "identity_source",
         )
         read_only_fields = (
             "uuid",
@@ -874,6 +898,7 @@ class UserSerializer(
             "date_joined",
             "agreement_date",
             "affiliations",
+            "identity_source",
         )
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},

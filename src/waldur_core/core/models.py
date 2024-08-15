@@ -71,33 +71,41 @@ class SlugMixin(models.Model):
     Mixin to automatically generate a name-based slug.
     """
 
-    slug = models.SlugField(editable=False)
+    slug = models.SlugField()
 
     class Meta:
         abstract = True
 
     def save(self, *args, **kwargs):
         if not self.slug:
-            base_slug = slugify(self.name)[:SLUG_NAME_LIMIT]
-
-            existing_slugs = self.__class__.objects.filter(
-                slug__startswith=base_slug
-            ).values_list("slug", flat=True)
-
-            # Find maximum suffix
-            max_num = 0
-            for slug in existing_slugs:
-                try:
-                    num = int(slug.split("-")[-1])
-                    if num > max_num:
-                        max_num = num
-                except ValueError:
-                    pass
-
-            new_slug = f"{base_slug}-{max_num + 1}"
-            self.slug = new_slug
+            slug_source = getattr(self, self.get_slug_source_field())
+            self.slug = generate_slug(slug_source, self.__class__)
 
         super().save(*args, **kwargs)
+
+    @classmethod
+    def get_slug_source_field(cls):
+        return "name"
+
+
+def generate_slug(name, klass):
+    base_slug = slugify(name)[:SLUG_NAME_LIMIT]
+
+    existing_slugs = klass.objects.filter(slug__startswith=base_slug).values_list(
+        "slug", flat=True
+    )
+
+    # Find maximum suffix
+    max_num = 0
+    for slug in existing_slugs:
+        try:
+            num = int(slug.split("-")[-1])
+            if num > max_num:
+                max_num = num
+        except ValueError:
+            pass
+
+    return f"{base_slug}-{max_num + 1}"
 
 
 class UiDescribableMixin(DescribableMixin):
@@ -213,6 +221,7 @@ class UserDetailsMixin(models.Model):
 
 @reversion.register()
 class User(
+    SlugMixin,
     LoggableMixin,
     UuidMixin,
     DescribableMixin,
@@ -284,7 +293,14 @@ class User(
         max_length=50,
         default="default",
         blank=True,
-        help_text=_("Indicates what registration method were used."),
+        help_text=_("Indicates what registration method was used."),
+    )
+    identity_source = models.CharField(
+        _("source of identity"),
+        max_length=50,
+        default="",
+        blank=True,
+        help_text=_("Indicates what identity provider was used."),
     )
     agreement_date = models.DateTimeField(
         _("agreement date"),
@@ -435,6 +451,10 @@ class User(
             return f"{self.get_username()} ({self.full_name})"
 
         return self.get_username()
+
+    @classmethod
+    def get_slug_source_field(cls):
+        return "username"
 
 
 class ImpersonatedUser(User):

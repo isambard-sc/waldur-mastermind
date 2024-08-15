@@ -19,6 +19,7 @@ from rest_framework import serializers
 from rest_framework.fields import Field, ReadOnlyField
 
 from waldur_core.core import utils as core_utils
+from waldur_core.core.models import generate_slug
 from waldur_core.core.signals import pre_serializer_fields
 
 from . import fields as core_fields
@@ -453,7 +454,13 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                 field_class = serializers.IntegerField
             if config_type == bool:
                 field_class = serializers.BooleanField
-            if config_type in ("color_field", "html_field", "text_field", "url_field"):
+            if config_type in (
+                "color_field",
+                "html_field",
+                "text_field",
+                "url_field",
+                "secret_field",
+            ):
                 field_class = serializers.CharField
             if not field_class:
                 continue
@@ -495,3 +502,33 @@ class TranslatedModelSerializerMixin(serializers.ModelSerializer):
                 for language_name in django_settings.LANGUAGE_CHOICES:
                     all_fields.append(f"{field_name}_{language_name}")
         return all_fields
+
+
+class SlugSerializerMixin(serializers.Serializer):
+    """
+    Ensures that slug is editable only by staff
+    """
+
+    slug = serializers.SlugField(required=False, allow_blank=True, max_length=50)
+
+    def get_fields(self):
+        fields = super().get_fields()
+
+        try:
+            request = self.context["view"].request
+            user = request.user
+        except (KeyError, AttributeError):
+            return fields
+
+        if not user.is_staff:
+            if "slug" in fields:
+                fields["slug"].read_only = True
+
+        return fields
+
+    def create(self, validated_data):
+        if "slug" not in validated_data:
+            klass = self.Meta.model
+            slug_source = validated_data[klass.get_slug_source_field()]
+            validated_data["slug"] = generate_slug(slug_source, klass)
+        return super().create(validated_data)
