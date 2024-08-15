@@ -95,6 +95,9 @@ from waldur_mastermind.marketplace.utils import (
 from waldur_mastermind.marketplace_slurm_remote import (
     PLUGIN_NAME as SLURM_REMOTE_PLUGIN_NAME,
 )
+from waldur_mastermind.marketplace_openportal import (
+    PLUGIN_NAME as OPENPORTAL_PLUGIN_NAME,
+)
 from waldur_mastermind.marketplace_support import PLUGIN_NAME as SUPPORT_PLUGIN_NAME
 from waldur_mastermind.promotions import models as promotions_models
 from waldur_mastermind.support import models as support_models
@@ -2033,6 +2036,7 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
             models.Order.States.ERRED,
         ),
         OfferingTypeValidator(SLURM_REMOTE_PLUGIN_NAME),
+        OfferingTypeValidator(OPENPORTAL_PLUGIN_NAME),
     ]
 
     set_state_executing_permissions = [
@@ -2054,7 +2058,10 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
             models.Order.States.EXECUTING,
         ),
         OfferingTypeValidator(
-            SLURM_REMOTE_PLUGIN_NAME, BASIC_PLUGIN_NAME, SUPPORT_PLUGIN_NAME
+            SLURM_REMOTE_PLUGIN_NAME,
+            OPENPORTAL_PLUGIN_NAME,
+            BASIC_PLUGIN_NAME,
+            SUPPORT_PLUGIN_NAME,
         ),
     ]
 
@@ -2073,6 +2080,7 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
 
     set_state_erred_validators = [
         OfferingTypeValidator(SLURM_REMOTE_PLUGIN_NAME),
+        OfferingTypeValidator(OPENPORTAL_PLUGIN_NAME),
     ]
 
     set_state_erred_permissions = [

@@ -51,6 +51,9 @@ from waldur_mastermind.marketplace_remote import PLUGIN_NAME as REMOTE_PLUGIN_NA
 from waldur_mastermind.marketplace_slurm_remote import (
     PLUGIN_NAME as SLURM_REMOTE_PLUGIN_NAME,
 )
+from waldur_mastermind.marketplace_openportal import (
+    PLUGIN_NAME as OPENPORTAL_PLUGIN_NAME,
+)
 
 from . import PLUGIN_NAME as BASIC_PLUGIN_NAME
 from . import models, plugins
@@ -1331,6 +1334,9 @@ def order_should_not_be_reviewed_by_provider(order: models.Order):
     user = order.consumer_reviewed_by or order.created_by
 
     if offering.type == SLURM_REMOTE_PLUGIN_NAME:
+        return False
+
+    if offering.type == OPENPORTAL_PLUGIN_NAME:
         return False
 
     if offering.type == BASIC_PLUGIN_NAME:

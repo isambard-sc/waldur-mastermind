@@ -19,6 +19,9 @@ from waldur_mastermind.marketplace_script import PLUGIN_NAME as SCRIPT_PLUGIN_NA
 from waldur_mastermind.marketplace_slurm_remote import (
     PLUGIN_NAME as SLURM_REMOTE_PLUGIN_NAME,
 )
+from waldur_mastermind.marketplace_openportal import (
+    PLUGIN_NAME as OPENPORTAL_PLUGIN_NAME,
+)
 
 from . import PLUGIN_NAME, callbacks, log, models, tasks, utils
 from .log import event_logger
@@ -28,6 +31,7 @@ logger = logging.getLogger(__name__)
 OFFERING_USER_ALLOWED_OFFERING_TYPES = [
     PLUGIN_NAME,
     SLURM_REMOTE_PLUGIN_NAME,
+    OPENPORTAL_PLUGIN_NAME,
     SCRIPT_PLUGIN_NAME,
 ]
 
