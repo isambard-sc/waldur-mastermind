@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0010_generate_missing_fingerprint"),
+        ("core", "0011_user_unix_username"),
     ]
 
     operations = [

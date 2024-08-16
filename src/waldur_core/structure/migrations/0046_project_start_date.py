@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("structure", "0045_customer_slug_project_slug"),
+        ("structure", "0046_project_short_name"),
     ]
 
     operations = [
