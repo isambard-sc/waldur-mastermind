@@ -1,56 +1,179 @@
-import requests
+import logging
+import re
+
+from waldur_openportal.base import BaseBatchClient, BatchError
+from waldur_openportal.parser import OpenPortalAssociationLine, OpenPortalReportLine
+from waldur_openportal.structures import Account, Association
+from waldur_openportal.utils import format_current_month
 
 
-class OpenPortalException(Exception):
+class OpenPortalError(BatchError):
     pass
 
 
-class OpenPortalClient:
+logger = logging.getLogger(__name__)
+
+
+class OpenPortalClient(BaseBatchClient):
     """
-    Python client for OpenPortal
-    https://github.com/isambard-sc/openportal
+    This class implements Python client for OpenPortal.
+    See also: https://github.com/isambard-sc/openportal
     """
 
-    def __init__(self, api_url, access_token, machinename="cluster"):
-        self.api_url = api_url
-        self.headers = {
-            "Authorization": f"Bearer {access_token}",
-            "X-Machine-Name": machinename,
-        }
+    def list_accounts(self):
+        output = self._execute_command(["list", "account"])
+        return [
+            self._parse_account(line) for line in output.splitlines() if "|" in line
+        ]
 
-    def _request(self, method, url, **kwargs):
-        try:
-            response = requests.request(
-                method, self.api_url + url, headers=self.headers, **kwargs
-            )
-        except requests.exceptions.RequestException:
-            raise OpenPortalException("Unable to perform OpenPortal API request.")
-        if response.ok:
-            return response.json()
-        else:
-            raise OpenPortalException(
-                f"Message: {response.reason}, status code: {response.status_code}"
-            )
+    def _parse_account(self, line):
+        parts = line.split("|")
+        return Account(
+            name=parts[0],
+            description=parts[1],
+            organization=parts[2],
+        )
 
-    def _get(self, url, **kwargs):
-        return self._request("get", url, **kwargs)
+    def get_account(self, name):
+        output = self._execute_command(["show", "account", name])
+        lines = [line for line in output.splitlines() if "|" in line]
+        if len(lines) == 0:
+            return None
+        return self._parse_account(lines[0])
 
-    def _post(self, url, **kwargs):
-        return self._request("post", url, **kwargs)
+    def create_account(self, name, description, organization, parent_name=None):
+        parts = [
+            "add",
+            "account",
+            name,
+            'description="%s"' % description,
+            'organization="%s"' % organization,
+        ]
+        if parent_name:
+            parts.append("parent=%s" % parent_name)
+        return self._execute_command(parts)
 
-    def list_jobs(self, page_size=25, page_number=0):
-        """
-        Returns OpenPortal task ID which fetches SLURM jobs.
-        """
-        return self._get(
-            "compute/jobs", params={"pageSize": page_size, "pageNumber": page_number}
-        )["task_id"]
+    def delete_all_users_from_account(self, name):
+        return self._execute_command(["remove", "user", "where", "account=%s" % name])
 
-    def get_task(self, task_id):
-        """
-        Returns OpenPortal task details by its ID.
-        """
-        return self._get(f"tasks/{task_id}")["task"]
+    def account_has_users(self, account):
+        output = self._execute_command(
+            ["show", "association", "where", "account=%s" % account]
+        )
+        items = [
+            self._parse_association(line) for line in output.splitlines() if "|" in line
+        ]
+        return any(item.user != "" for item in items)
 
-    def submit_job(self, fileobject):
-        return self._post("compute/jobs/upload", files={"file": fileobject})["task_id"]
+    def delete_account(self, name):
+        if self.account_has_users(name):
+            self.delete_all_users_from_account(name)
+
+        return self._execute_command(["remove", "account", "where", "name=%s" % name])
+
+    def set_resource_limits(self, account, quotas):
+        quota = "GrpTRESMins=cpu=%d,gres/gpu=%d,mem=%d" % (
+            quotas.cpu,
+            quotas.gpu,
+            quotas.ram,
+        )
+        return self._execute_command(["modify", "account", account, "set", quota])
+
+    def get_association(self, user, account):
+        output = self._execute_command(
+            ["show", "association", "where", "user=%s" % user, "account=%s" % account]
+        )
+        lines = [line for line in output.splitlines() if "|" in line]
+        if len(lines) == 0:
+            return None
+        return self._parse_association(lines[0])
+
+    def _parse_association(self, line):
+        parts = line.split("|")
+        value = parts[9]
+        match = re.match(r"cpu=(\d+)", value)
+        if match:
+            value = int(match.group(1))
+        return Association(
+            account=parts[1],
+            user=parts[2],
+            value=value,
+        )
+
+    def create_association(self, username, account, default_account=""):
+        return self._execute_command(
+            [
+                "add",
+                "user",
+                username,
+                "account=%s" % account,
+                "DefaultAccount=%s" % default_account,
+            ]
+        )
+
+    def delete_association(self, username, account):
+        return self._execute_command(
+            [
+                "remove",
+                "user",
+                "where",
+                "name=%s" % username,
+                "and",
+                "account=%s" % account,
+            ]
+        )
+
+    def get_usage_report(self, accounts):
+        month_start, month_end = format_current_month()
+
+        args = [
+            "--noconvert",
+            "--truncate",
+            "--allocations",
+            "--allusers",
+            "--starttime=%s" % month_start,
+            "--endtime=%s" % month_end,
+            "--accounts=%s" % ",".join(accounts),
+            "--format=Account,ReqTRES,Elapsed,User",
+        ]
+        output = self._execute_command(args, "sacct", immediate=False)
+        return [
+            OpenPortalReportLine(line) for line in output.splitlines() if "|" in line
+        ]
+
+    def get_resource_limits(self, account):
+        args = [
+            "show",
+            "association",
+            "format=account,GrpTRESMins",
+            "where",
+            "accounts=%s" % account,
+        ]
+        output = self._execute_command(args, immediate=False)
+        return [
+            OpenPortalAssociationLine(line)
+            for line in output.splitlines()
+            if "|" in line
+        ]
+
+    def list_account_users(self, account):
+        args = [
+            "list",
+            "associations",
+            "format=account,user",
+            "where",
+            "account=%s" % account,
+        ]
+        output = self._execute_command(args)
+        return [
+            line.split("|")[1]
+            for line in output.splitlines()
+            if "|" in line and line[-1] != "|"
+        ]
+
+    def _execute_command(self, command, command_name="sacctmgr", immediate=True):
+        account_command = [command_name, "--parsable2", "--noheader"]
+        if immediate:
+            account_command.append("--immediate")
+        account_command.extend(command)
+        return self.execute_command(account_command)

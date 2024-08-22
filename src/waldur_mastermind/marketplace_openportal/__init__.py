@@ -1,1 +1,1 @@
-PLUGIN_NAME = "Marketplace.OpenPortal"
+PLUGIN_NAME = "SlurmInvoices.SlurmPackage"

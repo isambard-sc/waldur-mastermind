@@ -1,62 +1,52 @@
-import logging
-import time
+import itertools
+import re
 
-from waldur_openportal.client import OpenPortalClient
+from django.utils import timezone
 
-from .models import OPJob
+from waldur_core.core import utils as core_utils
+from waldur_core.structure.managers import (
+    get_connected_customers,
+    get_connected_projects,
+)
+from waldur_openportal import models
 
-logger = logging.getLogger(__name__)
+MAPPING = {
+    "cpu_usage": "nc_cpu_usage",
+    "gpu_usage": "nc_gpu_usage",
+    "ram_usage": "nc_ram_usage",
+}
 
+FIELD_NAMES = MAPPING.keys()
 
-def pull_jobs(api_url, token, service_settings, project):
-    client = OpenPortalClient(api_url, token)
-    task_id = client.list_jobs()
-    while True:
-        task = client.get_task(task_id)
-        if task["status"] in ["200", "400"]:
-            break
-        time.sleep(2)
-
-    if task["status"] != "200":
-        logger.warning("OpenPortal task %s has failed", task_id)
-        return
-
-    for job_details in task["data"]:
-        job, created = OPJob.objects.update_or_create(
-            service_settings=service_settings,
-            project=project,
-            backend_id=job_details["jobid"],
-            defaults={
-                "name": job_details["name"],
-                "runtime_state": job_details["state"],
-                "state": OPJob.States.OK,
-            },
-        )
-        if created:
-            logger.info(
-                "SLURM job %s has been pulled from OpenPortal to project %s",
-                job.backend_id,
-                project.id,
-            )
+QUOTA_NAMES = MAPPING.values()
 
 
-def submit_job(api_url, token, job):
-    client = OpenPortalClient(api_url, token)
-    task_id = client.submit_job(job.file.file)
+def format_current_month():
+    today = timezone.now()
+    month_start = core_utils.month_start(today).strftime("%Y-%m-%d")
+    month_end = core_utils.month_end(today).strftime("%Y-%m-%d")
+    return month_start, month_end
 
-    while True:
-        task = client.get_task(task_id)
-        if task["status"] in ["200", "400"]:
-            break
-        time.sleep(2)
 
-    if task["status"] != "200":
-        job.state = OPJob.States.ERRED
-        job.error_message = task["data"]
-        job.save()
+def sanitize_allocation_name(name):
+    incorrect_symbols_regex = r"[^%s]+" % models.OPENPORTAL_ALLOCATION_REGEX
+    return re.sub(incorrect_symbols_regex, "", name)
 
-    job_id = task["data"]["jobid"]
-    job.backend_id = job_id
-    job.report = task["data"]["result"]
-    job.state = OPJob.States.OK
-    job.save()
+
+def get_user_allocations(user):
+    connected_projects = get_connected_projects(user)
+    connected_customers = get_connected_customers(user)
+
+    project_allocations = models.Allocation.objects.filter(
+        is_active=True, project__in=connected_projects
+    )
+
+    customer_allocations = models.Allocation.objects.filter(
+        is_active=True, project__customer__in=connected_customers
+    )
+
+    return (project_allocations, customer_allocations)
+
+
+def get_profile_allocations(profile):
+    return itertools.chain(*get_user_allocations(profile.user))

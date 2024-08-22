@@ -1,98 +1,62 @@
-import logging
-
 from celery import shared_task
 
-from waldur_auth_social.models import OAuthToken
-from waldur_core.core.utils import deserialize_instance
-from waldur_core.structure.managers import get_connected_projects
-from waldur_core.structure.models import Project
-from waldur_openportal.client import OpenPortalException
-from waldur_openportal.models import OPJob
-from waldur_mastermind.marketplace.models import OfferingUser
-from waldur_mastermind.marketplace_slurm import PLUGIN_NAME
+from waldur_core.core import utils as core_utils
+from waldur_core.structure import models as structure_models
 
-from . import utils
-
-logger = logging.getLogger(__name__)
+from . import backend, models, utils
 
 
-@shared_task(name="waldur_openportal.pull_jobs")
-def pull_jobs():
-    for offering_user in OfferingUser.objects.filter(offering__type=PLUGIN_NAME):
-        try:
-            oauth_token = OAuthToken.objects.get(
-                provider="keycloak", user=offering_user.user
+def get_structure_allocations(structure):
+    if isinstance(structure, structure_models.Project):
+        return list(models.Allocation.objects.filter(is_active=True, project=structure))
+    elif isinstance(structure, structure_models.Customer):
+        return list(
+            models.Allocation.objects.filter(
+                is_active=True, project__customer=structure
             )
-        except OAuthToken.DoesNotExist:
-            logger.debug("OAuth token for user %s is not found", offering_user.user)
-            continue
-
-        token = oauth_token.access_token
-        if not token:
-            logger.debug("Access token for user %s is not found", offering_user.user)
-            continue
-
-        service_settings = offering_user.offering.scope
-
-        if not service_settings:
-            logger.debug("Offering %s does not have scope", offering_user.offering)
-            continue
-
-        api_url = service_settings.options.get("openportal_api_url")
-        if not api_url:
-            logger.debug(
-                "Service settings %s does not have OpenPortal API URL", service_settings
-            )
-            continue
-
-        project_id = get_connected_projects(offering_user.user).first()
-        if not project_id:
-            logger.debug(
-                "User %s does not have access to any project", offering_user.user
-            )
-            continue
-
-        project = Project.objects.get(id=project_id)
-
-        try:
-            utils.pull_jobs(api_url, token, service_settings, project)
-        except OpenPortalException:
-            logger.exception("Unable to pull SLURM jobs using API %s", api_url)
-
-
-@shared_task(name="waldur_openportal.submit_job")
-def submit_job(serialized_job):
-    job = deserialize_instance(serialized_job)
-    try:
-        oauth_token = OAuthToken.objects.get(provider="keycloak", user=job.user)
-    except OAuthToken.DoesNotExist:
-        logger.debug("OAuth token for user %s is not found", job.user)
-        job.state = Job.States.ERRED
-        job.error_message = "OAuth token is not found"
-        job.save()
-        return
-
-    token = oauth_token.access_token
-    if not token:
-        logger.debug("Access token for user %s is not found", job.user)
-        job.state = OPJob.States.ERRED
-        job.error_message = "Access token is not found"
-        job.save()
-        return
-
-    api_url = job.service_settings.options.get("openportal_api_url")
-    if not api_url:
-        logger.debug(
-            "Service settings %s does not have OpenPortal API URL", job.service_settings
         )
-        job.state = OPJob.States.ERRED
-        job.error_message = "Service does not have OpenPortal API URL"
-        job.save()
-        return
+    else:
+        return []
 
-    try:
-        utils.submit_job(api_url, token, job)
-    except OpenPortalException as e:
-        job.state = OPJob.States.ERRED
-        job.error_message = str(e)
-        job.save()
+
+@shared_task(name="waldur_openportal.add_user")
+def add_user(serialized_profile):
+    profile = core_utils.deserialize_instance(serialized_profile)
+    for allocation in utils.get_profile_allocations(profile):
+        allocation.get_backend().add_user(allocation, profile.user, profile.username)
+
+
+@shared_task(name="waldur_openportal.delete_user")
+def delete_user(serialized_profile):
+    profile = core_utils.deserialize_instance(serialized_profile)
+    for allocation in utils.get_profile_allocations(profile):
+        allocation.get_backend().delete_user(allocation, profile.user, profile.username)
+
+
+@shared_task(name="waldur_openportal.process_role_granted")
+def process_role_granted(serialized_profile, serialized_structure):
+    profile = core_utils.deserialize_instance(serialized_profile)
+    structure = core_utils.deserialize_instance(serialized_structure)
+
+    allocations = get_structure_allocations(structure)
+
+    for allocation in allocations:
+        allocation.get_backend().add_user(allocation, profile.user, profile.username)
+
+
+@shared_task(name="waldur_openportal.process_role_revoked")
+def process_role_revoked(serialized_profile, serialized_structure):
+    profile = core_utils.deserialize_instance(serialized_profile)
+    structure = core_utils.deserialize_instance(serialized_structure)
+
+    allocations = get_structure_allocations(structure)
+
+    for allocation in allocations:
+        allocation.get_backend().delete_user(allocation, profile.user, profile.username)
+
+
+@shared_task(name="waldur_openportal.sync_allocation_users")
+def sync_allocation_users(serialized_allocation):
+    allocation = core_utils.deserialize_instance(serialized_allocation)
+    openportal_backend: backend.OpenPortalBackend = allocation.get_backend()
+    openportal_backend.sync_users(allocation)
