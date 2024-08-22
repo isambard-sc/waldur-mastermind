@@ -1917,6 +1917,10 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
     def approve_by_consumer(self, request, uuid=None):
         order: models.Order = self.get_object()
         order.review_by_consumer(request.user)
+        if order.project.start_date and order.project.start_date > timezone.now():
+            order.state = models.Order.States.PENDING_PROJECT
+            order.save(update_fields=["state"])
+            return Response(status=status.HTTP_200_OK)
         if utils.order_should_not_be_reviewed_by_provider(order):
             order.set_state_executing()
             order.save(update_fields=["state"])
@@ -2121,6 +2125,14 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         ),
         structure_utils.check_customer_blocked_or_archived,
     ]
+
+    @action(detail=True, methods=["post"])
+    def unlink(self, request, uuid=None):
+        if not request.user.is_staff:
+            raise PermissionDenied()
+        obj = self.get_object()
+        obj.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
@@ -2340,6 +2352,35 @@ class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
         )
     ]
     set_backend_id_serializer_class = serializers.ResourceBackendIDSerializer
+
+    @action(detail=True, methods=["post"])
+    def set_slug(self, request, uuid=None):
+        resource = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        new_slug = serializer.validated_data["slug"]
+        old_slug = resource.slug
+        if new_slug != old_slug:
+            resource.slug = serializer.validated_data["slug"]
+            resource.save()
+            logger.info(
+                "%s has changed slug from %s to %s",
+                request.user.full_name,
+                old_slug,
+                new_slug,
+            )
+
+            return Response(
+                {"status": _("Resource slug has been changed.")},
+                status=status.HTTP_200_OK,
+            )
+        else:
+            return Response(
+                {"status": _("Resource slug is not changed.")},
+                status=status.HTTP_200_OK,
+            )
+
+    set_slug_serializer_class = serializers.ResourceSlugSerializer
 
     @action(detail=True, methods=["post"])
     def submit_report(self, request, uuid=None):
