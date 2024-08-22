@@ -487,6 +487,37 @@ class WaldurSlurm(BaseModel):
     )
 
 
+class WaldurOpenPortal(BaseModel):
+    ENABLED = Field(
+        False,
+        description="Enable support for OpenPortal plugin in a deployment",
+    )
+    CUSTOMER_PREFIX = Field(
+        "waldur_customer_",
+        description="Prefix for OpenPortal account name corresponding to Waldur organization.",
+    )
+    PROJECT_PREFIX = Field(
+        "waldur_project_",
+        description="Prefix for OpenPortal account name corresponding to Waldur project.",
+    )
+    ALLOCATION_PREFIX = Field(
+        "waldur_allocation_",
+        description="Prefix for OpenPortal account name corresponding to Waldur allocation",
+    )
+    PRIVATE_KEY_PATH = Field(
+        "/etc/waldur/id_rsa",
+        description="Path to private key file used as SSH identity file for accessing OpenPortal master.",
+    )
+    DEFAULT_LIMITS = Field(
+        {
+            "CPU": 16000,  # Measured unit is CPU-minutes
+            "GPU": 400,  # Measured unit is GPU-minutes
+            "RAM": 100000 * 2**10,  # Measured unit is MB-h
+        },
+        description="Default limits of account that are set when OpenPortal account is provisioned.",
+    )
+
+
 class WaldurPID(BaseModel):
     DATACITE = Field(
         {
@@ -823,6 +854,7 @@ class WaldurConfiguration(BaseModel):
     WALDUR_HPC = WaldurHPC()
     WALDUR_SLURM = WaldurSlurm()
     WALDUR_PID = WaldurPID()
+    WALDUR_OPENPORTAL = WaldurOpenPortal()
     WALDUR_OPENSTACK = WaldurOpenstack()
     WALDUR_OPENSTACK_TENANT = WaldurOpenstackTenant()
     WALDUR_MARKETPLACE = WaldurMarketplace()
