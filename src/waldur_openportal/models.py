@@ -78,7 +78,11 @@ class AllocationUserUsage(UsageMixin):
     )
 
     user = models.ForeignKey(
-        to=settings.AUTH_USER_MODEL, on_delete=models.CASCADE, blank=True, null=True
+        to=settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+        related_name="openportal_allocation_user",
     )
 
     username = models.CharField(max_length=32)
