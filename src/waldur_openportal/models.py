@@ -49,7 +49,7 @@ class Allocation(UsageMixin, structure_models.BaseResource):
 
 class Association(core_models.UuidMixin):
     allocation = models.ForeignKey(
-        to=Allocation, on_delete=models.CASCADE, related_name="associations+"
+        to=Allocation, on_delete=models.CASCADE, related_name="openportal_associations"
     )
     username = models.CharField(
         max_length=128,
