@@ -26,3 +26,5 @@ docs/_build/
 docs/drfapi/
 
 /static
+poetry.lock
+pytest.ini
