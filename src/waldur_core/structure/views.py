@@ -718,7 +718,7 @@ class UserViewSet(viewsets.ModelViewSet):
                     if project in ["benchmarking", "brics"]:
                         projects[project] = ["slurm.aip1.isambard", "jupyter.aip1.isambard",
                                              "slurm.3.isambard"]
-                    elif project.startswith("i3-"):
+                    elif project.endswith("-i3"):
                         projects[project] = ["slurm.3.isambard"]
                     else:
                         projects[project] = ["slurm.aip1.isambard", "jupyter.aip1.isambard"]
