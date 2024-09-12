@@ -711,10 +711,17 @@ class UserViewSet(viewsets.ModelViewSet):
                 projects = {}
 
                 for project in project_names:
-                    projects[project] = ["slurm.aip1.isambard", "jupyter.aip1.isambard"]
-
+                    # very simple allocation mechanism for now - if the project
+                    # name starts with "i3-" then it will only have access to
+                    # the "slurm.3.isambard" platform, otherwise it will have
+                    # access to "slurm.aip1.isambard"
                     if project in ["benchmarking", "brics"]:
-                        projects[project].append("slurm.3.isambard")
+                        projects[project] = ["slurm.aip1.isambard", "jupyter.aip1.isambard",
+                                             "slurm.3.isambard"]
+                    elif project.startswith("i3-"):
+                        projects[project] = ["slurm.3.isambard"]
+                    else:
+                        projects[project] = ["slurm.aip1.isambard", "jupyter.aip1.isambard"]
 
                 if len(projects) == 0:
                     # this is not an active user
