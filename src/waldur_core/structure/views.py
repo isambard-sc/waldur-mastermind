@@ -1,4 +1,3 @@
-import datetime
 import logging
 
 from dbtemplates.models import Template
@@ -716,12 +715,19 @@ class UserViewSet(viewsets.ModelViewSet):
                     # the "slurm.3.isambard" platform, otherwise it will have
                     # access to "slurm.aip1.isambard"
                     if project in ["benchmarking", "brics"]:
-                        projects[project] = ["slurm.aip1.isambard", "jupyter.aip1.isambard",
-                                             "slurm.3.isambard"]
+                        projects[project] = [
+                            "slurm.aip1.isambard",
+                            "jupyter.aip1.isambard",
+                            "slurm.3.isambard",
+                            "slurm.macs3.isambard",
+                        ]
                     elif project.endswith("-i3"):
-                        projects[project] = ["slurm.3.isambard"]
+                        projects[project] = ["slurm.3.isambard", "slurm.macs3.isambard"]
                     else:
-                        projects[project] = ["slurm.aip1.isambard", "jupyter.aip1.isambard"]
+                        projects[project] = [
+                            "slurm.aip1.isambard",
+                            "jupyter.aip1.isambard",
+                        ]
 
                 if len(projects) == 0:
                     # this is not an active user
