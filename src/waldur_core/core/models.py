@@ -2,8 +2,8 @@ import logging
 import re
 from datetime import datetime
 from functools import lru_cache
+from zoneinfo import ZoneInfo
 
-import pytz
 from croniter.croniter import croniter
 from django.apps import apps
 from django.conf import settings
@@ -19,15 +19,17 @@ from model_utils.models import TimeStampedModel
 from reversion import revisions as reversion
 
 from waldur_core.core import managers as core_managers
-from waldur_core.core.fields import CronScheduleField, UUIDField
+from waldur_core.core.fields import JSONField, UUIDField
 from waldur_core.core.utils import normalize_unicode, send_mail
 from waldur_core.core.validators import (
     MinCronValueValidator,
+    validate_cron_schedule,
     validate_name,
+    validate_phone_number,
     validate_ssh_public_key,
 )
 from waldur_core.logging.loggers import LoggableMixin
-from waldur_core.media.models import ImageModelMixin
+from waldur_core.media.mixins import ImageModelMixin
 
 from .shims import AbstractBaseUser
 
@@ -150,7 +152,9 @@ class ScheduleMixin(models.Model):
     class Meta:
         abstract = True
 
-    schedule = CronScheduleField(max_length=15, validators=[MinCronValueValidator(1)])
+    schedule = models.CharField(
+        max_length=15, validators=[validate_cron_schedule, MinCronValueValidator(1)]
+    )
     next_trigger_at = models.DateTimeField(null=True)
     timezone = models.CharField(
         max_length=50, default=django_timezone.get_current_timezone_name
@@ -158,7 +162,7 @@ class ScheduleMixin(models.Model):
     is_active = models.BooleanField(default=False)
 
     def update_next_trigger_at(self):
-        tz = pytz.timezone(self.timezone)
+        tz = ZoneInfo(self.timezone)
         dt = datetime.now(tz)
         self.next_trigger_at = croniter(self.schedule, dt).get_next(datetime)
 
@@ -197,7 +201,12 @@ class UserDetailsMixin(models.Model):
         abstract = True
 
     native_name = models.CharField(_("native name"), max_length=100, blank=True)
-    phone_number = models.CharField(_("phone number"), max_length=255, blank=True)
+    phone_number = models.CharField(
+        _("phone number"),
+        max_length=255,
+        blank=True,
+        validators=[validate_phone_number],
+    )
     organization = models.CharField(_("organization"), max_length=255, blank=True)
     job_title = models.CharField(_("job title"), max_length=120, blank=True)
     affiliations = models.JSONField(
@@ -388,6 +397,8 @@ class User(
         ordering = ["username"]
 
     def save(self, *args, **kwargs):
+        if "update_fields" in kwargs and "query_field" not in kwargs["update_fields"]:
+            kwargs["update_fields"] = set(kwargs["update_fields"]).add("query_field")
         self.query_field = normalize_unicode(self.full_name)
 
         # The unix_username cannot be changed after creation as external systems may already depend on it.
@@ -525,9 +536,6 @@ def get_ssh_key_fingerprints(ssh_key):
     sha512_fp = f'SHA512:{sha512_b64.decode("utf-8")}'
 
     return md5_fp, sha256_fp, sha512_fp
-
-
-_SSH_PUBKEY_RC = re.compile(rb"\A(\S+)[ \t]+(\S+)")
 
 
 @reversion.register()
@@ -765,3 +773,17 @@ class Notification(UuidMixin, DescribableMixin, TimeStampedModel):
 
     def __str__(self):
         return self.key
+
+
+class ActionMixin(StateMixin):
+    class Meta:
+        abstract = True
+
+    action = models.CharField(max_length=50, blank=True)
+    action_details = JSONField(default=dict)
+    task_id = models.CharField(max_length=155, blank=True, null=True)
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_all_models(cls):
+        return [model for model in apps.get_models() if issubclass(model, cls)]

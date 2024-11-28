@@ -72,7 +72,6 @@ INSTALLED_APPS = (
     "health_check.contrib.migrations",
     "health_check.contrib.celery_ping",
     "dbtemplates",
-    "binary_database_files",
     "netfields",
     "constance",
     "constance.backends.database",
@@ -89,8 +88,8 @@ MIDDLEWARE = (
     "waldur_core.logging.middleware.CaptureEventContextMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    "axes.middleware.AxesMiddleware",
     "waldur_core.server.middleware.ImpersonationMiddleware",
+    "axes.middleware.AxesMiddleware",
 )
 
 REST_FRAMEWORK = {
@@ -123,7 +122,7 @@ REST_FRAMEWORK = {
 }
 
 AUTHENTICATION_BACKENDS = (
-    "axes.backends.AxesBackend",
+    "axes.backends.AxesStandaloneBackend",
     "django.contrib.auth.backends.ModelBackend",
     "waldur_core.core.authentication.AuthenticationBackend",
 )
@@ -189,8 +188,6 @@ USE_I18N = True
 
 USE_L10N = True
 
-LOCALE_PATHS = (os.path.join(BASE_DIR, "src", "waldur_core", "locale"),)
-
 USE_TZ = True
 
 # Static files (CSS, JavaScript, Images)
@@ -208,6 +205,8 @@ CELERY_TASK_QUEUES = {
 }
 CELERY_TASK_DEFAULT_QUEUE = "tasks"
 CELERY_TASK_ROUTES = ("waldur_core.server.celery.PriorityRouter",)
+CELERY_TRACK_STARTED = True
+CELERY_SEND_EVENTS = True
 
 CACHES = {
     "default": {
@@ -229,11 +228,6 @@ CELERY_BEAT_SCHEDULE = {
     "pull-service-resources": {
         "task": "waldur_core.structure.ServiceResourcesListPullTask",
         "schedule": timedelta(hours=1),
-        "args": (),
-    },
-    "pull-service-subresources": {
-        "task": "waldur_core.structure.ServiceSubResourcesListPullTask",
-        "schedule": timedelta(hours=2),
         "args": (),
     },
     "check-expired-permissions": {
@@ -259,6 +253,11 @@ CELERY_BEAT_SCHEDULE = {
     "process-pending-project-invitations": {
         "task": "waldur_core.users.process_pending_project_invitations",
         "schedule": timedelta(hours=2),
+        "args": (),
+    },
+    "core-reset-updating-resources": {
+        "task": "waldur_core.reset_updating_resources",
+        "schedule": timedelta(minutes=10),
         "args": (),
     },
     "structure-set-erred-stuck-resources": {
@@ -740,14 +739,11 @@ SWAGGER_SETTINGS = {
     },
 }
 
-AXES_ONLY_USER_FAILURES = True
+AXES_LOCKOUT_PARAMETERS = ["username"]
 AXES_COOLOFF_TIME = timedelta(minutes=10)
 AXES_FAILURE_LIMIT = 5
 
-# Django File Storage API
-DEFAULT_FILE_STORAGE = "binary_database_files.storage.DatabaseStorage"
-DB_FILES_AUTO_EXPORT_DB_TO_FS = False
-DATABASE_FILES_URL_METHOD = "URL_METHOD_2"
+DEFAULT_FILE_STORAGE = "waldur_core.media.storage.DatabaseStorage"
 
 # Disable excessive xmlschema and django-axes logging
 import logging
@@ -773,3 +769,6 @@ LANGUAGES = (
     ("ar", "العربية"),
     ("cs", "Čeština"),
 )
+
+# Disable SAML2 CSP warnings
+SAML_CSP_HANDLER = ""

@@ -1,5 +1,6 @@
 import datetime
 import logging
+from decimal import Decimal
 
 import jwt
 from dateutil.parser import parse as parse_datetime
@@ -26,14 +27,9 @@ from waldur_core.core.fields import NaturalChoiceField
 from waldur_core.core.models import User, get_ssh_key_fingerprints
 from waldur_core.core.serializers import GenericRelatedField
 from waldur_core.core.validators import validate_ssh_public_key
-from waldur_core.media.serializers import (
-    ProtectedFileField,
-    ProtectedImageField,
-    ProtectedMediaSerializerMixin,
-)
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.models import UserRole
-from waldur_core.permissions.utils import count_users, has_permission
+from waldur_core.permissions.utils import count_users, get_permissions, has_permission
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import serializers as structure_serializers
@@ -45,6 +41,7 @@ from waldur_mastermind.billing.serializers import get_payment_profiles
 from waldur_mastermind.common import mixins as common_mixins
 from waldur_mastermind.common.exceptions import TransactionRollback
 from waldur_mastermind.common.serializers import validate_options
+from waldur_mastermind.common.utils import prices_are_equal
 from waldur_mastermind.invoices.models import InvoiceItem
 from waldur_mastermind.invoices.utils import get_billing_price_estimate_for_resources
 from waldur_mastermind.marketplace.fields import PublicPlanField
@@ -65,19 +62,8 @@ logger = logging.getLogger(__name__)
 BillingTypes = models.OfferingComponent.BillingTypes
 
 
-class MarketplaceProtectedMediaSerializerMixin(serializers.ModelSerializer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if not settings.WALDUR_MARKETPLACE["ANONYMOUS_USER_CAN_VIEW_OFFERINGS"]:
-            self.serializer_field_mapping = (
-                ProtectedMediaSerializerMixin.serializer_field_mapping
-            )
-
-
 class ServiceProviderSerializer(
-    MarketplaceProtectedMediaSerializerMixin,
-    core_serializers.AugmentedSerializerMixin,
-    serializers.HyperlinkedModelSerializer,
+    core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
     class Meta:
         model = models.ServiceProvider
@@ -92,6 +78,7 @@ class ServiceProviderSerializer(
             "customer_uuid",
             "customer_image",
             "customer_abbreviation",
+            "customer_slug",
             "customer_native_name",
             "customer_country",
             "image",
@@ -99,7 +86,9 @@ class ServiceProviderSerializer(
             "description",
             "offering_count",
         )
-        related_paths = {"customer": ("uuid", "name", "native_name", "abbreviation")}
+        related_paths = {
+            "customer": ("uuid", "name", "native_name", "abbreviation", "slug")
+        }
         protected_fields = ("customer",)
         extra_kwargs = {
             "url": {
@@ -109,7 +98,7 @@ class ServiceProviderSerializer(
             "customer": {"lookup_field": "uuid"},
         }
 
-    customer_image = ProtectedImageField(source="customer.image", read_only=True)
+    customer_image = serializers.ImageField(source="customer.image", read_only=True)
     customer_country = serializers.CharField(source="customer.country", read_only=True)
     organization_group = serializers.CharField(
         source="customer.organization_group", read_only=True
@@ -119,10 +108,6 @@ class ServiceProviderSerializer(
         fields = super().get_fields()
         if self.context["request"].user.is_anonymous:
             del fields["enable_notifications"]
-        if settings.WALDUR_MARKETPLACE["ANONYMOUS_USER_CAN_VIEW_OFFERINGS"]:
-            fields["customer_image"] = serializers.ImageField(
-                source="customer.image", read_only=True
-            )
         return fields
 
     def validate(self, attrs):
@@ -163,7 +148,18 @@ class NestedSectionSerializer(serializers.ModelSerializer):
 class NestedColumnSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.CategoryColumn
-        fields = ("index", "title", "attribute", "widget")
+        fields = ("uuid", "index", "title", "attribute", "widget")
+
+
+class CategoryColumnSerializer(NestedColumnSerializer):
+    category = serializers.HyperlinkedRelatedField(
+        queryset=models.Category.objects.all(),
+        view_name="marketplace-category-detail",
+        lookup_field="uuid",
+    )
+
+    class Meta(NestedColumnSerializer.Meta):
+        fields = NestedColumnSerializer.Meta.fields + ("category",)
 
 
 class CategoryComponentSerializer(serializers.ModelSerializer):
@@ -236,7 +232,6 @@ class CategoryComponentsSerializer(serializers.ModelSerializer):
 
 
 class CategoryGroupSerializer(
-    MarketplaceProtectedMediaSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
@@ -259,7 +254,6 @@ class CategoryGroupSerializer(
 
 
 class CategorySerializer(
-    MarketplaceProtectedMediaSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
@@ -366,7 +360,7 @@ class CategorySerializer(
 
 
 PriceSerializer = serializers.DecimalField(
-    min_value=0,
+    min_value=Decimal(0),
     max_digits=common_mixins.PRICE_MAX_DIGITS,
     decimal_places=common_mixins.PRICE_DECIMAL_PLACES,
 )
@@ -404,7 +398,8 @@ class PricesUpdateSerializer(serializers.Serializer):
             price_field = "price"
         for key, old_component in component_map.items():
             new_price = future_prices.get(key, 0)
-            if getattr(old_component, price_field) != new_price:
+            old_price = getattr(old_component, price_field) or 0
+            if not prices_are_equal(old_price, new_price):
                 setattr(old_component, price_field, new_price)
                 old_component.save(update_fields=[price_field])
 
@@ -628,17 +623,13 @@ class PlanUsageResponseSerializer(serializers.Serializer):
     customer_provider_name = serializers.ReadOnlyField(source="offering.customer.name")
 
 
-class NestedScreenshotSerializer(
-    MarketplaceProtectedMediaSerializerMixin, serializers.ModelSerializer
-):
+class NestedScreenshotSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Screenshot
         fields = ("name", "uuid", "description", "image", "thumbnail", "created")
 
 
-class NestedOfferingFileSerializer(
-    MarketplaceProtectedMediaSerializerMixin, serializers.ModelSerializer
-):
+class NestedOfferingFileSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.OfferingFile
         fields = (
@@ -649,9 +640,7 @@ class NestedOfferingFileSerializer(
 
 
 class ScreenshotSerializer(
-    MarketplaceProtectedMediaSerializerMixin,
-    core_serializers.AugmentedSerializerMixin,
-    serializers.HyperlinkedModelSerializer,
+    core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
     class Meta:
         model = models.Screenshot
@@ -745,6 +734,7 @@ class OfferingComponentSerializer(serializers.ModelSerializer):
             "name",
             "description",
             "measured_unit",
+            "unit_factor",
             "limit_period",
             "limit_amount",
             "article_code",
@@ -782,6 +772,11 @@ class OfferingComponentSerializer(serializers.ModelSerializer):
             if is_builtin:
                 raise serializers.ValidationError(
                     _("Cannot create a component of built-in type: %s" % component_type)
+                )
+
+            if offering.components.filter(type=component_type).exists():
+                raise serializers.ValidationError(
+                    _("Component %s already exists." % component_type)
                 )
 
         return super().create(validated_data)
@@ -1044,7 +1039,6 @@ class ProviderOfferingDetailsSerializer(
     core_serializers.SlugSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     structure_serializers.CountrySerializerMixin,
-    MarketplaceProtectedMediaSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
@@ -1248,6 +1242,8 @@ class ProviderOfferingDetailsSerializer(
             service = offering.scope
         except AttributeError:
             return {}
+        if isinstance(service, structure_models.BaseResource):
+            service = service.service_settings
         if not service:
             return {}
         return {
@@ -1533,7 +1529,6 @@ class OfferingDescriptionUpdateSerializer(
 
 class OfferingOverviewUpdateSerializer(
     core_serializers.SlugSerializerMixin,
-    MarketplaceProtectedMediaSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
@@ -1619,6 +1614,12 @@ class OfferingIntegrationUpdateSerializer(serializers.ModelSerializer):
         instance.scope.domain = options_serializer.validated_data.get("domain")
         instance.scope.token = options_serializer.validated_data.get("token")
         instance.scope.options = options_serializer.validated_data.get("options")
+        instance.scope.console_type = options_serializer.validated_data.get(
+            "console_type"
+        )
+        instance.scope.console_domain_override = options_serializer.validated_data.get(
+            "console_domain_override"
+        )
         instance.scope.save()
 
         if (
@@ -1692,7 +1693,6 @@ class ComponentQuotaSerializer(serializers.ModelSerializer):
 
 
 class BaseItemSerializer(
-    MarketplaceProtectedMediaSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
@@ -1760,10 +1760,14 @@ class BaseItemSerializer(
     provider_name = serializers.ReadOnlyField(source="offering.customer.name")
     provider_uuid = serializers.ReadOnlyField(source="offering.customer.uuid")
     category_title = serializers.ReadOnlyField(source="offering.category.title")
-    category_icon = ProtectedImageField(source="offering.category.icon", read_only=True)
+    category_icon = serializers.ImageField(
+        source="offering.category.icon", read_only=True
+    )
     category_uuid = serializers.ReadOnlyField(source="offering.category.uuid")
-    offering_thumbnail = ProtectedFileField(source="offering.thumbnail", read_only=True)
-    offering_image = ProtectedFileField(source="offering.image", read_only=True)
+    offering_thumbnail = serializers.ImageField(
+        source="offering.thumbnail", read_only=True
+    )
+    offering_image = serializers.ImageField(source="offering.image", read_only=True)
 
     def validate_offering(self, offering):
         if not offering.state == models.Offering.States.ACTIVE:
@@ -1877,9 +1881,11 @@ class OrderDetailsSerializer(BaseOrderSerializer):
             "created_by_civil_number",
             "customer_name",
             "customer_uuid",
+            "customer_slug",
             "project_name",
             "project_uuid",
             "project_description",
+            "project_slug",
             "old_plan_name",
             "new_plan_name",
             "old_plan_uuid",
@@ -1915,10 +1921,12 @@ class OrderDetailsSerializer(BaseOrderSerializer):
 
     customer_name = serializers.ReadOnlyField(source="project.customer.name")
     customer_uuid = serializers.ReadOnlyField(source="project.customer.uuid")
+    customer_slug = serializers.ReadOnlyField(source="project.customer.slug")
 
     project_name = serializers.ReadOnlyField(source="project.name")
     project_uuid = serializers.ReadOnlyField(source="project.uuid")
     project_description = serializers.ReadOnlyField(source="project.description")
+    project_slug = serializers.ReadOnlyField(source="project.slug")
 
     old_plan_name = serializers.ReadOnlyField(source="old_plan.name")
     new_plan_name = serializers.ReadOnlyField(source="plan.name")
@@ -2127,7 +2135,10 @@ class OrderCreateSerializer(
         return ("project",)
 
     def quotas_validate(self, order):
-        if not order.offering.scope:
+        try:
+            if not order.offering.scope:
+                return
+        except AttributeError:
             return
         processor_class = manager.get_processor(
             order.offering.type, "create_resource_processor"
@@ -2227,7 +2238,9 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             "end_date_requested_by",
             "username",
             "limit_usage",
-            "requested_downscaling",
+            "downscaled",
+            "restrict_member_access",
+            "paused",
             "endpoints",
             "error_message",
             "error_traceback",
@@ -2248,6 +2261,7 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             "error_message",
             "error_traceback",
             "options",
+            "restrict_member_access",
         )
         view_name = "marketplace-resource-detail"
         extra_kwargs = dict(
@@ -2257,7 +2271,7 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
         )
 
     state = serializers.ReadOnlyField(source="get_state_display")
-    scope = core_serializers.GenericRelatedField()
+    scope = core_serializers.GenericRelatedField(read_only=True)
     resource_uuid = serializers.ReadOnlyField(source="backend_uuid")
     resource_type = serializers.ReadOnlyField(source="backend_type")
     project = serializers.HyperlinkedRelatedField(
@@ -2473,6 +2487,14 @@ class ResourceEndDateByProviderSerializer(serializers.ModelSerializer):
         resource.save(update_fields=["end_date_requested_by"])
 
 
+class ResourceBackendMetadataSerializer(serializers.ModelSerializer):
+    backend_metadata = serializers.JSONField(required=True)
+
+    class Meta:
+        model = models.Resource
+        fields = ("backend_metadata",)
+
+
 class ResourceUpdateLimitsSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Resource
@@ -2528,8 +2550,11 @@ class ResourceOptionsSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Metadata for resource options is not defined."
             )
-        validate_options(resource_options["options"], attrs)
-        return attrs
+        validate_options(resource_options["options"], attrs, optional=True)
+        if self.instance.options:
+            return {**self.instance.options, **attrs}
+        else:
+            return attrs
 
 
 class ResourceOfferingSerializer(serializers.ModelSerializer):
@@ -2643,6 +2668,90 @@ class ComponentUsageSerializer(BaseComponentUsageSerializer):
             return selected_field
 
         return fields
+
+
+class ComponentUserUsageSerializer(serializers.HyperlinkedModelSerializer):
+    user = serializers.HyperlinkedRelatedField(
+        queryset=models.OfferingUser.objects.all(),
+        view_name="marketplace-offering-user-detail",
+        lookup_field="uuid",
+    )
+    component_usage = serializers.HyperlinkedRelatedField(
+        queryset=models.ComponentUsage.objects.all(),
+        view_name="marketplace-component-usage-detail",
+        lookup_field="uuid",
+    )
+    measured_unit = serializers.ReadOnlyField(
+        source="component_usage.component.measured_unit"
+    )
+    component_type = serializers.ReadOnlyField(source="component_usage.component.type")
+    date = serializers.ReadOnlyField(source="component_usage.date")
+
+    resource_name = serializers.ReadOnlyField(source="component_usage.resource.name")
+    resource_uuid = serializers.ReadOnlyField(source="component_usage.resource.uuid")
+
+    offering_name = serializers.ReadOnlyField(
+        source="component_usage.resource.offering.name"
+    )
+    offering_uuid = serializers.ReadOnlyField(
+        source="component_usage.resource.offering.uuid"
+    )
+
+    project_uuid = serializers.ReadOnlyField(
+        source="component_usage.resource.project.uuid"
+    )
+    project_name = serializers.ReadOnlyField(
+        source="component_usage.resource.project.name"
+    )
+
+    customer_name = serializers.ReadOnlyField(
+        source="component_usage.resource.project.customer.name"
+    )
+    customer_uuid = serializers.ReadOnlyField(
+        source="component_usage.resource.project.customer.uuid"
+    )
+
+    class Meta:
+        fields = (
+            "uuid",
+            "user",
+            "username",
+            "component_usage",
+            "usage",
+            "measured_unit",
+            "description",
+            "created",
+            "modified",
+            "backend_id",
+            "resource_name",
+            "resource_uuid",
+            "offering_name",
+            "offering_uuid",
+            "project_name",
+            "project_uuid",
+            "customer_name",
+            "customer_uuid",
+            "component_type",
+            "date",
+        )
+        model = models.ComponentUserUsage
+
+
+class ComponentUserUsageCreateSerializer(serializers.ModelSerializer):
+    user = serializers.HyperlinkedRelatedField(
+        queryset=models.OfferingUser.objects.all(),
+        view_name="marketplace-offering-user-detail",
+        lookup_field="uuid",
+        required=False,
+    )
+
+    class Meta:
+        model = models.ComponentUserUsage
+        fields = (
+            "usage",
+            "username",
+            "user",
+        )
 
 
 class ResourcePlanPeriodSerializer(serializers.ModelSerializer):
@@ -2817,7 +2926,6 @@ class ComponentUsageCreateSerializer(serializers.Serializer):
 
 
 class OfferingFileSerializer(
-    MarketplaceProtectedMediaSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
@@ -2935,6 +3043,17 @@ class OfferingUserSerializer(
             )
 
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        request = self.context["request"]
+        offering = instance.offering
+
+        if not has_permission(
+            request, PermissionEnum.UPDATE_OFFERING_USER, offering.customer
+        ):
+            raise rf_exceptions.PermissionDenied()
+
+        return super().update(instance, validated_data)
 
 
 class OfferingUserUpdateRestrictionSerializer(serializers.Serializer):
@@ -3099,6 +3218,16 @@ class ResourceTerminateSerializer(serializers.Serializer):
     )
 
 
+class ResourceSetStateErredSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Resource
+        fields = ("error_message", "error_traceback")
+        extra_kwargs = dict(
+            error_message={"required": False},
+            error_traceback={"required": False},
+        )
+
+
 class MoveResourceSerializer(serializers.Serializer):
     project = structure_serializers.NestedProjectSerializer(
         queryset=structure_models.Project.available_objects.all(),
@@ -3143,10 +3272,7 @@ core_signals.pre_serializer_fields.connect(
 )
 
 
-class OfferingThumbnailSerializer(
-    MarketplaceProtectedMediaSerializerMixin,
-    serializers.HyperlinkedModelSerializer,
-):
+class OfferingThumbnailSerializer(serializers.HyperlinkedModelSerializer):
     thumbnail = serializers.ImageField(required=True)
 
     class Meta:
@@ -3339,9 +3465,7 @@ class ProviderCustomerProjectSerializer(serializers.ModelSerializer):
         return get_billing_price_estimate_for_resources(resources)
 
 
-class ProviderProjectSerializer(
-    MarketplaceProtectedMediaSerializerMixin, serializers.ModelSerializer
-):
+class ProviderProjectSerializer(serializers.ModelSerializer):
     class Meta:
         model = structure_models.Project
         fields = (
@@ -3351,9 +3475,7 @@ class ProviderProjectSerializer(
         )
 
 
-class ProviderUserSerializer(
-    ProtectedMediaSerializerMixin, serializers.ModelSerializer
-):
+class ProviderUserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = (
@@ -3362,6 +3484,46 @@ class ProviderUserSerializer(
             "email",
             "image",
         )
+
+
+class ProjectUserSerializer(serializers.ModelSerializer):
+    role = serializers.ReadOnlyField()
+    expiration_time = serializers.ReadOnlyField(source="perm.expiration_time")
+    offering_user_username = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            "url",
+            "uuid",
+            "username",
+            "full_name",
+            "email",
+            "role",
+            "expiration_time",
+            "offering_user_username",
+        ]
+        extra_kwargs = {
+            "url": {"lookup_field": "uuid"},
+        }
+
+    def get_offering_user_username(self, user):
+        offering = self.context["offering"]
+        offering_user = models.OfferingUser.objects.filter(
+            user=user, offering=offering
+        ).first()
+        return offering_user.username if offering_user else None
+
+    def to_representation(self, user):
+        project = self.context["project"]
+        permission = get_permissions(project, user).first()
+        setattr(user, "perm", permission)
+        setattr(
+            user,
+            "role",
+            permission and structure_models.get_old_role_name(permission.role.name),
+        )
+        return super().to_representation(user)
 
 
 class DetailedProviderUserSerializer(serializers.ModelSerializer):
@@ -3413,6 +3575,7 @@ class ProviderCustomerSerializer(serializers.ModelSerializer):
         fields = (
             "uuid",
             "name",
+            "slug",
             "abbreviation",
             "phone_number",
             "email",
@@ -3705,6 +3868,31 @@ class IntegrationStatusSerializer(serializers.ModelSerializer):
             "status",
             "last_request_timestamp",
         )
+
+
+class IntegrationStatusDetailsSerializer(
+    serializers.HyperlinkedModelSerializer, IntegrationStatusSerializer
+):
+    class Meta:
+        model = models.IntegrationStatus
+        fields = (
+            "agent_type",
+            "status",
+            "last_request_timestamp",
+            "offering",
+            "url",
+        )
+        protected_fields = ("offering",)
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-integration-status-detail",
+            },
+            "offering": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-provider-offering-detail",
+            },
+        }
 
 
 def get_integration_status(serializer, offering):

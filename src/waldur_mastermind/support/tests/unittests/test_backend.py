@@ -20,7 +20,7 @@ class BaseBackendTest(TestCase):
         self.fixture = fixtures.SupportFixture()
         self.backend = ServiceDeskBackend()
 
-        jira_patcher = mock.patch("waldur_jira.backend.JIRA")
+        jira_patcher = mock.patch("waldur_mastermind.support.backend.atlassian.JIRA")
         self.mocked_jira = jira_patcher.start()()
 
         self.mocked_jira.fields.return_value = json.loads(
@@ -79,8 +79,8 @@ class IssueCreateTest(BaseBackendTest):
     def test_user_for_caller_is_created(self):
         self.mocked_jira.waldur_search_users.return_value = []
         self.backend.create_issue(self.issue)
-        self.mocked_jira.create_customer.assert_called_once_with(
-            self.issue.caller.email, self.issue.caller.full_name
+        self.mocked_jira.waldur_create_customer_cloud.assert_called_once_with(
+            self.issue.caller.email, ""
         )
 
     @skip(

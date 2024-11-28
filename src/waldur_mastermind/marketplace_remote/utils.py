@@ -3,7 +3,6 @@ import logging
 from collections import defaultdict
 
 import requests
-import urllib3
 from django.db.models import Q
 from django.utils import dateparse
 from django.utils.dateparse import parse_datetime
@@ -12,7 +11,10 @@ from waldur_client import WaldurClient, WaldurClientException
 
 from waldur_auth_social.models import ProviderChoices
 from waldur_core.core.utils import get_system_robot
+from waldur_core.media import models as media_models
+from waldur_core.media import utils as media_utils
 from waldur_core.permissions.enums import RoleEnum
+from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
@@ -169,6 +171,42 @@ def update_remote_project(request):
         )
         if any(remote_project.get(key) != value for key, value in payload.items()):
             client.update_project(project_uuid=remote_project["uuid"], **payload)
+
+
+def sync_resource_team(resource):
+    offering = resource.offering
+    client = get_client_for_offering(resource.offering)
+    project = resource.project
+    remote_project, _ = get_or_create_remote_project(offering, project, client)
+
+    remote_team = client.marketplace_resource_get_team(resource.uuid.hex)
+    remote_permissions = {
+        (record["username"], record["role"]): record["uuid"] for record in remote_team
+    }
+
+    local_roles = UserRole.objects.filter(scope=project, is_active=True)
+    local_permissions = {
+        (record.user.username, record.role.name): record for record in local_roles
+    }
+
+    stale_permissions = set(remote_permissions) - set(local_permissions)
+
+    for username, role_name in stale_permissions:
+        user_uuid = remote_permissions[username, role_name]
+        remove_project_permission(client, remote_project["uuid"], user_uuid, role_name)
+
+    new_and_existing_users = (
+        set(local_permissions) | set(remote_permissions)
+    ) - stale_permissions
+
+    for username, role_name in new_and_existing_users:
+        user_uuid = remote_permissions.get((username, role_name))
+        if user_uuid is None:
+            user_uuid = client.get_remote_eduteams_user(username)["uuid"]
+        expiration_time = local_permissions[username, role_name].expiration_time
+        create_or_update_project_permission(
+            client, remote_project["uuid"], user_uuid, role_name, expiration_time
+        )
 
 
 def create_or_update_project_permission(
@@ -438,13 +476,40 @@ def import_plans(local_offering, remote_offering, local_components_map):
             )
 
 
-def import_offering_thumbnail(local_offering, remote_offering):
+def import_offering_thumbnail(
+    local_offering: marketplace_models.Offering, remote_offering
+):
     thumbnail_url = remote_offering["thumbnail"]
     if thumbnail_url:
         thumbnail_resp = requests.get(thumbnail_url)
         content = io.BytesIO(thumbnail_resp.content)
-        file_name = urllib3.util.parse_url(thumbnail_url).path.split("/")[-1]
-        local_offering.thumbnail.save(file_name, content)
+        file_name = local_offering.uuid.hex
+        if local_offering.thumbnail:
+            file_object = media_models.File.objects.get(
+                name=local_offering.thumbnail.name
+            )
+            local_file_hash = file_object.hash
+            remote_file_hash = media_utils.get_image_hash(thumbnail_resp.content)
+            if local_file_hash != remote_file_hash:
+                local_offering.thumbnail.delete()
+                local_offering.thumbnail.save(file_name, content)
+        else:
+            local_offering.thumbnail.save(file_name, content)
     else:
         local_offering.thumbnail.delete()
     local_offering.save(update_fields=["thumbnail"])
+
+
+def push_resource_options(local_resource):
+    offering = local_resource.offering
+    client = get_client_for_offering(offering)
+    try:
+        logger.info(
+            f"Pushing resource {local_resource} with backend ID {local_resource.backend_id} and"
+            f" options {local_resource.options} to remote Waldur"
+        )
+        client.marketplace_resource_update_options(
+            local_resource.backend_id, local_resource.options
+        )
+    except WaldurClientException as exc:
+        logger.error("Unable to push resource options: %s", exc)

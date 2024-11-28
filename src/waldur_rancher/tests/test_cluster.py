@@ -12,11 +12,9 @@ from waldur_core.structure.tests.factories import (
     SshPublicKeyFactory,
     UserFactory,
 )
-from waldur_openstack.openstack import models as openstack_models
-from waldur_openstack.openstack.tests import factories as openstack_factories
-from waldur_openstack.openstack_tenant.models import Flavor
-from waldur_openstack.openstack_tenant.tests import (
-    factories as openstack_tenant_factories,
+from waldur_openstack import models as openstack_models
+from waldur_openstack.tests import (
+    factories as openstack_factories,
 )
 from waldur_rancher import exceptions, models, tasks
 from waldur_rancher.tests import factories, fixtures, utils
@@ -44,7 +42,7 @@ class ClusterGetTest(test.APITransactionTestCase):
     def test_rancher_cluster_is_exposed_for_openstack_instance(self):
         self.client.force_authenticate(self.fixture.staff)
         response = self.client.get(
-            openstack_tenant_factories.InstanceFactory.get_url(self.fixture.instance)
+            openstack_factories.InstanceFactory.get_url(self.fixture.instance)
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(
@@ -55,7 +53,7 @@ class ClusterGetTest(test.APITransactionTestCase):
         self.fixture.node.delete()
         self.client.force_authenticate(self.fixture.staff)
         response = self.client.get(
-            openstack_tenant_factories.InstanceFactory.get_url(self.fixture.instance)
+            openstack_factories.InstanceFactory.get_url(self.fixture.instance)
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["rancher_cluster"], None)
@@ -64,15 +62,14 @@ class ClusterGetTest(test.APITransactionTestCase):
         project = ProjectFactory(customer=self.fixture.customer)
         admin = UserFactory()
         project.add_user(admin, ProjectRole.ADMIN)
-        vm = openstack_tenant_factories.InstanceFactory(
-            service_settings=self.fixture.tenant_settings,
+        vm = openstack_factories.InstanceFactory(
+            tenant=self.fixture.tenant,
+            service_settings=self.fixture.tenant.service_settings,
             project=project,
             state=StateMixin.States.OK,
         )
         self.client.force_authenticate(admin)
-        response = self.client.get(
-            openstack_tenant_factories.InstanceFactory.get_url(vm)
-        )
+        response = self.client.get(openstack_factories.InstanceFactory.get_url(vm))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["rancher_cluster"], None)
 
@@ -82,35 +79,28 @@ class BaseClusterCreateTest(test.APITransactionTestCase):
         super().setUp()
         self.fixture = fixtures.RancherFixture()
         self.url = factories.ClusterFactory.get_list_url()
-        openstack_service_settings = (
-            openstack_factories.OpenStackServiceSettingsFactory(
-                customer=self.fixture.customer
-            )
-        )
-        self.tenant = openstack_factories.TenantFactory(
-            service_settings=openstack_service_settings
-        )
+        self.tenant = self.fixture.tenant
 
-        openstack_tenant_factories.FlavorFactory(settings=self.fixture.tenant_settings)
-        image = openstack_tenant_factories.ImageFactory(
-            settings=self.fixture.tenant_settings
+        self.flavor = openstack_factories.FlavorFactory(
+            settings=self.tenant.service_settings,
+            ram=1024 * 8,
+            cores=2,
         )
-        self.default_security_group = openstack_tenant_factories.SecurityGroupFactory(
-            name="default", settings=self.fixture.tenant_settings
+        self.flavor.tenants.add(self.tenant)
+        image = openstack_factories.ImageFactory(settings=self.tenant.service_settings)
+        image.tenants.add(self.fixture.tenant)
+        self.default_security_group = openstack_factories.SecurityGroupFactory(
+            name="default", tenant=self.tenant
         )
         self.fixture.settings.options["base_image_name"] = image.name
         self.fixture.settings.save()
 
-        self.network = openstack_tenant_factories.NetworkFactory(
-            settings=self.fixture.tenant_settings
+        self.network = openstack_factories.NetworkFactory(tenant=self.tenant)
+        self.subnet = openstack_factories.SubNetFactory(
+            network=self.network,
+            tenant=self.tenant,
+            project=self.fixture.project,
         )
-        self.subnet = openstack_tenant_factories.SubNetFactory(
-            network=self.network, settings=self.fixture.tenant_settings
-        )
-        self.flavor = Flavor.objects.get(settings=self.fixture.tenant_settings)
-        self.flavor.ram = 1024 * 8
-        self.flavor.cores = 2
-        self.flavor.save()
         self.fixture.settings.options["base_subnet_name"] = self.subnet.name
         self.fixture.settings.save()
 
@@ -122,41 +112,31 @@ class BaseClusterCreateTest(test.APITransactionTestCase):
             "name": name,
             "service_settings": ServiceSettingsFactory.get_url(self.fixture.settings),
             "project": ProjectFactory.get_url(self.fixture.project),
-            "tenant_settings": openstack_tenant_factories.OpenStackTenantServiceSettingsFactory.get_url(
-                self.fixture.tenant_settings
-            ),
+            "tenant": openstack_factories.TenantFactory.get_url(self.fixture.tenant),
             "nodes": [
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": disk,
                     "memory": memory,
                     "cpu": cpu,
                     "roles": ["worker"],
                 },
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": disk,
                     "memory": memory,
                     "cpu": cpu,
                     "roles": ["controlplane", "worker"],
                 },
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": disk,
                     "memory": memory,
                     "cpu": cpu,
                     "roles": ["controlplane", "etcd"],
                 },
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": disk,
                     "memory": memory,
                     "cpu": cpu,
@@ -193,15 +173,14 @@ class ClusterCreateTest(BaseClusterCreateTest):
     @mock.patch("waldur_rancher.executors.core_tasks")
     def test_use_data_volumes(self, mock_core_tasks):
         self.client.force_authenticate(self.fixture.owner)
-        volume_type = openstack_tenant_factories.VolumeTypeFactory(
-            settings=self.fixture.tenant_settings
-        )
+        self.tenant.service_settings.shared = True
+        self.tenant.service_settings.save()
+        volume_type = openstack_factories.VolumeTypeFactory()
+        volume_type.tenants.add(self.tenant)
         payload = {
             "nodes": [
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": 1024,
                     "memory": 1,
                     "cpu": 1,
@@ -209,7 +188,7 @@ class ClusterCreateTest(BaseClusterCreateTest):
                     "data_volumes": [
                         {
                             "size": 12 * 1024,
-                            "volume_type": openstack_tenant_factories.VolumeTypeFactory.get_url(
+                            "volume_type": openstack_factories.VolumeTypeFactory.get_url(
                                 volume_type
                             ),
                             "mount_point": "/var/lib/etcd",
@@ -219,7 +198,7 @@ class ClusterCreateTest(BaseClusterCreateTest):
             ]
         }
         response = self._create_request_("new-cluster", add_payload=payload)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         self.assertTrue(models.Cluster.objects.filter(name="new-cluster").exists())
         cluster = models.Cluster.objects.get(name="new-cluster")
         self.assertEqual(len(cluster.node_set.first().initial_data["data_volumes"]), 1)
@@ -229,18 +208,14 @@ class ClusterCreateTest(BaseClusterCreateTest):
         payload = {
             "nodes": [
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": 1024,
                     "memory": 1,
                     "cpu": 1,
                     "roles": ["controlplane", "etcd", "worker"],
                 },
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": 1024,
                     "memory": 1,
                     "cpu": 1,
@@ -261,18 +236,14 @@ class ClusterCreateTest(BaseClusterCreateTest):
         payload = {
             "nodes": [
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": 1024,
                     "memory": 1,
                     "cpu": 1,
                     "roles": ["controlplane", "etcd", "worker"],
                 },
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": 1024,
                     "memory": 1,
                     "cpu": 1,
@@ -291,9 +262,7 @@ class ClusterCreateTest(BaseClusterCreateTest):
         payload = {
             "nodes": [
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": 1024,
                     "memory": 1,
                     "cpu": 1,
@@ -315,9 +284,7 @@ class ClusterCreateTest(BaseClusterCreateTest):
         payload = {
             "nodes": [
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": 1024,
                     "memory": 1,
                     "cpu": 1,
@@ -419,6 +386,7 @@ class ClusterCreateTest(BaseClusterCreateTest):
             "image": "",
             "subnet": "",
             "service_settings": "",
+            "tenant": "",
             "project": "",
             "system_volume_size": "",
             "system_volume_type": "",
@@ -525,22 +493,18 @@ class ClusterCreateTest(BaseClusterCreateTest):
         )
 
     def test_validate_security_groups_positive(self):
-        security_group1 = openstack_tenant_factories.SecurityGroupFactory(
-            settings=self.fixture.tenant_settings,
-        )
-        security_group2 = openstack_tenant_factories.SecurityGroupFactory(
-            settings=self.fixture.tenant_settings,
-        )
+        security_group1 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        security_group2 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
         self.client.force_authenticate(self.fixture.staff)
         payload = {
             "security_groups": [
                 {
-                    "url": openstack_tenant_factories.SecurityGroupFactory.get_url(
+                    "url": openstack_factories.SecurityGroupFactory.get_url(
                         security_group1
                     )
                 },
                 {
-                    "url": openstack_tenant_factories.SecurityGroupFactory.get_url(
+                    "url": openstack_factories.SecurityGroupFactory.get_url(
                         security_group2
                     )
                 },
@@ -550,18 +514,18 @@ class ClusterCreateTest(BaseClusterCreateTest):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
     def test_validate_security_groups_negative(self):
-        security_group1 = openstack_tenant_factories.SecurityGroupFactory()
-        security_group2 = openstack_tenant_factories.SecurityGroupFactory()
+        security_group1 = openstack_factories.SecurityGroupFactory()
+        security_group2 = openstack_factories.SecurityGroupFactory()
         self.client.force_authenticate(self.fixture.owner)
         payload = {
             "security_groups": [
                 {
-                    "url": openstack_tenant_factories.SecurityGroupFactory.get_url(
+                    "url": openstack_factories.SecurityGroupFactory.get_url(
                         security_group1
                     )
                 },
                 {
-                    "url": openstack_tenant_factories.SecurityGroupFactory.get_url(
+                    "url": openstack_factories.SecurityGroupFactory.get_url(
                         security_group2
                     )
                 },
@@ -580,28 +544,26 @@ class ClusterCreateTest(BaseClusterCreateTest):
         )
 
     def test_custom_security_groups_are_propagated_to_initial_data(self):
-        security_group1 = openstack_tenant_factories.SecurityGroupFactory(
-            settings=self.fixture.tenant_settings,
-        )
-        security_group2 = openstack_tenant_factories.SecurityGroupFactory(
-            settings=self.fixture.tenant_settings,
-        )
+        security_group1 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        security_group2 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
         self.client.force_authenticate(self.fixture.owner)
         payload = {
             "security_groups": [
                 {
-                    "url": openstack_tenant_factories.SecurityGroupFactory.get_url(
+                    "url": openstack_factories.SecurityGroupFactory.get_url(
                         security_group1
                     )
                 },
                 {
-                    "url": openstack_tenant_factories.SecurityGroupFactory.get_url(
+                    "url": openstack_factories.SecurityGroupFactory.get_url(
                         security_group2
                     )
                 },
             ]
         }
-        self._create_request_("new-cluster", add_payload=payload)
+        response = self._create_request_("new-cluster", add_payload=payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
         cluster = models.Cluster.objects.get(name="new-cluster")
         self.assertEqual(
             cluster.node_set.first().initial_data["security_groups"],
@@ -625,15 +587,14 @@ class ClusterCreateTest(BaseClusterCreateTest):
     @mock.patch("waldur_rancher.executors.core_tasks")
     def test_disable_data_volumes(self, mock_core_tasks):
         self.client.force_authenticate(self.fixture.owner)
-        volume_type = openstack_tenant_factories.VolumeTypeFactory(
-            settings=self.fixture.tenant_settings
+        volume_type = openstack_factories.VolumeTypeFactory(
+            settings=self.tenant.service_settings
         )
+        volume_type.tenants.add(self.tenant)
         payload = {
             "nodes": [
                 {
-                    "subnet": openstack_tenant_factories.SubNetFactory.get_url(
-                        self.subnet
-                    ),
+                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
                     "system_volume_size": 1024,
                     "memory": 1,
                     "cpu": 1,
@@ -641,7 +602,7 @@ class ClusterCreateTest(BaseClusterCreateTest):
                     "data_volumes": [
                         {
                             "size": 12 * 1024,
-                            "volume_type": openstack_tenant_factories.VolumeTypeFactory.get_url(
+                            "volume_type": openstack_factories.VolumeTypeFactory.get_url(
                                 volume_type
                             ),
                             "mount_point": "/var/lib/etcd",

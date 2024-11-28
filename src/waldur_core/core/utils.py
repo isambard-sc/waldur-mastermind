@@ -12,6 +12,8 @@ import warnings
 from collections import OrderedDict
 from itertools import chain
 from operator import itemgetter
+from secrets import choice
+from string import ascii_letters, digits
 
 import jwt
 import requests
@@ -35,6 +37,7 @@ from geopy.geocoders import Nominatim
 from requests.packages.urllib3 import exceptions
 from rest_framework.settings import api_settings
 
+import textile
 from ua_parser import user_agent_parser
 from waldur_core.structure.notifications import NOTIFICATIONS
 
@@ -153,6 +156,7 @@ def instance_from_url(url, user=None):
     """Restore instance from URL"""
     # XXX: This circular dependency will be removed then filter_queryset_for_user
     # will be moved to model manager method
+    from waldur_core.core.models import User
     from waldur_core.structure.managers import filter_queryset_for_user
 
     url = clear_url(url)
@@ -160,7 +164,10 @@ def instance_from_url(url, user=None):
     model = get_model_from_resolve_match(match)
     queryset = model.objects.all()
     if user is not None:
-        queryset = filter_queryset_for_user(model.objects.all(), user)
+        if user.is_staff and model == User:
+            queryset = filter_queryset_for_user(User.all_objects.all(), user)
+        else:
+            queryset = filter_queryset_for_user(model.objects.all(), user)
     return queryset.get(**match.kwargs)
 
 
@@ -432,6 +439,11 @@ def normalize_unicode(data):
     return unicodedata.normalize("NFKD", data).encode("ascii", "ignore").decode("utf8")
 
 
+def make_random_password(length=10):
+    alphabet = ascii_letters + digits
+    return "".join(choice(alphabet) for i in range(length))
+
+
 UNIT_PATTERN = re.compile(r"(\d+)([KMGTP]?)")
 
 UNITS = {
@@ -594,3 +606,7 @@ class SubqueryAggregate(Subquery):
 
 class SubquerySum(SubqueryAggregate):
     function = "SUM"
+
+
+def text2html(value: str):
+    return textile.textile(value.strip())

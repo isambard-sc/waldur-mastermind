@@ -4,7 +4,7 @@ import django_filters
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import Q
+from django.db.models import Q, QuerySet
 from django.utils.translation import gettext_lazy as _
 from django_filters.widgets import BooleanWidget
 from rest_framework import exceptions as rf_exceptions
@@ -64,9 +64,15 @@ class OfferingFilter(structure_filters.NameFilterSet, django_filters.FilterSet):
         view_name="customer-detail", field_name="customer__uuid"
     )
     customer_uuid = django_filters.UUIDFilter(field_name="customer__uuid")
-    allowed_customer_uuid = django_filters.UUIDFilter(method="filter_allowed_customer")
-    service_manager_uuid = django_filters.UUIDFilter(method="filter_service_manager")
-    project_uuid = django_filters.UUIDFilter(method="filter_project")
+    allowed_customer_uuid = django_filters.UUIDFilter(
+        method="filter_allowed_customer", label="Allowed customer UUID"
+    )
+    service_manager_uuid = django_filters.UUIDFilter(
+        method="filter_service_manager", label="Service manager UUID"
+    )
+    project_uuid = django_filters.UUIDFilter(
+        method="filter_project", label="Project UUID"
+    )
     parent_uuid = django_filters.UUIDFilter(field_name="parent__uuid")
     attributes = django_filters.CharFilter(method="filter_attributes")
     state = core_filters.MappedMultipleChoiceFilter(models.Offering.States.CHOICES)
@@ -177,7 +183,7 @@ class OfferingCustomersFilterBackend(BaseFilterBackend):
 
 
 class OfferingImportableFilterBackend(BaseFilterBackend):
-    def filter_queryset(self, request, queryset, view):
+    def filter_queryset(self, request, queryset: QuerySet[models.Offering], view):
         if "importable" in request.query_params:
             queryset = queryset.filter(
                 type__in=plugins.manager.get_importable_offering_types()
@@ -188,14 +194,6 @@ class OfferingImportableFilterBackend(BaseFilterBackend):
             if user.is_staff:
                 return queryset
 
-            queryset = queryset.filter(shared=False)
-
-            owned_offerings_ids = set(
-                queryset.filter(
-                    customer__in=get_connected_customers(user, RoleEnum.CUSTOMER_OWNER)
-                ).values_list("id", flat=True)
-            )
-
             # Import private offerings must be available for admins and managers
             projects_ids = set(
                 get_connected_projects(
@@ -203,18 +201,10 @@ class OfferingImportableFilterBackend(BaseFilterBackend):
                 )
             )
 
-            used_offerings_ids = {
-                offering.id
-                for offering in queryset.all()
-                if (
-                    offering.scope
-                    and offering.scope.scope
-                    and offering.scope.scope.project
-                    and offering.scope.scope.project.id in projects_ids
-                )
-            }
-
-            return queryset.filter(id__in=owned_offerings_ids | used_offerings_ids)
+            return queryset.filter(shared=False).filter(
+                Q(customer__in=get_connected_customers(user, RoleEnum.CUSTOMER_OWNER))
+                | Q(project__in=projects_ids)
+            )
         return queryset
 
 
@@ -354,7 +344,7 @@ class ResourceFilter(
     structure_filters.NameFilterSet,
     core_filters.CreatedModifiedFilter,
 ):
-    query = django_filters.CharFilter(method="filter_query")
+    query = django_filters.CharFilter(method="filter_query", label="Query")
     offering_type = django_filters.CharFilter(field_name="offering__type")
     offering_billable = django_filters.UUIDFilter(field_name="offering__billable")
     project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
@@ -363,19 +353,26 @@ class ResourceFilter(
     customer = core_filters.URLFilter(
         view_name="customer-detail", field_name="project__customer__uuid"
     )
-    service_manager_uuid = django_filters.UUIDFilter(method="filter_service_manager")
+    service_manager_uuid = django_filters.UUIDFilter(
+        method="filter_service_manager", label="Service Manager UUID"
+    )
     category_uuid = django_filters.UUIDFilter(field_name="offering__category__uuid")
     provider_uuid = django_filters.UUIDFilter(field_name="offering__customer__uuid")
-    backend_id = django_filters.CharFilter()
+    backend_id = django_filters.CharFilter(label="Backend ID")
     state = core_filters.MappedMultipleChoiceFilter(models.Resource.States.CHOICES)
     runtime_state = django_filters.CharFilter(
-        field_name="backend_metadata__runtime_state"
+        field_name="backend_metadata__runtime_state", label="Runtime state"
     )
-    requested_downscaling = django_filters.BooleanFilter(
-        field_name="requested_downscaling"
+    downscaled = django_filters.BooleanFilter(field_name="downscaled")
+    restrict_member_access = django_filters.BooleanFilter(
+        field_name="restrict_member_access"
     )
+    paused = django_filters.BooleanFilter(field_name="paused")
     lexis_links_supported = django_filters.BooleanFilter(
         method="filter_lexis_links_supported", label="LEXIS links supported"
+    )
+    visible_to_username = django_filters.CharFilter(
+        method="filter_visible_to_username", label="Visible to username"
     )
     o = django_filters.OrderingFilter(
         fields=(
@@ -401,6 +398,7 @@ class ResourceFilter(
             | Q(backend_metadata__internal_ips__icontains=value)
             | Q(backend_metadata__hypervisor_hostname__icontains=value)
             | Q(backend_metadata__router_fixed_ips__icontains=value)
+            | Q(backend_metadata__external_address__icontains=value)
         )
 
         # TODO: Drop union once plugin UUID is deprecated
@@ -437,6 +435,17 @@ class ResourceFilter(
             return queryset.filter(offering__plugin_options__has_key="heappe_url")
         else:
             return queryset.exclude(offering__plugin_options__has_key="heappe_url")
+
+    def filter_visible_to_username(self, queryset, name, value):
+        if value:
+            user = User.objects.filter(username=value).first()
+
+            if not user:
+                return queryset.none()
+
+            return queryset.filter_for_user(user)
+        else:
+            return queryset
 
 
 class ResourceScopeFilterBackend(core_filters.GenericKeyFilterBackend):
@@ -485,6 +494,8 @@ class PlanFilter(OfferingFilterMixin, django_filters.FilterSet):
         model = models.Plan
         fields = []
 
+    offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
+
 
 class CategoryComponentUsageScopeFilterBackend(core_filters.GenericKeyFilterBackend):
     def get_related_models(self):
@@ -520,6 +531,37 @@ class ComponentUsageFilter(django_filters.FilterSet):
     class Meta:
         model = models.ComponentUsage
         fields = ["billing_period"]
+
+
+class ComponentUserUsageFilter(django_filters.FilterSet):
+    resource = core_filters.URLFilter(
+        view_name="marketplace-resource-detail",
+        field_name="component_usage__resource__uuid",
+        label="Resource URL",
+    )
+    resource_uuid = django_filters.UUIDFilter(
+        field_name="component_usage__resource__uuid"
+    )
+    offering_uuid = django_filters.UUIDFilter(
+        field_name="component_usage__resource__offering__uuid"
+    )
+    project_uuid = django_filters.UUIDFilter(
+        field_name="component_usage__resource__project__uuid"
+    )
+    customer_uuid = django_filters.UUIDFilter(
+        field_name="component_usage__resource__project__customer__uuid"
+    )
+    date_before = django_filters.DateFilter(
+        field_name="component_usage__date__date", lookup_expr="lte"
+    )
+    date_after = django_filters.DateFilter(
+        field_name="component_usage__date__date", lookup_expr="gte"
+    )
+    type = django_filters.CharFilter(field_name="component_usage__component__type")
+
+    class Meta:
+        model = models.ComponentUserUsage
+        fields = ["component_usage__billing_period"]
 
 
 class OfferingReferralFilter(django_filters.FilterSet):
@@ -705,6 +747,15 @@ class CategoryFilter(django_filters.FilterSet):
         return queryset.filter(id__in=category_ids)
 
 
+class CategoryColumnFilter(django_filters.FilterSet):
+    class Meta:
+        model = models.CategoryColumn
+        fields = []
+
+    category_uuid = django_filters.UUIDFilter(field_name="category__uuid")
+    title = django_filters.CharFilter(lookup_expr="icontains")
+
+
 class PlanComponentFilter(django_filters.FilterSet):
     class Meta:
         model = models.PlanComponent
@@ -772,26 +823,28 @@ class MarketplaceInvoiceItemsFilter(django_filters.FilterSet):
         ]
 
 
-class PlanFilterBackend(BaseFilterBackend):
+class IntegrationStatusFilter(OfferingFilterMixin, django_filters.FilterSet):
+    o = django_filters.OrderingFilter(fields=("last_request_timestamp"))
+    agent_type = django_filters.CharFilter(field_name="agent_type")
+    status = core_filters.MappedMultipleChoiceFilter(
+        models.IntegrationStatus.States.CHOICES
+    )
+    customer_uuid = django_filters.CharFilter(field_name="offering__customer__uuid")
+
+    class Meta:
+        model = models.IntegrationStatus
+        fields = []
+
+
+class ProviderPlanFilterBackend(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
         user = request.user
 
         if user.is_staff:
             return queryset
 
-        customer_ids = get_connected_customers(user, RoleEnum.CUSTOMER_OWNER)
-
-        organization_group_ids = structure_models.Customer.objects.filter(
-            id__in=customer_ids
-        ).values_list("organization_group_id", flat=True)
-        organization_groups = structure_models.OrganizationGroup.objects.filter(
-            id__in=organization_group_ids
-        )
-
-        return queryset.filter(
-            Q(organization_groups__isnull=True)
-            | Q(organization_groups__in=organization_groups)
-        )
+        customer_ids = get_connected_customers(user)
+        return queryset.filter(offering__customer_id__in=customer_ids)
 
 
 def user_extra_query(user):

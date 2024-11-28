@@ -13,7 +13,7 @@ from waldur_core.core import models as core_models
 from waldur_core.core.models import BackendMixin
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.models import BaseResource, ServiceSettings
-from waldur_openstack.openstack import models as openstack_models
+from waldur_openstack import models as openstack_models
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +51,8 @@ class Cluster(SettingsMixin, BaseResource):
         help_text="Rancher generated node installation command base.",
     )
     tracker = FieldTracker()
-    tenant_settings = models.ForeignKey(
-        to=structure_models.ServiceSettings,
+    tenant = models.ForeignKey(
+        to=openstack_models.Tenant,
         on_delete=models.CASCADE,
         null=True,
         blank=True,
@@ -164,14 +164,10 @@ class RancherUser(
     BackendMixin,
     structure_models.StructureLoggableMixin,
 ):
-    user = models.ForeignKey(core_models.User, on_delete=models.PROTECT)
+    user = models.ForeignKey(core_models.User, on_delete=models.CASCADE)
     clusters = models.ManyToManyField(Cluster, through="RancherUserClusterLink")
     settings = models.ForeignKey("structure.ServiceSettings", on_delete=models.PROTECT)
     is_active = models.BooleanField(default=True)
-
-    @staticmethod
-    def make_random_password():
-        return core_models.User.objects.make_random_password()
 
     class Meta:
         unique_together = (("user", "settings"),)

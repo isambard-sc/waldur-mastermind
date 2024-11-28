@@ -6,11 +6,16 @@ from constance import config
 from django.core.files.base import ContentFile
 from django.template import Context, Template
 
-import textile
 from waldur_core.core.models import User as WaldurUser
+from waldur_core.core.utils import text2html
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.support import models
-from waldur_smax.backend import Comment, Issue, SmaxBackend, User
+from waldur_mastermind.support.backend.smax_utils import (
+    Comment,
+    Issue,
+    SmaxBackend,
+    User,
+)
 
 from . import SupportBackend, SupportBackendType, SupportedFormat
 
@@ -193,8 +198,6 @@ class SmaxServiceBackend(SupportBackend):
                 issue=issue,
                 backend_id=backend_attachment.id,
                 backend_name=self.backend_name,
-                mime_type=backend_attachment.content_type or "",
-                file_size=backend_attachment.size,
                 state=models.Attachment.States.OK,
                 author=support_user,
             )
@@ -384,7 +387,7 @@ class SmaxServiceBackend(SupportBackend):
         )
 
         # SMAX doesn't support new lines
-        body = textile.textile(body)
+        body = text2html(body)
 
         integration_user_upn = self.manager.get_user_by_upn(config.SMAX_LOGIN)
         comment = Comment(

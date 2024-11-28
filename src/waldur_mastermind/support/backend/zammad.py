@@ -12,8 +12,13 @@ from rest_framework.exceptions import ValidationError
 
 from waldur_core.core.models import User as WaldurUser
 from waldur_mastermind.support import models
-from waldur_zammad.backend import User as ZammadUser
-from waldur_zammad.backend import ZammadBackend, ZammadBackendError
+from waldur_mastermind.support.backend.zammad_utils import (
+    User as ZammadUser,
+)
+from waldur_mastermind.support.backend.zammad_utils import (
+    ZammadBackend,
+    ZammadBackendError,
+)
 
 from . import SupportBackend, SupportBackendType
 
@@ -151,8 +156,6 @@ class ZammadServiceBackend(SupportBackend):
         for zammad_attachment in zammad_comment.attachments:
             waldur_attachment = models.Attachment.objects.create(
                 issue=comment.issue,
-                mime_type=zammad_attachment.content_type or "",
-                file_size=zammad_attachment.size,
                 author=comment.author,
                 backend_id=zammad_attachment.id,
                 backend_name=self.backend_name,

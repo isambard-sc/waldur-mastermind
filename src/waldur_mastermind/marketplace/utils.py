@@ -146,7 +146,7 @@ def create_screenshot_thumbnail(screenshot):
     pic = screenshot.image
     fh = storage.open(pic.name, "rb")
     image = Image.open(fh)
-    image.thumbnail(settings.WALDUR_MARKETPLACE["THUMBNAIL_SIZE"], Image.ANTIALIAS)
+    image.thumbnail(settings.WALDUR_MARKETPLACE["THUMBNAIL_SIZE"])
     fh.close()
 
     thumb_extension = os.path.splitext(pic.name)[1]
@@ -227,7 +227,7 @@ def format_list(resources):
 
 def get_order_url(order):
     return core_utils.format_homeport_link(
-        "projects/{project_uuid}/marketplace-order-details/{order_uuid}/",
+        "marketplace-order-details/{order_uuid}/",
         order_uuid=order.uuid.hex,
         project_uuid=order.project.uuid,
     )
@@ -648,16 +648,14 @@ def get_offering_projects(offering):
 
 
 def is_user_related_to_offering(offering, user):
-    if offering.type == BASIC_PLUGIN_NAME:
-        connected_projects = get_connected_projects(user)
-        return (
-            models.Resource.objects.filter(
-                offering=offering, project__in=connected_projects
-            )
-            .exclude(state=models.Resource.States.TERMINATED)
-            .exists()
+    connected_projects = get_connected_projects(user)
+    return (
+        models.Resource.objects.filter(
+            offering=offering, project__in=connected_projects
         )
-    return False
+        .exclude(state=models.Resource.States.TERMINATED)
+        .exists()
+    )
 
 
 def get_start_and_end_dates_from_request(request):
@@ -1345,7 +1343,7 @@ def order_should_not_be_reviewed_by_provider(order: models.Order):
         user_is_service_provider_owner = structure_permissions._has_owner_access(
             user, offering.customer
         )
-        user_is_service_provider_offering_manger = (
+        user_is_service_provider_offering_manager = (
             structure_permissions._has_service_manager_access(user, offering.customer)
             and offering.has_user(user)
         )
@@ -1353,7 +1351,7 @@ def order_should_not_be_reviewed_by_provider(order: models.Order):
         return (
             auto_approve_remote_orders
             or user_is_service_provider_owner
-            or user_is_service_provider_offering_manger
+            or user_is_service_provider_offering_manager
         )
 
     return True
@@ -1405,7 +1403,7 @@ def get_provider_approvers(order):
 
 def refresh_integration_agent_status(request, agent_type):
     user_agent = core_utils.get_user_agent(request)
-    if "waldur-slurm-agent" not in user_agent:
+    if "waldur-site-agent" not in user_agent:
         return
 
     offering_uuid = request.query_params.get("offering_uuid")
@@ -1502,3 +1500,56 @@ def validate_end_date(
 
     if end_date:
         resource.end_date_requested_by = user
+
+
+def sync_component_user_usage(allocation_user_usage, plugin_name):
+    allocation = allocation_user_usage.allocation
+    resource = models.Resource.objects.filter(scope=allocation).first()
+    if resource is None:
+        logger.error(
+            "The allocation %s does not have a linked resource, skipping processing",
+            allocation,
+        )
+        return
+
+    if resource.offering.type != plugin_name:
+        return
+
+    offering_user = None
+    if allocation_user_usage.user is not None:
+        offering_user = models.OfferingUser.objects.filter(
+            offering=resource.offering, user=allocation_user_usage.user
+        ).first()
+
+    for offering_component in models.OfferingComponent.objects.filter(
+        offering=resource.offering
+    ):
+        usage = getattr(allocation_user_usage, offering_component.type + "_usage")
+
+        component_usage = models.ComponentUsage.objects.filter(
+            resource=resource,
+            billing_period__month=allocation_user_usage.month,
+            billing_period__year=allocation_user_usage.year,
+            component=offering_component,
+        ).first()
+
+        if component_usage is None:
+            logger.warning(
+                "The component usage for %s component of %s does not exist, skipping component user usage sync",
+                offering_component,
+                allocation,
+            )
+            continue
+
+        component_user_usage, created = (
+            models.ComponentUserUsage.objects.update_or_create(
+                username=allocation_user_usage.username,
+                component_usage=component_usage,
+                defaults={"usage": usage, "user": offering_user},
+            )
+        )
+
+        if created:
+            logger.info("%s has been created", component_user_usage)
+        else:
+            logger.info("%s has been updated, new usage: %s", component_usage, usage)

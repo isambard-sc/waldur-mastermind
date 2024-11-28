@@ -56,13 +56,17 @@ class BaseExecutor:
         link = cls.get_success_signature(instance, serialized_instance, **kwargs)
         link_error = cls.get_failure_signature(instance, serialized_instance, **kwargs)
         if is_async:
-            return signature.apply_async(
+            async_result = signature.apply_async(
                 link=link,
                 link_error=link_error,
                 countdown=countdown,
                 queue=is_heavy_task and "heavy" or None,
             )
+            if hasattr(instance, "task_id"):
+                instance.task_id = async_result.id
+                instance.save(update_fields=["task_id"])
         else:
+            result = None
             try:
                 result = signature.apply()
             except Exception as exc:
@@ -76,10 +80,13 @@ class BaseExecutor:
             else:
                 callback = link if not result.failed() else link_error
 
-            if callback is not None:
-                if not callback.immutable:
-                    callback.args = (result.id,) + callback.args
-                callback.apply()
+            if result:
+                if callback is not None:
+                    if not callback.immutable:
+                        callback.args = (result.id,) + callback.args
+                    callback.apply()
+            else:
+                result = callback.apply()
             return result.get()  # wait until task is ready
 
     @classmethod

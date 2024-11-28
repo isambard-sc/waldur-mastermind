@@ -146,12 +146,6 @@ class ServiceResourcesPullTask(BackgroundPullTask):
             backend.pull_resources()
 
 
-class ServiceSubResourcesPullTask(BackgroundPullTask):
-    def pull(self, service_settings):
-        backend = service_settings.get_backend()
-        backend.pull_subresources()
-
-
 class ServicePropertiesListPullTask(ServiceListPullTask):
     name = "waldur_core.structure.ServicePropertiesListPullTask"
     pull_task = ServicePropertiesPullTask
@@ -160,11 +154,6 @@ class ServicePropertiesListPullTask(ServiceListPullTask):
 class ServiceResourcesListPullTask(ServiceListPullTask):
     name = "waldur_core.structure.ServiceResourcesListPullTask"
     pull_task = ServiceResourcesPullTask
-
-
-class ServiceSubResourcesListPullTask(ServiceListPullTask):
-    name = "waldur_core.structure.ServiceSubResourcesListPullTask"
-    pull_task = ServiceSubResourcesPullTask
 
 
 class RetryUntilAvailableTask(core_tasks.Task):
@@ -231,11 +220,7 @@ class SetErredStuckResources(core_tasks.BackgroundTask):
             structure_models.BaseResource.States.CREATING,
             structure_models.BaseResource.States.CREATION_SCHEDULED,
         )
-        resource_models = (
-            structure_models.BaseResource.get_all_models()
-            + structure_models.SubResource.get_all_models()
-        )
-        for model in resource_models:
+        for model in structure_models.BaseResource.get_all_models():
             for resource in model.objects.filter(modified__lt=cutoff, state__in=states):
                 resource.set_erred()
                 resource.error_message = "Provisioning has timed out."

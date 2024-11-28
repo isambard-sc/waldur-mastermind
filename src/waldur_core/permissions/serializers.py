@@ -6,7 +6,6 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from waldur_core.core.serializers import TranslatedModelSerializerMixin
 from waldur_core.core.utils import is_uuid_like
-from waldur_core.media.serializers import ProtectedImageField
 from waldur_core.permissions.enums import TYPE_MAP, PermissionEnum
 from waldur_core.permissions.utils import (
     get_create_permission,
@@ -40,6 +39,20 @@ class RoleDetailsSerializer(TranslatedModelSerializerMixin):
     permissions = serializers.SerializerMethodField()
     users_count = serializers.SerializerMethodField()
     content_type = serializers.ReadOnlyField(source="content_type.model")
+
+    def get_fields(self):
+        fields = super().get_fields()
+
+        try:
+            request = self.context["view"].request
+            user = request.user
+        except (KeyError, AttributeError):
+            return fields
+
+        if user.is_anonymous or not (user.is_staff or user.is_support):
+            del fields["users_count"]
+
+        return fields
 
     def get_permissions(self, role):
         return list(
@@ -115,7 +128,7 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
     user_email = serializers.ReadOnlyField(source="user.email")
     user_full_name = serializers.ReadOnlyField(source="user.full_name")
     user_username = serializers.ReadOnlyField(source="user.username")
-    user_image = ProtectedImageField(source="user.image")
+    user_image = serializers.ImageField(source="user.image", read_only=True)
     created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
     created_by_uuid = serializers.ReadOnlyField(source="created_by.uuid")
 
@@ -139,6 +152,9 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
 
 
 class PermissionSerializer(serializers.Serializer):
+    user_uuid = serializers.ReadOnlyField(source="user.uuid")
+    user_name = serializers.ReadOnlyField(source="user.full_name")
+    user_slug = serializers.ReadOnlyField(source="user.slug")
     created = serializers.ReadOnlyField()
     expiration_time = serializers.ReadOnlyField()
     created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")

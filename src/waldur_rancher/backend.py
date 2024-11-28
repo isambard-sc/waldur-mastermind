@@ -361,7 +361,7 @@ class RancherBackend(ServiceBackend):
         if user.backend_id:
             return
 
-        password = models.RancherUser.make_random_password()
+        password = core_utils.make_random_password
         response = self.client.create_user(
             name=user.user.username, username=user.user.username, password=password
         )
@@ -1406,8 +1406,8 @@ class RancherBackend(ServiceBackend):
             if remote_service.get("selector") != local_service.selector:
                 local_service.selector = remote_service.get("selector")
                 update_fields.add("selector")
-            if remote_service["clusterIp"] != local_service.cluster_ip:
-                local_service.cluster_ip = remote_service["clusterIp"]
+            if remote_service.get("clusterIp", "") != local_service.cluster_ip:
+                local_service.cluster_ip = remote_service.get("clusterIp", "")
                 update_fields.add("cluster_ip")
             if update_fields:
                 local_service.save(update_fields=update_fields)

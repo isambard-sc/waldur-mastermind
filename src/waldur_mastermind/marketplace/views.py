@@ -80,7 +80,6 @@ from waldur_core.structure.managers import (
 )
 from waldur_core.structure.registry import SupportedServices, get_resource_type
 from waldur_core.structure.serializers import (
-    ProjectUserSerializer,
     get_resource_serializer_class,
 )
 from waldur_core.structure.signals import resource_imported
@@ -511,6 +510,18 @@ class CategoryViewSet(PublicViewsetMixin, EagerLoadMixin, core_views.ActionsView
     ) = [structure_permissions.is_staff]
 
 
+class CategoryColumnsViewSet(PublicViewsetMixin, core_views.ActionsViewSet):
+    queryset = models.CategoryColumn.objects.all()
+    serializer_class = serializers.CategoryColumnSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.CategoryColumnFilter
+
+    create_permissions = update_permissions = partial_update_permissions = (
+        destroy_permissions
+    ) = [structure_permissions.is_staff]
+
+
 class CategoryGroupViewSet(PublicViewsetMixin, core_views.ActionsViewSet):
     queryset = models.CategoryGroup.objects.all()
     serializer_class = serializers.CategoryGroupSerializer
@@ -808,7 +819,19 @@ class ProviderOfferingViewSet(
             )
 
         backend = offering.scope.get_backend()
-        resources = getattr(backend, method)()
+        try:
+            if isinstance(offering.scope, structure_models.BaseResource):
+                resources = getattr(backend, method)(offering.scope)
+            else:
+                resources = getattr(backend, method)()
+        except Exception as e:
+            resources = []
+            logger.error(
+                "Listing importable resources of offering %s failed. Error %s",
+                offering,
+                str(e),
+            )
+
         page = self.paginate_queryset(resources)
         return self.get_paginated_response(page)
 
@@ -837,15 +860,26 @@ class ProviderOfferingViewSet(
 
         resource_model = plugins.manager.get_resource_model(offering.type)
 
+        if isinstance(offering.scope, structure_models.BaseResource):
+            field = "tenant"
+        else:
+            field = "service_settings"
         if resource_model.objects.filter(
-            service_settings=offering.scope, backend_id=backend_id
+            **{field: offering.scope}, backend_id=backend_id
         ).exists():
             raise rf_exceptions.ValidationError(
                 _("Resource has been imported already.")
             )
 
         try:
-            resource = getattr(backend, method)(backend_id=backend_id, project=project)
+            if isinstance(offering.scope, structure_models.BaseResource):
+                resource = getattr(backend, method)(
+                    offering.scope, backend_id=backend_id, project=project
+                )
+            else:
+                resource = getattr(backend, method)(
+                    backend_id=backend_id, project=project
+                )
         except ServiceBackendError as e:
             raise rf_exceptions.ValidationError(str(e))
         else:
@@ -992,7 +1026,7 @@ class ProviderOfferingViewSet(
     @action(detail=True, methods=["post"])
     def delete_thumbnail(self, request, uuid=None):
         offering = self.get_object()
-        offering.thumbnail = None
+        offering.thumbnail.delete()
         offering.save()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -1700,7 +1734,7 @@ class ProviderPlanViewSet(core_views.UpdateReversionMixin, core_views.ActionsVie
     queryset = models.Plan.objects.all()
     serializer_class = serializers.ProviderPlanDetailsSerializer
     filterset_class = filters.PlanFilter
-    filter_backends = (DjangoFilterBackend, filters.PlanFilterBackend)
+    filter_backends = (DjangoFilterBackend, filters.ProviderPlanFilterBackend)
 
     disabled_actions = ["destroy"]
     update_validators = partial_update_validators = [validate_plan_update]
@@ -1773,7 +1807,7 @@ class ProviderPlanViewSet(core_views.UpdateReversionMixin, core_views.ActionsVie
         serializer.save()
         return Response(status=status.HTTP_200_OK)
 
-    update_organization_groups_permissions = [structure_permissions.is_owner]
+    update_organization_groups_permissions = update_permissions
 
     @action(detail=True, methods=["post"])
     def delete_organization_groups(self, request, uuid=None):
@@ -1827,6 +1861,9 @@ class ScreenshotViewSet(
 
 
 class PluginViewSet(views.APIView):
+    permission_classes = ()
+    authentication_classes = ()
+
     def get(self, request):
         offering_types = plugins.manager.get_offering_types()
         payload = []
@@ -2127,7 +2164,7 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
+class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
     queryset = models.Resource.objects.all()
     filter_backends = (DjangoFilterBackend, filters.ResourceScopeFilterBackend)
     filterset_class = filters.ResourceFilter
@@ -2138,33 +2175,11 @@ class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
         serializers.ResourceUpdateSerializer
     )
 
-    def get_queryset(self):
-        return self.queryset.filter_for_user(self.request.user)
-
     def list(self, request, *args, **kwargs):
         utils.refresh_integration_agent_status(
             request, models.IntegrationStatus.AgentTypes.USAGE_REPORTING
         )
         return super().list(request, *args, **kwargs)
-
-    @action(detail=False, methods=["post"])
-    def suggest_name(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        project: structure_models.Project = serializer.validated_data["project"]
-        offering: models.Offering = serializer.validated_data["offering"]
-        resource_count = models.Resource.objects.filter(
-            project=project, offering=offering
-        ).count()
-        parts = [
-            project.customer.slug,
-            project.slug,
-            offering.slug,
-        ]
-        result = "-".join(parts) + "-" + str(resource_count + 1)
-        return Response({"name": result})
-
-    suggest_name_serializer_class = serializers.ResourceSuggestNameSerializer
 
     @action(detail=True, methods=["get"])
     def details(self, request, uuid=None):
@@ -2179,6 +2194,21 @@ class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
             instance=resource.scope, context=self.get_serializer_context()
         )
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"])
+    def unlink(self, request, uuid=None):
+        """
+        Delete marketplace resource and related plugin resource from the database without scheduling operations on backend
+        and without checking current state of the resource. It is intended to be used
+        for removing resource stuck in transitioning state.
+        """
+        obj = self.get_object()
+        if obj.scope:
+            obj.scope.delete()
+        obj.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    unlink_permissions = [structure_permissions.is_staff]
 
     def create_resource_order(self, request, resource, **kwargs):
         with transaction.atomic():
@@ -2219,6 +2249,219 @@ class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
             models.Resource.States.OK, models.Resource.States.ERRED
         ),
     ]
+
+    @action(detail=True, methods=["get"])
+    def plan_periods(self, request, uuid=None):
+        resource = self.get_object()
+        qs = models.ResourcePlanPeriod.objects.filter(resource=resource)
+        qs = qs.filter(Q(end=None) | Q(end__gte=month_start(timezone.now())))
+        serializer = serializers.ResourcePlanPeriodSerializer(qs, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"])
+    def move_resource(self, request, uuid=None):
+        resource = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        project = serializer.validated_data["project"]
+        try:
+            utils.move_resource(resource, project)
+        except utils.MoveResourceException as exception:
+            error_message = str(exception)
+            return JsonResponse({"error_message": error_message}, status=409)
+
+        serialized_resource = serializers.ResourceSerializer(
+            resource, context=self.get_serializer_context()
+        )
+
+        return Response(serialized_resource.data, status=status.HTTP_200_OK)
+
+    move_resource_serializer_class = serializers.MoveResourceSerializer
+    move_resource_permissions = [structure_permissions.is_staff]
+
+    @action(detail=True, methods=["post"])
+    def set_slug(self, request, uuid=None):
+        resource = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        new_slug = serializer.validated_data["slug"]
+        old_slug = resource.slug
+        if new_slug != old_slug:
+            resource.slug = serializer.validated_data["slug"]
+            resource.save()
+            logger.info(
+                "%s has changed slug from %s to %s",
+                request.user.full_name,
+                old_slug,
+                new_slug,
+            )
+
+            return Response(
+                {"status": _("Resource slug has been changed.")},
+                status=status.HTTP_200_OK,
+            )
+        else:
+            return Response(
+                {"status": _("Resource slug is not changed.")},
+                status=status.HTTP_200_OK,
+            )
+
+    set_slug_permissions = [structure_permissions.is_staff]
+
+    set_slug_serializer_class = serializers.ResourceSlugSerializer
+
+    def _set_end_date(self, request, is_staff_action):
+        resource = self.get_object()
+        serializer = serializers.ResourceEndDateByProviderSerializer(
+            data=request.data, instance=resource, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        transaction.on_commit(
+            lambda: tasks.notify_about_resource_termination.delay(
+                resource.uuid.hex, request.user.uuid.hex, is_staff_action
+            )
+        )
+
+        if not is_staff_action:
+            log.log_marketplace_resource_end_date_has_been_updated_by_provider(
+                resource, request.user
+            )
+        else:
+            log.log_marketplace_resource_end_date_has_been_updated_by_staff(
+                resource, request.user
+            )
+
+        return Response(status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"])
+    def set_end_date_by_staff(self, request, uuid=None):
+        return self._set_end_date(request, True)
+
+    set_end_date_by_staff_permissions = [structure_permissions.is_staff]
+
+    @action(detail=True, methods=["get"], renderer_classes=[PlainTextRenderer])
+    def glauth_users_config(self, request, uuid=None):
+        resource: models.Resource = self.get_object()
+        project = resource.project
+        offering = resource.offering
+
+        if not offering.secret_options.get(
+            "service_provider_can_create_offering_user", False
+        ):
+            logger.warning(
+                "Offering %s doesn't have feature service_provider_can_create_offering_user enabled, skipping GLauth config generation",
+                offering,
+            )
+            return Response(
+                status=status.HTTP_400_BAD_REQUEST,
+                data="Offering %s doesn't have feature service_provider_can_create_offering_user enabled"
+                % offering,
+            )
+
+        integration_status, _ = models.IntegrationStatus.objects.get_or_create(
+            offering=offering,
+            agent_type=models.IntegrationStatus.AgentTypes.GLAUTH_SYNC,
+        )
+        integration_status.set_last_request_timestamp()
+        integration_status.set_backend_active()
+        integration_status.save()
+
+        user_ids = get_project_users(project.id)
+
+        offering_users = models.OfferingUser.objects.filter(
+            offering=offering,
+            user__id__in=user_ids,
+        ).exclude(username="")
+
+        offering_groups = models.OfferingUserGroup.objects.filter(offering=offering)
+
+        user_records = utils.generate_glauth_records_for_offering_users(
+            offering, offering_users
+        )
+
+        robot_accounts = models.RobotAccount.objects.filter(resource__offering=offering)
+
+        robot_account_records = utils.generate_glauth_records_for_robot_accounts(
+            offering, robot_accounts
+        )
+
+        other_group_records = []
+        for group in offering_groups:
+            gid = group.backend_metadata["gid"]
+            record = textwrap.dedent(
+                f"""
+                    [[groups]]
+                      name = "{gid}"
+                      gidnumber = {gid}
+                """
+            )
+            other_group_records.append(record)
+
+        response_text = "\n".join(
+            user_records + robot_account_records + other_group_records
+        )
+
+        return Response(response_text)
+
+    @action(detail=True, methods=["get"])
+    def offering_for_subresources(self, request, uuid=None):
+        resource = self.get_object()
+
+        try:
+            scope = structure_models.ServiceSettings.objects.get(
+                scope=resource.scope,
+            )
+        except structure_models.ServiceSettings.DoesNotExist:
+            scope = resource.scope
+
+        offerings = models.Offering.objects.filter(scope=scope)
+        result = [
+            {"uuid": offering.uuid.hex, "type": offering.type} for offering in offerings
+        ]
+        return Response(result)
+
+    @action(detail=True, methods=["get"])
+    def team(self, request, uuid=None):
+        resource = self.get_object()
+        project = resource.project
+
+        return Response(
+            serializers.ProjectUserSerializer(
+                instance=project.get_users(),
+                many=True,
+                context={
+                    "project": project,
+                    "offering": resource.offering,
+                    "request": request,
+                },
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class ResourceViewSet(BaseResourceViewSet):
+    def get_queryset(self):
+        return self.queryset.filter_for_user(self.request.user)
+
+    @action(detail=False, methods=["post"])
+    def suggest_name(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        project: structure_models.Project = serializer.validated_data["project"]
+        offering: models.Offering = serializer.validated_data["offering"]
+        resource_count = models.Resource.objects.filter(
+            project=project, offering=offering
+        ).count()
+        parts = [
+            project.customer.slug,
+            project.slug,
+            offering.slug,
+        ]
+        result = "-".join(parts) + "-" + str(resource_count + 1)
+        return Response({"name": result})
+
+    suggest_name_serializer_class = serializers.ResourceSuggestNameSerializer
 
     @action(detail=True, methods=["post"])
     def switch_plan(self, request, uuid=None):
@@ -2281,34 +2524,37 @@ class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
         core_validators.StateValidator(models.Resource.States.OK),
     ]
 
-    @action(detail=True, methods=["get"])
-    def plan_periods(self, request, uuid=None):
-        resource = self.get_object()
-        qs = models.ResourcePlanPeriod.objects.filter(resource=resource)
-        qs = qs.filter(Q(end=None) | Q(end__gte=month_start(timezone.now())))
-        serializer = serializers.ResourcePlanPeriodSerializer(qs, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
-
     @action(detail=True, methods=["post"])
-    def move_resource(self, request, uuid=None):
+    def update_options(self, request, uuid=None):
         resource = self.get_object()
-        serializer = self.get_serializer(data=request.data)
+        serializer = self.get_serializer(data=request.data, instance=resource)
         serializer.is_valid(raise_exception=True)
-        project = serializer.validated_data["project"]
-        try:
-            utils.move_resource(resource, project)
-        except utils.MoveResourceException as exception:
-            error_message = str(exception)
-            return JsonResponse({"error_message": error_message}, status=409)
+        serializer.save()
 
-        serialized_resource = serializers.ResourceSerializer(
-            resource, context=self.get_serializer_context()
+        return Response(
+            {"status": _("Resource options are submitted")}, status=status.HTTP_200_OK
         )
 
-        return Response(serialized_resource.data, status=status.HTTP_200_OK)
+    update_options_permissions = [
+        permission_factory(
+            PermissionEnum.UPDATE_RESOURCE_OPTIONS,
+            ["project", "project.customer"],
+        )
+    ]
+    update_options_serializer_class = serializers.ResourceOptionsSerializer
 
-    move_resource_serializer_class = serializers.MoveResourceSerializer
-    move_resource_permissions = [structure_permissions.is_staff]
+
+class ProviderResourceViewSet(BaseResourceViewSet):
+    def get_queryset(self):
+        return self.queryset.filter_for_offering_customer(self.request.user)
+
+    @action(detail=True, methods=["post"])
+    def set_end_date_by_provider(self, request, uuid=None):
+        return self._set_end_date(request, False)
+
+    set_end_date_by_provider_permissions = [
+        permissions.user_can_set_end_date_by_provider
+    ]
 
     @action(detail=True, methods=["post"])
     def set_backend_id(self, request, uuid=None):
@@ -2346,35 +2592,6 @@ class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
     set_backend_id_serializer_class = serializers.ResourceBackendIDSerializer
 
     @action(detail=True, methods=["post"])
-    def set_slug(self, request, uuid=None):
-        resource = self.get_object()
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        new_slug = serializer.validated_data["slug"]
-        old_slug = resource.slug
-        if new_slug != old_slug:
-            resource.slug = serializer.validated_data["slug"]
-            resource.save()
-            logger.info(
-                "%s has changed slug from %s to %s",
-                request.user.full_name,
-                old_slug,
-                new_slug,
-            )
-
-            return Response(
-                {"status": _("Resource slug has been changed.")},
-                status=status.HTTP_200_OK,
-            )
-        else:
-            return Response(
-                {"status": _("Resource slug is not changed.")},
-                status=status.HTTP_200_OK,
-            )
-
-    set_slug_serializer_class = serializers.ResourceSlugSerializer
-
-    @action(detail=True, methods=["post"])
     def submit_report(self, request, uuid=None):
         resource = self.get_object()
         serializer = self.get_serializer(data=request.data)
@@ -2393,202 +2610,80 @@ class ResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
     submit_report_serializer_class = serializers.ResourceReportSerializer
 
     @action(detail=True, methods=["post"])
-    def update_options(self, request, uuid=None):
+    def set_backend_metadata(self, request, uuid=None):
         resource = self.get_object()
-        serializer = self.get_serializer(data=request.data, instance=resource)
+        serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
 
-        return Response(
-            {"status": _("Resource options are submitted")}, status=status.HTTP_200_OK
-        )
-
-    update_options_permissions = [
-        permission_factory(
-            PermissionEnum.UPDATE_RESOURCE_OPTIONS,
-            ["project", "project.customer"],
-        )
-    ]
-    update_options_serializer_class = serializers.ResourceOptionsSerializer
-
-    def _set_end_date(self, request, is_staff_action):
-        resource = self.get_object()
-        serializer = serializers.ResourceEndDateByProviderSerializer(
-            data=request.data, instance=resource, context={"request": request}
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        transaction.on_commit(
-            lambda: tasks.notify_about_resource_termination.delay(
-                resource.uuid.hex, request.user.uuid.hex, is_staff_action
-            )
-        )
-
-        if not is_staff_action:
-            log.log_marketplace_resource_end_date_has_been_updated_by_provider(
-                resource, request.user
-            )
-        else:
-            log.log_marketplace_resource_end_date_has_been_updated_by_staff(
-                resource, request.user
-            )
-
-        return Response(status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=["post"])
-    def set_end_date_by_provider(self, request, uuid=None):
-        return self._set_end_date(request, False)
-
-    set_end_date_by_provider_permissions = [
-        permissions.user_can_set_end_date_by_provider
-    ]
-
-    @action(detail=True, methods=["post"])
-    def set_end_date_by_staff(self, request, uuid=None):
-        return self._set_end_date(request, True)
-
-    set_end_date_by_staff_permissions = [structure_permissions.is_staff]
-
-    # Service provider endpoint only
-    @action(detail=True, methods=["get"])
-    def team(self, request, uuid=None):
-        resource = self.get_object()
-        project = resource.project
-
-        return Response(
-            ProjectUserSerializer(
-                instance=project.get_users(),
-                many=True,
-                context={"project": project, "request": request},
-            ).data,
-            status=status.HTTP_200_OK,
-        )
-
-    team_permissions = [
-        permission_factory(PermissionEnum.LIST_RESOURCE_USERS, ["offering.customer"])
-    ]
-
-    # Service provider endpoint only
-    @action(detail=True, methods=["post"])
-    def downscaling_request_completed(self, request, uuid=None):
-        resource = self.get_object()
-        resource.requested_downscaling = False
+        resource.backend_metadata = serializer.validated_data["backend_metadata"]
         resource.save()
-        logger.info(
-            "Downscaling request for resource %s completed",
-            resource,
+
+        return Response(
+            {"status": _("The backend metadata is updated")}, status=status.HTTP_200_OK
         )
-        log.log_resource_downscaled(resource)
 
-        return Response(status=status.HTTP_200_OK)
-
-    downscaling_request_completed_permissions = [
+    set_backend_metadata_permissions = [
         permission_factory(
-            PermissionEnum.COMPLETE_RESOURCE_DOWNSCALING, ["offering.customer"]
+            PermissionEnum.SET_RESOURCE_BACKEND_METADATA,
+            ["offering.customer"],
         )
     ]
 
-    def downscaling_is_requested(obj):
-        if not obj.requested_downscaling:
-            raise ValidationError("Downscaling has not been requested.")
-
-    downscaling_request_completed_validators = [downscaling_is_requested]
-
-    @action(detail=True, methods=["get"])
-    def offering_for_subresources(self, request, uuid=None):
-        resource = self.get_object()
-
-        try:
-            service_settings = structure_models.ServiceSettings.objects.get(
-                scope=resource.scope,
-            )
-        except structure_models.ServiceSettingsDoesNotExist:
-            return Response([])
-
-        offerings = models.Offering.objects.filter(scope=service_settings)
-        result = [
-            {"uuid": offering.uuid.hex, "type": offering.type} for offering in offerings
-        ]
-        return Response(result)
-
-    @action(detail=True, methods=["get"], renderer_classes=[PlainTextRenderer])
-    def glauth_users_config(self, request, uuid=None):
-        resource: models.Resource = self.get_object()
-        project = resource.project
-        offering = resource.offering
-
-        if not offering.secret_options.get(
-            "service_provider_can_create_offering_user", False
-        ):
-            logger.warning(
-                "Offering %s doesn't have feature service_provider_can_create_offering_user enabled, skipping GLauth config generation",
-                offering,
-            )
-            return Response(
-                status=status.HTTP_400_BAD_REQUEST,
-                data="Offering %s doesn't have feature service_provider_can_create_offering_user enabled"
-                % offering,
-            )
-
-        integration_status, _ = models.IntegrationStatus.objects.get_or_create(
-            offering=offering,
-            agent_type=models.IntegrationStatus.AgentTypes.GLAUTH_SYNC,
-        )
-        integration_status.set_last_request_timestamp()
-        integration_status.set_backend_active()
-        integration_status.save()
-
-        user_ids = get_project_users(project.id)
-
-        offering_users = models.OfferingUser.objects.filter(
-            offering=offering,
-            user__id__in=user_ids,
-        ).exclude(username="")
-
-        offering_groups = models.OfferingUserGroup.objects.filter(offering=offering)
-
-        user_records = utils.generate_glauth_records_for_offering_users(
-            offering, offering_users
-        )
-
-        robot_accounts = models.RobotAccount.objects.filter(resource__offering=offering)
-
-        robot_account_records = utils.generate_glauth_records_for_robot_accounts(
-            offering, robot_accounts
-        )
-
-        other_group_records = []
-        for group in offering_groups:
-            gid = group.backend_metadata["gid"]
-            record = textwrap.dedent(
-                f"""
-                [[groups]]
-                  name = "{gid}"
-                  gidnumber = {gid}
-            """
-            )
-            other_group_records.append(record)
-
-        response_text = "\n".join(
-            user_records + robot_account_records + other_group_records
-        )
-
-        return Response(response_text)
+    set_backend_metadata_serializer_class = (
+        serializers.ResourceBackendMetadataSerializer
+    )
 
     @action(detail=True, methods=["post"])
-    def unlink(self, request, uuid=None):
-        """
-        Delete marketplace resource and related plugin resource from the database without scheduling operations on backend
-        and without checking current state of the resource. It is intended to be used
-        for removing resource stuck in transitioning state.
-        """
-        obj = self.get_object()
-        if obj.scope:
-            obj.scope.delete()
-        obj.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+    def set_as_erred(self, request, uuid=None):
+        resource = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
-    unlink_permissions = [structure_permissions.is_staff]
+        if serializer.validated_data.get("error_message"):
+            resource.error_message = serializer.validated_data["error_message"]
+
+        if serializer.validated_data.get("error_traceback"):
+            resource.error_traceback = serializer.validated_data["error_traceback"]
+
+        resource.set_state_erred()
+        resource.save()
+
+        if resource.scope and hasattr(resource.scope, "set_erred"):
+            resource.scope.set_erred()
+            resource.scope.save()
+
+        return Response(status=status.HTTP_200_OK)
+
+    set_as_erred_permissions = [
+        permission_factory(
+            PermissionEnum.SET_RESOURCE_STATE,
+            ["offering.customer"],
+        )
+    ]
+
+    set_as_erred_serializer_class = serializers.ResourceSetStateErredSerializer
+
+    @action(detail=True, methods=["post"])
+    def set_as_ok(self, request, uuid=None):
+        resource = self.get_object()
+
+        resource.set_state_ok()
+        resource.error_message = ""
+        resource.error_traceback = ""
+        resource.save()
+
+        if resource.scope and hasattr(resource.scope, "set_ok"):
+            resource.scope.set_ok()
+            resource.scope.save()
+
+        return Response(status=status.HTTP_200_OK)
+
+    set_as_erred_permissions = [
+        permission_factory(
+            PermissionEnum.SET_RESOURCE_STATE,
+            ["offering.customer"],
+        )
+    ]
 
 
 class ResourceOfferingsViewSet(ListAPIView):
@@ -2664,7 +2759,7 @@ class RelatedCustomersViewSet(ListAPIView):
         customer = self.get_customer()
         customer_ids = (
             models.Resource.objects.all()
-            .filter_for_user(self.request.user)
+            .filter_for_offering_customer(self.request.user)
             .filter(offering__customer=customer)
             .values_list("project__customer_id", flat=True)
             .distinct()
@@ -2686,6 +2781,7 @@ class CategoryComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
 
 class ComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
     queryset = models.ComponentUsage.objects.all().order_by("-date", "component__type")
+    lookup_field = "uuid"
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.ComponentUsageFilter
     serializer_class = serializers.ComponentUsageSerializer
@@ -2709,6 +2805,46 @@ class ComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
         return Response(status=status.HTTP_201_CREATED)
 
     set_usage_serializer_class = serializers.ComponentUsageCreateSerializer
+
+    @action(detail=True, methods=["post"])
+    def set_user_usage(self, request, *args, **kwargs):
+        component_usage = self.get_object()
+        serializer = self.get_serializer(
+            data=request.data,
+        )
+        serializer.is_valid(raise_exception=True)
+
+        validated_data = serializer.validated_data
+        existing_user_usage = models.ComponentUserUsage.objects.filter(
+            component_usage=component_usage, username=validated_data["username"]
+        ).first()
+
+        if existing_user_usage is None:
+            serializer.validated_data["component_usage"] = component_usage
+            serializer.save()
+        else:
+            existing_user_usage.usage = validated_data["usage"]
+            existing_user_usage.save()
+        return Response(status=status.HTTP_201_CREATED)
+
+    set_user_usage_serializer_class = serializers.ComponentUserUsageCreateSerializer
+
+    set_user_usage_permissions = [
+        permission_factory(
+            PermissionEnum.SET_RESOURCE_USAGE,
+            ["resource.offering", "resource.offering.customer"],
+        )
+    ]
+
+
+class ComponentUserUsageViewSet(core_views.ReadOnlyActionsViewSet):
+    lookup_field = "uuid"
+    queryset = models.ComponentUserUsage.objects.all().order_by(
+        "-component_usage__date", "component_usage__component__type"
+    )
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.ComponentUserUsageFilter
+    serializer_class = serializers.ComponentUserUsageSerializer
 
 
 class MarketplaceAPIViewSet(rf_viewsets.ViewSet):
@@ -2778,6 +2914,8 @@ class OfferingUsersViewSet(
     mixins.RetrieveModelMixin,
     mixins.ListModelMixin,
     mixins.CreateModelMixin,
+    mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
     rf_viewsets.GenericViewSet,
 ):
     queryset = models.OfferingUser.objects.all()
@@ -2785,6 +2923,16 @@ class OfferingUsersViewSet(
     lookup_field = "uuid"
     filter_backends = (DjangoFilterBackend,)
     filterset_class = filters.OfferingUserFilter
+
+    def perform_destroy(self, instance):
+        request = self.request
+        offering = instance.offering
+
+        if not has_permission(
+            request, PermissionEnum.DELETE_OFFERING_USER, offering.customer
+        ):
+            raise PermissionDenied(_("You do not have permission to delete this user."))
+        instance.delete()
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -3565,9 +3713,43 @@ class GlobalCategoriesViewSet(views.APIView):
             .order_by()
             .filter_for_user(request.user)
             .exclude(state=models.Resource.States.TERMINATED)
-            .values("offering__category__uuid")
-            .annotate(count=Count("*"))
         )
+
+        project_uuid = request.query_params.get("project_uuid")
+        customer_uuid = request.query_params.get("customer_uuid")
+
+        if project_uuid:
+            resources = resources.filter(project__uuid=project_uuid)
+
+        if customer_uuid:
+            resources = resources.filter(project__customer__uuid=customer_uuid)
+
+        qs = resources.values("offering__category__uuid").annotate(count=Count("*"))
         return Response(
-            {row["offering__category__uuid"].hex: row["count"] for row in resources}
+            {row["offering__category__uuid"].hex: row["count"] for row in qs}
         )
+
+
+class IntegrationStatusViewSet(core_views.ReadOnlyActionsViewSet):
+    lookup_field = "uuid"
+    queryset = models.IntegrationStatus.objects.all()
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.IntegrationStatusFilter
+    serializer_class = serializers.IntegrationStatusDetailsSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_staff or user.is_support:
+            return qs
+
+        offerings = [
+            offering
+            for offering in models.Offering.objects.all().filter_for_user(user)
+            if offering.customer.has_user(user, structure_models.CustomerRole.OWNER)
+            or offering.customer.has_user(
+                user,
+                structure_models.CustomerRole.SERVICE_MANAGER,
+            )
+        ]
+        return qs.filter(offering__in=offerings)

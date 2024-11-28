@@ -1,26 +1,18 @@
 import logging
 
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import MultipleObjectsReturned, ObjectDoesNotExist
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
-from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
-from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
-from waldur_openstack.openstack import models as openstack_models
-from waldur_openstack.openstack_base.utils import volume_type_name_to_quota_name
-from waldur_openstack.openstack_tenant import apps as openstack_tenant_apps
-from waldur_openstack.openstack_tenant import models as openstack_tenant_models
+from waldur_openstack import models as openstack_models
+from waldur_openstack.utils import volume_type_name_to_quota_name
 
 from . import (
-    CORES_TYPE,
     INSTANCE_TYPE,
-    RAM_TYPE,
-    SHARED_INSTANCE_TYPE,
     STORAGE_MODE_FIXED,
-    STORAGE_TYPE,
     TENANT_TYPE,
     VOLUME_TYPE,
     tasks,
@@ -48,17 +40,9 @@ def create_offering_from_tenant(sender, instance, created=False, **kwargs):
 
 
 def archive_offering(sender, instance, **kwargs):
-    service_settings = instance
-
-    if (
-        service_settings.type
-        == openstack_tenant_apps.OpenStackTenantConfig.service_name
-        and service_settings.content_type
-        == ContentType.objects.get_for_model(openstack_models.Tenant)
-    ):
-        marketplace_models.Offering.objects.filter(scope=service_settings).update(
-            state=marketplace_models.Offering.States.ARCHIVED
-        )
+    marketplace_models.Offering.objects.filter(scope=instance).update(
+        state=marketplace_models.Offering.States.ARCHIVED
+    )
 
 
 def synchronize_volume_metadata_on_save(sender, instance, created=False, **kwargs):
@@ -177,23 +161,19 @@ def synchronize_directly_connected_ips(sender, instance, created=False, **kwargs
     utils.import_instance_metadata(resource)
 
 
-def synchronize_internal_ips(sender, instance, created=False, **kwargs):
-    internal_ip = instance
-    if not created and not set(internal_ip.tracker.changed()) & {
+def synchronize_ports(sender, instance, created=False, **kwargs):
+    port = instance
+    if not created and not set(port.tracker.changed()) & {
         "fixed_ips",
         "instance_id",
     }:
         return
 
-    vms = {
-        vm
-        for vm in (internal_ip.instance_id, internal_ip.tracker.previous("instance_id"))
-        if vm
-    }
+    vms = {vm for vm in (port.instance_id, port.tracker.previous("instance_id")) if vm}
 
     for vm in vms:
         try:
-            scope = openstack_tenant_models.Instance.objects.get(id=vm)
+            scope = openstack_models.Instance.objects.get(id=vm)
             resource = marketplace_models.Resource.objects.get(scope=scope)
         except ObjectDoesNotExist:
             logger.debug(
@@ -211,23 +191,21 @@ def synchronize_floating_ips(sender, instance, created=False, **kwargs):
     floating_ip = instance
     if not created and not set(instance.tracker.changed()) & {
         "address",
-        "internal_ip_id",
+        "port_id",
     }:
         return
 
-    internal_ips = {
+    ports = {
         ip
         for ip in (
-            floating_ip.internal_ip_id,
-            floating_ip.tracker.previous("internal_ip_id"),
+            floating_ip.port_id,
+            floating_ip.tracker.previous("port_id"),
         )
         if ip
     }
-    for ip_id in internal_ips:
+    for ip_id in ports:
         try:
-            scope = openstack_tenant_models.Instance.objects.get(
-                internal_ips_set__id=ip_id
-            )
+            scope = openstack_models.Instance.objects.get(ports__id=ip_id)
             resource = marketplace_models.Resource.objects.get(scope=scope)
         except ObjectDoesNotExist:
             logger.debug(
@@ -258,7 +236,7 @@ def import_instance_metadata(vm):
         utils.import_instance_metadata(resource)
 
 
-def synchronize_internal_ips_on_delete(sender, instance, **kwargs):
+def synchronize_ports_on_delete(sender, instance, **kwargs):
     try:
         vm = instance.instance
     except ObjectDoesNotExist:
@@ -268,8 +246,8 @@ def synchronize_internal_ips_on_delete(sender, instance, **kwargs):
 
 
 def synchronize_floating_ips_on_delete(sender, instance, **kwargs):
-    if instance.internal_ip:
-        import_instance_metadata(instance.internal_ip.instance)
+    if instance.port:
+        import_instance_metadata(instance.port.instance)
 
 
 def create_resource_of_volume_if_instance_created(
@@ -325,10 +303,10 @@ def import_resource_metadata_when_resource_is_created(
     #  and the tracker includes the fields set when the resource was created.
     instance.tracker.set_saved_fields(fields=instance.tracker.changed())
 
-    if isinstance(instance.scope, openstack_tenant_models.Volume):
+    if isinstance(instance.scope, openstack_models.Volume):
         utils.import_volume_metadata(instance)
 
-    if isinstance(instance.scope, openstack_tenant_models.Instance):
+    if isinstance(instance.scope, openstack_models.Instance):
         utils.import_instance_metadata(instance)
 
 
@@ -357,7 +335,7 @@ def update_openstack_tenant_usages(sender, instance, created=False, **kwargs):
 def create_offering_component_for_volume_type(
     sender, instance, created=False, **kwargs
 ):
-    volume_type = instance
+    volume_type: openstack_models.VolumeType = instance
 
     try:
         offering = marketplace_models.Offering.objects.get(scope=volume_type.settings)
@@ -366,7 +344,7 @@ def create_offering_component_for_volume_type(
             "Skipping synchronization of volume type with "
             "marketplace because offering for service settings is not have found. "
             "Settings ID: %s",
-            instance.settings.id,
+            volume_type.settings.id,
         )
         return
 
@@ -388,12 +366,12 @@ def create_offering_component_for_volume_type(
         content_type=content_type,
         defaults=dict(
             offering=offering,
-            name="Storage (%s)" % instance.name,
+            name="Storage (%s)" % volume_type.name,
             # It is expected that internal name of offering component related to volume type
             # matches storage quota name generated in OpenStack
-            type=volume_type_name_to_quota_name(instance.name),
+            type=volume_type_name_to_quota_name(volume_type.name),
             measured_unit="GB",
-            description=instance.description,
+            description=volume_type.description,
             billing_type=marketplace_models.OfferingComponent.BillingTypes.LIMIT,
             limit_period=marketplace_models.OfferingComponent.LimitPeriods.MONTH,
         ),
@@ -407,7 +385,7 @@ def delete_offering_component_for_volume_type(sender, instance, **kwargs):
 def synchronize_limits_when_storage_mode_is_switched(
     sender, instance, created=False, **kwargs
 ):
-    offering = instance
+    offering: marketplace_models.Offering = instance
 
     if created:
         return
@@ -436,7 +414,8 @@ def synchronize_limits_when_storage_mode_is_switched(
     logger.info(
         "Synchronizing OpenStack tenant limits because storage mode is switched "
         "from %s to %s",
-        (old_mode, new_mode),
+        old_mode,
+        new_mode,
     )
 
     resources = marketplace_models.Resource.objects.filter(offering=offering).exclude(
@@ -481,104 +460,17 @@ def synchronize_tenant_name(sender, instance, offering=None, plan=None, **kwargs
     if not instance.tracker.has_changed("name"):
         return
 
-    service_settings = structure_models.ServiceSettings.objects.filter(
+    offerings = marketplace_models.Offering.objects.filter(
         object_id=tenant.id, content_type=ContentType.objects.get_for_model(tenant)
     )
 
-    for ss in service_settings:
-        offerings = marketplace_models.Offering.objects.filter(
-            object_id=ss.id, content_type=ContentType.objects.get_for_model(ss)
-        )
+    for offering in offerings.filter(type=INSTANCE_TYPE):
+        offering.name = utils.get_offering_name_for_instance(tenant)
+        offering.save(update_fields=["name"])
 
-        for offering in offerings.filter(type=INSTANCE_TYPE):
-            offering.name = utils.get_offering_name_for_instance(tenant)
-            offering.save(update_fields=["name"])
-
-        for offering in offerings.filter(type=VOLUME_TYPE):
-            offering.name = utils.get_offering_name_for_volume(tenant)
-            offering.save(update_fields=["name"])
-
-
-def update_usage_when_instance_configuration_is_updated(
-    sender, instance, created=False, **kwargs
-):
-    if instance.offering.type != SHARED_INSTANCE_TYPE:
-        return
-
-    if not created and not instance.tracker.has_changed("attributes"):
-        return
-
-    flavor_url = instance.attributes.get("flavor")
-    if not flavor_url:
-        return
-
-    try:
-        flavor = core_utils.instance_from_url(flavor_url)
-    except ObjectDoesNotExist:
-        logger.warning(
-            "Skipping OpenStack instance usage synchronization because flavor is not found."
-            "Resource ID: %s",
-            instance.id,
-        )
-        return
-
-    if not isinstance(flavor, openstack_tenant_models.Flavor):
-        logger.warning(
-            "Skipping OpenStack instance usage synchronization because flavor is not found."
-            "Resource ID: %s",
-            instance.id,
-        )
-        return
-
-    data_volume_size = instance.attributes.get("data_volume_size", 0)
-    system_volume_size = instance.attributes.get("system_volume_size", 0)
-
-    try:
-        plan_period = marketplace_models.ResourcePlanPeriod.objects.get(
-            resource=instance, end=None
-        )
-    except (ObjectDoesNotExist, MultipleObjectsReturned):
-        logger.warning(
-            "Skipping OpenStack instance usage synchronization because valid "
-            "ResourcePlanPeriod is not found. Resource ID: %s",
-            instance.id,
-        )
-        return
-
-    try:
-        ram_component = marketplace_models.OfferingComponent.objects.get(
-            offering=instance.offering, type=RAM_TYPE
-        )
-        cores_component = marketplace_models.OfferingComponent.objects.get(
-            offering=instance.offering, type=CORES_TYPE
-        )
-        storage_component = marketplace_models.OfferingComponent.objects.get(
-            offering=instance.offering, type=STORAGE_TYPE
-        )
-    except marketplace_models.OfferingComponent.DoesNotExist:
-        logger.warning(
-            "Skipping OpenStack instance usage synchronization because related offering component is not found."
-            "Resource ID: %s",
-            instance.id,
-        )
-        return
-
-    current_date = timezone.now()
-    billing_period = core_utils.month_start(current_date)
-    components = (
-        (ram_component, flavor.ram),
-        (cores_component, flavor.cores),
-        (storage_component, data_volume_size + system_volume_size),
-    )
-
-    for component, usage in components:
-        marketplace_models.ComponentUsage.objects.update_or_create(
-            resource=instance,
-            component=component,
-            billing_period=billing_period,
-            plan_period=plan_period,
-            defaults={"usage": usage, "date": current_date},
-        )
+    for offering in offerings.filter(type=VOLUME_TYPE):
+        offering.name = utils.get_offering_name_for_volume(tenant)
+        offering.save(update_fields=["name"])
 
 
 def synchronize_router_backend_metadata(sender, instance, created=False, **kwargs):
@@ -640,3 +532,37 @@ def set_mtu_when_network_has_been_created(sender, instance, created=False, **kwa
     if mtu:
         network.mtu = mtu
         network.save()
+
+
+def update_floating_ip_external_addresses(sender, instance, created=False, **kwargs):
+    floating_ip = instance
+
+    if not created:
+        return
+
+    utils.update_external_addresses_of_floating_ip(floating_ip)
+
+
+def update_instances_ip_external_addresses(sender, instance, created=False, **kwargs):
+    offering = instance
+
+    if offering.type != TENANT_TYPE:
+        return
+
+    if not created and not offering.tracker.has_changed("secret_options"):
+        return
+
+    previous_secret_options = offering.tracker.previous("secret_options") or {}
+
+    if "ipv4_external_ip_mapping" not in offering.secret_options.keys() and (
+        not previous_secret_options
+        or "ipv4_external_ip_mapping" not in previous_secret_options.keys()
+    ):
+        return
+
+    if previous_secret_options.get(
+        "ipv4_external_ip_mapping", []
+    ) == offering.secret_options.get("ipv4_external_ip_mapping", []):
+        return
+
+    utils.update_external_addresses_of_offering_floating_ips(offering)

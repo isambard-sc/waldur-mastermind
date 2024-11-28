@@ -51,15 +51,11 @@ class ServiceBackend(ABC):
     def sync(self):
         self.pull_service_properties()
         self.pull_resources()
-        self.pull_subresources()
 
     def pull_service_properties(self):
         pass
 
     def pull_resources(self):
-        pass
-
-    def pull_subresources(self):
         pass
 
     def has_global_properties(self):
@@ -94,12 +90,4 @@ class ServiceBackend(ABC):
             if remote_resource["backend_id"] in local_backend_ids:
                 continue
             result.append(remote_resource)
-        return result
-
-    def get_expired_resources(self, resource_model, remote_resources_ids):
-        local_resources = resource_model.objects.filter(service_settings=self.settings)
-        result = []
-        for resource in local_resources:
-            if resource.backend_id not in remote_resources_ids:
-                result.append(resource)
         return result

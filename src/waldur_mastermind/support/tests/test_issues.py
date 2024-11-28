@@ -3,21 +3,26 @@ from unittest import mock
 
 from constance.test.pytest import override_config
 from ddt import data, ddt
+from django.conf import settings
 from jira import Issue, User
 from jira.resources import IssueType, RequestType
 from rest_framework import status, test
 
+from waldur_core.core.authentication import TokenAuthentication
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.support import models, utils
 from waldur_mastermind.support.backend.atlassian import ServiceDeskBackend
 from waldur_mastermind.support.tests import base, factories
 from waldur_mastermind.support.tests.base import load_resource
-from waldur_openstack.openstack_tenant.tests import (
-    factories as openstack_tenant_factories,
+from waldur_openstack.tests import (
+    fixtures as openstack_fixtures,
 )
-from waldur_openstack.openstack_tenant.tests import (
-    fixtures as openstack_tenant_fixtures,
+from waldur_openstack.tests.factories import FloatingIPFactory, PortFactory
+
+IMPERSONATED_USER_HEADER = settings.WALDUR_CORE.get(
+    "REQUEST_HEADER_IMPERSONATED_USER_UUID"
 )
+IMPERSONATOR_HEADER = settings.WALDUR_CORE.get("RESPONSE_HEADER_IMPERSONATOR_UUID")
 
 
 @ddt
@@ -114,7 +119,7 @@ class IssueCreateBaseTest(base.BaseTest):
 
     def _mock_jira(self, old_jira=False, user=None):
         mock.patch.stopall()
-        mock_patch = mock.patch("waldur_jira.backend.JIRA")
+        mock_patch = mock.patch("waldur_mastermind.support.backend.atlassian.JIRA")
         self.mock_jira = mock_patch.start()
         self.mock_jira().fields.return_value = json.loads(
             load_resource("jira_fields.json")
@@ -515,6 +520,25 @@ class IssueCreateTest(IssueCreateBaseTest):
                 else:
                     _add_comment.assert_not_called()
 
+    def test_add_impersonator_name_to_description(self):
+        staff = self.fixture.staff
+        impersonated_user = self.fixture.global_support
+
+        token = TokenAuthentication().get_model().objects.get(user=staff)
+        self.client.credentials(
+            **{
+                "HTTP_AUTHORIZATION": "Token " + token.key,
+                IMPERSONATED_USER_HEADER: impersonated_user.uuid.hex,
+            }
+        )
+        factories.SupportUserFactory(user=staff)
+        priority = factories.PriorityFactory()
+        response = self.client.post(
+            self.url, data=self._get_valid_payload(priority=priority.name)
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(staff.username in response.data["description"])
+
 
 @override_config(ATLASSIAN_USE_OLD_API=True)
 class IssueCreateOldAPITest(IssueCreateBaseTest):
@@ -640,7 +664,7 @@ class IssueFilterTest(base.BaseTest):
             customer=self.fixture.customer, project=self.fixture.project
         )
         self.url = factories.IssueFactory.get_list_url()
-        self.openstack_fixture = openstack_tenant_fixtures.OpenStackTenantFixture()
+        self.openstack_fixture = openstack_fixtures.OpenStackFixture()
         self.issue.resource = self.openstack_fixture.instance
         self.issue.save()
 
@@ -659,10 +683,8 @@ class IssueFilterTest(base.BaseTest):
         self.assertEqual(response.data[0]["uuid"], self.issue.uuid.hex)
 
     def test_filter_by_internal_ip(self):
-        self.openstack_fixture.internal_ip.fixed_ips = [
-            {"ip_address": "111.222.333.444"}
-        ]
-        self.openstack_fixture.internal_ip.save()
+        self.openstack_fixture.port.fixed_ips = [{"ip_address": "111.222.333.444"}]
+        self.openstack_fixture.port.save()
         self.client.force_authenticate(self.fixture.staff)
 
         response = self.client.get(
@@ -679,12 +701,8 @@ class IssueFilterTest(base.BaseTest):
         self.assertEqual(response.data[0]["uuid"], self.issue.uuid.hex)
 
     def test_filter_by_external_ip(self):
-        internal_ip = openstack_tenant_factories.InternalIPFactory(
-            instance=self.openstack_fixture.instance
-        )
-        floating_ip = openstack_tenant_factories.FloatingIPFactory(
-            internal_ip=internal_ip
-        )
+        port = PortFactory(instance=self.openstack_fixture.instance)
+        floating_ip = FloatingIPFactory(port=port)
         self.client.force_authenticate(self.fixture.staff)
 
         response = self.client.get(

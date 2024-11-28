@@ -3,9 +3,10 @@ import traceback
 from uuid import uuid4
 
 from celery import Task as CeleryTask
-from celery import current_app
+from celery import current_app, shared_task
 from celery.app.task import _reprtask
 from celery.local import Proxy
+from celery.result import AsyncResult
 from celery.worker.request import Request
 from django.db import IntegrityError
 from django.db import models as django_models
@@ -221,7 +222,19 @@ class RuntimeStateChangeTask(Task):
         return instance
 
 
-class BackendMethodTask(RuntimeStateChangeTask, StateTransitionTask):
+class ResetErrorMessageTask(Task):
+    def pre_execute(self, instance):
+        if isinstance(instance, models.ErrorMessageMixin) and instance.error_message:
+            instance.error_message = ""
+            instance.error_traceback = ""
+            instance.save(update_fields=["error_message", "error_traceback"])
+
+        super().pre_execute(instance)
+
+
+class BackendMethodTask(
+    RuntimeStateChangeTask, StateTransitionTask, ResetErrorMessageTask
+):
     """Execute method of instance backend"""
 
     @classmethod
@@ -291,7 +304,7 @@ class ErrorMessageTask(Task):
     def save_error_message(self, instance):
         if isinstance(instance, models.ErrorMessageMixin):
             try:
-                error_message = self.result.result or ""
+                error_message = instance.error_message or self.result.result or ""
                 error_traceback = str(self.result.traceback)
             except AttributeError as ex:
                 error_message = f"Internal error: {ex.message}"
@@ -301,6 +314,7 @@ class ErrorMessageTask(Task):
             instance.error_traceback = error_traceback
 
             instance.save(update_fields=["error_message", "error_traceback"])
+
             # log exception if instance is not already ERRED.
             if instance.state != models.StateMixin.States.ERRED:
                 message = "Instance: %s.\n" % utils.serialize_instance(instance)
@@ -517,3 +531,21 @@ class ExtensionTaskMixin(CeleryTask, metaclass=TaskType):
             logger.info(message)
             return self.AsyncResult(options.get("task_id") or str(uuid4()))
         return super().apply_async(args=args, kwargs=kwargs, **options)
+
+
+@shared_task(name="waldur_core.reset_updating_resources")
+def reset_updating_resources():
+    for model in models.ActionMixin.get_all_models():
+        for instance in model.objects.filter(
+            state=models.StateMixin.States.UPDATING
+        ).exclude(task_id=None):
+            async_result = AsyncResult(instance.task_id)
+            if async_result.ready():
+                instance_description = f"{instance.__class__.__name__} instance `{instance}` (PK: {instance.pk})"
+                logger.info(
+                    "State of %s changed from UPDATING to OK because Celery task is ready.",
+                    instance_description,
+                )
+                instance.set_ok()
+                instance.task_id = None
+                instance.save(update_fields=["state", "task_id"])

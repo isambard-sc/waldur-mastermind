@@ -4,11 +4,13 @@ from datetime import timedelta
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import models
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
 
+import waldur_core.media.mixins
 from waldur_core.core import models as core_models
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.models import Role
@@ -38,7 +40,7 @@ class CallDocument(
 class CallManagingOrganisation(
     core_models.UuidMixin,
     core_models.DescribableMixin,
-    structure_models.ImageModelMixin,
+    waldur_core.media.mixins.ImageModelMixin,
     TimeStampedModel,
 ):
     customer = models.OneToOneField(structure_models.Customer, on_delete=models.CASCADE)
@@ -83,7 +85,7 @@ class Call(
     manager = models.ForeignKey(CallManagingOrganisation, on_delete=models.PROTECT)
     created_by = models.ForeignKey(
         core_models.User,
-        on_delete=models.PROTECT,
+        on_delete=models.SET_NULL,
         null=True,
         related_name="+",
     )
@@ -131,14 +133,14 @@ class RequestedOffering(
 
     approved_by = models.ForeignKey(
         core_models.User,
-        on_delete=models.PROTECT,
+        on_delete=models.SET_NULL,
         null=True,
         related_name="+",
         blank=True,
     )
     created_by = models.ForeignKey(
         core_models.User,
-        on_delete=models.PROTECT,
+        on_delete=models.SET_NULL,
         null=True,
         related_name="+",
     )
@@ -257,8 +259,13 @@ class ProposalDocumentation(
     )
 
 
+def filter_proposals(user):
+    return Q(created_by=user)
+
+
 class Proposal(
     TimeStampedModel,
+    structure_models.PermissionMixin,
     core_models.UuidMixin,
     core_models.NameMixin,
     core_models.DescribableMixin,
@@ -300,14 +307,14 @@ class Proposal(
     )
     approved_by = models.ForeignKey(
         core_models.User,
-        on_delete=models.PROTECT,
+        on_delete=models.SET_NULL,
         null=True,
         related_name="+",
         blank=True,
     )
     created_by = models.ForeignKey(
         core_models.User,
-        on_delete=models.PROTECT,
+        on_delete=models.SET_NULL,
         null=True,
         related_name="+",
     )
@@ -323,6 +330,7 @@ class Proposal(
 
     class Permissions:
         customer_path = "round__call__manager__customer"
+        build_query = filter_proposals
 
     def __str__(self):
         return f"{self.name} | {self.round.start_time} - {self.round.cutoff_time} | {self.round.call}"

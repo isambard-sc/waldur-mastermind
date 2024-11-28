@@ -574,3 +574,52 @@ def send_financial_report_by_mail(request):
             status=status.HTTP_202_ACCEPTED,
         )
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class CustomerCreditViewSet(core_views.ActionsViewSet):
+    lookup_field = "uuid"
+    filter_backends = (
+        structure_filters.GenericRoleFilter,
+        DjangoFilterBackend,
+    )
+    filterset_class = filters.CustomerCreditFilter
+    create_permissions = update_permissions = partial_update_permissions = (
+        destroy_permissions
+    ) = [structure_permissions.is_staff]
+    queryset = models.CustomerCredit.objects.all().order_by("created")
+    serializer_class = serializers.CustomerCreditSerializer
+    create_serializer_class = update_serializer_class = (
+        partial_update_serializer_class
+    ) = serializers.CreateCustomerCreditSerializer
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"])
+    def apply_compensations(self, request, uuid=None):
+        customer_credit = self.get_object()
+        utils.MonthlyCompensation(customer_credit.customer).apply_compensations()
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"])
+    def clear_compensations(self, request, uuid=None):
+        customer_credit = self.get_object()
+        utils.MonthlyCompensation(customer_credit.customer).clear_compensations()
+
+    apply_compensations_permissions = clear_compensations_permissions = [
+        structure_permissions.is_staff
+    ]
+
+
+class ProjectCreditViewSet(core_views.ActionsViewSet):
+    lookup_field = "uuid"
+    filter_backends = (
+        structure_filters.GenericRoleFilter,
+        DjangoFilterBackend,
+    )
+    update_permissions = partial_update_permissions = destroy_permissions = [
+        structure_permissions.is_owner
+    ]
+    queryset = models.ProjectCredit.objects.exclude(
+        project__customer__customercredit__isnull=True
+    ).order_by("created")
+    serializer_class = serializers.ProjectCreditSerializer
+    filterset_class = filters.ProjectCreditFilter

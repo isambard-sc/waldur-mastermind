@@ -14,7 +14,7 @@ from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.marketplace.models import Resource
 from waldur_mastermind.marketplace_remote.utils import INVALID_RESOURCE_STATES
 
-from . import PLUGIN_NAME, log, models, tasks
+from . import PLUGIN_NAME, log, models, tasks, utils
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ def sync_remote_project_when_request_is_approved(
         return
 
     transaction.on_commit(
-        lambda: tasks.sync_remote_project.delay(serialize_instance(instance))
+        lambda: tasks.sync_remote_project(serialize_instance(instance))
     )
 
 
@@ -206,3 +206,16 @@ def notify_about_project_details_update(sender, instance, created=False, **kwarg
             serialize_instance(instance)
         )
     )
+
+
+def update_remote_resource_options(sender, instance, created=False, **kwargs):
+    if not instance.tracker.has_changed("options"):
+        return
+
+    if not instance.backend_id:
+        return
+
+    if instance.offering.type != PLUGIN_NAME:
+        return
+
+    transaction.on_commit(lambda: utils.push_resource_options(instance))

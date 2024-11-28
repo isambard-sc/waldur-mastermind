@@ -174,9 +174,14 @@ class ProjectTypeFilter(NameFilterSet):
         fields = ["name"]
 
 
+class CustomerInFilter(django_filters.BaseInFilter, django_filters.UUIDFilter):
+    pass
+
+
 class ProjectFilter(NameFilterSet):
-    customer = django_filters.UUIDFilter(
+    customer = CustomerInFilter(
         field_name="customer__uuid",
+        lookup_expr="in",
         distinct=True,
     )
 
@@ -205,6 +210,7 @@ class ProjectFilter(NameFilterSet):
             ("customer__abbreviation", "customer_abbreviation"),
             ("estimated_cost", "estimated_cost"),
             ("end_date", "end_date"),
+            ("start_date", "start_date"),
         )
     )
 
@@ -279,10 +285,19 @@ class ProjectUserFilter(BaseFilterBackend):
 def filter_visible_users(queryset, user, extra=None):
     if user.is_staff or user.is_support:
         return queryset
-
     return (
         queryset.filter(is_staff=False)
         .filter(Q(id__in=get_visible_users(user)) | Q(id=user.id) | (extra or Q()))
+        .distinct()
+    )
+
+
+def filter_visible_user_permissions(queryset, user):
+    if user.is_staff or user.is_support:
+        return queryset
+    return (
+        queryset.filter(user__is_staff=False)
+        .filter(Q(user__id__in=get_visible_users(user)) | Q(user__id=user.id))
         .distinct()
     )
 
@@ -291,11 +306,7 @@ class UserFilterBackend(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
         user = request.user
 
-        if not django_settings.WALDUR_CORE.get("SHOW_ALL_USERS", False) and not (
-            user.is_staff or user.is_support
-        ):
-            queryset = filter_visible_users(queryset, user, self.get_extra_q(user))
-
+        queryset = filter_visible_users(queryset, user, self.get_extra_q(user))
         return queryset.order_by("username")
 
     _extra_query = []
@@ -317,12 +328,20 @@ class UserFilterBackend(BaseFilterBackend):
         return result
 
 
+class UserRoleFilterBackend(BaseFilterBackend):
+    def filter_queryset(self, request, queryset, view):
+        user = request.user
+        queryset = filter_visible_user_permissions(queryset, user)
+
+        return queryset
+
+
 class BaseUserFilter(django_filters.FilterSet):
     full_name = django_filters.CharFilter(
         method="filter_by_full_name", label="Full name"
     )
-    full_name_and_email = django_filters.CharFilter(
-        method="filter_by_full_name_and_email", label="Full name and email"
+    user_keyword = django_filters.CharFilter(
+        method="filter_by_user_keyword", label="User keyword"
     )
     username = django_filters.CharFilter()
     native_name = django_filters.CharFilter(lookup_expr="icontains")
@@ -334,14 +353,14 @@ class BaseUserFilter(django_filters.FilterSet):
     def filter_by_full_name(self, queryset, name, value):
         return core_filters.filter_by_full_name(queryset, value)
 
-    def filter_by_full_name_and_email(self, queryset, name, value):
-        return core_filters.filter_by_full_name_and_email(queryset, value)
+    def filter_by_user_keyword(self, queryset, name, value):
+        return core_filters.filter_by_user_keyword(queryset, value)
 
     class Meta:
         model = User
         fields = [
             "full_name",
-            "full_name_and_email",
+            "user_keyword",
             "native_name",
             "organization",
             "email",
@@ -359,6 +378,12 @@ class UserFilter(BaseUserFilter):
     is_staff = django_filters.BooleanFilter(widget=BooleanWidget)
     is_support = django_filters.BooleanFilter(widget=BooleanWidget)
     username = django_filters.CharFilter(field_name="username", lookup_expr="exact")
+    organization_roles = django_filters.CharFilter(
+        method="filter_organization_roles", label="Organization roles"
+    )
+    project_roles = django_filters.CharFilter(
+        method="filter_project_roles", label="Project roles"
+    )
     query = django_filters.CharFilter(method="filter_query")
 
     o = core_filters.ExtendedOrderingFilter(
@@ -378,14 +403,28 @@ class UserFilter(BaseUserFilter):
         )
     )
 
+    def filter_organization_roles(self, queryset, name, value):
+        roles = self.request.GET.getlist("organization_roles")
+        return queryset.filter(userrole__role__name__in=roles)
+
+    def filter_project_roles(self, queryset, name, value):
+        roles = self.request.GET.getlist("project_roles")
+        return queryset.filter(userrole__role__name__in=roles)
+
     def filter_query(self, queryset, name, value):
-        query = queryset.filter(
+        q = (
             Q(first_name__icontains=value)
             | Q(last_name__icontains=value)
             | Q(civil_number__icontains=value)
             | Q(username__icontains=value)
             | Q(email__icontains=value)
         )
+
+        if len(value.split()) > 1:
+            q |= Q(first_name__icontains=value.split()[0])
+            q |= Q(last_name__icontains=value.split()[1])
+
+        query = queryset.filter(q)
         return query
 
 
@@ -428,6 +467,11 @@ class UserPermissionFilter(django_filters.FilterSet):
     native_name = django_filters.CharFilter(
         field_name="user__native_name",
         lookup_expr="icontains",
+    )
+    user_slug = django_filters.CharFilter(
+        field_name="user__slug",
+        lookup_expr="icontains",
+        label="User slug contains",
     )
 
     def filter_by_full_name(self, queryset, name, value):

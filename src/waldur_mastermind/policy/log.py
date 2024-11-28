@@ -12,6 +12,8 @@ class PolicyActionOrderLogger(EventLogger):
             "block_modification_of_existing_resources",
             "terminate_resources",
             "request_downscaling",
+            "restrict_members",
+            "request_pausing",
         )
 
 

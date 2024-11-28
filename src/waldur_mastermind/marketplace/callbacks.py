@@ -58,7 +58,8 @@ def resource_creation_failed(resource: models.Resource, validate=False):
     resource.set_state_erred()
     resource.save(update_fields=["state"])
 
-    copy_error_from_resource_to_order(resource, order)
+    if order:
+        copy_error_from_resource_to_order(resource, order)
 
     log.log_resource_creation_failed(resource)
     return order
@@ -239,6 +240,9 @@ def resource_deletion_canceled(resource: models.Resource, validate=False):
 
 
 def resource_erred_on_backend(resource: models.Resource, validate=False):
+    if resource.state == models.Resource.States.ERRED:
+        return
+
     resource.set_state_erred()
     resource.save(update_fields=["state"])
 
@@ -287,9 +291,12 @@ States = StateMixin.States
 StateRouter = {
     (States.CREATING, States.OK): resource_creation_succeeded,
     (States.CREATING, States.ERRED): resource_creation_failed,
+    (States.CREATION_SCHEDULED, States.ERRED): resource_creation_failed,
     (States.UPDATING, States.OK): resource_update_succeeded,
     (States.UPDATING, States.ERRED): resource_update_failed,
+    (States.UPDATE_SCHEDULED, States.ERRED): resource_update_failed,
     (States.DELETING, States.ERRED): resource_deletion_failed,
+    (States.DELETION_SCHEDULED, States.ERRED): resource_deletion_failed,
     (States.OK, States.ERRED): resource_erred_on_backend,
 }
 

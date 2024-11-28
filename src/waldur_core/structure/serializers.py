@@ -20,11 +20,10 @@ from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core.clean_html import clean_html
 from waldur_core.core.fields import MappedChoiceField
-from waldur_core.media.serializers import ProtectedMediaSerializerMixin
 from waldur_core.permissions.enums import SYSTEM_CUSTOMER_ROLES, PermissionEnum
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.serializers import PermissionSerializer
-from waldur_core.permissions.utils import get_permissions, has_permission
+from waldur_core.permissions.utils import has_permission
 from waldur_core.structure import models, utils
 from waldur_core.structure.filters import filter_visible_users
 from waldur_core.structure.managers import (
@@ -158,9 +157,7 @@ class PermissionListSerializer(serializers.ListSerializer):
         return super().to_representation(data)
 
 
-class BasicUserSerializer(
-    ProtectedMediaSerializerMixin, serializers.HyperlinkedModelSerializer
-):
+class BasicUserSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = User
         fields = (
@@ -218,7 +215,6 @@ class ProjectSerializer(
     core_serializers.SlugSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     PermissionFieldFilteringMixin,
-    ProtectedMediaSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
@@ -238,6 +234,7 @@ class ProjectSerializer(
             "customer",
             "customer_uuid",
             "customer_name",
+            "customer_slug",
             "customer_native_name",
             "customer_abbreviation",
             "description",
@@ -266,7 +263,7 @@ class ProjectSerializer(
             },
         }
         related_paths = {
-            "customer": ("uuid", "name", "native_name", "abbreviation"),
+            "customer": ("uuid", "name", "native_name", "abbreviation", "slug"),
             "type": ("name", "uuid"),
         }
 
@@ -278,7 +275,7 @@ class ProjectSerializer(
             "start_date" in fields
             and isinstance(self.instance, models.Project)
             and self.instance.start_date
-            and self.instance.start_date >= timezone.now().date()
+            and self.instance.start_date < timezone.now().date()
         ):
             fields["start_date"].read_only = True
 
@@ -311,6 +308,7 @@ class ProjectSerializer(
             "description",
             "customer__uuid",
             "customer__name",
+            "customer__slug",
             "customer__native_name",
             "customer__abbreviation",
         )
@@ -370,7 +368,6 @@ class CountrySerializerMixin(serializers.Serializer):
 
 class CustomerSerializer(
     core_serializers.SlugSerializerMixin,
-    ProtectedMediaSerializerMixin,
     CountrySerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
@@ -619,7 +616,6 @@ class NestedProjectPermissionSerializer(serializers.ModelSerializer):
 
 
 class CustomerUserSerializer(
-    ProtectedMediaSerializerMixin,
     serializers.ModelSerializer,
 ):
     role = serializers.ReadOnlyField()
@@ -673,33 +669,6 @@ class CustomerUserSerializer(
         setattr(user, "perm", permission)
         setattr(user, "role", permission and get_old_role_name(permission.role.name))
         setattr(user, "projects", projects)
-        return super().to_representation(user)
-
-
-class ProjectUserSerializer(serializers.ModelSerializer):
-    role = serializers.ReadOnlyField()
-    expiration_time = serializers.ReadOnlyField(source="perm.expiration_time")
-
-    class Meta:
-        model = User
-        fields = [
-            "url",
-            "uuid",
-            "username",
-            "full_name",
-            "email",
-            "role",
-            "expiration_time",
-        ]
-        extra_kwargs = {
-            "url": {"lookup_field": "uuid"},
-        }
-
-    def to_representation(self, user):
-        project = self.context["project"]
-        permission = get_permissions(project, user).first()
-        setattr(user, "perm", permission)
-        setattr(user, "role", permission and get_old_role_name(permission.role.name))
         return super().to_representation(user)
 
 
@@ -811,7 +780,6 @@ class UserSerializer(
     core_serializers.SlugSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
-    ProtectedMediaSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
     email = serializers.EmailField()
@@ -831,6 +799,7 @@ class UserSerializer(
 
     def get_permissions(self, user):
         perms = UserRole.objects.filter(user=user, is_active=True)
+        perms = [perm for perm in perms if perm.scope]
         serializer = PermissionSerializer(instance=perms, many=True)
         return serializer.data
 
@@ -974,7 +943,7 @@ class UserSerializer(
                     and "is_active" in attrs.keys()
                     and not attrs["is_active"]
                     and len(attrs) == 1
-                ):
+                ) or self.instance.is_staff:
                     # Deactivation of user.
                     pass
                 else:
@@ -1093,6 +1062,7 @@ class ServiceSettingsSerializer(
         required=False,
         allow_null=True,
     )
+    scope_uuid = serializers.ReadOnlyField(source="scope.uuid")
     options = serializers.DictField()
 
     class Meta:
@@ -1110,6 +1080,7 @@ class ServiceSettingsSerializer(
             "customer_native_name",
             "terms_of_services",
             "scope",
+            "scope_uuid",
             "options",
         )
         read_only_fields = ("state", "error_message")

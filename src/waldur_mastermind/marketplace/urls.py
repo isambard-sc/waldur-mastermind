@@ -15,6 +15,11 @@ def register_in(router):
         basename="marketplace-category",
     )
     router.register(
+        r"marketplace-category-columns",
+        views.CategoryColumnsViewSet,
+        basename="marketplace-category-columns",
+    )
+    router.register(
         r"marketplace-category-groups",
         views.CategoryGroupViewSet,
         basename="marketplace-category-group",
@@ -56,6 +61,11 @@ def register_in(router):
         r"marketplace-resources", views.ResourceViewSet, basename="marketplace-resource"
     )
     router.register(
+        r"marketplace-provider-resources",
+        views.ProviderResourceViewSet,
+        basename="marketplace-provider-resource",
+    )
+    router.register(
         r"marketplace-category-component-usages",
         views.CategoryComponentUsageViewSet,
         basename="marketplace-category-component-usage",
@@ -64,6 +74,11 @@ def register_in(router):
         r"marketplace-component-usages",
         views.ComponentUsageViewSet,
         basename="marketplace-component-usage",
+    )
+    router.register(
+        r"marketplace-component-user-usages",
+        views.ComponentUserUsageViewSet,
+        basename="marketplace-component-user-usage",
     )
     router.register(
         r"marketplace-public-api",
@@ -129,6 +144,11 @@ def register_in(router):
         r"marketplace-category-components",
         views.CategoryComponentViewSet,
         basename="marketplace-category-component",
+    )
+    router.register(
+        r"marketplace-integration-statuses",
+        views.IntegrationStatusViewSet,
+        basename="marketplace-integration-status",
     )
 
 

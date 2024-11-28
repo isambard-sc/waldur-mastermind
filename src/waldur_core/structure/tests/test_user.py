@@ -399,6 +399,14 @@ class UserFilterTest(test.APITransactionTestCase):
             response = self.client.get(url, data={field: getattr(user, field)[:-1]})
             self.assertContains(response, user_url)
 
+    def test_use_query_parameter_to_filtering_by_full_name(self):
+        user = factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user)
+        url = factories.UserFactory.get_list_url()
+        user_url = factories.UserFactory.get_url(user)
+        response = self.client.get(url, data={"query": user.full_name})
+        self.assertContains(response, user_url)
+
     def test_user_list_can_be_filtered_with_accents(self):
         user = factories.UserFactory(is_staff=True, full_name="François Jürimäe")
         self.client.force_authenticate(user)
@@ -499,6 +507,15 @@ class UserUpdateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(
             response.data["agree_with_policy"], ["User must agree with the policy."]
+        )
+
+    def test_if_user_is_staff_he_can_update_his_profile_without_accepting_policy(self):
+        self.user.is_staff = True
+        self.user.save()
+        response = self.client.patch(self.url, self.invalid_payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["phone_number"], self.invalid_payload["phone_number"]
         )
 
     def test_if_user_already_accepted_policy_he_can_update_his_profile(self):
@@ -878,3 +895,40 @@ class UserCreateTest(test.APITransactionTestCase):
         self.client.force_authenticate(getattr(self.fixture, user))
         response = self.client.post(url, payload)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class UserPermissionTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.user1 = factories.UserFactory()
+        self.user2 = factories.UserFactory()
+        self.user3 = factories.UserFactory()
+        self.user4 = factories.UserFactory()
+
+        self.customer1 = factories.CustomerFactory()
+        self.customer1.add_user(self.user1, CustomerRole.OWNER)
+        self.customer1.add_user(self.user2, CustomerRole.SUPPORT)
+
+        self.customer2 = factories.CustomerFactory()
+        self.customer2.add_user(self.user3, CustomerRole.OWNER)
+
+        self.url = "http://testserver/api/user-permissions/"
+
+    def test_user_can_get_self_and_connected_users_permissions(self):
+        self.client.force_authenticate(self.user1)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(response.data[0]["user_uuid"], self.user1.uuid)
+        self.assertEqual(response.data[1]["user_uuid"], self.user2.uuid)
+
+        self.client.force_authenticate(self.user3)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["user_uuid"], self.user3.uuid)
+
+    def test_user_can_not_get_not_connected_users_permissions(self):
+        self.client.force_authenticate(self.user4)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 0)

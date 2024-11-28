@@ -5,8 +5,8 @@ import pkg_resources
 from rest_framework import status, test
 
 from waldur_core.structure.tests.factories import SshPublicKeyFactory
-from waldur_openstack.openstack_tenant.tests import (
-    factories as openstack_tenant_factories,
+from waldur_openstack.tests import (
+    factories as openstack_factories,
 )
 from waldur_rancher import models, tasks
 from waldur_rancher import utils as rancher_utils
@@ -39,7 +39,7 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
         self.node_url = factories.NodeFactory.get_list_url()
         self.payload = {
             "cluster": factories.ClusterFactory.get_url(self.fixture.cluster),
-            "subnet": openstack_tenant_factories.SubNetFactory.get_url(self.subnet),
+            "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
             "system_volume_size": 1024,
             "memory": 1,
             "cpu": 1,
@@ -76,12 +76,13 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
 
     @mock.patch("waldur_rancher.executors.tasks")
     def test_use_data_volumes(self, mock_tasks):
-        volume_type = openstack_tenant_factories.VolumeTypeFactory(
-            settings=self.fixture.tenant_settings
+        volume_type = openstack_factories.VolumeTypeFactory(
+            settings=self.tenant.service_settings
         )
+        volume_type.tenants.add(self.tenant)
         self.payload = {
             "cluster": factories.ClusterFactory.get_url(self.fixture.cluster),
-            "subnet": openstack_tenant_factories.SubNetFactory.get_url(self.subnet),
+            "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
             "system_volume_size": 1024,
             "memory": 1,
             "cpu": 1,
@@ -89,7 +90,7 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
             "data_volumes": [
                 {
                     "size": 12 * 1024,
-                    "volume_type": openstack_tenant_factories.VolumeTypeFactory.get_url(
+                    "volume_type": openstack_factories.VolumeTypeFactory.get_url(
                         volume_type
                     ),
                     "mount_point": "/var/lib/etcd",
@@ -107,12 +108,13 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
     @utils.override_plugin_settings(MOUNT_POINT_CHOICE_IS_MANDATORY=False)
     @mock.patch("waldur_rancher.executors.tasks")
     def test_use_data_volumes_without_mount_point(self, mock_tasks):
-        volume_type = openstack_tenant_factories.VolumeTypeFactory(
-            settings=self.fixture.tenant_settings
+        volume_type = openstack_factories.VolumeTypeFactory(
+            settings=self.tenant.service_settings
         )
+        volume_type.tenants.add(self.tenant)
         self.payload = {
             "cluster": factories.ClusterFactory.get_url(self.fixture.cluster),
-            "subnet": openstack_tenant_factories.SubNetFactory.get_url(self.subnet),
+            "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
             "system_volume_size": 1024,
             "memory": 1,
             "cpu": 1,
@@ -120,7 +122,7 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
             "data_volumes": [
                 {
                     "size": 12 * 1024,
-                    "volume_type": openstack_tenant_factories.VolumeTypeFactory.get_url(
+                    "volume_type": openstack_factories.VolumeTypeFactory.get_url(
                         volume_type
                     ),
                 }
@@ -137,12 +139,13 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
     @utils.override_plugin_settings(MOUNT_POINT_CHOICE_IS_MANDATORY=True)
     @mock.patch("waldur_rancher.executors.tasks")
     def test_if_mount_point_is_required(self, mock_tasks):
-        volume_type = openstack_tenant_factories.VolumeTypeFactory(
-            settings=self.fixture.tenant_settings
+        volume_type = openstack_factories.VolumeTypeFactory(
+            settings=self.tenant.service_settings
         )
+        volume_type.tenants.add(self.tenant)
         self.payload = {
             "cluster": factories.ClusterFactory.get_url(self.fixture.cluster),
-            "subnet": openstack_tenant_factories.SubNetFactory.get_url(self.subnet),
+            "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
             "system_volume_size": 1024,
             "memory": 1,
             "cpu": 1,
@@ -150,7 +153,7 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
             "data_volumes": [
                 {
                     "size": 12 * 1024,
-                    "volume_type": openstack_tenant_factories.VolumeTypeFactory.get_url(
+                    "volume_type": openstack_factories.VolumeTypeFactory.get_url(
                         volume_type
                     ),
                 }
@@ -205,9 +208,7 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
     def test_create_node_if_flavor_has_been_specified(self, mock_tasks):
         del self.payload["cpu"]
         del self.payload["memory"]
-        self.payload["flavor"] = openstack_tenant_factories.FlavorFactory.get_url(
-            self.flavor
-        )
+        self.payload["flavor"] = openstack_factories.FlavorFactory.get_url(self.flavor)
         response = self.create_node(self.fixture.staff)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(mock_tasks.CreateNodeTask.return_value.si.call_count, 1)
@@ -220,9 +221,7 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
 
         del self.payload["cpu"]
         del self.payload["memory"]
-        self.payload["flavor"] = openstack_tenant_factories.FlavorFactory.get_url(
-            self.flavor
-        )
+        self.payload["flavor"] = openstack_factories.FlavorFactory.get_url(self.flavor)
         response = self.create_node(self.fixture.staff)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -238,7 +237,7 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
         ssh_public_key = SshPublicKeyFactory(user=self.fixture.owner)
         self.payload = {
             "cluster": factories.ClusterFactory.get_url(self.fixture.cluster),
-            "subnet": openstack_tenant_factories.SubNetFactory.get_url(self.subnet),
+            "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
             "system_volume_size": 1024,
             "memory": 1,
             "cpu": 1,
@@ -418,10 +417,8 @@ class NodeLinkTest(test_cluster.BaseClusterCreateTest):
         self.cluster = factories.ClusterFactory(settings=self.settings)
         self.node = factories.NodeFactory(cluster=self.cluster)
         self.url = factories.NodeFactory.get_url(self.node, "link_openstack")
-        self.instance = openstack_tenant_factories.InstanceFactory()
-        self.instance_url = openstack_tenant_factories.InstanceFactory.get_url(
-            self.instance
-        )
+        self.instance = openstack_factories.InstanceFactory()
+        self.instance_url = openstack_factories.InstanceFactory.get_url(self.instance)
 
     def test_link_is_enabled_when_read_only_mode_is_disabled(self):
         self.client.force_authenticate(self.fixture.staff)
@@ -460,7 +457,7 @@ class NodeUnlinkTest(test_cluster.BaseClusterCreateTest):
         super().setUp()
         self.settings = factories.RancherServiceSettingsFactory()
         self.cluster = factories.ClusterFactory(settings=self.settings)
-        self.instance = openstack_tenant_factories.InstanceFactory()
+        self.instance = openstack_factories.InstanceFactory()
         self.node = factories.NodeFactory(cluster=self.cluster, instance=self.instance)
         self.url = factories.NodeFactory.get_url(self.node, "unlink_openstack")
 
@@ -497,8 +494,7 @@ class NodeActionsTest(test.APITransactionTestCase):
 
         self.url = factories.NodeFactory.get_url(self.node, action=self.action)
         self.mock_path = mock.patch(
-            "waldur_openstack.openstack_tenant.backend.OpenStackTenantBackend.%s"
-            % self.backend_method
+            "waldur_openstack.backend.OpenStackBackend.%s" % self.backend_method
         )
         self.mock_console = self.mock_path.start()
         self.mock_console.return_value = self.backend_return_value

@@ -4,10 +4,11 @@ from ddt import data, ddt
 from rest_framework import status, test
 
 from waldur_core.media.utils import dummy_image
+from waldur_core.permissions.fixtures import ProposalRole
+from waldur_core.permissions.utils import has_user
+from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.proposal import models, tasks
-from waldur_mastermind.proposal.tests import fixtures
-
-from . import factories
+from waldur_mastermind.proposal.tests import factories, fixtures
 
 
 @ddt
@@ -57,8 +58,13 @@ class ProposalCreateTest(test.APITransactionTestCase):
     def test_user_can_add_proposal(self, user):
         response = self.create_proposal(user)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        proposal = models.Proposal.objects.get(uuid=response.data["uuid"])
         self.assertTrue(
             models.Proposal.objects.filter(uuid=response.data["uuid"]).exists()
+        )
+        # Check if user has been added to proposal in MANAGER role
+        self.assertTrue(
+            has_user(proposal, getattr(self.fixture, user), ProposalRole.MANAGER)
         )
 
     def test_create_project_if_proposal_has_been_created(self):
@@ -214,6 +220,35 @@ class ActionTest(test.APITransactionTestCase):
         self.client.force_authenticate(user)
         response = self.client.post(self.url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_set_project_start_date_if_proposal_has_been_allocated(self):
+        self.proposal.state = models.Proposal.States.IN_REVIEW
+        self.proposal.save()
+
+        self.client.force_authenticate(self.fixture.staff)
+
+        url_allocate = factories.ProposalFactory.get_url(self.proposal, "allocate")
+        response = self.client.post(url_allocate)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.proposal.project.refresh_from_db()
+        self.assertEqual(self.proposal.project.start_date, None)
+
+        new_project = structure_factories.ProjectFactory(customer=self.fixture.customer)
+        new_proposal = factories.ProposalFactory(
+            round=self.fixture.round,
+            project=new_project,
+            state=models.Proposal.States.IN_REVIEW,
+        )
+        allocation_date = datetime.datetime.now() + datetime.timedelta(weeks=1)
+        new_proposal.round.allocation_date = allocation_date
+        new_proposal.round.allocation_time = models.Round.AllocationTimes.FIXED_DATE
+        new_proposal.round.save()
+
+        new_url_allocate = factories.ProposalFactory.get_url(new_proposal, "allocate")
+        response = self.client.post(new_url_allocate)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        new_project.refresh_from_db()
+        self.assertEqual(new_project.start_date, allocation_date.date())
 
 
 @ddt

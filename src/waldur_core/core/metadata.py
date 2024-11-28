@@ -57,9 +57,6 @@ class WaldurCore(BaseModel):
         False,
         description="Enables generation of the first project on organization creation.",
     )
-    ONLY_STAFF_MANAGES_SERVICES = Field(
-        False, description="Allows to restrict provider management only to staff users."
-    )
     NATIVE_NAME_ENABLED = Field(
         False,
         description="Allows to render native name field in customer and user forms.",
@@ -200,10 +197,6 @@ class WaldurCore(BaseModel):
         description="Specifies seller legal or effective country of registration or residence as an "
         "ISO 3166-1 alpha-2 country code. It is used for computing VAT charge rate."
     )
-    SHOW_ALL_USERS = Field(
-        False,
-        description="Indicates whether user can see all other users in `api/users/` endpoint.",
-    )
     TRANSLATION_DOMAIN = Field(
         "",
         description="Identifier of translation domain applied to current deployment.",
@@ -224,7 +217,7 @@ class WaldurCore(BaseModel):
         'For example: {"label": "Helpdesk", "url": "`https://example.com/`"}',
     )
     USER_MANDATORY_FIELDS: list[str] = Field(
-        ["full_name", "email"],
+        ["first_name", "last_name", "email"],
         description="List of user profile attributes that would be required for filling in HomePort. "
         "Note that backend will not be affected. If a mandatory field is missing in profile, "
         "a profile edit view will be forced upon user on any HomePort logged in action. "
@@ -292,7 +285,6 @@ class WaldurCore(BaseModel):
             "INVITATIONS_ENABLED",
             "VALIDATE_INVITATION_EMAIL",
             "NATIVE_NAME_ENABLED",
-            "ONLY_STAFF_MANAGES_SERVICES",
             "PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS",
             "TRANSLATION_DOMAIN",
             "MATOMO_URL_BASE",
@@ -430,30 +422,6 @@ class WaldurFreeipa(BaseModel):
 
     class Meta:
         public_settings = ["USERNAME_PREFIX", "ENABLED"]
-
-
-class WaldurKeycloak(BaseModel):
-    ENABLED = Field(
-        False,
-        description="Enable integration of group provisioning in configured Keycloak",
-    )
-    BASE_URL = Field(
-        "http://localhost:8080/auth", description="Base URL of Keycloak server"
-    )
-    REALM = Field("waldur", description="Realm used by Waldur")
-    CLIENT_ID = Field("waldur", description="Identification of Waldur client app")
-    CLIENT_SECRET = Field(
-        "UUID", description="Credentials are generated in Keycloak admin console"
-    )
-    USERNAME = Field(
-        "admin", description="Username of Keycloak user with administrative privileges"
-    )
-    PASSWORD = Field(
-        "secret", description="Password of Keycloak user with administrative privileges"
-    )
-
-    class Meta:
-        public_settings = ["ENABLED"]
 
 
 class WaldurSlurm(BaseModel):
@@ -778,25 +746,17 @@ class WaldurOpenstack(BaseModel):
         False,
         description="If true, generated credentials of a tenant are exposed to project users",
     )
-
-    class Meta:
-        public_settings = [
-            "TENANT_CREDENTIALS_VISIBLE",
-        ]
-
-
-class WaldurOpenstackTenant(BaseModel):
     MAX_CONCURRENT_PROVISION = Field(
         {
-            "OpenStackTenant.Instance": 4,
-            "OpenStackTenant.Volume": 4,
-            "OpenStackTenant.Snapshot": 4,
+            "OpenStack.Instance": 4,
+            "OpenStack.Volume": 4,
+            "OpenStack.Snapshot": 4,
         },
-        description="Maximum parallel executions of provisioning operations for OpenStackTenant resources",
+        description="Maximum parallel executions of provisioning operations for OpenStack resources",
     )
     ALLOW_CUSTOMER_USERS_OPENSTACK_CONSOLE_ACCESS = Field(
         True,
-        description="If true, customer users would be offered actions for accessing OpenStack Console",
+        description="If true, customer users would be offered actions for accessing OpenStack console",
     )
     REQUIRE_AVAILABILITY_ZONE = Field(
         False,
@@ -804,7 +764,7 @@ class WaldurOpenstackTenant(BaseModel):
     )
     ALLOW_DIRECT_EXTERNAL_NETWORK_CONNECTION = Field(
         False,
-        description="If true, allow connecting of Instances directly to external networks",
+        description="If true, allow connecting of instances directly to external networks",
     )
 
     class Meta:
@@ -812,6 +772,7 @@ class WaldurOpenstackTenant(BaseModel):
             "ALLOW_CUSTOMER_USERS_OPENSTACK_CONSOLE_ACCESS",
             "REQUIRE_AVAILABILITY_ZONE",
             "ALLOW_DIRECT_EXTERNAL_NETWORK_CONNECTION",
+            "TENANT_CREDENTIALS_VISIBLE",
         ]
 
 
@@ -819,19 +780,14 @@ class WaldurConfiguration(BaseModel):
     WALDUR_CORE = WaldurCore()
     WALDUR_AUTH_SOCIAL = WaldurAuthSocial()
     WALDUR_FREEIPA = WaldurFreeipa()
-    WALDUR_KEYCLOAK = WaldurKeycloak()
     WALDUR_HPC = WaldurHPC()
     WALDUR_SLURM = WaldurSlurm()
     WALDUR_PID = WaldurPID()
     WALDUR_OPENSTACK = WaldurOpenstack()
-    WALDUR_OPENSTACK_TENANT = WaldurOpenstackTenant()
     WALDUR_MARKETPLACE = WaldurMarketplace()
     WALDUR_MARKETPLACE_SCRIPT = WaldurMarketplaceScript()
     WALDUR_MARKETPLACE_REMOTE_SLURM = WaldurMarketplaceRemoteSlurm()
     WALDUR_AUTH_SAML2 = WaldurAuthSAML2()
-    USE_PROTECTED_URL = Field(
-        False, description="Protect media URLs using signed token."
-    )
     VERIFY_WEBHOOK_REQUESTS = Field(
         True,
         description="When webook is processed, requests verifies SSL certificates for HTTPS requests, just like a web browser.",

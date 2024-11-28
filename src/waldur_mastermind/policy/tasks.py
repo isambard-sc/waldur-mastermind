@@ -1,9 +1,15 @@
+import logging
+
 from celery import shared_task
 
 from waldur_core.core import utils as core_utils
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.structure.permissions import _get_customer, _get_project
-from waldur_mastermind.policy import log
+from waldur_mastermind.policy import log, models
+
+from . import utils
+
+logger = logging.getLogger(__name__)
 
 
 def send_emails(emails, policy):
@@ -48,3 +54,12 @@ def notify_customer_owners(serialized_policy):
     customer = _get_customer(policy.scope)
     emails = customer.get_user_mails(RoleEnum.CUSTOMER_OWNER)
     send_emails(emails, policy)
+
+
+@shared_task(name="waldur_mastermind.policy.check_polices")
+def check_polices():
+    for klass in core_utils.get_all_subclasses(models.Policy):
+        if klass._meta.abstract:
+            continue
+
+        utils.evaluate_policies(klass.objects.all())

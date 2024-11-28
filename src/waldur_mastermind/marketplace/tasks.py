@@ -69,7 +69,7 @@ def notify_consumer_about_pending_order(uuid):
         return
 
     order_link = core_utils.format_homeport_link(
-        "projects/{project_uuid}/marketplace-order-details/{order_uuid}/",
+        "marketplace-order-details/{order_uuid}/",
         project_uuid=order.project.uuid,
         order_uuid=order.uuid,
     )
@@ -101,7 +101,7 @@ def notify_provider_about_pending_order(order_uuid):
         return
 
     link = core_utils.format_homeport_link(
-        "providers/{organization_uuid}/marketplace-orders/",
+        "providers/{organization_uuid}/orders/",
         organization_uuid=order.offering.customer.uuid,
     )
 
@@ -212,19 +212,6 @@ def calculate_usage_for_current_month():
         calculate_usage_for_scope(start, end, scope)
 
 
-@shared_task(name="waldur_mastermind.marketplace.send_notifications_about_usages")
-def send_notifications_about_usages():
-    for warning in utils.get_info_about_missing_usage_reports():
-        customer = warning["customer"]
-        emails = customer.get_owner_mails()
-        warning["public_resources_url"] = utils.get_public_resources_url(customer)
-
-        if customer.serviceprovider.enable_notifications and emails:
-            core_utils.broadcast_mail(
-                "marketplace", "notification_usages", warning, emails
-            )
-
-
 @shared_task
 def terminate_resource(serialized_resource, serialized_user):
     resource = core_utils.deserialize_instance(serialized_resource)
@@ -309,7 +296,7 @@ def notify_about_stale_resource():
     for resource in resources:
         mails = resource.project.customer.get_owner_mails()
         resource_url = core_utils.format_homeport_link(
-            "projects/{project_uuid}/marketplace-project-resource-details/{resource_uuid}/",
+            "resource-details/{resource_uuid}/",
             project_uuid=resource.project.uuid.hex,
             resource_uuid=resource.uuid.hex,
         )
@@ -359,7 +346,7 @@ def notify_about_resource_termination(resource_uuid, user_uuid, is_staff_action=
     if user.email and user.notifications_enabled:
         bcc.append(user.email)
     resource_url = core_utils.format_homeport_link(
-        "projects/{project_uuid}/marketplace-project-resource-details/{resource_uuid}/",
+        "project-resource-details/{resource_uuid}/",
         project_uuid=resource.project.uuid.hex,
         resource_uuid=resource.uuid.hex,
     )
@@ -419,6 +406,41 @@ def notification_about_project_ending():
             core_utils.broadcast_mail(
                 "marketplace",
                 "notification_about_project_ending",
+                context,
+                [user.email],
+            )
+
+
+@shared_task(name="waldur_mastermind.marketplace.notification_about_resource_ending")
+def notification_about_resource_ending():
+    date_1 = timezone.datetime.today().date() + datetime.timedelta(days=1)
+    date_7 = timezone.datetime.today().date() + datetime.timedelta(days=7)
+    expired_resources = marketplace_models.Resource.objects.exclude(
+        end_date__isnull=True
+    ).filter(Q(end_date=date_1) | Q(end_date=date_7))
+
+    for resource in expired_resources:
+        users = (
+            resource.project.get_users()
+            .exclude(email="")
+            .exclude(notifications_enabled=False)
+        )
+
+        resource_url = core_utils.format_homeport_link(
+            "resource-details/{resource_uuid}/",
+            resource_uuid=resource.uuid.hex,
+        )
+
+        for user in users:
+            context = {
+                "resource_url": resource_url,
+                "resource": resource,
+                "user": user,
+                "delta": (resource.end_date - timezone.datetime.today().date()).days,
+            }
+            core_utils.broadcast_mail(
+                "marketplace",
+                "notification_about_resource_ending",
                 context,
                 [user.email],
             )
@@ -496,6 +518,10 @@ def process_pending_project_orders():
         state=models.Order.States.PENDING_PROJECT, project__in=active_project_ids
     )
     for order in orders:
+        # Setting the state to PENDING_PROVIDER because direct transition
+        # from PENDING_PROJECT to EXECUTING is not supported
+        order.state = models.Order.States.PENDING_PROVIDER
+        order.save(update_fields=["state"])
         if utils.order_should_not_be_reviewed_by_provider(order):
             order.set_state_executing()
             order.save(update_fields=["state"])
@@ -503,8 +529,6 @@ def process_pending_project_orders():
                 lambda: process_order_on_commit.delay(order, order.created_by)
             )
         else:
-            order.state = models.Order.States.PENDING_PROVIDER
-            order.save(update_fields=["state"])
             transaction.on_commit(
                 lambda: notify_provider_about_pending_order.delay(order.uuid)
             )

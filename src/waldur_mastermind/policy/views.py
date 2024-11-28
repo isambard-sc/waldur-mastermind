@@ -25,10 +25,7 @@ class ProjectEstimatedCostPolicyViewSet(ActionsViewSet):
 
     @action(detail=False, methods=["get"])
     def actions(self, request, *args, **kwargs):
-        data = [
-            action.__name__
-            for action in models.ProjectEstimatedCostPolicy.available_actions
-        ]
+        data = list(models.ProjectEstimatedCostPolicy.available_actions)
         return Response(data, status=status.HTTP_200_OK)
 
 
@@ -47,10 +44,7 @@ class CustomerEstimatedCostPolicyViewSet(ActionsViewSet):
 
     @action(detail=False, methods=["get"])
     def actions(self, request, *args, **kwargs):
-        data = [
-            action.__name__
-            for action in models.CustomerEstimatedCostPolicy.available_actions
-        ]
+        data = list(models.CustomerEstimatedCostPolicy.available_actions)
         return Response(data, status=status.HTTP_200_OK)
 
 
@@ -61,7 +55,7 @@ class OfferingEstimatedCostPolicyViewSet(ActionsViewSet):
         DjangoFilterBackend,
         structure_filters.GenericRoleFilter,
     ]
-    filterset_class = filters.OfferingEstimatedCostPolicyFilter
+    filterset_class = filters.PolicyFilter
     lookup_field = "uuid"
     destroy_permissions = update_permissions = partial_update_permissions = [
         structure_permissions.is_owner
@@ -69,8 +63,24 @@ class OfferingEstimatedCostPolicyViewSet(ActionsViewSet):
 
     @action(detail=False, methods=["get"])
     def actions(self, request, *args, **kwargs):
-        data = [
-            action.__name__
-            for action in models.OfferingEstimatedCostPolicy.available_actions
-        ]
+        data = list(action in models.OfferingEstimatedCostPolicy.available_actions)
+        return Response(data, status=status.HTTP_200_OK)
+
+
+class OfferingUsagePolicyViewSet(ActionsViewSet):
+    queryset = models.OfferingUsagePolicy.objects.all().order_by("-created")
+    serializer_class = serializers.OfferingUsagePolicySerializer
+    filter_backends = [
+        DjangoFilterBackend,
+        structure_filters.GenericRoleFilter,
+    ]
+    filterset_class = filters.PolicyFilter
+    lookup_field = "uuid"
+    destroy_permissions = update_permissions = partial_update_permissions = [
+        structure_permissions.is_owner
+    ]
+
+    @action(detail=False, methods=["get"])
+    def actions(self, request, *args, **kwargs):
+        data = list(models.OfferingUsagePolicy.available_actions)
         return Response(data, status=status.HTTP_200_OK)

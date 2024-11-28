@@ -1,6 +1,6 @@
 from django.utils.functional import cached_property
 
-from waldur_core.permissions.fixtures import CustomerRole
+from waldur_core.permissions.fixtures import CustomerRole, OfferingRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.marketplace import PLUGIN_NAME
@@ -48,6 +48,22 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
         return marketplace_factories.OfferingComponentFactory(
             offering=self.offering,
             billing_type=marketplace_models.OfferingComponent.BillingTypes.FIXED,
+        )
+
+    @cached_property
+    def plan_usage_component(self):
+        return marketplace_factories.PlanComponentFactory(
+            plan=self.plan,
+            component=self.offering_usage_component,
+        )
+
+    @cached_property
+    def offering_usage_component(self):
+        return marketplace_factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="ram",
+            name="RAM",
+            billing_type=marketplace_models.OfferingComponent.BillingTypes.USAGE,
         )
 
     @cached_property
@@ -111,3 +127,16 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
     @cached_property
     def offering_support(self):
         return self.offering_fixture.customer_support
+
+    @cached_property
+    def provider_owner(self):
+        user = structure_factories.UserFactory()
+        self.offering_customer.add_user(user, CustomerRole.OWNER)
+        return user
+
+    @cached_property
+    def provider_manager(self):
+        user = structure_factories.UserFactory()
+        self.offering_customer.add_user(user, CustomerRole.MANAGER)
+        self.offering.add_user(user, OfferingRole.MANAGER)
+        return user

@@ -3,9 +3,11 @@ from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
 from django_filters.widgets import BooleanWidget
 from rest_framework import filters
+from rest_framework.filters import BaseFilterBackend
 
 from waldur_core.core import filters as core_filters
 from waldur_core.core import serializers as core_serializers
+from waldur_core.core.mixins import ScopeMixin
 from waldur_core.logging import models, utils
 from waldur_core.logging.loggers import expand_event_groups
 
@@ -45,7 +47,19 @@ class EmailHookFilter(BaseHookFilter):
         fields = ("email",)
 
 
-class HookSummaryFilterBackend(core_filters.SummaryFilter):
+class HookSummaryFilterBackend(BaseFilterBackend):
+    def filter_queryset(self, request, queryset, view):
+        """Filter each resource separately using its own filter"""
+        summary_queryset = queryset
+        filtered_querysets = []
+        for queryset in summary_queryset.querysets:
+            filter_class = self.get_queryset_filter(queryset)
+            queryset = filter_class(request.query_params, queryset=queryset).qs
+            filtered_querysets.append(queryset)
+
+        summary_queryset.querysets = filtered_querysets
+        return summary_queryset
+
     def get_queryset_filter(self, queryset):
         if queryset.model == models.WebHook:
             return WebHookFilter
@@ -54,19 +68,32 @@ class HookSummaryFilterBackend(core_filters.SummaryFilter):
 
         return BaseHookFilter
 
-    def get_base_filter(self):
-        return BaseHookFilter
-
 
 class EventFilter(django_filters.FilterSet):
     created_from = core_filters.TimestampFilter(field_name="created", lookup_expr="gte")
     created_to = core_filters.TimestampFilter(field_name="created", lookup_expr="lt")
     message = django_filters.CharFilter(lookup_expr="icontains")
+    customer_uuid = django_filters.UUIDFilter(
+        method="filter_customer_uuid", label="Customer UUID"
+    )
+    project_uuid = django_filters.UUIDFilter(
+        method="filter_project_uuid", label="Project UUID"
+    )
+    user_uuid = django_filters.UUIDFilter(method="filter_user_uuid", label="User UUID")
     o = django_filters.OrderingFilter(fields=("created",))
 
     class Meta:
         model = models.Event
         fields = []
+
+    def filter_customer_uuid(self, queryset, name, value):
+        return queryset.filter(context__contains={"customer_uuid": value.hex})
+
+    def filter_project_uuid(self, queryset, name, value):
+        return queryset.filter(context__contains={"project_uuid": value.hex})
+
+    def filter_user_uuid(self, queryset, name, value):
+        return queryset.filter(context__contains={"user_uuid": value.hex})
 
 
 class EventFilterBackend(filters.BaseFilterBackend):
@@ -91,11 +118,18 @@ class EventFilterBackend(filters.BaseFilterBackend):
             if not visible.filter(pk=scope.pk).exists():
                 return queryset.none()
 
-            content_type = ContentType.objects.get_for_model(scope._meta.model)
+            content_type = ContentType.objects.get_for_model(scope)
             events = models.Feed.objects.filter(
                 content_type=content_type,
                 object_id=scope.id,
             ).values_list("event_id", flat=True)
+
+            # Include scope if it exists:
+            if isinstance(scope, ScopeMixin) and scope.content_type and scope.object_id:
+                events |= models.Feed.objects.filter(
+                    content_type=scope.content_type,
+                    object_id=scope.object_id,
+                ).values_list("event_id", flat=True)
             queryset = queryset.filter(id__in=events)
 
         elif not request.user.is_staff and not request.user.is_support:

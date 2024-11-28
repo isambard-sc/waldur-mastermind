@@ -3,19 +3,21 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.db.models.aggregates import Sum
 from django.utils.translation import gettext_lazy as _
-from rest_framework import serializers
+from rest_framework import exceptions, serializers
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
 from waldur_core.core import utils as core_utils
+from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import serializers as structure_serializers
 from waldur_mastermind.common.mixins import PRICE_DECIMAL_PLACES, PRICE_MAX_DIGITS
 from waldur_mastermind.common.utils import quantize_price
 from waldur_mastermind.marketplace import models as marketplace_models
 
-from . import models, utils
+from . import log, models, utils
 
 
 class InvoiceItemSerializer(serializers.HyperlinkedModelSerializer):
@@ -661,7 +663,6 @@ class PaymentProfileSerializer(serializers.HyperlinkedModelSerializer):
 
 
 class PaymentSerializer(
-    structure_serializers.ProtectedMediaSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
     profile = serializers.HyperlinkedRelatedField(
@@ -769,3 +770,238 @@ class FinancialReportEmailSerializer(serializers.Serializer):
         if len(value) < 1:
             raise serializers.ValidationError("Provide at least one email address")
         return value
+
+
+class NestedProviderOfferingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = marketplace_models.Offering
+        fields = ("uuid", "url", "type", "name")
+        extra_kwargs = {
+            "url": {
+                "view_name": "marketplace-provider-offering-detail",
+                "lookup_field": "uuid",
+            },
+        }
+
+
+class NestedPublicOfferingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = marketplace_models.Offering
+        fields = ("uuid", "url", "type", "name")
+        extra_kwargs = {
+            "url": {
+                "view_name": "marketplace-public-offering-detail",
+                "lookup_field": "uuid",
+            },
+        }
+
+
+class CustomerCreditSerializer(serializers.HyperlinkedModelSerializer):
+    offerings = NestedProviderOfferingSerializer(
+        read_only=True,
+        many=True,
+    )
+    customer_name = serializers.ReadOnlyField(source="customer.name")
+    customer_uuid = serializers.ReadOnlyField(source="customer.uuid")
+    customer_slug = serializers.ReadOnlyField(source="customer.slug")
+
+    class Meta:
+        model = models.CustomerCredit
+        fields = (
+            "uuid",
+            "url",
+            "value",
+            "customer",
+            "customer_name",
+            "customer_uuid",
+            "customer_slug",
+            "offerings",
+            "end_date",
+            "minimal_consumption",
+            "minimal_consumption_logic",
+            "allocated_to_projects",
+            "consumption_last_month",
+        )
+        protected_fields = ("customer",)
+
+        extra_kwargs = {
+            "url": {
+                "view_name": "customer-credit-detail",
+                "lookup_field": "uuid",
+            },
+            "customer": {
+                "view_name": "customer-detail",
+                "lookup_field": "uuid",
+            },
+        }
+
+
+class CreateCustomerCreditSerializer(CustomerCreditSerializer):
+    def validate_end_date(self, end_date):
+        if not end_date:
+            return
+
+        if end_date and end_date < datetime.date.today():
+            raise exceptions.ValidationError(
+                _("The end date must be greater than today's date.")
+            )
+
+        month_end = core_utils.month_end(end_date)
+        return month_end.date()
+
+    def get_from_attrs_or_instance(self, attrs, field_name, default=None):
+        return attrs.get(field_name, getattr(self.instance, field_name, default))
+
+    def validate(self, attrs):
+        minimal_consumption = self.get_from_attrs_or_instance(
+            attrs, "minimal_consumption"
+        )
+        minimal_consumption_logic = self.get_from_attrs_or_instance(
+            attrs, "minimal_consumption_logic"
+        )
+        end_date = self.get_from_attrs_or_instance(attrs, "end_date")
+        value = self.get_from_attrs_or_instance(attrs, "value")
+
+        if minimal_consumption and minimal_consumption >= value:
+            raise exceptions.ValidationError(
+                _("Minimum consumption must be smaller than the credit.")
+            )
+
+        if (
+            minimal_consumption_logic
+            == models.CustomerCredit.MinimalConsumptionLogic.LINEAR
+        ):
+            if not end_date:
+                raise exceptions.ValidationError(
+                    _("End date is required if minimal consumption logic is linear.")
+                )
+            elif (
+                end_date.year == datetime.date.today().year
+                and end_date.month == datetime.date.today().month
+            ):
+                raise exceptions.ValidationError(
+                    _(
+                        "End date must be greater if minimal consumption logic is linear."
+                    )
+                )
+        return attrs
+
+    offerings = serializers.HyperlinkedRelatedField(
+        view_name="marketplace-provider-offering-detail",
+        lookup_field="uuid",
+        queryset=marketplace_models.Offering.objects.all(),
+        required=False,
+        allow_null=True,
+        many=True,
+    )
+
+    def update(self, instance, validated_data):
+        old_offerings = set(instance.offerings.all())
+        new_offerings = set(validated_data.get("offerings", []))
+        instance = super().update(instance, validated_data)
+
+        if old_offerings != new_offerings:
+            log.log_changing_of_offerings(
+                instance.customer,
+                old_offerings,
+                new_offerings,
+            )
+
+        return instance
+
+
+class ProjectCreditSerializer(serializers.HyperlinkedModelSerializer):
+    project_name = serializers.ReadOnlyField(source="project.name")
+    project_uuid = serializers.ReadOnlyField(source="project.uuid")
+    project_slug = serializers.ReadOnlyField(source="project.slug")
+    customer_name = serializers.ReadOnlyField(source="project.customer.name")
+    customer_uuid = serializers.ReadOnlyField(source="project.customer.uuid")
+    customer_slug = serializers.ReadOnlyField(source="project.customer.slug")
+    customer_credit = serializers.ReadOnlyField(
+        source="project.customer.customercredit.value"
+    )
+    allocated_customer_credit = serializers.SerializerMethodField(
+        method_name="get_allocated_customer_credit"
+    )
+    offerings = NestedPublicOfferingSerializer(
+        read_only=True, many=True, source="project.customer.customercredit.offerings"
+    )
+
+    def get_allocated_customer_credit(self, project_credit):
+        return models.ProjectCredit.objects.filter(
+            project__customer=project_credit.project.customer
+        ).aggregate(sum=Sum("value"))["sum"]
+
+    def validate_project(self, project):
+        user = self.context["request"].user
+
+        if user.is_staff or user in project.customer.get_users(CustomerRole.OWNER):
+            return project
+
+        raise exceptions.PermissionDenied()
+
+    class Meta:
+        model = models.ProjectCredit
+        fields = (
+            "uuid",
+            "url",
+            "value",
+            "project",
+            "project_name",
+            "project_uuid",
+            "project_slug",
+            "customer_name",
+            "customer_slug",
+            "customer_uuid",
+            "customer_credit",
+            "allocated_customer_credit",
+            "consumption_last_month",
+            "offerings",
+        )
+
+        extra_kwargs = {
+            "url": {
+                "view_name": "project-credit-detail",
+                "lookup_field": "uuid",
+            },
+            "project": {
+                "view_name": "project-detail",
+                "lookup_field": "uuid",
+            },
+        }
+
+
+def get_project_credit(serializer, project):
+    try:
+        return models.ProjectCredit.objects.get(project=project).value
+    except models.ProjectCredit.DoesNotExist:
+        return None
+
+
+def add_project_credit(sender, fields, **kwargs):
+    fields["project_credit"] = serializers.SerializerMethodField()
+    setattr(sender, "get_project_credit", get_project_credit)
+
+
+core_signals.pre_serializer_fields.connect(
+    sender=structure_serializers.ProjectSerializer,
+    receiver=add_project_credit,
+)
+
+
+def get_customer_credit(serializer, customer):
+    try:
+        return models.CustomerCredit.objects.get(customer=customer).value
+    except models.CustomerCredit.DoesNotExist:
+        return None
+
+
+def add_customer_credit(sender, fields, **kwargs):
+    fields["customer_credit"] = serializers.SerializerMethodField()
+    setattr(sender, "get_customer_credit", get_customer_credit)
+
+
+core_signals.pre_serializer_fields.connect(
+    sender=structure_serializers.CustomerSerializer,
+    receiver=add_customer_credit,
+)

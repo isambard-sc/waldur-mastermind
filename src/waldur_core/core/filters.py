@@ -210,40 +210,6 @@ class ExternalFilterBackend(BaseFilterBackend):
         return queryset
 
 
-class SummaryFilter(BaseFilterBackend):
-    """Base filter for summary querysets"""
-
-    def filter_queryset(self, request, queryset, view):
-        queryset = self.filter(request, queryset, view)
-        return queryset
-
-    def get_queryset_filter(self, queryset):
-        """Return specific for queryset filter if it exists"""
-        raise NotImplementedError()
-
-    def get_base_filter(self):
-        """Return base filter that could be used for all summary objects"""
-        raise NotImplementedError()
-
-    def _get_filter(self, queryset):
-        try:
-            return self.get_queryset_filter(queryset)
-        except NotImplementedError:
-            return self.get_base_filter()
-
-    def filter(self, request, queryset, view):
-        """Filter each resource separately using its own filter"""
-        summary_queryset = queryset
-        filtered_querysets = []
-        for queryset in summary_queryset.querysets:
-            filter_class = self._get_filter(queryset)
-            queryset = filter_class(request.query_params, queryset=queryset).qs
-            filtered_querysets.append(queryset)
-
-        summary_queryset.querysets = filtered_querysets
-        return summary_queryset
-
-
 class EmptyFilter(django_filters.CharFilter):
     """
     This filter always returns empty queryset for non-empty value.
@@ -256,14 +222,6 @@ class EmptyFilter(django_filters.CharFilter):
             return qs
         else:
             return qs.none()
-
-
-class BaseSummaryFilterSet(django_filters.FilterSet):
-    def filter_queryset(self, queryset):
-        # Skip queryset class validation
-        for name, value in self.form.cleaned_data.items():
-            queryset = self.filters[name].filter(queryset, value)
-        return queryset
 
 
 class ExtendedOrderingFilter(django_filters.OrderingFilter):
@@ -315,10 +273,11 @@ def filter_by_full_name(queryset, value, field=""):
     )
 
 
-def filter_by_full_name_and_email(queryset, value):
+def filter_by_user_keyword(queryset, value):
     return queryset.filter(
         Q(**{"query_field__icontains": core_utils.normalize_unicode(value)})
         | Q(email__icontains=value)
+        | Q(username__icontains=value)
     ).distinct()
 
 

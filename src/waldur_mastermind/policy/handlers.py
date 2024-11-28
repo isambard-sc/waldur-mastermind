@@ -1,46 +1,54 @@
 import logging
 
-from django.utils import timezone
+from waldur_mastermind.invoices import models as invoices_models
+from waldur_mastermind.marketplace import models as marketplace_models
 
-from . import models
+from . import models, utils
 
 logger = logging.getLogger(__name__)
 
 
-def run_one_time_actions(policies):
-    for policy in policies:
-        if not policy.has_fired and policy.is_triggered():
-            policy.has_fired = True
-            policy.fired_datetime = timezone.now()
-            policy.save()
-
-            for action in policy.get_one_time_actions():
-                action(policy)
-                logger.info(
-                    "%s action has been triggered for %s. Policy UUID: %s",
-                    action.__name__,
-                    policy.scope.name,
-                    policy.uuid.hex,
-                )
-
-        elif policy.has_fired and not policy.is_triggered():
-            policy.has_fired = False
-            policy.save()
+def customer_estimated_cost_policy_trigger_handler(
+    sender, instance, created=False, **kwargs
+):
+    invoice_item = instance
+    policies = models.CustomerEstimatedCostPolicy.objects.filter(
+        scope=invoice_item.invoice.customer
+    )
+    utils.evaluate_policies(policies)
 
 
-def get_estimated_cost_policy_handler(klass):
+def project_estimated_cost_policy_trigger_handler(
+    sender, instance, created=False, **kwargs
+):
+    invoice_item = instance
+    policies = models.ProjectEstimatedCostPolicy.objects.filter(
+        scope=invoice_item.project
+    )
+    utils.evaluate_policies(policies)
+
+
+def get_offering_trigger_handler(klass):
     def handler(sender, instance, created=False, **kwargs):
-        estimated_cost = instance
+        resource = instance.resource
 
-        if not isinstance(estimated_cost.scope, klass.get_scope_class()):
-            return
+        if resource:
+            policies = klass.objects.filter(
+                scope=resource.offering,
+                organization_groups=resource.project.customer.organization_group,
+            )
 
-        scope = estimated_cost.scope
-        policies = klass.objects.filter(scope=scope)
-
-        run_one_time_actions(policies)
+            utils.evaluate_policies(policies)
 
     return handler
+
+
+offering_usage_policy_trigger_handler = get_offering_trigger_handler(
+    models.OfferingUsagePolicy
+)
+offering_estimated_cost_policy_trigger_handler = get_offering_trigger_handler(
+    models.OfferingEstimatedCostPolicy
+)
 
 
 def get_estimated_cost_policy_handler_for_observable_class(klass, observable_class):
@@ -54,12 +62,12 @@ def get_estimated_cost_policy_handler_for_observable_class(klass, observable_cla
         )
 
         for policy in policies:
-            if policy.is_triggered():
-                for action in policy.get_not_one_time_actions():
-                    action(policy, created)
+            if policy.get_threshold_actions() and policy.is_triggered():
+                for action in policy.get_threshold_actions():
+                    action.method(policy, created)
                     logger.info(
                         "%s action has been triggered for %s. Policy UUID: %s",
-                        action.__name__,
+                        action.method.__name__,
                         policy.scope.name,
                         policy.uuid.hex,
                     )
@@ -67,13 +75,45 @@ def get_estimated_cost_policy_handler_for_observable_class(klass, observable_cla
     return handler
 
 
-def offering_estimated_cost_trigger_handler(sender, instance, created=False, **kwargs):
-    invoice_item = instance
+def customer_credit_changed_handler(sender, instance, created=False, **kwargs):
+    customer_credit = instance
 
-    if invoice_item.resource:
-        policies = models.OfferingEstimatedCostPolicy.objects.filter(
-            scope=invoice_item.resource.offering,
-            organization_groups=invoice_item.resource.project.customer.organization_group,
+    if not customer_credit.tracker.has_changed("value"):
+        return
+
+    policies = models.CustomerEstimatedCostPolicy.objects.filter(
+        scope=customer_credit.customer
+    )
+    policies and utils.evaluate_policies(policies)
+
+    policies = models.ProjectEstimatedCostPolicy.objects.filter(
+        scope__customer=customer_credit.customer
+    )
+    policies and utils.evaluate_policies(policies)
+
+
+def project_credit_changed_handler(sender, instance, created=False, **kwargs):
+    project_credit = instance
+
+    if not project_credit.tracker.has_changed("value"):
+        return
+
+    policies = models.ProjectEstimatedCostPolicy.objects.filter(
+        scope__customer=project_credit.project.customer
+    )
+    policies and utils.evaluate_policies(policies)
+
+
+def customer_credit_offerings_list_changed_handler(
+    sender, instance, action, reverse, model, pk_set, **kwargs
+):
+    if action in ("post_add", "post_remove", "post_clear"):
+        offerings = marketplace_models.Offering.objects.filter(pk__in=pk_set)
+        customer_ids = invoices_models.CustomerCredit.objects.filter(
+            offerings__in=offerings
+        ).values_list("customer_id", flat=True)
+
+        policies = models.CustomerEstimatedCostPolicy.objects.filter(
+            scope_id__in=customer_ids
         )
-
-        run_one_time_actions(policies)
+        policies and utils.evaluate_policies(policies)

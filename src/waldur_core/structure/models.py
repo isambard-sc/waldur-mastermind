@@ -29,9 +29,13 @@ from waldur_core.core import fields as core_fields
 from waldur_core.core import models as core_models
 from waldur_core.core.fields import COUNTRIES_DICT, JSONField
 from waldur_core.core.models import AbstractFieldTracker
-from waldur_core.core.validators import validate_cidr_list, validate_name
+from waldur_core.core.validators import (
+    validate_cidr_list,
+    validate_name,
+    validate_phone_number,
+)
 from waldur_core.logging.loggers import LoggableMixin
-from waldur_core.media.models import ImageModelMixin
+from waldur_core.media.mixins import ImageModelMixin
 from waldur_core.media.validators import CertificateValidator
 from waldur_core.permissions.enums import SYSTEM_PROJECT_ROLES, RoleEnum
 from waldur_core.permissions.models import Role
@@ -47,7 +51,6 @@ from waldur_core.structure.managers import (
     PrivateServiceSettingsManager,
     ServiceSettingsManager,
     SharedServiceSettingsManager,
-    StructureManager,
     filter_queryset_for_user,
     get_connected_customers,
     get_customer_users,
@@ -328,7 +331,12 @@ class CustomerDetailsMixin(core_models.NameMixin, VATMixin, CoordinatesMixin):
     )
 
     email = models.EmailField(_("email address"), max_length=75, blank=True)
-    phone_number = models.CharField(_("phone number"), max_length=255, blank=True)
+    phone_number = models.CharField(
+        _("phone number"),
+        max_length=255,
+        blank=True,
+        validators=[validate_phone_number],
+    )
     access_subnets = models.TextField(
         validators=[validate_cidr_list],
         blank=True,
@@ -492,7 +500,7 @@ class ProjectType(
         return self.name
 
 
-class SoftDeletableManager(SoftDeletableManagerMixin, StructureManager):
+class SoftDeletableManager(SoftDeletableManagerMixin, models.Manager):
     pass
 
 
@@ -651,7 +659,7 @@ class Project(
     # Entities returned in manager available_objects are limited to not-deleted instances.
     # Entities returned in manager objects include deleted objects.
     available_objects = SoftDeletableManager()
-    objects = StructureManager()
+    objects = models.Manager()
 
     @property
     def is_expired(self):
@@ -709,6 +717,7 @@ class Project(
 
     class Meta:
         base_manager_name = "objects"
+        ordering = ["name"]
 
 
 class CustomerPermissionReview(core_models.UuidMixin):
@@ -991,6 +1000,15 @@ class BaseResource(
     def customer(self):
         return self.project.customer
 
+    @property
+    def marketplace_uuid(self):
+        from waldur_mastermind.marketplace.models import Resource
+
+        try:
+            return Resource.objects.get(scope=self).uuid
+        except (Resource.DoesNotExist, Resource.MultipleObjectsReturned):
+            return None
+
 
 class VirtualMachine(IPCoordinatesMixin, core_models.RuntimeStateMixin, BaseResource):
     def __init__(self, *args, **kwargs):
@@ -1062,40 +1080,11 @@ class VirtualMachine(IPCoordinatesMixin, core_models.RuntimeStateMixin, BaseReso
         return []
 
 
-class PrivateCloud(
-    quotas_models.QuotaModelMixin, core_models.RuntimeStateMixin, BaseResource
-):
-    class Meta:
-        abstract = True
-
-
 class Storage(core_models.RuntimeStateMixin, BaseResource):
     size = models.PositiveIntegerField(help_text=_("Size in MiB"))
 
     class Meta:
         abstract = True
-
-
-class Volume(Storage):
-    class Meta:
-        abstract = True
-
-
-class Snapshot(Storage):
-    class Meta:
-        abstract = True
-
-
-class SubResource(BaseResource):
-    """Resource dependent object that cannot exist without resource."""
-
-    class Meta:
-        abstract = True
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def get_all_models(cls):
-        return [model for model in apps.get_models() if issubclass(model, cls)]
 
 
 class UserAgreement(core_models.UuidMixin, LoggableMixin, TimeStampedModel):

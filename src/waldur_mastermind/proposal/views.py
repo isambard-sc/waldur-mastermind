@@ -20,7 +20,8 @@ from waldur_core.core.views import (
 )
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
-from waldur_core.permissions.utils import permission_factory
+from waldur_core.permissions.fixtures import ProposalRole
+from waldur_core.permissions.utils import add_user, permission_factory
 from waldur_core.permissions.views import UserRoleMixin
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
@@ -253,10 +254,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                     serializer.data,
                     status=status.HTTP_201_CREATED,
                 )
+        queryset = call.round_set.all().order_by("-start_time")
 
         return response.Response(
             self.get_serializer(
-                call.round_set,
+                queryset,
                 context=self.get_serializer_context(),
                 many=True,
             ).data,
@@ -456,7 +458,14 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             customer=proposal_round.call.manager.customer,
             name=project_name,
         )
-        serializer.save(project=project)
+        proposal = serializer.save(project=project)
+        if proposal:
+            add_user(
+                proposal,
+                self.request.user,
+                ProposalRole.MANAGER,
+                created_by=self.request.user,
+            )
 
     @decorators.action(detail=True, methods=["get", "post"])
     def resources(self, request, uuid=None):
@@ -577,6 +586,12 @@ class ReviewViewSet(ActionsViewSet):
     serializer_class = serializers.ReviewSerializer
     filterset_class = filters.ReviewFilter
     create_permissions = destroy_permissions = [permissions.is_staff]
+
+    update_validators = partial_update_validators = [
+        core_validators.StateValidator(
+            models.Review.States.CREATED, models.Review.States.IN_REVIEW
+        )
+    ]
 
     def get_queryset(self):
         user = self.request.user

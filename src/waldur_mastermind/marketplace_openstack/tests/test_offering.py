@@ -5,10 +5,8 @@ from ddt import data, ddt
 from django.core.exceptions import ObjectDoesNotExist
 from rest_framework import status, test
 
-from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole
-from waldur_core.structure import models as structure_models
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.common.mixins import UnitPriceMixin
@@ -16,51 +14,23 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.management.commands.load_categories import (
     load_category,
 )
-from waldur_mastermind.marketplace.tests import factories as marketplace_factories
+from waldur_mastermind.marketplace.tests import (
+    factories as marketplace_factories,
+)
 from waldur_mastermind.marketplace_openstack import (
     STORAGE_MODE_DYNAMIC,
     STORAGE_MODE_FIXED,
 )
-from waldur_openstack.openstack import models as openstack_models
-from waldur_openstack.openstack.tests import fixtures as openstack_fixtures
-from waldur_openstack.openstack.tests.factories import VolumeTypeFactory
-from waldur_openstack.openstack.tests.unittests.test_backend import BaseBackendTestCase
-from waldur_openstack.openstack_base.tests.fixtures import OpenStackFixture
-from waldur_openstack.openstack_base.utils import volume_type_name_to_quota_name
+from waldur_openstack import models as openstack_models
+from waldur_openstack.tests import factories as openstack_factories
+from waldur_openstack.tests import fixtures as openstack_fixtures
+from waldur_openstack.tests.factories import VolumeTypeFactory
+from waldur_openstack.tests.fixtures import OpenStackFixture
+from waldur_openstack.tests.unittests.test_backend import BaseBackendTestCase
+from waldur_openstack.utils import volume_type_name_to_quota_name
 
 from .. import INSTANCE_TYPE, TENANT_TYPE, VOLUME_TYPE
-from . import fixtures
 from .utils import BaseOpenStackTest, override_plugin_settings
-
-
-class VpcExternalFilterTest(BaseOpenStackTest):
-    def setUp(self):
-        super().setUp()
-        self.fixture = OpenStackFixture()
-        self.offering = marketplace_factories.OfferingFactory(
-            category=self.tenant_category,
-            project=self.fixture.project,
-            customer=self.fixture.customer,
-        )
-        self.url = marketplace_factories.OfferingFactory.get_list_url()
-
-    @override_waldur_core_settings(ONLY_STAFF_MANAGES_SERVICES=True)
-    def test_staff_can_see_vpc_offering(self):
-        self.client.force_authenticate(self.fixture.staff)
-        response = self.client.get(self.url)
-        self.assertEqual(1, len(response.data))
-
-    @override_waldur_core_settings(ONLY_STAFF_MANAGES_SERVICES=True)
-    def test_other_users_can_not_see_vpc_offering_if_feature_is_enabled(self):
-        self.client.force_authenticate(self.fixture.owner)
-        response = self.client.get(self.url)
-        self.assertEqual(0, len(response.data))
-
-    @override_waldur_core_settings(ONLY_STAFF_MANAGES_SERVICES=False)
-    def test_other_users_can_see_vpc_offering_if_feature_is_disabled(self):
-        self.client.force_authenticate(self.fixture.owner)
-        response = self.client.get(self.url)
-        self.assertEqual(1, len(response.data))
 
 
 class PlanComponentsTest(test.APITransactionTestCase):
@@ -130,10 +100,8 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
         tenant = self.trigger_offering_creation()
 
         offering = marketplace_models.Offering.objects.get(type=offering_type)
-        service_settings = offering.scope
 
-        self.assertTrue(isinstance(service_settings, structure_models.ServiceSettings))
-        self.assertEqual(service_settings.scope, tenant)
+        self.assertEqual(offering.scope, tenant)
         self.assertEqual(offering.customer, tenant.project.customer)
 
     @data(INSTANCE_TYPE, VOLUME_TYPE)
@@ -152,7 +120,7 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
     ):
         fixture = OpenStackFixture()
         tenant = openstack_models.Tenant.objects.create(
-            service_settings=fixture.openstack_service_settings,
+            service_settings=fixture.settings,
             project=fixture.project,
             state=openstack_models.Tenant.States.CREATING,
         )
@@ -176,7 +144,7 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
     def trigger_offering_creation(self):
         fixture = OpenStackFixture()
         tenant = openstack_models.Tenant.objects.create(
-            service_settings=fixture.openstack_service_settings,
+            service_settings=fixture.settings,
             project=fixture.project,
             state=openstack_models.Tenant.States.CREATING,
         )
@@ -193,7 +161,7 @@ class OfferingComponentForVolumeTypeTest(test.APITransactionTestCase):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
             type=TENANT_TYPE,
-            scope=self.fixture.openstack_service_settings,
+            scope=self.fixture.settings,
             plugin_options={"storage_mode": STORAGE_MODE_DYNAMIC},
         )
         self.volume_type = self.fixture.volume_type
@@ -218,9 +186,7 @@ class OfferingComponentForVolumeTypeTest(test.APITransactionTestCase):
         self.offering.plugin_options = {"storage_mode": STORAGE_MODE_FIXED}
         self.offering.save()
 
-        new_volume_type = VolumeTypeFactory(
-            settings=self.fixture.openstack_service_settings
-        )
+        new_volume_type = VolumeTypeFactory(settings=self.fixture.settings)
 
         self.assertFalse(
             marketplace_models.OfferingComponent.objects.filter(
@@ -283,10 +249,10 @@ class OfferingCreateTest(BaseBackendTestCase):
         )
         self.category_url = marketplace_factories.CategoryFactory.get_url()
         self.url = marketplace_factories.OfferingFactory.get_list_url()
-        mock_executors_patch = mock.patch(
-            "waldur_mastermind.marketplace_openstack.views.executors"
+        patcher = mock.patch(
+            "waldur_mastermind.marketplace_openstack.views.TenantCreateExecutor"
         )
-        mock_executors_patch.start()
+        patcher.start()
 
     def tearDown(self):
         mock.patch.stopall()
@@ -401,7 +367,7 @@ class OfferingUpdateTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
-            type=TENANT_TYPE, scope=self.fixture.openstack_service_settings
+            type=TENANT_TYPE, scope=self.fixture.settings
         )
         self.component = marketplace_factories.OfferingComponentFactory(
             offering=self.offering,
@@ -451,7 +417,7 @@ class OfferingDetailsTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
-            type=TENANT_TYPE, scope=self.fixture.openstack_service_settings
+            type=TENANT_TYPE, scope=self.fixture.settings
         )
         marketplace_factories.OfferingComponentFactory(
             offering=self.offering, type="cores"
@@ -491,7 +457,7 @@ class OfferingDetailsTest(test.APITransactionTestCase):
 @ddt
 class OfferingNameTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.MarketplaceOpenStackFixture()
+        self.fixture = OpenStackFixture()
 
     @data(INSTANCE_TYPE, VOLUME_TYPE)
     def test_renaming_openstack_tenant_should_also_rename_linked_private_offerings(
@@ -499,9 +465,161 @@ class OfferingNameTest(test.APITransactionTestCase):
     ):
         offering = marketplace_factories.OfferingFactory(
             type=offering_type,
-            scope=self.fixture.private_settings,
+            scope=self.fixture.tenant,
         )
-        self.fixture.openstack_tenant.name = "new_name"
-        self.fixture.openstack_tenant.save()
+        self.fixture.tenant.name = "new_name"
+        self.fixture.tenant.save()
         offering.refresh_from_db()
         self.assertTrue("new_name" in offering.name)
+
+
+class RouterExternalIPTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.UserFixture()
+        self.router = openstack_factories.RouterFactory(fixed_ips=["100.100.100.1"])
+        self.external_ips = [
+            {
+                "floating_ip": "100.100.100.0/24",
+                "external_ip": "200.200.200.0/24",
+            }
+        ]
+        self.offering = marketplace_factories.OfferingFactory(
+            type=TENANT_TYPE,
+            secret_options={"ipv4_external_ip_mapping": self.external_ips},
+        )
+        self.resource = marketplace_factories.ResourceFactory(
+            offering=self.offering, scope=self.router.tenant
+        )
+        self.url = openstack_factories.RouterFactory.get_url(self.router)
+        self.client.force_authenticate(self.fixture.staff)
+
+    def test_external_ips_has_been_added(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["offering_external_ips"], ["200.200.200.1"])
+
+    def test_external_ips_has_not_been_added(self):
+        self.router.fixed_ips = ["1.100.100.1"]
+        self.router.save()
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["offering_external_ips"], [])
+
+
+class InstanceExternalIPTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = openstack_fixtures.OpenStackFixture()
+        self.instance = self.fixture.instance
+        self.external_ips = [
+            {
+                "floating_ip": "100.100.100.0/24",
+                "external_ip": "200.200.200.0/24",
+            }
+        ]
+        self.parent_offering = marketplace_factories.OfferingFactory(
+            type=TENANT_TYPE,
+            secret_options={"ipv4_external_ip_mapping": self.external_ips},
+        )
+        self.offering = marketplace_factories.OfferingFactory(
+            type=INSTANCE_TYPE,
+            parent=self.parent_offering,
+        )
+        self.resource = marketplace_factories.ResourceFactory(offering=self.offering)
+        self.resource.scope = self.fixture.instance
+        self.resource.save()
+
+        self.url = marketplace_factories.ResourceFactory.get_url(
+            self.resource, "details"
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+    def test_external_ips_has_been_added(self):
+        floating_ip = openstack_factories.FloatingIPFactory(
+            port=self.fixture.port,
+            address="100.100.100.1",
+            service_settings=self.fixture.settings,
+            project=self.fixture.project,
+            tenant=self.fixture.tenant,
+            state=openstack_models.FloatingIP.States.OK,
+        )
+        floating_ip.refresh_from_db()
+        self.assertEqual(floating_ip.external_address, ["200.200.200.1"])
+        self.parent_offering.secret_options["ipv4_external_ip_mapping"] = [
+            {
+                "floating_ip": "100.100.100.0/24",
+                "external_ip": "300.300.300.0/24",
+            }
+        ]
+        self.parent_offering.save()
+        floating_ip.refresh_from_db()
+        self.assertEqual(floating_ip.external_address, ["300.300.300.1"])
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["external_address"], ["300.300.300.1"])
+
+    def test_external_ips_has_not_been_added(self):
+        floating_ip = openstack_factories.FloatingIPFactory(
+            port=self.fixture.port,
+            address="1.100.100.1",
+            service_settings=self.fixture.settings,
+            project=self.fixture.project,
+            tenant=self.fixture.tenant,
+            state=openstack_models.FloatingIP.States.OK,
+        )
+        floating_ip.refresh_from_db()
+        self.assertEqual(floating_ip.external_address, [])
+
+    def test_filter(self):
+        openstack_factories.FloatingIPFactory(
+            port=self.fixture.port,
+            address="100.100.100.1",
+            service_settings=self.fixture.settings,
+            project=self.fixture.project,
+            tenant=self.fixture.tenant,
+            state=openstack_models.FloatingIP.States.OK,
+        )
+        openstack_factories.FloatingIPFactory(
+            port=self.fixture.port,
+            address="100.100.100.2",
+            service_settings=self.fixture.settings,
+            project=self.fixture.project,
+            tenant=self.fixture.tenant,
+            state=openstack_models.FloatingIP.States.OK,
+        )
+        marketplace_factories.ResourceFactory()
+        url = marketplace_factories.ResourceFactory.get_list_url()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 2)
+
+        response = self.client.get(url, {"query": "200.200.200.2"})
+        self.assertEqual(len(response.data), 1)
+
+
+class UpdateSecretOptionsTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.UserFixture()
+        self.secret_options = {
+            "ipv4_external_ip_mapping": [
+                {
+                    "floating_ip": "100.100.100.0/24",
+                    "external_ip": "200.200.200.0/24",
+                }
+            ]
+        }
+        self.offering = marketplace_factories.OfferingFactory(
+            type=TENANT_TYPE,
+        )
+        self.url = marketplace_factories.OfferingFactory.get_url(
+            self.offering, "update_integration"
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+    def test_update_ipv4_external_ip_mapping(self):
+        response = self.client.post(
+            self.url, data={"secret_options": self.secret_options}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.secret_options, self.secret_options)

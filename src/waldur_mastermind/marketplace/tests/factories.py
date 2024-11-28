@@ -7,7 +7,7 @@ from django.utils import timezone
 from rest_framework.reverse import reverse
 
 from waldur_core.core import utils as core_utils
-from waldur_core.core.types import BaseMetaFactory
+from waldur_core.core.tests.types import BaseMetaFactory
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.marketplace import models
@@ -46,7 +46,9 @@ def backend_metadata_generator(number):
     }
 
 
-class ServiceProviderFactory(factory.django.DjangoModelFactory):
+class ServiceProviderFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.ServiceProvider]
+):
     class Meta:
         model = models.ServiceProvider
 
@@ -68,7 +70,9 @@ class ServiceProviderFactory(factory.django.DjangoModelFactory):
         return url if action is None else url + action + "/"
 
 
-class CategoryFactory(factory.django.DjangoModelFactory):
+class CategoryFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Category]
+):
     class Meta:
         model = models.Category
 
@@ -89,7 +93,36 @@ class CategoryFactory(factory.django.DjangoModelFactory):
         return url if action is None else url + action + "/"
 
 
-class CategoryGroupFactory(factory.django.DjangoModelFactory):
+class CategoryColumnFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.CategoryColumn]
+):
+    class Meta:
+        model = models.CategoryColumn
+
+    category = factory.SubFactory(CategoryFactory)
+    title = factory.Sequence(lambda n: "category-column-%s" % n)
+    index = factory.Sequence(lambda n: n)
+    attribute = factory.Sequence(lambda n: "attribute-%s" % n)
+
+    @classmethod
+    def get_url(cls, column=None, action=None):
+        if column is None:
+            column = CategoryColumnFactory()
+        url = "http://testserver" + reverse(
+            "marketplace-category-columns-detail",
+            kwargs={"uuid": column.uuid.hex},
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = "http://testserver" + reverse("marketplace-category-columns-list")
+        return url if action is None else url + action + "/"
+
+
+class CategoryGroupFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.CategoryGroup]
+):
     class Meta:
         model = models.CategoryGroup
 
@@ -110,7 +143,10 @@ class CategoryGroupFactory(factory.django.DjangoModelFactory):
         return url if action is None else url + action + "/"
 
 
-class CategoryComponentFactory(factory.django.DjangoModelFactory):
+class CategoryComponentFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.CategoryComponent],
+):
     class Meta:
         model = models.CategoryComponent
 
@@ -169,7 +205,10 @@ class OfferingFactory(
         )
 
 
-class ReferralFactory(factory.django.DjangoModelFactory):
+class ReferralFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[pid_models.DataciteReferral],
+):
     class Meta:
         model = pid_models.DataciteReferral
         exclude = ["scope"]
@@ -211,15 +250,32 @@ class OfferingReferralFactory(ReferralFactory):
         model = pid_models.DataciteReferral
 
 
-class SectionFactory(factory.django.DjangoModelFactory):
+class SectionFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Section]
+):
     class Meta:
         model = models.Section
 
-    key = factory.Sequence(lambda n: "section-%s" % n)
+    key = factory.Sequence(lambda n: "section-key-%s" % n)
+    title = factory.Sequence(lambda n: "section-title-%s" % n)
     category = factory.SubFactory(CategoryFactory)
 
+    @classmethod
+    def get_url(cls, section=None):
+        if section is None:
+            section = SectionFactory()
+        return "http://testserver" + reverse(
+            "marketplace-section-detail", kwargs={"key": section.key}
+        )
 
-class AttributeFactory(factory.django.DjangoModelFactory):
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse("marketplace-section-list")
+
+
+class AttributeFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Attribute]
+):
     class Meta:
         model = models.Attribute
 
@@ -228,7 +284,9 @@ class AttributeFactory(factory.django.DjangoModelFactory):
 
 
 @factory.django.mute_signals(signals.pre_save, signals.post_save)
-class ScreenshotFactory(factory.django.DjangoModelFactory):
+class ScreenshotFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Screenshot]
+):
     class Meta:
         model = models.Screenshot
 
@@ -251,7 +309,9 @@ class ScreenshotFactory(factory.django.DjangoModelFactory):
         return url if action is None else url + action + "/"
 
 
-class PlanFactory(factory.django.DjangoModelFactory):
+class PlanFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Plan]
+):
     class Meta:
         model = models.Plan
 
@@ -279,12 +339,15 @@ class PlanFactory(factory.django.DjangoModelFactory):
         return url
 
     @classmethod
-    def get_list_url(cls, action=None):
+    def get_provider_list_url(cls, action=None):
         url = "http://testserver" + reverse("marketplace-plan-list")
         return url if action is None else url + action + "/"
 
 
-class OfferingComponentFactory(factory.django.DjangoModelFactory):
+class OfferingComponentFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.OfferingComponent],
+):
     class Meta:
         model = models.OfferingComponent
 
@@ -294,7 +357,9 @@ class OfferingComponentFactory(factory.django.DjangoModelFactory):
     billing_type = models.OfferingComponent.BillingTypes.FIXED
 
 
-class PlanComponentFactory(factory.django.DjangoModelFactory):
+class PlanComponentFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.PlanComponent]
+):
     class Meta:
         model = models.PlanComponent
 
@@ -309,7 +374,9 @@ class PlanComponentFactory(factory.django.DjangoModelFactory):
         return url if action is None else url + action + "/"
 
 
-class OrderFactory(factory.django.DjangoModelFactory):
+class OrderFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Order]
+):
     class Meta:
         model = models.Order
         rename = {"order_attributes": "attributes"}
@@ -348,7 +415,9 @@ class OrderFactory(factory.django.DjangoModelFactory):
         return url if action is None else url + action + "/"
 
 
-class ResourceFactory(factory.django.DjangoModelFactory):
+class ResourceFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Resource]
+):
     class Meta:
         model = models.Resource
 
@@ -367,12 +436,28 @@ class ResourceFactory(factory.django.DjangoModelFactory):
         return url if action is None else url + action + "/"
 
     @classmethod
+    def get_provider_resource_url(cls, resource=None, action=None):
+        if resource is None:
+            resource = ResourceFactory()
+        url = reverse(
+            "marketplace-provider-resource-detail", kwargs={"uuid": resource.uuid.hex}
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
     def get_list_url(cls, action=None):
         url = reverse("marketplace-resource-list")
         return url if action is None else url + action + "/"
 
+    @classmethod
+    def get_provider_resource_list_url(cls, action=None):
+        url = reverse("marketplace-provider-resource-list")
+        return url if action is None else url + action + "/"
 
-class OfferingFileFactory(factory.django.DjangoModelFactory):
+
+class OfferingFileFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.OfferingFile]
+):
     class Meta:
         model = models.OfferingFile
 
@@ -395,7 +480,9 @@ class OfferingFileFactory(factory.django.DjangoModelFactory):
         return url if action is None else url + action + "/"
 
 
-class ComponentUsageFactory(factory.django.DjangoModelFactory):
+class ComponentUsageFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.ComponentUsage]
+):
     class Meta:
         model = models.ComponentUsage
 
@@ -413,7 +500,10 @@ class ComponentUsageFactory(factory.django.DjangoModelFactory):
     )
 
 
-class ResourcePlanPeriodFactory(factory.django.DjangoModelFactory):
+class ResourcePlanPeriodFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.ResourcePlanPeriod],
+):
     class Meta:
         model = models.ResourcePlanPeriod
 
@@ -422,7 +512,9 @@ class ResourcePlanPeriodFactory(factory.django.DjangoModelFactory):
     start = core_utils.month_start(timezone.now())
 
 
-class RobotAccountFactory(factory.django.DjangoModelFactory):
+class RobotAccountFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.RobotAccount]
+):
     class Meta:
         model = models.RobotAccount
 
@@ -443,28 +535,10 @@ class RobotAccountFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("marketplace-robot-account-list")
 
 
-class SectionFactory(factory.django.DjangoModelFactory):
-    class Meta:
-        model = models.Section
-
-    key = factory.Sequence(lambda n: "section-key-%s" % n)
-    title = factory.Sequence(lambda n: "section-title-%s" % n)
-    category = factory.SubFactory(CategoryFactory)
-
-    @classmethod
-    def get_url(cls, section=None):
-        if section is None:
-            section = SectionFactory()
-        return "http://testserver" + reverse(
-            "marketplace-section-detail", kwargs={"key": section.key}
-        )
-
-    @classmethod
-    def get_list_url(cls):
-        return "http://testserver" + reverse("marketplace-section-list")
-
-
-class IntegrationStatusFactory(factory.django.DjangoModelFactory):
+class IntegrationStatusFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.IntegrationStatus],
+):
     class Meta:
         model = models.IntegrationStatus
 

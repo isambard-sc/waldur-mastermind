@@ -8,21 +8,12 @@ from rest_framework import serializers
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
 from waldur_core.core.validators import BackendURLValidator
-from waldur_core.media.serializers import ProtectedMediaSerializerMixin
-from waldur_core.structure import models as structure_models
 from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.models import VirtualMachine
-from waldur_openstack.openstack import models as openstack_models
-from waldur_openstack.openstack import serializers as openstack_serializers
-from waldur_openstack.openstack_tenant import apps as openstack_tenant_apps
-from waldur_openstack.openstack_tenant import models as openstack_tenant_models
-from waldur_openstack.openstack_tenant import (
-    serializers as openstack_tenant_serializers,
-)
-from waldur_openstack.openstack_tenant.serializers import (
-    _validate_instance_security_groups,
-)
+from waldur_openstack import models as openstack_models
+from waldur_openstack import serializers as openstack_serializers
+from waldur_openstack.serializers import _validate_instance_security_groups
 
 from . import models, utils, validators
 
@@ -116,8 +107,8 @@ class DataVolumeSerializer(
 ):
     size = serializers.IntegerField()
     volume_type = serializers.HyperlinkedRelatedField(
-        view_name="openstacktenant-volume-type-detail",
-        queryset=openstack_tenant_models.VolumeType.objects.all(),
+        view_name="openstack-volume-type-detail",
+        queryset=openstack_models.VolumeType.objects.all(),
         lookup_field="uuid",
         allow_null=True,
         required=False,
@@ -153,15 +144,15 @@ class BaseNodeSerializer(
 ):
     ROLE_CHOICES = ("controlplane", "etcd", "worker")
     subnet = serializers.HyperlinkedRelatedField(
-        view_name="openstacktenant-subnet-detail",
-        queryset=openstack_tenant_models.SubNet.objects.all(),
+        view_name="openstack-subnet-detail",
+        queryset=openstack_models.SubNet.objects.all(),
         lookup_field="uuid",
         allow_null=True,
         write_only=True,
     )
     flavor = serializers.HyperlinkedRelatedField(
-        view_name="openstacktenant-flavor-detail",
-        queryset=openstack_tenant_models.Flavor.objects.all(),
+        view_name="openstack-flavor-detail",
+        queryset=openstack_models.Flavor.objects.all(),
         lookup_field="uuid",
         allow_null=True,
         write_only=True,
@@ -177,8 +168,8 @@ class BaseNodeSerializer(
         ],
     )
     system_volume_type = serializers.HyperlinkedRelatedField(
-        view_name="openstacktenant-volume-type-detail",
-        queryset=openstack_tenant_models.VolumeType.objects.all(),
+        view_name="openstack-volume-type-detail",
+        queryset=openstack_models.VolumeType.objects.all(),
         lookup_field="uuid",
         allow_null=True,
         required=False,
@@ -240,10 +231,10 @@ class NestedSecurityGroupSerializer(
     core_serializers.HyperlinkedRelatedModelSerializer,
 ):
     class Meta:
-        model = openstack_tenant_models.SecurityGroup
+        model = openstack_models.SecurityGroup
         fields = ("url",)
         extra_kwargs = {
-            "url": {"lookup_field": "uuid", "view_name": "openstacktenant-sgp-detail"}
+            "url": {"lookup_field": "uuid", "view_name": "openstack-sgp-detail"}
         }
 
 
@@ -251,13 +242,13 @@ class ClusterSerializer(
     structure_serializers.SshPublicKeySerializerMixin,
     structure_serializers.BaseResourceSerializer,
 ):
-    tenant_settings = serializers.HyperlinkedRelatedField(
-        queryset=structure_models.ServiceSettings.objects.filter(
-            type=openstack_tenant_apps.OpenStackTenantConfig.service_name
-        ),
-        view_name="servicesettings-detail",
+    tenant = serializers.HyperlinkedRelatedField(
+        queryset=openstack_models.Tenant.objects.all(),
+        view_name="openstack-tenant-detail",
         lookup_field="uuid",
     )
+
+    tenant_uuid = serializers.ReadOnlyField(source="tenant.uuid")
 
     name = serializers.CharField(
         max_length=150, validators=[validators.ClusterNameValidator]
@@ -272,7 +263,7 @@ class ClusterSerializer(
     )
 
     security_groups = NestedSecurityGroupSerializer(
-        queryset=openstack_tenant_models.SecurityGroup.objects.all(),
+        queryset=openstack_models.SecurityGroup.objects.all(),
         many=True,
         required=False,
         write_only=True,
@@ -287,7 +278,8 @@ class ClusterSerializer(
         fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
             "node_command",
             "nodes",
-            "tenant_settings",
+            "tenant",
+            "tenant_uuid",
             "runtime_state",
             "ssh_public_key",
             "install_longhorn",
@@ -296,17 +288,11 @@ class ClusterSerializer(
         )
         read_only_fields = (
             structure_serializers.BaseResourceSerializer.Meta.read_only_fields
-            + (
-                "node_command",
-                "runtime_state",
-            )
+            + ("node_command", "runtime_state")
         )
         protected_fields = (
             structure_serializers.BaseResourceSerializer.Meta.protected_fields
-            + (
-                "nodes",
-                "tenant_settings",
-            )
+            + ("nodes", "tenant")
         )
         extra_kwargs = dict(
             cluster={
@@ -344,16 +330,16 @@ class ClusterSerializer(
         if clusters.exists():
             raise serializers.ValidationError(_("Name is not unique."))
 
-        tenant_settings = attrs.get("tenant_settings")
+        tenant = attrs.get("tenant")
         security_groups = attrs.pop("security_groups", [])
-        if tenant_settings and security_groups:
-            _validate_instance_security_groups(security_groups, tenant_settings)
+        if tenant and security_groups:
+            _validate_instance_security_groups(security_groups, tenant)
         utils.expand_added_nodes(
             name,
             nodes,
             project,
             service_settings,
-            tenant_settings,
+            tenant,
             ssh_public_key,
             security_groups,
         )
@@ -393,6 +379,9 @@ class NodeSerializer(serializers.HyperlinkedModelSerializer):
     cluster_uuid = serializers.ReadOnlyField(source="cluster.uuid")
     instance_name = serializers.ReadOnlyField(source="instance.name")
     instance_uuid = serializers.ReadOnlyField(source="instance.uuid")
+    instance_marketplace_uuid = serializers.ReadOnlyField(
+        source="instance.marketplace_uuid"
+    )
 
     class Meta:
         model = models.Node
@@ -414,6 +403,7 @@ class NodeSerializer(serializers.HyperlinkedModelSerializer):
             "instance",
             "instance_name",
             "instance_uuid",
+            "instance_marketplace_uuid",
             "controlplane_role",
             "etcd_role",
             "worker_role",
@@ -491,7 +481,7 @@ class CreateNodeSerializer(
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
-        cluster = attrs["cluster"]
+        cluster: models.Cluster = attrs["cluster"]
         ssh_public_key = attrs.pop("ssh_public_key", None)
         node = attrs
         utils.expand_added_nodes(
@@ -499,7 +489,7 @@ class CreateNodeSerializer(
             [node],
             cluster.project,
             cluster.service_settings,
-            cluster.tenant_settings,
+            cluster.tenant,
             ssh_public_key,
         )
         return attrs
@@ -507,8 +497,8 @@ class CreateNodeSerializer(
 
 class LinkOpenstackSerializer(serializers.Serializer):
     instance = serializers.HyperlinkedRelatedField(
-        view_name="openstacktenant-instance-detail",
-        queryset=openstack_tenant_models.Instance.objects.all(),
+        view_name="openstack-instance-detail",
+        queryset=openstack_models.Instance.objects.all(),
         lookup_field="uuid",
         write_only=True,
     )
@@ -604,10 +594,7 @@ class NamespaceSerializer(structure_serializers.BasePropertySerializer):
         }
 
 
-class TemplateSerializer(
-    ProtectedMediaSerializerMixin,
-    structure_serializers.BasePropertySerializer,
-):
+class TemplateSerializer(structure_serializers.BasePropertySerializer):
     catalog_name = serializers.ReadOnlyField(source="catalog.name")
 
     class Meta:
@@ -1111,13 +1098,12 @@ def get_rancher_cluster_for_openstack_instance(serializer, scope):
         ).exists():
             return
 
-        cluster = queryset.filter(tenant_settings=scope.service_settings).get()
-    except models.Cluster.DoesNotExist:
-        return None
-    except MultipleObjectsReturned:
+        cluster = queryset.filter(tenant=scope.tenant).get()
+    except (models.Cluster.DoesNotExist, MultipleObjectsReturned):
         return None
     return {
         "name": cluster.name,
+        "marketplace_uuid": cluster.marketplace_uuid,
         "uuid": cluster.uuid,
     }
 
@@ -1128,6 +1114,6 @@ def add_rancher_cluster_to_openstack_instance(sender, fields, **kwargs):
 
 
 core_signals.pre_serializer_fields.connect(
-    sender=openstack_tenant_serializers.InstanceSerializer,
+    sender=openstack_serializers.InstanceSerializer,
     receiver=add_rancher_cluster_to_openstack_instance,
 )

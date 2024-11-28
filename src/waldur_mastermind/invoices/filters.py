@@ -37,6 +37,8 @@ class InvoiceItemFilter(django_filters.FilterSet):
     year = django_filters.NumberFilter(field_name="invoice__year")
     month = django_filters.NumberFilter(field_name="invoice__month")
     project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
+    customer_uuid = django_filters.UUIDFilter(field_name="project__customer__uuid")
+    credit_uuid = django_filters.UUIDFilter(field_name="credit__uuid")
 
 
 class PaymentProfileFilter(django_filters.FilterSet):
@@ -72,3 +74,50 @@ class PaymentFilter(django_filters.FilterSet):
     class Meta:
         model = models.Payment
         fields = ["date_of_payment"]
+
+
+class CustomerCreditFilter(django_filters.FilterSet):
+    customer_uuid = django_filters.UUIDFilter(field_name="customer__uuid")
+    customer_name = django_filters.CharFilter(
+        field_name="customer__name", lookup_expr="icontains"
+    )
+    customer_slug = django_filters.CharFilter(
+        field_name="customer__slug", lookup_expr="exact"
+    )
+    o = django_filters.OrderingFilter(
+        fields=(
+            ("customer__name", "customer_name"),
+            ("value", "value"),
+            ("end_date", "end_date"),
+            ("minimal_consumption", "minimal_consumption"),
+        ),
+    )
+
+    class Meta:
+        model = models.CustomerCredit
+        fields = []
+
+
+class ProjectCreditFilter(django_filters.FilterSet):
+    project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
+    project_name = django_filters.CharFilter(
+        field_name="project__name", lookup_expr="icontains"
+    )
+    customer_uuid = django_filters.UUIDFilter(field_name="project__customer__uuid")
+    customer_name = django_filters.CharFilter(
+        field_name="project__customer__name", lookup_expr="icontains"
+    )
+    customer_slug = django_filters.CharFilter(
+        field_name="project__customer__slug", lookup_expr="exact"
+    )
+
+    o = django_filters.OrderingFilter(
+        fields=(
+            ("project__name", "project_name"),
+            ("value", "value"),
+        ),
+    )
+
+    class Meta:
+        model = models.ProjectCredit
+        fields = []

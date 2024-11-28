@@ -15,13 +15,14 @@ from model_utils.models import TimeFramedModel, TimeStampedModel
 from rest_framework import exceptions as rf_exceptions
 from reversion import revisions as reversion
 
+import waldur_core.media.mixins
 from waldur_core.core import fields as core_fields
 from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.logging.loggers import LoggableMixin
-from waldur_core.media.models import get_upload_path
+from waldur_core.media.mixins import get_upload_path
 from waldur_core.media.validators import ImageValidator
 from waldur_core.permissions.utils import get_users
 from waldur_core.quotas import fields as quotas_fields
@@ -41,7 +42,7 @@ User = get_user_model()
 class ServiceProvider(
     core_models.UuidMixin,
     core_models.DescribableMixin,
-    structure_models.ImageModelMixin,
+    waldur_core.media.mixins.ImageModelMixin,
     TimeStampedModel,
 ):
     customer = models.OneToOneField(structure_models.Customer, on_delete=models.CASCADE)
@@ -207,7 +208,9 @@ class Category(
         return "marketplace-category"
 
 
-class CategoryColumn(models.Model):
+class CategoryColumn(
+    core_models.UuidMixin,
+):
     """
     This model is needed in order to render resources table with extra columns.
     Usually each column corresponds to specific resource attribute.
@@ -366,7 +369,7 @@ class Offering(
     LoggableMixin,
     pid_mixins.DataciteMixin,
     CoordinatesMixin,
-    structure_models.ImageModelMixin,
+    waldur_core.media.mixins.ImageModelMixin,
     common_mixins.BackendMetadataMixin,
 ):
     class States:
@@ -654,6 +657,11 @@ class OfferingComponent(
         choices=LimitPeriods.CHOICES, blank=True, null=True, max_length=6
     )
     limit_amount = models.IntegerField(blank=True, null=True)
+    # unit_factor is for metadata only and is not involved in any computations in Mastermind
+    unit_factor = models.IntegerField(
+        default=1,
+        help_text=_("The conversion factor from backend units to measured_unit"),
+    )
     # max_value and min_value fields are used if billing_type is LIMIT
     max_value = models.IntegerField(blank=True, null=True)
     min_value = models.IntegerField(blank=True, null=True)
@@ -1052,7 +1060,9 @@ class Resource(
     objects = managers.ResourceManager()
     # Effective ID is used when resource is provisioned through remote Waldur
     effective_id = models.CharField(max_length=255, blank=True)
-    requested_downscaling = models.BooleanField(default=False)
+    downscaled = models.BooleanField(default=False)
+    restrict_member_access = models.BooleanField(default=False)
+    paused = models.BooleanField(default=False)
 
     @property
     def customer(self):
@@ -1391,6 +1401,28 @@ class ComponentUsage(
         return ("uuid", "description", "usage", "date", "resource", "component")
 
 
+class ComponentUserUsage(
+    TimeStampedModel,
+    core_models.DescribableMixin,
+    core_models.BackendMixin,
+    core_models.UuidMixin,
+    LoggableMixin,
+):
+    """
+    This model represents an amount of a component consumed by a user.
+    """
+
+    user = models.ForeignKey(
+        to="OfferingUser", on_delete=models.CASCADE, blank=True, null=True
+    )
+    username = models.CharField(max_length=100)
+    component_usage = models.ForeignKey(ComponentUsage, on_delete=models.CASCADE)
+    usage = models.DecimalField(default=0, decimal_places=2, max_digits=20)
+
+    class Meta:
+        unique_together = ("username", "component_usage")
+
+
 class OfferingFile(
     core_models.UuidMixin,
     core_models.NameMixin,
@@ -1486,6 +1518,7 @@ class RobotAccount(
 
     class Meta:
         unique_together = ("resource", "type")
+        ordering = ["created"]
 
     def get_log_fields(self):
         return (

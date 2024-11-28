@@ -31,7 +31,7 @@ class IntegrationStatusCreationTest(test.APITransactionTestCase):
             ).count(),
         )
         response = self.client.get(
-            url, headers={"USER_AGENT": "waldur-slurm-agent/1.0.0"}
+            url, headers={"USER_AGENT": "waldur-site-agent/1.0.0"}
         )
         self.assertEqual(200, response.status_code)
 
@@ -68,7 +68,7 @@ class IntegrationStatusCreationTest(test.APITransactionTestCase):
             ).count(),
         )
         response = self.client.get(
-            url, headers={"USER_AGENT": "waldur-slurm-agent/1.0.0"}
+            url, headers={"USER_AGENT": "waldur-site-agent/1.0.0"}
         )
         self.assertEqual(200, response.status_code)
 
@@ -105,7 +105,7 @@ class IntegrationStatusCreationTest(test.APITransactionTestCase):
             ).count(),
         )
         response = self.client.get(
-            url, headers={"USER_AGENT": "waldur-slurm-agent/1.0.0"}
+            url, headers={"USER_AGENT": "waldur-site-agent/1.0.0"}
         )
         self.assertEqual(200, response.status_code)
 
@@ -157,3 +157,21 @@ class IntegrationStatusGetTest(test.APITransactionTestCase):
         self.assertEqual(200, response.status_code)
 
         self.assertIsNone(response.data["integration_status"], response.data)
+
+    @data("offering_owner", "service_manager")
+    def test_service_provider_user_can_view_integration_statuses(self, user):
+        self.client.force_login(getattr(self.fixture, user))
+        url = factories.IntegrationStatusFactory.get_list_url()
+        response = self.client.get(url)
+        self.assertEqual(200, response.status_code)
+
+        self.assertEqual(3, len(response.data), response.data)
+
+    @data("offering_manager", "offering_admin")
+    def test_service_provider_user_can_not_view_integration_statuses(self, user):
+        self.client.force_login(getattr(self.fixture, user))
+        url = factories.IntegrationStatusFactory.get_list_url()
+        response = self.client.get(url)
+        self.assertEqual(200, response.status_code)
+
+        self.assertEqual(0, len(response.data), response.data)

@@ -183,6 +183,7 @@ class OpenstackSection(FeatureSection):
     hide_volume_type_selector = Feature(
         "Allow to hide OpenStack volume type selector when instance or volume is provisioned."
     )
+    show_migrations = Feature("Show OpenStack tenant migrations action and tab")
 
 
 class TelemetrySection(FeatureSection):
@@ -191,3 +192,12 @@ class TelemetrySection(FeatureSection):
         description = "Telemetry settings"
 
     send_metrics = Feature("Send telemetry metrics.")
+
+
+# Temporarily commented out to fix Homeport linter
+# class InvoiceSection(FeatureSection):
+#    class Meta:
+#        key = "invoice"
+#        description = "Invoice settings"
+
+# display_credit_management = Feature("Display credit management.")

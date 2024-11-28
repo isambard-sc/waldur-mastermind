@@ -69,7 +69,7 @@ class Migration(migrations.Migration):
                     models.ImageField(
                         blank=True,
                         null=True,
-                        upload_to=waldur_core.media.models.get_upload_path,
+                        upload_to=waldur_core.media.mixins.get_upload_path,
                     ),
                 ),
                 (
@@ -487,13 +487,14 @@ class Migration(migrations.Migration):
                     models.ImageField(
                         blank=True,
                         null=True,
-                        upload_to=waldur_core.media.models.get_upload_path,
+                        upload_to=waldur_core.media.mixins.get_upload_path,
                     ),
                 ),
             ],
             options={
                 "abstract": False,
                 "base_manager_name": "objects",
+                "ordering": ["name"],
             },
             bases=(
                 waldur_core.core.models.DescendantMixin,

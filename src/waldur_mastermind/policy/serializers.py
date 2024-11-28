@@ -8,6 +8,7 @@ from rest_framework import serializers
 from waldur_core.core import serializers as core_serializers
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.permissions import _get_customer
+from waldur_mastermind.invoices.models import CustomerCredit, ProjectCredit
 
 from . import models
 
@@ -27,7 +28,7 @@ class PolicySerializer(serializers.HyperlinkedModelSerializer):
             return
 
         actions = set(value.split(","))
-        if actions - {a.__name__ for a in self.Meta.model.available_actions}:
+        if actions - self.Meta.model.available_actions:
             raise ValidationError(
                 _("%(value)s includes unavailable actions."),
                 params={"value": value},
@@ -51,11 +52,11 @@ class PolicySerializer(serializers.HyperlinkedModelSerializer):
                 policy.uuid.hex,
             )
 
-            for action in policy.get_one_time_actions():
-                action(policy)
+            for action in policy.get_immediate_actions():
+                action.method(policy)
                 logger.info(
-                    "%s action of policy %s has been triggerd.",
-                    action.__name__,
+                    "%s action of policy %s has been triggered.",
+                    action.method.__name__,
                     policy.uuid.hex,
                 )
 
@@ -65,7 +66,6 @@ class PolicySerializer(serializers.HyperlinkedModelSerializer):
         fields = (
             "uuid",
             "url",
-            "limit_cost",
             "scope",
             "scope_name",
             "scope_uuid",
@@ -76,11 +76,62 @@ class PolicySerializer(serializers.HyperlinkedModelSerializer):
             "has_fired",
             "fired_datetime",
         )
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+            },
+            "scope": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-provider-offering-detail",
+            },
+        }
+
+
+class EstimatedCostPolicySerializer(PolicySerializer):
+    period_name = serializers.ReadOnlyField(source="get_period_display")
+
+    class Meta(PolicySerializer.Meta):
+        fields = PolicySerializer.Meta.fields + (
+            "limit_cost",
+            "period",
+            "period_name",
+        )
 
 
 class ProjectEstimatedCostPolicySerializer(
-    core_serializers.AugmentedSerializerMixin, PolicySerializer
+    core_serializers.AugmentedSerializerMixin, EstimatedCostPolicySerializer
 ):
+    class Meta(EstimatedCostPolicySerializer.Meta):
+        model = models.ProjectEstimatedCostPolicy
+        view_name = "marketplace-project-estimated-cost-policy-detail"
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+            },
+            "scope": {"lookup_field": "uuid", "view_name": "project-detail"},
+        }
+        fields = EstimatedCostPolicySerializer.Meta.fields + (
+            "project_credit",
+            "customer_credit",
+        )
+
+    project_credit = serializers.SerializerMethodField()
+    customer_credit = serializers.SerializerMethodField()
+
+    def get_project_credit(self, instance):
+        project: structure_models.Project = instance.scope
+        try:
+            return ProjectCredit.objects.get(project=project).value
+        except ProjectCredit.DoesNotExist:
+            return None
+
+    def get_customer_credit(self, instance):
+        customer: structure_models.Customer = instance.scope.customer
+        try:
+            return CustomerCredit.objects.get(customer=customer).value
+        except CustomerCredit.DoesNotExist:
+            return None
+
     def validate_scope(self, scope):
         if not scope:
             return
@@ -97,20 +148,29 @@ class ProjectEstimatedCostPolicySerializer(
             _("User is not allowed to configure policies.")
         )
 
-    class Meta(PolicySerializer.Meta):
-        model = models.ProjectEstimatedCostPolicy
-        view_name = "marketplace-project-estimated-cost-policy-detail"
+
+class CustomerEstimatedCostPolicySerializer(EstimatedCostPolicySerializer):
+    class Meta(EstimatedCostPolicySerializer.Meta):
+        model = models.CustomerEstimatedCostPolicy
+        view_name = "marketplace-customer-estimated-cost-policy-detail"
         extra_kwargs = {
             "url": {
                 "lookup_field": "uuid",
+                "view_name": "marketplace-customer-estimated-cost-policy-detail",
             },
-            "scope": {"lookup_field": "uuid", "view_name": "project-detail"},
+            "scope": {"lookup_field": "uuid", "view_name": "customer-detail"},
         }
+        fields = EstimatedCostPolicySerializer.Meta.fields + ("customer_credit",)
 
+    customer_credit = serializers.SerializerMethodField()
 
-class CustomerEstimatedCostPolicySerializer(
-    core_serializers.AugmentedSerializerMixin, PolicySerializer
-):
+    def get_customer_credit(self, instance):
+        customer: structure_models.Customer = instance.scope
+        try:
+            return CustomerCredit.objects.get(customer=customer).value
+        except CustomerCredit.DoesNotExist:
+            return None
+
     def validate_scope(self, scope):
         if not scope:
             return
@@ -124,20 +184,8 @@ class CustomerEstimatedCostPolicySerializer(
             _("User is not allowed to configure policies.")
         )
 
-    class Meta(PolicySerializer.Meta):
-        model = models.CustomerEstimatedCostPolicy
-        view_name = "marketplace-customer-estimated-cost-policy-detail"
-        extra_kwargs = {
-            "url": {
-                "lookup_field": "uuid",
-            },
-            "scope": {"lookup_field": "uuid", "view_name": "customer-detail"},
-        }
 
-
-class OfferingEstimatedCostPolicySerializer(
-    core_serializers.AugmentedSerializerMixin, PolicySerializer
-):
+class OfferingPolicySerializerMixin(core_serializers.AugmentedSerializerMixin):
     organization_groups = serializers.HyperlinkedRelatedField(
         queryset=structure_models.OrganizationGroup.objects.all(),
         view_name="organization-group-detail",
@@ -162,20 +210,89 @@ class OfferingEstimatedCostPolicySerializer(
             _("User is not allowed to configure policies.")
         )
 
-    class Meta(PolicySerializer.Meta):
-        fields = PolicySerializer.Meta.fields + ("organization_groups",)
-        model = models.OfferingEstimatedCostPolicy
-        view_name = "marketplace-offering-estimated-cost-policy-detail"
+    class Meta:
+        fields = ("organization_groups",)
         extra_kwargs = {
-            "url": {
-                "lookup_field": "uuid",
-            },
-            "scope": {
-                "lookup_field": "uuid",
-                "view_name": "marketplace-provider-offering-detail",
-            },
-            "organization_group": {
+            "organization_groups": {
                 "lookup_field": "uuid",
                 "view_name": "organization-group-detail",
             },
         }
+
+
+class OfferingEstimatedCostPolicySerializer(
+    OfferingPolicySerializerMixin, EstimatedCostPolicySerializer
+):
+    period_name = serializers.ReadOnlyField(source="get_period_display")
+
+    class Meta(EstimatedCostPolicySerializer.Meta):
+        fields = (
+            EstimatedCostPolicySerializer.Meta.fields
+            + OfferingPolicySerializerMixin.Meta.fields
+            + ("period", "period_name")
+        )
+        model = models.OfferingEstimatedCostPolicy
+        view_name = "marketplace-offering-estimated-cost-policy-detail"
+        extra_kwargs = EstimatedCostPolicySerializer.Meta.extra_kwargs
+        extra_kwargs.update(OfferingPolicySerializerMixin.Meta.extra_kwargs)
+
+
+class NestedOfferingComponentLimitSerializer(serializers.ModelSerializer):
+    type = serializers.CharField(source="component.type")
+
+    class Meta:
+        model = models.OfferingComponentLimit
+        fields = ("type", "limit")
+
+
+class OfferingUsagePolicySerializer(OfferingPolicySerializerMixin, PolicySerializer):
+    component_limits_set = NestedOfferingComponentLimitSerializer(many=True)
+    period_name = serializers.ReadOnlyField(source="get_period_display")
+
+    class Meta(PolicySerializer.Meta):
+        fields = (
+            PolicySerializer.Meta.fields
+            + OfferingPolicySerializerMixin.Meta.fields
+            + ("component_limits_set", "period", "period_name")
+        )
+        model = models.OfferingUsagePolicy
+        view_name = "marketplace-offering-usage-policy-detail"
+        extra_kwargs = EstimatedCostPolicySerializer.Meta.extra_kwargs
+        extra_kwargs.update(OfferingPolicySerializerMixin.Meta.extra_kwargs)
+
+    def _create_or_update(self, policy, component_limits):
+        if component_limits is None:
+            return
+
+        offering = policy.scope
+        components = []
+
+        for component_limit in component_limits:
+            component_type = component_limit["component"]["type"]
+            limit = component_limit["limit"]
+            component = offering.components.filter(type=component_type).first()
+            components.append(component)
+
+            if not component:
+                raise ValidationError(
+                    f"Offering has not component with type {component_type}."
+                )
+
+            models.OfferingComponentLimit.objects.update_or_create(
+                policy=policy, defaults={"component": component, "limit": limit}
+            )
+
+        models.OfferingComponentLimit.objects.filter(policy=policy).exclude(
+            component__in=components
+        ).delete()
+
+    def create(self, validated_data):
+        component_limits = validated_data.pop("component_limits_set", None)
+        policy = super().create(validated_data)
+        self._create_or_update(policy, component_limits)
+        return policy
+
+    def update(self, policy, validated_data):
+        component_limits = validated_data.pop("component_limits_set", None)
+        self._create_or_update(policy, component_limits)
+        return super().update(policy, validated_data)

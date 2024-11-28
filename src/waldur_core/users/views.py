@@ -44,7 +44,7 @@ class InvitationViewSet(ProtectedViewSet):
         invitation: models.Invitation = serializer.save()
         if isinstance(invitation.scope, Project):
             project: Project = invitation.scope
-            if project.start_date and project.start_date > timezone.now():
+            if project.start_date and project.start_date > timezone.now().date():
                 invitation.state = models.Invitation.State.PENDING_PROJECT
                 invitation.save()
                 return
@@ -122,12 +122,16 @@ class InvitationViewSet(ProtectedViewSet):
         elif invitation.state not in (
             models.Invitation.State.PENDING,
             models.Invitation.State.EXPIRED,
+            models.Invitation.State.CANCELED,
         ):
             raise ValidationError(
-                _("Only pending and expired invitations can be resent.")
+                _("Only pending, expired and canceled invitations can be resent.")
             )
 
-        if invitation.state == models.Invitation.State.EXPIRED:
+        if invitation.state in [
+            models.Invitation.State.EXPIRED,
+            models.Invitation.State.CANCELED,
+        ]:
             invitation.state = models.Invitation.State.PENDING
             invitation.created = timezone.now()
             invitation.save()
@@ -145,8 +149,13 @@ class InvitationViewSet(ProtectedViewSet):
 
         if not can_manage_invitation_with(self.request, invitation.scope):
             raise PermissionDenied()
-        elif invitation.state != models.Invitation.State.PENDING:
-            raise ValidationError(_("Only pending invitation can be canceled."))
+        elif invitation.state not in [
+            models.Invitation.State.PENDING,
+            models.Invitation.State.PENDING_PROJECT,
+        ]:
+            raise ValidationError(
+                _("Only pending or planned invitations can be canceled.")
+            )
 
         invitation.cancel()
         return Response(
@@ -224,10 +233,10 @@ class InvitationViewSet(ProtectedViewSet):
         else:
             return Response({"email": invitation.email}, status=status.HTTP_200_OK)
 
-    @action(detail=True, filter_backends=[filters.PendingInvitationFilter])
+    @action(detail=True, filter_backends=[filters.VisibleInvitationFilter])
     def details(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
-        serializer = serializers.PendingInvitationDetailsSerializer(instance=invitation)
+        serializer = serializers.VisibleInvitationDetailsSerializer(instance=invitation)
         return Response(serializer.data)
 
 

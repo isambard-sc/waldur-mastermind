@@ -93,7 +93,7 @@ def create_or_update_keycloak_user(backend_user):
     email = backend_user.get("email")
     first_name = backend_user.get("given_name", "")
     last_name = backend_user.get("family_name", "")
-    organization = backend_user.get("org", "")
+    organization = backend_user.get("affiliation") or backend_user.get("org") or ""
     identity_source = backend_user.get("identity_source", "")
     try:
         user = User.objects.get(username=username)
@@ -186,9 +186,10 @@ def create_or_update_eduteams_user(backend_user):
         "email": email,
     }
     try:
-        user = User.objects.get(username=username)
+        user = User.all_objects.get(username=username)
         user.last_sync = timezone.now()
-        update_fields = set(["last_sync"])
+        user.is_active = True
+        update_fields = set(["last_sync", "is_active"])
         for key, value in payload.items():
             if getattr(user, key) != value:
                 setattr(user, key, value)
@@ -218,7 +219,8 @@ def pull_remote_eduteams_user(username):
         user_info = get_remote_eduteams_user_info(username)
     except NotFound:
         try:
-            user = User.objects.get(username=username, is_active=True)
+            # check across active users with default manager
+            user = User.objects.get(username=username)
         except User.DoesNotExist:
             return
         else:
@@ -315,7 +317,8 @@ def refresh_remote_eduteams_token():
             },
         )
         if token_response.status_code != 200:
-            raise ParseError("Unable to get access token. Service is down.")
+            message = f"Unable to get access token. Reason: {token_response.json()}"
+            raise ParseError(message)
         try:
             access_token = token_response.json()["access_token"]
             cache.set("REMOTE_EDUTEAMS_ACCESS_TOKEN", access_token, 30 * 60)

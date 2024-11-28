@@ -1,0 +1,456 @@
+import datetime
+
+from ddt import data, ddt
+from django.db.models.aggregates import Sum
+from freezegun import freeze_time
+from rest_framework import status, test
+
+from waldur_core.logging import models as logging_models
+from waldur_core.structure.tests import factories as structure_factories
+from waldur_mastermind.invoices import models, tasks, utils
+from waldur_mastermind.invoices.tests import factories, fixtures
+from waldur_mastermind.marketplace.tests import factories as marketplace_factories
+
+
+@ddt
+class CustomerCreditRetrieveTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+        self.url = factories.CustomerCreditFactory.get_url(self.fixture.customer_credit)
+
+    @data("staff", "global_support", "owner")
+    def test_user_with_access_can_retrieve_credit(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @data("manager", "admin", "user")
+    def test_user_cannot_retrieve_credit(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+@ddt
+class CustomerCreditCreateTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.InvoiceFixture()
+
+    def create_credit(self, user):
+        payload = {
+            "customer": structure_factories.CustomerFactory.get_url(
+                self.fixture.customer
+            ),
+            "value": 1000,
+        }
+        self.client.force_authenticate(getattr(self.fixture, user))
+        url = factories.CustomerCreditFactory.get_list_url()
+        return self.client.post(url, payload)
+
+    @data("staff")
+    def test_user_with_access_can_create_credit(self, user):
+        response = self.create_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="create_of_credit_by_staff"
+            ).exists()
+        )
+
+    @data("global_support", "owner", "manager", "admin", "user")
+    def test_user_cannot_create_credit(self, user):
+        response = self.create_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_minimal_consumption_validation(self):
+        payload = {
+            "customer": structure_factories.CustomerFactory.get_url(
+                self.fixture.customer
+            ),
+            "value": 1000,
+            "minimal_consumption": 100,
+        }
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.CustomerCreditFactory.get_list_url()
+        response = self.client.post(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        payload = {
+            "customer": structure_factories.CustomerFactory.get_url(),
+            "value": 1000,
+            "minimal_consumption": 2000,
+        }
+        url = factories.CustomerCreditFactory.get_list_url()
+        response = self.client.post(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @freeze_time("2024-10-10")
+    def test_minimal_consumption_logic(self):
+        payload = {
+            "customer": structure_factories.CustomerFactory.get_url(
+                self.fixture.customer
+            ),
+            "value": 1600,
+            "end_date": datetime.date(year=2025, month=10, day=15),
+            "minimal_consumption_logic": models.CustomerCredit.MinimalConsumptionLogic.LINEAR,
+            "minimal_consumption": 500,
+        }
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.CustomerCreditFactory.get_list_url()
+        response = self.client.post(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        credit = models.CustomerCredit.objects.filter(uuid=response.data["uuid"]).get()
+        self.assertEqual(credit.minimal_consumption, payload["minimal_consumption"])
+        self.assertEqual(credit.end_date, datetime.date(year=2025, month=10, day=31))
+
+        with freeze_time("2024-11-01"):
+            self.fixture.invoice.set_created()
+            credit.refresh_from_db()
+            self.assertEqual(
+                (payload["value"] - payload["minimal_consumption"]) / 11,
+                credit.minimal_consumption,
+            )
+
+
+@ddt
+class CustomerCreditUpdateTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+        self.fixture.customer_credit
+
+    def update_credit(self, user):
+        payload = {"value": 500}
+        self.client.force_authenticate(getattr(self.fixture, user))
+        url = factories.CustomerCreditFactory.get_url(self.fixture.customer_credit)
+        return self.client.patch(url, payload)
+
+    @data("staff")
+    def test_user_with_access_can_update_credit(self, user):
+        response = self.update_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="update_of_credit_by_staff"
+            ).exists()
+        )
+
+    @data("global_support", "owner", "manager", "admin", "user")
+    def test_user_cannot_update_credit(self, user):
+        response = self.update_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_logging_of_offering_changing(self):
+        payload = {"offerings": [marketplace_factories.OfferingFactory.get_url()]}
+        self.client.force_authenticate(getattr(self.fixture, "staff"))
+        url = factories.CustomerCreditFactory.get_url(self.fixture.customer_credit)
+        response = self.client.patch(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="allowed_offerings_have_been_updated"
+            ).exists()
+        )
+
+
+@ddt
+class CustomerCreditDeleteTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+
+    def delete_credit(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        url = factories.CustomerCreditFactory.get_url(self.fixture.customer_credit)
+        return self.client.delete(url)
+
+    @data("staff")
+    def test_user_with_access_can_delete_credit(self, user):
+        response = self.delete_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    @data("global_support", "owner", "manager", "admin", "user")
+    def test_user_cannot_delete_credit(self, user):
+        response = self.delete_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@ddt
+class ProjectCreditRetrieveTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+        self.url = factories.ProjectCreditFactory.get_url(self.fixture.project_credit)
+
+    @data("staff", "global_support", "owner")
+    def test_user_with_access_can_retrieve_credit(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @data("manager", "admin", "user")
+    def test_user_cannot_retrieve_credit(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+@ddt
+class ProjectCreditCreateTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+        self.fixture.customer_credit
+
+    def create_credit(self, user):
+        payload = {
+            "project": structure_factories.ProjectFactory.get_url(self.fixture.project),
+            "value": 10,
+        }
+        self.client.force_authenticate(getattr(self.fixture, user))
+        url = factories.ProjectCreditFactory.get_list_url()
+        return self.client.post(url, payload)
+
+    @data("staff", "owner")
+    def test_user_with_access_can_create_credit(self, user):
+        response = self.create_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    @data("global_support", "manager", "admin", "user")
+    def test_user_cannot_create_credit(self, user):
+        response = self.create_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@ddt
+class ProjectCreditUpdateTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+
+    def update_credit(self, user):
+        payload = {"value": 7}
+        self.client.force_authenticate(getattr(self.fixture, user))
+        url = factories.ProjectCreditFactory.get_url(self.fixture.project_credit)
+        return self.client.patch(url, payload)
+
+    @data("staff", "owner")
+    def test_user_with_access_can_update_credit(self, user):
+        response = self.update_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @data("manager", "admin", "user")
+    def test_user_cannot_update_credit(self, user):
+        response = self.update_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @data(
+        "global_support",
+    )
+    def test_global_support_user_cannot_update_credit(self, user):
+        response = self.update_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@ddt
+class ProjectCreditDeleteTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+
+    def delete_credit(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        url = factories.ProjectCreditFactory.get_url(self.fixture.project_credit)
+        return self.client.delete(url)
+
+    @data("staff", "owner")
+    def test_user_with_access_can_delete_credit(self, user):
+        response = self.delete_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    @data("manager", "admin", "user")
+    def test_user_cannot_delete_credit(self, user):
+        response = self.delete_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @data(
+        "global_support",
+    )
+    def test_global_support_user_cannot_delete_credit(self, user):
+        response = self.delete_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@freeze_time("2024-01-01")
+class CustomerCreditTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.InvoiceFixture()
+        self.invoice = self.fixture.invoice
+        self.invoice_item = self.fixture.invoice_item
+
+    def test_compensate_cost(self):
+        credit_value = self.invoice.total // 2
+        credit = factories.CustomerCreditFactory(
+            customer=self.invoice.customer, value=credit_value
+        )
+        old_total = self.invoice.total
+        self.invoice.set_created()
+        self.assertTrue(models.InvoiceItem.objects.filter(credit=credit).exists())
+        credit_item = models.InvoiceItem.objects.filter(credit=credit).get()
+        self.assertEqual(credit_value * -1, credit_item.total)
+        self.assertEqual(self.invoice.total, old_total - credit.value)
+        credit.refresh_from_db()
+        self.assertEqual(credit.value, 0)
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="reduction_of_credit"
+            ).exists()
+        )
+
+        with freeze_time("2024-02-01"):
+            self.assertEqual(credit.consumption_last_month, credit_value)
+
+    def test_compensate_cost_if_credit_greater_than_item_cost(self):
+        credit_value = self.invoice.total * 2
+        credit = factories.CustomerCreditFactory(
+            customer=self.invoice.customer, value=credit_value
+        )
+        old_total = self.invoice.total
+        self.invoice.set_created()
+        self.assertTrue(models.InvoiceItem.objects.filter(credit=credit).exists())
+        credit_item = models.InvoiceItem.objects.filter(credit=credit).get()
+        self.assertEqual(old_total * -1, credit_item.total)
+        self.assertEqual(self.invoice.total, 0)
+        credit.refresh_from_db()
+        self.assertEqual(credit.value, credit_value - old_total)
+
+    def test_minimal_consumption(self):
+        old_total = self.invoice.total
+        credit_value = self.invoice.total * 3
+        minimal_consumption = self.invoice.total * 2
+        credit = factories.CustomerCreditFactory(
+            customer=self.invoice.customer,
+            value=credit_value,
+            minimal_consumption=minimal_consumption,
+        )
+        self.invoice.set_created()
+        self.assertTrue(models.InvoiceItem.objects.filter(credit=credit).exists())
+        self.assertEqual(old_total * -1, old_total - minimal_consumption)
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="reduction_of_credit_due_to_minimal_consumption"
+            ).exists()
+        )
+
+    def test_task_set_to_zero_overdue_credits(self):
+        credit_1 = factories.CustomerCreditFactory()
+        credit_2 = factories.CustomerCreditFactory(
+            end_date=datetime.date.today() + datetime.timedelta(days=5)
+        )
+        credit_3 = factories.CustomerCreditFactory(
+            end_date=datetime.date.today() - datetime.timedelta(days=5)
+        )
+        tasks.set_to_zero_overdue_credits()
+        credit_1.refresh_from_db()
+        credit_2.refresh_from_db()
+        credit_3.refresh_from_db()
+        self.assertTrue(credit_1.value)
+        self.assertTrue(credit_2.value)
+        self.assertFalse(credit_3.value)
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="set_to_zero_overdue_credit"
+            ).exists()
+        )
+
+    def test_consumption_last_month(self):
+        pass
+
+
+@freeze_time("2024-01-01")
+class ProjectCreditTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+        self.customer_credit = self.fixture.customer_credit
+        self.project_credit = self.fixture.project_credit
+        self.invoice = self.fixture.invoice
+        self.invoice_item = self.fixture.invoice_item
+
+    def test_project_credits_reduced(self):
+        old_project_credit_value = self.project_credit.value
+        self.invoice.set_created()
+        self.project_credit.refresh_from_db()
+        self.assertTrue(self.project_credit.value < old_project_credit_value)
+
+        with freeze_time("2024-02-01"):
+            consumption_last_month = (
+                self.invoice.items.filter(credit=self.customer_credit).aggregate(
+                    sum=Sum("unit_price")
+                )["sum"]
+                * -1
+            )
+            self.assertEqual(
+                self.project_credit.consumption_last_month, consumption_last_month
+            )
+
+    def test_use_organisation_credit(self):
+        old_customer_credit_value = self.customer_credit.value
+        self.invoice.set_created()
+        self.customer_credit.refresh_from_db()
+        self.assertEqual(
+            self.customer_credit.value,
+            old_customer_credit_value - self.project_credit.value,
+        )
+
+
+class ProcessingCreditTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+        self.customer_credit = self.fixture.customer_credit
+        self.project_credit = self.fixture.project_credit
+        self.invoice = self.fixture.invoice
+        self.invoice_item = self.fixture.invoice_item
+
+    def _processing_compensations(self, minimal_consumption=0):
+        self.customer_credit.minimal_consumption = minimal_consumption
+        self.customer_credit.save()
+        old_project_credit_value = self.project_credit.value
+        old_customer_credit_value = self.customer_credit.value
+        monthly_compensation = utils.MonthlyCompensation(self.customer_credit.customer)
+        monthly_compensation.apply_compensations()
+        self.project_credit.refresh_from_db()
+        self.customer_credit.refresh_from_db()
+        consumption = (
+            self.invoice.items.filter(credit=self.customer_credit).aggregate(
+                sum=Sum("unit_price")
+            )["sum"]
+            * -1
+        )
+
+        self.assertEqual(
+            self.project_credit.value, old_project_credit_value - consumption
+        )
+        self.assertEqual(
+            self.customer_credit.value,
+            old_customer_credit_value - max(consumption, minimal_consumption),
+        )
+
+        monthly_compensation.clear_compensations()
+        self.assertEqual(
+            self.invoice.items.filter(credit=self.customer_credit).count(), 0
+        )
+        self.project_credit.refresh_from_db()
+        self.customer_credit.refresh_from_db()
+        self.assertEqual(self.project_credit.value, old_project_credit_value)
+        self.assertEqual(self.customer_credit.value, old_customer_credit_value)
+
+    def test_clear_compensations(self):
+        self._processing_compensations()
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="roll_back_customer_credit"
+            ).exists()
+        )
+
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="roll_back_project_credit"
+            ).exists()
+        )
+
+    def test_if_minimal_consumption_exists(self):
+        self._processing_compensations(90)

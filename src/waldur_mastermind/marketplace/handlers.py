@@ -1,5 +1,6 @@
 import logging
 
+from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import signals
@@ -11,6 +12,8 @@ from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.models import Customer
+from waldur_core.users import models as users_models
+from waldur_core.users.tasks import process_invitation
 from waldur_mastermind.marketplace.managers import get_connected_offerings
 from waldur_mastermind.marketplace.permissions import (
     order_should_not_be_reviewed_by_consumer,
@@ -89,13 +92,15 @@ def init_resource_parent(sender, instance, created=False, **kwargs):
         # Skipping support offering
         return
 
-    if not isinstance(service, structure_models.ServiceSettings):
+    if isinstance(service, structure_models.BaseResource):
+        base_resource = service
+    elif not isinstance(service, structure_models.ServiceSettings):
         return
+    else:
+        base_resource = service.scope
 
-    base_resource = service.scope
-
-    if not isinstance(base_resource, structure_models.BaseResource):
-        return
+        if not isinstance(base_resource, structure_models.BaseResource):
+            return
 
     try:
         parent_resource = models.Resource.objects.get(scope=base_resource)
@@ -114,7 +119,7 @@ def notify_approvers_when_order_is_created(sender, instance, created=False, **kw
     ):
         if order_should_not_be_reviewed_by_consumer(order):
             order.review_by_consumer(order.created_by)
-            if order.project.start_date and order.project.start_date > now():
+            if order.project.start_date and order.project.start_date > now().date():
                 order.state = models.Order.States.PENDING_PROJECT
                 order.save(update_fields=["state"])
                 return
@@ -137,6 +142,54 @@ def notify_approvers_when_order_is_created(sender, instance, created=False, **kw
         else:
             transaction.on_commit(
                 lambda: tasks.notify_consumer_about_pending_order.delay(order.uuid)
+            )
+
+
+def process_invitations_and_orders_when_project_start_date_is_unset(
+    sender, instance, created=False, **kwargs
+):
+    if created:
+        return
+
+    project = instance
+
+    if not project.tracker.has_changed("start_date"):
+        return
+
+    if project.start_date:
+        return
+
+    project_content_type = ContentType.objects.get_for_model(structure_models.Project)
+    invitations = users_models.Invitation.objects.filter(
+        state=users_models.Invitation.State.PENDING_PROJECT,
+        object_id=project.id,
+        content_type=project_content_type,
+    )
+    for invitation in invitations:
+        invitation.state = models.Invitation.State.PENDING
+        invitation.save()
+        sender = invitation.created_by.full_name or invitation.created_by.username
+        transaction.on_commit(
+            lambda: process_invitation.delay(invitation.uuid.hex, sender)
+        )
+
+    orders = models.Order.objects.filter(
+        state=models.Order.States.PENDING_PROJECT, project=project
+    )
+    for order in orders:
+        # Setting the state to PENDING_PROVIDER because direct transition
+        # from PENDING_PROJECT to EXECUTING is not supported
+        order.state = models.Order.States.PENDING_PROVIDER
+        order.save(update_fields=["state"])
+        if utils.order_should_not_be_reviewed_by_provider(order):
+            order.set_state_executing()
+            order.save(update_fields=["state"])
+            transaction.on_commit(
+                lambda: tasks.process_order_on_commit.delay(order, order.created_by)
+            )
+        else:
+            transaction.on_commit(
+                lambda: tasks.notify_provider_about_pending_order.delay(order.uuid)
             )
 
 
@@ -710,16 +763,59 @@ def offering_has_been_created_or_updated(sender, instance, created=False, **kwar
             )
 
 
-def resource_has_been_renamed(sender, instance, created=False, **kwargs):
+def resource_has_been_changed(sender, instance, created=False, **kwargs):
     if created:
         return
 
-    if not instance.tracker.has_changed("name"):
+    if not instance.tracker.changed():
         return
 
-    log.log_marketplace_resource_renamed(
-        instance, instance.tracker.previous("name") or ""
-    )
+    changed = []
+
+    def get_relative_object_name(field_name, value):
+        if not value:
+            return ""
+
+        try:
+            return str(
+                getattr(models.Resource, field_name.replace("_id", ""))
+                .get_queryset()
+                .get(id=value)
+            )
+        except ObjectDoesNotExist:
+            return ""
+
+    for field, old_value in instance.tracker.changed().items():
+        if field in (
+            "modified",
+            "backend_metadata",
+            "object_id",
+            "content_type_id",
+            "options",
+            "error_message",
+            "current_usages",
+        ):
+            continue
+
+        if field == "state":
+            old_value = models.Resource.get_state_display(
+                models.Resource(state=old_value)
+            )
+            new_value = instance.get_state_display()
+        elif field == "project_id":
+            old_value = get_relative_object_name("project_id", old_value)
+            new_value = get_relative_object_name("project_id", getattr(instance, field))
+        elif field == "offering_id":
+            old_value = get_relative_object_name("offering_id", old_value)
+            new_value = get_relative_object_name(
+                "offering_id", getattr(instance, field)
+            )
+        else:
+            new_value = getattr(instance, field)
+
+        changed.append({"name": field, "from": old_value, "to": new_value})
+
+    log.log_marketplace_resource_has_been_changed(instance, changed)
 
 
 def resource_state_has_been_changed(sender, instance, created=False, **kwargs):
