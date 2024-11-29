@@ -1,5 +1,6 @@
 from waldur_core.structure import views
-
+from django.urls import path
+import waldur_core.brics as brics
 
 def register_in(router):
     router.register(r"customers", views.CustomerViewSet)
@@ -51,4 +52,6 @@ def register_in(router):
     )
 
 
-urlpatterns = []
+urlpatterns = [
+    path("brics/access_for_email", brics.access_for_email),
+]
