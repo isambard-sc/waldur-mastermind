@@ -4,6 +4,10 @@ from django.contrib import auth
 from django.utils.translation import gettext_lazy as _
 from django.http import JsonResponse
 
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.permissions import IsAuthenticated
+
 from http import HTTPStatus as status
 
 from waldur_core.structure import models
@@ -13,7 +17,9 @@ logger = logging.getLogger(__name__)
 
 User = auth.get_user_model()
 
-
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def access_for_email(request):
     """
     Return the level of access available for the passed email address.
@@ -64,15 +70,9 @@ def access_for_email(request):
     reason filled, everything else is null
 
     """
-    print("access_for_email")
-    print(request)
-
     user = request.user
 
-    print(user)
-
     if not user.is_authenticated:
-        print("User is NOT AUTHENTICATED!")
         response = JsonResponse({})
         response.status_code = status.UNAUTHORIZED
         return response
@@ -91,9 +91,19 @@ def access_for_email(request):
         response.status_code = status.BAD_REQUEST
         return response
 
+    if not request.user.is_staff:
+        if user.email != email:
+            response = JsonResponse(
+                {"error": "You can only query your own email"}
+            )
+            response.status_code = status.FORBIDDEN
+            return response
+
+    print(f"INFO: brics.access_for_email request for {email} from {user} ({user.email})")
+
     qs = User.all_objects.all()
 
-    if not (request.user.is_staff or request.user.is_support):
+    if not request.user.is_staff:
         qs = qs.filter(is_active=True)
 
     qs = qs.filter(email__iexact=email)
