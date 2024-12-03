@@ -424,6 +424,21 @@ class WaldurFreeipa(BaseModel):
         public_settings = ["USERNAME_PREFIX", "ENABLED"]
 
 
+class WaldurOpenPortal(BaseModel):
+    ENABLED = Field(
+        False,
+        description="Enable support for OpenPortal plugin in a deployment",
+    )
+    DEFAULT_LIMITS = Field(
+        {
+            "CPU": 16000,  # Measured unit is CPU-minutes
+            "GPU": 400,  # Measured unit is GPU-minutes
+            "RAM": 100000 * 2**10,  # Measured unit is MB-h
+        },
+        description="Default limits of account that are set when OpenPortal account is provisioned.",
+    )
+
+
 class WaldurSlurm(BaseModel):
     ENABLED = Field(
         False,
@@ -783,6 +798,7 @@ class WaldurConfiguration(BaseModel):
     WALDUR_HPC = WaldurHPC()
     WALDUR_SLURM = WaldurSlurm()
     WALDUR_PID = WaldurPID()
+    WALDUR_OPENPORTAL = WaldurOpenPortal()
     WALDUR_OPENSTACK = WaldurOpenstack()
     WALDUR_MARKETPLACE = WaldurMarketplace()
     WALDUR_MARKETPLACE_SCRIPT = WaldurMarketplaceScript()

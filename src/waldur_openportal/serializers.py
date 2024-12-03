@@ -13,7 +13,7 @@ from rest_framework import serializers as rf_serializers
 from . import models
 
 
-class UserJobSerializer(BaseResourceSerializer):
+class JobSerializer(BaseResourceSerializer):
     class Meta(BaseResourceSerializer.Meta):
         model = models.Job
         fields = BaseResourceSerializer.Meta.fields + (

@@ -2,8 +2,7 @@ import logging
 import time
 import datetime
 
-from waldur_core.openportal import OpenPortalException
-from waldur_core.openportal.client import OpenPortalClient
+from .client import OpenPortalClient, OpenPortalException
 
 from .models import Job
 

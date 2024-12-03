@@ -6,7 +6,6 @@ try:
 except ImportError:
     have_openportal = False
 
-from .utils import register_job
 
 class OpenPortalException(Exception):
     pass

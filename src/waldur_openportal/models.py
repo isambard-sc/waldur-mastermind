@@ -11,8 +11,6 @@ from waldur_core.structure.models import BaseResource
 from waldur_core.core import models as core_models
 from waldur_core.structure import models as structure_models
 
-from . import utils
-
 
 class Job(BaseResource):
     @classmethod
@@ -27,6 +25,7 @@ class Job(BaseResource):
 
     user = models.ForeignKey(
         help_text="Reference to user which submitted job",
+        related_name="op-job-user+",
         on_delete=models.CASCADE,
         to=settings.AUTH_USER_MODEL,
         blank=True,
@@ -69,6 +68,7 @@ class Allocation(UsageMixin, structure_models.BaseResource):
         return "openportal-allocation"
 
     def usage_changed(self):
+        from . import utils
         return any(self.tracker.has_changed(field) for field in utils.FIELD_NAMES)
 
     @classmethod
@@ -111,7 +111,11 @@ class AllocationUserUsage(UsageMixin):
     )
 
     user = models.ForeignKey(
-        to=settings.AUTH_USER_MODEL, on_delete=models.CASCADE, blank=True, null=True
+        to=settings.AUTH_USER_MODEL,
+        related_name="op-allocation-user+",
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True
     )
 
     username = models.CharField(max_length=32)
