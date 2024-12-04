@@ -1,14 +1,4 @@
-import re
-
 from waldur_core.structure.serializers import BaseResourceSerializer
-from waldur_core.structure import serializers as structure_serializers
-from waldur_core.structure.permissions import _has_admin_access
-from waldur_core.core import serializers as core_serializers
-
-from django.core.validators import MinValueValidator
-from django.utils.translation import gettext_lazy as _
-from rest_framework import exceptions as rf_exceptions
-from rest_framework import serializers as rf_serializers
 
 from . import models
 
@@ -17,6 +7,7 @@ class JobSerializer(BaseResourceSerializer):
     class Meta(BaseResourceSerializer.Meta):
         model = models.Job
         fields = BaseResourceSerializer.Meta.fields + (
+            "runtime_state",
             "command",
             "user",
             "user_uuid",
@@ -27,7 +18,7 @@ class JobSerializer(BaseResourceSerializer):
             "user",
             "report",
         )
-        protected_fields = BaseResourceSerializer.Meta.protected_fields + ("file",)
+        protected_fields = BaseResourceSerializer.Meta.protected_fields + ("command",)
         extra_kwargs = {
             **BaseResourceSerializer.Meta.extra_kwargs,
             "user": {"lookup_field": "uuid", "view_name": "user-detail"},
@@ -38,160 +29,11 @@ class JobSerializer(BaseResourceSerializer):
 
     def get_fields(self):
         fields = super().get_fields()
+        if not self.instance:
+            fields["command"].required = True
+            fields["command"].allow_null = False
         return fields
 
     def create(self, validated_data):
         validated_data["user"] = self.context["request"].user
         return super().create(validated_data)
-
-
-### Serializers related to accounting
-
-
-class AllocationSerializer(
-    structure_serializers.BaseResourceSerializer,
-    core_serializers.AugmentedSerializerMixin,
-):
-    username = rf_serializers.SerializerMethodField()
-    gateway = rf_serializers.SerializerMethodField()
-    homepage = rf_serializers.ReadOnlyField(source="service_settings.homepage")
-
-    def get_username(self, allocation):
-        request = self.context["request"]
-        return request.user
-
-    def get_gateway(self, allocation):
-        options = allocation.service_settings.options
-        return options.get("gateway") or options.get("hostname")
-
-    class Meta(structure_serializers.BaseResourceSerializer.Meta):
-        model = models.Allocation
-        fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
-            "cpu_limit",
-            "cpu_usage",
-            "gpu_limit",
-            "gpu_usage",
-            "ram_limit",
-            "ram_usage",
-            "username",
-            "gateway",
-            "is_active",
-            "homepage",
-        )
-        read_only_fields = (
-            structure_serializers.BaseResourceSerializer.Meta.read_only_fields
-            + (
-                "cpu_usage",
-                "gpu_usage",
-                "ram_usage",
-                "cpu_limit",
-                "gpu_limit",
-                "ram_limit",
-                "is_active",
-            )
-        )
-        extra_kwargs = dict(
-            url={"lookup_field": "uuid", "view_name": "openportal-allocation-detail"},
-            cpu_limit={"validators": [MinValueValidator(0)]},
-            gpu_limit={"validators": [MinValueValidator(0)]},
-            ram_limit={"validators": [MinValueValidator(0)]},
-        )
-
-    def validate(self, attrs):
-        attrs = super().validate(attrs)
-        # Skip validation on update
-        if self.instance:
-            return attrs
-
-        correct_name_regex = "^([%s]{1,63})$" % models.OPENPORTAL_ALLOCATION_REGEX
-        name = attrs.get("name")
-        if not re.match(correct_name_regex, name):
-            raise rf_serializers.ValidationError(
-                _(
-                    "Name '%s' must be 1-63 characters long, each of "
-                    "which can only be alphanumeric or a hyphen"
-                )
-                % name
-            )
-
-        project = attrs["project"]
-        user = self.context["request"].user
-        if not _has_admin_access(user, project):
-            raise rf_exceptions.PermissionDenied(
-                _("You do not have permissions to create allocation for given project.")
-            )
-        return attrs
-
-
-class AllocationSetLimitsSerializer(rf_serializers.ModelSerializer):
-    cpu_limit = rf_serializers.IntegerField(min_value=-1)
-    gpu_limit = rf_serializers.IntegerField(min_value=-1)
-    ram_limit = rf_serializers.IntegerField(min_value=-1)
-
-    class Meta:
-        model = models.Allocation
-        fields = ("cpu_limit", "gpu_limit", "ram_limit")
-
-
-class AllocationUserUsageCreateSerializer(rf_serializers.HyperlinkedModelSerializer):
-    class Meta:
-        model = models.AllocationUserUsage
-        fields = (
-            "cpu_usage",
-            "ram_usage",
-            "gpu_usage",
-            "month",
-            "year",
-            "user",
-            "username",
-        )
-        extra_kwargs = {
-            "user": {
-                "lookup_field": "uuid",
-                "view_name": "user-detail",
-            },
-        }
-
-
-class AllocationUserUsageSerializer(rf_serializers.HyperlinkedModelSerializer):
-    full_name = rf_serializers.ReadOnlyField(source="user.full_name")
-
-    class Meta:
-        model = models.AllocationUserUsage
-        fields = (
-            "cpu_usage",
-            "ram_usage",
-            "gpu_usage",
-            "month",
-            "year",
-            "allocation",
-            "user",
-            "username",
-            "full_name",
-        )
-        extra_kwargs = {
-            "allocation": {
-                "lookup_field": "uuid",
-                "view_name": "openportal-allocation-detail",
-            },
-            "user": {
-                "lookup_field": "uuid",
-                "view_name": "user-detail",
-            },
-        }
-
-
-class AssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
-    allocation = rf_serializers.HyperlinkedRelatedField(
-        queryset=models.Allocation.objects.all(),
-        view_name="openportal-allocation-detail",
-        lookup_field="uuid",
-    )
-
-    class Meta:
-        model = models.Association
-        fields = (
-            "uuid",
-            "username",
-            "allocation",
-        )

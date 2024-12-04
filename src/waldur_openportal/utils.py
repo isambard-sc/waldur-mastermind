@@ -26,8 +26,15 @@ def sync():
         logger.error("Failed to connect to OpenPortal: %s", e)
         return
 
+    client.health(logger)
+
     # find all of the jobs that are in pending state
-    jobs = Job.objects.filter(state=Job.States.PENDING)
+    jobs = Job.objects.filter(state__in=[Job.States.CREATION_SCHEDULED,
+                                         Job.States.CREATING,
+                                         Job.States.UPDATE_SCHEDULED,
+                                         Job.States.UPDATING])
+
+    logger.info("Found %d jobs in unfinished state", len(jobs))
 
     for job in jobs:
         try:
@@ -35,7 +42,7 @@ def sync():
         except OpenPortalException as e:
             logger.error("Failed to get job %s: %s", job.backend_id, e)
             job.state = Job.States.ERRED
-            job.error_message = str(e)
+            job.report = str(e)
             job.save()
             continue
 
@@ -44,7 +51,7 @@ def sync():
         if op_job.is_error:
             logger.error("Job %s has failed: %s", job.backend_id, op_job.error_message)
             job.state = Job.States.ERRED
-            job.error_message = op_job.error_message
+            job.report = op_job.error_message
             job.save()
         elif op_job.is_finished:
             logger.info("Job %s has finished: %s", job.backend_id, job.result)
@@ -60,12 +67,24 @@ def submit_job(job):
         logger.error("Failed to connect to OpenPortal: %s", e)
         raise e
 
+    # make sure that the job is in the "CREATION_SCHEDULED" state
+    if job.state != Job.States.CREATION_SCHEDULED:
+        logger.error(f"Job {job} is not in the 'CREATION_SCHEDULED' state - state: {job.state}")
+        raise OpenPortalException("Job is not in the 'CREATION_SCHEDULED' state")
+
+    # make sure that the user submitting the job is a staff user
+    if not job.user.is_staff:
+        logger.error("User %s is not a staff user", job.user)
+        raise OpenPortalException(f"User {job.user} is not a staff user")
+
     try:
         op_job = client.run(job.command)
     except OpenPortalException as e:
         logger.error("Failed to run command %s: %s", job.command, e)
         raise e
 
+    job.report.clear()
+    job.state = Job.States.CREATING
     job.backend_id = op_job.uid
 
     # give it 2 seconds to complete before passing to
@@ -79,12 +98,10 @@ def submit_job(job):
 
     if op_job.is_error:
         job.state = Job.States.ERRED
-        job.error_message = op_job.error_message
-        job.save()
+        job.report = op_job.error_message
 
     elif op_job.is_finished:
         job.state = Job.States.OK
         job.report = op_job.result
-        job.save()
 
     job.save()

@@ -22,6 +22,16 @@ class OpenPortalClient:
         if not have_openportal:
             raise OpenPortalException("OpenPortal is not available")
 
+        if not openportal.is_config_loaded():
+            self.load_config()
+
+    def load_config(self):
+        """
+        Load the OpenPortal configuration from the file specified
+        in the OPENPORTAL_CONFIG environment variable. Raises an
+        OpenPortalException if the environment variable is not set
+        or if the config file cannot be loaded
+        """
         # the name of the config file is held in the
         # OPENPORTAL_CONFIG environment variable
         try:
@@ -38,6 +48,20 @@ class OpenPortalClient:
             openportal.load_config(config_file)
         except Exception as e:
             raise OpenPortalException(f"Failed to load OpenPortal config from '{config_file}': {e}")
+
+    def health(self, logger):
+        """
+        Log the health of the OpenPortal system to the logger
+        """
+        if not have_openportal:
+            raise OpenPortalException("OpenPortal is not available")
+
+        try:
+            health = openportal.health()
+        except Exception as e:
+            raise OpenPortalException(f"Failed to get OpenPortal health: {e}")
+
+        logger.info(f"OpenPortal health: {health}")
 
     def get(self, uid):
         """
