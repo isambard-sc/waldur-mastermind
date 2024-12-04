@@ -37,16 +37,6 @@ class OpenPortalViewSet(core_views.ActionsViewSet):
         "destroy",
     ]
 
-    create_association_serializer_class = delete_association_serializer_class = (
-        serializers.UsernameSerializer
-    )
-
-    create_association_permissions = delete_association_permissions = (
-        set_limits_permissions
-    ) = set_usage_permissions = set_state_permissions = set_backend_id_permissions = [
-        permissions.user_is_service_provider_owner_or_service_provider_manager
-    ]
-
     @action(detail=True, methods=["post"])
     def set_limits(self, request, uuid=None):
         resource = self.get_object()
@@ -130,96 +120,6 @@ class OpenPortalViewSet(core_views.ActionsViewSet):
         )
 
     set_usage_serializer_class = openportal_serializers.AllocationUserUsageCreateSerializer
-
-    @action(detail=True, methods=["POST"])
-    def create_association(self, request, uuid=None):
-        resource = self.get_object()
-        offering = resource.offering
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        username = serializer.validated_data["username"]
-
-        allocation = resource.scope
-        if not allocation:
-            raise ValidationError(
-                _("The resource does not have a related OpenPortal allocation.")
-            )
-
-        association, created = openportal_models.Association.objects.get_or_create(
-            allocation=allocation,
-            username=username,
-        )
-        if created:
-            logger.info("The association %s has been created", association)
-            offering_users = marketplace_models.OfferingUser.objects.filter(
-                offering=offering, username=username
-            )
-            if offering_users.count() == 0:
-                logger.info(
-                    "There is no offering user for %s with username %s",
-                    offering,
-                    username,
-                )
-            else:
-                offering_user = offering_users.first()
-                if offering_user.propagation_date is None:
-                    offering_user.set_propagation_date()
-                    offering_user.save(update_fields=["propagation_date"])
-                    logger.info(
-                        "The corresponding offering user %s has been marked as propagated",
-                        offering_user,
-                    )
-            return Response(
-                {
-                    "detail": _(
-                        "Association between the allocation and the username has been successfully created."
-                    ),
-                },
-                status=status.HTTP_201_CREATED,
-            )
-
-        return Response(
-            {
-                "detail": _(
-                    "Association between the allocation and the username already exists."
-                ),
-            },
-            status=status.HTTP_200_OK,
-        )
-
-    @action(detail=True, methods=["POST"])
-    def delete_association(self, request, uuid=None):
-        resource = self.get_object()
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        username = serializer.validated_data["username"]
-
-        allocation = resource.scope
-        if not allocation:
-            raise ValidationError(
-                _("The resource does not have a related OpenPortal allocation.")
-            )
-
-        associations = openportal_models.Association.objects.filter(
-            allocation=allocation, username=username
-        )
-        if not associations:
-            raise ValidationError(
-                _("Association between the allocation and the username does not exist.")
-            )
-
-        for association in associations:
-            association.delete()
-            logger.info("The association %s has been deleted", association)
-
-        return Response(
-            {
-                "detail": _(
-                    "Association between the allocation and the username has been successfully deleted."
-                ),
-            },
-            status=status.HTTP_200_OK,
-        )
 
     @action(detail=True, methods=["POST"])
     def set_state(self, request, uuid=None):

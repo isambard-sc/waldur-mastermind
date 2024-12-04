@@ -1,3 +1,5 @@
+import logging
+
 from django.db import transaction
 
 from waldur_core.structure.models import ServiceSettings
@@ -6,9 +8,13 @@ from waldur_openportal import models as openportal_models
 
 from .apps import MarketplaceOpenPortalConfig
 
+logger = logging.getLogger(__name__)
+
 
 class CreateAllocationProcessor(processors.BasicCreateResourceProcessor):
     def process_order(self, user):
+        logger.info(f"Creating OpenPortal allocation for order {self.order} from {user}")
+
         with transaction.atomic():
             service_settings, _ = ServiceSettings.objects.update_or_create(
                 type=MarketplaceOpenPortalConfig.service_name,
@@ -31,6 +37,8 @@ class CreateAllocationProcessor(processors.BasicCreateResourceProcessor):
 
 class DeleteAllocationProcessor(processors.BasicDeleteResourceProcessor):
     def process_order(self, user):
+        logger.info(f"Deleting OpenPortal allocation for order {self.order} from {user}")
+
         with transaction.atomic():
             marketplace_resource = self.order.resource
             marketplace_resource.set_state_terminating()
@@ -39,6 +47,8 @@ class DeleteAllocationProcessor(processors.BasicDeleteResourceProcessor):
 
 class UpdateAllocationLimitsProcessor(processors.BasicUpdateResourceProcessor):
     def update_limits_process(self, user):
+        logger.info(f"Updating OpenPortal allocation for order {self.order} from {user}")
+
         allocation: openportal_models.Allocation = self.order.resource.scope
         allocation.schedule_updating()
         allocation.save(update_fields=["state"])

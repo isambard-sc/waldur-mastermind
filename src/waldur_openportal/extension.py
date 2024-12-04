@@ -27,3 +27,9 @@ class OpenPortalExtension(WaldurExtension):
                 "args": (),
             },
         }
+
+    @staticmethod
+    def get_cleanup_executor():
+        from waldur_openportal.executors import OpenPortalCleanupExecutor
+
+        return OpenPortalCleanupExecutor

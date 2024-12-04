@@ -1,3 +1,4 @@
+import logging
 import datetime
 
 from celery import shared_task
@@ -7,9 +8,12 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils
 from waldur_mastermind.marketplace_openportal import PLUGIN_NAME
 
+logger = logging.getLogger(__name__)
+
 
 @shared_task(name="waldur_mastermind.marketplace_openportal.sync_offering_users")
 def sync_offering_users():
+    logger.info("Synchronizing offering users for OpenPortal offerings...")
     offerings = marketplace_models.Offering.objects.filter(
         type=PLUGIN_NAME,
         state__in=[
@@ -21,6 +25,9 @@ def sync_offering_users():
         plugin_options__username_generation_policy=utils.UsernameGenerationPolicy.SERVICE_PROVIDER.value
     )
 
+    logger.info("Found %s offerings to synchronize", offerings.count())
+    logger.info(f"Calling waldur_mastermind.marketplace.utils.user_offerings_mapping({offerings})")
+
     utils.user_offerings_mapping(offerings)
 
 
@@ -28,6 +35,8 @@ def sync_offering_users():
     name="waldur_mastermind.marketplace_openportal.mark_offering_backend_as_disconnected_after_timeout"
 )
 def mark_offering_backend_as_disconnected_after_timeout():
+    logger.info("Marking offering backend as disconnected after timeout...")
+
     one_hour_ago = timezone.now() - datetime.timedelta(hours=1)
     integration_statuses = marketplace_models.IntegrationStatus.objects.filter(
         status=marketplace_models.IntegrationStatus.States.ACTIVE,
@@ -35,5 +44,9 @@ def mark_offering_backend_as_disconnected_after_timeout():
         last_request_timestamp__lt=one_hour_ago,
     )
     for integration_status in integration_statuses:
+        logger.info(
+            "Marking offering backend as disconnected for offering %s",
+            integration_status.offering,
+        )
         integration_status.set_backend_disconnected()
         integration_status.save(update_fields=["status"])

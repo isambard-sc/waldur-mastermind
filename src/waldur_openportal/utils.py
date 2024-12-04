@@ -1,10 +1,18 @@
+import itertools
 import logging
 import time
+import re
 import datetime
+
+from waldur_core.structure.managers import (
+    get_connected_customers,
+    get_connected_projects,
+)
 
 from .client import OpenPortalClient, OpenPortalException
 
 from .models import Job
+from . import models
 
 logger = logging.getLogger(__name__)
 
@@ -105,3 +113,28 @@ def submit_job(job):
         job.report = op_job.result
 
     job.save()
+
+
+
+def get_user_allocations(user):
+    connected_projects = get_connected_projects(user)
+    connected_customers = get_connected_customers(user)
+
+    project_allocations = models.Allocation.objects.filter(
+        is_active=True, project__in=connected_projects
+    )
+
+    customer_allocations = models.Allocation.objects.filter(
+        is_active=True, project__customer__in=connected_customers
+    )
+
+    return (project_allocations, customer_allocations)
+
+
+def get_profile_allocations(profile):
+    return itertools.chain(*get_user_allocations(profile.user))
+
+
+def sanitize_allocation_name(name):
+    incorrect_symbols_regex = r"[^%s]+" % models.OPENPORTAL_ALLOCATION_REGEX
+    return re.sub(incorrect_symbols_regex, "", name)
