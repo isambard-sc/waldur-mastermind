@@ -6,6 +6,7 @@ from django.db.models import signals
 class MarketplaceOpenPortalConfig(AppConfig):
     name = "waldur_mastermind.marketplace_openportal"
     verbose_name = "Marketplace OpenPortal"
+    service_name = "OpenPortal"
 
     def ready(self):
         from waldur_mastermind.marketplace import handlers as marketplace_handlers
