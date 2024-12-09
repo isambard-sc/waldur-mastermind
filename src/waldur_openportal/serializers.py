@@ -17,6 +17,15 @@ from . import models
 logger = logging.getLogger(__name__)
 
 
+class OpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer):
+    class Meta:
+        secret_fields = ("instance_name")
+
+    instance_name = rf_serializers.CharField(
+        source="options.instance_name", label=_("Full pathname to the OpenPortal instance in the agent network")
+    )
+
+
 class JobSerializer(BaseResourceSerializer):
     class Meta(BaseResourceSerializer.Meta):
         model = models.Job

@@ -26,7 +26,7 @@ class MarketplaceOpenPortalExtension(WaldurExtension):
                 "schedule": timedelta(minutes=30),
                 "args": (),
             },
-            "mark-offering-backend-as-disconnected-after-timeout": {
+            "mark-openportal-offering-backend-as-disconnected-after-timeout": {
                 "task": "waldur_mastermind.marketplace_openportal.mark_offering_backend_as_disconnected_after_timeout",
                 "schedule": timedelta(hours=1),
                 "args": (),

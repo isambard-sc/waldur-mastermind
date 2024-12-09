@@ -64,7 +64,7 @@ class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
 
 class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
-    queryset = models.Association.objects.all().order_by("username")
+    queryset = models.Association.objects.all()
     serializer_class = serializers.AssociationSerializer
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)

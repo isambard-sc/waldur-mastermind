@@ -123,15 +123,15 @@ def create_offering_user_for_openportal_user(sender, allocation, user, username,
     )
 
 
-def drop_offering_user_for_slurm_user(sender, allocation, user, **kwargs):
+def drop_offering_user_for_openportal_user(sender, allocation, user, **kwargs):
     try:
         offering = marketplace_models.Offering.objects.get(
             scope=allocation.service_settings
         )
     except marketplace_models.Offering.DoesNotExist:
         logger.warning(
-            "Skipping SLURM user synchronization because offering is not found. "
-            "SLURM settings ID: %s",
+            "Skipping OpenPortaluser synchronization because offering is not found. "
+            "OpenPortal settings ID: %s",
             allocation.service_settings_id,
         )
         return
@@ -139,8 +139,6 @@ def drop_offering_user_for_slurm_user(sender, allocation, user, **kwargs):
     marketplace_models.OfferingUser.objects.filter(
         offering=offering, user=user
     ).delete()
-
-
 
 
 def update_component_quota(sender, instance, created=False, **kwargs):
