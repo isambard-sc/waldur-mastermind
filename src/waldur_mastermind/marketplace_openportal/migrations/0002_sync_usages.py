@@ -16,9 +16,7 @@ def sync_usages(apps, schema_editor):
         except ObjectDoesNotExist:
             continue
         resource.current_usages = {
-            "cpu": allocation.cpu_usage,
-            "gpu": allocation.gpu_usage,
-            "ram": allocation.ram_usage,
+            "node": allocation.node_usage,
         }
         resource.save(update_fields=["current_usages"])
 

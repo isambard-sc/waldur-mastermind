@@ -429,26 +429,6 @@ class WaldurOpenPortal(BaseModel):
         False,
         description="Enable support for OpenPortal plugin in a deployment",
     )
-    CUSTOMER_PREFIX = Field(
-        "waldur_customer_",
-        description="Prefix for OpenPortal account name corresponding to Waldur organization.",
-    )
-    PROJECT_PREFIX = Field(
-        "waldur_project_",
-        description="Prefix for OpenPortal account name corresponding to Waldur project.",
-    )
-    ALLOCATION_PREFIX = Field(
-        "waldur_allocation_",
-        description="Prefix for OpenPortal account name corresponding to Waldur allocation",
-    )
-    DEFAULT_LIMITS = Field(
-        {
-            "CPU": 16000,  # Measured unit is CPU-minutes
-            "GPU": 400,  # Measured unit is GPU-minutes
-            "RAM": 100000 * 2**10,  # Measured unit is MB-h
-        },
-        description="Default limits of account that are set when OpenPortal account is provisioned.",
-    )
 
 
 class WaldurSlurm(BaseModel):

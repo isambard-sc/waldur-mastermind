@@ -71,18 +71,6 @@ class OpenPortalReportLine(BaseReportLine):
         return self._parts[3]
 
     @cached_property
-    def cpu(self):
-        return self.parse_field("cpu")
-
-    @cached_property
-    def gpu(self):
-        return self.parse_field("gres/gpu")
-
-    @cached_property
-    def ram(self):
-        return self.parse_field("mem") // 2**20  # Convert from Bytes to MB
-
-    @cached_property
     def node(self):
         return self.parse_field("node")
 

@@ -51,7 +51,7 @@ class OpenPortalConfig(AppConfig):
             )
 
         structure_models.Project.add_quota_field(
-            name="nc_allocation_count",
+            name="op_allocation_count",
             quota_field=CounterQuotaField(
                 target_models=lambda: [models.Allocation],
                 path_to_scope="project",
@@ -59,7 +59,7 @@ class OpenPortalConfig(AppConfig):
         )
 
         structure_models.Customer.add_quota_field(
-            name="nc_allocation_count",
+            name="op_allocation_count",
             quota_field=CounterQuotaField(
                 target_models=lambda: [models.Allocation],
                 path_to_scope="project.customer",

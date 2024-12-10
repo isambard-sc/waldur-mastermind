@@ -21,7 +21,6 @@ class BaseBatchClient(metaclass=abc.ABCMeta):
     def list_accounts(self):
         """
         Get accounts list.
-        :return: list[structures.Account object]
         """
         raise NotImplementedError()
 
@@ -30,7 +29,6 @@ class BaseBatchClient(metaclass=abc.ABCMeta):
         """
         Get account info.
         :param name: [string] batch account name
-        :return: [structures.Account object]
         """
         raise NotImplementedError()
 
@@ -71,7 +69,6 @@ class BaseBatchClient(metaclass=abc.ABCMeta):
         Get association user and account.
         :param user: [string] user name
         :param account: [string] account name
-        :return: [structures.Association object]
         """
         raise NotImplementedError()
 

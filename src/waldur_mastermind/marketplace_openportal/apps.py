@@ -32,40 +32,20 @@ class MarketplaceOpenPortalConfig(AppConfig):
 
         USAGE = marketplace_models.OfferingComponent.BillingTypes.USAGE
         TOTAL = marketplace_models.OfferingComponent.LimitPeriods.TOTAL
-        default_limits = django_settings.WALDUR_OPENPORTAL["DEFAULT_LIMITS"]
+
         manager.register(
             PLUGIN_NAME,
             create_resource_processor=processor.CreateAllocationProcessor,
             delete_resource_processor=processor.DeleteAllocationProcessor,
             components=(
                 Component(
-                    type="cpu",
-                    name="CPU",
-                    measured_unit="hours",
+                    type="node",
+                    name="node",
+                    measured_unit="seconds",
                     billing_type=USAGE,
                     limit_period=TOTAL,
                     limit_amount=openportal_registrators.OpenPortalRegistrator.convert_quantity(
-                        default_limits["CPU"], "cpu"
-                    ),
-                ),
-                Component(
-                    type="gpu",
-                    name="GPU",
-                    measured_unit="hours",
-                    billing_type=USAGE,
-                    limit_period=TOTAL,
-                    limit_amount=openportal_registrators.OpenPortalRegistrator.convert_quantity(
-                        default_limits["GPU"], "gpu"
-                    ),
-                ),
-                Component(
-                    type="ram",
-                    name="RAM",
-                    measured_unit="GB-hours",
-                    billing_type=USAGE,
-                    limit_period=TOTAL,
-                    limit_amount=openportal_registrators.OpenPortalRegistrator.convert_quantity(
-                        default_limits["RAM"], "ram"
+                        0, "node"
                     ),
                 ),
             ),

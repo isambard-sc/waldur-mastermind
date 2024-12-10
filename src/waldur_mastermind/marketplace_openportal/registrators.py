@@ -10,10 +10,5 @@ class OpenPortalRegistrator(marketplace_registrators.MarketplaceRegistrator):
 
     @classmethod
     def convert_quantity(cls, usage, component_type):
-        minutes_in_hour = 60
-        if component_type == "ram":
-            mb_in_gb = 1024
-            quantity = int(math.ceil(1.0 * usage / mb_in_gb / minutes_in_hour))
-        else:
-            quantity = int(math.ceil(1.0 * usage / minutes_in_hour))
-        return quantity
+        seconds_in_hour = 3600
+        return math.ceil(1.0 * usage / seconds_in_hour)

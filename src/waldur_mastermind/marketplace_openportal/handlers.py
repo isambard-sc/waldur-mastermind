@@ -13,12 +13,8 @@ from waldur_mastermind.marketplace_openportal import PLUGIN_NAME
 logger = logging.getLogger(__name__)
 
 COMPONENT_FIELDS = {
-    "cpu_usage",
-    "gpu_usage",
-    "ram_usage",
-    "cpu_limit",
-    "gpu_limit",
-    "ram_limit",
+    "node_usage",
+    "node_limit",
 }
 
 

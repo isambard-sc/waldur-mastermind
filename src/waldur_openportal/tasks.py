@@ -124,42 +124,14 @@ def get_structure_allocations(structure):
 def add_user(serialized_profile):
     profile = core_utils.deserialize_instance(serialized_profile)
     for allocation in utils.get_profile_allocations(profile):
-        allocation.get_backend().add_user(allocation, profile.user, profile.username)
+        allocation.get_backend().add_user(allocation, profile.user)
 
 
 @shared_task(name="waldur_openportal.delete_user")
 def delete_user(serialized_profile):
     profile = core_utils.deserialize_instance(serialized_profile)
     for allocation in utils.get_profile_allocations(profile):
-        allocation.get_backend().delete_user(allocation, profile.user, profile.username)
-
-
-@shared_task(name="waldur_openportal.process_role_granted")
-def process_role_granted(serialized_profile, serialized_structure):
-    profile = core_utils.deserialize_instance(serialized_profile)
-    structure = core_utils.deserialize_instance(serialized_structure)
-
-    allocations = get_structure_allocations(structure)
-
-    for allocation in allocations:
-        try:
-            allocation.get_backend().add_user(
-                allocation, profile.user, profile.username
-            )
-        except ServiceBackendNotImplemented:
-            # Ignore a case of the remote OpenPortal allocation
-            pass
-
-
-@shared_task(name="waldur_openportal.process_role_revoked")
-def process_role_revoked(serialized_profile, serialized_structure):
-    profile = core_utils.deserialize_instance(serialized_profile)
-    structure = core_utils.deserialize_instance(serialized_structure)
-
-    allocations = get_structure_allocations(structure)
-
-    for allocation in allocations:
-        allocation.get_backend().delete_user(allocation, profile.user, profile.username)
+        allocation.get_backend().delete_user(allocation, profile.user)
 
 
 @shared_task(name="waldur_openportal.sync_allocation_users")

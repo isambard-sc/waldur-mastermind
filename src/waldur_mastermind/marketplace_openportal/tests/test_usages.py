@@ -58,33 +58,25 @@ class ComponentUsageTest(test.APITransactionTestCase):
         backend.client = mock.Mock()
         backend.client.get_usage_report.return_value = [
             OpenPortalReportLine(
-                "allocation1|cpu=1,node=1,gres/gpu=1,gres/gpu:tesla=1|00:01:00|user1|"
+                "allocation1|node=1"
             ),
             OpenPortalReportLine(
-                "allocation1|cpu=2,node=2,gres/gpu=2,gres/gpu:tesla=1|00:02:00|user2|"
+                "allocation1|node=2"
             ),
         ]
         backend.sync_usage()
         self.allocation.refresh_from_db()
 
-        self.assertEqual(self.allocation.cpu_usage, 1 + 2 * 2)
-        self.assertEqual(self.allocation.gpu_usage, 1 + 2 * 2)
+        self.assertEqual(self.allocation.node_usage, 1 + 2 * 2)
 
         self.assertTrue(
             marketplace_models.ComponentUsage.objects.filter(
-                resource=self.resource, component__type="cpu"
-            ).exists()
-        )
-        self.assertTrue(
-            marketplace_models.ComponentUsage.objects.filter(
-                resource=self.resource, component__type="gpu"
+                resource=self.resource, component__type="node"
             ).exists()
         )
 
     def test_create_component_quota(self):
-        self.allocation.cpu_usage = 1
-        self.allocation.gpu_usage = 10
-        self.allocation.ram_usage = 100
+        self.allocation.node_usage = 1
         self.allocation.save()
 
         for component in manager.get_components(PLUGIN_NAME):
@@ -114,9 +106,7 @@ class ComponentUsageTest(test.APITransactionTestCase):
         self.assertEqual(0, items.count())
 
     def test_invoice_item_is_created_for_each_component_when_usage_is_reported(self):
-        self.allocation.cpu_usage = 1
-        self.allocation.gpu_usage = 10
-        self.allocation.ram_usage = 100
+        self.allocation.node_usage = 1
         self.allocation.save()
 
         for component in manager.get_components(PLUGIN_NAME):
@@ -127,32 +117,12 @@ class ComponentUsageTest(test.APITransactionTestCase):
                 ).exists()
             )
 
-    def test_cpu_usage_is_converted_in_invoice_item_from_minutes_to_hours(self):
-        self.allocation.cpu_usage = 60
+    def test_node_usage_is_converted_in_invoice_item_from_minutes_to_hours(self):
+        self.allocation.node_usage = 60
         self.allocation.save()
 
         item = InvoiceItem.objects.get(
-            resource=self.resource, details__offering_component_type="cpu"
-        )
-        self.assertEqual(item.quantity, 1)
-
-    def test_gpu_usage_is_converted_in_invoice_item_from_minutes_to_hours(self):
-        self.allocation.gpu_usage = 60
-        self.allocation.save()
-
-        item = InvoiceItem.objects.get(
-            resource=self.resource, details__offering_component_type="gpu"
-        )
-        self.assertEqual(item.quantity, 1)
-
-    def test_ram_usage_is_converted_in_invoice_item_from_minutes_to_hours_and_from_mb_to_gb(
-        self,
-    ):
-        self.allocation.ram_usage = 60 * 1024
-        self.allocation.save()
-
-        item = InvoiceItem.objects.get(
-            resource=self.resource, details__offering_component_type="ram"
+            resource=self.resource, details__offering_component_type="node"
         )
         self.assertEqual(item.quantity, 1)
 
@@ -196,4 +166,4 @@ class ComponentUserUsageTest(test.APITransactionTestCase):
             component_usage=component_usage,
         ).first()
         self.assertIsNotNone(component_user_usage)
-        self.assertEqual(allocation_user_usage.cpu_usage, component_user_usage.usage)
+        self.assertEqual(allocation_user_usage.node_usage, component_user_usage.usage)

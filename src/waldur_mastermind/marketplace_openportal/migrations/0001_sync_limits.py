@@ -16,9 +16,7 @@ def sync_limits(apps, schema_editor):
         except ObjectDoesNotExist:
             continue
         resource.limits = {
-            "cpu": allocation.cpu_limit,
-            "gpu": allocation.gpu_limit,
-            "ram": allocation.ram_limit,
+            "node": allocation.node_limit,
         }
         resource.save(update_fields=["limits"])
 
