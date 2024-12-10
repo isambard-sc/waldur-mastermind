@@ -25,29 +25,29 @@ class OpenPortalBackend(ServiceBackend):
         self.client = self.get_client(settings)
 
     def get_client(self, settings):
+        logger.info(f"Creating OpenPortal client for settings: {settings}")
         return OpenPortalClient(
-            hostname=settings.options.get("hostname", "localhost"),
-            username=settings.username or "root",
-            port=settings.options.get("port", 22),
-            key_path=django_settings.WALDUR_OPENPORTAL["PRIVATE_KEY_PATH"],
-            use_sudo=settings.options.get("use_sudo", False),
+            instance_name=settings.options.get("instance_name", None),
         )
 
     def pull_resources(self):
+        logger.info(f"Pulling OpenPortal resources for settings: {self}")
         for allocation in self.get_allocation_queryset().filter(
             state=models.Allocation.States.OK
         ):
             try:
-                logger.debug("About to pull allocation %s", allocation)
+                logger.info("About to pull allocation %s", allocation)
                 self.pull_allocation(allocation)
             except Exception as e:
                 logger.error("Error while pulling allocation [%s]: %s", allocation, e)
             self.sync_usage()
 
     def ping(self, raise_exception=False):
+        logger.info(f"Pinging OpenPortal")
         try:
-            self.client.list_accounts()
+            self.client.health()
         except base.BatchError as e:
+            logger.error(f"OpenPortal is not available: {e}")
             if raise_exception:
                 raise ServiceBackendError(e)
             return False
@@ -55,9 +55,12 @@ class OpenPortalBackend(ServiceBackend):
             return True
 
     def sync_users(self, allocation):
+        logger.info(f"Syncing users for allocation: {allocation}")
         users = allocation.project.get_users()
+        logger.info(f"Users for allocation: {users}")
         profiles = freeipa_models.Profile.objects.filter(user__in=users)
         for profile in profiles:
+            logger.info(f"Adding user {profile.username} to allocation {allocation}")
             succeeded = self.add_user(
                 allocation, profile.user, profile.username.lower()
             )
@@ -78,6 +81,7 @@ class OpenPortalBackend(ServiceBackend):
             username__in=stale_usernames
         ):
             username = profile.username.lower()
+            logger.info(f"Deleting user {username} from allocation {allocation}")
             succeeded = self.delete_user(allocation, profile.user, username)
             if succeeded:
                 try:
@@ -97,6 +101,7 @@ class OpenPortalBackend(ServiceBackend):
                     )
 
     def create_allocation(self, allocation):
+        logger.info(f"Creating allocation: {allocation}")
         project = allocation.project
         customer_account = self.get_customer_name(project.customer)
         project_account = self.get_project_name(project)
@@ -125,6 +130,7 @@ class OpenPortalBackend(ServiceBackend):
         self.sync_users(allocation)
 
     def delete_allocation(self, allocation):
+        logger.info(f"Deleting allocation: {allocation}")
         account = allocation.backend_id
 
         if not account.strip():
@@ -151,6 +157,7 @@ class OpenPortalBackend(ServiceBackend):
         """
         Create association between user and OpenPortal account if it does not exist yet.
         """
+        logger.info(f"Adding OpenPortal user {username} to allocation {allocation}")
         account = allocation.backend_id
 
         if not account.strip():
@@ -178,6 +185,7 @@ class OpenPortalBackend(ServiceBackend):
         """
         Delete association between user and OpenPortal account if it exists.
         """
+        logger.info(f"Deleting OpenPortal user {username} from allocation {allocation}")
         account = allocation.backend_id
 
         if not account.strip():
@@ -199,6 +207,7 @@ class OpenPortalBackend(ServiceBackend):
 
     def set_resource_limits(self, allocation: models.Allocation):
         # TODO: add default limits configuration (https://opennode.atlassian.net/browse/WAL-3037)
+        logger.info(f"Setting resource limits for allocation {allocation}")
         limits = Quotas(
             cpu=allocation.cpu_limit,
             gpu=allocation.gpu_limit,
@@ -207,6 +216,7 @@ class OpenPortalBackend(ServiceBackend):
         self.client.set_resource_limits(allocation.backend_id, limits)
 
     def sync_usage(self):
+        logger.info(f"Syncing OpenPortal usage for settings: {self}")
         waldur_allocations = {
             allocation.backend_id: allocation
             for allocation in self.get_allocation_queryset()
@@ -217,7 +227,7 @@ class OpenPortalBackend(ServiceBackend):
         for account, usage in report.items():
             allocation = waldur_allocations.get(account)
             if not allocation:
-                logger.debug(
+                logger.info(
                     "Skipping usage report for account %s because it is not managed under Waldur",
                     account,
                 )
@@ -225,6 +235,7 @@ class OpenPortalBackend(ServiceBackend):
             self._update_quotas(allocation, usage)
 
     def pull_allocation(self, allocation):
+        logger.info(f"Pulling OpenPortal allocation {allocation}")
         self.sync_users(allocation)
         account = allocation.backend_id
 
@@ -242,6 +253,7 @@ class OpenPortalBackend(ServiceBackend):
         self._update_limits(allocation, limits)
 
     def get_usage_report(self, accounts):
+        logger.info(f"Getting OpenPortal usage report for accounts: {accounts}")
         report = {}
         lines = self.client.get_usage_report(accounts)
 
@@ -261,6 +273,7 @@ class OpenPortalBackend(ServiceBackend):
         return report
 
     def get_allocation_limits(self, account):
+        logger.info(f"Getting OpenPortal limits for account: {account}")
         lines = self.client.get_resource_limits(account)
         correct_lines = [
             association for association in lines if association.resource_limits
@@ -271,6 +284,7 @@ class OpenPortalBackend(ServiceBackend):
             return limits
 
     def _update_limits(self, allocation, limits):
+        logger.info(f"Updating limits for OpenPortal allocation {allocation}")
         if not limits:
             return
         allocation.cpu_limit = limits.cpu
@@ -280,6 +294,7 @@ class OpenPortalBackend(ServiceBackend):
 
     @transaction.atomic()
     def _update_quotas(self, allocation, usage):
+        logger.info(f"Updating quotas for OpenPortal allocation {allocation} for usage {usage}")
         quotas = usage.pop("TOTAL_ACCOUNT_USAGE")
         allocation.cpu_usage = quotas.cpu
         allocation.gpu_usage = quotas.gpu
@@ -307,34 +322,42 @@ class OpenPortalBackend(ServiceBackend):
             )
 
     def create_customer(self, customer):
+        logger.info(f"Creating OpenPortal customer {customer}")
         customer_name = self.get_customer_name(customer)
         return self.client.create_account(customer_name, customer.name, customer_name)
 
     def delete_customer(self, customer_uuid):
+        logger.info(f"Deleting OpenPortal customer {customer_uuid}")
         self.client.delete_account(self.get_customer_name(customer_uuid))
 
     def create_project(self, project):
+        logger.info(f"Creating OpenPortal project {project}")
         name = self.get_project_name(project)
         parent_name = self.get_customer_name(project.customer)
         return self.client.create_account(name, project.name, name, parent_name)
 
     def delete_project(self, project_uuid):
+        logger.info(f"Deleting OpenPortal project {project_uuid}")
         self.client.delete_account(self.get_project_name(project_uuid))
 
     def get_allocation_queryset(self):
+        logger.info("Getting OpenPortal allocation queryset")
         return models.Allocation.objects.filter(service_settings=self.settings)
 
     def get_customer_name(self, customer):
+        logger.info(f"Getting OpenPortal customer name for customer {customer}")
         return self.get_account_name(
             django_settings.WALDUR_OPENPORTAL["CUSTOMER_PREFIX"], customer
         )
 
     def get_project_name(self, project):
+        logger.info(f"Getting OpenPortal project name for project {project}")
         return self.get_account_name(
             django_settings.WALDUR_OPENPORTAL["PROJECT_PREFIX"], project
         )
 
     def get_allocation_name(self, allocation):
+        logger.info(f"Getting OpenPortal allocation name for allocation {allocation}")
         prefix = django_settings.WALDUR_OPENPORTAL["ALLOCATION_PREFIX"]
         name = allocation.name
         hexpart = allocation.uuid.hex[:5]
@@ -345,6 +368,7 @@ class OpenPortalBackend(ServiceBackend):
         return result_name.lower()
 
     def get_account_name(self, prefix, object_or_uuid):
+        logger.info(f"Getting OpenPortal account name for object {object_or_uuid}")
         key = (
             isinstance(object_or_uuid, str)
             and object_or_uuid
@@ -353,6 +377,7 @@ class OpenPortalBackend(ServiceBackend):
         return f"{prefix}{key}"
 
     def _update_allocation_associations(self, allocation):
+        logger.info(f"Updating associations for allocation {allocation}")
         backend_usernames = self.client.list_account_users(allocation.backend_id)
 
         local_usernames = [

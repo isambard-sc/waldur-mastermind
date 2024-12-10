@@ -15,39 +15,10 @@ from . import models
 
 class OpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer):
     class Meta:
-        secret_fields = ("hostname", "username", "port", "gateway")
+        secret_fields = ("instance_name")
 
-    username = rf_serializers.CharField(
-        max_length=100, help_text=_("Administrative user"), default="root"
-    )
-
-    hostname = rf_serializers.CharField(
-        source="options.hostname", label=_("Hostname or IP address of master node")
-    )
-
-    default_account = rf_serializers.CharField(
-        source="options.default_account", label=_("Default OpenPortal account for user")
-    )
-
-    port = rf_serializers.IntegerField(source="options.port", required=False)
-
-    use_sudo = rf_serializers.BooleanField(
-        source="options.use_sudo",
-        default=False,
-        help_text=_("Set to true to activate privilege escalation"),
-        required=False,
-    )
-
-    gateway = rf_serializers.CharField(
-        source="options.gateway",
-        label=_("Hostname or IP address of gateway node"),
-        required=False,
-    )
-
-    firecrest_api_url = rf_serializers.CharField(
-        source="options.firecrest_api_url",
-        label=_("FirecREST API base URL"),
-        required=False,
+    instance_name = rf_serializers.CharField(
+        source="options.instance_name", label=_("Full path name for the OpenPortal Agent managing this instance")
     )
 
 

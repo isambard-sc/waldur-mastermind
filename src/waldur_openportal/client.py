@@ -1,6 +1,14 @@
 import logging
 import re
 
+try:
+    import openportal
+    import os
+    have_openportal = True
+except ImportError:
+    have_openportal = False
+
+
 from waldur_openportal.base import BaseBatchClient, BatchError
 from waldur_openportal.parser import OpenPortalAssociationLine, OpenPortalReportLine
 from waldur_openportal.structures import Account, Association
@@ -19,6 +27,91 @@ class OpenPortalClient(BaseBatchClient):
     This class implements Python client for OpenPortal.
     See also: https://github.com/isambard-sc/openportal
     """
+
+    def __init__(self, instance_name=None):
+        # make sure that the OpenPortal config is loaded
+        if not have_openportal:
+            raise OpenPortalError("OpenPortal is not available")
+
+        if not openportal.is_config_loaded():
+            self.load_config()
+
+        self._instance_name = instance_name
+
+    def instance_name(self):
+        """
+        Return the full path name for the agent instance that
+        is being used by this client
+        """
+        return self._instance_name
+
+    def load_config(self):
+        """
+        Load the OpenPortal configuration from the file specified
+        in the OPENPORTAL_CONFIG environment variable. Raises an
+        OpenPortalException if the environment variable is not set
+        or if the config file cannot be loaded
+        """
+        # the name of the config file is held in the
+        # OPENPORTAL_CONFIG environment variable
+        try:
+            config_file = os.environ.get("OPENPORTAL_CONFIG")
+        except KeyError:
+            raise OpenPortalError("OPENPORTAL_CONFIG environment variable not set")
+
+        if not config_file:
+            raise OpenPortalError("OPENPORTAL_CONFIG environment variable not set")
+
+        try:
+            # this isn't thread-safe - we should make it thread-save
+            # in the OpenPortal python layer
+            openportal.load_config(config_file)
+        except Exception as e:
+            raise OpenPortalError(f"Failed to load OpenPortal config from '{config_file}': {e}")
+
+    def health(self, logger):
+        """
+        Log the health of the OpenPortal system to the logger
+        """
+        if not have_openportal:
+            raise OpenPortalError("OpenPortal is not available")
+
+        try:
+            health = openportal.health()
+        except Exception as e:
+            raise OpenPortalError(f"Failed to get OpenPortal health: {e}")
+
+        logger.info(f"OpenPortal health: {health}")
+
+    def get(self, uid):
+        """
+        Return the OpenPortal job with the specified UID
+        """
+        if not have_openportal:
+            raise OpenPortalError(f"OpenPortal is not available - cannot get job with UID '{uid}'")
+
+        try:
+            job = openportal.get(uid)
+        except Exception as e:
+            raise OpenPortalError(f"Failed to get job with UID '{uid}': {e}")
+
+        return job
+
+    def run(self, command):
+        """
+        Run the OpenPortal command 'command' and return the OpenPortal
+        job that was created. Raises an OpenPortalException if anything
+        goes wrong
+        """
+        if not have_openportal:
+            raise OpenPortalError(f"OpenPortal is not available - cannot run '{command}'")
+
+        try:
+            job = openportal.run_cmd(command)
+        except Exception as e:
+            raise OpenPortalError(f"Failed to run '{command}': {e}")
+
+        return job
 
     def list_accounts(self):
         output = self._execute_command(["list", "account"])
