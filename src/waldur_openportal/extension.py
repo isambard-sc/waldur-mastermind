@@ -13,6 +13,18 @@ class OpenPortalExtension(WaldurExtension):
         return register_in
 
     @staticmethod
+    def celery_tasks():
+        from datetime import timedelta
+
+        return {
+            "waldur-openportal-sync": {
+                "task": "waldur_openportal.sync",
+                "schedule": timedelta(minutes=1),
+                "args": (),
+            },
+        }
+
+    @staticmethod
     def get_cleanup_executor():
         from waldur_openportal.executors import OpenPortalCleanupExecutor
 
