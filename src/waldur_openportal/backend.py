@@ -56,69 +56,44 @@ class OpenPortalBackend(ServiceBackend):
 
     def sync_users(self, allocation):
         logger.info(f"Syncing users for allocation: {allocation}")
+        op_project_name = allocation.backend_id
         users = allocation.project.get_users()
         logger.info(f"Users for allocation: {users}")
-        profiles = freeipa_models.Profile.objects.filter(user__in=users)
-        for profile in profiles:
-            logger.info(f"Adding user {profile.username} to allocation {allocation}")
-            succeeded = self.add_user(
-                allocation, profile.user, profile.username.lower()
+
+        backend_usernames = []
+
+        for user in users:
+            user = self._get_user_name(user)
+            logger.info(f"Syncing user: {user} in {op_project_name}")
+
+            username = self.client.add_user(username=username, project_id=op_project_name)
+
+            models.Association.objects.get_or_create(
+                allocation=allocation,
+                username=username
             )
-            if succeeded:
-                models.Association.objects.get_or_create(
-                    allocation=allocation,
-                    username=profile.username,
-                )
 
-        all_backend_usernames = self.client.list_account_users(allocation.backend_id)
-        backend_usernames = freeipa_models.Profile.objects.filter(
-            username__in=all_backend_usernames
-        ).values_list("username", flat=True)
-        local_usernames = [profile.username for profile in profiles]
-        stale_usernames = set(backend_usernames) - set(local_usernames)
+            backend_usernames.append(username)
 
-        for profile in freeipa_models.Profile.objects.filter(
-            username__in=stale_usernames
-        ):
-            username = profile.username.lower()
-            logger.info(f"Deleting user {username} from allocation {allocation}")
-            succeeded = self.delete_user(allocation, profile.user, username)
-            if succeeded:
-                try:
-                    models.Association.objects.get(
-                        allocation=allocation, username=username
-                    ).delete()
-                    logger.info(
-                        "Association between %s and %s has been deleted",
-                        allocation,
-                        profile.user,
-                    )
-                except models.Association.DoesNotExist:
-                    logger.warn(
-                        "Association between %s and %s has been already deleted",
-                        allocation,
-                        profile.user,
-                    )
+        all_backend_usernames = self.client.get_users(project_id=allocation.backend_id)
+
+        stale_usernames = set(all_backend_usernames) - set(backend_usernames)
+
+        for username in stale_usernames:
+            self.client.delete_user(username=username)
 
     def create_allocation(self, allocation):
         logger.info(f"Creating allocation: {allocation}")
         project = allocation.project
-        customer_account = self.get_customer_name(project.customer)
-        project_account = self.get_project_name(project)
         allocation_account = self.get_allocation_name(allocation)
 
-        if not self.client.get_account(customer_account):
-            self.create_customer(project.customer)
+        logger.info(f"Details: {project} : {allocation_account}")
 
-        if not self.client.get_account(project_account):
-            self.create_project(project)
+        op_project_name = self.client.add_project(project=project)
 
-        self.client.create_account(
-            name=allocation_account,
-            description=allocation.name,
-            organization=project_account,
-        )
-        allocation.backend_id = allocation_account
+        logger.info(f"Created project: {op_project_name}")
+
+        allocation.backend_id = op_project_name
 
         default_limits = django_settings.WALDUR_OPENPORTAL["DEFAULT_LIMITS"]
         allocation.cpu_limit = default_limits["CPU"]
@@ -131,54 +106,44 @@ class OpenPortalBackend(ServiceBackend):
 
     def delete_allocation(self, allocation):
         logger.info(f"Deleting allocation: {allocation}")
-        account = allocation.backend_id
+        op_project_name = allocation.backend_id
 
-        if not account.strip():
+        if not op_project_name.strip():
             raise ServiceBackendError(
-                "Empty backend_id for allocation: %s" % allocation
+                "Empty backend_id for allocation: %s" % op_project_name
             )
 
-        if self.client.get_account(account):
-            self.client.delete_account(account)
+        self.client.delete_project(project_id=op_project_name)
 
         project = allocation.project
         if self.get_allocation_queryset().filter(project=project).count() == 0:
             self.delete_project(project)
 
-        if (
-            self.get_allocation_queryset()
-            .filter(project__customer=project.customer)
-            .count()
-            == 0
-        ):
-            self.delete_customer(project.customer)
-
-    def add_user(self, allocation, user, username):
+    def add_user(self, allocation, user):
         """
         Create association between user and OpenPortal account if it does not exist yet.
         """
-        logger.info(f"Adding OpenPortal user {username} to allocation {allocation}")
-        account = allocation.backend_id
+        logger.info(f"Adding user {user} to allocation {allocation} in OpenPortal")
+        op_project_id = allocation.backend_id
 
-        if not account.strip():
+        if not op_project_id.strip():
             raise ServiceBackendError(
                 "Empty backend_id for allocation: %s" % allocation
             )
 
-        default_account = self.settings.options.get("default_account")
-        if not self.client.get_association(username, account):
-            logger.info("Creating association between %s and %s", username, account)
-            try:
-                self.client.create_association(username, account, default_account)
-                signals.openportal_association_created.send(
-                    models.Allocation,
-                    allocation=allocation,
-                    user=user,
-                    username=username,
-                )
-            except base.BatchError as err:
-                logger.error("Unable to create association in OpenPortal: %s", err)
-                return False
+        try:
+            username = self.client.add_user(username=user, project_id=op_project_id)
+
+            signals.openportal_association_created.send(
+                models.Allocation,
+                allocation=allocation,
+                user=user,
+                username=username,
+            )
+        except Exception as e:
+            logger.error("Unable to create association in OpenPortal: %s", e)
+            return False
+
         return True
 
     def delete_user(self, allocation, user, username):
@@ -302,17 +267,21 @@ class OpenPortalBackend(ServiceBackend):
         allocation.save(update_fields=["cpu_usage", "gpu_usage", "ram_usage"])
 
         usernames = usage.keys()
-        usermap = {
-            profile.username: profile.user
-            for profile in freeipa_models.Profile.objects.filter(username__in=usernames)
-        }
+
+        logger.error(f"NEED TO MAP FROM USERNAMES {usernames} BACK TO USERS")
+
+        #usermap = {
+        #    profile.username: profile.user
+        #    for profile in freeipa_models.Profile.objects.filter(username__in=usernames)
+        #}
 
         for username, quotas in usage.items():
             models.AllocationUserUsage.objects.update_or_create(
                 allocation=allocation,
                 year=timezone.now().year,
                 month=timezone.now().month,
-                user=usermap.get(username),
+                user=self._username_to_user(username),
+                user=username,
                 username=username,
                 defaults={
                     "cpu_usage": quotas.cpu,
@@ -321,64 +290,38 @@ class OpenPortalBackend(ServiceBackend):
                 },
             )
 
-    def create_customer(self, customer):
-        logger.info(f"Creating OpenPortal customer {customer}")
-        customer_name = self.get_customer_name(customer)
-        return self.client.create_account(customer_name, customer.name, customer_name)
-
-    def delete_customer(self, customer_uuid):
-        logger.info(f"Deleting OpenPortal customer {customer_uuid}")
-        self.client.delete_account(self.get_customer_name(customer_uuid))
-
     def create_project(self, project):
         logger.info(f"Creating OpenPortal project {project}")
-        name = self.get_project_name(project)
-        parent_name = self.get_customer_name(project.customer)
-        return self.client.create_account(name, project.name, name, parent_name)
+        return self.client.add_project(project=self.get_project_name(project))
 
     def delete_project(self, project_uuid):
         logger.info(f"Deleting OpenPortal project {project_uuid}")
-        self.client.delete_account(self.get_project_name(project_uuid))
+        self.client.delete_project(project=self.get_project_name(project_uuid))
 
     def get_allocation_queryset(self):
         logger.info("Getting OpenPortal allocation queryset")
         return models.Allocation.objects.filter(service_settings=self.settings)
 
-    def get_customer_name(self, customer):
-        logger.info(f"Getting OpenPortal customer name for customer {customer}")
-        return self.get_account_name(
-            django_settings.WALDUR_OPENPORTAL["CUSTOMER_PREFIX"], customer
-        )
-
-    def get_project_name(self, project):
-        logger.info(f"Getting OpenPortal project name for project {project}")
-        return self.get_account_name(
-            django_settings.WALDUR_OPENPORTAL["PROJECT_PREFIX"], project
-        )
-
-    def get_allocation_name(self, allocation):
-        logger.info(f"Getting OpenPortal allocation name for allocation {allocation}")
-        prefix = django_settings.WALDUR_OPENPORTAL["ALLOCATION_PREFIX"]
-        name = allocation.name
-        hexpart = allocation.uuid.hex[:5]
-        raw_name = f"{prefix}{hexpart}_{name}"
-        result_name = sanitize_allocation_name(raw_name)[
-            : models.OPENPORTAL_ALLOCATION_NAME_MAX_LEN
-        ]
-        return result_name.lower()
-
-    def get_account_name(self, prefix, object_or_uuid):
-        logger.info(f"Getting OpenPortal account name for object {object_or_uuid}")
+    def get_project_name(self, object_or_uuid):
+        logger.info(f"Getting OpenPortal project name for project {object_or_uuid}")
         key = (
             isinstance(object_or_uuid, str)
             and object_or_uuid
             or object_or_uuid.uuid.hex
         )
-        return f"{prefix}{key}"
+        return key
+
+    def get_allocation_name(self, allocation):
+        logger.info(f"Getting OpenPortal allocation name for allocation {allocation}")
+        name = allocation.name
+        result_name = sanitize_allocation_name(name)[
+            : models.OPENPORTAL_ALLOCATION_NAME_MAX_LEN
+        ]
+        return result_name.lower()
 
     def _update_allocation_associations(self, allocation):
         logger.info(f"Updating associations for allocation {allocation}")
-        backend_usernames = self.client.list_account_users(allocation.backend_id)
+        backend_usernames = self.client.get_users(allocation.backend_id)
 
         local_usernames = [
             association.username for association in allocation.associations.all()
