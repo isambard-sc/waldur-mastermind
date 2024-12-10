@@ -1,46 +1,17 @@
+import re
+
 from django.conf import settings
+from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models
-from django.core.validators import MaxValueValidator, MinValueValidator
+from django.utils.translation import gettext_lazy as _
+from model_utils import FieldTracker
 
 from waldur_core.core import models as core_models
-from waldur_core.structure.models import BaseResource
-
-from model_utils import FieldTracker
+from waldur_core.structure import models as structure_models
+from waldur_openportal import utils
 
 OPENPORTAL_ALLOCATION_REGEX = "a-zA-Z0-9-_"
 OPENPORTAL_ALLOCATION_NAME_MAX_LEN = 34
-
-
-class Job(BaseResource):
-    """
-    This model represents a single job that is being run via OpenPortal.
-    A job is, e.g. an instruction to add or remove a user from a project,
-    create new instances of platforms etc.
-    """
-
-    @classmethod
-    def get_service_name(cls):
-        return "OPENPORTAL"
-
-    command = models.TextField(
-        help_text="Command being run via OpenPortal",
-        blank=True,
-        null=True,
-    )
-    user = models.ForeignKey(
-        help_text="Reference to user which submitted job",
-        related_name="op-jobs-user+",
-        on_delete=models.CASCADE,
-        to=settings.AUTH_USER_MODEL,
-        blank=True,
-        null=True,
-    )
-    report = models.JSONField("Job output", blank=True, null=True)
-    runtime_state = models.CharField(max_length=100, blank=True)
-
-    @classmethod
-    def get_url_name(cls):
-        return "openportal-job"
 
 
 class UsageMixin(models.Model):
@@ -52,7 +23,7 @@ class UsageMixin(models.Model):
     gpu_usage = models.BigIntegerField(default=0)
 
 
-class Allocation(UsageMixin, BaseResource):
+class Allocation(UsageMixin, structure_models.BaseResource):
     is_active = models.BooleanField(default=True)
     tracker = FieldTracker()
 
@@ -65,7 +36,6 @@ class Allocation(UsageMixin, BaseResource):
         return "openportal-allocation"
 
     def usage_changed(self):
-        from . import utils
         return any(self.tracker.has_changed(field) for field in utils.FIELD_NAMES)
 
     @classmethod
@@ -77,19 +47,44 @@ class Allocation(UsageMixin, BaseResource):
         )
 
 
+class Association(core_models.UuidMixin):
+    allocation = models.ForeignKey(
+        to=Allocation,
+        on_delete=models.CASCADE,
+        related_name="op-associations-allocation+"
+    )
+    username = models.CharField(
+        max_length=128,
+        validators=[
+            RegexValidator(
+                re.compile(core_models.USERNAME_REGEX),
+                _("Enter a valid username."),
+                "invalid",
+            ),
+        ],
+    )
+
+    def __str__(self):
+        return f"{self.allocation.name} <-> {self.username}"
+
+
 class AllocationUserUsage(UsageMixin):
     """
     Allocation usage per user. This model is responsible for the allocation usage definition for particular user.
     """
 
-    allocation = models.ForeignKey(to=Allocation, related_name="op-auu-allocation+", on_delete=models.CASCADE)
+    allocation = models.ForeignKey(to=Allocation, on_delete=models.CASCADE, related_name="op-allocationuser-allocation+")
     year = models.PositiveSmallIntegerField()
     month = models.PositiveSmallIntegerField(
         validators=[MinValueValidator(1), MaxValueValidator(12)]
     )
 
     user = models.ForeignKey(
-        to=settings.AUTH_USER_MODEL, related_name="op-auu-user+", on_delete=models.CASCADE, blank=True, null=True
+        to=settings.AUTH_USER_MODEL,
+        related_name="op-allocationuser-user+",
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True
     )
 
     username = models.CharField(max_length=32)
@@ -99,13 +94,3 @@ class AllocationUserUsage(UsageMixin):
 
     def __repr__(self) -> str:
         return self.__str__()
-
-
-
-class Association(core_models.UuidMixin):
-    allocation = models.ForeignKey(
-        to=Allocation, on_delete=models.CASCADE, related_name="op-associations+"
-    )
-
-    def __str__(self):
-        return f"{self.allocation.name} <-> {self.uuid}"

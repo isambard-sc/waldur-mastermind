@@ -1,5 +1,3 @@
-import logging
-
 from celery import shared_task
 
 from waldur_core.core import utils as core_utils
@@ -7,14 +5,6 @@ from waldur_core.structure import models as structure_models
 from waldur_core.structure.exceptions import ServiceBackendNotImplemented
 
 from . import backend, models, utils
-
-
-logger = logging.getLogger(__name__)
-
-
-@shared_task(name="waldur_openportal.sync")
-def sync():
-    utils.sync()
 
 
 def get_structure_allocations(structure):
@@ -34,14 +24,14 @@ def get_structure_allocations(structure):
 def add_user(serialized_profile):
     profile = core_utils.deserialize_instance(serialized_profile)
     for allocation in utils.get_profile_allocations(profile):
-        allocation.get_backend().add_user(allocation, profile.user)
+        allocation.get_backend().add_user(allocation, profile.user, profile.username)
 
 
 @shared_task(name="waldur_openportal.delete_user")
 def delete_user(serialized_profile):
     profile = core_utils.deserialize_instance(serialized_profile)
     for allocation in utils.get_profile_allocations(profile):
-        allocation.get_backend().delete_user(allocation, profile.user)
+        allocation.get_backend().delete_user(allocation, profile.user, profile.username)
 
 
 @shared_task(name="waldur_openportal.process_role_granted")
@@ -52,9 +42,13 @@ def process_role_granted(serialized_profile, serialized_structure):
     allocations = get_structure_allocations(structure)
 
     for allocation in allocations:
-        allocation.get_backend().add_user(
-            allocation, profile.user,
-        )
+        try:
+            allocation.get_backend().add_user(
+                allocation, profile.user, profile.username
+            )
+        except ServiceBackendNotImplemented:
+            # Ignore a case of the remote OpenPortal allocation
+            pass
 
 
 @shared_task(name="waldur_openportal.process_role_revoked")

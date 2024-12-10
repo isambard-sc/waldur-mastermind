@@ -1,8 +1,3 @@
-from django.db import transaction
-
-from waldur_core.core.utils import serialize_instance
-from waldur_core.structure.views import ResourceViewSet
-
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import permissions, response, status, viewsets
@@ -13,16 +8,7 @@ from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
 
-from . import executors, filters, models, serializers, tasks
-
-
-class JobViewSet(ResourceViewSet):
-    queryset = models.Job.objects.all()
-    serializer_class = serializers.JobSerializer
-
-    def perform_create(self, serializer):
-        job = serializer.save()
-        transaction.on_commit(lambda: tasks.submit_job.delay(serialize_instance(job)))
+from . import executors, filters, models, serializers
 
 
 class AllocationViewSet(structure_views.ResourceViewSet):
@@ -64,7 +50,7 @@ class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
 
 class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
-    queryset = models.Association.objects.all()
+    queryset = models.Association.objects.all().order_by("username")
     serializer_class = serializers.AssociationSerializer
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)

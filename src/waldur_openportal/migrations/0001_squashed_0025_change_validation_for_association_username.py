@@ -20,7 +20,7 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
-        ("waldur_openportal", "0001_initial"),
+        ("structure", "0001_squashed_0036"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
@@ -98,7 +98,7 @@ class Migration(migrations.Migration):
                     "project",
                     models.ForeignKey(
                         on_delete=django.db.models.deletion.CASCADE,
-                        related_name="+",
+                        related_name="op-project+",
                         to="structure.project",
                     ),
                 ),
@@ -106,7 +106,7 @@ class Migration(migrations.Migration):
                     "service_settings",
                     models.ForeignKey(
                         on_delete=django.db.models.deletion.CASCADE,
-                        related_name="+",
+                        related_name="op-service-settings+",
                         to="structure.servicesettings",
                     ),
                 ),
@@ -153,8 +153,8 @@ class Migration(migrations.Migration):
                     "allocation",
                     models.ForeignKey(
                         on_delete=django.db.models.deletion.CASCADE,
-                        related_name="associations",
-                        to="waldur_slurm.allocation",
+                        related_name="op-associations+",
+                        to="waldur_openportal.allocation",
                     ),
                 ),
             ],
@@ -183,6 +183,7 @@ class Migration(migrations.Migration):
                     models.ForeignKey(
                         blank=True,
                         null=True,
+                        related_name="op-user+",
                         on_delete=django.db.models.deletion.CASCADE,
                         to=settings.AUTH_USER_MODEL,
                     ),
@@ -190,8 +191,9 @@ class Migration(migrations.Migration):
                 (
                     "allocation",
                     models.ForeignKey(
+                        related_name="op-usage+",
                         on_delete=django.db.models.deletion.CASCADE,
-                        to="waldur_slurm.allocation",
+                        to="waldur_openportal.allocation",
                     ),
                 ),
                 (

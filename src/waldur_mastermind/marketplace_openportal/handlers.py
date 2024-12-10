@@ -130,7 +130,7 @@ def drop_offering_user_for_openportal_user(sender, allocation, user, **kwargs):
         )
     except marketplace_models.Offering.DoesNotExist:
         logger.warning(
-            "Skipping OpenPortaluser synchronization because offering is not found. "
+            "Skipping OpenPortal user synchronization because offering is not found. "
             "OpenPortal settings ID: %s",
             allocation.service_settings_id,
         )
@@ -139,63 +139,6 @@ def drop_offering_user_for_openportal_user(sender, allocation, user, **kwargs):
     marketplace_models.OfferingUser.objects.filter(
         offering=offering, user=user
     ).delete()
-
-
-def update_component_quota(sender, instance, created=False, **kwargs):
-    if created:
-        return
-
-    if not set(instance.tracker.changed()) & COMPONENT_FIELDS:
-        return
-
-    allocation = instance
-
-    try:
-        resource = marketplace_models.Resource.objects.get(scope=allocation)
-    except django_exceptions.ObjectDoesNotExist:
-        return
-
-    for component in manager.get_components(PLUGIN_NAME):
-        usage = getattr(allocation, component.type + "_usage")
-        limit = getattr(allocation, component.type + "_limit")
-
-        try:
-            offering_component = marketplace_models.OfferingComponent.objects.get(
-                offering=resource.offering, type=component.type
-            )
-        except marketplace_models.OfferingComponent.DoesNotExist:
-            logger.warning(
-                "Skipping Allocation synchronization because this "
-                "marketplace.OfferingComponent does not exist."
-                "Allocation ID: %s",
-                allocation.id,
-            )
-        else:
-            marketplace_models.ComponentQuota.objects.update_or_create(
-                resource=resource,
-                component=offering_component,
-                defaults={"limit": limit, "usage": usage},
-            )
-            try:
-                plan_period = marketplace_models.ResourcePlanPeriod.objects.get(
-                    resource=resource, end=None
-                )
-            except (ObjectDoesNotExist, MultipleObjectsReturned):
-                logger.warning(
-                    "Skipping component usage synchronization because valid"
-                    "ResourcePlanPeriod is not found."
-                    "Allocation ID: %s",
-                    allocation.id,
-                )
-            else:
-                date = timezone.now()
-                marketplace_models.ComponentUsage.objects.update_or_create(
-                    resource=resource,
-                    component=offering_component,
-                    billing_period=month_start(date),
-                    plan_period=plan_period,
-                    defaults={"usage": usage, "date": date},
-                )
 
 
 def sync_component_user_usage_when_allocation_user_usage_is_submitted(

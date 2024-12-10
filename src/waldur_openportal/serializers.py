@@ -1,65 +1,54 @@
 import re
-import logging
 
 from django.core.validators import MinValueValidator
 from django.utils.translation import gettext_lazy as _
-
-from waldur_core.structure.serializers import BaseResourceSerializer
-from waldur_core.core import serializers as core_serializers
-from waldur_core.structure import serializers as structure_serializers
-from waldur_core.structure.permissions import _has_admin_access
-
 from rest_framework import exceptions as rf_exceptions
 from rest_framework import serializers as rf_serializers
 
-from . import models
+from waldur_core.core import serializers as core_serializers
+from waldur_core.structure import serializers as structure_serializers
+from waldur_core.structure.permissions import _has_admin_access
+from waldur_freeipa import models as freeipa_models
 
-logger = logging.getLogger(__name__)
+from . import models
 
 
 class OpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer):
     class Meta:
-        secret_fields = ("instance_name")
+        secret_fields = ("hostname", "username", "port", "gateway")
 
-    instance_name = rf_serializers.CharField(
-        source="options.instance_name", label=_("Full pathname to the OpenPortal instance in the agent network")
+    username = rf_serializers.CharField(
+        max_length=100, help_text=_("Administrative user"), default="root"
     )
 
+    hostname = rf_serializers.CharField(
+        source="options.hostname", label=_("Hostname or IP address of master node")
+    )
 
-class JobSerializer(BaseResourceSerializer):
-    class Meta(BaseResourceSerializer.Meta):
-        model = models.Job
-        fields = BaseResourceSerializer.Meta.fields + (
-            "runtime_state",
-            "command",
-            "user",
-            "user_uuid",
-            "user_name",
-            "report",
-        )
-        read_only_fields = BaseResourceSerializer.Meta.read_only_fields + (
-            "user",
-            "report",
-        )
-        protected_fields = BaseResourceSerializer.Meta.protected_fields + ("command",)
-        extra_kwargs = {
-            **BaseResourceSerializer.Meta.extra_kwargs,
-            "user": {"lookup_field": "uuid", "view_name": "user-detail"},
-        }
-        related_paths = {
-            "user": ("uuid", "name"),
-        }
+    default_account = rf_serializers.CharField(
+        source="options.default_account", label=_("Default OpenPortal account for user")
+    )
 
-    def get_fields(self):
-        fields = super().get_fields()
-        if not self.instance:
-            fields["command"].required = True
-            fields["command"].allow_null = False
-        return fields
+    port = rf_serializers.IntegerField(source="options.port", required=False)
 
-    def create(self, validated_data):
-        validated_data["user"] = self.context["request"].user
-        return super().create(validated_data)
+    use_sudo = rf_serializers.BooleanField(
+        source="options.use_sudo",
+        default=False,
+        help_text=_("Set to true to activate privilege escalation"),
+        required=False,
+    )
+
+    gateway = rf_serializers.CharField(
+        source="options.gateway",
+        label=_("Hostname or IP address of gateway node"),
+        required=False,
+    )
+
+    firecrest_api_url = rf_serializers.CharField(
+        source="options.firecrest_api_url",
+        label=_("FirecREST API base URL"),
+        required=False,
+    )
 
 
 class AllocationSerializer(
@@ -73,9 +62,9 @@ class AllocationSerializer(
     def get_username(self, allocation):
         request = self.context["request"]
         try:
-            return request.user.unix_shortname
-        except Exception as e:
-            logger.warning(f"Failed to get username for allocation {allocation}: {e}")
+            profile = freeipa_models.Profile.objects.get(user=request.user)
+            return profile.username
+        except freeipa_models.Profile.DoesNotExist:
             return None
 
     def get_gateway(self, allocation):
@@ -121,14 +110,23 @@ class AllocationSerializer(
         if self.instance:
             return attrs
 
+        correct_name_regex = "^([%s]{1,63})$" % models.OPENPORTAL_ALLOCATION_REGEX
+        name = attrs.get("name")
+        if not re.match(correct_name_regex, name):
+            raise rf_serializers.ValidationError(
+                _(
+                    "Name '%s' must be 1-63 characters long, each of "
+                    "which can only be alphanumeric or a hyphen"
+                )
+                % name
+            )
+
         project = attrs["project"]
         user = self.context["request"].user
-
         if not _has_admin_access(user, project):
             raise rf_exceptions.PermissionDenied(
                 _("You do not have permissions to create allocation for given project.")
             )
-
         return attrs
 
 
@@ -201,5 +199,6 @@ class AssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
         model = models.Association
         fields = (
             "uuid",
+            "username",
             "allocation",
         )

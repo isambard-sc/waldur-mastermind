@@ -67,6 +67,7 @@ class AllocationUserUsageAdmin(admin.ModelAdmin):
 class AssociationAdmin(admin.ModelAdmin):
     list_display = admin.ModelAdmin.list_display + (
         "allocation",
+        "username",
     )
 
 

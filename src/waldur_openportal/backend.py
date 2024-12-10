@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from waldur_core.structure.backend import ServiceBackend
 from waldur_core.structure.exceptions import ServiceBackendError
+from waldur_freeipa import models as freeipa_models
 from waldur_openportal import signals
 from waldur_openportal.client import OpenPortalClient
 from waldur_openportal.structures import Quotas
@@ -24,7 +25,13 @@ class OpenPortalBackend(ServiceBackend):
         self.client = self.get_client(settings)
 
     def get_client(self, settings):
-        return OpenPortalClient()
+        return OpenPortalClient(
+            hostname=settings.options.get("hostname", "localhost"),
+            username=settings.username or "root",
+            port=settings.options.get("port", 22),
+            key_path=django_settings.WALDUR_OPENPORTAL["PRIVATE_KEY_PATH"],
+            use_sudo=settings.options.get("use_sudo", False),
+        )
 
     def pull_resources(self):
         for allocation in self.get_allocation_queryset().filter(
@@ -39,8 +46,8 @@ class OpenPortalBackend(ServiceBackend):
 
     def ping(self, raise_exception=False):
         try:
-            self.client.health()
-        except Exception as e:
+            self.client.list_accounts()
+        except base.BatchError as e:
             if raise_exception:
                 raise ServiceBackendError(e)
             return False
@@ -49,7 +56,45 @@ class OpenPortalBackend(ServiceBackend):
 
     def sync_users(self, allocation):
         users = allocation.project.get_users()
-        logger.info(f"Add users {users} to OpenPortal")
+        profiles = freeipa_models.Profile.objects.filter(user__in=users)
+        for profile in profiles:
+            succeeded = self.add_user(
+                allocation, profile.user, profile.username.lower()
+            )
+            if succeeded:
+                models.Association.objects.get_or_create(
+                    allocation=allocation,
+                    username=profile.username,
+                )
+
+        all_backend_usernames = self.client.list_account_users(allocation.backend_id)
+        backend_usernames = freeipa_models.Profile.objects.filter(
+            username__in=all_backend_usernames
+        ).values_list("username", flat=True)
+        local_usernames = [profile.username for profile in profiles]
+        stale_usernames = set(backend_usernames) - set(local_usernames)
+
+        for profile in freeipa_models.Profile.objects.filter(
+            username__in=stale_usernames
+        ):
+            username = profile.username.lower()
+            succeeded = self.delete_user(allocation, profile.user, username)
+            if succeeded:
+                try:
+                    models.Association.objects.get(
+                        allocation=allocation, username=username
+                    ).delete()
+                    logger.info(
+                        "Association between %s and %s has been deleted",
+                        allocation,
+                        profile.user,
+                    )
+                except models.Association.DoesNotExist:
+                    logger.warn(
+                        "Association between %s and %s has been already deleted",
+                        allocation,
+                        profile.user,
+                    )
 
     def create_allocation(self, allocation):
         project = allocation.project
@@ -102,9 +147,9 @@ class OpenPortalBackend(ServiceBackend):
         ):
             self.delete_customer(project.customer)
 
-    def add_user(self, allocation, user):
+    def add_user(self, allocation, user, username):
         """
-        Create association between user and SLURM account if it does not exist yet.
+        Create association between user and OpenPortal account if it does not exist yet.
         """
         account = allocation.backend_id
 
@@ -114,23 +159,24 @@ class OpenPortalBackend(ServiceBackend):
             )
 
         default_account = self.settings.options.get("default_account")
-        if not self.client.get_association(user, account):
-            logger.info("Creating association between %s and %s", user, account)
+        if not self.client.get_association(username, account):
+            logger.info("Creating association between %s and %s", username, account)
             try:
-                self.client.create_association(user, account, default_account)
+                self.client.create_association(username, account, default_account)
                 signals.openportal_association_created.send(
                     models.Allocation,
                     allocation=allocation,
                     user=user,
+                    username=username,
                 )
             except base.BatchError as err:
                 logger.error("Unable to create association in OpenPortal: %s", err)
                 return False
         return True
 
-    def delete_user(self, allocation, user):
+    def delete_user(self, allocation, user, username):
         """
-        Delete association between user and SLURM account if it exists.
+        Delete association between user and OpenPortal account if it exists.
         """
         account = allocation.backend_id
 
@@ -139,10 +185,10 @@ class OpenPortalBackend(ServiceBackend):
                 "Empty backend_id for allocation: %s" % allocation
             )
 
-        if self.client.get_association(user, account):
-            logger.info("Deleting association between %s and %s", user, account)
+        if self.client.get_association(username, account):
+            logger.info("Deleting association between %s and %s", username, account)
             try:
-                self.client.delete_association(user, account)
+                self.client.delete_association(username, account)
                 signals.openportal_association_deleted.send(
                     models.Allocation, allocation=allocation, user=user
                 )
@@ -239,6 +285,26 @@ class OpenPortalBackend(ServiceBackend):
         allocation.gpu_usage = quotas.gpu
         allocation.ram_usage = quotas.ram
         allocation.save(update_fields=["cpu_usage", "gpu_usage", "ram_usage"])
+
+        usernames = usage.keys()
+        usermap = {
+            profile.username: profile.user
+            for profile in freeipa_models.Profile.objects.filter(username__in=usernames)
+        }
+
+        for username, quotas in usage.items():
+            models.AllocationUserUsage.objects.update_or_create(
+                allocation=allocation,
+                year=timezone.now().year,
+                month=timezone.now().month,
+                user=usermap.get(username),
+                username=username,
+                defaults={
+                    "cpu_usage": quotas.cpu,
+                    "gpu_usage": quotas.gpu,
+                    "ram_usage": quotas.ram,
+                },
+            )
 
     def create_customer(self, customer):
         customer_name = self.get_customer_name(customer)
