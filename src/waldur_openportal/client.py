@@ -94,7 +94,7 @@ class OpenPortalRunner:
             raise OpenPortalError(f"OpenPortal is not available - cannot run '{command}'")
 
         try:
-            job = openportal.run_cmd(command)
+            job = openportal.run(command)
         except Exception as e:
             raise OpenPortalError(f"Failed to run '{command}': {e}")
 
@@ -111,10 +111,10 @@ class OpenPortalClient(BaseBatchClient):
 
         instance_name = instance_name.lower().strip()
 
-        if instance_name.contains(" "):
+        if " " in instance_name:
             raise OpenPortalError("Instance name cannot contain spaces")
 
-        if not instance_name.contains("."):
+        if "." not in instance_name:
             raise OpenPortalError("Instance name must contain a period")
 
         if len(instance_name) < 3:
@@ -188,9 +188,6 @@ class OpenPortalClient(BaseBatchClient):
         based on the passed username, which will be returned by this method
         once the user has been added (which we will call the op_user_name)
         """
-        if self.is_global():
-            raise OpenPortalError("Cannot add user in global mode")
-
         username = self._sanitise_user_name(name)
         op_project_name = self._sanitise_op_project_name(op_project_name)
 
@@ -202,14 +199,11 @@ class OpenPortalClient(BaseBatchClient):
 
     def delete_user(self, op_user_name):
         """
-        Delete the OpenPortal user with specified op_user_name
+        Remove the OpenPortal user with specified op_user_name
         """
-        if self.is_global():
-            raise OpenPortalError("Cannot delete user in global mode")
-
         op_user_name = self._sanitise_op_user_name(op_user_name)
 
-        self.run(f"{self.instance_name()} delete_user {self._sanitise_op_user_name(op_user_name)}")
+        self.run(f"{self.instance_name()} remove_user {self._sanitise_op_user_name(op_user_name)}")
 
         logger.info(f"Deleted OpenPortal user '{op_user_name}'")
 
@@ -221,9 +215,6 @@ class OpenPortalClient(BaseBatchClient):
         name, and will create it, and return the internal name that
         was used (which we will call the `op_project_name`)
         """
-        if self.is_global():
-            raise OpenPortalError("Cannot create project in global mode")
-
         project_name = self._sanitise_project_name(name)
 
         op_project_name = self.run(f"{self.instance_name()} add_project {project_name}")
@@ -237,12 +228,9 @@ class OpenPortalClient(BaseBatchClient):
         Delete the project with the specified `op_project_name`. This should be
         the internal name used for the project
         """
-        if self.is_global():
-            raise OpenPortalError("Cannot delete project in global mode")
-
         op_project_name = self._sanitise_op_project_name(op_project_name)
 
-        self.run(f"{self.instance_name()} delete_project {self._sanitise_op_project_name(op_project_name)}")
+        self.run(f"{self.instance_name()} remove_project {self._sanitise_op_project_name(op_project_name)}")
 
     def set_resource_limits(self, account, quotas):
         raise NotImplementedError("set_resource_limits is not implemented")
@@ -267,7 +255,7 @@ class OpenPortalClient(BaseBatchClient):
         start_time = datetime.datetime.now()
         op_job.update()
 
-        while not op_job.is_finished():
+        while not op_job.is_finished:
             op_job.update()
             time.sleep(0.1)
 
@@ -281,7 +269,7 @@ class OpenPortalClient(BaseBatchClient):
         if op_job.is_error:
             logger.error(f"Job {command} has failed: {op_job.error_message}")
             raise OpenPortalError(f"Job '{command}' failed: {op_job.error_message}")
-        elif op_job.is_finished:
+        else:
             logger.info(f"Job {command} has finished: {op_job.result}")
             return op_job.result
 
