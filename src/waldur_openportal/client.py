@@ -11,9 +11,9 @@ except ImportError:
 
 
 from waldur_openportal.base import BaseBatchClient, BatchError
-from waldur_openportal.parser import OpenPortalAssociationLine, OpenPortalReportLine
-from waldur_openportal.structures import Account, Association
-from waldur_openportal.utils import format_current_month
+from waldur_slurm.structures import Account
+
+from .models import Allocation
 
 
 class OpenPortalError(BatchError):
@@ -284,3 +284,47 @@ class OpenPortalClient(BaseBatchClient):
         elif op_job.is_finished:
             logger.info(f"Job {command} has finished: {op_job.result}")
             return op_job.result
+
+
+    ### Required methods to override from BaseBatchClient
+
+    def list_accounts(self):
+        projects = self.run(f"{self.instance_name()} get_projects")
+
+        # parse the above into a list of Account objects
+        logger.info(f"Got projects: {projects}")
+
+        return [Account(name=project, description="", organization="") for project in projects]
+
+    def create_account(self, name, description, organization, parent_name=None):
+        logger.info(f"Creating account '{name}' with description '{description}' and organization '{organization}'")
+
+        if parent_name is not None:
+            logger.warning(f"Ignoring parent_name '{parent_name}' as OpenPortal does not support account hierarchies")
+
+        return self.add_project(name)
+
+    def delete_account(self, name):
+        logger.info(f"Deleting account '{name}'")
+
+        # note that we probably want the caller to have already found the
+        # internal name for the project, as we don't want to have to do that
+        # here
+        raise NotImplementedError("delete_account is not implemented")
+
+    def get_account(self, name):
+        # Again, we need to map from the project name to the internal name
+        # for the project
+        raise NotImplementedError("get_account is not implemented")
+
+    def create_association(self, username, account, default_account=""):
+        # Again, we need to map to internal names...
+        raise NotImplementedError("create_association is not implemented")
+
+    def delete_association(self, username, account):
+        # Again, we need to map to internal names...
+        raise NotImplementedError("delete_association is not implemented")
+
+    def get_association(self, user, account):
+        # Again, we need to map to internal names...
+        raise NotImplementedError("get_association is not implemented")

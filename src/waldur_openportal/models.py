@@ -83,7 +83,9 @@ class Association(core_models.UuidMixin):
     user = models.ForeignKey(
         to=settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        related_name="op-associations-user+"
+        related_name="op-associations-user+",
+        blank=True,
+        null=True,
     )
     username = models.CharField(
         max_length=MAX_OP_USERNAME_LENGTH,

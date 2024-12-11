@@ -9,7 +9,7 @@ from waldur_core.structure import models as structure_models
 from waldur_core.structure.exceptions import ServiceBackendNotImplemented
 
 from . import backend, models, utils
-from .client import OpenPortalClient, OpenPortalError
+from .client import OpenPortalRunner, OpenPortalError
 
 
 logger = logging.getLogger(__name__)
@@ -18,12 +18,12 @@ logger = logging.getLogger(__name__)
 @shared_task(name="waldur_openportal.sync")
 def sync():
     try:
-        client = OpenPortalClient()
+        runner = OpenPortalRunner()
     except OpenPortalError as e:
         logger.error("Failed to connect to OpenPortal: %s", e)
         return
 
-    client.health(logger)
+    runner.health()
 
     # find all of the jobs that are in pending state
     jobs = models.Job.objects.filter(state__in=[
@@ -36,7 +36,7 @@ def sync():
 
     for job in jobs:
         try:
-            op_job = client.get(job.backend_id)
+            op_job = runner.get(job.backend_id)
         except OpenPortalError as e:
             logger.error("Failed to get job %s: %s", job.backend_id, e)
             job.state = models.Job.States.ERRED
@@ -60,7 +60,7 @@ def sync():
 
 def submit_job(job):
     try:
-        client = OpenPortalClient()
+        runner = OpenPortalRunner()
     except OpenPortalError as e:
         logger.error("Failed to connect to OpenPortal: %s", e)
         raise e
@@ -76,7 +76,7 @@ def submit_job(job):
         raise OpenPortalError(f"User {job.user} is not a staff user")
 
     try:
-        op_job = client.run(job.command)
+        op_job = runner.run(job.command)
     except OpenPortalError as e:
         logger.error("Failed to run command %s: %s", job.command, e)
         raise e
