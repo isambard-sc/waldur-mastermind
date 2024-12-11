@@ -1,6 +1,4 @@
 import logging
-import time
-import datetime
 
 try:
     import openportal
@@ -252,19 +250,25 @@ class OpenPortalClient(BaseBatchClient):
         logger.info(f"Running command '{command}'")
         op_job = self._runner.run(command)
 
-        start_time = datetime.datetime.now()
-        op_job.update()
+        # wait for the job to finish, printing out log messages
+        # periodically
+        if hasattr(op_job, "wait"):
+            while not op_job.wait(1000):
+                logger.info(f"Job {command} is still running...")
+        else:
+            import time
 
-        while not op_job.is_finished:
             op_job.update()
-            time.sleep(0.1)
+            num_waits = 0
+            while not op_job.is_finished:
+                num_waits += 1
 
-            # need some way to say that we've been waiting too long
-            # and pass this down to a background process? Or is this
-            # already happening in the background in Waldur?
-            if (datetime.datetime.now() - start_time).seconds > 60:
-                logger.error(f"Job '{op_job.uid}' for command {command} did not complete within 60 seconds")
-                raise OpenPortalError(f"Job '{op_job.uid}' did not complete within 60 seconds")
+                if num_waits % 10 == 0:
+                    logger.info(f"Job {command} is still running...")
+
+                time.sleep(0.1)
+
+                op_job.update()
 
         if op_job.is_error:
             logger.error(f"Job {command} has failed: {op_job.error_message}")
