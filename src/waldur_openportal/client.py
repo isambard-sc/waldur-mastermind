@@ -147,13 +147,13 @@ class OpenPortalClient(BaseBatchClient):
 
     def _sanitise_project_name(self, name):
         name = name.lower().strip().replace(" ", "_").replace(".", "_")
-        return f"{self.portal_name()}.{name}"
+        return f"{name}.{self.portal_name()}"
 
     def _sanitise_op_project_name(self, name):
         name = name.lower().strip().replace(" ", "_")
 
-        if not name.startswith(f"{self.portal_name()}."):
-            raise OpenPortalError(f"Project name '{name}' does not start with portal name '{self.portal_name()}'")
+        if not name.endswith(f".{self.portal_name()}"):
+            raise OpenPortalError(f"Project name '{name}' does not end with portal name '{self.portal_name()}'")
 
         if len(name) <= len(self.portal_name()) + 2:
             raise OpenPortalError(f"Project name '{name}' is too short")
@@ -167,8 +167,8 @@ class OpenPortalClient(BaseBatchClient):
     def _sanitise_op_user_name(self, name):
         name = name.lower().strip().replace(" ", "_")
 
-        if not name.startswith(f"{self.portal_name()}."):
-            raise OpenPortalError(f"User name '{name}' does not start with portal name '{self.portal_name()}'")
+        if not name.endswith(f".{self.portal_name()}"):
+            raise OpenPortalError(f"User name '{name}' does not end with portal name '{self.portal_name()}'")
 
         if name.count(".") != 2:
             raise OpenPortalError(f"User name '{name}' does not contain exactly 2 periods")
