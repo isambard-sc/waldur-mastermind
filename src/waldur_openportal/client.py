@@ -66,7 +66,9 @@ class OpenPortalRunner:
         except Exception as e:
             raise OpenPortalError(f"Failed to get OpenPortal health: {e}")
 
-        logger.info(f"OpenPortal health: {health}")
+        if not health.is_healthy():
+            logger.error(f"OpenPortal is not healthy: {health}")
+            raise OpenPortalError(f"OpenPortal is not healthy: {health}")
 
     def get(self, uid):
         """
@@ -76,7 +78,7 @@ class OpenPortalRunner:
             raise OpenPortalError(f"OpenPortal is not available - cannot get job with UID '{uid}'")
 
         try:
-            job = openportal.get(uid)
+            job = openportal.get(str(uid))
         except Exception as e:
             raise OpenPortalError(f"Failed to get job with UID '{uid}': {e}")
 
@@ -92,7 +94,7 @@ class OpenPortalRunner:
             raise OpenPortalError(f"OpenPortal is not available - cannot run '{command}'")
 
         try:
-            job = openportal.run(command)
+            job = openportal.run(command, 100)
         except Exception as e:
             raise OpenPortalError(f"Failed to run '{command}': {e}")
 
@@ -189,7 +191,7 @@ class OpenPortalClient(BaseBatchClient):
         username = self._sanitise_user_name(name)
         op_project_name = self._sanitise_op_project_name(op_project_name)
 
-        op_user_name = self.run(f"{self.instance_name()} add_user {username}.{op_project_name}")
+        op_user_name = str(self.run(f"{self.instance_name()} add_user {username}.{op_project_name}").user)
 
         logger.info(f"Added OpenPortal user '{username}' to project '{op_project_name}' with internal name '{op_user_name}'")
 
@@ -215,7 +217,7 @@ class OpenPortalClient(BaseBatchClient):
         """
         project_name = self._sanitise_project_name(name)
 
-        op_project_name = self.run(f"{self.instance_name()} add_project {project_name}")
+        op_project_name = str(self.run(f"{self.instance_name()} add_project {project_name}").project)
 
         logger.info(f"Created OpenPortal project '{project_name}' with internal name '{op_project_name}'")
 
@@ -231,7 +233,8 @@ class OpenPortalClient(BaseBatchClient):
         self.run(f"{self.instance_name()} remove_project {self._sanitise_op_project_name(op_project_name)}")
 
     def set_resource_limits(self, account, quotas):
-        raise NotImplementedError("set_resource_limits is not implemented")
+        logger.info(f"Setting resource limits for account '{account}' to '{quotas}'")
+        # raise NotImplementedError("set_resource_limits is not implemented")
 
     def get_usage_report(self, accounts):
         raise NotImplementedError("get_usage_report is not implemented")
@@ -241,7 +244,10 @@ class OpenPortalClient(BaseBatchClient):
 
     def get_users(self, op_project_name):
         op_project_name = self._sanitise_op_project_name(op_project_name)
-        return self.run(f"{self.instance_name()} get_users {op_project_name}")
+        users = self.run(f"{self.instance_name()} get_users {op_project_name}")
+        logger.info(f"Got users for project '{op_project_name}': {users}")
+
+        return []
 
     def run(self, command):
         """
@@ -250,31 +256,14 @@ class OpenPortalClient(BaseBatchClient):
         logger.info(f"Running command '{command}'")
         op_job = self._runner.run(command)
 
-        # wait for the job to finish, printing out log messages
-        # periodically
-        if hasattr(op_job, "wait"):
-            while not op_job.wait(1000):
-                logger.info(f"Job {command} is still running...")
-        else:
-            import time
-
-            op_job.update()
-            num_waits = 0
-            while not op_job.is_finished:
-                num_waits += 1
-
-                if num_waits % 10 == 0:
-                    logger.info(f"Job {command} is still running...")
-
-                time.sleep(0.1)
-
-                op_job.update()
+        while not op_job.wait(1000):
+            logger.info(f"Job {command} is still running...")
 
         if op_job.is_error:
             logger.error(f"Job {command} has failed: {op_job.error_message}")
             raise OpenPortalError(f"Job '{command}' failed: {op_job.error_message}")
         else:
-            logger.info(f"Job {command} has finished: {op_job.result}")
+            logger.info(f"Job finished: {op_job}")
             return op_job.result
 
 
