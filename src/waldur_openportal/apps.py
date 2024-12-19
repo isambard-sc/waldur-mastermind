@@ -8,37 +8,59 @@ class OpenPortalConfig(AppConfig):
     service_name = "OpenPortal"
 
     def ready(self):
+        from waldur_core.core import models as core_models
         from waldur_core.permissions import signals as permission_signals
+        from waldur_core.quotas import models as quota_models
         from waldur_core.quotas.fields import CounterQuotaField, QuotaField
         from waldur_core.structure import models as structure_models
         from waldur_core.structure.registry import SupportedServices
-        from waldur_freeipa import models as freeipa_models
 
         from . import handlers, models, utils
         from .backend import OpenPortalBackend
 
         SupportedServices.register_backend(OpenPortalBackend)
 
+        for model in (structure_models.Customer, structure_models.Project):
+            signals.post_save.connect(
+                handlers.schedule_sync,
+                sender=model,
+                dispatch_uid="waldur_openportal.handlers.schedule_sync_on_%s_creation"
+                % model.__class__,
+            )
+
+            signals.pre_delete.connect(
+                handlers.schedule_sync,
+                sender=model,
+                dispatch_uid="waldur_openportal.handlers.schedule_sync_on_%s_deletion"
+                % model.__class__,
+            )
+
         signals.post_save.connect(
-            handlers.process_user_creation,
-            sender=freeipa_models.Profile,
-            dispatch_uid="waldur_openportal.handlers.process_user_creation",
+            handlers.update_user,
+            sender=core_models.User,
+            dispatch_uid="waldur_openportal.handlers.update_user",
         )
 
         signals.pre_delete.connect(
-            handlers.process_user_deletion,
-            sender=freeipa_models.Profile,
-            dispatch_uid="waldur_openportal.handlers.process_user_deletion",
+            handlers.delete_user,
+            sender=core_models.User,
+            dispatch_uid="waldur_openportal.handlers.delete_user",
+        )
+
+        signals.post_save.connect(
+            handlers.schedule_sync_on_quota_change,
+            sender=quota_models.QuotaLimit,
+            dispatch_uid="waldur_openportal.handlers.schedule_sync_on_quota_save",
         )
 
         permission_signals.role_granted.connect(
-            handlers.process_role_granted,
-            dispatch_uid="waldur_openportal.handlers.process_role_granted",
+            handlers.role_granted,
+            dispatch_uid="waldur_openportal.handlers.role_granted",
         )
 
         permission_signals.role_revoked.connect(
-            handlers.process_role_revoked,
-            dispatch_uid="waldur_openportal.handlers.process_role_revoked",
+            handlers.role_revoked,
+            dispatch_uid="waldur_openportal.handlers.role_revoked",
         )
 
         for quota in utils.QUOTA_NAMES:

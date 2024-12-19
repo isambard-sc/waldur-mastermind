@@ -89,12 +89,17 @@ class Association(core_models.UuidMixin):
     )
     username = models.CharField(
         max_length=MAX_OP_USERNAME_LENGTH,
+        blank=True,
+        null=True,
     )
 
     def op_project_name(self):
         return self.allocation.op_project_name()
 
-    def op_user_name(self):
+    def set_op_user_name(self, username):
+        self.username = username
+
+    def get_op_user_name(self):
         return self.username
 
     def __str__(self):

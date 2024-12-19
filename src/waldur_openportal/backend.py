@@ -65,17 +65,6 @@ class OpenPortalBackend(ServiceBackend):
         """
         return user.unix_username
 
-    def get_op_user_name(self, user):
-        """
-        Return the username that OpenPortal uses for the passed user.
-        Returns None if the user is not in OpenPortal.
-        """
-        try:
-            association = models.Association.objects.get(user=user)
-            return association.username
-        except models.Association.DoesNotExist:
-            return None
-
     def sync_users(self, allocation):
         logger.info(f"Syncing users for allocation: {allocation}")
         op_project_name = allocation.op_project_name()
@@ -89,24 +78,50 @@ class OpenPortalBackend(ServiceBackend):
 
         # go through and add the users who are not in OpenPortal
         for user in users:
-            op_user_name = self.get_op_user_name(user)
+            try:
+                # get the association between the user and the allocation
+                (association, created) = models.Association.objects.get_or_create(user=user, allocation=allocation)
 
-            if op_user_name is None or op_user_name not in op_user_names:
-                logger.info(f"Adding user {user} to OpenPortal")
-                unix_shortname = self.get_user_short_name(user)
-                op_user_name = self.client.add_user(name=unix_shortname, op_project_name=op_project_name)
+                logger.info(f"Association: {association} {association.__class__}")
 
-                models.Association.objects.get_or_create(
-                    allocation=allocation,
-                    username=username
-                )
+                op_user_name = association.get_op_user_name()
 
-            allocation_user_names.append(op_user_name)
+                if op_user_name is None or op_user_name not in op_user_names:
+                    logger.info(f"Adding user {user} to OpenPortal")
+                    unix_shortname = self.get_user_short_name(user)
+
+                    if unix_shortname is None or not unix_shortname.strip():
+                        logger.error(f"Empty unix_shortname for user: {user} - cannot add to OpenPortal")
+                        continue
+
+                    new_op_user_name = self.client.add_user(name=unix_shortname, op_project_name=op_project_name)
+
+                    logger.info(f"Added user {user} to OpenPortal as {new_op_user_name}")
+
+                    if (op_user_name is not None) and (new_op_user_name != op_user_name):
+                        logger.warning(f"User {user} has a changing username in OpenPortal: {op_user_name} -> {new_op_user_name}")
+
+                    association.set_op_user_name(new_op_user_name)
+                    association.save()
+
+                    signals.openportal_association_created.send(
+                        models.Allocation,
+                        allocation=allocation,
+                        user=user,
+                    )
+
+                allocation_user_names.append(op_user_name)
+            except Exception as e:
+                logger.error(f"Unable to add user {user} to OpenPortal: {e}")
 
         stale_op_user_names = set(op_user_names) - set(allocation_user_names)
 
         for username in stale_op_user_names:
-            self.client.delete_user(username)
+            try:
+                self.client.delete_user(username)
+                # no need to signal as the user has already been removed from the association
+            except Exception as e:
+                logger.error(f"Unable to delete user {username} from OpenPortal: {e}")
 
     def create_allocation(self, allocation):
         logger.info(f"Creating allocation: {allocation}")
@@ -156,17 +171,36 @@ class OpenPortalBackend(ServiceBackend):
 
         unix_shortname = self.get_user_short_name(user)
 
+        if unix_shortname is None or not unix_shortname.strip():
+            logger.error(f"Empty unix_shortname for user: {user}")
+            raise ServiceBackendError(
+                f"Empty unix_shortname for user: {user} - cannot add to OpenPortal"
+            )
+
+        # get or create the association between the user and the allocation
+        (association, created) = models.Association.objects.get_or_create(user=user, allocation=allocation)
+
+        logger.info(f"Association: {association} {association.__class__}")
+
+        op_user_name = association.get_op_user_name()
+
         try:
-            op_user_name = self.client.add_user(unix_shortname, op_project_name)
+            new_op_user_name = self.client.add_user(unix_shortname, op_project_name)
+            logger.info(f"Added user {new_op_user_name} for {user} to OpenPortal")
+
+            if (op_user_name is not None) and (new_op_user_name != op_user_name):
+                logger.warning(f"User {user} has a changing username in OpenPortal: {op_user_name} -> {new_op_user_name}")
+
+            association.set_op_user_name(new_op_user_name)
+            association.save()
 
             signals.openportal_association_created.send(
                 models.Allocation,
                 allocation=allocation,
                 user=user,
-                username=op_user_name,
             )
         except Exception as e:
-            logger.error("Unable to create association in OpenPortal: %s", e)
+            logger.error(f"Unable to add user {user} to allocation {allocation} in OpenPortal: {e}")
             return False
 
         return True
@@ -183,18 +217,33 @@ class OpenPortalBackend(ServiceBackend):
                 "Empty op_project_name for allocation: %s" % allocation
             )
 
-        op_user_name = self.get_op_user_name(user)
+        # find the association between the user and the allocation
+        try:
+            association = models.Association.objects.get(user=user, allocation=allocation)
+        except Exception as e:
+            logger.error(f"Unable to find association between user {user} and allocation {allocation}: {e}")
+            return False
+
+        op_user_name = association.get_op_user_name()
 
         if op_user_name is not None:
-            logger.info(f"Deleting user {op_user_name} from OpenPortal")
-            self.client.delete_user(op_user_name)
+            try:
+                logger.info(f"Deleting user {op_user_name} from OpenPortal")
+                self.client.delete_user(op_user_name)
 
-            signals.openportal_association_deleted.send(
-                models.Allocation, allocation=allocation, user=user, username=op_user_name
-            )
+                # delete this association
+                association.delete()
 
-            return True
+                signals.openportal_association_deleted.send(
+                    models.Allocation, allocation=allocation, user=user
+                )
+
+                return True
+            except Exception as e:
+                logger.error(f"Unable to delete user {user} from allocation {allocation} in OpenPortal: {e}")
+                return False
         else:
+            logger.warning(f"User {user} is not associated with OpenPortal?")
             return False
 
     def set_resource_limits(self, allocation: models.Allocation):
@@ -308,28 +357,4 @@ class OpenPortalBackend(ServiceBackend):
         return models.Allocation.objects.filter(service_settings=self.settings)
 
     def _update_allocation_associations(self, allocation):
-        logger.info(f"Updating associations for allocation {allocation}")
-        op_user_names = self.client.get_users(allocation.op_project_name())
-
-        local_usernames = [
-            association.username for association in allocation.associations.all()
-        ]
-        stale_usernames = set(local_usernames) - set(op_user_names)
-        models.Association.objects.filter(
-            allocation=allocation, username__in=stale_usernames
-        ).delete()
-
-        logger.info(
-            "Associations for allocation %s and users %s have been removed",
-            allocation,
-            stale_usernames,
-        )
-
-        new_usernames = set(op_user_names) - set(local_usernames)
-
-        # where is this getting the user for the association?
-        for username in new_usernames:
-            models.Association.objects.create(
-                allocation=allocation,
-                username=username,
-            )
+        logger.info(f"OpenPortal NoOp - Updating associations for allocation {allocation}")

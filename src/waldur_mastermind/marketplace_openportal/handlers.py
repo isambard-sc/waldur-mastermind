@@ -99,7 +99,8 @@ def update_component_quota(sender, instance, created=False, **kwargs):
         resource.save(update_fields=["current_usages"])
 
 
-def create_offering_user_for_openportal_user(sender, allocation, user, username, **kwargs):
+def create_offering_user_for_openportal_user(sender, allocation, user, **kwargs):
+    logger.info(f"OpenPortal - creating offering user for user {user} in {allocation}")
     try:
         offering = marketplace_models.Offering.objects.get(
             scope=allocation.service_settings
@@ -115,11 +116,11 @@ def create_offering_user_for_openportal_user(sender, allocation, user, username,
     marketplace_models.OfferingUser.objects.update_or_create(
         offering=offering,
         user=user,
-        defaults={"username": username},
     )
 
 
 def drop_offering_user_for_openportal_user(sender, allocation, user, **kwargs):
+    logger.info(f"OpenPortal - dropping offering user for user {user} in {allocation}")
     try:
         offering = marketplace_models.Offering.objects.get(
             scope=allocation.service_settings

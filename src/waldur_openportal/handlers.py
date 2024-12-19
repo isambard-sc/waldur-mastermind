@@ -1,3 +1,4 @@
+import logging
 import functools
 
 from django.conf import settings
@@ -10,6 +11,8 @@ from waldur_core.structure.models import Customer, Project
 
 from . import models, tasks, utils
 
+logger = logging.getLogger(__name__)
+
 
 def if_plugin_enabled(f):
     """Calls decorated handler only if plugin is enabled."""
@@ -18,40 +21,72 @@ def if_plugin_enabled(f):
     def wrapped(*args, **kwargs):
         if settings.WALDUR_OPENPORTAL["ENABLED"]:
             return f(*args, **kwargs)
+        else:
+            logger.info("Skipping OpenPortal handler because plugin is disabled.")
 
     return wrapped
 
 
 @if_plugin_enabled
-def process_user_creation(sender, instance, created=False, **kwargs):
-    if not created:
-        return
-    transaction.on_commit(
-        lambda: tasks.add_user.delay(core_utils.serialize_instance(instance))
-    )
+def schedule_sync(*args, **kwargs):
+    logger.info("Scheduling OpenPortal synchronization.")
+    tasks.schedule_sync()
 
 
 @if_plugin_enabled
-def process_user_deletion(sender, instance, **kwargs):
+def schedule_sync_on_quota_change(sender, instance, created=False, **kwargs):
+    if instance.name != utils.QUOTA_NAME:
+        return
+    if created and instance.value == -1:
+        return
+
+    transaction.on_commit(schedule_sync)
+
+
+@if_plugin_enabled
+def update_user(sender, instance, created=False, **kwargs):
+    user = instance
+    logger.info(f"OpenPortal - updating user {user}")
+
+    transaction.on_commit(
+        lambda: tasks.update_user.delay(core_utils.serialize_instance(user))
+    )
+
+@if_plugin_enabled
+def delete_user(sender, instance, **kwargs):
+    user = instance
+    logger.info(f"OpenPortal - deleting user {user}")
+
     transaction.on_commit(
         lambda: tasks.delete_user.delay(core_utils.serialize_instance(instance))
     )
 
 
 @if_plugin_enabled
-def process_role_granted(sender, instance: UserRole, **kwargs):
+def role_granted(sender, instance: UserRole, **kwargs):
+    logger.info(f"OpenPortal - granting role {instance.role} for user {instance.user} in {instance.scope}")
+
     # Skip synchronization of custom roles
     if not instance.role.is_system_role:
+        logger.warning(f"Cannot synchronize custom role {instance.role} for user {instance.user} as not a system role.")
+        return
+
+    if not instance.role.is_active:
+        logger.warning(f"Cannot synchronize role {instance.role} for user {instance.user} as role is not active.")
         return
 
     if not isinstance(instance.scope, Customer | Project):
         return
 
-    raise NotImplementedError("process_role_granted not implemented yet.")
+    # let's just update the user...
+    logger.info(f"Send update_user({sender}, {instance}, created=True, **{kwargs})")
+    update_user(sender, instance, created=True, **kwargs)
 
 
 @if_plugin_enabled
-def process_role_revoked(sender, instance, **kwargs):
+def role_revoked(sender, instance, **kwargs):
+    logger.info(f"OpenPortal - revoking role {instance.role} for user {instance.user} in {instance.scope}")
+
     # Skip synchronization of custom roles
     if not instance.role.is_system_role:
         return
@@ -59,7 +94,8 @@ def process_role_revoked(sender, instance, **kwargs):
     if not isinstance(instance.scope, Customer | Project):
         return
 
-    raise NotImplementedError("process_role_revoked not implemented yet.")
+    # re-sync everything - it's safer, but could be optimised
+    schedule_sync()
 
 
 @if_plugin_enabled

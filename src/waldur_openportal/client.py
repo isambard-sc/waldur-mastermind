@@ -233,14 +233,13 @@ class OpenPortalClient(BaseBatchClient):
         self.run(f"{self.instance_name()} remove_project {self._sanitise_op_project_name(op_project_name)}")
 
     def set_resource_limits(self, account, quotas):
-        logger.info(f"Setting resource limits for account '{account}' to '{quotas}'")
-        # raise NotImplementedError("set_resource_limits is not implemented")
+        logger.info(f"OpenPortal NoOp - Setting resource limits for account '{account}' to '{quotas}'")
 
     def get_usage_report(self, accounts):
-        raise NotImplementedError("get_usage_report is not implemented")
+        logger.info(f"OpenPortal NoOp - Getting usage report for accounts '{accounts}'")
 
     def get_resource_limits(self, account):
-        raise NotImplementedError("get_usage_report is not implemented")
+        logger.info(f"OpenPortal NoOp - Getting resource limits for account '{account}'")
 
     def get_users(self, op_project_name):
         op_project_name = self._sanitise_op_project_name(op_project_name)
@@ -291,21 +290,21 @@ class OpenPortalClient(BaseBatchClient):
         # note that we probably want the caller to have already found the
         # internal name for the project, as we don't want to have to do that
         # here
-        raise NotImplementedError("delete_account is not implemented")
+        logger.warning("OpenPortal NoOp - Deleting account is not implemented")
 
     def get_account(self, name):
         # Again, we need to map from the project name to the internal name
         # for the project
-        raise NotImplementedError("get_account is not implemented")
+        logger.warning("OpenPortal NoOp - Getting account is not implemented")
 
     def create_association(self, username, account, default_account=""):
         # Again, we need to map to internal names...
-        raise NotImplementedError("create_association is not implemented")
+        logger.warning("OpenPortal NoOp - Creating association is not implemented")
 
     def delete_association(self, username, account):
         # Again, we need to map to internal names...
-        raise NotImplementedError("delete_association is not implemented")
+        logger.warning("OpenPortal NoOp - Deleting association is not implemented")
 
     def get_association(self, user, account):
         # Again, we need to map to internal names...
-        raise NotImplementedError("get_association is not implemented")
+        logger.warning("OpenPortal NoOp - Getting association is not implemented")
