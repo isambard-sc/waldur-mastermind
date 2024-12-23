@@ -166,20 +166,6 @@ class OpenPortalClient(BaseBatchClient):
         name = name.lower().strip().replace(" ", "_").replace(".", "_")
         return name
 
-    def _sanitise_op_user_name(self, name):
-        name = name.lower().strip().replace(" ", "_")
-
-        if not name.endswith(f".{self.portal_name()}"):
-            raise OpenPortalError(f"User name '{name}' does not end with portal name '{self.portal_name()}'")
-
-        if name.count(".") != 2:
-            raise OpenPortalError(f"User name '{name}' does not contain exactly 2 periods")
-
-        if len(name) <= len(self.portal_name()) + 3:
-            raise OpenPortalError(f"User name '{name}' is too short")
-
-        return name
-
     def add_user(self, name, op_project_name):
         """
         Tell OpenPortal to add the specified name to the project with the
@@ -191,21 +177,39 @@ class OpenPortalClient(BaseBatchClient):
         username = self._sanitise_user_name(name)
         op_project_name = self._sanitise_op_project_name(op_project_name)
 
-        op_user_name = str(self.run(f"{self.instance_name()} add_user {username}.{op_project_name}").user)
+        user_mapping = self.run(f"{self.instance_name()} add_user {username}.{op_project_name}")
 
-        logger.info(f"Added OpenPortal user '{username}' to project '{op_project_name}' with internal name '{op_user_name}'")
+        logger.info(f"Added OpenPortal user '{user_mapping.user}' to project '{op_project_name}' with internal name '{user_mapping.local_user}'")
 
-        return self._sanitise_op_user_name(op_user_name)
+        return user_mapping
 
-    def delete_user(self, op_user_name):
+    def _to_user_identifier(self, user_identifier):
         """
-        Remove the OpenPortal user with specified op_user_name
+        Convert the passed user_identifier to a UserIdentifier object
         """
-        op_user_name = self._sanitise_op_user_name(op_user_name)
+        from openportal import UserIdentifier, UserMapping
 
-        self.run(f"{self.instance_name()} remove_user {self._sanitise_op_user_name(op_user_name)}")
+        if isinstance(user_identifier, UserIdentifier):
+            return str(user_identifier)
+        elif isinstance(user_identifier, UserMapping):
+            return str(user_identifier.user)
+        else:
+            user_identifier = str(user_identifier).lstrip().rstrip()
 
-        logger.info(f"Deleted OpenPortal user '{op_user_name}'")
+            if user_identifier.find(" ") != -1:
+                raise OpenPortalError(f"Invalid user identifier: {user_identifier}")
+
+            return user_identifier
+
+    def delete_user(self, user_identifier):
+        """
+        Remove the OpenPortal user with specified UserIdentifier
+        """
+        user_identifier = self._to_user_identifier(user_identifier)
+
+        self.run(f"{self.instance_name()} remove_user {user_identifier}")
+
+        logger.info(f"Deleted OpenPortal user '{user_identifier}'")
 
     def add_project(self, name):
         """
@@ -243,10 +247,14 @@ class OpenPortalClient(BaseBatchClient):
 
     def get_users(self, op_project_name):
         op_project_name = self._sanitise_op_project_name(op_project_name)
-        users = self.run(f"{self.instance_name()} get_users {op_project_name}")
-        logger.info(f"Got users for project '{op_project_name}': {users}")
+        user_mappings = self.run(f"{self.instance_name()} get_users {op_project_name}")
 
-        return []
+        users = {}
+
+        for user_mapping in user_mappings:
+            users[str(user_mapping.user)] = user_mapping.local_user
+
+        return users
 
     def run(self, command):
         """

@@ -46,5 +46,5 @@ def get_user_allocations(user):
     return (project_allocations, customer_allocations)
 
 
-def get_profile_allocations(profile):
-    return itertools.chain(*get_user_allocations(profile.user))
+def get_profile_allocations(user):
+    return itertools.chain(*get_user_allocations(user))

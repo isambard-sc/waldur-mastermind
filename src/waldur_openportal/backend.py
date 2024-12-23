@@ -72,7 +72,9 @@ class OpenPortalBackend(ServiceBackend):
         logger.info(f"Users for allocation: {users}")
 
         # list all users who OpenPortal thinks are in the project
-        op_user_names = self.client.get_users(op_project_name=op_project_name)
+        op_users = self.client.get_users(op_project_name=op_project_name)
+
+        logger.info(f"Users in OpenPortal: {op_users}")
 
         allocation_user_names = []
 
@@ -86,7 +88,7 @@ class OpenPortalBackend(ServiceBackend):
 
                 op_user_name = association.get_op_user_name()
 
-                if op_user_name is None or op_user_name not in op_user_names:
+                if op_user_name is None or op_user_name not in op_users:
                     logger.info(f"Adding user {user} to OpenPortal")
                     unix_shortname = self.get_user_short_name(user)
 
@@ -94,7 +96,8 @@ class OpenPortalBackend(ServiceBackend):
                         logger.error(f"Empty unix_shortname for user: {user} - cannot add to OpenPortal")
                         continue
 
-                    new_op_user_name = self.client.add_user(name=unix_shortname, op_project_name=op_project_name)
+                    user_mapping = self.client.add_user(name=unix_shortname, op_project_name=op_project_name)
+                    new_op_user_name = str(user_mapping)
 
                     logger.info(f"Added user {user} to OpenPortal as {new_op_user_name}")
 
@@ -114,7 +117,9 @@ class OpenPortalBackend(ServiceBackend):
             except Exception as e:
                 logger.error(f"Unable to add user {user} to OpenPortal: {e}")
 
-        stale_op_user_names = set(op_user_names) - set(allocation_user_names)
+        stale_op_user_names = set([str(user) for user in op_users.keys()]) - set(allocation_user_names)
+
+        logger.info(f"Stale users in OpenPortal: {stale_op_user_names}")
 
         for username in stale_op_user_names:
             try:
@@ -185,7 +190,8 @@ class OpenPortalBackend(ServiceBackend):
         op_user_name = association.get_op_user_name()
 
         try:
-            new_op_user_name = self.client.add_user(unix_shortname, op_project_name)
+            user_mapping = self.client.add_user(unix_shortname, op_project_name)
+            new_op_user_name = str(user_mapping.user)
             logger.info(f"Added user {new_op_user_name} for {user} to OpenPortal")
 
             if (op_user_name is not None) and (new_op_user_name != op_user_name):
