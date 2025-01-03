@@ -45,7 +45,6 @@ iptools = "0.7.0"
 jira = "2.0.0"
 lxml = "^4.6.5"
 openportal = ">=0.4.0"
-paypalrestsdk = "1.13.1"
 pbr = "4.0.4"
 Pillow = "^11.0.0"
 psycopg2-binary = "2.9.10"
@@ -69,7 +68,6 @@ sentry-sdk = "^2.8.0"
 python-freeipa = "0.2.5"
 django-modeltranslation = "0.18.5"
 django-axes = "^7.0.0"
-geopy = "^2.0.0"
 google-api-python-client = "^1.12.11"
 google-auth-httplib2 = "^0.1.0"
 google-auth-oauthlib = "^0.4.6"
@@ -79,9 +77,9 @@ django-upload-validator = {git = "https://github.com/waldur/django-upload-valida
 django-binary-database-files = {git = "https://github.com/waldur/django-binary-database-files.git", rev = "fix/load-command-for-db-files"}
 pydantic = "^1.10.18"
 cryptography = "43.0.3"
-python-waldur-client = "^0.5.0"
+python-waldur-client = "^0.5.5"
 kubernetes = ">=31.0.0"
-Django = "^4.2"
+Django = "^4.2.16"
 azure-mgmt-consumption = "^9.0.0"
 django-netfields = "^1.3.0"
 django-constance = {extras = ["database"], version = "^2.9.1"}
@@ -94,6 +92,7 @@ sqlalchemy = "^2.0.31"
 django-redis = "5.4.0"
 beautifulsoup4 = "^4.12.3"
 nh3 = "^0.2.18"
+paho-mqtt = "2.1.0"
 
 [tool.poetry.group.dev.dependencies]
 djangorestframework-stubs = {extras = ["compatible-mypy"], version = "^3.14.5"}
@@ -124,7 +123,6 @@ waldur_billing = "waldur_mastermind.billing.extension:BillingExtension"
 waldur_booking = "waldur_mastermind.booking.extension:BookingExtension"
 waldur_digitalocean = "waldur_digitalocean.extension:DigitalOceanExtension"
 waldur_freeipa = "waldur_freeipa.extension:FreeIPAExtension"
-waldur_geo_ip = "waldur_geo_ip.extension:GeoIPExtension"
 waldur_invoices = "waldur_mastermind.invoices.extension:InvoicesExtension"
 waldur_marketplace = "waldur_mastermind.marketplace.extension:MarketplaceExtension"
 waldur_marketplace_azure = "waldur_mastermind.marketplace_azure.extension:MarketplaceAzureExtension"
@@ -146,7 +144,6 @@ waldur_openstack_replication = "waldur_openstack_replication.extension:OpenStack
 waldur_notifications = "waldur_mastermind.notifications.extension:NotificationsExtension"
 waldur_policy = "waldur_mastermind.policy.extension:PolicyExtension"
 waldur_proposal = "waldur_mastermind.proposal.extension:ProposalExtension"
-waldur_paypal = "waldur_paypal.extension:PayPalExtension"
 waldur_rancher = "waldur_rancher.extension:RancherExtension"
 waldur_slurm = "waldur_slurm.extension:SlurmExtension"
 waldur_support = "waldur_mastermind.support.extension:SupportExtension"
@@ -202,7 +199,6 @@ known-first-party = [
   "factory",
   "fluent_dashboard",
   "freezegun",
-  "geopy",
   "glanceclient",
   "google_auth_oauthlib",
   "google",
@@ -228,10 +224,8 @@ known-first-party = [
   "neutronclient",
   "novaclient",
   "oauthlib",
-  "paypalrestsdk",
   "PIL",
   "pkg_resources",
-  "prettytable",
   "pycountry",
   "pydantic",
   "python_freeipa",

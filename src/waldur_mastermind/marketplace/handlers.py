@@ -185,7 +185,7 @@ def process_invitations_and_orders_when_project_start_date_is_unset(
             order.set_state_executing()
             order.save(update_fields=["state"])
             transaction.on_commit(
-                lambda: tasks.process_order_on_commit.delay(order, order.created_by)
+                lambda: tasks.process_order_on_commit(order, order.created_by)
             )
         else:
             transaction.on_commit(
@@ -267,6 +267,19 @@ def update_category_offerings_count(sender, **kwargs):
             category=category, state=models.Offering.States.ACTIVE
         ).count()
         category.set_quota_usage("offering_count", value)
+
+
+def delete_service_setting_when_offering_is_deleted(sender, instance, **kwargs):
+    offering: models.Offering = instance
+    try:
+        service_settings = offering.scope
+    except AttributeError:
+        return
+
+    if not isinstance(service_settings, structure_models.ServiceSettings):
+        return
+
+    service_settings.delete()
 
 
 def create_resource_plan_period_when_resource_is_created(
@@ -813,6 +826,9 @@ def resource_has_been_changed(sender, instance, created=False, **kwargs):
         else:
             new_value = getattr(instance, field)
 
+        if not old_value and not new_value:
+            continue
+
         changed.append({"name": field, "from": old_value, "to": new_value})
 
     log.log_marketplace_resource_has_been_changed(instance, changed)
@@ -1018,6 +1034,30 @@ def update_offering_user_username_after_offering_settings_change(
     for offering_user in offering_users:
         new_username = utils.generate_username(offering_user.user, offering)
         logger.info("New username for %s is %s", offering_user, new_username)
+        offering_user.username = new_username
+
+        utils.setup_linux_related_data(offering_user, offering)
+        offering_user.save(update_fields=["username", "backend_metadata"])
+
+
+def update_offering_user_username_after_user_change(sender, instance, **kwargs):
+    """Set new username for offering users after site_username in user details has been changed."""
+    user = instance
+
+    # Update username for offering users only if site_username has been changed
+    if not user.tracker.has_changed("details") or not user.details.get("site_username"):
+        return
+
+    offering_users = models.OfferingUser.objects.filter(
+        user=user,
+        offering__type__in=OFFERING_USER_ALLOWED_OFFERING_TYPES,
+        offering__plugin_options__username_generation_policy=utils.UsernameGenerationPolicy.IDENTITY_CLAIM.name,
+    )
+
+    for offering_user in offering_users:
+        offering = offering_user.offering
+        new_username = utils.generate_username(user, offering)
+        logger.info("Setting username for %s to %s", offering_user, new_username)
         offering_user.username = new_username
 
         utils.setup_linux_related_data(offering_user, offering)

@@ -1,8 +1,11 @@
+from datetime import timedelta
 from typing import TypeVar
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
-from django.db.models import QuerySet
+from django.db.models import F, Q, QuerySet
+from django.db.models.functions import Now
+from rest_framework.authtoken import models as authtoken_models
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.managers import GenericKeyMixin
@@ -29,16 +32,26 @@ def filter_queryset_for_user(queryset: QuerySet[T], user) -> QuerySet[T]:
     except AttributeError:
         return queryset
 
+    list_permission = getattr(permissions, "list_permission", None)
+
     subquery = models.Q()
 
     customer_path = getattr(permissions, "customer_path", None)
     project_path = getattr(permissions, "project_path", None)
 
     if customer_path:
-        subquery |= build_filter(customer_path, get_connected_customers(user))
+        if list_permission:
+            customers = get_connected_customers_by_permission(user, list_permission)
+        else:
+            customers = get_connected_customers(user)
+        subquery |= build_filter(customer_path, customers)
 
     if project_path:
-        subquery |= build_filter(project_path, get_connected_projects(user))
+        if list_permission:
+            projects = get_connected_projects_by_permission(user, list_permission)
+        else:
+            projects = get_connected_projects(user)
+        subquery |= build_filter(project_path, projects)
 
     build_query = getattr(permissions, "build_query", None)
     if build_query:
@@ -183,3 +196,13 @@ def get_organization_groups(user):
     return structure_models.Customer.objects.filter(
         id__in=get_visible_customers(user)
     ).values("organization_group")
+
+
+def get_active_tokens():
+    # Get tokens that are either:
+    # 1. Within their lifetime (created + token_lifetime > now)
+    # 2. Have no lifetime limit (token_lifetime is NULL)
+    return authtoken_models.Token.objects.filter(
+        Q(created__gte=Now() - F("user__token_lifetime") * timedelta(seconds=1))
+        | Q(user__token_lifetime__isnull=True)
+    ).select_related("user")

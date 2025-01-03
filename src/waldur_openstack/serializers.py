@@ -245,7 +245,15 @@ class FlavorSerializer(structure_serializers.BasePropertySerializer):
 class ImageSerializer(structure_serializers.BasePropertySerializer):
     class Meta:
         model = models.Image
-        fields = ("url", "uuid", "name", "min_disk", "min_ram", "settings")
+        fields = (
+            "url",
+            "uuid",
+            "name",
+            "min_disk",
+            "min_ram",
+            "settings",
+            "backend_id",
+        )
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
             "settings": {"lookup_field": "uuid"},
@@ -964,6 +972,8 @@ class TenantSerializer(structure_serializers.BaseResourceSerializer):
         validated_data["user_password"] = core_utils.pwgen()
 
         subnet_cidr = validated_data.pop("subnet_cidr")
+        # if MTU was passed
+        mtu = validated_data.get("mtu")
         with transaction.atomic():
             tenant: models.Tenant = super().create(validated_data)
             network = models.Network.objects.create(
@@ -972,6 +982,7 @@ class TenantSerializer(structure_serializers.BaseResourceSerializer):
                 tenant=tenant,
                 service_settings=tenant.service_settings,
                 project=tenant.project,
+                mtu=mtu,
             )
             models.SubNet.objects.create(
                 name=slugified_name + "-sub-net",

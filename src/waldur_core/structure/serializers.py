@@ -725,7 +725,9 @@ class CustomerPermissionReviewSerializer(
         }
 
 
-class ProjectPermissionLogSerializer(BasePermissionSerializer):
+class ProjectPermissionLogSerializer(
+    core_serializers.RestrictedSerializerMixin, BasePermissionSerializer
+):
     customer_uuid = serializers.ReadOnlyField(source="scope.customer.uuid")
     customer_name = serializers.ReadOnlyField(source="scope.customer.name")
     project_uuid = serializers.ReadOnlyField(source="scope.uuid")
@@ -982,7 +984,9 @@ class UserEmailChangeSerializer(serializers.Serializer):
     email = serializers.EmailField()
 
 
-class SshKeySerializer(serializers.HyperlinkedModelSerializer):
+class SshKeySerializer(
+    core_serializers.RestrictedSerializerMixin, serializers.HyperlinkedModelSerializer
+):
     user_uuid = serializers.ReadOnlyField(source="user.uuid")
 
     class Meta:

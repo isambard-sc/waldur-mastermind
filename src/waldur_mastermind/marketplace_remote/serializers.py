@@ -1,6 +1,9 @@
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
+from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
+from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
 
 from . import PLUGIN_NAME, constants, models
@@ -62,6 +65,120 @@ class ProjectUpdateRequestSerializer(serializers.ModelSerializer):
             "new_is_industry",
             "created_by",
         )
+
+
+class NestedRemoteLocalCategorySerializer(serializers.HyperlinkedModelSerializer):
+    local_category_name = serializers.ReadOnlyField(source="local_category.title")
+    local_category_uuid = serializers.ReadOnlyField(source="local_category.uuid")
+
+    class Meta:
+        fields = (
+            "local_category",
+            "remote_category",
+            "local_category_name",
+            "local_category_uuid",
+            "remote_category_name",
+        )
+        model = models.RemoteLocalCategory
+        extra_kwargs = {
+            "local_category": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-category-detail",
+            },
+        }
+
+
+class RemoteSynchronisationSerializer(
+    core_serializers.AugmentedSerializerMixin,
+    serializers.HyperlinkedModelSerializer,
+):
+    local_service_provider_name = serializers.ReadOnlyField(
+        source="local_service_provider.customer.name"
+    )
+    remotelocalcategory_set = NestedRemoteLocalCategorySerializer(many=True)
+
+    class Meta:
+        model = models.RemoteSynchronisation
+        view_name = "marketplace-remote-synchronisation-detail"
+        fields = [
+            "uuid",
+            "url",
+            "api_url",
+            "token",
+            "remote_organization_uuid",
+            "remote_organization_name",
+            "local_service_provider",
+            "local_service_provider_name",
+            "is_active",
+            "last_execution",
+            "last_output",
+            "get_state_display",
+            "error_message",
+            "created",
+            "modified",
+            "remotelocalcategory_set",
+        ]
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+            },
+            "local_service_provider": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-service-provider-detail",
+            },
+        }
+        read_only_fields = ["error_message"]
+        protected_fields = ("remote_organization_uuid",)
+
+    def validate(self, attrs):
+        if structure_models.Customer.objects.filter(
+            uuid=attrs.get("remote_organization_uuid")
+        ).exists():
+            raise serializers.ValidationError(
+                _("Synchronization cannot reference the same Waldur instance.")
+            )
+        return attrs
+
+    def _create_or_update_category_mapping(self, remote_synchronisation, categories):
+        if not categories:
+            raise serializers.ValidationError(
+                _("At least one category must be specified.")
+            )
+
+        # Check for duplicate local categories
+        local_categories = [c["local_category"] for c in categories]
+        if len(local_categories) != len(set(local_categories)):
+            raise serializers.ValidationError(
+                _("Duplicate local categories are not allowed.")
+            )
+
+        # Check for duplicate remote categories
+        remote_categories = [c["remote_category"] for c in categories]
+        if len(remote_categories) != len(set(remote_categories)):
+            raise serializers.ValidationError(
+                _("Duplicate remote categories are not allowed.")
+            )
+
+        remote_synchronisation.remotelocalcategory_set.all().delete()
+
+        for c in categories:
+            models.RemoteLocalCategory.objects.create(
+                local_category=c["local_category"],
+                remote_category=c["remote_category"],
+                remote_synchronisation=remote_synchronisation,
+            )
+
+    def create(self, validated_data):
+        categories = validated_data.pop("remotelocalcategory_set", [])
+        remote_synchronisation = super().create(validated_data)
+        self._create_or_update_category_mapping(remote_synchronisation, categories)
+        return remote_synchronisation
+
+    def update(self, remote_synchronisation, validated_data):
+        if "remotelocalcategory_set" in validated_data:
+            categories = validated_data.pop("remotelocalcategory_set", [])
+            self._create_or_update_category_mapping(remote_synchronisation, categories)
+        return super().update(remote_synchronisation, validated_data)
 
 
 def mark_synced_fields_as_read_only(sender, fields, serializer, **kwargs):

@@ -75,12 +75,14 @@ class PermissionEnum(str, Enum):
     UPDATE_RESOURCE_ROBOT_ACCOUNT = "RESOURCE.UPDATE_ROBOT_ACCOUNT"
     DELETE_RESOURCE_ROBOT_ACCOUNT = "RESOURCE.DELETE_ROBOT_ACCOUNT"
 
+    LIST_ORDERS = "ORDER.LIST"
     APPROVE_PRIVATE_ORDER = "ORDER.APPROVE_PRIVATE"
     APPROVE_ORDER = "ORDER.APPROVE"
     REJECT_ORDER = "ORDER.REJECT"
     DESTROY_ORDER = "ORDER.DESTROY"
     CANCEL_ORDER = "ORDER.CANCEL"
 
+    LIST_RESOURCES = "RESOURCE.LIST"
     TERMINATE_RESOURCE = "RESOURCE.TERMINATE"
     LIST_IMPORTABLE_RESOURCES = "RESOURCE.LIST_IMPORTABLE"
     SET_RESOURCE_END_DATE = "RESOURCE.SET_END_DATE"
@@ -95,6 +97,30 @@ class PermissionEnum(str, Enum):
     ACCEPT_BOOKING_REQUEST = "RESOURCE.ACCEPT_BOOKING_REQUEST"
     REJECT_BOOKING_REQUEST = "RESOURCE.REJECT_BOOKING_REQUEST"
     MANAGE_RESOURCE_USERS = "RESOURCE.MANAGE_USERS"
+    RESOURCE_CONSUMPTION_LIMITATION = "RESOURCE.CONSUMPTION_LIMITATION"
+
+    GET_SERVICE_PROVIDER_API_SECRET_CODE = "SERVICE_PROVIDER.GET_API_SECRET_CODE"
+    GENERATE_SERVICE_PROVIDER_API_SECRET_CODE = (
+        "SERVICE_PROVIDER.GENERATE_API_SECRET_CODE"
+    )
+    LIST_SERVICE_PROVIDER_CUSTOMERS = "SERVICE_PROVIDER.LIST_CUSTOMERS"
+    LIST_SERVICE_PROVIDER_CUSTOMER_PROJECTS = "SERVICE_PROVIDER.LIST_CUSTOMER_PROJECTS"
+    LIST_SERVICE_PROVIDER_PROJECTS = "SERVICE_PROVIDER.LIST_PROJECTS"
+    LIST_SERVICE_PROVIDER_PROJECT_PERMISSIONS = (
+        "SERVICE_PROVIDER.LIST_PROJECT_PERMISSIONS"
+    )
+    LIST_SERVICE_PROVIDER_KEYS = "SERVICE_PROVIDER.LIST_KEYS"
+    LIST_SERVICE_PROVIDER_USERS = "SERVICE_PROVIDER.LIST_USERS"
+    LIST_SERVICE_PROVIDER_USER_CUSTOMERS = "SERVICE_PROVIDER.LIST_USER_CUSTOMERS"
+    SET_SERVICE_PROVIDER_OFFERINGS_USERNAME = "SERVICE_PROVIDER.SET_OFFERINGS_USERNAME"
+    GET_SERVICE_PROVIDER_STATISTICS = "SERVICE_PROVIDER.GET_STATISTICS"
+    GET_SERVICE_PROVIDER_REVENUE = "SERVICE_PROVIDER.GET_REVENUE"
+    GET_SERVICE_PROVIDER_ROBOT_ACCOUNT_CUSTOMERS = (
+        "SERVICE_PROVIDER.GET_ROBOT_ACCOUNT_CUSTOMERS"
+    )
+    GET_SERVICE_PROVIDER_ROBOT_ACCOUNT_PROJECTS = (
+        "SERVICE_PROVIDER.GET_ROBOT_ACCOUNT_PROJECTS"
+    )
 
     CREATE_PROJECT_PERMISSION = "PROJECT.CREATE_PERMISSION"
     CREATE_CUSTOMER_PERMISSION = "CUSTOMER.CREATE_PERMISSION"
@@ -117,6 +143,7 @@ class PermissionEnum(str, Enum):
     CREATE_LEXIS_LINK = "LEXIS_LINK.CREATE"
     DELETE_LEXIS_LINK = "LEXIS_LINK.DELETE"
 
+    LIST_PROJECTS = "PROJECT.LIST"
     CREATE_PROJECT = "PROJECT.CREATE"
     DELETE_PROJECT = "PROJECT.DELETE"
     UPDATE_PROJECT = "PROJECT.UPDATE"
@@ -134,6 +161,9 @@ class PermissionEnum(str, Enum):
     DELETE_ACCESS_SUBNET = "ACCESS_SUBNET.DELETE"
 
     UPDATE_OFFERING_USER_RESTRICTION = "OFFERINGUSER.UPDATE_RESTRICTION"
+
+    LIST_INVITATIONS = "INVITATION.LIST"
+    LIST_CUSTOMER_PERMISSION_REVIEWS = "CUSTOMER.LIST_PERMISSION_REVIEWS"
 
 
 CREATE_PERMISSIONS = {
@@ -271,6 +301,7 @@ PERMISSION_DESCRIPTION = [
     {
         "label": "Order",
         "options": [
+            {"label": "List orders", "value": "ORDER.LIST"},
             {"label": "Approve order", "value": "ORDER.APPROVE"},
             {
                 "label": "Approve private order",
@@ -285,23 +316,9 @@ PERMISSION_DESCRIPTION = [
         ],
     },
     {
-        "label": "Resource",
+        "label": "Provider actions",
         "options": [
-            {"label": "Terminate resource", "value": "RESOURCE.TERMINATE"},
-            {
-                "label": "List importable resources",
-                "value": "RESOURCE.LIST_IMPORTABLE",
-            },
-            {
-                "label": "Set resource end date",
-                "value": "RESOURCE.SET_END_DATE",
-            },
             {"label": "Set resource usage", "value": "RESOURCE.SET_USAGE"},
-            {"label": "Switch resource plan", "value": "RESOURCE.SET_PLAN"},
-            {
-                "label": "Update resource limits",
-                "value": "RESOURCE.SET_LIMITS",
-            },
             {
                 "label": "Set resource backend id",
                 "value": "RESOURCE.SET_BACKEND_ID",
@@ -310,18 +327,17 @@ PERMISSION_DESCRIPTION = [
                 "label": "Submit resource report",
                 "value": "RESOURCE.SUBMIT_REPORT",
             },
-            {"label": "List resource users", "value": "RESOURCE.LIST_USERS"},
             {
-                "label": "Complete resource downscaling",
-                "value": "RESOURCE.COMPLETE_DOWNSCALING",
+                "label": "Set resource end date",
+                "value": "RESOURCE.SET_END_DATE",
             },
             {
-                "label": "Accept booking request",
-                "value": "RESOURCE.ACCEPT_BOOKING_REQUEST",
+                "label": "Set resource state",
+                "value": "RESOURCE.SET_STATE",
             },
             {
-                "label": "Reject booking request",
-                "value": "RESOURCE.REJECT_BOOKING_REQUEST",
+                "label": "Set resource backend metadata",
+                "value": "RESOURCE.SET_BACKEND_METADATA",
             },
             {
                 "label": "Create robot account",
@@ -335,11 +351,111 @@ PERMISSION_DESCRIPTION = [
                 "label": "Delete robot account",
                 "value": "RESOURCE.DELETE_ROBOT_ACCOUNT",
             },
+            {
+                "label": "Manage resource users",
+                "value": "RESOURCE.MANAGE_USERS",
+            },
+            {
+                "value": "SERVICE_PROVIDER.GET_API_SECRET_CODE",
+                "label": "Get API secret code",
+            },
+            {
+                "value": "SERVICE_PROVIDER.GENERATE_API_SECRET_CODE",
+                "label": "Generate API secret code",
+            },
+            {
+                "value": "SERVICE_PROVIDER.LIST_CUSTOMERS",
+                "label": "List service provider customers",
+            },
+            {
+                "value": "SERVICE_PROVIDER.LIST_CUSTOMER_PROJECTS",
+                "label": "List service provider customer projects",
+            },
+            {
+                "value": "SERVICE_PROVIDER.LIST_PROJECTS",
+                "label": "List service provider projects",
+            },
+            {
+                "value": "SERVICE_PROVIDER.LIST_PROJECT_PERMISSIONS",
+                "label": "List service provider project permissions",
+            },
+            {
+                "value": "SERVICE_PROVIDER.LIST_KEYS",
+                "label": "List service provider keys",
+            },
+            {
+                "value": "SERVICE_PROVIDER.LIST_USERS",
+                "label": "List service provider users",
+            },
+            {
+                "value": "SERVICE_PROVIDER.LIST_USER_CUSTOMERS",
+                "label": "List service provider user customers",
+            },
+            {
+                "value": "SERVICE_PROVIDER.SET_OFFERINGS_USERNAME",
+                "label": "Set offerings username",
+            },
+            {
+                "value": "SERVICE_PROVIDER.GET_STATISTICS",
+                "label": "Get service provider statistics",
+            },
+            {
+                "value": "SERVICE_PROVIDER.GET_REVENUE",
+                "label": "Get service provider revenue",
+            },
+            {
+                "value": "SERVICE_PROVIDER.GET_ROBOT_ACCOUNT_CUSTOMERS",
+                "label": "Get service provider robot account customers",
+            },
+            {
+                "value": "SERVICE_PROVIDER.GET_ROBOT_ACCOUNT_PROJECTS",
+                "label": "Get service provider robot account projects",
+            },
+        ],
+    },
+    {
+        "label": "Customer actions for resources",
+        "options": [
+            {"label": "List resources", "value": "RESOURCE.LIST"},
+            {
+                "label": "Set resource end date",
+                "value": "RESOURCE.SET_END_DATE",
+            },
+            {"label": "Terminate resource", "value": "RESOURCE.TERMINATE"},
+            {
+                "label": "List importable resources",
+                "value": "RESOURCE.LIST_IMPORTABLE",
+            },
+            {"label": "Switch resource plan", "value": "RESOURCE.SET_PLAN"},
+            {
+                "label": "Update resource limits",
+                "value": "RESOURCE.SET_LIMITS",
+            },
+            {
+                "label": "Accept booking request",
+                "value": "RESOURCE.ACCEPT_BOOKING_REQUEST",
+            },
+            {
+                "label": "Reject booking request",
+                "value": "RESOURCE.REJECT_BOOKING_REQUEST",
+            },
+            {
+                "label": "Update resource options",
+                "value": "RESOURCE.UPDATE_OPTIONS",
+            },
+            {
+                "label": "Set resource consumption limitation",
+                "value": "RESOURCE.CONSUMPTION_LIMITATION",
+            },
         ],
     },
     {
         "label": "Team members",
         "options": [
+            {
+                "value": "INVITATION.LIST",
+                "label": "List invitations",
+            },
             {
                 "label": "Create project permission",
                 "value": "PROJECT.CREATE_PERMISSION",
@@ -381,6 +497,7 @@ PERMISSION_DESCRIPTION = [
     {
         "label": "Project",
         "options": [
+            {"label": "List projects", "value": "PROJECT.LIST"},
             {
                 "label": "Create project",
                 "value": "PROJECT.CREATE",

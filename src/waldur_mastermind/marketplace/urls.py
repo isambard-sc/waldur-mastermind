@@ -58,7 +58,9 @@ def register_in(router):
         basename="marketplace-order",
     )
     router.register(
-        r"marketplace-resources", views.ResourceViewSet, basename="marketplace-resource"
+        r"marketplace-resources",
+        views.ConsumerResourceViewSet,
+        basename="marketplace-resource",
     )
     router.register(
         r"marketplace-provider-resources",
@@ -149,6 +151,11 @@ def register_in(router):
         r"marketplace-integration-statuses",
         views.IntegrationStatusViewSet,
         basename="marketplace-integration-status",
+    )
+    router.register(
+        r"component-user-usage-limits",
+        views.ComponentUserUsageLimitViewSet,
+        basename="component-user-usage-limit",
     )
 
 

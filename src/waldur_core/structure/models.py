@@ -37,7 +37,7 @@ from waldur_core.core.validators import (
 from waldur_core.logging.loggers import LoggableMixin
 from waldur_core.media.mixins import ImageModelMixin
 from waldur_core.media.validators import CertificateValidator
-from waldur_core.permissions.enums import SYSTEM_PROJECT_ROLES, RoleEnum
+from waldur_core.permissions.enums import SYSTEM_PROJECT_ROLES, PermissionEnum, RoleEnum
 from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import (
     add_user,
@@ -58,9 +58,8 @@ from waldur_core.structure.managers import (
     get_project_users,
     get_visible_customers,
 )
+from waldur_core.structure.mixins import CoordinatesMixin, IPCoordinatesMixin
 from waldur_core.structure.registry import SupportedServices, get_resource_type
-from waldur_geo_ip.mixins import CoordinatesMixin, IPCoordinatesMixin
-from waldur_geo_ip.utils import get_coordinates_by_ip
 
 
 def validate_service_type(service_type):
@@ -291,9 +290,9 @@ CUSTOMER_DETAILS_FIELDS = (
     "postal",
     "address",
     "bank_name",
-    "bank_account",
     "latitude",
     "longitude",
+    "bank_account",
     "country",
 )
 
@@ -593,6 +592,7 @@ class Project(
     class Permissions:
         customer_path = "customer"
         project_path = "self"
+        list_permission = PermissionEnum.LIST_PROJECTS
 
     class Quotas(quotas_models.QuotaModelMixin.Quotas):
         enable_fields_caching = False
@@ -723,6 +723,7 @@ class Project(
 class CustomerPermissionReview(core_models.UuidMixin):
     class Permissions:
         customer_path = "customer"
+        list_permission = PermissionEnum.LIST_CUSTOMER_PERMISSION_REVIEWS
 
     customer = models.ForeignKey(
         Customer,
@@ -1040,10 +1041,6 @@ class VirtualMachine(IPCoordinatesMixin, core_models.RuntimeStateMixin, BaseReso
 
     class Meta:
         abstract = True
-
-    def detect_coordinates(self):
-        if self.external_ips:
-            return get_coordinates_by_ip(self.external_ips)
 
     def get_access_url(self):
         if self.external_ips:

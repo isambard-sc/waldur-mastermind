@@ -23,6 +23,7 @@ from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core.utils import create_batch_fetcher, pwgen
 from waldur_core.structure.backend import ServiceBackend, log_backend_action
+from waldur_core.structure.models import ServiceSettings
 from waldur_core.structure.registry import get_resource_type
 from waldur_core.structure.signals import resource_pulled
 from waldur_core.structure.utils import (
@@ -93,7 +94,7 @@ class OpenStackBackend(ServiceBackend):
     }
 
     def __init__(self, settings):
-        self.settings = settings
+        self.settings: ServiceSettings = settings
 
     @property
     def admin_session(self):
@@ -235,6 +236,7 @@ class OpenStackBackend(ServiceBackend):
 
     def pull_service_properties(self):
         self.pull_service_settings_quotas()
+        self.pull_global_volume_types()
 
     def pull_resources(self):
         self.pull_tenants()
@@ -430,6 +432,29 @@ class OpenStackBackend(ServiceBackend):
                     "cores": remote_flavor.vcpus,
                     "ram": remote_flavor.ram,
                     "disk": self.gb2mb(remote_flavor.disk),
+                },
+            )
+
+    def pull_global_volume_types(self):
+        cinder = get_cinder_client(self.admin_session)
+        try:
+            remote_volume_types = cinder.volume_types.list()
+        except cinder_exceptions.ClientException as e:
+            raise OpenStackBackendError(e)
+        volume_type_blacklist = parse_comma_separated_list(
+            self.settings.options.get("volume_type_blacklist", "")
+        )
+        models.VolumeType.objects.filter(settings=self.settings).exclude(
+            backend_id__in=[volume_type.id for volume_type in remote_volume_types]
+        ).delete()
+        for volume_type in remote_volume_types:
+            models.VolumeType.objects.update_or_create(
+                settings=self.settings,
+                backend_id=volume_type.id,
+                defaults={
+                    "name": volume_type.name,
+                    "description": volume_type.description or "",
+                    "disabled": volume_type.name in volume_type_blacklist,
                 },
             )
 
@@ -923,7 +948,7 @@ class OpenStackBackend(ServiceBackend):
 
             try:
                 subnet_backend_id = backend_port["fixed_ips"][0]["subnet_id"]
-            except (AttributeError, KeyError):
+            except (AttributeError, KeyError, IndexError):
                 pass
 
             device_id = backend_port.get("device_id")
@@ -3934,11 +3959,16 @@ class OpenStackBackend(ServiceBackend):
                 v.volumeId for v in nova.volumes.get_server_volumes(backend_id)
             ]
             flavor_id = backend_instance.flavor["id"]
+            image_id = backend_instance.image and backend_instance.image.get("id")
         except nova_exceptions.ClientException as e:
             raise OpenStackBackendError(e)
 
         instance: models.Instance = self._backend_instance_to_instance(
-            tenant, backend_instance, flavor_id, connected_internal_network_names
+            tenant,
+            backend_instance,
+            flavor_id,
+            connected_internal_network_names,
+            image_id,
         )
         with transaction.atomic():
             instance.tenant = tenant
@@ -3979,6 +4009,7 @@ class OpenStackBackend(ServiceBackend):
         backend_instance,
         backend_flavor_id=None,
         connected_internal_network_names=None,
+        backend_image_id=None,
     ):
         # parse launch time
         try:
@@ -4055,6 +4086,18 @@ class OpenStackBackend(ServiceBackend):
                     instance.cores = backend_flavor.vcpus
                     instance.ram = backend_flavor.ram
 
+        if backend_image_id:
+            try:
+                image = models.Image.objects.get(
+                    settings=tenant.service_settings, backend_id=backend_image_id
+                )
+                instance.image_name = image.name
+            except models.Image.DoesNotExist:
+                backend_image = self._get_image(tenant, backend_image_id)
+                # If image has been removed in OpenStack cloud, we should skip update
+                if backend_image:
+                    instance.image_name = backend_image.name
+
         attached_volumes = backend_instance.to_dict().get(
             "os-extended-volumes:volumes_attached", []
         )
@@ -4077,6 +4120,18 @@ class OpenStackBackend(ServiceBackend):
         except nova_exceptions.ClientException as e:
             raise OpenStackBackendError(e)
 
+    def _get_image(self, tenant: models.Tenant, image_id):
+        session = get_tenant_session(tenant)
+        glance = get_glance_client(session)
+
+        try:
+            return glance.images.get(image_id)
+        except glance_exceptions.NotFound:
+            logger.info("OpenStack image %s is gone.", image_id)
+            return None
+        except glance_exceptions.ClientException as e:
+            raise OpenStackBackendError(e)
+
     def get_instances(self, tenant: models.Tenant) -> list[models.Instance]:
         nova = get_nova_client(self.admin_session)
 
@@ -4092,8 +4147,11 @@ class OpenStackBackend(ServiceBackend):
         instances = []
         for backend_instance in backend_instances:
             flavor_id = backend_instance.flavor["id"]
+            image_id = backend_instance.image and backend_instance.image.get("id")
             instances.append(
-                self._backend_instance_to_instance(tenant, backend_instance, flavor_id)
+                self._backend_instance_to_instance(
+                    tenant, backend_instance, flavor_id, backend_image_id=image_id
+                )
             )
         return instances
 

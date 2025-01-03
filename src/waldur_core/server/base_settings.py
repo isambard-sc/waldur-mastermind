@@ -176,7 +176,7 @@ ROOT_URLCONF = "waldur_core.server.urls"
 AUTH_USER_MODEL = "core.User"
 
 # Session
-# https://docs.djangoproject.com/en/2.2/ref/settings/#sessions
+# https://docs.djangoproject.com/en/4.2/ref/settings/#sessions
 SESSION_COOKIE_AGE = 3600
 SESSION_SAVE_EVERY_REQUEST = True
 
@@ -191,8 +191,19 @@ USE_L10N = True
 USE_TZ = True
 
 # Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/2.2/howto/static-files/
+# https://docs.djangoproject.com/en/4.2/howto/static-files/
 STATIC_URL = "/static/"
+
+# RabbitMQ requirements:
+# rabbitmq-plugins enable rabbitmq_mqtt
+# rabbitmq-plugins enable rabbitmq_web_mqtt (for websockets)
+RABBITMQ_MQTT = {
+    "HOST": "localhost",
+    "PORT": 1883,
+    "USER": "test",
+    "PASSWORD": "test",
+    "MANAGEMENT_PORT": 15672,
+}
 
 # Celery
 CELERY_BROKER_URL = "redis://localhost"

@@ -7,7 +7,6 @@ from django.contrib import auth
 from django.core import exceptions as django_exceptions
 from django.db import transaction
 from django.db.models import Count, Q
-from django.db.utils import DataError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -16,7 +15,6 @@ from rest_framework import filters as rf_filters
 from rest_framework import mixins, status, viewsets
 from rest_framework import permissions as rf_permissions
 from rest_framework import serializers as rf_serializers
-from rest_framework.authtoken import models as authtoken_models
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.response import Response
@@ -32,7 +30,6 @@ from waldur_core.core.log import event_logger
 from waldur_core.core.utils import is_uuid_like
 from waldur_core.core.views import ActionsViewSet
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
-from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import (
     has_permission,
     permission_factory,
@@ -40,6 +37,8 @@ from waldur_core.permissions.utils import (
 from waldur_core.permissions.views import UserRoleMixin
 from waldur_core.structure import filters, models, permissions, serializers, utils
 from waldur_core.structure.managers import (
+    filter_queryset_for_user,
+    get_active_tokens,
     get_connected_customers,
     get_connected_projects,
 )
@@ -240,6 +239,7 @@ class CustomerViewSet(UserRoleMixin, core_mixins.EagerLoadMixin, viewsets.ModelV
         resources = marketplace_models.Resource.objects.filter(
             project__customer=customer
         ).exclude(state=marketplace_models.Resource.States.TERMINATED)
+        resources = filter_queryset_for_user(resources, request.user)
 
         components_data_list = get_components_usage_data_from_resources(resources)
 
@@ -437,6 +437,7 @@ class ProjectViewSet(
         resources = marketplace_models.Resource.objects.filter(project=project).exclude(
             state=marketplace_models.Resource.States.TERMINATED
         )
+        resources = filter_queryset_for_user(resources, request.user)
 
         components_data_list = get_components_usage_data_from_resources(resources)
 
@@ -649,23 +650,6 @@ class UserViewSet(viewsets.ModelViewSet):
             event_context={"affected_user": user},
         )
         logger.info(f"User {user} has been created by {self.request.user}.")
-
-
-class UserPermissionViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = UserRole.objects.all()
-    serializer_class = serializers.PermissionSerializer
-    lookup_field = "uuid"
-    filter_backends = (
-        filters.UserRoleFilterBackend,
-        DjangoFilterBackend,
-    )
-    filterset_class = filters.UserPermissionFilter
-
-    def get_queryset(self):
-        qs = super().get_queryset()
-        if self.request.user.is_staff or self.request.user.is_support:
-            return qs
-        return qs.filter(user__is_active=True).distinct()
 
 
 class CustomerPermissionReviewViewSet(
@@ -945,35 +929,8 @@ class NotificationTemplateViewSet(ActionsViewSet):
 class AuthTokenViewSet(ActionsViewSet):
     serializer_class = serializers.AuthTokenSerializers
     lookup_field = "user_id"
-    filter_backends = []
     disabled_actions = ["create", "update", "partial_update"]
     permission_classes = (core_permissions.IsStaff,)
 
     def get_queryset(self):
-        query = (
-            'SELECT * FROM "authtoken_token" '
-            'INNER JOIN "core_user" ON ("authtoken_token"."user_id" = "core_user"."id") '
-            'WHERE (("authtoken_token"."created" >= '
-            'NOW() - INTERVAL \'1 SECOND\' * "core_user"."token_lifetime")'
-            ' OR "core_user"."token_lifetime" IS NULL)'
-        )
-        queryset = authtoken_models.Token.objects.raw(query)
-
-        def get(user_id):
-            try:
-                users = list(
-                    authtoken_models.Token.objects.raw(
-                        query + ' AND "authtoken_token"."user_id" = %s', [user_id]
-                    )
-                )
-            except DataError:
-                raise authtoken_models.Token.DoesNotExist()
-
-            if len(users):
-                return users[0]
-            else:
-                raise authtoken_models.Token.DoesNotExist()
-
-        queryset.get = get
-
-        return queryset
+        return get_active_tokens()

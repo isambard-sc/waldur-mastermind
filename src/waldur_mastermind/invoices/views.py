@@ -1,10 +1,11 @@
 import datetime
 import decimal
 import uuid
+from decimal import Decimal
 
 from dateutil.relativedelta import relativedelta
 from django.db import transaction
-from django.db.models import F, Sum
+from django.db.models import F, Q, QuerySet, Sum
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import exceptions, status
@@ -16,8 +17,10 @@ from waldur_core.core import views as core_views
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
+from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.permissions import IsStaffOrSupportUser
 from waldur_mastermind.common.utils import quantize_price
+from waldur_mastermind.invoices import compensations
 from waldur_mastermind.invoices.models import InvoiceItem
 
 from . import filters, log, models, serializers, tasks, utils
@@ -154,10 +157,8 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
 
     @action(detail=False)
     def growth(self, request):
-        if not self.request.user.is_staff and not request.user.is_support:
-            raise exceptions.PermissionDenied()
-
-        customers = structure_models.Customer.objects.all()
+        queryset = structure_models.Customer.objects.all()
+        customers = filter_queryset_for_user(queryset, request.user)
         customers = structure_filters.AccountingStartDateFilter().filter_queryset(
             request, customers, self
         )
@@ -197,9 +198,9 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
         field = is_accounting_mode and "total_price" or "total_cost"
         total_values = {
             f"{row['year']}-{row['month']}": row["total_value"]
-            for row in models.Invoice.objects.values("year", "month").annotate(
-                total_value=Sum(field)
-            )
+            for row in models.Invoice.objects.filter(customer__in=customers)
+            .values("year", "month")
+            .annotate(total_value=Sum(field))
         }
         other_values = {
             f"{row['year']}-{row['month']}": row["total_value"]
@@ -414,6 +415,97 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
         data = self._get_costs_data(invoices)
         return Response(data)
 
+    def _get_costs_for_periods_data(
+        self, invoices: QuerySet, period: int, month_start: datetime.date
+    ) -> dict[str, str]:
+        PERIOD_LENGTHS = {
+            models.PeriodMixin.Periods.MONTH_1: 1,
+            models.PeriodMixin.Periods.MONTH_3: 3,
+            models.PeriodMixin.Periods.MONTH_12: 12,
+        }
+        period_length = PERIOD_LENGTHS.get(period, 0)
+
+        query = Q()
+
+        for n in range(period_length):
+            previous_month_date = month_start - relativedelta(months=n)
+            query |= Q(
+                invoice__month=previous_month_date.month,
+                invoice__year=previous_month_date.year,
+            )
+
+        total_price: Decimal | None = (
+            invoices.filter(query).aggregate(
+                total_price=Sum(F("unit_price") * F("quantity"))
+            )["total_price"]
+            or 0
+        )
+
+        start_date = month_start - relativedelta(months=period_length)
+
+        return {
+            "total_price": f"{total_price:.2f}",
+            "start_date": start_date.strftime("%Y-%m-%d"),
+            "end_date": month_start.strftime("%Y-%m-%d"),
+        }
+
+    def _get_costs_for_entity(self, invoices, period, month_start):
+        if period == models.PeriodMixin.Periods.TOTAL:
+            total_price = (
+                invoices.aggregate(total_price=Sum(F("unit_price") * F("quantity")))[
+                    "total_price"
+                ]
+                or 0
+            )
+            return {
+                "total_price": f"{total_price:.2f}",
+                "start_date": "N/A",
+                "end_date": "N/A",
+            }
+
+        return self._get_costs_for_periods_data(invoices, period, month_start)
+
+    @action(detail=False, methods=["get"], filterset_class=filters.InvoiceItemFilter)
+    def project_costs_for_period(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.GET, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        project_uuid = serializer.validated_data["project_uuid"]
+        period = serializer.validated_data["period"]
+        month_start = datetime.date.today().replace(day=1)
+
+        invoices = (
+            InvoiceItem.objects.filter(project_uuid=project_uuid.hex)
+            .values("invoice__year", "invoice__month")
+            .annotate(price=Sum(F("unit_price") * F("quantity")))
+            .distinct()
+            .order_by("-invoice__year", "-invoice__month")
+        )
+
+        invoices = filter_queryset_for_user(invoices, request.user)
+
+        data = self._get_costs_for_entity(invoices, period, month_start)
+        return Response(data)
+
+    @action(detail=False, methods=["get"], filterset_class=filters.InvoiceItemFilter)
+    def customer_costs_for_period(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.GET, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        customer_uuid = serializer.validated_data["customer_uuid"]
+        period = serializer.validated_data["period"]
+        month_start = datetime.date.today().replace(day=1)
+
+        invoices = (
+            InvoiceItem.objects.filter(invoice__customer__uuid=customer_uuid.hex)
+            .values("invoice__year", "invoice__month")
+            .annotate(price=Sum(F("unit_price") * F("quantity")))
+            .values("invoice__year", "invoice__month", "price")
+            .order_by("-invoice__year", "-invoice__month")
+        )
+
+        invoices = filter_queryset_for_user(invoices, request.user)
+        data = self._get_costs_for_entity(invoices, period, month_start)
+        return Response(data)
+
     create_compensation_serializer_class = serializers.InvoiceItemCompensationSerializer
 
     update_serializer_class = serializers.InvoiceItemUpdateSerializer
@@ -421,6 +513,14 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
     partial_update_serializer_class = serializers.InvoiceItemUpdateSerializer
 
     migrate_to_serializer_class = serializers.InvoiceItemMigrateToSerializer
+
+    project_costs_for_period_serializer_class = (
+        serializers.InvoiceItemProjectCostsForPeriodSerializer
+    )
+
+    customer_costs_for_period_serializer_class = (
+        serializers.InvoiceItemCustomerCostsForPeriodSerializer
+    )
 
     create_compensation_permissions = update_permissions = (
         partial_update_permissions
@@ -596,13 +696,17 @@ class CustomerCreditViewSet(core_views.ActionsViewSet):
     @action(detail=True, methods=["post"])
     def apply_compensations(self, request, uuid=None):
         customer_credit = self.get_object()
-        utils.MonthlyCompensation(customer_credit.customer).apply_compensations()
+        compensations.MonthlyCompensation(
+            customer_credit.customer
+        ).apply_compensations()
 
     @transaction.atomic
     @action(detail=True, methods=["post"])
     def clear_compensations(self, request, uuid=None):
         customer_credit = self.get_object()
-        utils.MonthlyCompensation(customer_credit.customer).clear_compensations()
+        compensations.MonthlyCompensation(
+            customer_credit.customer
+        ).clear_compensations()
 
     apply_compensations_permissions = clear_compensations_permissions = [
         structure_permissions.is_staff

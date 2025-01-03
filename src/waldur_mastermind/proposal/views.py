@@ -170,6 +170,10 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             raise exceptions.ValidationError(
                 _("Call must have a round to be activated.")
             )
+        if call.reviewers.count() == 0:
+            raise exceptions.ValidationError(
+                _("Call must have reviewers to be activated.")
+            )
         call.state = models.Call.States.ACTIVE
         call.save()
         return response.Response(
@@ -322,11 +326,13 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         instance = self.get_object()
 
         documents = request.data.getlist("documents", [])
+        description = request.data.get("description", "")
 
         for file_data in documents:
             obj, created = models.CallDocument.objects.get_or_create(
                 call=instance,
                 file=file_data,
+                description=description,
             )
             if created:
                 instance.documents.add(obj)

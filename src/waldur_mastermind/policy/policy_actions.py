@@ -1,4 +1,5 @@
 import logging
+import re
 
 from django.db import transaction
 
@@ -135,7 +136,9 @@ def block_modification_of_existing_resources(policy, created):
 def request_downscaling(policy):
     project = structure_permissions._get_project(policy.scope)
 
-    resources = marketplace_models.Resource.objects.exclude(
+    resources = marketplace_models.Resource.objects.filter(
+        offering__plugin_options__supports_downscaling=True
+    ).exclude(
         state__in=(
             marketplace_models.Resource.States.TERMINATED,
             marketplace_models.Resource.States.TERMINATING,
@@ -165,7 +168,9 @@ def request_downscaling(policy):
 def reset_downscaling(policy):
     project = structure_permissions._get_project(policy.scope)
 
-    resources = marketplace_models.Resource.objects.exclude(
+    resources = marketplace_models.Resource.filter(
+        offering__plugin_options__supports_downscaling=True
+    ).objects.exclude(
         state__in=(
             marketplace_models.Resource.States.TERMINATED,
             marketplace_models.Resource.States.TERMINATING,
@@ -239,9 +244,9 @@ def reset_member_restriction(policy):
 def request_pausing(policy):
     project = structure_permissions._get_project(policy.scope)
 
-    resources = marketplace_models.Resource.objects.exclude(
-        state__in=(marketplace_models.Resource.States.TERMINATED,)
-    )
+    resources = marketplace_models.Resource.objects.filter(
+        offering__plugin_options__supports_pausing=True
+    ).exclude(state__in=(marketplace_models.Resource.States.TERMINATED,))
 
     if project:
         resources = resources.filter(project=project)
@@ -266,9 +271,9 @@ def request_pausing(policy):
 def reset_pausing(policy):
     project = structure_permissions._get_project(policy.scope)
 
-    resources = marketplace_models.Resource.objects.exclude(
-        state__in=(marketplace_models.Resource.States.TERMINATED,)
-    )
+    resources = marketplace_models.Resource.objects.filter(
+        offering__plugin_options__supports_pausing=True
+    ).exclude(state__in=(marketplace_models.Resource.States.TERMINATED,))
 
     if project:
         resources = resources.filter(project=project)
@@ -282,6 +287,37 @@ def reset_pausing(policy):
         policy.uuid.hex,
         ", ".join([r.name for r in resources]),
     )
+
+
+def notify_external_user(policy):
+    serialized_policy = core_utils.serialize_instance(policy)
+    tasks.notify_external_user.delay(serialized_policy)
+
+    logger.info(
+        "Policy action notify_external_user has been triggered. Policy UUID: %s.",
+        policy.uuid.hex,
+    )
+
+    log.event_logger.policy_action.info(
+        "Cost policy has been triggered and notification to external user has been scheduled.",
+        event_type="notify_external_user",
+        event_context={"policy_uuid": policy.uuid.hex},
+    )
+
+
+def notify_external_user_validator(input_value):
+    if not isinstance(input_value, str):
+        return False
+
+    email_regex = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+    emails = input_value.split(",")
+
+    for email in emails:
+        email = email.strip()
+        if email and not email_regex.match(email):
+            return False
+
+    return True
 
 
 POLICY_ACTIONS = {
@@ -324,5 +360,11 @@ POLICY_ACTIONS = {
         action_type=enums.PolicyActionTypes.IMMEDIATE,
         method=request_pausing,
         reset_method=reset_pausing,
+    ),
+    "notify_external_user": structures.PolicyAction(
+        action_type=enums.PolicyActionTypes.IMMEDIATE,
+        method=notify_external_user,
+        reset_method=None,
+        options_validator=notify_external_user_validator,
     ),
 }

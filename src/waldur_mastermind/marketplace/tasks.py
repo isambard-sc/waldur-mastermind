@@ -31,7 +31,7 @@ from waldur_mastermind.marketplace.utils import (
 )
 from waldur_mastermind.support.backend import get_active_backend
 
-from . import exceptions, models, utils
+from . import exceptions, models, plugins, utils
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +101,8 @@ def notify_provider_about_pending_order(order_uuid):
         return
 
     link = core_utils.format_homeport_link(
-        "providers/{organization_uuid}/orders/",
-        organization_uuid=order.offering.customer.uuid,
+        "marketplace-order-details/{order_uuid}/",
+        order_uuid=order.uuid,
     )
 
     context = {
@@ -526,9 +526,33 @@ def process_pending_project_orders():
             order.set_state_executing()
             order.save(update_fields=["state"])
             transaction.on_commit(
-                lambda: process_order_on_commit.delay(order, order.created_by)
+                lambda: process_order_on_commit(order, order.created_by)
             )
         else:
             transaction.on_commit(
                 lambda: notify_provider_about_pending_order.delay(order.uuid)
             )
+
+
+@shared_task(name="waldur_mastermind.marketplace.mark_resources_as_erred_after_timeout")
+def mark_resources_as_erred_after_timeout():
+    now = timezone.now()
+    two_hours_ago = now - datetime.timedelta(hours=2)
+    stale_orders = marketplace_models.Order.objects.filter(
+        offering__type__in=plugins.manager.list_interruptible_offerings(),
+        state=marketplace_models.Order.States.EXECUTING,
+        modified__lt=two_hours_ago,
+    )
+
+    for order in stale_orders:
+        order.fail()
+        order.error_message = "Execution has timed out."
+        order.save(update_fields=["state", "error_message"])
+        resource = order.resource
+        resource.set_state_erred()
+        resource.backend_metadata.update({"state": "Erred"})
+        resource.save(update_fields=["state", "backend_metadata"])
+        scope: structure_models.BaseResource = resource.scope
+        if scope:
+            scope.set_erred()
+            scope.save(update_fields=["state"])

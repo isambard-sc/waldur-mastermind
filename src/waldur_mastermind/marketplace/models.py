@@ -1,5 +1,4 @@
 from decimal import Decimal
-from functools import lru_cache
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
@@ -24,11 +23,12 @@ from waldur_core.core import validators as core_validators
 from waldur_core.logging.loggers import LoggableMixin
 from waldur_core.media.mixins import get_upload_path
 from waldur_core.media.validators import ImageValidator
+from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.utils import get_users
 from waldur_core.quotas import fields as quotas_fields
 from waldur_core.quotas import models as quotas_models
 from waldur_core.structure import models as structure_models
-from waldur_geo_ip.mixins import CoordinatesMixin
+from waldur_core.structure.mixins import CoordinatesMixin
 from waldur_mastermind.marketplace.exceptions import PolicyException
 from waldur_pid import mixins as pid_mixins
 
@@ -477,6 +477,9 @@ class Offering(
 
     billable = models.BooleanField(
         default=True, help_text=_("Purchase and usage is invoiced.")
+    )
+    support_per_user_consumption_limitation = models.BooleanField(
+        default=False, help_text=_("Set per user limits for resource components.")
     )
 
     objects = managers.OfferingManager()
@@ -1039,6 +1042,7 @@ class Resource(
     class Permissions:
         customer_path = "project__customer"
         project_path = "project"
+        list_permission = PermissionEnum.LIST_RESOURCES
 
     class Meta:
         ordering = ["created"]
@@ -1133,6 +1137,12 @@ class Resource(
     def get_url_name(cls):
         return "marketplace-resource"
 
+    def get_homeport_link(self):
+        return core_utils.format_homeport_link(
+            "resource-details/{resource_uuid}/",
+            resource_uuid=self.uuid.hex,
+        )
+
     @property
     def is_expired(self):
         return self.end_date and self.end_date <= timezone.datetime.today().date()
@@ -1146,7 +1156,6 @@ class Resource(
         return f"{self.uuid} ({self.offering.name})"
 
     @property
-    @lru_cache(maxsize=1)
     def creation_order(self):
         return Order.objects.filter(resource=self, type=Order.Types.CREATE).first()
 
@@ -1251,6 +1260,7 @@ class Order(
     class Permissions:
         customer_path = "project__customer"
         project_path = "project"
+        list_permission = PermissionEnum.LIST_ORDERS
 
     class Meta:
         verbose_name = _("Order")
@@ -1328,7 +1338,7 @@ class Order(
         )
 
     def __str__(self):
-        return f"type: {self.get_type_display()}, offering: {self.offering}, created_by: {self.created_by}"
+        return f"UUID: {self.uuid}, type: {self.get_type_display()}, offering: {self.offering}, created_by: {self.created_by}"
 
 
 class ComponentQuota(TimeStampedModel):
@@ -1421,6 +1431,27 @@ class ComponentUserUsage(
 
     class Meta:
         unique_together = ("username", "component_usage")
+
+
+class ComponentUserUsageLimit(
+    TimeStampedModel,
+    core_models.UuidMixin,
+    LoggableMixin,
+):
+    resource = models.ForeignKey(on_delete=models.CASCADE, to=Resource)
+    component = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=OfferingComponent,
+    )
+    user = models.ForeignKey(to="OfferingUser", on_delete=models.CASCADE, null=False)
+    limit = models.DecimalField(default=0, decimal_places=2, max_digits=20)
+
+    class Meta:
+        unique_together = ("resource", "component", "user")
+
+    class Permissions:
+        customer_path = "resource__project__customer"
+        project_path = "resource__project"
 
 
 class OfferingFile(

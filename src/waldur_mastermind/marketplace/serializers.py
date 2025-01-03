@@ -24,8 +24,8 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core.clean_html import clean_html
 from waldur_core.core.fields import NaturalChoiceField
+from waldur_core.core.mixins import GetValueMixin
 from waldur_core.core.models import User, get_ssh_key_fingerprints
-from waldur_core.core.serializers import GenericRelatedField
 from waldur_core.core.validators import validate_ssh_public_key
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.models import UserRole
@@ -45,14 +45,17 @@ from waldur_mastermind.common.utils import prices_are_equal
 from waldur_mastermind.invoices.models import InvoiceItem
 from waldur_mastermind.invoices.utils import get_billing_price_estimate_for_resources
 from waldur_mastermind.marketplace.fields import PublicPlanField
+from waldur_mastermind.marketplace.managers import ResourceQuerySet
 from waldur_mastermind.marketplace.plugins import manager
 from waldur_mastermind.marketplace.processors import CreateResourceProcessor
 from waldur_mastermind.marketplace.utils import (
+    UsernameGenerationPolicy,
     get_service_provider_resources,
     get_service_provider_user_ids,
     validate_attributes,
     validate_end_date,
 )
+from waldur_mastermind.marketplace_openstack import TENANT_TYPE
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_pid import models as pid_models
 
@@ -756,6 +759,17 @@ class OfferingComponentSerializer(serializers.ModelSerializer):
             attrs["max_value"] = 1
             attrs["limit_period"] = models.OfferingComponent.LimitPeriods.MONTH
             attrs["limit_amount"] = None
+        if self.instance and self.instance.offering.type == TENANT_TYPE:
+            protected_fields = set(attrs.keys()) & {
+                "type",
+                "name",
+                "measured_unit",
+                "billing_type",
+            }
+            if protected_fields:
+                raise serializers.ValidationError(
+                    "OpenStack offering components are not editable."
+                )
         return attrs
 
     def create(self, validated_data):
@@ -1056,7 +1070,8 @@ class ProviderOfferingDetailsSerializer(
     plans = BaseProviderPlanSerializer(many=True, required=False)
     screenshots = NestedScreenshotSerializer(many=True, read_only=True)
     state = serializers.ReadOnlyField(source="get_state_display")
-    scope = GenericRelatedField(read_only=True)
+    state_code = serializers.ReadOnlyField(source="state")
+    scope = core_serializers.GenericRelatedField(read_only=True)
     scope_uuid = serializers.ReadOnlyField(source="scope.uuid")
     scope_state = serializers.ReadOnlyField(source="scope.get_state_display")
     files = NestedOfferingFileSerializer(many=True, read_only=True)
@@ -1103,6 +1118,7 @@ class ProviderOfferingDetailsSerializer(
             "secret_options",
             "service_attributes",
             "state",
+            "state_code",
             "native_name",
             "native_description",
             "vendor_details",
@@ -1573,8 +1589,200 @@ class OfferingResourceOptionsUpdateSerializer(serializers.ModelSerializer):
         fields = ("resource_options",)
 
 
+class LifecyclePluginOptionsSerializer(serializers.Serializer):
+    auto_approve_remote_orders = serializers.BooleanField(
+        required=False,
+        help_text="If set to True, an order can be processed without approval",
+    )
+    max_resource_termination_offset_in_days = serializers.IntegerField(
+        required=False,
+        min_value=0,
+        help_text="Maximum resource termination offset in days",
+    )
+    default_resource_termination_offset_in_days = serializers.IntegerField(
+        required=False,
+        min_value=0,
+        help_text="If set, it will be used as a default resource termination offset in days",
+    )
+    is_resource_termination_date_required = serializers.BooleanField(
+        required=False,
+        help_text="If set to True, resource termination date is required",
+    )
+    latest_date_for_resource_termination = serializers.DateField(
+        required=False,
+        help_text="If set, it will be used as a latest date for resource termination",
+    )
+    auto_approve_in_service_provider_projects = serializers.BooleanField(
+        required=False,
+        help_text="Skip approval of public offering belonging to the same organization under which the request is done",
+    )
+
+
+class SupportPluginOptionsSerializer(serializers.Serializer):
+    enable_issues_for_membership_changes = serializers.BooleanField(
+        required=False,
+        help_text="Enable issues for membership changes",
+    )
+
+
+class OpenStackPluginOptionsSerializer(serializers.Serializer):
+    default_internal_network_mtu = serializers.IntegerField(
+        required=False,
+        min_value=68,
+        max_value=9000,
+        help_text="If set, it will be used as a default MTU for the first network in a tenant",
+    )
+    max_instances = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        help_text="Default limit for number of instances in OpenStack tenant",
+    )
+    max_volumes = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        help_text="Default limit for number of volumes in OpenStack tenant",
+    )
+    storage_mode = serializers.ChoiceField(
+        required=False,
+        choices=["fixed", "dynamic"],
+        help_text="Storage mode for OpenStack offering",
+    )
+    snapshot_size_limit_gb = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        help_text="Default limit for snapshot size in GB",
+    )
+
+
+class HeappePluginOptionsSerializer(serializers.Serializer):
+    heappe_cluster_id = serializers.CharField(
+        required=False, help_text="HEAppE cluster id"
+    )
+    heappe_local_base_path = serializers.CharField(
+        required=False, help_text="HEAppE local base path"
+    )
+    heappe_url = serializers.CharField(required=False, help_text="HEAppE url")
+    heappe_username = serializers.CharField(required=False, help_text="HEAppE username")
+    homedir_prefix = serializers.CharField(
+        required=False, help_text="GLAuth homedir prefix", default="/home/"
+    )
+
+
+class GLAuthPluginOptionsSerializer(serializers.Serializer):
+    initial_primarygroup_number = serializers.IntegerField(
+        required=False,
+        default=5000,
+        help_text="GLAuth initial primary group number",
+        min_value=0,
+    )
+    initial_uidnumber = serializers.IntegerField(
+        required=False, default=5000, help_text="GLAuth initial uidnumber", min_value=0
+    )
+    initial_usergroup_number = serializers.IntegerField(
+        required=False,
+        default=6000,
+        help_text="GLAuth initial usergroup number",
+        min_value=0,
+    )
+    username_anonymized_prefix = serializers.CharField(
+        required=False,
+        default="waldur_",
+        help_text="GLAuth prefix for anonymized usernames",
+    )
+    username_generation_policy = serializers.ChoiceField(
+        required=False,
+        choices=[option.value for option in UsernameGenerationPolicy],
+        help_text="GLAuth username generation policy",
+        default=UsernameGenerationPolicy.SERVICE_PROVIDER.value,
+    )
+
+
+class RancherPluginOptionsSerializer(serializers.Serializer):
+    flavors_regex = serializers.CharField(
+        required=False, help_text="Regular expression to limit flavors list"
+    )
+
+
+class MergedPluginOptionsSerializer(
+    LifecyclePluginOptionsSerializer,
+    OpenStackPluginOptionsSerializer,
+    HeappePluginOptionsSerializer,
+    GLAuthPluginOptionsSerializer,
+    SupportPluginOptionsSerializer,
+    RancherPluginOptionsSerializer,
+):
+    pass
+
+
+class HeappeSecretOptionsSerializer(serializers.Serializer):
+    heappe_cluster_password = serializers.CharField(
+        required=False, help_text="HEAppE cluster password"
+    )
+    heappe_password = serializers.CharField(required=False, help_text="HEAppE password")
+
+
+class IPMappingSerializer(serializers.Serializer):
+    floating_ip = serializers.CharField(help_text="Floating IP")
+    external_ip = serializers.CharField(help_text="External IP")
+
+
+class OpenstackSecretOptionsSerializer(serializers.Serializer):
+    ipv4_external_ip_mapping = IPMappingSerializer(
+        required=False,
+        help_text="OpenStack IPv4 external IP mapping",
+        many=True,
+    )
+
+
+class GLAuthSecretOptionsSerializer(serializers.Serializer):
+    shared_user_password = serializers.CharField(
+        required=False, help_text="GLAuth shared user password"
+    )
+
+
+class SupportSecretOptionsSerializer(serializers.Serializer):
+    template_confirmation_comment = serializers.CharField(
+        required=False, help_text="Template confirmation comment"
+    )
+
+
+class ScriptSecretOptionsSerializer(serializers.Serializer):
+    language = serializers.CharField(
+        required=False, help_text="Script language: Python or Bash"
+    )
+    environ = serializers.JSONField(
+        required=False, help_text="Script environment variables"
+    )
+
+
+class RemoteServiceSecretOptionsSerializer(serializers.Serializer):
+    api_url = serializers.CharField(required=False, help_text="API URL")
+    token = serializers.CharField(required=False, help_text="Waldur access token")
+    customer_uuid = serializers.CharField(required=False, help_text="Organization UUID")
+
+
+class GenericSecretOptionsSerializer(serializers.Serializer):
+    service_provider_can_create_offering_user = serializers.BooleanField(
+        required=False, help_text="Service provider can create offering user"
+    )
+
+
+class MergedSecretOptionsSerializer(
+    HeappeSecretOptionsSerializer,
+    OpenstackSecretOptionsSerializer,
+    GLAuthSecretOptionsSerializer,
+    SupportSecretOptionsSerializer,
+    ScriptSecretOptionsSerializer,
+    GenericSecretOptionsSerializer,
+    RemoteServiceSecretOptionsSerializer,
+):
+    pass
+
+
 class OfferingIntegrationUpdateSerializer(serializers.ModelSerializer):
     service_attributes = serializers.JSONField(required=False)
+    secret_options = MergedSecretOptionsSerializer(required=False)
+    plugin_options = MergedPluginOptionsSerializer(required=False)
 
     class Meta:
         model = models.Offering
@@ -1606,6 +1814,8 @@ class OfferingIntegrationUpdateSerializer(serializers.ModelSerializer):
         options_serializer = options_serializer_class(
             instance=instance.scope, data=service_attributes, context=self.context
         )
+        for field in options_serializer.fields.values():
+            field.required = False
         options_serializer.is_valid(raise_exception=True)
         instance.scope.backend_url = options_serializer.validated_data.get(
             "backend_url"
@@ -1648,6 +1858,7 @@ class OfferingPermissionSerializer(
         lookup_field="uuid",
     )
     offering_name = serializers.ReadOnlyField(source="scope.name")
+    offering_slug = serializers.ReadOnlyField(source="scope.slug")
     offering_uuid = serializers.ReadOnlyField(source="scope.uuid")
     role_name = serializers.ReadOnlyField(source="role.name")
 
@@ -1661,6 +1872,7 @@ class OfferingPermissionSerializer(
             "created_by",
             "offering",
             "offering_uuid",
+            "offering_slug",
             "offering_name",
             "role_name",
         ) + structure_serializers.BasePermissionSerializer.Meta.fields
@@ -2577,7 +2789,7 @@ class CategoryComponentUsageSerializer(
 ):
     category_title = serializers.ReadOnlyField(source="component.category.title")
     category_uuid = serializers.ReadOnlyField(source="component.category.uuid")
-    scope = GenericRelatedField(
+    scope = core_serializers.GenericRelatedField(
         related_models=(structure_models.Project, structure_models.Customer)
     )
 
@@ -2745,6 +2957,33 @@ class ComponentUserUsageCreateSerializer(serializers.ModelSerializer):
         lookup_field="uuid",
         required=False,
     )
+
+    def validate(self, attrs):
+        user = attrs.get("user")
+        component_usage = self.context["view"].get_object()
+        new_usage = attrs.get("usage", 0)
+
+        usage_limit = models.ComponentUserUsageLimit.objects.filter(
+            resource=component_usage.resource,
+            component=component_usage.component,
+            user=user,
+        ).first()
+
+        if usage_limit:
+            total_usage = (
+                models.ComponentUserUsage.objects.filter(
+                    user=user, component_usage=component_usage
+                ).aggregate(total=Sum("usage"))["total"]
+                or 0
+            )
+
+            if total_usage + new_usage > usage_limit.limit:
+                raise serializers.ValidationError(
+                    f"Usage limit exceeded. Maximum allowed: {usage_limit.limit}, "
+                    f"current usage: {total_usage}, additional: {new_usage}."
+                )
+
+        return attrs
 
     class Meta:
         model = models.ComponentUserUsage
@@ -2954,7 +3193,7 @@ class OfferingReferralSerializer(
     serializers.HyperlinkedModelSerializer,
     core_serializers.AugmentedSerializerMixin,
 ):
-    scope = GenericRelatedField(read_only=True)
+    scope = core_serializers.GenericRelatedField(read_only=True)
     scope_uuid = serializers.ReadOnlyField(source="scope.uuid")
 
     class Meta:
@@ -3098,7 +3337,7 @@ class OfferingUserRoleSerializer(serializers.HyperlinkedModelSerializer):
 
 
 class ResourceUserSerializer(serializers.HyperlinkedModelSerializer):
-    resource = FilterForUserField(
+    resource = serializers.HyperlinkedRelatedField(
         lookup_field="uuid",
         view_name="marketplace-resource-detail",
         queryset=models.Resource.objects.all(),
@@ -3133,6 +3372,13 @@ class ResourceUserSerializer(serializers.HyperlinkedModelSerializer):
                 "view_name": "marketplace-offering-user-role-detail",
             },
         )
+
+    def get_fields(self):
+        fields = super().get_fields()
+        user = self.context["request"].user
+        queryset: ResourceQuerySet = fields["resource"].queryset
+        fields["resource"].queryset = queryset.filter_for_service_consumer(user)
+        return fields
 
     def validate(self, attrs):
         if attrs["role"].offering != attrs["resource"].offering:
@@ -3394,6 +3640,14 @@ class CountStatsSerializer(serializers.Serializer):
         return self._get_value(record, "count")
 
 
+class OfferingStatsCounterSerializer(serializers.Serializer):
+    category_uuid = serializers.UUIDField()
+    category_title = serializers.CharField()
+    service_provider_name = serializers.CharField()
+    service_provider_uuid = serializers.UUIDField()
+    count = serializers.IntegerField()
+
+
 class CustomerStatsSerializer(CountStatsSerializer):
     abbreviation = serializers.SerializerMethodField()
 
@@ -3432,7 +3686,9 @@ class OfferingStatsSerializer(serializers.Serializer):
     country = serializers.CharField(source="offering__country")
 
 
-class ProviderCustomerProjectSerializer(serializers.ModelSerializer):
+class ProviderCustomerProjectSerializer(
+    core_serializers.RestrictedSerializerMixin, serializers.ModelSerializer
+):
     class Meta:
         model = structure_models.Project
         fields = (
@@ -3527,7 +3783,9 @@ class ProjectUserSerializer(serializers.ModelSerializer):
         return super().to_representation(user)
 
 
-class DetailedProviderUserSerializer(serializers.ModelSerializer):
+class DetailedProviderUserSerializer(
+    core_serializers.RestrictedSerializerMixin, serializers.ModelSerializer
+):
     class Meta:
         model = User
         fields = (
@@ -3570,10 +3828,25 @@ class DetailedProviderUserSerializer(serializers.ModelSerializer):
         return fields
 
 
-class ProviderCustomerSerializer(serializers.ModelSerializer):
+class ProviderOfferingCustomerSerializer(
+    core_serializers.RestrictedSerializerMixin, serializers.ModelSerializer
+):
     class Meta:
         model = structure_models.Customer
         fields = (
+            "uuid",
+            "name",
+            "slug",
+            "abbreviation",
+            "phone_number",
+            "email",
+        )
+
+
+class ProviderCustomerSerializer(ProviderOfferingCustomerSerializer):
+    class Meta:
+        model = structure_models.Customer
+        fields = ProviderOfferingCustomerSerializer.Meta.fields + (
             "uuid",
             "name",
             "slug",
@@ -3639,12 +3912,17 @@ class ProviderCustomerSerializer(serializers.ModelSerializer):
 
 
 class ProviderOfferingSerializer(
-    core_serializers.SlugSerializerMixin, serializers.ModelSerializer
+    core_serializers.SlugSerializerMixin,
+    core_serializers.RestrictedSerializerMixin,
+    serializers.ModelSerializer,
 ):
+    customer_uuid = serializers.ReadOnlyField(source="customer.uuid")
+
     class Meta:
         model = models.Offering
         fields = (
             "uuid",
+            "customer_uuid",
             "name",
             "slug",
             "category_title",
@@ -3894,6 +4172,71 @@ class IntegrationStatusDetailsSerializer(
                 "view_name": "marketplace-provider-offering-detail",
             },
         }
+
+
+class ComponentUserUsageLimitSerializer(
+    serializers.HyperlinkedModelSerializer, GetValueMixin
+):
+    component = serializers.SlugRelatedField(
+        queryset=models.OfferingComponent.objects.all(),
+        slug_field="uuid",
+    )
+    component_type = serializers.ReadOnlyField(source="component.type")
+
+    class Meta:
+        model = models.ComponentUserUsageLimit
+        fields = (
+            "url",
+            "uuid",
+            "resource",
+            "component",
+            "component_type",
+            "user",
+            "limit",
+        )
+
+        protected_fields = ("resource",)
+
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "component-user-usage-limit-detail",
+            },
+            "resource": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-resource-detail",
+            },
+            "user": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-offering-user-detail",
+            },
+        }
+
+    def validate_limit(self, limit):
+        if limit < 0:
+            raise serializers.ValidationError("Limit must be a positive number.")
+        return limit
+
+    def validate(self, attrs):
+        component = self.get_from_attrs_or_instance(attrs, "component")
+        resource = self.get_from_attrs_or_instance(attrs, "resource")
+
+        if not self.instance:
+            if not has_permission(
+                self.context["request"],
+                PermissionEnum.RESOURCE_CONSUMPTION_LIMITATION,
+                resource.project,
+            ) and not has_permission(
+                self.context["request"],
+                PermissionEnum.RESOURCE_CONSUMPTION_LIMITATION,
+                resource.project.customer,
+            ):
+                raise PermissionDenied()
+
+        if not resource.offering.components.filter(uuid=component.uuid).exists():
+            serializers.ValidationError("Component is wrong.")
+
+        return attrs
 
 
 def get_integration_status(serializer, offering):

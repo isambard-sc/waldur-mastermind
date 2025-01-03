@@ -164,6 +164,9 @@ class ActionsTest(test.APITransactionTestCase):
         self.policy.save()
 
         resource = self.fixture.resource
+        offering = resource.offering
+        offering.plugin_options.update({"supports_downscaling": True})
+        offering.save()
 
         self.create_invoice_item(self.policy.limit_cost + 1)
 
@@ -178,6 +181,9 @@ class ActionsTest(test.APITransactionTestCase):
         self.policy.save()
 
         resource = self.fixture.resource
+        offering = resource.offering
+        offering.plugin_options.update({"supports_pausing": True})
+        offering.save()
 
         self.create_invoice_item(self.policy.limit_cost + 1)
 
@@ -202,3 +208,20 @@ class ActionsTest(test.APITransactionTestCase):
         self.policy.refresh_from_db()
         self.assertTrue(self.policy.has_fired)
         self.assertTrue(resource.restrict_member_access)
+
+    @mock.patch("waldur_core.core.utils.send_mail")
+    def test_notify_external_user(self, mock_send_mail):
+        external_user_email = "external_user@domen.com"
+        self.policy.actions = "notify_external_user"
+        self.policy.options = {"notify_external_user": external_user_email}
+        self.policy.save()
+
+        serialized_policy = core_utils.serialize_instance(self.policy)
+        tasks.notify_external_user(serialized_policy)
+
+        mock_send_mail.assert_called_once()
+        self.assertEqual(mock_send_mail.call_args.kwargs["to"][0], external_user_email)
+
+        self.assertTrue(
+            logging_models.Event.objects.filter(event_type="policy_notification")
+        )

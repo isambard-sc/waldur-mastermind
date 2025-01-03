@@ -3,10 +3,12 @@ import logging
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 from django.utils.translation import gettext_lazy as _
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
+from rest_framework.viewsets import ReadOnlyModelViewSet
 
 from waldur_core.core.permissions import IsAdminOrReadOnly
 from waldur_core.core.utils import is_uuid_like
@@ -52,6 +54,14 @@ class RoleViewSet(ActionsViewSet):
         serializer.is_valid(raise_exception=True)
         role = serializer.save()
         serializer = serializers.RoleDetailsSerializer(instance=role)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["PUT"])
+    def update_descriptions(self, request, uuid=None):
+        instance = self.get_object()
+        serializer = serializers.RoleDescriptionSerializer(instance, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"])
@@ -176,3 +186,17 @@ class UserRoleMixin:
             request.user,
         )
         return Response(status=status.HTTP_200_OK)
+
+
+class UserPermissionViewSet(ReadOnlyModelViewSet):
+    queryset = models.UserRole.objects.all()
+    serializer_class = serializers.PermissionSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.UserPermissionFilter
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.request.user.is_staff or self.request.user.is_support:
+            return qs
+        return qs.filter(user=self.request.user).distinct()

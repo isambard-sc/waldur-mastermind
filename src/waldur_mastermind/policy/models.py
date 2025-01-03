@@ -7,7 +7,6 @@ from django.core import exceptions
 from django.db import models
 from django.db.models import Q, Sum
 from django.utils.translation import gettext_lazy as _
-from django_fsm import FSMIntegerField
 from model_utils.models import TimeStampedModel
 
 from waldur_core.core import models as core_models
@@ -15,10 +14,10 @@ from waldur_core.core import utils as core_utils
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.invoices import (
-    models as invoices_models,
+    compensations as invoices_compensation,
 )
 from waldur_mastermind.invoices import (
-    utils as invoices_utils,
+    models as invoices_models,
 )
 from waldur_mastermind.marketplace import models as marketplace_models
 
@@ -43,6 +42,11 @@ class Policy(
         related_name="+",
         blank=True,
         null=True,
+    )
+    options = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_("Fields for saving actions extra data. Keys are name of actions."),
     )
     actions = NotImplemented
     scope = NotImplemented
@@ -87,27 +91,7 @@ class Policy(
         abstract = True
 
 
-class PeriodMixin(models.Model):
-    class Periods:
-        TOTAL = 1
-        MONTH_1 = 2
-        MONTH_3 = 3
-        MONTH_12 = 4
-
-        CHOICES = (
-            (TOTAL, "Total"),
-            (MONTH_1, "1 month"),
-            (MONTH_3, "3 month"),
-            (MONTH_12, "12 month"),
-        )
-
-    period = FSMIntegerField(default=Periods.MONTH_1, choices=Periods.CHOICES)
-
-    class Meta:
-        abstract = True
-
-
-class EstimatedCostPolicyMixin(PeriodMixin):
+class EstimatedCostPolicyMixin(invoices_models.PeriodMixin):
     trigger_class = invoices_models.InvoiceItem
 
     limit_cost = models.IntegerField()
@@ -156,6 +140,7 @@ class ProjectPolicy(Policy):
     available_actions: set[str] = {
         "notify_project_team",
         "notify_organization_owners",
+        "notify_external_user",
         "block_creation_of_new_resources",
         "block_modification_of_existing_resources",
         "terminate_resources",
@@ -184,7 +169,7 @@ class ProjectEstimatedCostPolicy(EstimatedCostPolicyMixin, ProjectPolicy):
     def is_triggered(self):
         project = self.scope
         invoice_items = invoices_models.InvoiceItem.objects.filter(project=project)
-        compensation = invoices_utils.MonthlyCompensation(project.customer)
+        compensation = invoices_compensation.MonthlyCompensation(project.customer)
         return self._is_triggered(
             invoice_items, compensation.get_project_compensation(project)
         )
@@ -199,6 +184,7 @@ class CustomerPolicy(Policy):
 
     available_actions: set[str] = {
         "notify_organization_owners",
+        "notify_external_user",
         "block_creation_of_new_resources",
         "block_modification_of_existing_resources",
         "terminate_resources",
@@ -229,7 +215,7 @@ class CustomerEstimatedCostPolicy(EstimatedCostPolicyMixin, CustomerPolicy):
         invoice_items = invoices_models.InvoiceItem.objects.filter(
             invoice__customer=customer
         )
-        compensation = invoices_utils.MonthlyCompensation(customer)
+        compensation = invoices_compensation.MonthlyCompensation(customer)
 
         return self._is_triggered(invoice_items, compensation.total_compensation)
 
@@ -243,6 +229,7 @@ class OfferingPolicy(Policy):
 
     available_actions: set[str] = {
         "notify_organization_owners",
+        "notify_external_user",
         "block_creation_of_new_resources",
     }
     observable_classes = []
@@ -281,7 +268,7 @@ class OfferingEstimatedCostPolicy(EstimatedCostPolicyMixin, OfferingPolicy):
         verbose_name_plural = "Offering estimated cost policies"
 
 
-class OfferingUsagePolicy(PeriodMixin, OfferingPolicy):
+class OfferingUsagePolicy(invoices_models.PeriodMixin, OfferingPolicy):
     trigger_class = marketplace_models.ComponentUsage
 
     component_limit = models.ManyToManyField(

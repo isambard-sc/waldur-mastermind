@@ -73,7 +73,9 @@ from waldur_core.structure.executors import ServiceSettingsPullExecutor
 from waldur_core.structure.managers import (
     filter_queryset_for_user,
     get_connected_customers,
+    get_connected_customers_by_permission,
     get_connected_projects,
+    get_connected_projects_by_permission,
     get_organization_groups,
     get_project_users,
     get_visible_users,
@@ -87,7 +89,10 @@ from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices import serializers as invoice_serializers
 from waldur_mastermind.marketplace import PLUGIN_NAME as BASIC_PLUGIN_NAME
 from waldur_mastermind.marketplace import callbacks
-from waldur_mastermind.marketplace.managers import filter_offering_permissions
+from waldur_mastermind.marketplace.managers import (
+    ResourceQuerySet,
+    filter_offering_permissions,
+)
 from waldur_mastermind.marketplace.utils import (
     validate_attributes,
 )
@@ -142,11 +147,6 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
     queryset = models.ServiceProvider.objects.all().order_by("customer__name")
     serializer_class = serializers.ServiceProviderSerializer
     filterset_class = filters.ServiceProviderFilter
-    api_secret_code_permissions = projects_permissions = (
-        project_permissions_permissions
-    ) = keys_permissions = users_permissions = set_offerings_username_permissions = [
-        structure_permissions.is_owner
-    ]
 
     @action(detail=True, methods=["GET", "POST"])
     def api_secret_code(self, request, uuid=None):
@@ -155,11 +155,23 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
         """
         service_provider = self.get_object()
         if request.method == "GET":
+            if not has_permission(
+                request,
+                PermissionEnum.GET_SERVICE_PROVIDER_API_SECRET_CODE,
+                service_provider.customer,
+            ):
+                raise PermissionDenied()
             return Response(
                 {"api_secret_code": service_provider.api_secret_code},
                 status=status.HTTP_200_OK,
             )
         else:
+            if not has_permission(
+                request,
+                PermissionEnum.GENERATE_SERVICE_PROVIDER_API_SECRET_CODE,
+                service_provider.customer,
+            ):
+                raise PermissionDenied()
             service_provider.generate_api_secret_code()
             service_provider.save()
             return Response(
@@ -178,6 +190,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
         service_provider = self.get_object()
         return utils.get_service_provider_user_ids(self.request.user, service_provider)
 
+    customers_permissions = [
+        permission_factory(
+            PermissionEnum.LIST_SERVICE_PROVIDER_CUSTOMERS,
+            ["customer"],
+        )
+    ]
+
     @action(detail=True, methods=["GET"])
     def customers(self, request, uuid=None):
         service_provider = self.get_object()
@@ -193,6 +212,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
             },
         )
         return self.get_paginated_response(serializer.data)
+
+    customer_projects_permissions = [
+        permission_factory(
+            PermissionEnum.LIST_SERVICE_PROVIDER_CUSTOMER_PROJECTS,
+            ["customer"],
+        )
+    ]
 
     @action(detail=True, methods=["GET"])
     def customer_projects(self, request, uuid=None):
@@ -214,6 +240,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
         )
         return self.get_paginated_response(serializer.data)
 
+    projects_permissions = [
+        permission_factory(
+            PermissionEnum.LIST_SERVICE_PROVIDER_PROJECTS,
+            ["customer"],
+        )
+    ]
+
     @action(detail=True, methods=["GET"])
     def projects(self, request, uuid=None):
         project_ids = self.get_customer_project_ids()
@@ -223,6 +256,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
             page, many=True, context=self.get_serializer_context()
         )
         return self.get_paginated_response(serializer.data)
+
+    project_permissions_permissions = [
+        permission_factory(
+            PermissionEnum.LIST_SERVICE_PROVIDER_PROJECT_PERMISSIONS,
+            ["customer"],
+        )
+    ]
 
     @action(detail=True, methods=["GET"])
     def project_permissions(self, request, uuid=None):
@@ -240,6 +280,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
         )
         return self.get_paginated_response(serializer.data)
 
+    keys_permissions = [
+        permission_factory(
+            PermissionEnum.LIST_SERVICE_PROVIDER_KEYS,
+            ["customer"],
+        )
+    ]
+
     @action(detail=True, methods=["GET"])
     def keys(self, request, uuid=None):
         user_ids = self.get_customer_user_ids()
@@ -249,6 +296,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
             page, many=True, context=self.get_serializer_context()
         )
         return self.get_paginated_response(serializer.data)
+
+    users_permissions = [
+        permission_factory(
+            PermissionEnum.LIST_SERVICE_PROVIDER_USERS,
+            ["customer"],
+        )
+    ]
 
     @action(detail=True, methods=["GET"])
     def users(self, request, uuid=None):
@@ -263,6 +317,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
             page, many=True, context=context
         )
         return self.get_paginated_response(serializer.data)
+
+    user_customers_permissions = [
+        permission_factory(
+            PermissionEnum.LIST_SERVICE_PROVIDER_USER_CUSTOMERS,
+            ["customer"],
+        )
+    ]
 
     @action(detail=True, methods=["GET"])
     def user_customers(self, request, uuid=None):
@@ -310,6 +371,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
             )
 
     destroy_permissions = [structure_permissions.is_owner, check_related_resources]
+
+    set_offerings_username_permissions = [
+        permission_factory(
+            PermissionEnum.SET_SERVICE_PROVIDER_OFFERINGS_USERNAME,
+            ["customer"],
+        )
+    ]
 
     @action(detail=True, methods=["POST"])
     def set_offerings_username(self, request, uuid=None):
@@ -364,6 +432,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
             page, many=True, context=self.get_serializer_context()
         )
         return self.get_paginated_response(serializer.data)
+
+    stat_permissions = [
+        permission_factory(
+            PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
+            ["customer"],
+        )
+    ]
 
     @action(detail=True, methods=["GET"])
     def stat(self, request, uuid=None):
@@ -442,6 +517,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
             status=status.HTTP_200_OK,
         )
 
+    revenue_permissions = [
+        permission_factory(
+            PermissionEnum.GET_SERVICE_PROVIDER_REVENUE,
+            ["customer"],
+        )
+    ]
+
     @action(detail=True, methods=["GET"])
     def revenue(self, request, uuid=None):
         start = month_start(timezone.datetime.today()) - relativedelta(years=1)
@@ -463,6 +545,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
             status=status.HTTP_200_OK,
         )
 
+    robot_account_customers_permissions = [
+        permission_factory(
+            PermissionEnum.GET_SERVICE_PROVIDER_ROBOT_ACCOUNT_CUSTOMERS,
+            ["customer"],
+        )
+    ]
+
     @action(detail=True, methods=["GET"])
     def robot_account_customers(self, request, uuid=None):
         service_provider = self.get_object()
@@ -479,6 +568,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
         page = self.paginate_queryset(customers)
         data = [{"name": row.name, "uuid": row.uuid} for row in page]
         return self.get_paginated_response(data)
+
+    robot_account_projects_permissions = [
+        permission_factory(
+            PermissionEnum.GET_SERVICE_PROVIDER_ROBOT_ACCOUNT_PROJECTS,
+            ["customer"],
+        )
+    ]
 
     @action(detail=True, methods=["GET"])
     def robot_account_projects(self, request, uuid=None):
@@ -555,6 +651,13 @@ def validate_offering_update(offering):
     if offering.state == models.Offering.States.ARCHIVED:
         raise rf_exceptions.ValidationError(
             _("It is not possible to update archived offering.")
+        )
+
+
+def validate_offering_has_plans(offering):
+    if not models.offering_has_plans(offering):
+        raise rf_exceptions.ValidationError(
+            _("Offering does not have any billing plans.")
         )
 
 
@@ -791,6 +894,9 @@ class ProviderOfferingViewSet(
     activate_validators = pause_validators = archive_validators = destroy_validators = [
         structure_utils.check_customer_blocked_or_archived
     ]
+
+    activate_validators += [validate_offering_has_plans]
+    unpause_validators = [validate_offering_has_plans]
 
     update_permissions = [can_update_offering]
 
@@ -1037,7 +1143,7 @@ class ProviderOfferingViewSet(
         offering = self.get_object()
         active_customers = utils.get_active_customers(request, self)
         customer_queryset = utils.get_offering_customers(offering, active_customers)
-        serializer_class = structure_serializers.CustomerSerializer
+        serializer_class = serializers.ProviderOfferingCustomerSerializer
         serializer = serializer_class(
             instance=customer_queryset, many=True, context=self.get_serializer_context()
         )
@@ -1919,8 +2025,12 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         if user.is_staff or user.is_support:
             return self.queryset
 
-        connected_projects = get_connected_projects(user)
-        connected_customers = get_connected_customers(user)
+        connected_projects = get_connected_projects_by_permission(
+            user, PermissionEnum.LIST_ORDERS
+        )
+        connected_customers = get_connected_customers_by_permission(
+            user, PermissionEnum.LIST_ORDERS
+        )
 
         return self.queryset.filter(
             Q(project__in=connected_projects)
@@ -2165,7 +2275,7 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
 
 
 class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
-    queryset = models.Resource.objects.all()
+    queryset: ResourceQuerySet = models.Resource.objects.all()
     filter_backends = (DjangoFilterBackend, filters.ResourceScopeFilterBackend)
     filterset_class = filters.ResourceFilter
     lookup_field = "uuid"
@@ -2440,9 +2550,9 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
         )
 
 
-class ResourceViewSet(BaseResourceViewSet):
+class ConsumerResourceViewSet(BaseResourceViewSet):
     def get_queryset(self):
-        return self.queryset.filter_for_user(self.request.user)
+        return self.queryset.filter_for_service_consumer(self.request.user)
 
     @action(detail=False, methods=["post"])
     def suggest_name(self, request, *args, **kwargs):
@@ -2546,7 +2656,7 @@ class ResourceViewSet(BaseResourceViewSet):
 
 class ProviderResourceViewSet(BaseResourceViewSet):
     def get_queryset(self):
-        return self.queryset.filter_for_offering_customer(self.request.user)
+        return self.queryset.filter_for_service_provider(self.request.user)
 
     @action(detail=True, methods=["post"])
     def set_end_date_by_provider(self, request, uuid=None):
@@ -2700,9 +2810,9 @@ class ResourceOfferingsViewSet(ListAPIView):
     def get_queryset(self):
         user = self.request.user
         category = self.get_category()
+        qs: ResourceQuerySet = models.Resource.objects.all()
         offerings = (
-            models.Resource.objects.all()
-            .filter_for_user(user)
+            qs.filter_for_service_consumer(user)
             .filter(offering__category=category)
             .exclude(state=models.Resource.States.TERMINATED)
             .values_list("offering_id", flat=True)
@@ -2757,9 +2867,9 @@ class RelatedCustomersViewSet(ListAPIView):
 
     def get_queryset(self):
         customer = self.get_customer()
+        qs: ResourceQuerySet = models.Resource.objects.all()
         customer_ids = (
-            models.Resource.objects.all()
-            .filter_for_offering_customer(self.request.user)
+            qs.filter_for_service_provider(self.request.user)
             .filter(offering__customer=customer)
             .values_list("project__customer_id", flat=True)
             .distinct()
@@ -3054,6 +3164,45 @@ class StatsViewSet(rf_viewsets.ViewSet):
         ).annotate(count=Count("customer__uuid"))
         serializer = serializers.CustomerStatsSerializer(data, many=True)
         return Response(status=status.HTTP_200_OK, data=serializer.data)
+
+    @action(detail=False, methods=["get"])
+    def offerings_counter_stats(self, request):
+        excluded_states = (
+            models.Offering.States.ARCHIVED,
+            models.Offering.States.DRAFT,
+        )
+        try:
+            offerings_stats = (
+                models.Offering.objects.select_related("category", "customer")
+                .exclude(state__in=excluded_states)
+                .values(
+                    category_uuid=F("category__uuid"),
+                    category_title=F("category__title"),
+                    service_provider_name=F("customer__name"),
+                    service_provider_uuid=F("customer__uuid"),
+                )
+                .annotate(count=Count("uuid", distinct=True))
+            )
+
+            serialized_data = serializers.OfferingStatsCounterSerializer(
+                offerings_stats, many=True
+            ).data
+
+            return Response(
+                serialized_data,
+                status=status.HTTP_200_OK,
+            )
+        except models.Offering.DoesNotExist as e:
+            logger.error(f"Offerings not found: {str(e)}")
+            return Response(
+                {"error": "Offerings not found"}, status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error fetching offering stats: {str(e)}")
+            return Response(
+                {"error": "An unexpected error occurred"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     @action(detail=False, methods=["get"])
     def organization_resource_count(self, request, *args, **kwargs):
@@ -3708,10 +3857,10 @@ class GlobalCategoriesViewSet(views.APIView):
 
     def get(self, request):
         # We need to reset ordering to avoid extra GROUP BY created field.
+        qs: ResourceQuerySet = models.Resource.objects.all()
         resources = (
-            models.Resource.objects.all()
-            .order_by()
-            .filter_for_user(request.user)
+            qs.order_by()
+            .filter_for_service_consumer(request.user)
             .exclude(state=models.Resource.States.TERMINATED)
         )
 
@@ -3753,3 +3902,17 @@ class IntegrationStatusViewSet(core_views.ReadOnlyActionsViewSet):
             )
         ]
         return qs.filter(offering__in=offerings)
+
+
+class ComponentUserUsageLimitViewSet(core_views.ActionsViewSet):
+    lookup_field = "uuid"
+    queryset = models.ComponentUserUsageLimit.objects.all().order_by("-created")
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    serializer_class = serializers.ComponentUserUsageLimitSerializer
+
+    destroy_permissions = update_permissions = partial_update_permissions = [
+        permission_factory(
+            PermissionEnum.RESOURCE_CONSUMPTION_LIMITATION,
+            ["resource.project.customer", "resource.project"],
+        )
+    ]

@@ -42,7 +42,7 @@ from waldur_mastermind.marketplace_remote.utils import (
     sync_project_permission,
 )
 
-from . import PLUGIN_NAME, utils
+from . import PLUGIN_NAME, utils, utils_sync_remote_offerings
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +253,9 @@ class OfferingListPullTask(BackgroundListPullTask):
     pull_task = OfferingPullTask
 
     def get_pulled_objects(self):
-        return models.Offering.objects.filter(type=PLUGIN_NAME)
+        return models.Offering.objects.filter(
+            type=PLUGIN_NAME, secret_options__has_keys=["api_url", "token"]
+        )
 
 
 class OfferingUserPullTask(BackgroundPullTask):
@@ -319,7 +321,9 @@ class OfferingUserListPullTask(BackgroundListPullTask):
     pull_task = OfferingUserPullTask
 
     def get_pulled_objects(self):
-        return models.Offering.objects.filter(type=PLUGIN_NAME)
+        return models.Offering.objects.filter(
+            type=PLUGIN_NAME, secret_options__has_keys=["api_url", "token"]
+        )
 
 
 class ResourcePullTask(BackgroundPullTask):
@@ -1158,3 +1162,11 @@ class RemoteProjectDataListPushTask(BackgroundListPullTask):
 class RemoteResourcePermissionsPushTask(BackgroundPullTask):
     def pull(self, instance: models.Offering):
         pass
+
+
+@shared_task(name="waldur_mastermind.marketplace_remote.remote_offerings_sync")
+def remote_offerings_sync() -> None:
+    for sync in remote_models.RemoteSynchronisation.objects.filter(
+        is_active=True,
+    ).exclude(state=remote_models.RemoteSynchronisation.States.PROCESSING):
+        utils_sync_remote_offerings.RemoteSynchronisationRunner(sync).run()

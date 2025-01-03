@@ -70,6 +70,7 @@ class UsernameGenerationPolicy(Enum):
     FULL_NAME = "full_name"  # Usernames are constructed using first and last name of users with numerical suffix, e.g. "john_doe_01"
     WALDUR_USERNAME = "waldur_username"  # Using username field of User model
     FREEIPA = "freeipa"  # Using username field of waldur_freeipa.Profile model
+    IDENTITY_CLAIM = "identity_claim"  # Using username from external IDP system
 
 
 def get_order_processor(order):
@@ -197,9 +198,9 @@ def get_service_provider_info(source):
 
         return {
             "service_provider_name": customer.name,
-            "service_provider_uuid": ""
-            if not service_provider
-            else service_provider.uuid.hex,
+            "service_provider_uuid": (
+                "" if not service_provider else service_provider.uuid.hex
+            ),
         }
     except models.Resource.DoesNotExist:
         return {}
@@ -785,17 +786,19 @@ def serialize_resource_limit_period(period):
 def terminate_resource(resource, user, termination_comment=None, scheduled=False):
     from waldur_mastermind.marketplace import views
 
-    view = views.ResourceViewSet.as_view({"post": "terminate"})
+    view = views.ConsumerResourceViewSet.as_view({"post": "terminate"})
 
     # Terminate pending orders if they exist
     for order in models.Order.objects.filter(
         resource=resource,
-        state__in=[models.Order.States.PENDING_CONSUMER]
-        if scheduled
-        else [
-            models.Order.States.PENDING_CONSUMER,
-            models.Order.States.PENDING_PROVIDER,
-        ],
+        state__in=(
+            [models.Order.States.PENDING_CONSUMER]
+            if scheduled
+            else [
+                models.Order.States.PENDING_CONSUMER,
+                models.Order.States.PENDING_PROVIDER,
+            ]
+        ),
     ):
         order.cancel(termination_comment)
         order.save()
@@ -1121,6 +1124,13 @@ def generate_glauth_records_for_offering_users(offering, offering_users):
     for offering_user in offering_users:
         user = offering_user.user
         username = offering_user.username
+        if "uidnumber" not in offering_user.backend_metadata:
+            logger.warning(
+                "OfferingUser %s does not have uidnumber in backend_metadata, skipping generation of glauth record",
+                offering_user,
+            )
+            continue
+
         uidnumber = offering_user.backend_metadata["uidnumber"]
         primarygroup = offering_user.backend_metadata["primarygroup"]
         login_shell = offering_user.backend_metadata["loginShell"]
@@ -1285,6 +1295,9 @@ def generate_username(user, offering):
 
     if username_generation_policy == UsernameGenerationPolicy.FREEIPA.value:
         return create_username_from_freeipa_profile(user)
+
+    if username_generation_policy == UsernameGenerationPolicy.IDENTITY_CLAIM.value:
+        return user.details.get("site_username", "")
 
     return ""
 

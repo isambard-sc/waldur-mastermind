@@ -6,6 +6,7 @@ from itertools import product
 
 import pkg_resources
 from ddt import data, ddt, idata
+from django.core.exceptions import ObjectDoesNotExist
 from rest_framework import exceptions as rest_exceptions
 from rest_framework import status, test
 
@@ -1253,6 +1254,19 @@ class OfferingPartialUpdateTest(test.APITransactionTestCase):
         self.offering.refresh_from_db()
         self.assertEqual(self.offering.backend_id, "new_backend_id")
 
+    def test_update_openstack_tenant_password(self):
+        self.offering.type = "OpenStack.Tenant"
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(self.offering, "update_integration")
+        response = self.client.post(
+            url, {"service_attributes": {"password": "new_password"}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.scope.password, "new_password")
+
     @data("staff", "owner")
     def test_update_location(self, user):
         url = factories.OfferingFactory.get_url(self.offering, "update_location")
@@ -1386,6 +1400,7 @@ class OfferingDeleteTest(test.APITransactionTestCase):
             shared=True,
             state=models.Offering.States.DRAFT,
         )
+        factories.PlanFactory(offering=self.offering)
         CustomerRole.OWNER.add_permission(PermissionEnum.DELETE_OFFERING)
 
     @data("staff", "owner")
@@ -1435,6 +1450,20 @@ class OfferingDeleteTest(test.APITransactionTestCase):
         url = factories.OfferingFactory.get_url(self.offering)
         response = self.client.delete(url)
         return response
+
+    def test_when_offering_is_deleted_related_service_setting_is_deleted(self):
+        # Arrange
+        self.service_settings = structure_factories.ServiceSettingsFactory(
+            customer=self.customer
+        )
+        self.offering.scope = self.service_settings
+        self.offering.save()
+
+        # Act
+        self.delete_offering("owner")
+
+        # Assert
+        self.assertRaises(ObjectDoesNotExist, self.service_settings.refresh_from_db)
 
 
 @ddt
@@ -1579,6 +1608,14 @@ class OfferingStateTest(test.APITransactionTestCase):
         response, offering = self.update_offering_state(user, "activate")
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(offering.state, models.Offering.States.ACTIVE)
+
+    def test_validate_offering_has_plans(self):
+        self.offering.plans.all().delete()
+        response, offering = self.update_offering_state("staff", "activate")
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+        self.assertTrue("Offering does not have any billing plans." in response.data)
 
     @data("owner", "user", "customer_support", "admin", "manager", "service_manager")
     def test_unauthorized_user_can_not_activate_offering(self, user):
@@ -2294,3 +2331,19 @@ class ListCustomerUsersTest(test.APITransactionTestCase):
             self.fixture.offering, "list_customer_users"
         )
         return self.client.get(url)
+
+
+class ResourceOfferingsViewSetTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.category = self.fixture.offering.category
+        self.resource = self.fixture.resource
+
+    def test_filter_offerings_by_category(self):
+        url = f"/api/marketplace-resource-offerings/{self.category.uuid.hex}/"
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.fixture.offering.uuid.hex)
