@@ -53,9 +53,6 @@ RUN cd /usr/src/waldur && find . -name "tests" -exec rm -r {} + && bash docker_b
 RUN rm -rf /usr/local/src/ansible-waldur-module/.git \
            /usr/local/src/django-dbtemplates/.git
 
-# Delete all development libraries
-RUN apt-get purge -y lib*-dev git
-
 # Make sure that the django cors headers package is installed!
 RUN pip install django-cors-headers
 
