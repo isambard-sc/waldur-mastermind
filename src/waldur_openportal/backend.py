@@ -66,7 +66,7 @@ class OpenPortalBackend(ServiceBackend):
         return user.unix_username
 
     def sync_users(self, allocation):
-        logger.info(f"Syncing users for allocation: {allocation}")
+        logger.info(f"Syncing users for allocation: {allocation} | {allocation.op_project_name()}")
         op_project_name = allocation.op_project_name()
         users = allocation.project.get_users()
         logger.info(f"Users for allocation: {users}")
@@ -117,6 +117,9 @@ class OpenPortalBackend(ServiceBackend):
             except Exception as e:
                 logger.error(f"Unable to add user {user} to OpenPortal: {e}")
 
+        logger.info(f"Keys = {op_users.keys()}")
+        logger.info(f"Allocation user names: {allocation_user_names}")
+
         stale_op_user_names = set([str(user) for user in op_users.keys()]) - set(allocation_user_names)
 
         logger.info(f"Stale users in OpenPortal: {stale_op_user_names}")
@@ -165,6 +168,7 @@ class OpenPortalBackend(ServiceBackend):
     def add_user(self, allocation, user):
         """
         Create association between user and OpenPortal account if it does not exist yet.
+        The allocation contains the information of which project the user is in.
         """
         logger.info(f"Adding user {user} to allocation {allocation} in OpenPortal")
         op_project_name = allocation.op_project_name()
@@ -183,11 +187,14 @@ class OpenPortalBackend(ServiceBackend):
             )
 
         # get or create the association between the user and the allocation
+        # This association holds the username of the user in OpenPortal on this instance
         (association, created) = models.Association.objects.get_or_create(user=user, allocation=allocation)
 
-        logger.info(f"Association: {association} {association.__class__}")
-
         op_user_name = association.get_op_user_name()
+
+        if op_user_name is not None:
+            logger.info(f"User likely already exists with username {op_user_name}")
+            logger.info("Adding them again just in case they were removed accidentally")
 
         try:
             user_mapping = self.client.add_user(unix_shortname, op_project_name)
@@ -215,7 +222,7 @@ class OpenPortalBackend(ServiceBackend):
         """
         Delete association between user and OpenPortal account if it exists.
         """
-        logger.info(f"Deleting OpenPortal user {user} from allocation {allocation}")
+        logger.info(f"Deleting OpenPortal user {user} from allocation {allocation} | {allocation.op_project_name()}")
         op_project_name = allocation.op_project_name()
 
         if not op_project_name.strip():

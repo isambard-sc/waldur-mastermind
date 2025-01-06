@@ -125,6 +125,10 @@ def get_structure_allocations(structure):
 
 @shared_task(name="waldur_openportal.update_user")
 def update_user(serialized_user):
+    """
+    Update the user by making sure that they are added to all OpenPortal
+    resources to which they have allocations.
+    """
     logger.info(f"task.update_user: {serialized_user}")
     user = core_utils.deserialize_instance(serialized_user)
 
@@ -132,7 +136,9 @@ def update_user(serialized_user):
         logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
         return
 
-    for allocation in utils.get_profile_allocations(user):
+    for allocation in utils.get_project_allocations(user):
+        print(f"Adding user {user} to project {allocation} | {allocation.op_project_name()}")
+
         # adding and updating are the same thing in OpenPortal
         allocation.get_backend().add_user(allocation, user)
 
@@ -146,7 +152,8 @@ def delete_user(serialized_user):
         logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
         return
 
-    for allocation in utils.get_profile_allocations(user):
+    for allocation in utils.get_project_allocations(user):
+        print(f"Deleting user {user} from project {allocation} | {allocation.op_project_name()}")
         allocation.get_backend().delete_user(allocation, user)
 
 

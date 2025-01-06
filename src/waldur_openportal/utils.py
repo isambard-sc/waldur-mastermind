@@ -31,20 +31,34 @@ def sanitize_allocation_name(name):
     return re.sub(incorrect_symbols_regex, "", name)
 
 
-def get_user_allocations(user):
-    connected_projects = get_connected_projects(user)
+def get_customer_allocations(user):
+    """
+    Return the allocations to the user associated with being a customer.
+    This will typically be all of the allocations associated with customer
+    roles in, e.g. an organisation
+    """
     connected_customers = get_connected_customers(user)
-
-    project_allocations = models.Allocation.objects.filter(
-        is_active=True, project__in=connected_projects
-    )
 
     customer_allocations = models.Allocation.objects.filter(
         is_active=True, project__customer__in=connected_customers
     )
 
-    return (project_allocations, customer_allocations)
+    print(f"customer_allocations for user {user}: {customer_allocations}")
+
+    return customer_allocations
 
 
-def get_profile_allocations(user):
-    return itertools.chain(*get_user_allocations(user))
+def get_project_allocations(user):
+    """
+    Return all of the allocations associated with the passed user
+    to any project. This gives the projects in which the user is active.
+    Projects in which the user is inactive are ignored
+    """
+    connected_projects = get_connected_projects(user)
+
+    project_allocations = models.Allocation.objects.filter(
+        is_active=True, project__in=connected_projects
+    )
+
+    print(f"project_allocations for user {user}: {project_allocations}")
+    return project_allocations
