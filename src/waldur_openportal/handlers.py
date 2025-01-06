@@ -6,6 +6,7 @@ from django.db import transaction
 from django.db.models import Sum
 
 from waldur_core.core import utils as core_utils
+from waldur_core.core.models import User
 from waldur_core.permissions.models import UserRole
 from waldur_core.structure.models import Customer, Project
 
@@ -46,7 +47,13 @@ def schedule_sync_on_quota_change(sender, instance, created=False, **kwargs):
 @if_plugin_enabled
 def update_user(sender, instance, created=False, **kwargs):
     user = instance
+
     logger.info(f"OpenPortal - updating user {user}")
+
+    # check if this is a User type
+    if not isinstance(user, User):
+        logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
+        return
 
     transaction.on_commit(
         lambda: tasks.update_user.delay(core_utils.serialize_instance(user))
@@ -57,6 +64,10 @@ def delete_user(sender, instance, **kwargs):
     user = instance
     logger.info(f"OpenPortal - deleting user {user}")
 
+    if not isinstance(instance, User):
+        logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
+        return
+
     transaction.on_commit(
         lambda: tasks.delete_user.delay(core_utils.serialize_instance(instance))
     )
@@ -65,6 +76,12 @@ def delete_user(sender, instance, **kwargs):
 @if_plugin_enabled
 def role_granted(sender, instance: UserRole, **kwargs):
     logger.info(f"OpenPortal - granting role {instance.role} for user {instance.user} in {instance.scope}")
+
+    user = instance.user
+
+    if not isinstance(user, User):
+        logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
+        return
 
     # Skip synchronization of custom roles
     if not instance.role.is_system_role:
@@ -79,8 +96,8 @@ def role_granted(sender, instance: UserRole, **kwargs):
         return
 
     # let's just update the user...
-    logger.info(f"Send update_user({sender}, {instance}, created=True, **{kwargs})")
-    update_user(sender, instance, created=True, **kwargs)
+    logger.info(f"Really sending update_user({sender}, {user}, created=True, **{kwargs})")
+    update_user(sender, user, created=True, **kwargs)
 
 
 @if_plugin_enabled

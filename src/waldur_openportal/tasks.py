@@ -5,6 +5,7 @@ import time
 from celery import shared_task
 
 from waldur_core.core import utils as core_utils
+from waldur_core.core.models import User
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.exceptions import ServiceBackendNotImplemented
 
@@ -123,20 +124,30 @@ def get_structure_allocations(structure):
 
 
 @shared_task(name="waldur_openportal.update_user")
-def update_user(serialized_profile):
-    logger.info(f"task.update_user: {serialized_profile}")
-    profile = core_utils.deserialize_instance(serialized_profile)
-    for allocation in utils.get_profile_allocations(profile):
+def update_user(serialized_user):
+    logger.info(f"task.update_user: {serialized_user}")
+    user = core_utils.deserialize_instance(serialized_user)
+
+    if not isinstance(user, User):
+        logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
+        return
+
+    for allocation in utils.get_profile_allocations(user):
         # adding and updating are the same thing in OpenPortal
-        allocation.get_backend().add_user(allocation, profile.user)
+        allocation.get_backend().add_user(allocation, user)
 
 
 @shared_task(name="waldur_openportal.delete_user")
-def delete_user(serialized_profile):
-    logger.info(f"task.delete_user: {serialized_profile}")
-    profile = core_utils.deserialize_instance(serialized_profile)
-    for allocation in utils.get_profile_allocations(profile):
-        allocation.get_backend().delete_user(allocation, profile.user)
+def delete_user(serialized_user):
+    logger.info(f"task.delete_user: {serialized_user}")
+    user = core_utils.deserialize_instance(serialized_user)
+
+    if not isinstance(user, User):
+        logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
+        return
+
+    for allocation in utils.get_profile_allocations(user):
+        allocation.get_backend().delete_user(allocation, user)
 
 
 @shared_task(name="waldur_openportal.sync_allocation_users")
