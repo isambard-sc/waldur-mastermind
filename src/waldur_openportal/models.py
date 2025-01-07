@@ -129,6 +129,14 @@ class Association(core_models.UuidMixin):
         null=True,
     )
 
+    # This is the local groupname on the instance being allocated
+    # (e.g. the primary unix group for the user)
+    groupname = models.CharField(
+        max_length=MAX_GROUPNAME_LENGTH,
+        blank=True,
+        null=True,
+    )
+
     # This is the OpenPortal UserIdentifier that uniquely
     # identifies this user in OpenPortal
     useridentifier = models.CharField(
@@ -163,6 +171,12 @@ class Association(core_models.UuidMixin):
     def get_user_identifier(self) -> openportal.UserIdentifier:
         return openportal.UserIdentifier(self.useridentifier)
 
+    def has_local_group(self) -> bool:
+        return bool(self.groupname)
+
+    def get_local_group(self) -> str:
+        return self.groupname
+
     def has_local_user(self) -> bool:
         return bool(self.username)
 
@@ -170,7 +184,7 @@ class Association(core_models.UuidMixin):
         return self.username
 
     def has_mapping(self) -> bool:
-        return self.has_user_identifier() and self.has_local_user()
+        return self.has_user_identifier() and self.has_local_user() and self.has_local_group()
 
     def set_mapping(self, mapping: openportal.UserMapping):
         if not isinstance(mapping, openportal.UserMapping):
@@ -184,6 +198,12 @@ class Association(core_models.UuidMixin):
         else:
             self.username = mapping.local_user
 
+        if self.has_local_group():
+            if mapping.local_group != self.get_local_group():
+                raise ValueError(f"Local group {mapping.local_group} does not match association {self.groupname}")
+        else:
+            self.groupname = mapping.local_group
+
     def get_mapping(self) -> openportal.UserMapping:
         if not self.has_user_identifier():
             raise ValueError("UserIdentifier is not set!")
@@ -191,7 +211,7 @@ class Association(core_models.UuidMixin):
         if not self.has_local_user():
             raise ValueError("Local user is not set!")
 
-        return openportal.UserMapping(f"{self.get_user_identifier()}:{self.get_local_user()}")
+        return openportal.UserMapping(f"{self.get_user_identifier()}:{self.get_local_user()}:{self.get_local_group()}")
 
     def __str__(self):
         if self.has_mapping():
