@@ -30,8 +30,14 @@ def if_plugin_enabled(f):
 
 @if_plugin_enabled
 def schedule_sync(*args, **kwargs):
+    """
+    Schedule a synchronization of OpenPortal data. This will double-check
+    that all users are correctly associated with all projects and
+    instances, and will add/remove users as needed
+    """
+
     logger.info("Scheduling OpenPortal synchronization.")
-    tasks.schedule_sync()
+    tasks.sync()
 
 
 @if_plugin_enabled
@@ -45,22 +51,42 @@ def schedule_sync_on_quota_change(sender, instance, created=False, **kwargs):
 
 
 @if_plugin_enabled
-def update_user(sender, instance, created=False, **kwargs):
+def update_user(sender, instance, force_add=False, **kwargs):
+    """
+    Update the user (passed as "instance") in OpenPortal. This will
+    look for all associations between the user and all projects and
+    will add the user to each of those projects.
+    """
+
     user = instance
 
-    logger.info(f"OpenPortal - updating user {user}")
+    logger.info(f"OpenPortal - updating user {user} - tracker {user.tracker.changed()} - force_add {force_add}")
 
-    # check if this is a User type
-    if not isinstance(user, User):
-        logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
-        return
+    if force_add or set(user.tracker.changed()) & {"unix_username"}:
+        # Either the user's unix_username has changed, or the user has
+        # just been added to the project - we need to update the user
+        # (updating is the same as adding in OpenPortal)
+        logger.info(f"OpenPortal - updating user {user}")
 
-    transaction.on_commit(
-        lambda: tasks.update_user.delay(core_utils.serialize_instance(user))
-    )
+        # check if this is a User type
+        if not isinstance(user, User):
+            logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
+            return
+
+        transaction.on_commit(
+            lambda: tasks.update_user.delay(core_utils.serialize_instance(user))
+        )
+
 
 @if_plugin_enabled
 def delete_user(sender, instance, **kwargs):
+    """
+    Completely delete the user from all OpenPortal allocations to which
+    they are allocated. This is called when a user is completely deleted
+    from Waldur. It should not be used to remove a user from an individual
+    project. Instead, schedule a sync, and the sync will remove all users
+    who are incorrectly still associated with projects.
+    """
     user = instance
     logger.info(f"OpenPortal - deleting user {user}")
 
@@ -75,6 +101,12 @@ def delete_user(sender, instance, **kwargs):
 
 @if_plugin_enabled
 def role_granted(sender, instance: UserRole, **kwargs):
+    """
+    This function is called when a user is granted a role in a project.
+    The instance should by a UserRole. Note that this will trigger
+    an `update_user` for the user, which will ensure that the user
+    is correctly added to all projects to which they should have access.
+    """
     logger.info(f"OpenPortal - granting role {instance.role} for user {instance.user} in {instance.scope}")
 
     user = instance.user
@@ -96,12 +128,17 @@ def role_granted(sender, instance: UserRole, **kwargs):
         return
 
     # let's just update the user...
-    logger.info(f"Really sending update_user({sender}, {user}, created=True, **{kwargs})")
-    update_user(sender, user, created=True, **kwargs)
+    logger.info(f"Really sending update_user({sender}, {user}, force_add=True, **{kwargs})")
+    update_user(sender, user, force_add=True, **kwargs)
 
 
 @if_plugin_enabled
 def role_revoked(sender, instance, **kwargs):
+    """
+    Revoke a role from the passed user. Note that this will trigger a full
+    OpenPortal synchronization, which will ensure that all users are
+    removed from projects from which they are not allocated.
+    """
     logger.info(f"OpenPortal - revoking role {instance.role} for user {instance.user} in {instance.scope}")
 
     # Skip synchronization of custom roles

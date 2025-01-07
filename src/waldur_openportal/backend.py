@@ -1,3 +1,4 @@
+
 import logging
 import operator
 from functools import reduce
@@ -14,6 +15,7 @@ from waldur_openportal.structures import Quotas
 
 from . import base, models
 from .utils import sanitize_allocation_name
+from . import op as openportal
 
 logger = logging.getLogger(__name__)
 
@@ -66,17 +68,17 @@ class OpenPortalBackend(ServiceBackend):
         return user.unix_username
 
     def sync_users(self, allocation):
-        logger.info(f"Syncing users for allocation: {allocation} | {allocation.op_project_name()}")
-        op_project_name = allocation.op_project_name()
+        project = allocation.get_project_identifier()
+        logger.info(f"Syncing users for allocation: {allocation} | {project}")
         users = allocation.project.get_users()
         logger.info(f"Users for allocation: {users}")
 
         # list all users who OpenPortal thinks are in the project
-        op_users = self.client.get_users(op_project_name=op_project_name)
+        user_mappings = self.client.get_users(project)
 
-        logger.info(f"Users in OpenPortal: {op_users}")
+        logger.info(f"Users of {project} in OpenPortal: {user_mappings}")
 
-        allocation_user_names = []
+        allocated_mappings = []
 
         # go through and add the users who are not in OpenPortal
         for user in users:
@@ -84,27 +86,31 @@ class OpenPortalBackend(ServiceBackend):
                 # get the association between the user and the allocation
                 (association, created) = models.Association.objects.get_or_create(user=user, allocation=allocation)
 
-                logger.info(f"Association: {association} {association.__class__}")
+                logger.info(f"Association: {association}")
 
-                op_user_name = association.get_op_user_name()
+                mapping = None
 
-                if op_user_name is None or op_user_name not in op_users:
+                if association.has_mapping():
+                    mapping = association.get_mapping()
+
+                if mapping is None or mapping not in user_mappings:
                     logger.info(f"Adding user {user} to OpenPortal")
-                    unix_shortname = self.get_user_short_name(user)
+                    shortname = self.get_user_short_name(user)
 
-                    if unix_shortname is None or not unix_shortname.strip():
+                    if shortname is None or not shortname.strip():
                         logger.error(f"Empty unix_shortname for user: {user} - cannot add to OpenPortal")
                         continue
 
-                    user_mapping = self.client.add_user(name=unix_shortname, op_project_name=op_project_name)
-                    new_op_user_name = str(user_mapping)
+                    new_mapping = self.client.add_user(shortname=shortname, project=project)
 
-                    logger.info(f"Added user {user} to OpenPortal as {new_op_user_name}")
+                    logger.info(f"Added user {user} to OpenPortal project {project} with mapping {new_mapping}")
 
-                    if (op_user_name is not None) and (new_op_user_name != op_user_name):
-                        logger.warning(f"User {user} has a changing username in OpenPortal: {op_user_name} -> {new_op_user_name}")
+                    if (mapping is not None) and (new_mapping != mapping):
+                        logger.warning(f"User {user} has a changing username in OpenPortal: {mapping} -> {new_mapping}")
 
-                    association.set_op_user_name(new_op_user_name)
+                    mapping = new_mapping
+
+                    association.set_mapping(mapping)
                     association.save()
 
                     signals.openportal_association_created.send(
@@ -113,23 +119,20 @@ class OpenPortalBackend(ServiceBackend):
                         user=user,
                     )
 
-                allocation_user_names.append(op_user_name)
+                allocated_mappings.append(mapping)
             except Exception as e:
                 logger.error(f"Unable to add user {user} to OpenPortal: {e}")
 
-        logger.info(f"Keys = {op_users.keys()}")
-        logger.info(f"Allocation user names: {allocation_user_names}")
+        stale_mappings = set(user_mappings) - set(allocated_mappings)
 
-        stale_op_user_names = set([str(user) for user in op_users.keys()]) - set(allocation_user_names)
+        logger.info(f"Stale users in OpenPortal: {stale_mappings}")
 
-        logger.info(f"Stale users in OpenPortal: {stale_op_user_names}")
-
-        for username in stale_op_user_names:
+        for mapping in stale_mappings:
             try:
-                self.client.delete_user(username)
+                self.client.delete_user(mapping.user)
                 # no need to signal as the user has already been removed from the association
             except Exception as e:
-                logger.error(f"Unable to delete user {username} from OpenPortal: {e}")
+                logger.error(f"Unable to delete user with mapping {mapping} from OpenPortal: {e}")
 
     def create_allocation(self, allocation):
         logger.info(f"Creating allocation: {allocation}")
@@ -141,6 +144,8 @@ class OpenPortalBackend(ServiceBackend):
         op_project_name = self.client.add_project(project_name)
 
         logger.info(f"Created project: {op_project_name}")
+
+        allocation.set_op_project(op_project)
 
         allocation.backend_id = op_project_name
 
