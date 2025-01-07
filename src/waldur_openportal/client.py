@@ -62,7 +62,7 @@ class OpenPortalRunner:
             logger.error(f"OpenPortal is not healthy: {health}")
             raise openportal.OpenPortalError(f"OpenPortal is not healthy: {health}")
 
-    def get(self, uid):
+    def get(self, uid: str) -> openportal.Job:
         """
         Return the OpenPortal job with the specified UID
         """
@@ -76,10 +76,10 @@ class OpenPortalRunner:
 
         return job
 
-    def run(self, command):
+    def run(self, command: str) -> openportal.Job:
         """
         Run the OpenPortal command 'command' and return the OpenPortal
-        job that was created. Raises an OpenPortalException if anything
+        job that was created. Raises an OpenPortalError if anything
         goes wrong
         """
         if not openportal.have_openportal:
@@ -126,7 +126,10 @@ class OpenPortalClient(BaseBatchClient):
         this method once the user has been added
         """
         if not isinstance(project, openportal.ProjectIdentifier):
-            project = openportal.ProjectIdentifier(project)
+            try:
+                project = openportal.ProjectIdentifier(project)
+            except Exception:
+                project = openportal.ProjectIdentifier(f"{project}.{self.portal()}")
 
         if (not shortname) or (not shortname.strip()):
             raise openportal.OpenPortalError(f"Invalid empty username '{shortname}'")
@@ -159,7 +162,10 @@ class OpenPortalClient(BaseBatchClient):
         was used (which we will call the `op_project_name`)
         """
         if not isinstance(project, openportal.ProjectIdentifier):
-            project = openportal.ProjectIdentifier(project)
+            try:
+                project = openportal.ProjectIdentifier(project)
+            except Exception:
+                project = openportal.ProjectIdentifier(f"{project}.{self.portal()}")
 
         mapping = self.run(f"{self.destination()} add_project {project}")
 
@@ -172,7 +178,10 @@ class OpenPortalClient(BaseBatchClient):
         Delete the project with the specified name.
         """
         if not isinstance(project, openportal.ProjectIdentifier):
-            project = openportal.ProjectIdentifier(project)
+            try:
+                project = openportal.ProjectIdentifier(project)
+            except Exception:
+                project = openportal.ProjectIdentifier(f"{project}.{self.portal()}")
 
         self.run(f"{self.destination()} remove_project {project}")
 
@@ -188,14 +197,14 @@ class OpenPortalClient(BaseBatchClient):
     def get_users(self, project: openportal.ProjectIdentifier) -> list[openportal.UserMapping]:
         return self.run(f"{self.destination()} get_users {project}")
 
-    def run(self, command):
+    def run(self, command: str):
         """
         Run the passed command and await the result
         """
         logger.info(f"Running command '{command}'")
         op_job = self._runner.run(command)
 
-        while not op_job.wait(1000):
+        while not op_job.wait(2500):
             logger.info(f"Job {command} is still running...")
 
         if op_job.is_error:

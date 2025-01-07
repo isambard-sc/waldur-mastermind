@@ -46,7 +46,11 @@ def update_user(serialized_user):
         return
 
     for allocation in utils.get_project_allocations(user):
-        print(f"Adding user {user} to project {allocation} | {allocation.op_project_name()}")
+        if not allocation.has_project_identifier():
+            logger.warning(f"OpenPortal - {allocation} has no project identifier, skipping")
+            continue
+
+        logger.info(f"Adding user {user} to project {allocation.get_project_identifier()}")
 
         # adding and updating are the same thing in OpenPortal
         allocation.get_backend().add_user(allocation, user)
@@ -67,7 +71,11 @@ def delete_user(serialized_user):
         return
 
     for allocation in utils.get_project_allocations(user):
-        print(f"Deleting user {user} from project {allocation} | {allocation.op_project_name()}")
+        if not allocation.has_project_identifier():
+            logger.warning(f"OpenPortal - {allocation} has no project identifier, skipping")
+            continue
+
+        print(f"Deleting user {user} from project {allocation.get_project_identifier()}")
         allocation.get_backend().delete_user(allocation, user)
 
 
@@ -79,6 +87,7 @@ def sync_allocation_users(serialized_allocation):
     """
     logger.info(f"task.sync_allocation_users: {serialized_allocation}")
     allocation = core_utils.deserialize_instance(serialized_allocation)
+
     openportal_backend: backend.OpenPortalBackend = allocation.get_backend()
     openportal_backend.sync_users(allocation)
 

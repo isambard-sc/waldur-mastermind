@@ -1,5 +1,3 @@
-import re
-
 from . import op as openportal
 
 from django.conf import settings
@@ -12,39 +10,9 @@ from waldur_core.core import models as core_models
 from waldur_core.structure import models as structure_models
 from waldur_openportal import utils
 
-MAX_USERNAME_LENGTH = 32
-MAX_OP_USER_LENGTH = 96
-
-class Job(structure_models.BaseResource):
-    """
-    This model represents a single job that is being run via OpenPortal.
-    A job is, e.g. an instruction to add or remove a user from a project,
-    create new instances of platforms etc.
-    """
-
-    @classmethod
-    def get_service_name(cls):
-        return "OpenPortal"
-
-    command = models.TextField(
-        help_text="Command being run via OpenPortal",
-        blank=True,
-        null=True,
-    )
-    user = models.ForeignKey(
-        help_text="Reference to user which submitted job",
-        related_name="op-jobs-user+",
-        on_delete=models.CASCADE,
-        to=settings.AUTH_USER_MODEL,
-        blank=True,
-        null=True,
-    )
-    report = models.TextField("Job output", blank=True, null=True)
-    runtime_state = models.CharField(max_length=32, blank=True)
-
-    @classmethod
-    def get_url_name(cls):
-        return "openportal-job"
+MAX_GROUPNAME_LENGTH = 64
+MAX_USERNAME_LENGTH = 64
+MAX_USERIDENTIFIER_LENGTH = 128
 
 
 class UsageMixin(models.Model):
@@ -60,12 +28,26 @@ class Allocation(UsageMixin, structure_models.BaseResource):
 
     node_limit = models.BigIntegerField(default=0)
 
+    # The local group name for the group to which all members of the
+    # allocation will be added (e.g. the Unix group)
+    groupname = models.TextField(
+        max_length = MAX_GROUPNAME_LENGTH,
+        blank=True,
+        null=True,
+    )
+
     @classmethod
     def get_url_name(cls):
         return "openportal-allocation"
 
     def usage_changed(self):
         return any(self.tracker.has_changed(field) for field in utils.FIELD_NAMES)
+
+    def has_local_group(self) -> bool:
+        return bool(self.groupname)
+
+    def get_local_group(self) -> str:
+        return self.groupname
 
     def has_project_identifier(self) -> bool:
         return bool(self.backend_id)
@@ -88,11 +70,38 @@ class Allocation(UsageMixin, structure_models.BaseResource):
 
         return openportal.ProjectIdentifier(self.backend_id)
 
+    def has_mapping(self) -> bool:
+        return self.has_project_identifier() and self.has_local_group()
+
+    def get_mapping(self) -> openportal.ProjectMapping:
+        if not self.has_mapping():
+            raise ValueError("ProjectMapping is not set!")
+
+        return openportal.ProjectMapping(f"{self.get_project_identifier()}:{self.get_local_group()}")
+
+    def set_mapping(self, mapping: openportal.ProjectMapping):
+        if not isinstance(mapping, openportal.ProjectMapping):
+            mapping = openportal.ProjectMapping(mapping)
+
+        self.set_project_identifier(mapping.project)
+        self.groupname = mapping.local_group
+
     @classmethod
     def get_backend_fields(cls):
         return super().get_backend_fields() + (
             "node_usage",
         )
+
+    def __str__(self):
+        if self.has_mapping():
+            return f"{self.name}|{self.get_mapping()}"
+        elif self.has_project_identifier():
+            return f"{self.name}|{self.get_project_identifier()}"
+        else:
+            return f"{self.name} (not in OpenPortal)"
+
+    def __repr__(self):
+        return self.__str__()
 
 
 class Association(core_models.UuidMixin):
@@ -102,6 +111,7 @@ class Association(core_models.UuidMixin):
         on_delete=models.CASCADE,
         related_name="op-associations-allocation+"
     )
+
     # This is the Waldur user which is associated with the allocation.
     user = models.ForeignKey(
         to=settings.AUTH_USER_MODEL,
@@ -121,8 +131,8 @@ class Association(core_models.UuidMixin):
 
     # This is the OpenPortal UserIdentifier that uniquely
     # identifies this user in OpenPortal
-    op_user = models.CharField(
-        max_length=MAX_OP_USER_LENGTH,
+    useridentifier = models.CharField(
+        max_length=MAX_USERIDENTIFIER_LENGTH,
         blank=True,
         null=True
     )
@@ -137,23 +147,21 @@ class Association(core_models.UuidMixin):
         return self.allocation.get_project_identifier()
 
     def has_user_identifier(self) -> bool:
-        return bool(self.op_user)
+        return bool(self.useridentifier)
 
     def set_user_identifier(self, user: openportal.UserIdentity):
         if not isinstance(user, openportal.UserIdentity):
             user = openportal.UserIdentifier(user)
 
         if self.has_user_identifier():
-            if user != self.get_op_user():
-                raise ValueError(f"User {user} does not match association {self.op_user()}")
-
-            return
-
-        self.set_project_identifier(user.project_identifier)
-        self.op_user = str(user)
+            if user != self.get_user_identifier():
+                raise ValueError(f"User {user} does not match association {self.get_user_identifier()}")
+        else:
+            self.set_project_identifier(user.project_identifier)
+            self.useridentifier = str(user)
 
     def get_user_identifier(self) -> openportal.UserIdentifier:
-        return openportal.UserIdentifier(self.username)
+        return openportal.UserIdentifier(self.useridentifier)
 
     def has_local_user(self) -> bool:
         return bool(self.username)
@@ -173,10 +181,8 @@ class Association(core_models.UuidMixin):
         if self.has_local_user():
             if mapping.local_user != self.get_local_user():
                 raise ValueError(f"Local user {mapping.local_user} does not match association {self.username}")
-
-            return
-
-        self.username = mapping.local_user
+        else:
+            self.username = mapping.local_user
 
     def get_mapping(self) -> openportal.UserMapping:
         if not self.has_user_identifier():
@@ -185,10 +191,18 @@ class Association(core_models.UuidMixin):
         if not self.has_local_user():
             raise ValueError("Local user is not set!")
 
-        return openportal.UserMapping(f"{self.get_op_user()}:{self.get_local_user()}")
+        return openportal.UserMapping(f"{self.get_user_identifier()}:{self.get_local_user()}")
 
     def __str__(self):
-        return f"{self.allocation.name} <-> {self.mapping}"
+        if self.has_mapping():
+            return f"{self.allocation} <-> {self.get_mapping()}"
+        elif self.has_user_identifier():
+            return f"{self.allocation} <-> {self.get_user_identifier()}"
+        else:
+            return f"{self.allocation} <-> {self.user} (not in OpenPortal)"
+
+    def __repr__(self):
+        return self.__str__()
 
 
 class AllocationUserUsage(UsageMixin):

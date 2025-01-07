@@ -67,7 +67,18 @@ class OpenPortalBackend(ServiceBackend):
         """
         return user.unix_username
 
-    def sync_users(self, allocation):
+    def sync_users(self, allocation: models.Allocation) -> None:
+        if not isinstance(allocation, models.Allocation):
+            raise ServiceBackendError(
+                "Invalid allocation type %s" % type(allocation)
+            )
+
+        if not allocation.has_project_identifier():
+            logger.warning(f"Allocation {allocation} has no project identifier - creating now!")
+            # this already calls 'sync_users' on the created allocation
+            self.create_allocation(allocation)
+            return
+
         project = allocation.get_project_identifier()
         logger.info(f"Syncing users for allocation: {allocation} | {project}")
         users = allocation.project.get_users()
@@ -135,81 +146,106 @@ class OpenPortalBackend(ServiceBackend):
                 logger.error(f"Unable to delete user with mapping {mapping} from OpenPortal: {e}")
 
     def create_allocation(self, allocation):
-        logger.info(f"Creating allocation: {allocation}")
-        project = allocation.project
-        project_name = self.get_project_short_name(project)
+        if allocation.has_project_identifier():
+            project = allocation.get_project_identifier()
+            logger.info(f"Allocation already exists: {allocation} | {project}")
 
-        logger.info(f"Details: {project} : {project_name}")
+            # add it again just to be sure
+            mapping = self.client.add_project(project)
 
-        op_project_name = self.client.add_project(project_name)
+            logger.info(f"Re-added allocation {allocation} to OpenPortal with mapping {mapping}")
 
-        logger.info(f"Created project: {op_project_name}")
+            if allocation.has_mapping():
+                if allocation.get_mapping() != mapping:
+                    logger.warning(f"Allocation {allocation} has a changing project name in OpenPortal: {mapping} -> {allocation.get_mapping()}")
+                else:
+                    allocation.set_mapping(mapping)
+        else:
+            project = allocation.project
+            project_name = self.get_project_short_name(project)
+            logger.info(f"Creating allocation: {allocation} for project {project_name}")
 
-        allocation.set_op_project(op_project)
+            if project_name is None or not project_name.strip():
+                logger.error(f"Empty project_name for allocation: {allocation} - cannot create in OpenPortal")
+                return
 
-        allocation.backend_id = op_project_name
+            mapping = self.client.add_project(project_name)
+
+            logger.info(f"Created OpenPortal project {project_name} with mapping {mapping}")
+
+            allocation.set_mapping(mapping)
 
         allocation.node_limit = 0
         allocation.save()
 
         self.set_resource_limits(allocation)
-        self.sync_users(allocation)
+
+        if allocation.has_project_identifier():
+            self.sync_users(allocation)
+        else:
+            logger.error(f"Program bug? Allocation {allocation} has no project identifier - cannot sync users")
 
     def delete_allocation(self, allocation):
         logger.info(f"Deleting allocation: {allocation}")
-        op_project_name = allocation.op_project_name()
 
-        if not op_project_name.strip():
-            raise ServiceBackendError(
-                "Empty op_project_name for allocation: %s" % allocation
-            )
-
-        self.client.delete_project(op_project_name)
+        if not allocation.has_project_identifier():
+            logger.info(f"Allocation already deleted: {allocation}")
+        else:
+            try:
+                project = allocation.get_project_identifier()
+                self.client.delete_project(project)
+            except Exception as e:
+                logger.error(f"Unable to delete allocation {allocation} from OpenPortal: {e}")
 
         project = allocation.project
         if self.get_allocation_queryset().filter(project=project).count() == 0:
             self.delete_project(project)
 
-    def add_user(self, allocation, user):
+    def add_user(self, allocation: models.Allocation, user) -> bool:
         """
         Create association between user and OpenPortal account if it does not exist yet.
         The allocation contains the information of which project the user is in.
         """
-        logger.info(f"Adding user {user} to allocation {allocation} in OpenPortal")
-        op_project_name = allocation.op_project_name()
-
-        if not op_project_name.strip():
+        if not isinstance(allocation, models.Allocation):
             raise ServiceBackendError(
-                "Empty op_project_name for allocation: %s" % allocation
+                "Invalid allocation type %s" % type(allocation)
             )
 
-        unix_shortname = self.get_user_short_name(user)
+        if not allocation.has_project_identifier():
+            logger.error(f"Allocation {allocation} has no project identifier - cannot add user {user} to OpenPortal")
+            return False
 
-        if unix_shortname is None or not unix_shortname.strip():
-            logger.error(f"Empty unix_shortname for user: {user}")
-            raise ServiceBackendError(
-                f"Empty unix_shortname for user: {user} - cannot add to OpenPortal"
-            )
+        project = allocation.get_project_identifier()
+
+        logger.info(f"Adding user {user} to project {project} in OpenPortal")
+
+        shortname = self.get_user_short_name(user)
+
+        if shortname is None or not shortname.strip():
+            logger.error(f"Empty unix_shortname for user: {user} - they cannot be added to OpenPortal")
+            return False
 
         # get or create the association between the user and the allocation
         # This association holds the username of the user in OpenPortal on this instance
         (association, created) = models.Association.objects.get_or_create(user=user, allocation=allocation)
 
-        op_user_name = association.get_op_user_name()
+        mapping = None
 
-        if op_user_name is not None:
-            logger.info(f"User likely already exists with username {op_user_name}")
+        if association.has_mapping():
+            mapping = association.get_mapping()
+
+        if mapping is not None:
+            logger.info(f"User likely already exists with mapping {mapping}")
             logger.info("Adding them again just in case they were removed accidentally")
 
         try:
-            user_mapping = self.client.add_user(unix_shortname, op_project_name)
-            new_op_user_name = str(user_mapping.user)
-            logger.info(f"Added user {new_op_user_name} for {user} to OpenPortal")
+            new_mapping = self.client.add_user(shortname=shortname, project=project)
+            logger.info(f"Added user {user} with mapping {new_mapping}")
 
-            if (op_user_name is not None) and (new_op_user_name != op_user_name):
-                logger.warning(f"User {user} has a changing username in OpenPortal: {op_user_name} -> {new_op_user_name}")
+            if (mapping is not None) and (new_mapping != mapping):
+                logger.warning(f"User {user} has a changing mapping in OpenPortal: {mapping} -> {new_mapping}")
 
-            association.set_op_user_name(new_op_user_name)
+            association.set_mapping(new_mapping)
             association.save()
 
             signals.openportal_association_created.send(
@@ -223,17 +259,22 @@ class OpenPortalBackend(ServiceBackend):
 
         return True
 
-    def delete_user(self, allocation, user):
+    def delete_user(self, allocation: models.Allocation, user) -> bool:
         """
         Delete association between user and OpenPortal account if it exists.
         """
-        logger.info(f"Deleting OpenPortal user {user} from allocation {allocation} | {allocation.op_project_name()}")
-        op_project_name = allocation.op_project_name()
-
-        if not op_project_name.strip():
+        if not isinstance(allocation, models.Allocation):
             raise ServiceBackendError(
-                "Empty op_project_name for allocation: %s" % allocation
+                "Invalid allocation type %s" % type(allocation)
             )
+
+        if not allocation.has_project_identifier():
+            logger.error(f"Allocation {allocation} has no project identifier - cannot delete user {user} from OpenPortal")
+            return False
+
+        project = allocation.get_project_identifier()
+
+        logger.info(f"Deleting OpenPortal user {user} from project {project}")
 
         # find the association between the user and the allocation
         try:
@@ -242,41 +283,63 @@ class OpenPortalBackend(ServiceBackend):
             logger.error(f"Unable to find association between user {user} and allocation {allocation}: {e}")
             return False
 
-        op_user_name = association.get_op_user_name()
-
-        if op_user_name is not None:
-            try:
-                logger.info(f"Deleting user {op_user_name} from OpenPortal")
-                self.client.delete_user(op_user_name)
-
-                # delete this association
-                association.delete()
-
-                signals.openportal_association_deleted.send(
-                    models.Allocation, allocation=allocation, user=user
-                )
-
-                return True
-            except Exception as e:
-                logger.error(f"Unable to delete user {user} from allocation {allocation} in OpenPortal: {e}")
-                return False
-        else:
+        if not association.has_mapping():
             logger.warning(f"User {user} is not associated with OpenPortal?")
             return False
 
+        op_user = association.get_user_identifier()
+
+        try:
+            logger.info(f"Deleting user {op_user} from project {project} in OpenPortal")
+
+            try:
+                self.client.delete_user(op_user)
+            except Exception as e:
+                logger.error(f"Unable to delete user {op_user} from project {project} in OpenPortal: {e}")
+
+                # see if this user still exists in the project - if not, we can continue
+                mappings = self.client.get_users(project)
+
+                if association.get_mapping() in mappings:
+                    logger.error(f"User {op_user} still exists in project {project} - cannot delete")
+                    return False
+
+            # delete this association
+            association.delete()
+
+            signals.openportal_association_deleted.send(
+                models.Allocation, allocation=allocation, user=user
+            )
+
+            return True
+        except Exception as e:
+            logger.error(f"Unable to delete user {user} from allocation {allocation} in OpenPortal: {e}")
+            return False
+
     def set_resource_limits(self, allocation: models.Allocation):
-        logger.info(f"Setting resource limits for allocation {allocation}")
+        if not isinstance(allocation, models.Allocation):
+            raise ServiceBackendError(
+                "Invalid allocation type %s" % type(allocation)
+            )
+
+        if not allocation.has_project_identifier():
+            logger.error(f"Allocation {allocation} has no project identifier - cannot set resource limits")
+            return
+
+        project = allocation.get_project_identifier()
+
+        logger.info(f"Setting resource limits for allocation {project}")
         limits = Quotas(
             node=allocation.node_limit,
         )
-        self.client.set_resource_limits(allocation.op_project_name(), limits)
+        self.client.set_resource_limits(project, limits)
 
     def sync_usage(self):
         logger.info(f"Syncing OpenPortal usage for settings: {self}")
         waldur_allocations = {
-            allocation.op_project_name(): allocation
+            allocation.get_project_identifier(): allocation
             for allocation in self.get_allocation_queryset()
-            if allocation.op_project_name()
+            if allocation.has_project_identifier()
         }
 
         report = self.get_usage_report(waldur_allocations.keys())
@@ -290,22 +353,28 @@ class OpenPortalBackend(ServiceBackend):
                 continue
             self._update_quotas(allocation, usage)
 
-    def pull_allocation(self, allocation):
-        logger.info(f"Pulling OpenPortal allocation {allocation}")
-        self.sync_users(allocation)
-        op_project_name = allocation.op_project_name()
-
-        if not op_project_name.strip():
+    def pull_allocation(self, allocation: models.Allocation):
+        if not isinstance(allocation, models.Allocation):
             raise ServiceBackendError(
-                "Empty op_project_name for allocation: %s" % allocation
+                "Invalid allocation type %s" % type(allocation)
             )
 
-        report = self.get_usage_report([op_project_name])
-        usage = report.get(op_project_name)
+        if not allocation.has_project_identifier():
+            raise ServiceBackendError(
+                "Allocation %s has no project identifier - cannot pull from OpenPortal" % allocation
+            )
+
+        logger.info(f"Pulling OpenPortal allocation {allocation}")
+        self.sync_users(allocation)
+
+        project = allocation.get_project_identifier()
+
+        report = self.get_usage_report([project])
+        usage = report.get(project)
         if not usage:
             usage = {"TOTAL_ACCOUNT_USAGE": Quotas()}
         self._update_quotas(allocation, usage)
-        limits = self.get_allocation_limits(op_project_name)
+        limits = self.get_allocation_limits(project)
         self._update_limits(allocation, limits)
 
     def get_usage_report(self, accounts):

@@ -21,42 +21,6 @@ class OpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer
     )
 
 
-class JobSerializer(structure_serializers.BaseResourceSerializer):
-    class Meta(structure_serializers.BaseResourceSerializer.Meta):
-        model = models.Job
-        fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
-            "runtime_state",
-            "command",
-            "user",
-            "user_uuid",
-            "user_name",
-            "report",
-        )
-        read_only_fields = structure_serializers.BaseResourceSerializer.Meta.read_only_fields + (
-            "user",
-            "report",
-        )
-        protected_fields = structure_serializers.BaseResourceSerializer.Meta.protected_fields + ("command",)
-        extra_kwargs = {
-            **structure_serializers.BaseResourceSerializer.Meta.extra_kwargs,
-            "user": {"lookup_field": "uuid", "view_name": "user-detail"},
-        }
-        related_paths = {
-            "user": ("uuid", "name"),
-        }
-
-    def get_fields(self):
-        fields = super().get_fields()
-        if not self.instance:
-            fields["command"].required = True
-            fields["command"].allow_null = False
-        return fields
-
-    def create(self, validated_data):
-        validated_data["user"] = self.context["request"].user
-        return super().create(validated_data)
-
-
 class AllocationSerializer(
     structure_serializers.BaseResourceSerializer,
     core_serializers.AugmentedSerializerMixin,
@@ -75,6 +39,7 @@ class AllocationSerializer(
         model = models.Allocation
         fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
             "node_limit",
+            "groupname",
             "node_usage",
             "username",
             "is_active",
@@ -168,5 +133,6 @@ class AssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
         fields = (
             "uuid",
             "username",
+            "useridentifier",
             "allocation",
         )
