@@ -1,16 +1,12 @@
 import logging
-import datetime
-import time
 
 from celery import shared_task
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.models import User
 from waldur_core.structure import models as structure_models
-from waldur_core.structure.exceptions import ServiceBackendNotImplemented
 
 from . import backend, models, utils
-from .client import OpenPortalRunner, OpenPortalError
 
 
 logger = logging.getLogger(__name__)

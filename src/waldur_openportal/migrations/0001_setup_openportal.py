@@ -13,7 +13,6 @@ import waldur_core.core.models
 import waldur_core.core.validators
 import waldur_core.logging.loggers
 
-from waldur_openportal.models import MAX_OP_USERNAME_LENGTH
 
 class Migration(migrations.Migration):
     initial = True

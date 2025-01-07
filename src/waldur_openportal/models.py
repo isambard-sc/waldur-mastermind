@@ -149,8 +149,8 @@ class Association(core_models.UuidMixin):
     def has_user_identifier(self) -> bool:
         return bool(self.useridentifier)
 
-    def set_user_identifier(self, user: openportal.UserIdentity):
-        if not isinstance(user, openportal.UserIdentity):
+    def set_user_identifier(self, user: openportal.UserIdentifier):
+        if not isinstance(user, openportal.UserIdentifier):
             user = openportal.UserIdentifier(user)
 
         if self.has_user_identifier():
