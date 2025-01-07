@@ -58,7 +58,7 @@ class Allocation(UsageMixin, structure_models.BaseResource):
 
         if self.has_project_identifier():
             if project != self.get_project_identifier():
-                raise ValueError(f"Project {project} does not match allocation {self.op_project()}")
+                raise ValueError(f"Project {project} does not match allocation {self.get_project_identifier()}")
 
             return
 

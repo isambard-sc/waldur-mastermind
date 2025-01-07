@@ -6,9 +6,9 @@ class OpenPortalError(BatchError):
     pass
 
 try:
-    from openportal import Destination, Health, Job, ProjectIdentifier, ProjectMapping, \
-        UserIdentifier, UserMapping, is_config_loaded, load_config, health, \
-        get, run
+    from openportal import Destination, Health, Job, PortalIdentifier, \
+        ProjectIdentifier, ProjectMapping, UserIdentifier, UserMapping, \
+        is_config_loaded, load_config, health, get, run
 
     have_openportal = True
 except ImportError:
@@ -25,6 +25,10 @@ except ImportError:
             _raise_no_openportal_error()
 
     class Job:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class PortalIdentifier:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 

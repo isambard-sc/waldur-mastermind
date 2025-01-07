@@ -117,6 +117,17 @@ class OpenPortalClient(BaseBatchClient):
         """
         return self._destination
 
+    def portal(self) -> openportal.PortalIdentifier:
+        """
+        Return the name of the portal that holds the instance that
+        is being managed by this client
+        """
+        try:
+            return openportal.PortalIdentifier(self._destination.agents[0])
+        except Exception as e:
+            logger.error(f"Failed to get portal name from destination {self._destination}: {e}")
+            raise openportal.OpenPortalError(f"Failed to get portal name from destination {self._destination}: {e}")
+
     def add_user(self, shortname: str, project: openportal.ProjectIdentifier) -> openportal.UserMapping:
         """
         Tell OpenPortal to add the specified short (unix) name to the project.
@@ -158,8 +169,7 @@ class OpenPortalClient(BaseBatchClient):
         Tell OpenPortal to create a project with the specified name.
         This name should be unique on the caller side. OpenPortal will
         derive a unique internal name for this project based on that
-        name, and will create it, and return the internal name that
-        was used (which we will call the `op_project_name`)
+        name, and will create it, and return the mapping
         """
         if not isinstance(project, openportal.ProjectIdentifier):
             try:
