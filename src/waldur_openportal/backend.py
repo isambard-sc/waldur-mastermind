@@ -235,8 +235,8 @@ class OpenPortalBackend(ServiceBackend):
             mapping = association.get_mapping()
 
         if mapping is not None:
-            logger.info(f"User likely already exists with mapping {mapping}")
-            logger.info("Adding them again just in case they were removed accidentally")
+            logger.info(f"User {user} hasd previously been in {project} with mapping {mapping}")
+            logger.info("Re-adding them to OpenPortal with the same mapping.")
 
         try:
             new_mapping = self.client.add_user(shortname=shortname, project=project)
