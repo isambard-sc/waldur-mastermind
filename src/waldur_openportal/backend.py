@@ -145,6 +145,36 @@ class OpenPortalBackend(ServiceBackend):
             except Exception as e:
                 logger.error(f"Unable to delete user with mapping {mapping} from OpenPortal: {e}")
 
+    def assert_can_create_allocation_for_project(self, project):
+        """
+        This checks to see if the passed project is allowed to create an allocation
+        on the instance managed by this backend. Projects are only allowed to create
+        a single allocation per instance, and they must have a routing path
+        that matches the destination of this instance.
+        """
+        destination = self.client.destination()
+
+        logger.info(f"Asserting that project {project} can create an allocation for {destination}")
+
+        existing_allocations = self.get_allocation_queryset().filter(project=project)
+
+        for allocation in existing_allocations:
+            logger.info(f"Existing allocation: {allocation} | {allocation.state} | {allocation.is_active} | {allocation.has_project_identifier()}")
+
+        # find all of these allocations that are active and that have a project identifier
+        existing_allocations = [
+            allocation for allocation in existing_allocations
+            if allocation.has_project_identifier() and allocation.state != models.Allocation.States.ERRED
+        ]
+
+        if len(existing_allocations) > 0:
+            logger.error(f"Project {project} already has existing allocation(s) in OpenPortal for {destination}")
+            logger.error(f"These are {existing_allocations}")
+            raise ServiceBackendError(
+                f"Project {project} already has an allocation for {destination} in OpenPortal. " +
+                 "You may only have a single active allocation per destination per project. " +
+                 f"The existing allocation(s) are: {existing_allocations}")
+
     def create_allocation(self, allocation):
         if allocation.has_project_identifier():
             project = allocation.get_project_identifier()
@@ -161,13 +191,16 @@ class OpenPortalBackend(ServiceBackend):
                 else:
                     allocation.set_mapping(mapping)
         else:
+            self.assert_can_create_allocation_for_project(allocation.project)
+
             project = allocation.project
             project_name = self.get_project_short_name(project)
+
             logger.info(f"Creating allocation: {allocation} for project {project_name}")
 
             if project_name is None or not project_name.strip():
                 logger.error(f"Empty project_name for allocation: {allocation} - cannot create in OpenPortal")
-                return
+                raise ServiceBackendError(f"Empty project_name for allocation. Please set a short name for {project}")
 
             mapping = self.client.add_project(project_name)
 
@@ -184,6 +217,7 @@ class OpenPortalBackend(ServiceBackend):
             self.sync_users(allocation)
         else:
             logger.error(f"Program bug? Allocation {allocation} has no project identifier - cannot sync users")
+            raise ServiceBackendError(f"Allocation {allocation} for {project} has no project identifier - cannot sync users")
 
     def delete_allocation(self, allocation):
         logger.info(f"Deleting allocation: {allocation}")
