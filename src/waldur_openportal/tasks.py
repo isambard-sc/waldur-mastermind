@@ -100,3 +100,17 @@ def sync():
     for customer in structure_models.Customer.objects.all():
         for allocation in get_structure_allocations(customer):
             sync_allocation_users.delay(core_utils.serialize_instance(allocation))
+
+
+@shared_task(name="waldur_openportal.sync_project")
+def sync_project(serialized_project):
+    """
+    This is a project sync - this will go through all users associated
+    with the project and ensure that they have the correct associations
+    with any OpenPortal allocations. This will add and remove users as needed.
+    """
+    logger.info(f"OpenPortal task.sync_project: {serialized_project}")
+    project = core_utils.deserialize_instance(serialized_project)
+
+    for allocation in get_structure_allocations(project):
+        sync_allocation_users.delay(core_utils.serialize_instance(allocation))

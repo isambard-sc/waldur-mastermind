@@ -134,7 +134,7 @@ class OpenPortalBackend(ServiceBackend):
             except Exception as e:
                 logger.error(f"Unable to add user {user} to OpenPortal: {e}")
 
-        stale_mappings = set(user_mappings) - set(allocated_mappings)
+        stale_mappings = [mapping for mapping in user_mappings if mapping not in allocated_mappings]
 
         logger.info(f"Stale users in OpenPortal: {stale_mappings}")
 

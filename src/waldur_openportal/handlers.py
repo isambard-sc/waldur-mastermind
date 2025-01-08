@@ -41,6 +41,18 @@ def schedule_sync(*args, **kwargs):
 
 
 @if_plugin_enabled
+def schedule_project_sync(project):
+    """
+    Schedule a synchronization of OpenPortal data for a specific project.
+    This will double-check that all users are correctly associated with
+    the project, and will add/remove users as needed
+    """
+
+    logger.info(f"Scheduling OpenPortal synchronization for project {project}")
+    tasks.sync_project(core_utils.serialize_instance(project))
+
+
+@if_plugin_enabled
 def schedule_sync_on_quota_change(sender, instance, created=False, **kwargs):
     if instance.name != utils.QUOTA_NAME:
         return
@@ -148,8 +160,9 @@ def role_revoked(sender, instance, **kwargs):
     if not isinstance(instance.scope, Customer | Project):
         return
 
-    # re-sync everything - it's safer, but could be optimised
-    schedule_sync()
+    # re-sync everyone in the project - this is safe as it will catch
+    # people who should have been removed previously too
+    schedule_project_sync(instance.scope)
 
 
 @if_plugin_enabled
