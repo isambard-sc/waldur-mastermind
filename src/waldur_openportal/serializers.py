@@ -25,23 +25,12 @@ class AllocationSerializer(
     structure_serializers.BaseResourceSerializer,
     core_serializers.AugmentedSerializerMixin,
 ):
-    username = rf_serializers.SerializerMethodField()
-
-    def get_username(self, allocation):
-        request = self.context["request"]
-        try:
-            association = models.Association.objects.get(user=request.user)
-            return association.username
-        except models.Association.DoesNotExist:
-            return None
-
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.Allocation
         fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
             "node_limit",
             "groupname",
             "node_usage",
-            "username",
             "is_active",
         )
         read_only_fields = (
@@ -123,7 +112,7 @@ class AllocationUserUsageSerializer(rf_serializers.HyperlinkedModelSerializer):
 
 class AssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
     allocation = rf_serializers.HyperlinkedRelatedField(
-        queryset=models.Allocation.objects.all(),
+        queryset=models.Association.objects.all(),
         view_name="openportal-allocation-detail",
         lookup_field="uuid",
     )
@@ -133,6 +122,7 @@ class AssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
         fields = (
             "uuid",
             "username",
+            "groupname",
             "useridentifier",
             "allocation",
         )
