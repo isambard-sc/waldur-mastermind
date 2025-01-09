@@ -1,5 +1,7 @@
-from . import views
+from django.urls import path
 
+from . import views
+from .api import access_for_email
 
 def register_in(router):
     router.register(
@@ -25,3 +27,7 @@ def register_in(router):
         views.ProjectInfoViewSet,
         basename="openportal-projectinfo",
     )
+
+urlpatterns = [
+    path("openportal/access_for_email", access_for_email),
+]

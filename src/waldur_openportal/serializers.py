@@ -1,4 +1,4 @@
-import re
+import logging
 
 from django.core.validators import MinValueValidator
 from django.utils.translation import gettext_lazy as _
@@ -7,9 +7,12 @@ from rest_framework import serializers as rf_serializers
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.structure import serializers as structure_serializers
+
 from waldur_core.structure.permissions import _has_admin_access
 
 from . import models
+
+logger = logging.getLogger(__name__)
 
 
 class OpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer):
@@ -130,7 +133,7 @@ class AssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
 
 class UserInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
     class Meta:
-        model = models.AllocationUserUsage
+        model = models.UserInfo
         fields = (
             "shortname",
             "user",
@@ -141,6 +144,21 @@ class UserInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
                 "view_name": "user-detail",
             },
         }
+
+
+class UserInfoModifySerializer(UserInfoSerializer):
+
+    def validate(self, attrs):
+        logger.info(f"Validating UserInfo {attrs}")
+        return attrs
+
+    def create(self, validated_data):
+        logger.info(f"Creating UserInfo {validated_data}")
+        raise NotImplementedError()
+
+    def update(self, instance, validated_data):
+        logger.info(f"Updating UserInfo {validated_data}")
+        raise NotImplementedError()
 
 
 class ProjectInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
@@ -157,3 +175,18 @@ class ProjectInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
                 "view_name": "project-detail",
             },
         }
+
+
+class ProjectInfoModifySerializer(ProjectInfoSerializer):
+
+    def validate(self, attrs):
+        logger.info(f"Validating ProjectInfo {attrs}")
+        return attrs
+
+    def create(self, validated_data):
+        logger.info(f"Creating ProjectInfo {validated_data}")
+        raise NotImplementedError()
+
+    def update(self, instance, validated_data):
+        logger.info(f"Updating ProjectInfo {validated_data}")
+        raise NotImplementedError()
