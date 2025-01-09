@@ -55,17 +55,51 @@ class OpenPortalBackend(ServiceBackend):
         else:
             return True
 
-    def get_project_short_name(self, project):
+    def get_project_shortname(self, project):
         """
-        Return the preferred short name for the passed project.
+        Return the preferred shortname for the passed project.
         """
-        return project.short_name
+        # look up the short name from the models.ProjectInfo object
+        # associated with this project
+        project_info, created = models.ProjectInfo.objects.get_or_create(project=project)
 
-    def get_user_short_name(self, user):
+        # if this is not set, then copy it in from the project.short_name
+        # property (which may disappear in the future)
+        if project_info.shortname is None:
+            try:
+                logger.info(f"Copying shortname from the project's short_name for {project}")
+                project_info.shortname = project.short_name
+                project_info.save()
+            except Exception as e:
+                logger.error(f"Unable to set shortname for project {project}: {e}")
+
+        if project_info.shortname is None:
+            logger.error(f"Empty shortname for project: {project}")
+
+        return project_info.shortname
+
+    def get_user_shortname(self, user):
         """
-        Return the preferred short name for the passed user.
+        Return the preferred shortname for the passed user.
         """
-        return user.unix_username
+        # look up the short name from the models.UserInfo object
+        # associated with this user
+        user_info, created = models.UserInfo.objects.get_or_create(user=user)
+
+        # if this is not set, then copy it in from the user.unix_username
+        # property (which may disappear in the future)
+        if user_info.shortname is None:
+            try:
+                logger.info(f"Copying shortname from the user's unix_username for {user}")
+                user_info.shortname = user.unix_username
+                user_info.save()
+            except Exception as e:
+                logger.error(f"Unable to set shortname for user {user}: {e}")
+
+        if user_info.shortname is None:
+            logger.error(f"Empty shortname for user: {user}")
+
+        return user_info.shortname
 
     def sync_users(self, allocation: models.Allocation) -> None:
         if not isinstance(allocation, models.Allocation):
@@ -97,8 +131,6 @@ class OpenPortalBackend(ServiceBackend):
                 # get the association between the user and the allocation
                 (association, created) = models.Association.objects.get_or_create(user=user, allocation=allocation)
 
-                logger.info(f"Association: {association}")
-
                 mapping = None
 
                 if association.has_mapping():
@@ -106,10 +138,10 @@ class OpenPortalBackend(ServiceBackend):
 
                 if mapping is None or mapping not in user_mappings:
                     logger.info(f"Adding user {user} to OpenPortal")
-                    shortname = self.get_user_short_name(user)
+                    shortname = self.get_user_shortname(user)
 
                     if shortname is None or not shortname.strip():
-                        logger.error(f"Empty unix_shortname for user: {user} - cannot add to OpenPortal")
+                        logger.error(f"Empty shortname for user: {user} - cannot add to OpenPortal")
                         continue
 
                     new_mapping = self.client.add_user(shortname=shortname, project=project)
@@ -136,7 +168,8 @@ class OpenPortalBackend(ServiceBackend):
 
         stale_mappings = [mapping for mapping in user_mappings if mapping not in allocated_mappings]
 
-        logger.info(f"Stale users in OpenPortal: {stale_mappings}")
+        if len(stale_mappings) > 0:
+            logger.info(f"Stale users in OpenPortal: {stale_mappings}")
 
         for mapping in stale_mappings:
             try:
@@ -194,7 +227,7 @@ class OpenPortalBackend(ServiceBackend):
             self.assert_can_create_allocation_for_project(allocation.project)
 
             project = allocation.project
-            project_name = self.get_project_short_name(project)
+            project_name = self.get_project_shortname(project)
 
             logger.info(f"Creating allocation: {allocation} for project {project_name}")
 
@@ -253,7 +286,7 @@ class OpenPortalBackend(ServiceBackend):
 
         logger.info(f"Adding user {user} to project {project} in OpenPortal")
 
-        shortname = self.get_user_short_name(user)
+        shortname = self.get_user_shortname(user)
 
         if shortname is None or not shortname.strip():
             logger.error(f"Empty unix_shortname for user: {user} - they cannot be added to OpenPortal")

@@ -4,16 +4,20 @@ from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils.translation import gettext_lazy as _
+from django.core import validators
+
 from model_utils import FieldTracker
 
 from waldur_core.core import models as core_models
 from waldur_core.structure import models as structure_models
 from waldur_openportal import utils
 
+MAX_USER_SHORTNAME_LENGTH = 32
+MAX_PROJECT_SHORTNAME_LENGTH = 30
 MAX_GROUPNAME_LENGTH = 64
 MAX_USERNAME_LENGTH = 64
 MAX_USERIDENTIFIER_LENGTH = 128
-
+MAX_ALLOWED_DESTINATIONS_LENGTH = 1024
 
 class UsageMixin(models.Model):
     class Meta:
@@ -255,3 +259,144 @@ class AllocationUserUsage(UsageMixin):
 
     def __repr__(self) -> str:
         return self.__str__()
+
+
+class UserInfo(models.Model):
+    """
+    This model is responsible for storing additional user information
+    required by OpenPortal. Currently this is the preferred shortname
+    for the user, which will be combined with the project shortname
+    to create the local username
+    """
+
+    user = models.OneToOneField(
+        to=settings.AUTH_USER_MODEL,
+        related_name="op-userinfo-user+",
+        on_delete=models.CASCADE,
+    )
+
+    shortname = models.CharField(
+        verbose_name=_("shortname"),
+        max_length=MAX_USER_SHORTNAME_LENGTH,
+        unique=True,
+        null=True,
+        help_text=_(
+            "A short, unique name for you. It will be used to form your local username on any systems. Should only contain lower-case letters and digits and must start with a letter."
+        ),
+        validators=[
+            validators.RegexValidator(
+                regex=r"^[a-z][a-z0-9]+$",
+                message="Must start with a letter and only contain numbers and letters.",
+            ),
+            validators.RegexValidator(
+                regex=r"(admin)|(root)$",
+                inverse_match=True,
+            ),
+            validators.MinLengthValidator(4),
+            validators.MaxLengthValidator(MAX_USER_SHORTNAME_LENGTH),
+        ],
+    )
+
+    tracker = FieldTracker(fields=["shortname"])
+
+    def __str__(self) -> str:
+        return f"{self.user}: {self.shortname}"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    def save(self, *args, **kwargs):
+        if "update_fields" in kwargs and "query_field" not in kwargs["update_fields"]:
+            kwargs["update_fields"] = set(kwargs["update_fields"]).add("query_field")
+
+        # The shortname cannot be changed after creation as external systems may already depend on it.
+        prev = self.tracker.previous("shortname")
+        if self.tracker.has_changed("shortname") and prev:
+            new = self.shortname
+            raise ValueError(
+                _(
+                    f"Cannot change shortname of user ('{prev}' → '{new}') after creation."
+                )
+            )
+
+        super().save(*args, **kwargs)
+
+
+class ProjectInfo(models.Model):
+    """
+    This model is responsible for storing additional project information
+    required by OpenPortal. Currently this is the shortname for the project,
+    which will be combined with the user shortname to create the local
+    username on a system. It also contains the list of allowable
+    destinations of instances that can be attached to this project.
+    For example, a project may only allow "brics.aip1.*", meaning that
+    only instances that start with "brics.aip1." can be attached to
+    this project.
+    """
+
+    project = models.OneToOneField(
+        to=structure_models.Project,
+        related_name="op-projectinfo-project+",
+        on_delete=models.CASCADE,
+    )
+
+    shortname = models.CharField(
+        verbose_name=_("shortname"),
+        max_length=MAX_PROJECT_SHORTNAME_LENGTH,
+        unique=True,
+        null=True,
+        help_text=_(
+            "A short, unique name for the project. It will be used to form the local username of any users in the project on any systems. Should only contain lower-case letters and digits and must start with a letter."
+        ),
+        validators=[
+            validators.RegexValidator(
+                regex=r"^[a-z0-9\-_]+$",
+                ),
+            validators.RegexValidator(
+                regex=r"(-admin)|(-root)$",
+                inverse_match=True,
+                ),
+            validators.MinLengthValidator(3),
+            validators.MaxLengthValidator(MAX_PROJECT_SHORTNAME_LENGTH),
+        ],
+    )
+
+    # This is the list of allowable destinations of instances that can be attached to this project.
+    # For example, a project may only allow "brics.aip1.*", meaning that only instances that start with
+    # "brics.aip1." can be attached to this project.
+    allowed_destinations = models.TextField(
+        verbose_name=_("allowed destinations"),
+        max_length=MAX_ALLOWED_DESTINATIONS_LENGTH,
+        help_text=_(
+            "A comma-separated list of allowable destinations of instances that \
+             can be attached to this project. For example, a project may only allow \
+             'brics.aip1.*', meaning that only instances that start with 'brics.aip1.' \
+             can be attached to this project."
+        ),
+        blank=True,
+        null=True,
+    )
+
+    tracker = FieldTracker(fields=["shortname", "allowed_destinations"])
+
+    def __str__(self) -> str:
+        return f"{self.project}: {self.shortname}"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    def save(self, *args, **kwargs):
+        if "update_fields" in kwargs and "query_field" not in kwargs["update_fields"]:
+            kwargs["update_fields"] = set(kwargs["update_fields"]).add("query_field")
+
+        # The shortname cannot be changed after creation as external systems may already depend on it.
+        prev = self.tracker.previous("shortname")
+        if self.tracker.has_changed("shortname") and prev:
+            new = self.shortname
+            raise ValueError(
+                _(
+                    f"Cannot change shortname of project ('{prev}' → '{new}') after creation."
+                )
+            )
+
+        super().save(*args, **kwargs)
