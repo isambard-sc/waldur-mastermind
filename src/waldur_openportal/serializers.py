@@ -126,3 +126,34 @@ class AssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
             "useridentifier",
             "allocation",
         )
+
+
+class UserInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
+    class Meta:
+        model = models.AllocationUserUsage
+        fields = (
+            "shortname",
+            "user",
+        )
+        extra_kwargs = {
+            "user": {
+                "lookup_field": "uuid",
+                "view_name": "user-detail",
+            },
+        }
+
+
+class ProjectInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
+    class Meta:
+        model = models.ProjectInfo
+        fields = (
+            "project",
+            "shortname",
+            "allowed_destinations",
+        )
+        extra_kwargs = {
+            "project": {
+                "lookup_field": "uuid",
+                "view_name": "project-detail",
+            },
+        }

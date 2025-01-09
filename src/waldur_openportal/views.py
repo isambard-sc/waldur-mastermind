@@ -55,3 +55,21 @@ class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.AssociationFilter
+
+
+class UserInfoViewSet(viewsets.ReadOnlyModelViewSet):
+    lookup_field = "uuid"
+    queryset = models.UserInfo.objects.all().order_by("shortname")
+    serializer_class = serializers.UserInfoSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.UserInfoFilter
+
+
+class ProjectInfoViewSet(viewsets.ReadOnlyModelViewSet):
+    lookup_field = "uuid"
+    queryset = models.ProjectInfo.objects.all().order_by("shortname")
+    serializer_class = serializers.ProjectInfoSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.ProjectInfoFilter

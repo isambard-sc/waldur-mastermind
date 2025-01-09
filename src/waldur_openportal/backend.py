@@ -302,7 +302,7 @@ class OpenPortalBackend(ServiceBackend):
             mapping = association.get_mapping()
 
         if mapping is not None:
-            logger.info(f"User {user} hasd previously been in {project} with mapping {mapping}")
+            logger.info(f"User {user} has previously been in {project} with mapping {mapping}")
             logger.info("Re-adding them to OpenPortal with the same mapping.")
 
         try:

@@ -30,3 +30,13 @@ class AssociationFilter(django_filters.FilterSet):
         view_name="openportal-allocation-detail", field_name="allocation__uuid"
     )
     allocation_uuid = django_filters.UUIDFilter(field_name="allocation__uuid")
+
+
+class UserInfoFilter(django_filters.FilterSet):
+    user = core_filters.URLFilter(view_name="user-detail", field_name="user__uuid")
+    user_uuid = django_filters.UUIDFilter(field_name="user__uuid")
+
+
+class ProjectInfoFilter(django_filters.FilterSet):
+    project = core_filters.URLFilter(view_name="project-detail", field_name="project__uuid")
+    project_uuid = django_filters.UUIDFilter(field_name="project__uuid")

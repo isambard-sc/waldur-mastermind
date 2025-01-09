@@ -15,3 +15,13 @@ def register_in(router):
         views.AssociationViewSet,
         basename="openportal-association",
     )
+    router.register(
+        r"openportal-userinfo",
+        views.UserInfoViewSet,
+        basename="openportal-userinfo",
+    )
+    router.register(
+        r"openportal-projectinfo",
+        views.ProjectInfoViewSet,
+        basename="openportal-projectinfo",
+    )
