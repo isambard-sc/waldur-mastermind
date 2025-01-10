@@ -26,6 +26,13 @@ class OpenPortalBackend(ServiceBackend):
         self.settings = settings
         self.client = self.get_client(settings)
 
+    def destination(self) -> openportal.Destination:
+        """
+        Return the OpenPortal Destination for the instance
+        being managed by this backend
+        """
+        return self.client.destination()
+
     def get_client(self, settings):
         logger.info(f"Creating OpenPortal client for settings: {settings}")
         return OpenPortalClient(

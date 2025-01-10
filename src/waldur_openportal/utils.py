@@ -1,4 +1,3 @@
-import itertools
 import re
 
 from django.utils import timezone
@@ -8,7 +7,8 @@ from waldur_core.structure.managers import (
     get_connected_customers,
     get_connected_projects,
 )
-from waldur_openportal import models
+
+from . import models
 
 MAPPING = {
     "node_usage": "op_node_usage",

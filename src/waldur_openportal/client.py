@@ -99,6 +99,9 @@ class OpenPortalClient(BaseBatchClient):
     See also: https://github.com/isambard-sc/openportal
     """
     def __init__(self, instance_name):
+        if instance_name is None:
+            raise openportal.OpenPortalError("Instance name cannot be None")
+
         self._runner = OpenPortalRunner()
         self._destination = openportal.Destination(instance_name)
 

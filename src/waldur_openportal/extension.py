@@ -1,8 +1,4 @@
-import logging
-
 from waldur_core.core import WaldurExtension
-
-logger = logging.getLogger(__name__)
 
 
 class OpenPortalExtension(WaldurExtension):
@@ -13,9 +9,6 @@ class OpenPortalExtension(WaldurExtension):
     @staticmethod
     def django_urls():
         from .urls import urlpatterns
-
-        logger.info("OpenPortalExtension urlpatterns: %s", urlpatterns)
-
         return urlpatterns
 
     @staticmethod

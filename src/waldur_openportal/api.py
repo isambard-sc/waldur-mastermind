@@ -10,8 +10,12 @@ from rest_framework.permissions import IsAuthenticated
 
 from http import HTTPStatus as status
 
-from waldur_core.structure import models
+from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import get_connected_projects
+
+from . import models
+from . import utils
+
 
 logger = logging.getLogger(__name__)
 
@@ -39,36 +43,6 @@ def access_for_email(request):
     a staff user can query any email address, but a non-staff user can
     only query email addresses for projects in which they have this
     level of access)
-
-    This returns a JSON object as follows, with fields
-
-    {
-        "email": "email_in_waldur",
-        "status": "active | invited | unknown",
-        "short_name": "short_name",
-        "projects": {
-            "project_1": ["platform_1", "platform_2"],
-            "project_2": ["platform_1"]
-        }
-        "invited_by": "invited_by_user",
-        "reason": "reason"
-    }
-
-    The fields are filled in three different ways, depending on the
-    status of the email address:
-
-    Status == active:
-
-    short_name and projects are filled. invited_by and reason are null
-
-    Status == invited:
-
-    invited_by filled, everything else is null
-
-    Status == unknown:
-
-    reason filled, everything else is null
-
     """
     user = request.user
 
@@ -99,7 +73,7 @@ def access_for_email(request):
             response.status_code = status.FORBIDDEN
             return response
 
-    logger.info(f"openportal/access_for_email request for {email} from {user} ({user.email})")
+    logger.info(f"api/openportal/access_for_email request for {email} from {user} ({user.email})")
 
     qs = User.all_objects.all()
 
@@ -110,64 +84,68 @@ def access_for_email(request):
 
     reason = None
     is_authorised = False
-    short_name = None
-    projects = None
+    projects = {}
 
     # Waldur stores old accounts, so can only stop searching
     # when we find an active user - can't break early for an
     # inactive user in case there is another active user with
     # the same email (or if there is a pending invitation for
     # that email)
-    for person in qs:
-        if person.is_active:
-            # get the list of projects the user is active on,
-            # and the platforms they can access, plus
-            # their short name
-            email_in_waldur = person.email
-
-            connected_projects = get_connected_projects(person)
-            projects = models.Project.available_objects.filter(
-                id__in=connected_projects
+    for user in qs:
+        if user.is_active:
+            # how many projects is this user associated with?
+            member_of_projects = structure_models.Project.available_objects.filter(
+                id__in=get_connected_projects(user)
             )
-            project_names = [p.short_name for p in projects]
 
-            if not project_names:
-                project_names = []
+            if len(member_of_projects) == 0:
+                # skip this user as they are not a member of any projects
+                logger.warning(f"User {user} is not an active member of any projects")
+                reason = "User account is not a member of any projects."
+                continue
 
-            projects = {}
+            # get the UserInfo object for the user
+            userinfo, created = models.UserInfo.objects.get_or_create(user=user)
+            userinfo.sanitise()
 
-            for project in project_names:
-                # very simple allocation mechanism for now - if the project
-                # name starts with "i3-" then it will only have access to
-                # the "slurm.3.isambard" platform, otherwise it will have
-                # access to "slurm.aip1.isambard"
-                if project in ["benchmarking", "brics"]:
-                    projects[project] = [
-                        "slurm.aip1.isambard",
-                        "jupyter.aip1.isambard",
-                        "slurm.3.isambard",
-                        "slurm.macs3.isambard",
-                    ]
-                elif project.endswith("-i3"):
-                    projects[project] = ["slurm.3.isambard", "slurm.macs3.isambard"]
-                else:
-                    projects[project] = [
-                        "slurm.aip1.isambard",
-                        "jupyter.aip1.isambard",
-                    ]
+            email_in_waldur = user.email
 
-            if len(projects) == 0:
-                # this is not an active user
-                reason = "User account has no active projects."
-            else:
-                # this is an active user
-                is_authorised = True
-                short_name = person.unix_username
+            # loop over all of the allocations for this user
+            for allocation in utils.get_project_allocations(user):
+                if not allocation.has_project_identifier():
+                    logger.warning(f"OpenPortal - {allocation} has no project identifier, skipping")
+                    continue
 
-                if short_name is None or len(short_name) == 0:
-                    short_name = ""
+                project = str(allocation.get_project_identifier())
+                destination = str(allocation.get_backend().destination())
 
-                break
+                # find the association between the user and the allocation
+                try:
+                    association = models.Association.objects.get(user=user, allocation=allocation)
+                except models.Association.DoesNotExist:
+                    logger.warning(f"Association between {user} and {allocation} not found - skipping")
+                    continue
+
+                username = association.username
+
+                if username is None:
+                    logger.warning(f"Association between {user} and {allocation} has no username '{username}' - skipping")
+                    continue
+
+                if project not in projects:
+                    projects[project] = []
+
+                access = {
+                    "projectname": str(allocation.project.name),
+                    "destination": destination,
+                    "username": username,
+                }
+
+                projects[project].append(access)
+
+            # this is an active user
+            is_authorised = True
+            break
         elif reason is None:
             reason = "User account is not active"
 
@@ -176,7 +154,6 @@ def access_for_email(request):
             {
                 "email": email_in_waldur,
                 "status": "active",
-                "short_name": short_name,
                 "projects": projects,
                 "invited_by": "",
                 "reason": "",
@@ -216,7 +193,6 @@ def access_for_email(request):
                 "email": email_in_waldur,
                 "status": "invited",
                 "projects": {},
-                "short_name": "",
                 "invited_by": invited_by,
                 "reason": "",
             }
@@ -232,7 +208,6 @@ def access_for_email(request):
         {
             "email": email,
             "status": "unknown",
-            "short_name": "",
             "projects": {},
             "invited_by": "",
             "reason": reason,
