@@ -329,7 +329,11 @@ class UserInfo(models.Model):
             raise ValueError("Shortname cannot be empty.")
 
         if hasattr(self.user, "unix_username"):
-           self.shortname = self.user.unix_username
+            if shortname != self.user.unix_username and self.user.unix_username is not None:
+                self.user.unix_username = self.shortname
+                self.user.save()
+
+            self.shortname = self.user.unix_username
 
         if self.shortname and self.shortname != shortname:
             logger.error(f"Cannot change shortname of user {self.user} from {self.shortname} to {shortname}")
@@ -437,7 +441,11 @@ class ProjectInfo(models.Model):
             raise ValueError("Shortname cannot be empty.")
 
         if hasattr(self.project, "short_name"):
-           self.shortname = self.project.short_name
+            if shortname != self.project.short_name and self.project.short_name is not None:
+                self.project.short_name = self.shortname
+                self.project.save()
+
+            self.shortname = self.project.short_name
 
         if self.shortname and self.shortname != shortname:
             logger.error(f"Cannot change shortname of project {self.project} from {self.shortname} to {shortname}")

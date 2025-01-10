@@ -49,8 +49,3 @@ def register_in(router):
         views.AccessSubnetViewSet,
         basename="access-subnets",
     )
-
-
-urlpatterns = [
-    path("brics/access_for_email", brics.access_for_email),
-]

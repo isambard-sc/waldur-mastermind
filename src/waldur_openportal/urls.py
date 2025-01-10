@@ -1,4 +1,4 @@
-from django.urls import path
+from django.urls import re_path
 
 from . import views
 from .api import access_for_email
@@ -29,5 +29,9 @@ def register_in(router):
     )
 
 urlpatterns = [
-    path("openportal/access_for_email", access_for_email),
+    re_path(
+        r"^api/openportal/access_for_email/",
+        access_for_email,
+        name="access-for-email",
+    ),
 ]

@@ -1,6 +1,7 @@
 
 import logging
 import operator
+import re
 from functools import reduce
 
 from django.conf import settings as django_settings
@@ -185,7 +186,7 @@ class OpenPortalBackend(ServiceBackend):
         a single allocation per instance, and they must have a routing path
         that matches the destination of this instance.
         """
-        destination = self.client.destination()
+        destination = str(self.client.destination())
 
         logger.info(f"Asserting that project {project} can create an allocation for {destination}")
 
@@ -207,6 +208,40 @@ class OpenPortalBackend(ServiceBackend):
                 f"Project {project} already has an allocation for {destination} in OpenPortal. " +
                  "You may only have a single active allocation per destination per project. " +
                  f"The existing allocation(s) are: {existing_allocations}")
+
+        # now look at the allowed destinations for this project, from its
+        # project-info object
+        project_info, created = models.ProjectInfo.objects.get_or_create(project=project)
+        project_info.sanitise()
+
+        if project_info.allowed_destinations is None:
+            logger.error(f"Project {project} has no allowed destinations")
+            raise ServiceBackendError(
+                f"Project {project} has no allowed OpenPortal destinations, so cannot create an allocation on {destination}")
+
+        allowed_destinations = project_info.allowed_destinations.split(",")
+
+        for allowed_destination in allowed_destinations:
+            allowed_destination = allowed_destination.strip()
+
+            # the allowed_destination is a regular expression, so we need to match it
+            if allowed_destination == destination:
+                # we have an exact match
+                return
+            elif allowed_destination == "*":
+                # this is a wildcard, so we allow it
+                return
+            else:
+                if re.match(allowed_destination, destination):
+                    # this is a match
+                    return
+
+        logger.error(f"Project {project} is not allowed to create an allocation for {destination}")
+        logger.error(f"Allowed destinations are: {allowed_destinations}")
+
+        raise ServiceBackendError(
+            f"Project {project} is not allowed to create an allocation for {destination}. " +
+            f"Allowed destinations are: {allowed_destinations}")
 
     def create_allocation(self, allocation):
         if allocation.has_project_identifier():
@@ -289,7 +324,7 @@ class OpenPortalBackend(ServiceBackend):
         shortname = self.get_user_shortname(user)
 
         if shortname is None or not shortname.strip():
-            logger.error(f"Empty unix_shortname for user: {user} - they cannot be added to OpenPortal")
+            logger.error(f"Empty shortname for user: {user} - they cannot be added to OpenPortal")
             return False
 
         # get or create the association between the user and the allocation
