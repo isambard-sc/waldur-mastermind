@@ -104,6 +104,21 @@ class UserInfoViewSet(core_views.ActionsViewSet):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=["get"])
+    def me(self, request):
+        logger.info(f"Retrieving UserInfo for 'me'=user {request.user}")
+
+        try:
+            userinfo = self._get(request.user.uuid)
+        except Exception as e:
+            logger.error(f"Error retrieving user {request.user}: {e}")
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        serializer = serializers.UserInfoSerializer(instance=userinfo,
+                                                    context={"request": request})
+
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["PUT"])
     def set_shortname(self, request, user=None):
         logger.info(f"Setting shortname for user {user} : {request}")
@@ -114,10 +129,22 @@ class UserInfoViewSet(core_views.ActionsViewSet):
             logger.error(f"Error retrieving user {user}: {e}")
             return Response(status=status.HTTP_404_NOT_FOUND)
 
-        serializer = serializers.UserInfoModifySerializer(userinfo, data=request.data)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+        user = userinfo.user
 
+        logger.info(f"userinfo.user = {user}")
+        logger.info(f"request.data = {request.data}")
+
+        try:
+            userinfo.shortname = request.data["shortname"]
+            userinfo.save()
+        except Exception as e:
+            logger.error(f"Error setting shortname for user {user}: {e}")
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = serializers.UserInfoSerializer(instance=userinfo,
+                                                    context={"request": request})
+
+        logger.info(f"Return response... {serializer.data}")
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 

@@ -146,21 +146,6 @@ class UserInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
         }
 
 
-class UserInfoModifySerializer(UserInfoSerializer):
-
-    def validate(self, attrs):
-        logger.info(f"Validating UserInfo {attrs}")
-        return attrs
-
-    def create(self, validated_data):
-        logger.info(f"Creating UserInfo {validated_data}")
-        raise NotImplementedError()
-
-    def update(self, instance, validated_data):
-        logger.info(f"Updating UserInfo {validated_data}")
-        raise NotImplementedError()
-
-
 class ProjectInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
     class Meta:
         model = models.ProjectInfo
@@ -176,17 +161,3 @@ class ProjectInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
             },
         }
 
-
-class ProjectInfoModifySerializer(ProjectInfoSerializer):
-
-    def validate(self, attrs):
-        logger.info(f"Validating ProjectInfo {attrs}")
-        return attrs
-
-    def create(self, validated_data):
-        logger.info(f"Creating ProjectInfo {validated_data}")
-        raise NotImplementedError()
-
-    def update(self, instance, validated_data):
-        logger.info(f"Updating ProjectInfo {validated_data}")
-        raise NotImplementedError()
