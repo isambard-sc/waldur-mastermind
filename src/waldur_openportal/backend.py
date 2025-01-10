@@ -63,15 +63,15 @@ class OpenPortalBackend(ServiceBackend):
         # associated with this project
         project_info, created = models.ProjectInfo.objects.get_or_create(project=project)
 
+        project = project_info.project
+
         # if this is not set, then copy it in from the project.short_name
         # property (which may disappear in the future)
-        if project_info.shortname is None:
-            try:
+        if project_info.shortname is None and hasattr(project, "short_name"):
+            if project.short_name is not None:
                 logger.info(f"Copying shortname from the project's short_name for {project}")
-                project_info.shortname = project.short_name
+                project_info.set_shortname(project.shortname)
                 project_info.save()
-            except Exception as e:
-                logger.error(f"Unable to set shortname for project {project}: {e}")
 
         if project_info.shortname is None:
             logger.error(f"Empty shortname for project: {project}")
@@ -86,15 +86,15 @@ class OpenPortalBackend(ServiceBackend):
         # associated with this user
         user_info, created = models.UserInfo.objects.get_or_create(user=user)
 
+        user = user_info.user
+
         # if this is not set, then copy it in from the user.unix_username
         # property (which may disappear in the future)
-        if user_info.shortname is None:
-            try:
+        if user_info.shortname is None and hasattr(user, "unix_username"):
+            if user.unix_username is not None:
                 logger.info(f"Copying shortname from the user's unix_username for {user}")
-                user_info.shortname = user.unix_username
+                user_info.set_shortname(user.unix_username)
                 user_info.save()
-            except Exception as e:
-                logger.error(f"Unable to set shortname for user {user}: {e}")
 
         if user_info.shortname is None:
             logger.error(f"Empty shortname for user: {user}")

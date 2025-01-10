@@ -1,3 +1,5 @@
+import logging
+
 from . import op as openportal
 
 from django.conf import settings
@@ -11,6 +13,8 @@ from model_utils import FieldTracker
 from waldur_core.core import models as core_models
 from waldur_core.structure import models as structure_models
 from waldur_openportal import utils
+
+logger = logging.getLogger(__name__)
 
 MAX_USER_SHORTNAME_LENGTH = 32
 MAX_PROJECT_SHORTNAME_LENGTH = 30
@@ -305,6 +309,34 @@ class UserInfo(models.Model):
     def __repr__(self) -> str:
         return self.__str__()
 
+    def sanitise(self):
+        """
+        Double check that our shortname matches the user unix_username
+        if this field exists
+        """
+        if hasattr(self.user, "unix_username"):
+            if self.shortname != self.user.unix_username and self.user.unix_username is not None:
+                self.set_shortname(self.user.unix_username)
+                self.save()
+
+    def set_shortname(self, shortname: str):
+        """
+        Set the shortname, checking whether or not this has not already
+        been set, and making sure it lines up with the unix_username if
+        that field is present in the user
+        """
+        if not shortname:
+            raise ValueError("Shortname cannot be empty.")
+
+        if hasattr(self.user, "unix_username"):
+           self.shortname = self.user.unix_username
+
+        if self.shortname and self.shortname != shortname:
+            logger.error(f"Cannot change shortname of user {self.user} from {self.shortname} to {shortname}")
+            raise ValueError(f"Cannot change shortname of user {self.user} from {self.shortname} to {shortname}")
+
+        self.shortname = shortname
+
     def save(self, *args, **kwargs):
         if "update_fields" in kwargs and "query_field" not in kwargs["update_fields"]:
             kwargs["update_fields"] = set(kwargs["update_fields"]).add("query_field")
@@ -384,6 +416,44 @@ class ProjectInfo(models.Model):
 
     def __repr__(self) -> str:
         return self.__str__()
+
+    def sanitise(self):
+        """
+        Double check that our shortname matches the project short_name
+        if this field exists
+        """
+        if hasattr(self.project, "short_name"):
+            if self.shortname != self.project.short_name and self.project.short_name is not None:
+                self.set_shortname(self.project.short_name)
+                self.save()
+
+    def set_shortname(self, shortname: str):
+        """
+        Set the shortname, checking whether or not this has not already
+        been set, and making sure it lines up with the short_name if
+        that field is present in the project
+        """
+        if not shortname:
+            raise ValueError("Shortname cannot be empty.")
+
+        if hasattr(self.project, "short_name"):
+           self.shortname = self.project.short_name
+
+        if self.shortname and self.shortname != shortname:
+            logger.error(f"Cannot change shortname of project {self.project} from {self.shortname} to {shortname}")
+            raise ValueError(f"Cannot change shortname of project {self.project} from {self.shortname} to {shortname}")
+
+        self.shortname = shortname
+
+    def set_allowed_destinations(self, destinations: str):
+        """
+        Set the allowed destinations of instances that can be attached to this project.
+        This should be a comma-separated list of destinations.
+        """
+        if not destinations:
+            self.allowed_destinations = None
+        else:
+            self.allowed_destinations = str(destinations)
 
     def save(self, *args, **kwargs):
         if "update_fields" in kwargs and "query_field" not in kwargs["update_fields"]:

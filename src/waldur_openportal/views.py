@@ -8,6 +8,7 @@ from rest_framework.response import Response
 
 from waldur_core.core import executors as core_executors
 from waldur_core.structure import filters as structure_filters
+from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
 from waldur_core.core import views as core_views
@@ -83,6 +84,7 @@ class UserInfoViewSet(core_views.ActionsViewSet):
         user = core_models.User.objects.get(uuid=user)
 
         userinfo, created = models.UserInfo.objects.get_or_create(user=user)
+        userinfo.sanitise()
 
         if created:
             logger.info(f"Created UserInfo {userinfo} for user {user}")
@@ -121,7 +123,11 @@ class UserInfoViewSet(core_views.ActionsViewSet):
 
     @action(detail=True, methods=["PUT"])
     def set_shortname(self, request, user=None):
-        logger.info(f"Setting shortname for user {user} : {request}")
+        try:
+            shortname = str(request.data["shortname"])
+        except Exception as e:
+            logger.error(f"You must provide the 'shortname' field: {e}")
+            return Response(status=status.HTTP_400_BAD_REQUEST)
 
         try:
             userinfo = self._get(user)
@@ -131,11 +137,12 @@ class UserInfoViewSet(core_views.ActionsViewSet):
 
         user = userinfo.user
 
-        logger.info(f"userinfo.user = {user}")
-        logger.info(f"request.data = {request.data}")
+        if request.user != user and not request.user.is_staff:
+            logger.error(f"User {request.user} is not allowed to set shortname for user {user}")
+            return Response(status=status.HTTP_403_FORBIDDEN)
 
         try:
-            userinfo.shortname = request.data["shortname"]
+            userinfo.set_shortname(shortname)
             userinfo.save()
         except Exception as e:
             logger.error(f"Error setting shortname for user {user}: {e}")
@@ -144,7 +151,6 @@ class UserInfoViewSet(core_views.ActionsViewSet):
         serializer = serializers.UserInfoSerializer(instance=userinfo,
                                                     context={"request": request})
 
-        logger.info(f"Return response... {serializer.data}")
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
@@ -152,36 +158,98 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
     queryset = models.ProjectInfo.objects.all().order_by("shortname")
     lookup_field = "project"
     serializer_class = serializers.ProjectInfoSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [
+        permissions.IsAuthenticated,
+        IsAdminOrReadOnly
+    ]
     filterset_class = filters.ProjectInfoFilter
 
-    def create(self, request):
-        serializer = serializers.ProjectInfoModifySerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        projectinfo = serializer.save()
-        serializer = serializers.ProjectInfoSerializer(instance=projectinfo)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+    def _get(self, project):
+        project = structure_models.Project.objects.get(uuid=project)
 
-    def update(self, request, **kwargs):
-        instance = self.get_object()
-        serializer = serializers.ProjectInfoModifySerializer(instance, data=request.data)
-        serializer.is_valid(raise_exception=True)
-        projectinfo = serializer.save()
-        serializer = serializers.ProjectInfoSerializer(instance=projectinfo)
+        projectinfo, created = models.ProjectInfo.objects.get_or_create(project=project)
+        projectinfo.sanitise()
+
+        if created:
+            logger.info(f"Created ProjectInfo {projectinfo} for project {project}")
+        else:
+            logger.info(f"Retrieved ProjectInfo {projectinfo} for project {project}")
+
+        return projectinfo
+
+    def retrieve(self, request, pk=None, project=None):
+        logger.info(f"Retrieving ProjectInfo {pk} : {request} : {project}")
+        try:
+            projectinfo = self._get(project)
+        except Exception as e:
+            logger.error(f"Error retrieving project {project} : {e}")
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        serializer = serializers.ProjectInfoSerializer(instance=projectinfo,
+                                                       context={"request": request})
+
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["PUT"])
-    def update_shortname(self, request, project=None):
-        instance = self.get_object()
-        serializer = serializers.ProjectInfoModifySerializer(instance, data=request.data)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+    def set_shortname(self, request, project=None):
+        try:
+            shortname = str(request.data["shortname"])
+        except Exception as e:
+            logger.error(f"You must provide the 'shortname' field: {e}")
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            projectinfo = self._get(project)
+        except Exception as e:
+            logger.error(f"Error retrieving project {project}: {e}")
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        project = projectinfo.project
+
+        if not request.user.is_staff:
+            logger.error(f"User {request.user} is not allowed to set shortname for project {project}")
+            return Response(status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            projectinfo.set_shortname(shortname)
+            projectinfo.save()
+        except Exception as e:
+            logger.error(f"Error setting shortname for project {project}: {e}")
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = serializers.ProjectInfoSerializer(instance=projectinfo,
+                                                       context={"request": request})
+
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["PUT"])
-    def update_allowed_destinations(self, request, project=None):
-        instance = self.get_object()
-        serializer = serializers.ProjectInfoModifySerializer(instance, data=request.data)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+    def set_allowed_destinations(self, request, project=None):
+        try:
+            allowed_destinations = str(request.data["allowed_destinations"])
+        except Exception as e:
+            logger.error(f"You must provide the 'allowed_destinations' field: {e}")
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            projectinfo = self._get(project)
+        except Exception as e:
+            logger.error(f"Error retrieving project {project}: {e}")
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        project = projectinfo.project
+
+        if not request.user.is_staff:
+            logger.error(f"User {request.user} is not allowed to set allowed_destinations for project {project}")
+            return Response(status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            projectinfo.set_allowed_destinations(allowed_destinations)
+            projectinfo.save()
+        except Exception as e:
+            logger.error(f"Error setting allowed_destinations for project {project}: {e}")
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = serializers.ProjectInfoSerializer(instance=projectinfo,
+                                                       context={"request": request})
+
         return Response(serializer.data, status=status.HTTP_200_OK)
