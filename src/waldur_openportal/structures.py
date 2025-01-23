@@ -1,3 +1,7 @@
+import collections
+
+Account = collections.namedtuple("Account", ["name", "description", "organization"])
+Association = collections.namedtuple("Association", ["account", "user", "value"])
 
 class Quotas:
     def __init__(self, node=0):

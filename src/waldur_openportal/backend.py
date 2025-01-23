@@ -553,4 +553,30 @@ class OpenPortalBackend(ServiceBackend):
         return models.Allocation.objects.filter(service_settings=self.settings)
 
     def _update_allocation_associations(self, allocation):
-        logger.info(f"OpenPortal NoOp - Updating associations for allocation {allocation}")
+        logger.info(f"Updating associations for allocation {allocation}")
+        project = allocation.get_project_identifier()
+
+        # get the UserMappings for all users that are registered with
+        # OpenPortal for this allocation
+        backend_users = self.client.get_users(project)
+
+        # get the UserMappings for all users that Waldur says should
+        # be associated with this allocation
+        local_users = [
+            association.get_mapping() for association in allocation.associations.all() if association.has_mapping()
+        ]
+
+        # Get the UserIdentifiers for all users that are in OpenPortal
+        # who shouldn't be (because they are not in Waldur)
+        stale_users = [user.user for user in backend_users if user not in local_users]
+
+        # Now remove the associations for all of these users
+        models.Association.objects.filter(
+            allocation=allocation, useridentifier__in=stale_users
+        ).delete()
+
+        logger.info(
+            "Associations for allocation %s and users %s have been removed",
+            allocation,
+            stale_users,
+        )
