@@ -36,6 +36,8 @@ def update_component_quota(sender, instance, created=False, **kwargs):
     except django_exceptions.ObjectDoesNotExist:
         return
 
+    new_limits = {}
+    new_usages = {}
     for component in manager.get_components(PLUGIN_NAME):
         usage = getattr(allocation, component.type + "_usage")
         limit = getattr(allocation, component.type + "_limit")
@@ -52,6 +54,8 @@ def update_component_quota(sender, instance, created=False, **kwargs):
                 allocation.id,
             )
         else:
+            new_limits[component.type] = limit
+            new_usages[component.type] = usage
             marketplace_models.ComponentQuota.objects.update_or_create(
                 resource=resource,
                 component=offering_component,
@@ -78,13 +82,64 @@ def update_component_quota(sender, instance, created=False, **kwargs):
                     defaults={"usage": usage, "date": date},
                 )
 
+    if resource.limits != new_limits:
+        logger.debug(
+            "Syncing limits for OpenPortal. Allocation ID: %s. Old limits: %s. New limits: %s",
+            allocation.id,
+            resource.limits,
+            new_limits,
+        )
+        resource.limits = new_limits
+        resource.save(update_fields=["limits"])
 
-def create_offering_user_for_openportal_user(sender, allocation, user, username, **kwargs):
-    logger.info(f"OpenPortal No-Op - create_offering_user_for_openportal_user {user} {username}")
+    if resource.current_usages != new_usages:
+        logger.debug(
+            "Syncing usages for OpenPortal. Allocation ID: %s. Old usages: %s. New usages: %s",
+            allocation.id,
+            resource.current_usages,
+            new_usages,
+        )
+        resource.current_usages = new_usages
+        resource.save(update_fields=["current_usages"])
+
+
+def create_offering_user_for_openportal_user(sender, allocation, user, **kwargs):
+    logger.info(f"OpenPortal - creating offering user for user {user} in {allocation}")
+    try:
+        offering = marketplace_models.Offering.objects.get(
+            scope=allocation.service_settings
+        )
+    except marketplace_models.Offering.DoesNotExist:
+        logger.warning(
+            "Skipping OpenPortal user synchronization because offering is not found. "
+            "OpenPortal settings ID: %s",
+            allocation.service_settings_id,
+        )
+        return
+
+    marketplace_models.OfferingUser.objects.update_or_create(
+        offering=offering,
+        user=user,
+    )
 
 
 def drop_offering_user_for_openportal_user(sender, allocation, user, **kwargs):
-    logger.info(f"OpenPortal No-Op - drop_offering_user_for_slurm_user {user} {allocation}")
+    logger.info(f"OpenPortal - dropping offering user for user {user} in {allocation}")
+    try:
+        offering = marketplace_models.Offering.objects.get(
+            scope=allocation.service_settings
+        )
+    except marketplace_models.Offering.DoesNotExist:
+        logger.warning(
+            "Skipping OpenPortal user synchronization because offering is not found. "
+            "OpenPortal settings ID: %s",
+            allocation.service_settings_id,
+        )
+        return
+
+    marketplace_models.OfferingUser.objects.filter(
+        offering=offering, user=user
+    ).delete()
 
 
 def sync_component_user_usage_when_allocation_user_usage_is_submitted(
