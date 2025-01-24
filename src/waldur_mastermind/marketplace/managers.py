@@ -1,4 +1,4 @@
-from django.conf import settings
+from constance import config
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import models as django_models
@@ -58,7 +58,7 @@ class OfferingQuerySet(django_models.QuerySet):
         )
 
         if user.is_anonymous:
-            if not settings.WALDUR_MARKETPLACE["ANONYMOUS_USER_CAN_VIEW_OFFERINGS"]:
+            if not config.ANONYMOUS_USER_CAN_VIEW_OFFERINGS:
                 return self.none()
             else:
                 return queryset.filter(shared=True)
@@ -105,7 +105,7 @@ class OfferingQuerySet(django_models.QuerySet):
             | Q(
                 shared=True,
                 organization_groups__isnull=False,
-                organization_groups=customer.organization_group,
+                organization_groups__in=customer.organization_groups.all(),
             )
             | Q(customer__uuid=value)
         )
@@ -180,7 +180,7 @@ class PlanQuerySet(django_models.QuerySet):
             Q(organization_groups__isnull=True)
             | Q(
                 organization_groups__isnull=False,
-                organization_groups=customer.organization_group,
+                organization_groups__in=customer.organization_groups.all(),
             )
         )
 
@@ -195,7 +195,7 @@ class PlanQuerySet(django_models.QuerySet):
         )
 
         if user.is_anonymous:
-            if not settings.WALDUR_MARKETPLACE["ANONYMOUS_USER_CAN_VIEW_PLANS"]:
+            if not config.ANONYMOUS_USER_CAN_VIEW_PLANS:
                 return self.none()
             else:
                 return queryset.filter(offering__shared=True)

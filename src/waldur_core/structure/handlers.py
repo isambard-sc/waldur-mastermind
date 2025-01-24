@@ -1,18 +1,14 @@
 import logging
-import re
 
-from django.conf import settings
 from django.db import transaction
-from django.template.loader import render_to_string
 from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.models import StateMixin
-from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import get_customer, get_permissions
 from waldur_core.structure.log import event_logger
-from waldur_core.structure.managers import count_customer_users, get_connected_customers
+from waldur_core.structure.managers import count_customer_users
 from waldur_core.structure.models import Customer, Project, ServiceSettings
 
 from . import tasks
@@ -52,8 +48,44 @@ def log_customer_save(sender, instance, created=False, **kwargs):
             },
         )
     else:
+        changed_fields = instance.tracker.changed().copy()
+        for field in (
+            "modified",
+            "image",
+            "access_subnet_set",
+            "projects",
+            "reviews",
+            "service_settings",
+            "groupinvitation",
+            "invitation",
+            "customeropenstack",
+            "customercluster",
+            "customernetwork",
+            "customernetworkpair",
+            "customerdatastore",
+            "customerfolder",
+            "paymentprofile",
+            "customercredit",
+            "serviceprovider",
+            "checklist",
+            "customerestimatedcostpolicy",
+            "callmanagingorganisation",
+            "issues",
+            "organization_groups",
+        ):
+            changed_fields.pop(field, None)
+
+        if not changed_fields:
+            return
+        message = "Customer {customer_name} has been updated."
+
+        for name in sorted(changed_fields.keys()):
+            previous_value = changed_fields[name]
+            current_value = getattr(instance, name)
+            message = f"{message} {name.capitalize()} has been changed from '{previous_value}' to '{current_value}'."
+
         event_logger.customer.info(
-            "Customer {customer_name} has been updated.",
+            message,
             event_type="customer_update_succeeded",
             event_context={
                 "customer": instance,
@@ -246,58 +278,6 @@ def delete_service_settings_on_scope_delete(sender, instance, **kwargs):
     """
     for service_settings in ServiceSettings.objects.filter(scope=instance):
         service_settings.delete()
-
-
-def notify_about_user_profile_changes(sender, instance, created=False, **kwargs):
-    user = instance
-    change_fields = settings.WALDUR_CORE["NOTIFICATIONS_PROFILE_CHANGES"]["FIELDS"]
-    organizations = get_connected_customers(user, RoleEnum.CUSTOMER_OWNER)
-
-    if not (
-        (set(change_fields) & set(user.tracker.changed())) and organizations.exists()
-    ):
-        return
-
-    fields = []
-    for field in change_fields:
-        if user.tracker.has_changed(field):
-            fields.append(
-                {
-                    "name": field,
-                    "old_value": user.tracker.previous(field),
-                    "new_value": getattr(user, field, None),
-                }
-            )
-    context = {
-        "user": user,
-        "fields": fields,
-        "organizations": Customer.objects.filter(id__in=organizations),
-    }
-    msg = render_to_string(
-        "structure/notifications_profile_changes.html",
-        context,
-    )
-
-    msg = re.sub(r"\s+", " ", msg).strip()
-
-    event_logger.user.info(
-        msg, event_type="user_profile_changed", event_context={"affected_user": user}
-    )
-
-    if (
-        settings.WALDUR_CORE["NOTIFICATIONS_PROFILE_CHANGES"][
-            "ENABLE_OPERATOR_OWNER_NOTIFICATIONS"
-        ]
-        and settings.WALDUR_CORE["NOTIFICATIONS_PROFILE_CHANGES"][
-            "OPERATOR_NOTIFICATION_EMAILS"
-        ]
-    ):
-        emails = settings.WALDUR_CORE["NOTIFICATIONS_PROFILE_CHANGES"][
-            "OPERATOR_NOTIFICATION_EMAILS"
-        ]
-        core_utils.broadcast_mail(
-            "structure", "notifications_profile_changes_operator", context, emails
-        )
 
 
 def update_customer_users_count(sender, **kwargs):

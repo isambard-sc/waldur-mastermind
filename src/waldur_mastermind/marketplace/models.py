@@ -20,7 +20,7 @@ from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
-from waldur_core.logging.loggers import LoggableMixin
+from waldur_core.logging.mixins import LoggableMixin
 from waldur_core.media.mixins import get_upload_path
 from waldur_core.media.validators import ImageValidator
 from waldur_core.permissions.enums import PermissionEnum
@@ -480,6 +480,9 @@ class Offering(
     )
     support_per_user_consumption_limitation = models.BooleanField(
         default=False, help_text=_("Set per user limits for resource components.")
+    )
+    access_url = models.URLField(
+        help_text=_("Publicly accessible offering access URL"), blank=True
     )
 
     objects = managers.OfferingManager()
@@ -1007,6 +1010,7 @@ class Resource(
     structure_models.StructureLoggableMixin,
     common_mixins.BackendMetadataMixin,
     core_models.ErrorMessageMixin,
+    core_models.LastSyncMixin,
 ):
     """
     Core resource is abstract model, marketplace resource is not abstract,
@@ -1123,6 +1127,9 @@ class Resource(
             "backend_metadata",
             "backend_uuid",
             "backend_type",
+            "backend_id",
+            "effective_id",
+            "slug",
         )
 
     @property

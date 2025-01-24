@@ -7,7 +7,7 @@ from django.db.models import QuerySet
 
 from paho.mqtt import publish as mqtt_publish
 from waldur_core.logging import backend, models
-from waldur_core.logging.loggers import LoggableMixin
+from waldur_core.logging.mixins import LoggableMixin
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 class ObservableObjectType(Enum):
     ORDER = "order"
     USER_ROLE = "user_role"
+    RESOURCE = "resource"
 
 
 def get_loggable_models():

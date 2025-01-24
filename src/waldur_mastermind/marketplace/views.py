@@ -4,8 +4,8 @@ import logging
 import textwrap
 
 import reversion
+from constance import config
 from dateutil.relativedelta import relativedelta
-from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection, transaction
@@ -52,6 +52,7 @@ from waldur_core.core.utils import (
     is_uuid_like,
     month_start,
     order_with_nulls,
+    remove_duplicate_hyphens,
 )
 from waldur_core.logging.loggers import event_logger
 from waldur_core.permissions.enums import PermissionEnum
@@ -121,9 +122,10 @@ class BaseMarketplaceView(core_views.ActionsViewSet):
 
 class PublicViewsetMixin:
     def get_permissions(self):
-        if settings.WALDUR_MARKETPLACE[
-            "ANONYMOUS_USER_CAN_VIEW_OFFERINGS"
-        ] and self.action in ["list", "retrieve"]:
+        if config.ANONYMOUS_USER_CAN_VIEW_OFFERINGS and self.action in [
+            "list",
+            "retrieve",
+        ]:
             return [rf_permissions.AllowAny()]
         else:
             return super().get_permissions()
@@ -2085,7 +2087,6 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
 
     approve_by_provider_validators = [
         structure_utils.check_customer_blocked_or_archived,
-        structure_utils.check_project_end_date,
         core_validators.StateValidator(models.Order.States.PENDING_PROVIDER),
     ]
 
@@ -2270,8 +2271,16 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         if not request.user.is_staff:
             raise PermissionDenied()
         obj = self.get_object()
-        obj.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        logger.info("Starting unlink for order %s", obj.uuid)
+        log.log_order_unlink(obj)
+        try:
+            obj.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Exception as e:
+            logger.error(
+                "Error unlinking the order. Error: %s",
+                str(e),
+            )
 
 
 class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
@@ -2313,10 +2322,20 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
         for removing resource stuck in transitioning state.
         """
         obj = self.get_object()
-        if obj.scope:
-            obj.scope.delete()
-        obj.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        log.log_resource_unlink(obj)
+        logger.info("Starting unlink for resource %s", obj.uuid)
+        try:
+            if obj.scope:
+                obj.scope.delete()
+            obj.delete()
+            logger.debug("Resource %s has been unlinked", obj.uuid)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Exception as e:
+            logger.error(
+                "Error during resource unlink. Error %s",
+                obj,
+                str(e),
+            )
 
     unlink_permissions = [structure_permissions.is_staff]
 
@@ -2569,6 +2588,7 @@ class ConsumerResourceViewSet(BaseResourceViewSet):
             offering.slug,
         ]
         result = "-".join(parts) + "-" + str(resource_count + 1)
+        result = remove_duplicate_hyphens(result)
         return Response({"name": result})
 
     suggest_name_serializer_class = serializers.ResourceSuggestNameSerializer
@@ -2789,6 +2809,19 @@ class ProviderResourceViewSet(BaseResourceViewSet):
         return Response(status=status.HTTP_200_OK)
 
     set_as_erred_permissions = [
+        permission_factory(
+            PermissionEnum.SET_RESOURCE_STATE,
+            ["offering.customer"],
+        )
+    ]
+
+    @action(detail=True, methods=["post"])
+    def refresh_last_sync(self, request, uuid=None):
+        resource = self.get_object()
+        resource.last_sync = timezone.now()
+        resource.save(update_fields=["last_sync"])
+
+    refresh_last_sync_permissions = [
         permission_factory(
             PermissionEnum.SET_RESOURCE_STATE,
             ["offering.customer"],
@@ -3059,7 +3092,7 @@ class OfferingUsersViewSet(
         visible_customers = managed_customers.union(nested_customers)
         visible_organization_groups = structure_models.Customer.objects.filter(
             id__in=visible_customers
-        ).values_list("organization_group_id", flat=True)
+        ).values_list("organization_groups__id", flat=True)
 
         queryset = queryset.filter(
             # Exclude offerings with disabled OfferingUsers feature
@@ -3366,37 +3399,39 @@ class StatsViewSet(rf_viewsets.ViewSet):
     def count_users_of_service_providers(self, request, *args, **kwargs):
         result = []
 
-        for sp in models.ServiceProvider.objects.all().select_related(
-            "customer", "customer__organization_group"
+        for sp in models.ServiceProvider.objects.all().prefetch_related(
+            "customer__organization_groups"
         ):
-            data = {
-                "count": utils.get_service_provider_user_ids(
-                    self.request.user, sp
-                ).count()
-            }
-            data.update(self._get_service_provider_info(sp))
-            result.append(data)
+            for group in sp.customer.organization_groups.all():
+                data = {
+                    "count": utils.get_service_provider_user_ids(
+                        self.request.user, sp
+                    ).count(),
+                    "customer_organization_group_uuid": group.uuid.hex,
+                    "customer_organization_group_name": group.name,
+                }
+                data.update(self._get_service_provider_info(sp))
+                result.append(data)
 
-        return Response(
-            result,
-            status=status.HTTP_200_OK,
-        )
+        return Response(result, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["get"])
     def count_projects_of_service_providers(self, request, *args, **kwargs):
         result = []
 
-        for sp in models.ServiceProvider.objects.all().select_related(
-            "customer", "customer__organization_group"
+        for sp in models.ServiceProvider.objects.all().prefetch_related(
+            "customer__organization_groups"
         ):
-            data = {"count": utils.get_service_provider_project_ids(sp).count()}
-            data.update(self._get_service_provider_info(sp))
-            result.append(data)
+            for group in sp.customer.organization_groups.all():
+                data = {
+                    "count": utils.get_service_provider_project_ids(sp).count(),
+                    "customer_organization_group_uuid": group.uuid.hex,
+                    "customer_organization_group_name": group.name,
+                }
+                data.update(self._get_service_provider_info(sp))
+                result.append(data)
 
-        return Response(
-            result,
-            status=status.HTTP_200_OK,
-        )
+        return Response(result, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["get"])
     def count_projects_of_service_providers_grouped_by_oecd(
@@ -3404,23 +3439,28 @@ class StatsViewSet(rf_viewsets.ViewSet):
     ):
         result = []
 
-        for sp in models.ServiceProvider.objects.all().select_related(
-            "customer", "customer__organization_group"
+        for sp in models.ServiceProvider.objects.all().prefetch_related(
+            "customer__organization_groups"
         ):
-            project_ids = utils.get_service_provider_project_ids(sp)
-            projects = (
-                structure_models.Project.available_objects.filter(id__in=project_ids)
-                .values("oecd_fos_2007_code")
-                .annotate(count=Count("id"))
-            )
+            for group in sp.customer.organization_groups.all():
+                project_ids = utils.get_service_provider_project_ids(sp)
+                projects = (
+                    structure_models.Project.available_objects.filter(
+                        id__in=project_ids
+                    )
+                    .values("oecd_fos_2007_code")
+                    .annotate(count=Count("id"))
+                )
 
-            for p in projects:
-                data = {
-                    "count": p["count"],
-                    "oecd_fos_2007_code": p["oecd_fos_2007_code"],
-                }
-                data.update(self._get_service_provider_info(sp))
-                result.append(data)
+                for p in projects:
+                    data = {
+                        "count": p["count"],
+                        "oecd_fos_2007_code": p["oecd_fos_2007_code"],
+                        "customer_organization_group_uuid": group.uuid.hex,
+                        "customer_organization_group_name": group.name,
+                    }
+                    data.update(self._get_service_provider_info(sp))
+                    result.append(data)
 
         return Response(
             self._expand_result_with_oecd_name(result), status=status.HTTP_200_OK
@@ -3548,20 +3588,16 @@ class StatsViewSet(rf_viewsets.ViewSet):
 
     @staticmethod
     def _get_service_provider_info(service_provider):
+        customer = service_provider.customer
+        # organization_groups = customer.organization_groups.all()
         return {
             "service_provider_uuid": service_provider.uuid.hex,
-            "customer_uuid": service_provider.customer.uuid.hex,
-            "customer_name": service_provider.customer.name,
-            "customer_organization_group_uuid": (
-                service_provider.customer.organization_group.uuid.hex
-                if service_provider.customer.organization_group
-                else ""
-            ),
-            "customer_organization_group_name": (
-                service_provider.customer.organization_group.name
-                if service_provider.customer.organization_group
-                else ""
-            ),
+            "customer_uuid": customer.uuid.hex,
+            "customer_name": customer.name,
+            # "customer_organization_groups": [
+            #     {"uuid": group.uuid.hex, "name": group.name}
+            #     for group in organization_groups
+            # ],
         }
 
     @staticmethod
@@ -3705,18 +3741,32 @@ class StatsViewSet(rf_viewsets.ViewSet):
     def count_active_resources_grouped_by_organization_group(
         self, request, *args, **kwargs
     ):
-        result = (
-            self.get_active_resources()
-            .values(
-                "offering__customer__organization_group__name",
-                "offering__customer__organization_group__uuid",
+        organization_groups = structure_models.OrganizationGroup.objects.annotate(
+            customer_count=Count("customers")
+        ).filter(customer_count__gt=0)
+
+        results = []
+
+        for group in organization_groups:
+            active_resources = self.get_active_resources().filter(
+                offering__customer__in=group.customers.all()
             )
-            .annotate(count=Count("id"))
-            .order_by()
-        )
+
+            resource_count = active_resources.count()
+
+            if resource_count > 0:
+                results.append(
+                    {
+                        "organization_group_uuid": group.uuid.hex,
+                        "organization_group_name": group.name,
+                        "count": resource_count,
+                    }
+                )
+
+        serialized_results = serializers.CountStatsSerializer(results, many=True).data
 
         return Response(
-            serializers.CountStatsSerializer(result, many=True).data,
+            serialized_results,
             status=status.HTTP_200_OK,
         )
 

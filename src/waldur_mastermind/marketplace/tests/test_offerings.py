@@ -5,6 +5,7 @@ import tempfile
 from itertools import product
 
 import pkg_resources
+from constance.test.pytest import override_config
 from ddt import data, ddt, idata
 from django.core.exceptions import ObjectDoesNotExist
 from rest_framework import exceptions as rest_exceptions
@@ -30,7 +31,6 @@ from waldur_mastermind.marketplace.management.commands.import_offering import (
 from waldur_mastermind.marketplace.plugins import manager
 from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
-from waldur_mastermind.marketplace.tests.helpers import override_marketplace_settings
 from waldur_mastermind.marketplace_support import PLUGIN_NAME
 from waldur_mastermind.marketplace_vmware import VIRTUAL_MACHINE_TYPE
 
@@ -68,7 +68,7 @@ class OfferingGetTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.json()), 0)
 
-    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=False)
+    @override_config(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=False)
     def test_offerings_should_be_invisible_to_unauthenticated_users(self):
         url = factories.OfferingFactory.get_list_url()
         response = self.client.get(url)
@@ -79,7 +79,7 @@ class OfferingGetTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.json()), 0)
 
-    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
+    @override_config(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
     def test_offerings_should_be_visible_to_unauthenticated_users(self):
         url = factories.OfferingFactory.get_list_url()
         response = self.client.get(url)
@@ -470,8 +470,7 @@ class OfferingFilterTest(test.APITransactionTestCase):
         organization_group = structure_factories.OrganizationGroupFactory()
         offering.organization_groups.add(organization_group)
 
-        self.fixture.customer.organization_group = organization_group
-        self.fixture.customer.save()
+        self.fixture.customer.organization_groups.add(organization_group)
 
         # Act
         self.client.force_authenticate(self.fixture.owner)
@@ -568,8 +567,7 @@ class OfferingPlansFilterTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data["plans"]), 0)
 
-        self.fixture.customer.organization_group = organization_group
-        self.fixture.customer.save()
+        self.fixture.customer.organization_groups.add(organization_group)
 
         # user can get plans if they are connected with the same organization_groups
         response = self.client.get(self.url)
@@ -592,8 +590,7 @@ class OfferingPlansFilterTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data["plans"]), 0)
 
-        self.fixture.project.customer.organization_group = organization_group
-        self.fixture.project.customer.save()
+        self.fixture.project.customer.organization_groups.add(organization_group)
 
         # user can get plans if they are connected with the same organization_groups
         response = self.client.get(self.url)
@@ -1733,7 +1730,7 @@ class OfferingPublicGetTest(test.APITransactionTestCase):
         ]
         factories.PlanFactory(offering=self.offerings[-1])
 
-    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=False)
+    @override_config(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=False)
     def test_anonymous_cannot_view_offerings(self):
         url = factories.OfferingFactory.get_public_list_url()
         response = self.client.get(url)
@@ -1961,7 +1958,7 @@ class OfferingDoiTest(test.APITransactionTestCase):
         self.assertTrue("pid" in response[0])
         self.assertTrue(len(response) == 1)
 
-    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=False)
+    @override_config(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=False)
     def test_anonymous_user_cannot_lookup_offering_referrals(self):
         url = factories.OfferingReferralFactory.get_list_url()
 

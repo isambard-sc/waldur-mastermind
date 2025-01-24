@@ -23,7 +23,7 @@ class OrganizationGroupListTest(test.APITransactionTestCase):
         self.assertEqual(len(response.data), 2)
 
     def test_list_filters(self):
-        """Test of organization_groups' list filter by name, type and parent UUID."""
+        """Test of organization_groups' list filter by name and parent UUID."""
         organization_group_parent = factories.OrganizationGroupFactory()
         self.organization_group_1.parent = organization_group_parent
         self.organization_group_1.save()
@@ -37,11 +37,6 @@ class OrganizationGroupListTest(test.APITransactionTestCase):
                 "name": "name_exact",
                 "valid": self.organization_group_1.name,
                 "invalid": self.organization_group_1.name[2:],
-            },
-            {
-                "name": "type",
-                "valid": self.organization_group_1.type.name,
-                "invalid": self.organization_group_1.type.name[2:],
             },
             {
                 "name": "parent",
@@ -70,9 +65,10 @@ class OrganizationGroupChangeTest(test.APITransactionTestCase):
         self.fixture = fixtures.CustomerFixture()
         self.organization_group_1 = factories.OrganizationGroupFactory()
         self.organization_group_2 = factories.OrganizationGroupFactory()
-        self.fixture.customer.organization_group = self.organization_group_1
-        self.fixture.customer.save()
-        self.url = factories.CustomerFactory.get_url(self.fixture.customer)
+        self.fixture.customer.organization_groups.add(self.organization_group_1)
+        self.url = factories.CustomerFactory.get_url(
+            self.fixture.customer, action="update_organization_groups"
+        )
 
     @data(
         "staff",
@@ -82,13 +78,13 @@ class OrganizationGroupChangeTest(test.APITransactionTestCase):
         new_organization_group_url = factories.OrganizationGroupFactory.get_url(
             self.organization_group_2
         )
-        response = self.client.patch(
-            self.url, {"organization_group": new_organization_group_url}
+        response = self.client.post(
+            self.url, {"organization_groups": [new_organization_group_url]}
         )
         self.assertEqual(status.HTTP_200_OK, response.status_code)
         self.fixture.customer.refresh_from_db()
-        self.assertEqual(
-            self.fixture.customer.organization_group, self.organization_group_2
+        self.assertIn(
+            self.organization_group_2, self.fixture.customer.organization_groups.all()
         )
 
     @data(
@@ -99,48 +95,10 @@ class OrganizationGroupChangeTest(test.APITransactionTestCase):
         new_organization_group_url = factories.OrganizationGroupFactory.get_url(
             self.organization_group_2
         )
-        response = self.client.patch(
-            self.url, {"organization_group": new_organization_group_url}
+        response = self.client.post(
+            self.url, {"organization_groups": [new_organization_group_url]}
         )
         self.assertEqual(status.HTTP_403_FORBIDDEN, response.status_code)
-
-
-@ddt
-class OrganizationGroupTypeListTest(test.APITransactionTestCase):
-    def setUp(self):
-        self.fixture = fixtures.UserFixture()
-        self.type_1 = factories.OrganizationGroupTypeFactory()
-        self.type_2 = factories.OrganizationGroupTypeFactory()
-        self.url = factories.OrganizationGroupTypeFactory.get_list_url()
-
-    @data("staff", "user", None)
-    def test_user_can_list_organization_group_types(self, user):
-        if user:
-            self.client.force_authenticate(user=getattr(self.fixture, user))
-
-        response = self.client.get(self.url)
-        self.assertEqual(status.HTTP_200_OK, response.status_code)
-        self.assertEqual(len(response.data), 2)
-
-    def test_list_filters(self):
-        rows = [
-            {"name": "name", "valid": self.type_1.name[2:], "invalid": "AAA"},
-            {
-                "name": "name_exact",
-                "valid": self.type_1.name,
-                "invalid": self.type_1.name[2:],
-            },
-        ]
-        self.client.force_authenticate(user=self.fixture.staff)
-
-        for row in rows:
-            response = self.client.get(self.url, data={row["name"]: row["valid"]})
-            self.assertEqual(status.HTTP_200_OK, response.status_code)
-            self.assertEqual(len(response.data), 1)
-
-            response = self.client.get(self.url, data={row["name"]: row["invalid"]})
-            self.assertEqual(status.HTTP_200_OK, response.status_code)
-            self.assertEqual(len(response.data), 0)
 
 
 @ddt
@@ -152,10 +110,8 @@ class OrganizationGroupCreateTest(test.APITransactionTestCase):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
         url = factories.OrganizationGroupFactory.get_list_url()
-        group_type = factories.OrganizationGroupTypeFactory()
         payload = {
             "name": "testcrud",
-            "type": group_type.uuid.hex,
         }
         response = self.client.post(url, payload)
         return response
@@ -164,10 +120,8 @@ class OrganizationGroupCreateTest(test.APITransactionTestCase):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
         organization_group = factories.OrganizationGroupFactory(name="testcrud")
-        group_type = factories.OrganizationGroupTypeFactory()
         payload = {
             "name": "updated_testcrud",
-            "type": group_type.uuid.hex,
         }
         response = self.client.put(
             factories.OrganizationGroupFactory.get_url(organization_group), payload

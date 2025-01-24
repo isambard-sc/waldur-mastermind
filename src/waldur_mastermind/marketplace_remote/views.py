@@ -18,7 +18,7 @@ from waldur_core.permissions.utils import has_permission
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure.filters import GenericRoleFilter
 from waldur_core.structure.models import Customer
-from waldur_mastermind.marketplace import callbacks, models, permissions, plugins
+from waldur_mastermind.marketplace import callbacks, models, permissions
 from waldur_mastermind.marketplace_remote import PLUGIN_NAME
 from waldur_mastermind.marketplace_remote.models import (
     ProjectUpdateRequest,
@@ -70,20 +70,12 @@ class OfferingsListView(RemoteView):
             )
 
         remote_customer_uuid = request.query_params["customer_uuid"]
-        whitelist_types = [
-            offering_type
-            for offering_type in plugins.manager.get_offering_types()
-            if plugins.manager.enable_remote_support(offering_type)
-        ]
-
-        params = {
-            "shared": True,
-            "allowed_customer_uuid": remote_customer_uuid,
-            "type": whitelist_types,
-            "field": ["uuid", "name", "type", "state", "category_title"],
-        }
         try:
-            remote_offerings = client.list_marketplace_public_offerings(params)
+            remote_offerings = utils.get_remote_offerings(
+                client,
+                remote_customer_uuid,
+                fields=["uuid", "name", "type", "state", "category_title"],
+            )
         except WaldurClientException as e:
             return Response(str(e), status=status.HTTP_400_BAD_REQUEST)
 
@@ -274,3 +266,31 @@ class RemoteSynchronisationViewSet(core_views.ActionsViewSet):
             ).data,
             status=status.HTTP_200_OK,
         )
+
+
+class SyncResourceView(APIView):
+    permission_classes = [rf_permissions.IsAuthenticated, core_permissions.IsStaff]
+
+    def get_resource(self):
+        resource_uuid = self.kwargs["uuid"]
+        if not is_uuid_like(resource_uuid):
+            return Response(status=status.HTTP_400_BAD_REQUEST, data="UUID is invalid.")
+        resource = models.Resource.objects.filter(uuid=resource_uuid).first()
+        if resource is None:
+            return Response(
+                status=status.HTTP_404_NOT_FOUND, data="A resource is not found"
+            )
+        if resource.state == models.Resource.States.TERMINATED:
+            return Response(
+                status=status.HTTP_400_BAD_REQUEST, data="The resource is terminated"
+            )
+        if resource.state == models.Resource.States.UPDATING:
+            return Response(
+                status=status.HTTP_400_BAD_REQUEST, data="The resource is updating"
+            )
+        return resource
+
+    def post(self, *args, **kwargs):
+        resource = self.get_resource()
+        tasks.ResourcePullTask.apply_async(args=[serialize_instance(resource)])
+        return Response(status=status.HTTP_200_OK)

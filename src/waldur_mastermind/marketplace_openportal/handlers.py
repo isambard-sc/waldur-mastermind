@@ -5,10 +5,14 @@ from django.core.exceptions import MultipleObjectsReturned, ObjectDoesNotExist
 from django.utils import timezone
 
 from waldur_core.core.utils import month_start
+from waldur_core.logging import tasks as logging_tasks
+from waldur_core.logging import utils as logging_utils
+from waldur_core.permissions import models as permission_models
+from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.plugins import manager
-from waldur_mastermind.marketplace_openportal import PLUGIN_NAME
+from waldur_mastermind.marketplace_openportal import PLUGIN_NAME, utils
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +36,6 @@ def update_component_quota(sender, instance, created=False, **kwargs):
     except django_exceptions.ObjectDoesNotExist:
         return
 
-    new_limits = {}
-    new_usages = {}
     for component in manager.get_components(PLUGIN_NAME):
         usage = getattr(allocation, component.type + "_usage")
         limit = getattr(allocation, component.type + "_limit")
@@ -50,8 +52,6 @@ def update_component_quota(sender, instance, created=False, **kwargs):
                 allocation.id,
             )
         else:
-            new_limits[component.type] = limit
-            new_usages[component.type] = usage
             marketplace_models.ComponentQuota.objects.update_or_create(
                 resource=resource,
                 component=offering_component,
@@ -78,67 +78,106 @@ def update_component_quota(sender, instance, created=False, **kwargs):
                     defaults={"usage": usage, "date": date},
                 )
 
-    if resource.limits != new_limits:
-        logger.debug(
-            "Syncing limits for OpenPortal. Allocation ID: %s. Old limits: %s. New limits: %s",
-            allocation.id,
-            resource.limits,
-            new_limits,
-        )
-        resource.limits = new_limits
-        resource.save(update_fields=["limits"])
-
-    if resource.current_usages != new_usages:
-        logger.debug(
-            "Syncing usages for OpenPortal. Allocation ID: %s. Old usages: %s. New usages: %s",
-            allocation.id,
-            resource.current_usages,
-            new_usages,
-        )
-        resource.current_usages = new_usages
-        resource.save(update_fields=["current_usages"])
-
-
-def create_offering_user_for_openportal_user(sender, allocation, user, **kwargs):
-    logger.info(f"OpenPortal - creating offering user for user {user} in {allocation}")
-    try:
-        offering = marketplace_models.Offering.objects.get(
-            scope=allocation.service_settings
-        )
-    except marketplace_models.Offering.DoesNotExist:
-        logger.warning(
-            "Skipping OpenPortal user synchronization because offering is not found. "
-            "OpenPortal settings ID: %s",
-            allocation.service_settings_id,
-        )
-        return
-
-    marketplace_models.OfferingUser.objects.update_or_create(
-        offering=offering,
-        user=user,
-    )
-
-
-def drop_offering_user_for_openportal_user(sender, allocation, user, **kwargs):
-    logger.info(f"OpenPortal - dropping offering user for user {user} in {allocation}")
-    try:
-        offering = marketplace_models.Offering.objects.get(
-            scope=allocation.service_settings
-        )
-    except marketplace_models.Offering.DoesNotExist:
-        logger.warning(
-            "Skipping OpenPortal user synchronization because offering is not found. "
-            "OpenPortal settings ID: %s",
-            allocation.service_settings_id,
-        )
-        return
-
-    marketplace_models.OfferingUser.objects.filter(
-        offering=offering, user=user
-    ).delete()
-
 
 def sync_component_user_usage_when_allocation_user_usage_is_submitted(
     sender, instance, **kwargs
 ):
     marketplace_utils.sync_component_user_usage(instance, PLUGIN_NAME)
+
+
+def send_order_created_to_mqtt(sender, instance, created=False, **kwargs):
+    order: marketplace_models.Order = instance
+    if created:
+        return
+
+    offering = order.offering
+    if offering.type != PLUGIN_NAME:
+        return
+
+    if (
+        not order.tracker.has_changed("state")
+        or order.state != marketplace_models.Order.States.PENDING_PROVIDER
+    ):
+        return
+
+    payload = {"order_uuid": order.uuid.hex}
+    messages = utils.prepare_mqtt_messages(
+        offering, payload, logging_utils.ObservableObjectType.ORDER
+    )
+    if messages:
+        logging_tasks.publish_mqtt_messages.delay(messages)
+
+
+def process_role_changed(permission: permission_models.UserRole, granted: bool):
+    if not isinstance(permission.scope, structure_models.Project):
+        return
+
+    project = permission.scope
+    offering_ids = set(
+        project.resource_set.filter(
+            state=marketplace_models.Resource.States.OK,
+            offering__type=PLUGIN_NAME,
+        ).values_list("offering", flat=True)
+    )
+
+    if not offering_ids:
+        return
+
+    user = permission.user
+    offerings = marketplace_models.Offering.objects.filter(id__in=offering_ids)
+
+    all_messages = []
+    for offering in offerings:
+        logger.debug(
+            "Processing user role changed event for project %s, offering %s, user %s, granted: %s",
+            project,
+            offering,
+            user,
+            granted,
+        )
+        payload = {
+            "user_uuid": user.uuid.hex,
+            "user_username": user.username,
+            "project_uuid": project.uuid.hex,
+            "project_name": project.name,
+            "role_name": permission.role.name,
+            "granted": granted,
+        }
+        messages = utils.prepare_mqtt_messages(
+            offering, payload, logging_utils.ObservableObjectType.USER_ROLE
+        )
+        all_messages.extend(messages)
+
+    if all_messages:
+        logging_tasks.publish_mqtt_messages.delay(all_messages)
+
+
+def send_role_revoked_message_to_mqtt(
+    sender, instance: permission_models.UserRole, **kwargs
+):
+    process_role_changed(instance, False)
+
+
+def send_role_granted_message_to_mqtt(
+    sender, instance: permission_models.UserRole, **kwargs
+):
+    process_role_changed(instance, True)
+
+
+def send_resource_update_message_to_mqtt(
+    sender, instance: marketplace_models.Resource, created=False, **kwargs
+):
+    if created:
+        return
+
+    offering = instance.offering
+    if offering.type != PLUGIN_NAME:
+        return
+
+    if not any(
+        instance.tracker.has_changed(field_name)
+        for field_name in ["downscaled", "restrict_member_access", "paused", "limits"]
+    ):
+        return
+
+    utils.push_resource_update_message(instance)

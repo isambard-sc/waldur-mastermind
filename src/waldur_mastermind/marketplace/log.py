@@ -1,6 +1,6 @@
 from numbers import Number
 
-from django.conf import settings
+from constance import config
 from django.db import transaction
 from django.template import Context, Template
 
@@ -117,6 +117,8 @@ class MarketplaceOfferingLogger(EventLogger):
 
 class MarketplaceOrderLogger(EventLogger):
     order = models.Order
+    type = str
+    resource_name = str
 
     class Meta:
         event_types = (
@@ -126,13 +128,35 @@ class MarketplaceOrderLogger(EventLogger):
             "marketplace_order_completed",
             "marketplace_order_terminated",
             "marketplace_order_failed",
+            "marketplace_order_unlinked",
         )
         event_groups = {"resources": event_types}
 
+    # We use this method to get the type display for the order instead of using the get_type_display method
+    # because of the PULL choice being added in dry run types
     @staticmethod
     def get_scopes(event_context):
         order = event_context["order"]
         return {order, order.project, order.project.customer, order.resource}
+
+    @staticmethod
+    def get_order_type_display(order):
+        try:
+            display = order.get_type_display()
+            if isinstance(display, str):
+                return display
+        except (AttributeError, TypeError):
+            pass
+
+        # Mapping based on DryRunTypes.CHOICES that uses RequestTypeMixin.Types.CHOICES and adds a new choice for Pull as it is added within DryRunTypes during dry run creation
+        dry_run_types = {
+            1: "Create",
+            2: "Update",
+            3: "Terminate",
+            4: "Pull",
+        }
+
+        return dry_run_types.get(order.type, "Unknown")
 
 
 class MarketplaceResourceLogger(EventLogger):
@@ -147,9 +171,7 @@ class MarketplaceResourceLogger(EventLogger):
         if not event_context:
             event_context = {}
 
-        if not settings.WALDUR_MARKETPLACE[
-            "NOTIFY_ABOUT_RESOURCE_CHANGE"
-        ] or event_type not in (
+        if not config.NOTIFY_ABOUT_RESOURCE_CHANGE or event_type not in (
             "marketplace_resource_create_succeeded",
             "marketplace_resource_create_failed",
             "marketplace_resource_create_canceled",
@@ -161,9 +183,7 @@ class MarketplaceResourceLogger(EventLogger):
             return
 
         if (
-            settings.WALDUR_MARKETPLACE[
-                "DISABLE_SENDING_NOTIFICATIONS_ABOUT_RESOURCE_UPDATE"
-            ]
+            config.DISABLE_SENDING_NOTIFICATIONS_ABOUT_RESOURCE_UPDATE
             and event_type == "marketplace_resource_update_succeeded"
         ):
             return
@@ -198,6 +218,7 @@ class MarketplaceResourceLogger(EventLogger):
             "marketplace_resource_paused",
             "marketplace_resource_erred_on_backend",
             "marketplace_resource_has_been_changed",
+            "marketplace_resource_unlinked",
         )
         nullable_fields = ["old_name"]
         event_groups = {"resources": event_types}
@@ -281,49 +302,73 @@ event_logger.register("marketplace_resource_user", MarketplaceResourceUserLogger
 
 def log_order_created(order):
     event_logger.marketplace_order.info(
-        "Marketplace order has been created.",
+        "Marketplace order for resource {resource_name} has been created. Type: {type}",
         event_type="marketplace_order_created",
-        event_context={"order": order},
+        event_context={
+            "order": order,
+            "type": MarketplaceOrderLogger.get_order_type_display(order),
+            "resource_name": order.resource.name,
+        },
     )
 
 
 def log_order_approved(order):
     event_logger.marketplace_order.info(
-        "Marketplace order has been approved.",
+        "Marketplace order for resource {resource_name} has been approved. Type: {type}",
         event_type="marketplace_order_approved",
-        event_context={"order": order},
+        event_context={
+            "order": order,
+            "type": MarketplaceOrderLogger.get_order_type_display(order),
+            "resource_name": order.resource.name,
+        },
     )
 
 
 def log_order_rejected(order):
     event_logger.marketplace_order.info(
-        "Marketplace order has been rejected.",
+        "Marketplace order for resource {resource_name} has been rejected. Type: {type}",
         event_type="marketplace_order_rejected",
-        event_context={"order": order},
+        event_context={
+            "order": order,
+            "type": MarketplaceOrderLogger.get_order_type_display(order),
+            "resource_name": order.resource.name,
+        },
     )
 
 
 def log_order_completed(order):
     event_logger.marketplace_order.info(
-        "Marketplace order has been completed.",
+        "Marketplace order for resource {resource_name} has been completed. Type: {type}",
         event_type="marketplace_order_completed",
-        event_context={"order": order},
+        event_context={
+            "order": order,
+            "type": MarketplaceOrderLogger.get_order_type_display(order),
+            "resource_name": order.resource.name,
+        },
     )
 
 
 def log_order_canceled(order):
     event_logger.marketplace_order.info(
-        "Marketplace order has been terminated.",
+        "Marketplace order for resource {resource_name} has been terminated. Type: {type}",
         event_type="marketplace_order_terminated",
-        event_context={"order": order},
+        event_context={
+            "order": order,
+            "type": MarketplaceOrderLogger.get_order_type_display(order),
+            "resource_name": order.resource.name,
+        },
     )
 
 
 def log_order_failed(order):
     event_logger.marketplace_order.info(
-        "Marketplace order has been marked as failed.",
+        "Marketplace order for resource {resource_name} has been marked as failed. Type: {type}",
         event_type="marketplace_order_failed",
-        event_context={"order": order},
+        event_context={
+            "order": order,
+            "type": MarketplaceOrderLogger.get_order_type_display(order),
+            "resource_name": order.resource.name,
+        },
     )
 
 
@@ -356,6 +401,14 @@ def log_resource_creation_canceled(instance):
         "Resource {resource_name} creation has been canceled.",
         event_type="marketplace_resource_create_canceled",
         event_context={"resource": instance},
+    )
+
+
+def log_resource_unlink(resource):
+    event_logger.marketplace_resource.info(
+        "Resource {resource_name} has been unlinked.",
+        event_type="marketplace_resource_unlinked",
+        event_context={"resource": resource},
     )
 
 
@@ -552,4 +605,16 @@ def log_marketplace_resource_has_been_changed(resource, changed):
         .replace("}", "}}"),
         event_type="marketplace_resource_has_been_changed",
         event_context=event_context,
+    )
+
+
+def log_order_unlink(order):
+    event_logger.marketplace_order.info(
+        "Order {order_uuid} for resource {resource_name} has been unlinked. Type: {type}",
+        event_type="marketplace_order_unlinked",
+        event_context={
+            "order": order,
+            "type": MarketplaceOrderLogger.get_order_type_display(order),
+            "resource_name": order.resource.name,
+        },
     )

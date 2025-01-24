@@ -366,6 +366,36 @@ class CountrySerializerMixin(serializers.Serializer):
     country_name = serializers.ReadOnlyField(source="get_country_display")
 
 
+class OrganizationGroupSerializer(serializers.HyperlinkedModelSerializer):
+    parent_uuid = serializers.ReadOnlyField(source="parent.uuid")
+    parent_name = serializers.ReadOnlyField(source="parent.type.name")
+    customers_count = serializers.ReadOnlyField()
+
+    class Meta:
+        model = models.OrganizationGroup
+        fields = (
+            "uuid",
+            "url",
+            "name",
+            "parent_uuid",
+            "parent_name",
+            "parent",
+            "customers_count",
+        )
+        extra_kwargs = {
+            "url": {"view_name": "organization-group-detail", "lookup_field": "uuid"},
+            "parent": {
+                "lookup_field": "uuid",
+                "view_name": "organization-group-detail",
+            },
+        }
+
+    def update(self, instance, validated_data):
+        instance.name = validated_data.get("name", instance.name)
+        instance.save()
+        return instance
+
+
 class CustomerSerializer(
     core_serializers.SlugSerializerMixin,
     CountrySerializerMixin,
@@ -375,24 +405,7 @@ class CustomerSerializer(
 ):
     projects = serializers.SerializerMethodField()
     display_name = serializers.ReadOnlyField(source="get_display_name")
-    organization_group_name = serializers.ReadOnlyField(
-        source="organization_group.name"
-    )
-    organization_group_uuid = serializers.ReadOnlyField(
-        source="organization_group.uuid"
-    )
-    organization_group_parent_name = serializers.ReadOnlyField(
-        source="organization_group.parent.name"
-    )
-    organization_group_parent_uuid = serializers.ReadOnlyField(
-        source="organization_group.parent.uuid"
-    )
-    organization_group_type_name = serializers.ReadOnlyField(
-        source="organization_group.type.name"
-    )
-    organization_group_type_uuid = serializers.ReadOnlyField(
-        source="organization_group.type.uuid"
-    )
+    organization_groups = OrganizationGroupSerializer(many=True, read_only=True)
     projects_count = serializers.SerializerMethodField()
     users_count = serializers.SerializerMethodField()
 
@@ -402,13 +415,7 @@ class CustomerSerializer(
             "url",
             "uuid",
             "created",
-            "organization_group",
-            "organization_group_name",
-            "organization_group_uuid",
-            "organization_group_parent_name",
-            "organization_group_parent_uuid",
-            "organization_group_type_name",
-            "organization_group_type_uuid",
+            "organization_groups",
             "display_name",
             "projects",
             "backend_id",
@@ -428,17 +435,13 @@ class CustomerSerializer(
             "default_tax_percent",
             "agreement_number",
             "domain",
-            "organization_group",
+            "organization_groups",
             "blocked",
             "archived",
             "sponsor_number",
         )
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
-            "organization_group": {
-                "lookup_field": "uuid",
-                "view_name": "organization-group-detail",
-            },
         }
 
     def get_fields(self):
@@ -1382,69 +1385,6 @@ class BasePropertySerializer(
 ):
     class Meta:
         model = NotImplemented
-
-
-class OrganizationGroupSerializer(serializers.HyperlinkedModelSerializer):
-    type = serializers.UUIDField(source="type.uuid")
-    type_name = serializers.CharField(source="type.name", read_only=True)
-    parent_uuid = serializers.ReadOnlyField(source="parent.uuid")
-    parent_name = serializers.ReadOnlyField(source="parent.type.name")
-    customers_count = serializers.ReadOnlyField()
-
-    class Meta:
-        model = models.OrganizationGroup
-        fields = (
-            "uuid",
-            "url",
-            "name",
-            "type",
-            "type_name",
-            "parent_uuid",
-            "parent_name",
-            "parent",
-            "customers_count",
-        )
-        extra_kwargs = {
-            "url": {"view_name": "organization-group-detail", "lookup_field": "uuid"},
-            "parent": {
-                "lookup_field": "uuid",
-                "view_name": "organization-group-detail",
-            },
-        }
-
-    def create(self, validated_data):
-        type_uuid = validated_data.pop("type", None)
-        if type_uuid:
-            validated_data["type"] = models.OrganizationGroupType.objects.get(
-                uuid=type_uuid["uuid"]
-            )
-        return super().create(validated_data)
-
-    def update(self, instance, validated_data):
-        type_uuid = validated_data.pop("type", None)
-        if type_uuid:
-            instance.type = models.OrganizationGroupType.objects.get(
-                uuid=type_uuid["uuid"]
-            )
-        instance.name = validated_data.get("name", instance.name)
-        instance.save()
-        return instance
-
-
-class OrganizationGroupTypesSerializer(serializers.HyperlinkedModelSerializer):
-    class Meta:
-        model = models.OrganizationGroupType
-        fields = (
-            "uuid",
-            "url",
-            "name",
-        )
-        extra_kwargs = {
-            "url": {
-                "lookup_field": "uuid",
-                "view_name": "organization-group-type-detail",
-            },
-        }
 
 
 class UserAgreementSerializer(serializers.HyperlinkedModelSerializer):

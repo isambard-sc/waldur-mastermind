@@ -27,6 +27,9 @@ def filter_queryset_for_user(queryset: QuerySet[T], user) -> QuerySet[T]:
     if user is None or user.is_staff or user.is_support:
         return queryset
 
+    if not user.is_active:
+        return queryset.none()
+
     try:
         permissions = queryset.model.Permissions
     except AttributeError:
@@ -63,6 +66,13 @@ def filter_queryset_for_user(queryset: QuerySet[T], user) -> QuerySet[T]:
     return queryset.filter(subquery).distinct()
 
 
+def filter_customer_by_ip_address(ip_address):
+    return structure_models.Customer.objects.filter(
+        models.Q(access_subnet_set__inet__isnull=True)
+        | models.Q(access_subnet_set__inet__net_contains_or_equals=ip_address)
+    ).values_list("id", flat=True)
+
+
 def filter_queryset_by_user_ip(queryset, request):
     user = request.user
     user_ip = core_utils.get_ip_address(request)
@@ -86,10 +96,7 @@ def filter_queryset_by_user_ip(queryset, request):
         path = customer_path + "__id__in"
         none_path = customer_path + "_id"
 
-    customers_ids = structure_models.Customer.objects.filter(
-        models.Q(access_subnet_set__inet__isnull=True)
-        | models.Q(access_subnet_set__inet__net_contains_or_equals=user_ip)
-    ).values_list("id", flat=True)
+    customers_ids = filter_customer_by_ip_address(user_ip)
     subquery = models.Q(**{path: customers_ids}) | models.Q(**{none_path: None})
     return queryset.filter(subquery)
 
@@ -193,9 +200,11 @@ def get_visible_projects(user):
 
 
 def get_organization_groups(user):
-    return structure_models.Customer.objects.filter(
-        id__in=get_visible_customers(user)
-    ).values("organization_group")
+    return (
+        structure_models.Customer.objects.filter(id__in=get_visible_customers(user))
+        .values_list("organization_groups__id", flat=True)
+        .distinct()
+    )
 
 
 def get_active_tokens():

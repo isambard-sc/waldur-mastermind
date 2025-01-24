@@ -515,7 +515,8 @@ def override_db_settings(request):
     if request.method == "GET":
         from constance.admin import get_values
 
-        return Response(get_values())
+        serialized_data = ConstanceSettingsSerializer(get_values())
+        return Response(serialized_data.data)
     serializer = ConstanceSettingsSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     serializer.save()

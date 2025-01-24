@@ -10,7 +10,7 @@ import unicodedata
 from enum import Enum
 from io import BytesIO
 
-from django.conf import settings
+from constance import config
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
@@ -147,7 +147,8 @@ def create_screenshot_thumbnail(screenshot):
     pic = screenshot.image
     fh = storage.open(pic.name, "rb")
     image = Image.open(fh)
-    image.thumbnail(settings.WALDUR_MARKETPLACE["THUMBNAIL_SIZE"])
+    width, height = map(int, config.THUMBNAIL_SIZE.split("x"))
+    image.thumbnail((width, height))
     fh.close()
 
     thumb_extension = os.path.splitext(pic.name)[1]
@@ -1373,7 +1374,7 @@ def order_should_not_be_reviewed_by_provider(order: models.Order):
 def get_consumer_approvers(order):
     users = User.objects.none()
 
-    if settings.WALDUR_MARKETPLACE["NOTIFY_STAFF_ABOUT_APPROVALS"]:
+    if config.NOTIFY_STAFF_ABOUT_APPROVALS:
         users |= User.objects.filter(is_staff=True, is_active=True)
 
     users |= get_users_with_permission(
@@ -1395,7 +1396,7 @@ def get_consumer_approvers(order):
 def get_provider_approvers(order):
     users = User.objects.none()
 
-    if settings.WALDUR_MARKETPLACE["NOTIFY_STAFF_ABOUT_APPROVALS"]:
+    if config.NOTIFY_STAFF_ABOUT_APPROVALS:
         users |= User.objects.filter(is_staff=True, is_active=True)
 
     users |= get_users_with_permission(
@@ -1537,6 +1538,9 @@ def sync_component_user_usage(allocation_user_usage, plugin_name):
     for offering_component in models.OfferingComponent.objects.filter(
         offering=resource.offering
     ):
+        if not hasattr(allocation_user_usage, offering_component.type + "_usage"):
+            continue
+
         usage = getattr(allocation_user_usage, offering_component.type + "_usage")
 
         component_usage = models.ComponentUsage.objects.filter(

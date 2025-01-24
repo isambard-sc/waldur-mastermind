@@ -39,6 +39,7 @@ class MarketplaceSlurmConfig(AppConfig):
             update_resource_processor=processor.UpdateAllocationLimitsProcessor,
             delete_resource_processor=processor.DeleteAllocationProcessor,
             can_update_limits=True,
+            enable_remote_support=True,
         )
 
         signals.post_save.connect(
@@ -51,6 +52,12 @@ class MarketplaceSlurmConfig(AppConfig):
             handlers.send_order_created_to_mqtt,
             sender=marketplace_models.Order,
             dispatch_uid="waldur_mastermind.marketplace_slurm_remote.send_order_created_to_mqtt",
+        )
+
+        signals.post_save.connect(
+            handlers.send_resource_update_message_to_mqtt,
+            sender=marketplace_models.Resource,
+            dispatch_uid="waldur_mastermind.marketplace_slurm_remote.send_resource_status_changed_message_to_mqtt",
         )
 
         permission_signals.role_granted.connect(

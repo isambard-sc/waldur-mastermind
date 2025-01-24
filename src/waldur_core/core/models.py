@@ -28,7 +28,7 @@ from waldur_core.core.validators import (
     validate_phone_number,
     validate_ssh_public_key,
 )
-from waldur_core.logging.loggers import LoggableMixin
+from waldur_core.logging.mixins import LoggableMixin
 from waldur_core.media.mixins import ImageModelMixin
 
 from .shims import AbstractBaseUser
@@ -144,6 +144,13 @@ class ErrorMessageMixin(models.Model):
     error_traceback = models.TextField(blank=True)
 
 
+class LastSyncMixin(models.Model):
+    class Meta:
+        abstract = True
+
+    last_sync = models.DateTimeField(default=django_timezone.now, editable=False)
+
+
 class ScheduleMixin(models.Model):
     """
     Mixin to add a standardized "schedule" fields.
@@ -233,6 +240,7 @@ class User(
     SlugMixin,
     LoggableMixin,
     UuidMixin,
+    LastSyncMixin,
     DescribableMixin,
     AbstractBaseUser,
     UserDetailsMixin,
@@ -296,7 +304,6 @@ class User(
         ),
     )
     date_joined = models.DateTimeField(_("date joined"), default=django_timezone.now)
-    last_sync = models.DateTimeField(default=django_timezone.now, editable=False)
     registration_method = models.CharField(
         _("registration method"),
         max_length=50,
@@ -569,6 +576,16 @@ class SshPublicKey(LoggableMixin, UuidMixin, models.Model):
     def type(self):
         key_parts = self.public_key.split(" ", 1)
         return key_parts[0]
+
+    def get_log_fields(self):
+        return (
+            "uuid",
+            "name",
+            "type",
+            "fingerprint_md5",
+            "fingerprint_sha256",
+            "fingerprint_sha512",
+        )
 
     class Meta:
         unique_together = ("user", "name")

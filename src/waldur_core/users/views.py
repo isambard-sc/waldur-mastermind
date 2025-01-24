@@ -1,3 +1,4 @@
+from constance import config
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
@@ -10,7 +11,6 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
-from waldur_core.core import log as core_log
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import validators as core_validators
 from waldur_core.core.views import ProtectedViewSet, ReadOnlyActionsViewSet
@@ -180,39 +180,23 @@ class InvitationViewSet(ProtectedViewSet):
         detail=True, methods=["post"], filter_backends=[filters.PendingInvitationFilter]
     )
     def accept(self, request, uuid=None):
-        """Accept invitation for current user.
-
-        To replace user's email with email from invitation - add parameter
-        'replace_email' to request POST body.
-        """
+        """Accept invitation for current user."""
         invitation: models.Invitation = self.get_object()
 
         if has_user(invitation.scope, request.user, invitation.role):
             raise ValidationError(_("User has already the same role in this scope."))
 
-        replace_email = False
         if invitation.email != request.user.email:
-            if settings.WALDUR_CORE["ENABLE_STRICT_CHECK_ACCEPTING_INVITATION"]:
+            if config.ENABLE_STRICT_CHECK_ACCEPTING_INVITATION:
                 raise ValidationError(
                     _("User’s email and email of the invitation are not equal.")
                 )
-
-            replace_email = bool(request.data.get("replace_email"))
 
         if settings.WALDUR_CORE["INVITATION_DISABLE_MULTIPLE_ROLES"]:
             if UserRole.objects.filter(user=request.user, is_active=True).exists():
                 raise ValidationError(_("User already has role within another scope."))
 
         invitation.accept(request.user)
-        if replace_email:
-            old_mail = request.user.email
-            request.user.email = invitation.email
-            request.user.save(update_fields=["email"])
-            core_log.event_logger.user.info(
-                f"User email has been changed via invitation from {old_mail} to {invitation.email}",
-                event_type="user_profile_changed",
-                event_context={"affected_user": request.user},
-            )
 
         return Response(
             {"detail": _("Invitation has been successfully accepted.")},

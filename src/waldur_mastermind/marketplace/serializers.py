@@ -3,9 +3,9 @@ import logging
 from decimal import Decimal
 
 import jwt
+from constance import config
 from dateutil.parser import parse as parse_datetime
 from django import forms
-from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
@@ -85,7 +85,7 @@ class ServiceProviderSerializer(
             "customer_native_name",
             "customer_country",
             "image",
-            "organization_group",
+            "organization_groups",
             "description",
             "offering_count",
         )
@@ -103,8 +103,8 @@ class ServiceProviderSerializer(
 
     customer_image = serializers.ImageField(source="customer.image", read_only=True)
     customer_country = serializers.CharField(source="customer.country", read_only=True)
-    organization_group = serializers.CharField(
-        source="customer.organization_group", read_only=True
+    organization_groups = structure_serializers.OrganizationGroupSerializer(
+        many=True, read_only=True
     )
 
     def get_fields(self):
@@ -918,6 +918,7 @@ class ExportImportOfferingSerializer(serializers.ModelSerializer):
             "description",
             "full_description",
             "terms_of_service",
+            "access_url",
             "rating",
             "attributes",
             "options",
@@ -1098,6 +1099,7 @@ class ProviderOfferingDetailsSerializer(
             "terms_of_service",
             "terms_of_service_link",
             "privacy_policy_link",
+            "access_url",
             "endpoints",
             "roles",
             "customer",
@@ -1387,9 +1389,6 @@ class OfferingCreateSerializer(ProviderOfferingDetailsSerializer):
         offering_type = attrs.get("type", getattr(self.instance, "type", None))
         builtin_components = plugins.manager.get_components(offering_type)
 
-        valid_types = set()
-        fixed_types = set()
-
         if builtin_components and attrs.get("components"):
             if {c.get("type") for c in attrs.get("components")} - {
                 c.type for c in builtin_components
@@ -1397,35 +1396,6 @@ class OfferingCreateSerializer(ProviderOfferingDetailsSerializer):
                 raise serializers.ValidationError(
                     {"components": _("Extra components are not allowed.")}
                 )
-            valid_types = {component.type for component in builtin_components}
-
-        elif builtin_components:
-            valid_types = {component.type for component in builtin_components}
-            if self.instance:
-                valid_types.update(
-                    set(self.instance.components.values_list("type", flat=True))
-                )
-            fixed_types = {
-                component.type
-                for component in plugins.manager.get_components(offering_type)
-                if component.billing_type == BillingTypes.FIXED
-            }
-            if self.instance:
-                fixed_types.update(
-                    set(
-                        self.instance.components.filter(
-                            billing_type=BillingTypes.FIXED
-                        ).values_list("type", flat=True)
-                    )
-                )
-
-        elif custom_components:
-            valid_types = {component["type"] for component in custom_components}
-            fixed_types = {
-                component["type"]
-                for component in custom_components
-                if component["billing_type"] == BillingTypes.FIXED
-            }
 
     def _create_plans(self, offering, plans):
         for plan_data in plans:
@@ -1567,6 +1537,7 @@ class OfferingOverviewUpdateSerializer(
             "terms_of_service",
             "terms_of_service_link",
             "privacy_policy_link",
+            "access_url",
             "getting_started",
             "integration_guide",
             "slug",
@@ -2183,9 +2154,9 @@ def validate_public_offering(order: models.Order):
 
     # Order is ok if consumer and provider organization groups match
     if (
-        order.project.customer.organization_group_id
+        order.project.customer.organization_groups.exists()
         and order.offering.organization_groups.filter(
-            id=order.project.customer.organization_group_id
+            id__in=order.project.customer.organization_groups.all()
         ).exists()
     ):
         return
@@ -2460,6 +2431,7 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             "offering_customer_uuid",
             "options",
             "available_actions",
+            "last_sync",
         )
         read_only_fields = (
             "backend_metadata",
@@ -2475,6 +2447,7 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             "error_traceback",
             "options",
             "restrict_member_access",
+            "last_sync",
         )
         view_name = "marketplace-resource-detail"
         extra_kwargs = dict(
@@ -2645,7 +2618,7 @@ class ResourceUpdateSerializer(serializers.ModelSerializer):
     def validate_end_date(self, end_date):
         if not end_date:
             return
-        if not settings.WALDUR_MARKETPLACE["ENABLE_RESOURCE_END_DATE"]:
+        if not config.ENABLE_RESOURCE_END_DATE:
             raise serializers.ValidationError(
                 {"end_date": _("Update of this field is not allowed.")}
             )
@@ -2672,7 +2645,7 @@ class ResourceEndDateByProviderSerializer(serializers.ModelSerializer):
     def validate_end_date(self, end_date):
         if not end_date:
             return
-        if not settings.WALDUR_MARKETPLACE["ENABLE_RESOURCE_END_DATE"]:
+        if not config.ENABLE_RESOURCE_END_DATE:
             raise serializers.ValidationError(
                 {"end_date": _("Update of this field is not allowed.")}
             )
@@ -3551,6 +3524,14 @@ class OrganizationGroupsSerializer(serializers.Serializer):
 
             if organization_groups:
                 plan.organization_groups.add(*organization_groups)
+
+        elif isinstance(self.instance, structure_models.Customer):
+            customer = self.instance
+            organization_groups = self.validated_data["organization_groups"]
+            customer.organization_groups.clear()
+
+            if organization_groups:
+                customer.organization_groups.add(*organization_groups)
 
 
 class CostsSerializer(serializers.Serializer):

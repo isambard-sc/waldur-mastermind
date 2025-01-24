@@ -353,6 +353,7 @@ class PublicCallSerializer(
             "rounds",
             "documents",
             "backend_id",
+            "external_url",
         )
         view_name = "proposal-public-call-detail"
         extra_kwargs = {
@@ -722,9 +723,11 @@ class ProtectedRoundSerializer(
 
 
 class ProposalDocumentationSerializer(serializers.ModelSerializer):
+    file_name = serializers.ReadOnlyField(source="file.name")
+
     class Meta:
         model = models.ProposalDocumentation
-        fields = ["file"]
+        fields = ["file", "file_name", "created"]
 
 
 class ProposalUpdateProjectDetailsSerializer(serializers.ModelSerializer):

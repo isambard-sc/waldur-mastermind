@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timedelta
 
 from django.contrib import auth
-from django.db.models import OuterRef, Q
+from django.db.models import OuterRef, ProtectedError, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone as timezone
 from django.utils.translation import gettext_lazy as _
@@ -51,6 +51,19 @@ class CallManagingOrganisationViewSet(PublicViewsetMixin, BaseMarketplaceView):
     queryset = models.CallManagingOrganisation.objects.all().order_by("customer__name")
     serializer_class = serializers.CallManagingOrganisationSerializer
     filterset_class = filters.CallManagingOrganisationFilter
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        try:
+            self.perform_destroy(instance)
+            return response.Response(status=status.HTTP_204_NO_CONTENT)
+        except ProtectedError:
+            return response.Response(
+                {
+                    "detail": "Cannot delete this call manager as there are existing connected calls or user permissions."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
     @decorators.action(detail=True)
     def stats(self, request, uuid=None):
@@ -380,7 +393,10 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     model = models.Proposal
 
     get_queryset = permissions_utils.queryset_factory(
-        models.Proposal, RoleEnum.CALL_MANAGER, "round.call", created_by=True
+        models.Proposal,
+        RoleEnum.CALL_MANAGER,
+        "round.call",
+        created_by=True,
     )
 
     def is_creator(request, view, obj=None):

@@ -35,7 +35,12 @@ def get_created_date():
     return datetime.date(now.year, now.month, 1)
 
 
-class Invoice(core_models.UuidMixin, core_models.BackendMixin, models.Model):
+class Invoice(
+    structure_models.StructureLoggableMixin,
+    core_models.UuidMixin,
+    core_models.BackendMixin,
+    models.Model,
+):
     """Invoice describes billing information about purchased resources for customers on a monthly basis"""
 
     class Permissions:
@@ -106,6 +111,9 @@ class Invoice(core_models.UuidMixin, core_models.BackendMixin, models.Model):
         max_length=300,
         blank=True,
     )
+
+    def get_log_fields(self):
+        return ("uuid", "name", "year", "month", "customer")
 
     tracker = FieldTracker()
 
@@ -223,7 +231,10 @@ def get_quantity(unit, start, end):
 
 
 class InvoiceItem(
-    core_models.UuidMixin, common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin
+    structure_models.StructureLoggableMixin,
+    core_models.UuidMixin,
+    common_mixins.ProductCodeMixin,
+    common_mixins.UnitPriceMixin,
 ):
     """
     It is expected that get_scope_type method is defined as class method in scope class
@@ -432,6 +443,9 @@ class InvoiceItem(
     def __str__(self):
         return self.name or "<InvoiceItem %s>" % self.pk
 
+    def get_log_fields(self):
+        return ("uuid", "invoice")
+
 
 class PaymentType(models.CharField):
     FIXED_PRICE = "fixed_price"
@@ -451,7 +465,9 @@ class PaymentType(models.CharField):
 
 
 class PaymentProfile(core_models.UuidMixin, core_models.NameMixin, models.Model):
-    organization = models.ForeignKey("structure.Customer", on_delete=models.PROTECT)
+    organization = models.ForeignKey(
+        structure_models.Customer, on_delete=models.PROTECT
+    )
     payment_type = PaymentType()
     attributes = models.JSONField(default=dict, blank=True)
     is_active = models.BooleanField(null=True, default=True)
@@ -507,7 +523,7 @@ class Payment(core_models.UuidMixin, core_models.TimeStampedModel):
         return "payment"
 
 
-class CustomerCredit(core_models.UuidMixin, core_models.TimeStampedModel):
+class BaseCredit(core_models.UuidMixin, core_models.TimeStampedModel):
     class MinimalConsumptionLogic:
         FIXED = "fixed"
         LINEAR = "linear"
@@ -517,16 +533,7 @@ class CustomerCredit(core_models.UuidMixin, core_models.TimeStampedModel):
             (LINEAR, "Linear"),
         )
 
-    customer = models.OneToOneField(structure_models.Customer, on_delete=models.CASCADE)
-    value = models.DecimalField(
-        default=0,
-        validators=[MinValueValidator(decimal.Decimal("0"))],
-        max_digits=16,
-        decimal_places=5,
-    )
-    offerings = models.ManyToManyField(marketplace_models.Offering)
-    end_date = models.DateField(null=True)
-    minimal_consumption = models.DecimalField(
+    expected_consumption = models.DecimalField(
         default=0,
         validators=[MinValueValidator(decimal.Decimal("0"))],
         max_digits=16,
@@ -537,6 +544,61 @@ class CustomerCredit(core_models.UuidMixin, core_models.TimeStampedModel):
         choices=MinimalConsumptionLogic.CHOICES,
         default=MinimalConsumptionLogic.FIXED,
     )
+    grace_coefficient = models.DecimalField(
+        max_digits=3,
+        decimal_places=0,
+        default=decimal.Decimal("0"),
+    )
+    apply_as_minimal_consumption = models.BooleanField(default=True)
+    end_date = models.DateField(null=True)
+    value = models.DecimalField(
+        default=0,
+        validators=[MinValueValidator(decimal.Decimal("0"))],
+        max_digits=16,
+        decimal_places=5,
+    )
+
+    @property
+    def time_left_factor(self):
+        today = datetime.date.today()
+        days_until_credit_end = decimal.Decimal(
+            (self.end_date.replace(day=1) - today).days
+        )
+
+        if days_until_credit_end <= 0:
+            return decimal.Decimal("1")
+
+        days_in_current_month = decimal.Decimal(monthrange(today.year, today.month)[1])
+        return min(decimal.Decimal("1"), days_in_current_month / days_until_credit_end)
+
+    def calculate_linear_expected_consumption(self, total_compensation):
+        return (
+            max(decimal.Decimal("0"), self.expected_consumption - total_compensation)
+            * (decimal.Decimal("1") - self.time_left_factor)
+            + self.value * self.time_left_factor
+        )
+
+    @property
+    def minimal_consumption(self):
+        if not self.apply_as_minimal_consumption:
+            return 0
+
+        if (
+            self.end_date
+            and self.end_date.year == datetime.date.today().year
+            and self.end_date.month == datetime.date.today().month
+        ):
+            return self.expected_consumption
+
+        return (100 - self.grace_coefficient) / 100 * self.expected_consumption
+
+    class Meta:
+        abstract = True
+
+
+class CustomerCredit(BaseCredit):
+    customer = models.OneToOneField(structure_models.Customer, on_delete=models.CASCADE)
+    offerings = models.ManyToManyField(marketplace_models.Offering)
 
     tracker = FieldTracker()
 
@@ -577,14 +639,8 @@ class CustomerCredit(core_models.UuidMixin, core_models.TimeStampedModel):
         return f"Customer credit for {self.customer.name}, value {self.value}"
 
 
-class ProjectCredit(core_models.UuidMixin, core_models.TimeStampedModel):
+class ProjectCredit(BaseCredit):
     project = models.OneToOneField(structure_models.Project, on_delete=models.CASCADE)
-    value = models.DecimalField(
-        default=0,
-        validators=[MinValueValidator(decimal.Decimal("0"))],
-        max_digits=16,
-        decimal_places=5,
-    )
 
     @property
     def consumption_last_month(self):
