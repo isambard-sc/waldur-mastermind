@@ -41,7 +41,7 @@ class MarketplaceOpenPortalConfig(AppConfig):
             components=(
                 Component(
                     type="node",
-                    name="node-hours",
+                    name="NODE",
                     measured_unit="node-hours",
                     billing_type=USAGE,
                     limit_period=TOTAL,
