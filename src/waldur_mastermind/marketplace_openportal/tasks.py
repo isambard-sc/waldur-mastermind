@@ -1,4 +1,5 @@
 import datetime
+import logging
 
 from celery import shared_task
 from django.utils import timezone
@@ -8,9 +9,12 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace_openportal import PLUGIN_NAME, utils
 
+logger = logging.getLogger(__name__)
+
 
 @shared_task(name="waldur_mastermind.marketplace_openportal.sync_offering_users")
 def sync_offering_users():
+    logger.info("Syncing offering users for OpenPortal marketplace plugin.")
     offerings = marketplace_models.Offering.objects.filter(
         type=PLUGIN_NAME,
         state__in=[
@@ -29,6 +33,7 @@ def sync_offering_users():
     name="waldur_mastermind.marketplace_openportal.mark_offering_backend_as_disconnected_after_timeout"
 )
 def mark_offering_backend_as_disconnected_after_timeout():
+    logger.info("Marking OpenPortal offering backend as disconnected after timeout.")
     one_hour_ago = timezone.now() - datetime.timedelta(hours=1)
     integration_statuses = marketplace_models.IntegrationStatus.objects.filter(
         status=marketplace_models.IntegrationStatus.States.ACTIVE,
@@ -46,6 +51,8 @@ def sync_resources():
     Sync resources that haven't been updated in the last hour.
     Only processes resources that users have subscribed to receive updates for.
     """
+    logger.info("Syncing resources for OpenPortal marketplace plugin.")
+
     # Get active subscriptions and their users in a single query
     active_subscriptions = logging_models.EventSubscription.objects.filter(
         user__is_active=True, observable_objects__contains=[{"object_type": "resource"}]

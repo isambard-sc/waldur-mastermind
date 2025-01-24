@@ -79,6 +79,14 @@ def update_component_quota(sender, instance, created=False, **kwargs):
                 )
 
 
+def create_offering_user_for_openportal_user(sender, allocation, user, username, **kwargs):
+    logger.info(f"OpenPortal No-Op - create_offering_user_for_openportal_user {user} {username}")
+
+
+def drop_offering_user_for_openportal_user(sender, allocation, user, **kwargs):
+    logger.info(f"OpenPortal No-Op - drop_offering_user_for_slurm_user {user} {allocation}")
+
+
 def sync_component_user_usage_when_allocation_user_usage_is_submitted(
     sender, instance, **kwargs
 ):
