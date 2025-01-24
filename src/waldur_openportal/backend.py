@@ -49,7 +49,6 @@ class OpenPortalBackend(ServiceBackend):
                 self.pull_allocation(allocation)
             except Exception as e:
                 logger.error("Error while pulling allocation [%s]: %s", allocation, e)
-            self.sync_usage()
 
     def ping(self, raise_exception=False):
         logger.info(f"Pinging OpenPortal")
@@ -443,24 +442,27 @@ class OpenPortalBackend(ServiceBackend):
         )
         self.client.set_resource_limits(project, limits)
 
-    def sync_usage(self):
-        logger.info(f"Syncing OpenPortal usage for settings: {self}")
-        waldur_allocations = {
-            allocation.get_project_identifier(): allocation
-            for allocation in self.get_allocation_queryset()
-            if allocation.has_project_identifier()
-        }
+    def sync_usage(self, allocation: models.Allocation):
+        if not isinstance(allocation, models.Allocation):
+            raise ServiceBackendError(
+                "Invalid allocation type %s" % type(allocation)
+            )
 
-        report = self.get_usage_report(waldur_allocations.keys())
-        for account, usage in report.items():
-            allocation = waldur_allocations.get(account)
-            if not allocation:
-                logger.info(
-                    "Skipping usage report for account %s because it is not managed under Waldur",
-                    account,
-                )
-                continue
-            self._update_quotas(allocation, usage)
+        if not allocation.has_project_identifier():
+            logger.error(f"Allocation {allocation} has no project identifier - cannot sync usage")
+            return
+
+        project = allocation.get_project_identifier()
+        logger.info(f"Syncing OpenPortal usage for allocation {allocation} and project {project}")
+
+        # accounting is based on collecting monthly reports
+        report = self.client.get_usage_report(project, openportal.DateRange.this_month())
+
+        logger.info(f"Usage report for project {project}:\n{report}")
+
+        self._update_usage_from_report(allocation, report)
+        limits = self.get_allocation_limits(project)
+        self._update_limits(allocation, limits)
 
     def pull_allocation(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):
@@ -475,45 +477,12 @@ class OpenPortalBackend(ServiceBackend):
 
         logger.info(f"Pulling OpenPortal allocation {allocation}")
         self.sync_users(allocation)
-
-        project = allocation.get_project_identifier()
-
-        report = self.get_usage_report([project])
-        usage = report.get(project)
-        if not usage:
-            usage = {"TOTAL_ACCOUNT_USAGE": Quotas()}
-        self._update_quotas(allocation, usage)
-        limits = self.get_allocation_limits(project)
-        self._update_limits(allocation, limits)
-
-    def get_usage_report(self, accounts):
-        logger.info(f"Getting OpenPortal usage report for accounts: {accounts}")
-        report = {}
-        lines = self.client.get_usage_report(accounts)
-
-        for line in lines:
-            report.setdefault(line.account, {}).setdefault(line.user, Quotas())
-            report[line.account][line.user] += line.quotas
-
-        for usage in report.values():
-            for user_usage in usage.values():
-                user_usage.node = round(user_usage.node)
-            quotas = usage.values()
-            total = reduce(operator.add, quotas)
-            usage["TOTAL_ACCOUNT_USAGE"] = total
-
-        return report
+        self.sync_usage(allocation)
 
     def get_allocation_limits(self, account):
         logger.info(f"Getting OpenPortal limits for account: {account}")
-        lines = self.client.get_resource_limits(account)
-        correct_lines = [
-            association for association in lines if association.resource_limits
-        ]
-        if len(correct_lines) > 0:
-            line = correct_lines[0]
-            limits = Quotas(node=line.node)
-            return limits
+        limits = self.client.get_resource_limits(account)
+        logger.info(f"OpenPortal limits for account {account}: {limits}")
 
     def _update_limits(self, allocation, limits):
         logger.info(f"Updating limits for OpenPortal allocation {allocation}")
@@ -523,28 +492,56 @@ class OpenPortalBackend(ServiceBackend):
         allocation.save(update_fields=["node_limit"])
 
     @transaction.atomic()
-    def _update_quotas(self, allocation, usage):
-        logger.info(f"Updating quotas for OpenPortal allocation {allocation} for usage {usage}")
-        quotas = usage.pop("TOTAL_ACCOUNT_USAGE")
-        allocation.node_usage = quotas.node
+    def _update_usage_from_report(self, allocation, report: openportal.ProjectUsageReport):
+        # this will be the total usage this month - check that we have
+        # dates that are all in the same month...
+        if len(report.dates) == 0:
+            logger.error(f"Empty usage report for {allocation}")
+            return
+
+        day = report.dates[0]
+
+        for date in report.dates[1:]:
+            if date.month != day.month or date.year != day.year:
+                logger.error(f"Usage report for {allocation} spans multiple months")
+                return
+
+        allocation.node_usage = report.total_usage.node_seconds
         allocation.save(update_fields=["node_usage"])
 
-        usernames = usage.keys()
+        associations = models.Association.objects.filter(allocation=allocation)
 
-        usermap = {
-            association.username: association.user
-            for association in models.Association.objects.filter(username__in=usernames)
-        }
+        if len(associations) == 0:
+            logger.warning(f"Allocation {allocation} has no associations - skipping")
+            return
 
-        for username, quotas in usage.items():
+        for association in associations:
+            user = association.user
+
+            if not association.has_user_identifier():
+                logger.warning(f"User {user} in {association} has no user identifier - skipping")
+                continue
+
+            user_identifier = association.get_user_identifier()
+
+            # look up the usage for this user from the report
+            try:
+                usage = report.usage(user_identifier).node_seconds
+            except Exception as e:
+                logger.warning(f"User {user} has no usage in the report: {e}")
+                usage = 0
+
+            # we save usage using the UserIdentifier rather than the local
+            # username, so that a consistent identifier is used across
+            # all resources in a project
             models.AllocationUserUsage.objects.update_or_create(
                 allocation=allocation,
-                year=timezone.now().year,
-                month=timezone.now().month,
-                user=usermap.get(username, None),
-                username=username,
+                year=day.year,
+                month=day.month,
+                user=user,
+                username=str(user_identifier),
                 defaults={
-                    "node_usage": quotas.node,
+                    "node_usage": usage
                 },
             )
 

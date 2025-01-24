@@ -201,8 +201,10 @@ class OpenPortalClient(BaseBatchClient):
     def set_resource_limits(self, account, quotas):
         logger.info(f"OpenPortal NoOp - Setting resource limits for account '{account}' to '{quotas}'")
 
-    def get_usage_report(self, accounts):
-        logger.info(f"OpenPortal NoOp - Getting usage report for accounts '{accounts}'")
+    def get_usage_report(self, project: openportal.ProjectIdentifier, date_range: openportal.DateRange):
+        logger.info(f"get_usage_report for project '{project}' for date range '{date_range}'")
+        report = self.run(f"{self.destination()} get_usage_report {project} {date_range}")
+        return report
 
     def get_resource_limits(self, account):
         logger.info(f"OpenPortal NoOp - Getting resource limits for account '{account}'")

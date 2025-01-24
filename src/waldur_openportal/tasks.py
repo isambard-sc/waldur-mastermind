@@ -75,6 +75,18 @@ def delete_user(serialized_user):
         allocation.get_backend().delete_user(allocation, user)
 
 
+@shared_task(name="waldur_openportal.sync_allocation_usage")
+def sync_allocation_usage(serialized_allocation):
+    """
+    This task is called to synchronise the usage for the passed allocation
+    """
+    logger.info(f"task.sync_allocation_usage: {serialized_allocation}")
+    allocation = core_utils.deserialize_instance(serialized_allocation)
+
+    openportal_backend: backend.OpenPortalBackend = allocation.get_backend()
+    openportal_backend.sync_usage(allocation)
+
+
 @shared_task(name="waldur_openportal.sync_allocation_users")
 def sync_allocation_users(serialized_allocation):
     """
@@ -86,6 +98,16 @@ def sync_allocation_users(serialized_allocation):
 
     openportal_backend: backend.OpenPortalBackend = allocation.get_backend()
     openportal_backend.sync_users(allocation)
+
+
+@shared_task(name="waldur_openportal.sync_usage")
+def sync_usage():
+    """
+    This task is called to synchronise the usage for all allocations
+    """
+    logger.info("OpenPortal task.sync_usage")
+    for allocation in models.Allocation.objects.filter(is_active=True):
+        sync_allocation_usage.delay(core_utils.serialize_instance(allocation))
 
 
 @shared_task(name="waldur_openportal.sync")

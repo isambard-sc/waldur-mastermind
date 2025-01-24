@@ -22,9 +22,14 @@ class OpenPortalExtension(WaldurExtension):
         from datetime import timedelta
 
         return {
-            "waldur-openportal-sync": {
+            "waldur-openportal-sync-users": {
                 "task": "waldur_openportal.sync",
-                "schedule": timedelta(hours=2),
+                "schedule": timedelta(minutes=60),
+                "args": (),
+            },
+            "waldur-openportal-sync-usage": {
+                "task": "waldur_openportal.sync_usage",
+                "schedule": timedelta(seconds=30),
                 "args": (),
             },
         }

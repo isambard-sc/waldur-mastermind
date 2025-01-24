@@ -8,7 +8,8 @@ class OpenPortalError(BatchError):
 try:
     from openportal import Destination, Health, Job, PortalIdentifier, \
         ProjectIdentifier, ProjectMapping, UserIdentifier, UserMapping, \
-        is_config_loaded, load_config, health, get, run
+        is_config_loaded, load_config, health, get, run, DateRange, \
+        UsageReport, Usage, ProjectUsageReport
 
     have_openportal = True
 except ImportError:
@@ -45,6 +46,22 @@ except ImportError:
             _raise_no_openportal_error()
 
     class UserMapping:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class DateRange:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class UsageReport:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class Usage:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class ProjectUsageReport:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
