@@ -32,6 +32,7 @@ class MarketplaceOpenPortalConfig(AppConfig):
 
         USAGE = marketplace_models.OfferingComponent.BillingTypes.USAGE
         TOTAL = marketplace_models.OfferingComponent.LimitPeriods.TOTAL
+        default_limits = django_settings.WALDUR_OPENPORTAL["DEFAULT_LIMITS"]
 
         manager.register(
             PLUGIN_NAME,
@@ -40,12 +41,12 @@ class MarketplaceOpenPortalConfig(AppConfig):
             components=(
                 Component(
                     type="node",
-                    name="node",
-                    measured_unit="seconds",
+                    name="NODE",
+                    measured_unit="hours",
                     billing_type=USAGE,
                     limit_period=TOTAL,
                     limit_amount=openportal_registrators.OpenPortalRegistrator.convert_quantity(
-                        0, "node"
+                        default_limits["NODE"], "node"
                     ),
                 ),
             ),

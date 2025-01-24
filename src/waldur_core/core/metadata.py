@@ -426,6 +426,13 @@ class WaldurOpenPortal(BaseModel):
         False,
         description="Enable support for OpenPortal plugin in a deployment",
     )
+    DEFAULT_LIMITS = Field(
+        {
+            "NODE": 3600, # Measured unit is node-seconds
+        },
+        description="Default limits of account that are set when OpenPortal account is provisioned.",
+    )
+
 
 
 class WaldurSlurm(BaseModel):
