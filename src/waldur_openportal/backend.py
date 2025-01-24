@@ -1,12 +1,11 @@
 
 import logging
-import operator
+import math
 import re
 from functools import reduce
 
 from django.conf import settings as django_settings
 from django.db import transaction
-from django.utils import timezone
 
 from waldur_core.structure.backend import ServiceBackend
 from waldur_core.structure.exceptions import ServiceBackendError
@@ -506,7 +505,10 @@ class OpenPortalBackend(ServiceBackend):
                 logger.error(f"Usage report for {allocation} spans multiple months")
                 return
 
-        allocation.node_usage = report.total_usage.node_seconds
+        def to_node_hours(node_seconds):
+            return int(math.ceil(node_seconds / 3600.0))
+
+        allocation.node_usage = to_node_hours(report.total_usage.node_seconds)
         allocation.save(update_fields=["node_usage"])
 
         associations = models.Association.objects.filter(allocation=allocation)
@@ -524,9 +526,9 @@ class OpenPortalBackend(ServiceBackend):
 
             user_identifier = association.get_user_identifier()
 
-            # look up the usage for this user from the report
+            # look up the usage for this user from the report - record this in node-hours
             try:
-                usage = report.usage(user_identifier).node_seconds
+                usage = to_node_hours(report.usage(user_identifier).node_seconds)
             except Exception as e:
                 logger.warning(f"User {user} has no usage in the report: {e}")
                 usage = 0

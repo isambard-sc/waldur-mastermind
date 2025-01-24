@@ -41,8 +41,8 @@ class MarketplaceOpenPortalConfig(AppConfig):
             components=(
                 Component(
                     type="node",
-                    name="NODE",
-                    measured_unit="hours",
+                    name="node-hours",
+                    measured_unit="node-hours",
                     billing_type=USAGE,
                     limit_period=TOTAL,
                     limit_amount=openportal_registrators.OpenPortalRegistrator.convert_quantity(
