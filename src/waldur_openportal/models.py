@@ -27,7 +27,7 @@ class UsageMixin(models.Model):
     class Meta:
         abstract = True
 
-    node_usage = models.BigIntegerField(default=0)
+    node_usage = models.DecimalField(default=0, decimal_places=2, max_digits=20)
 
 
 class Allocation(UsageMixin, structure_models.BaseResource):

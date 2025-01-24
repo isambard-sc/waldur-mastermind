@@ -506,7 +506,7 @@ class OpenPortalBackend(ServiceBackend):
                 return
 
         def to_node_hours(node_seconds):
-            return int(math.ceil(node_seconds / 3600.0))
+            return node_seconds / 3600.0
 
         allocation.node_usage = to_node_hours(report.total_usage.node_seconds)
         allocation.save(update_fields=["node_usage"])
