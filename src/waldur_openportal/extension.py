@@ -29,7 +29,7 @@ class OpenPortalExtension(WaldurExtension):
             },
             "waldur-openportal-sync-usage": {
                 "task": "waldur_openportal.sync_usage",
-                "schedule": timedelta(seconds=30),
+                "schedule": timedelta(minutes=29),
                 "args": (),
             },
         }
