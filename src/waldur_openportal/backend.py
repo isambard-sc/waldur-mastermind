@@ -435,11 +435,19 @@ class OpenPortalBackend(ServiceBackend):
 
         project = allocation.get_project_identifier()
 
-        logger.info(f"Setting resource limits for allocation {project}")
-        limits = Quotas(
-            node=allocation.node_limit,
-        )
-        self.client.set_resource_limits(project, limits)
+        limit = openportal.Usage.from_hours(allocation.node_limit)
+
+        logger.info(f"Setting resource limit for allocation {project} to {limit}")
+        set_limit = self.client.set_resource_limits(project, limit)
+
+        if set_limit.seconds != limit.seconds:
+            logger.error(f"Unable to set limit for project {project} to {limit} - got {set_limit}")
+
+    def get_resource_limits(self, project: openportal.ProjectIdentifier) -> openportal.Usage:
+        logger.info(f"Getting OpenPortal limits for account: {project}")
+        limit = self.client.get_resource_limits(project)
+        logger.info(f"OpenPortal limits for project {project}: {limit}")
+        return limit
 
     def sync_usage(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):
@@ -466,11 +474,20 @@ class OpenPortalBackend(ServiceBackend):
 
         report = self.client.get_usage_report(project, openportal.DateRange.this_month())
 
-        logger.info(f"Usage report for project {project}:\n{report}")
-
+        logger.info(f"Total usage for project = {report.total_usage}")
         self._update_usage_from_report(allocation, report)
-        limits = self.get_allocation_limits(project)
-        self._update_limits(allocation, limits)
+
+        # check that the limits in the resource match the limits in the allocation
+        limit: openportal.Usage = self.get_resource_limits(project)
+
+        expected_limit = openportal.Usage.from_hours(allocation.node_limit)
+
+        if limit.seconds != expected_limit.seconds:
+            logger.warning(f"Limit for project {project} does not match expected limit: {limit} != {expected_limit}")
+            new_limit = self.client.set_resource_limits(project, expected_limit)
+
+            if new_limit.seconds != expected_limit.seconds:
+                logger.error(f"Unable to set limit for project {project} to {expected_limit} - got {new_limit}")
 
     def pull_allocation(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):
@@ -486,18 +503,6 @@ class OpenPortalBackend(ServiceBackend):
         logger.info(f"Pulling OpenPortal allocation {allocation}")
         self.sync_users(allocation)
         self.sync_usage(allocation)
-
-    def get_allocation_limits(self, account):
-        logger.info(f"Getting OpenPortal limits for account: {account}")
-        limits = self.client.get_resource_limits(account)
-        logger.info(f"OpenPortal limits for account {account}: {limits}")
-
-    def _update_limits(self, allocation, limits):
-        logger.info(f"Updating limits for OpenPortal allocation {allocation}")
-        if not limits:
-            return
-        allocation.node_limit = limits.node
-        allocation.save(update_fields=["node_limit"])
 
     @transaction.atomic()
     def _update_usage_from_report(self, allocation, report: openportal.ProjectUsageReport):

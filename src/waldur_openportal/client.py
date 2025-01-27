@@ -105,7 +105,38 @@ class OpenPortalClient(BaseBatchClient):
         self._runner = OpenPortalRunner()
         self._destination = openportal.Destination(instance_name)
 
-        logger.info(f"Created OpenPortal client for instance {self._destination}")
+    def _to_project_identifier(self, project) -> openportal.ProjectIdentifier:
+        """
+        Convert the passed (any) object into a ProjectIdentifier
+        """
+        if not isinstance(project, openportal.ProjectIdentifier):
+            try:
+                project = openportal.ProjectIdentifier(project)
+            except Exception:
+                project = openportal.ProjectIdentifier(f"{project}.{self.portal()}")
+
+        return project
+
+    def _to_user_identifier(self, user) -> openportal.UserIdentifier:
+        """
+        Convert the passed (any) object into a UserIdentifier
+        """
+        if not isinstance(user, openportal.UserIdentifier):
+            try:
+                user = openportal.UserIdentifier(user)
+            except Exception:
+                user = openportal.UserIdentifier(f"{user}.{self.portal()}")
+
+        return user
+
+    def _to_usage(self, usage) -> openportal.Usage:
+        """
+        Convert the passed (any) object into a Usage object
+        """
+        if not isinstance(usage, openportal.Usage):
+            usage = openportal.Usage.parse(str(usage))
+
+        return usage
 
     def health(self) -> openportal.Health:
         """
@@ -139,11 +170,7 @@ class OpenPortalClient(BaseBatchClient):
         based on the passed username and project, which will be returned by
         this method once the user has been added
         """
-        if not isinstance(project, openportal.ProjectIdentifier):
-            try:
-                project = openportal.ProjectIdentifier(project)
-            except Exception:
-                project = openportal.ProjectIdentifier(f"{project}.{self.portal()}")
+        project = self._to_project_identifier(project)
 
         if (not shortname) or (not shortname.strip()):
             raise openportal.OpenPortalError(f"Invalid empty username '{shortname}'")
@@ -160,8 +187,7 @@ class OpenPortalClient(BaseBatchClient):
         """
         Remove the OpenPortal user with specified UserIdentifier
         """
-        if not isinstance(user, openportal.UserIdentifier):
-            user = openportal.UserIdentifier(user)
+        user = self._to_user_identifier(user)
 
         self.run(f"{self.destination()} remove_user {user}")
 
@@ -174,11 +200,7 @@ class OpenPortalClient(BaseBatchClient):
         derive a unique internal name for this project based on that
         name, and will create it, and return the mapping
         """
-        if not isinstance(project, openportal.ProjectIdentifier):
-            try:
-                project = openportal.ProjectIdentifier(project)
-            except Exception:
-                project = openportal.ProjectIdentifier(f"{project}.{self.portal()}")
+        project = self._to_project_identifier(project)
 
         mapping = self.run(f"{self.destination()} add_project {project}")
 
@@ -190,26 +212,46 @@ class OpenPortalClient(BaseBatchClient):
         """
         Delete the project with the specified name.
         """
-        if not isinstance(project, openportal.ProjectIdentifier):
-            try:
-                project = openportal.ProjectIdentifier(project)
-            except Exception:
-                project = openportal.ProjectIdentifier(f"{project}.{self.portal()}")
+        project = self._to_project_identifier(project)
 
         self.run(f"{self.destination()} remove_project {project}")
 
-    def set_resource_limits(self, account, quotas):
-        logger.info(f"OpenPortal NoOp - Setting resource limits for account '{account}' to '{quotas}'")
+    def set_resource_limits(self, project: openportal.ProjectIdentifier, limit: openportal.Usage) -> openportal.Usage:
+        """
+        Set the resource usage limit for the specified project to the specified limit.
+        This returns the limit that has actually been set.
+        """
+        project = self._to_project_identifier(project)
+        usage = self._to_usage(limit)
+
+        new_limit = self.run(f"{self.destination()} set_limit {project} {limit}")
+
+        return new_limit
+
+    def get_resource_limits(self, project: openportal.ProjectIdentifier) -> openportal.Usage:
+        """
+        Get the resource usage limit for the specified project
+        """
+        project = self._to_project_identifier(project)
+
+        limit = self.run(f"{self.destination()} get_limit {project}")
+
+        return limit
 
     def get_usage_report(self, project: openportal.ProjectIdentifier, date_range: openportal.DateRange):
-        logger.info(f"get_usage_report for project '{project}' for date range '{date_range}'")
+        """
+        Return the usage report for the specified project and date range
+        """
+        project = self._to_project_identifier(project)
+
         report = self.run(f"{self.destination()} get_usage_report {project} {date_range}")
         return report
 
-    def get_resource_limits(self, account):
-        logger.info(f"OpenPortal NoOp - Getting resource limits for account '{account}'")
-
     def get_users(self, project: openportal.ProjectIdentifier) -> list[openportal.UserMapping]:
+        """
+        Return the mappings for all users on the resource for the specified project
+        """
+        project = self._to_project_identifier(project)
         return self.run(f"{self.destination()} get_users {project}")
 
     def run(self, command: str):
@@ -229,18 +271,22 @@ class OpenPortalClient(BaseBatchClient):
             logger.info(f"Job finished: {command} - SUCCESS")
             return op_job.result
 
-
     ### Required methods to override from BaseBatchClient
 
-    def list_accounts(self):
+    def list_accounts(self) -> list[Account]:
+        """
+        Return the Account objects for all projects active on the resource
+        """
         projects = self.run(f"{self.destination()} get_projects")
-
-        # parse the above into a list of Account objects
-        logger.info(f"Got projects: {projects}")
-
         return [Account(name=project, description="", organization="") for project in projects]
 
-    def create_account(self, name, description, organization, parent_name=None):
+    def create_account(self, name: str, description: str, organization: str, parent_name: str=None) -> openportal.ProjectMapping:
+        """
+        Create an account with the specified name, description, organization and parent account.
+        However, OpenPortal only cares about the project name, and ignores the description,
+        organisation and parent name. This just creates a project with the specified name,
+        returning the project mapping for that project
+        """
         logger.info(f"Creating account '{name}' with description '{description}' and organization '{organization}'")
 
         if parent_name is not None:
@@ -248,9 +294,11 @@ class OpenPortalClient(BaseBatchClient):
 
         return self.add_project(name)
 
-    def delete_account(self, name):
-        logger.info(f"Deleting account '{name}'")
-        self.delete_project(name)
+    def delete_account(self, name: str):
+        """
+        Delete the account with the specified name (the name should be the project identifier)
+        """
+        logger.warning(f"OpenPortal NoOp - Deleting account '{name}' is not implemented")
 
     def get_account(self, name):
         # Again, we need to map from the project name to the internal name
