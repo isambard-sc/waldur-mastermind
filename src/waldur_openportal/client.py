@@ -226,7 +226,7 @@ class OpenPortalClient(BaseBatchClient):
             logger.error(f"Job {command} has failed: {op_job.error_message}")
             raise openportal.OpenPortalError(f"Job '{command}' failed: {op_job.error_message}")
         else:
-            logger.info(f"Job finished: {op_job}")
+            logger.info(f"Job finished: {command} - SUCCESS")
             return op_job.result
 
 

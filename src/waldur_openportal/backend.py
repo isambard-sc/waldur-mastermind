@@ -454,7 +454,16 @@ class OpenPortalBackend(ServiceBackend):
         project = allocation.get_project_identifier()
         logger.info(f"Syncing OpenPortal usage for allocation {allocation} and project {project}")
 
-        # accounting is based on collecting monthly reports
+        # accounting is based on collecting monthly reports - make sure we have all
+        # of the reports since the start date of accounting
+        accounting_start_date = allocation.project.customer.accounting_start_date
+        logger.info(f"Accounting start date for project {project}: {accounting_start_date}")
+
+        # get all of the months since that start date and today
+        months = openportal.DateRange(accounting_start_date, openportal.DateRange.today().days[0]).months
+
+        logger.info(f"Months since accounting start date: {months}")
+
         report = self.client.get_usage_report(project, openportal.DateRange.this_month())
 
         logger.info(f"Usage report for project {project}:\n{report}")
@@ -505,10 +514,7 @@ class OpenPortalBackend(ServiceBackend):
                 logger.error(f"Usage report for {allocation} spans multiple months")
                 return
 
-        def to_node_hours(node_seconds):
-            return node_seconds / 3600.0
-
-        allocation.node_usage = to_node_hours(report.total_usage.node_seconds)
+        allocation.node_usage = report.total_usage.hours
         allocation.save(update_fields=["node_usage"])
 
         associations = models.Association.objects.filter(allocation=allocation)
@@ -528,7 +534,7 @@ class OpenPortalBackend(ServiceBackend):
 
             # look up the usage for this user from the report - record this in node-hours
             try:
-                usage = to_node_hours(report.usage(user_identifier).node_seconds)
+                usage = report.usage(user_identifier).hours
             except Exception as e:
                 logger.warning(f"User {user} has no usage in the report: {e}")
                 usage = 0

@@ -265,7 +265,7 @@ class AllocationUserUsage(UsageMixin):
         return self.__str__()
 
 
-class HistoricalAllocation(models.Model, UsageMixin):
+class HistoricalAllocation(UsageMixin):
     """
     This model holds the historical usage of an allocation.
     It records the total usage per month, plus whether or not that
