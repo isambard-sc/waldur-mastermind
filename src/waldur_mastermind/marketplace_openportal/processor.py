@@ -8,10 +8,10 @@ from .apps import MarketplaceOpenPortalConfig
 class CreateAllocationProcessor(processors.BaseCreateResourceProcessor):
     viewset = openportal_views.AllocationViewSet
 
-    fields = (
-        "name",
-        "description",
-    )
+    # fields = (
+    #     "name",
+    #     "description",
+    # )
 
 
 class DeleteAllocationProcessor(processors.DeleteScopedResourceProcessor):

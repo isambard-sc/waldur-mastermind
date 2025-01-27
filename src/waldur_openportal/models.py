@@ -265,6 +265,30 @@ class AllocationUserUsage(UsageMixin):
         return self.__str__()
 
 
+class HistoricalAllocation(models.Model, UsageMixin):
+    """
+    This model holds the historical usage of an allocation.
+    It records the total usage per month, plus whether or not that
+    month is "complete" (i.e. the report from OpenPortal is complete
+    for that month, and no more usage will be added).
+    """
+    allocation = models.ForeignKey(to=Allocation, on_delete=models.CASCADE, related_name="op-historicalallocation+")
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(12)]
+    )
+    is_complete = models.BooleanField(default=False)
+
+    def __str__(self):
+        if self.is_complete:
+            return f"{self.allocation.name} [{self.year}-{self.month}]: {self.node_usage}"
+        else:
+            return f"{self.allocation.name} [{self.year}-{self.month}]: {self.node_usage} (incomplete)"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
 class UserInfo(models.Model):
     """
     This model is responsible for storing additional user information
