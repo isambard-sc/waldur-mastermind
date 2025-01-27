@@ -1,16 +1,7 @@
 import abc
 import logging
-import subprocess  # noqa: S404
-
-from django.utils.functional import cached_property
-
-from .structures import Quotas
 
 logger = logging.getLogger(__name__)
-
-
-class BatchError(Exception):
-    pass
 
 
 class BaseBatchClient(metaclass=abc.ABCMeta):
@@ -101,52 +92,3 @@ class BaseBatchClient(metaclass=abc.ABCMeta):
         :return: list[BaseReportLine]
         """
         raise NotImplementedError()
-
-    def execute_command(self, command):
-        logger.info(f"Executing command: {command}")
-        return ""
-
-
-class BaseReportLine(metaclass=abc.ABCMeta):
-    @abc.abstractproperty
-    def account(self):
-        pass
-
-    @abc.abstractproperty
-    def user(self):
-        pass
-
-    @property
-    def cpu(self):
-        return 0
-
-    @property
-    def gpu(self):
-        return 0
-
-    @property
-    def ram(self):
-        return 0
-
-    @property
-    def duration(self):
-        return 0
-
-    @property
-    def charge(self):
-        return 0
-
-    @property
-    def node(self):
-        return 0
-
-    @cached_property
-    def quotas(self):
-        return Quotas(
-            self.cpu * self.duration,
-            self.gpu * self.duration,
-            self.ram * self.duration,
-        )
-
-    def __str__(self):
-        return f"ReportLine: User={self.user}, Account={self.account}, CPU={self.cpu}, GPU={self.gpu}, RAM={self.ram}, Duration={self.duration}, Charge={self.charge}, Node={self.node}"

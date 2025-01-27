@@ -1,8 +1,6 @@
 
 import logging
-import math
 import re
-from functools import reduce
 
 from django.conf import settings as django_settings
 from django.db import transaction
@@ -11,10 +9,8 @@ from waldur_core.structure.backend import ServiceBackend
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_openportal import signals
 from waldur_openportal.client import OpenPortalClient
-from waldur_openportal.structures import Quotas
 
 from . import base, models
-from .utils import sanitize_allocation_name
 from . import op as openportal
 
 logger = logging.getLogger(__name__)
@@ -449,6 +445,66 @@ class OpenPortalBackend(ServiceBackend):
         logger.info(f"OpenPortal limits for project {project}: {limit}")
         return limit
 
+    @transaction.atomic()
+    def _update_usage_from_report(self, allocation, report: openportal.ProjectUsageReport,
+                                  update_current: bool = True):
+        # this will be the total usage this month - check that we have
+        # dates that are all in the same month...
+        if len(report.dates) == 0:
+            logger.error(f"Empty usage report for {allocation}")
+            return
+
+        day = report.dates[0]
+
+        for date in report.dates[1:]:
+            if date.month != day.month or date.year != day.year:
+                logger.error(f"Usage report for {allocation} spans multiple months")
+                return
+
+        if report.is_complete:
+            logger.info(f"Forced update as usage report for {allocation} is complete")
+        elif abs(float(allocation.node_usage) - float(report.total_usage.hours)) > 0.00001:
+            # check whether or not there has been any change in total usage.
+            # If not, then no need to update the usage for the allocation
+            logger.info(f"Usage for allocation {allocation} has not changed: {allocation.node_usage} == {report.total_usage.hours}. Not updating.")
+            return
+
+        if update_current:
+            # only update this month's usage if we are updating the current month
+            allocation.node_usage = report.total_usage.hours
+            allocation.save(update_fields=["node_usage"])
+
+        associations = models.Association.objects.filter(allocation=allocation)
+
+        for association in associations:
+            user = association.user
+
+            if not association.has_user_identifier():
+                continue
+
+            user_identifier = association.get_user_identifier()
+
+            # look up the usage for this user from the report - record this in node-hours
+            try:
+                usage = report.usage(user_identifier).hours
+            except Exception as e:
+                logger.warning(f"User {user} has no usage in the report: {e}")
+                usage = 0
+
+            # we save usage using the UserIdentifier rather than the local
+            # username, so that a consistent identifier is used across
+            # all resources in a project
+            models.AllocationUserUsage.objects.update_or_create(
+                allocation=allocation,
+                year=day.year,
+                month=day.month,
+                user=user,
+                username=str(user_identifier),
+                defaults={
+                    "node_usage": usage
+                },
+            )
+
     def sync_usage(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):
             raise ServiceBackendError(
@@ -472,10 +528,36 @@ class OpenPortalBackend(ServiceBackend):
 
         logger.info(f"Months since accounting start date: {months}")
 
-        report = self.client.get_usage_report(project, openportal.DateRange.this_month())
+        for month in months:
+            # get the historical report for this month
+            first_day = month.days[0]
 
-        logger.info(f"Total usage for project = {report.total_usage}")
-        self._update_usage_from_report(allocation, report)
+            historical_report, created = models.HistoricalAllocation.objects.get_or_create(
+                allocation=allocation,
+                year=first_day.year,
+                month=first_day.month,
+                defaults={
+                    "node_usage": 0,
+                    "is_complete": False,
+                }
+            )
+
+            if created:
+                logger.info(f"Created historical report for {allocation} in {month}")
+
+            if historical_report.is_complete:
+                logger.info(f"Skipping {month} as report is complete")
+                continue
+
+            report = self.client.get_usage_report(project, month)
+
+            logger.info(f"Total usage for project in {month} = {report.total_usage}")
+            self._update_usage_from_report(allocation, report,
+                                           update_current=(month == openportal.DateRange.this_month()))
+
+            historical_report.node_usage = report.total_usage.hours
+            historical_report.is_complete = report.is_complete
+            historical_report.save()
 
         # check that the limits in the resource match the limits in the allocation
         limit: openportal.Usage = self.get_resource_limits(project)
@@ -503,60 +585,6 @@ class OpenPortalBackend(ServiceBackend):
         logger.info(f"Pulling OpenPortal allocation {allocation}")
         self.sync_users(allocation)
         self.sync_usage(allocation)
-
-    @transaction.atomic()
-    def _update_usage_from_report(self, allocation, report: openportal.ProjectUsageReport):
-        # this will be the total usage this month - check that we have
-        # dates that are all in the same month...
-        if len(report.dates) == 0:
-            logger.error(f"Empty usage report for {allocation}")
-            return
-
-        day = report.dates[0]
-
-        for date in report.dates[1:]:
-            if date.month != day.month or date.year != day.year:
-                logger.error(f"Usage report for {allocation} spans multiple months")
-                return
-
-        allocation.node_usage = report.total_usage.hours
-        allocation.save(update_fields=["node_usage"])
-
-        associations = models.Association.objects.filter(allocation=allocation)
-
-        if len(associations) == 0:
-            logger.warning(f"Allocation {allocation} has no associations - skipping")
-            return
-
-        for association in associations:
-            user = association.user
-
-            if not association.has_user_identifier():
-                logger.warning(f"User {user} in {association} has no user identifier - skipping")
-                continue
-
-            user_identifier = association.get_user_identifier()
-
-            # look up the usage for this user from the report - record this in node-hours
-            try:
-                usage = report.usage(user_identifier).hours
-            except Exception as e:
-                logger.warning(f"User {user} has no usage in the report: {e}")
-                usage = 0
-
-            # we save usage using the UserIdentifier rather than the local
-            # username, so that a consistent identifier is used across
-            # all resources in a project
-            models.AllocationUserUsage.objects.update_or_create(
-                allocation=allocation,
-                year=day.year,
-                month=day.month,
-                user=user,
-                username=str(user_identifier),
-                defaults={
-                    "node_usage": usage
-                },
-            )
 
     def get_allocation_queryset(self):
         logger.info("Getting OpenPortal allocation queryset")

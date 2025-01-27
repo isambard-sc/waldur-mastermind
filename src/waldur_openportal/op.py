@@ -1,8 +1,6 @@
 
 
-from waldur_openportal.base import BatchError
-
-class OpenPortalError(BatchError):
+class OpenPortalError(Exception):
     pass
 
 try:
