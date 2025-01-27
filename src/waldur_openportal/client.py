@@ -3,12 +3,7 @@ import os
 
 from . import op as openportal
 
-
-from waldur_openportal.base import BaseBatchClient
 from waldur_slurm.structures import Account
-
-from .models import Allocation
-
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +88,7 @@ class OpenPortalRunner:
         return job
 
 
-class OpenPortalClient(BaseBatchClient):
+class OpenPortalClient:
     """
     This class implements Python client for OpenPortal.
     See also: https://github.com/isambard-sc/openportal
@@ -271,8 +266,6 @@ class OpenPortalClient(BaseBatchClient):
             logger.info(f"Job finished: {command} - SUCCESS")
             return op_job.result
 
-    ### Required methods to override from BaseBatchClient
-
     def list_accounts(self) -> list[Account]:
         """
         Return the Account objects for all projects active on the resource
@@ -293,26 +286,3 @@ class OpenPortalClient(BaseBatchClient):
             logger.warning(f"Ignoring parent_name '{parent_name}' as OpenPortal does not support account hierarchies")
 
         return self.add_project(name)
-
-    def delete_account(self, name: str):
-        """
-        Delete the account with the specified name (the name should be the project identifier)
-        """
-        logger.warning(f"OpenPortal NoOp - Deleting account '{name}' is not implemented")
-
-    def get_account(self, name):
-        # Again, we need to map from the project name to the internal name
-        # for the project
-        logger.warning("OpenPortal NoOp - Getting account is not implemented")
-
-    def create_association(self, username, account, default_account=""):
-        # Again, we need to map to internal names...
-        logger.warning("OpenPortal NoOp - Creating association is not implemented")
-
-    def delete_association(self, username, account):
-        # Again, we need to map to internal names...
-        logger.warning("OpenPortal NoOp - Deleting association is not implemented")
-
-    def get_association(self, user, account):
-        # Again, we need to map to internal names...
-        logger.warning("OpenPortal NoOp - Getting association is not implemented")

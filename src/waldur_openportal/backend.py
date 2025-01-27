@@ -10,7 +10,7 @@ from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_openportal import signals
 from waldur_openportal.client import OpenPortalClient
 
-from . import base, models
+from . import models
 from . import op as openportal
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ class OpenPortalBackend(ServiceBackend):
         logger.info(f"Pinging OpenPortal")
         try:
             self.client.health()
-        except base.BatchError as e:
+        except openportal.OpenPortalError as e:
             logger.error(f"OpenPortal is not available: {e}")
             if raise_exception:
                 raise ServiceBackendError(e)

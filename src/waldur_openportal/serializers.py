@@ -131,6 +131,24 @@ class AssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
         )
 
 
+class HistoricalAllocationSerializer(rf_serializers.HyperlinkedModelSerializer):
+    class Meta:
+        model = models.HistoricalAllocation
+        fields = (
+            "node_usage",
+            "month",
+            "year",
+            "allocation",
+            "is_complete"
+        )
+        extra_kwargs = {
+            "allocation": {
+                "lookup_field": "uuid",
+                "view_name": "openportal-allocation-detail",
+            },
+        }
+
+
 class UserInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
     class Meta:
         model = models.UserInfo
