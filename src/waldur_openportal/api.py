@@ -49,6 +49,7 @@ def access_for_email(request):
     {
         "email": email_in_waldur,
         "status": status_in_waldur,
+        "short_name": shortname_in_waldur,
         "projects": projects as described below,
         "invited_by": email of the user who invited this person, if invited
         "reason": the reason for any rejection, if status is rejected
@@ -124,6 +125,7 @@ def access_for_email(request):
     reason = None
     is_authorised = False
     projects = {}
+    short_name_in_waldur = None
 
     # Waldur stores old accounts, so can only stop searching
     # when we find an active user - can't break early for an
@@ -148,6 +150,9 @@ def access_for_email(request):
             userinfo.sanitise()
 
             email_in_waldur = user.email
+
+            if short_name_in_waldur is None:
+                short_name_in_waldur = userinfo.short_name
 
             # loop over all of the allocations for this user
             for allocation in utils.get_project_allocations(user):
@@ -200,11 +205,15 @@ def access_for_email(request):
         elif reason is None:
             reason = "User account is not active"
 
+    if short_name_in_waldur is None:
+        short_name_in_waldur = ""
+
     if is_authorised:
         response = JsonResponse(
             {
                 "email": email_in_waldur,
                 "status": "active",
+                "short_name": short_name_in_waldur,
                 "projects": projects,
                 "invited_by": "",
                 "reason": "",
@@ -245,6 +254,7 @@ def access_for_email(request):
             {
                 "email": email_in_waldur,
                 "status": "invited",
+                "short_name": short_name_in_waldur,
                 "projects": {},
                 "invited_by": invited_by,
                 "reason": "",
@@ -263,6 +273,7 @@ def access_for_email(request):
         {
             "email": email,
             "status": "unknown",
+            "short_name": short_name_in_waldur,
             "projects": {},
             "invited_by": "",
             "reason": reason,
