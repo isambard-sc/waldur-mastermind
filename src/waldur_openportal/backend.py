@@ -545,18 +545,22 @@ class OpenPortalBackend(ServiceBackend):
             if created:
                 logger.info(f"Created historical report for {allocation} in {month}")
 
-            if historical_report.is_complete:
+            is_current_month: bool = month == openportal.DateRange.this_month()
+
+            # The current month's report cannot be complete
+            is_report_complete: bool = (not is_current_month) and historical_report.is_complete
+
+            if is_report_complete:
                 logger.info(f"Skipping {month} as report is complete")
                 continue
 
             report = self.client.get_usage_report(project, month)
 
             logger.info(f"Total usage for project in {month} = {report.total_usage}")
-            self._update_usage_from_report(allocation, report,
-                                           update_current=(month == openportal.DateRange.this_month()))
+            self._update_usage_from_report(allocation, report, update_current=is_current_month)
 
             historical_report.node_usage = report.total_usage.hours
-            historical_report.is_complete = report.is_complete
+            historical_report.is_complete = is_report_complete
             historical_report.save()
 
         # check that the limits in the resource match the limits in the allocation
