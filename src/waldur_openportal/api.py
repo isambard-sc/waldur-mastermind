@@ -43,6 +43,45 @@ def access_for_email(request):
     a staff user can query any email address, but a non-staff user can
     only query email addresses for projects in which they have this
     level of access)
+
+    The returned JSON object is as follows:
+
+    {
+        "email": email_in_waldur,
+        "status": status_in_waldur,
+        "projects": projects as described below,
+        "invited_by": email of the user who invited this person, if invited
+        "reason": the reason for any rejection, if status is rejected
+    }
+
+    Where "projects" is a dictionary as follows, with key/value pairs
+    for each project the user with the email can access
+
+    {
+        "project-a": {
+            "name": "Project A",
+            "resources": [
+                {
+                    "name": "batch.cluster1.example",
+                    "username": "user.proj-a"
+                },
+                {
+                    "name": "batch.cluster2.example",
+                    "username": "user.proj-a"
+                }
+            ]
+        },
+        "project-b": {
+            "name": "Project B",
+            "resources": [
+                {
+                    "name": "batch.cluster2.example",
+                    "username": "user.proj-b"
+                }
+            ]
+        }
+    }
+
     """
     user = request.user
 
@@ -133,15 +172,27 @@ def access_for_email(request):
                     continue
 
                 if project not in projects:
-                    projects[project] = []
+                    projects[project] = {
+                        "name": str(allocation.project.name),
+                        "resources": [],
+                    }
 
-                access = {
-                    "projectname": str(allocation.project.name),
-                    "destination": destination,
-                    "username": username,
-                }
+                projects[project]["resources"].append(
+                    {
+                        "name": destination,
+                        "username": username,
+                    }
+                )
 
-                projects[project].append(access)
+                # special case for testing Jupyter - members of brics.brics
+                # are added to the Jupyter resource
+                if project == "brics.brics":
+                    projects[project]["resources"].append(
+                        {
+                            "name": "brics.aip1.notebooks.shared",
+                            "username": username,
+                        }
+                    )
 
             # this is an active user
             is_authorised = True
@@ -159,6 +210,8 @@ def access_for_email(request):
                 "reason": "",
             }
         )
+
+        logger.info(f"access_for_email({email}, {user}) {response.content}")
 
         response.status_code = status.OK
         return response
@@ -198,6 +251,8 @@ def access_for_email(request):
             }
         )
 
+        logger.info(f"access_for_email({email}, {user}) {response.content}")
+
         response.status_code = status.OK
         return response
 
@@ -213,6 +268,8 @@ def access_for_email(request):
             "reason": reason,
         }
     )
+
+    logger.info(f"access_for_email({email}, {user}) {response.content}")
 
     response.status_code = status.OK
     return response

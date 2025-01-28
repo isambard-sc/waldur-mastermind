@@ -24,12 +24,12 @@ class OpenPortalExtension(WaldurExtension):
         return {
             "waldur-openportal-sync-users": {
                 "task": "waldur_openportal.sync",
-                "schedule": timedelta(minutes=60),
+                "schedule": timedelta(minutes=59),
                 "args": (),
             },
             "waldur-openportal-sync-usage": {
                 "task": "waldur_openportal.sync_usage",
-                "schedule": timedelta(seconds=30),
+                "schedule": timedelta(minutes=17),
                 "args": (),
             },
         }
