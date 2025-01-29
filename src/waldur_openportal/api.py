@@ -105,19 +105,20 @@ def access_for_email(request):
         response.status_code = status.BAD_REQUEST
         return response
 
-    if not request.user.is_staff:
-        if user.email != email:
-            response = JsonResponse(
-                {"error": "You can only query your own email"}
-            )
-            response.status_code = status.FORBIDDEN
-            return response
+    can_query_all_emails = user.is_staff or user.is_support
+
+    if (not can_query_all_emails) and user.email != email:
+        response = JsonResponse(
+            {"error": "You can only query your own email"}
+        )
+        response.status_code = status.FORBIDDEN
+        return response
 
     logger.info(f"api/openportal/access_for_email request for {email} from {user} ({user.email})")
 
     qs = User.all_objects.all()
 
-    if not request.user.is_staff:
+    if not can_query_all_emails:
         qs = qs.filter(is_active=True)
 
     qs = qs.filter(email__iexact=email)
