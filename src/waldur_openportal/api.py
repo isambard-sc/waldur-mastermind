@@ -155,6 +155,23 @@ def access_for_email(request):
             if short_name_in_waldur is None:
                 short_name_in_waldur = userinfo.shortname
 
+            # special case for testing Jupyter - members of brics.brics
+            # are added to the Jupyter resource
+            for project in member_of_projects:
+                if project.short_name == "brics":
+                    if "brics.brics" not in projects:
+                        projects["brics.brics"] = {
+                            "name": str(project.name),
+                            "resources": [],
+                        }
+
+                    projects["brics.brics"]["resources"].append(
+                        {
+                            "name": "brics.aip1.notebooks.shared",
+                            "username": f"{userinfo.shortname}.brics",
+                        }
+                    )
+
             # loop over all of the allocations for this user
             for allocation in utils.get_project_allocations(user):
                 if not allocation.has_project_identifier():
@@ -189,16 +206,6 @@ def access_for_email(request):
                         "username": username,
                     }
                 )
-
-                # special case for testing Jupyter - members of brics.brics
-                # are added to the Jupyter resource
-                if project == "brics.brics":
-                    projects[project]["resources"].append(
-                        {
-                            "name": "brics.aip1.notebooks.shared",
-                            "username": username,
-                        }
-                    )
 
             # this is an active user
             is_authorised = True
