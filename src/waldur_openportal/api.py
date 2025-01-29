@@ -152,7 +152,7 @@ def access_for_email(request):
             email_in_waldur = user.email
 
             if short_name_in_waldur is None:
-                short_name_in_waldur = userinfo.short_name
+                short_name_in_waldur = userinfo.shortname
 
             # loop over all of the allocations for this user
             for allocation in utils.get_project_allocations(user):
