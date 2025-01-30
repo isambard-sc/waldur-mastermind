@@ -2,16 +2,14 @@ from waldur_mastermind.marketplace import processors
 from waldur_openportal import models as openportal_models
 from waldur_openportal import views as openportal_views
 
-from .apps import MarketplaceOpenPortalConfig
-
 
 class CreateAllocationProcessor(processors.BaseCreateResourceProcessor):
     viewset = openportal_views.AllocationViewSet
 
-    # fields = (
-    #     "name",
-    #     "description",
-    # )
+    fields = (
+        "name",
+        "description",
+    )
 
 
 class DeleteAllocationProcessor(processors.DeleteScopedResourceProcessor):
