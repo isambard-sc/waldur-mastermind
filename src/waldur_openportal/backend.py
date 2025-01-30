@@ -215,10 +215,11 @@ class OpenPortalBackend(ServiceBackend):
         project_info, created = models.ProjectInfo.objects.get_or_create(project=project)
         project_info.sanitise()
 
-        if project_info.allowed_destinations is None:
-            logger.error(f"Project {project} has no allowed destinations")
-            raise ServiceBackendError(
-                f"Project {project} has no allowed OpenPortal destinations, so cannot create an allocation on {destination}")
+        if project_info.allowed_destinations is None or len(project_info.allowed_destinations.strip()) == 0:
+            # by default, projects can connect to any destination - this can be refined
+            # down as needed by the admin
+            logger.info(f"Project {project} is allowed to create an allocation for any destination")
+            return
 
         allowed_destinations = project_info.allowed_destinations.split(",")
 
