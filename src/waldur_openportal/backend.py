@@ -29,8 +29,14 @@ class OpenPortalBackend(ServiceBackend):
         """
         return self.client.destination()
 
+    def portal(self) -> openportal.PortalIdentifier:
+        """
+        Return the OpenPortal Portal for the instance
+        being managed by this backend
+        """
+        return self.client.portal()
+
     def get_client(self, settings):
-        logger.info(f"Creating OpenPortal client for settings: {settings}")
         return OpenPortalClient(
             instance_name=settings.options.get("instance_name", None),
         )
@@ -68,17 +74,7 @@ class OpenPortalBackend(ServiceBackend):
             project=project
         )
 
-        project = project_info.project
-
-        # if this is not set, then copy it in from the project.short_name
-        # property (which may disappear in the future)
-        if project_info.shortname is None and hasattr(project, "short_name"):
-            if project.short_name is not None:
-                logger.info(
-                    f"Copying shortname from the project's short_name for {project}"
-                )
-                project_info.set_shortname(project.shortname)
-                project_info.save()
+        project_info.sanitise()
 
         if project_info.shortname is None:
             logger.error(f"Empty shortname for project: {project}")

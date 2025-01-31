@@ -158,7 +158,7 @@ def access_for_email(request):
             email_in_waldur = user.email
 
             if short_name_in_waldur is None:
-                short_name_in_waldur = userinfo.shortname
+                short_name_in_waldur = str(userinfo.shortname).strip()
 
             # special case - brics users can access the notebook
             for project in member_of_projects:
@@ -178,13 +178,43 @@ def access_for_email(request):
 
             # loop over all of the allocations for this user
             for allocation in utils.get_project_allocations(user):
-                if not allocation.has_project_identifier():
-                    logger.warning(
-                        f"OpenPortal - {allocation} has no project identifier, skipping"
-                    )
-                    continue
+                if allocation.has_project_identifier():
+                    project_id = allocation.get_project_identifier()
+                    project = str(project_id)
+                    project_short_name = str(project_id.project).strip()
+                else:
+                    # we need to guess the project identifier. Do this by
+                    # combining the project short name and the portal name
+                    backend = allocation.get_backend()
 
-                project = str(allocation.get_project_identifier())
+                    project_short_name = backend.get_project_shortname(
+                        allocation.project
+                    )
+
+                    if (
+                        project_short_name is None
+                        or len(str(project_short_name).strip()) == 0
+                    ):
+                        logger.warning(
+                            f"Allocation {allocation} has no project short name - skipping"
+                        )
+                        continue
+
+                    project_short_name = str(project_short_name).strip()
+
+                    portal = backend.portal()
+
+                    if portal is None or len(str(portal).strip()) == 0:
+                        logger.warning(
+                            f"Allocation {allocation} has no portal name - skipping"
+                        )
+                        continue
+
+                    project = f"{project_short_name}.{portal}"
+                    logger.warning(
+                        f"{allocation} is missing project identifier - guessing '{project}'"
+                    )
+
                 destination = str(allocation.get_backend().destination())
 
                 # find the association between the user and the allocation
@@ -192,19 +222,25 @@ def access_for_email(request):
                     association = models.Association.objects.get(
                         user=user, allocation=allocation
                     )
+                    username = association.username
                 except models.Association.DoesNotExist:
                     logger.warning(
-                        f"Association between {user} and {allocation} not found - skipping"
+                        f"Association between {user} and {allocation} not found"
                     )
-                    continue
-
-                username = association.username
+                    username = None
 
                 if username is None:
-                    logger.warning(
-                        f"Association between {user} and {allocation} has no username '{username}' - skipping"
-                    )
-                    continue
+                    # we will have to guess the username too...
+                    if short_name_in_waldur is not None:
+                        username = f"{short_name_in_waldur}.{project_short_name}"
+                        logger.warning(
+                            f"Guessing username as '{username}' as this is not set for {project}"
+                        )
+                    else:
+                        logger.warning(
+                            f"Skipping {project} as username is not set and short name is not set"
+                        )
+                        continue
 
                 if project not in projects:
                     projects[project] = {
