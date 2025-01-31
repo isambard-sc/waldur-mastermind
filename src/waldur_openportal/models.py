@@ -23,6 +23,7 @@ MAX_USERNAME_LENGTH = 64
 MAX_USERIDENTIFIER_LENGTH = 128
 MAX_ALLOWED_DESTINATIONS_LENGTH = 1024
 
+
 class UsageMixin(models.Model):
     class Meta:
         abstract = True
@@ -39,14 +40,20 @@ class Allocation(UsageMixin, structure_models.BaseResource):
     # The local group name for the group to which all members of the
     # allocation will be added (e.g. the Unix group)
     groupname = models.TextField(
-        max_length = MAX_GROUPNAME_LENGTH,
+        max_length=MAX_GROUPNAME_LENGTH,
         blank=True,
         null=True,
     )
 
+    # Whether or not the project has been successfully added to OpenPortal
+    is_added = models.BooleanField(default=False)
+
     @classmethod
     def get_url_name(cls):
         return "openportal-allocation"
+
+    def is_added_to_openportal(self):
+        return self.is_added
 
     def usage_changed(self):
         return any(self.tracker.has_changed(field) for field in utils.FIELD_NAMES)
@@ -66,7 +73,9 @@ class Allocation(UsageMixin, structure_models.BaseResource):
 
         if self.has_project_identifier():
             if project != self.get_project_identifier():
-                raise ValueError(f"Project {project} does not match allocation {self.get_project_identifier()}")
+                raise ValueError(
+                    f"Project {project} does not match allocation {self.get_project_identifier()}"
+                )
 
             return
 
@@ -85,7 +94,9 @@ class Allocation(UsageMixin, structure_models.BaseResource):
         if not self.has_mapping():
             raise ValueError("ProjectMapping is not set!")
 
-        return openportal.ProjectMapping(f"{self.get_project_identifier()}:{self.get_local_group()}")
+        return openportal.ProjectMapping(
+            f"{self.get_project_identifier()}:{self.get_local_group()}"
+        )
 
     def set_mapping(self, mapping: openportal.ProjectMapping):
         if not isinstance(mapping, openportal.ProjectMapping):
@@ -96,9 +107,7 @@ class Allocation(UsageMixin, structure_models.BaseResource):
 
     @classmethod
     def get_backend_fields(cls):
-        return super().get_backend_fields() + (
-            "node_usage",
-        )
+        return super().get_backend_fields() + ("node_usage",)
 
     def __str__(self):
         if self.has_mapping():
@@ -117,7 +126,7 @@ class Association(core_models.UuidMixin):
     allocation = models.ForeignKey(
         to=Allocation,
         on_delete=models.CASCADE,
-        related_name="op-associations-allocation+"
+        related_name="op-associations-allocation+",
     )
 
     # This is the Waldur user which is associated with the allocation.
@@ -148,9 +157,7 @@ class Association(core_models.UuidMixin):
     # This is the OpenPortal UserIdentifier that uniquely
     # identifies this user in OpenPortal
     useridentifier = models.CharField(
-        max_length=MAX_USERIDENTIFIER_LENGTH,
-        blank=True,
-        null=True
+        max_length=MAX_USERIDENTIFIER_LENGTH, blank=True, null=True
     )
 
     def has_project_identifier(self) -> bool:
@@ -171,7 +178,9 @@ class Association(core_models.UuidMixin):
 
         if self.has_user_identifier():
             if user != self.get_user_identifier():
-                raise ValueError(f"User {user} does not match association {self.get_user_identifier()}")
+                raise ValueError(
+                    f"User {user} does not match association {self.get_user_identifier()}"
+                )
         else:
             self.set_project_identifier(user.project_identifier)
             self.useridentifier = str(user)
@@ -192,7 +201,11 @@ class Association(core_models.UuidMixin):
         return self.username
 
     def has_mapping(self) -> bool:
-        return self.has_user_identifier() and self.has_local_user() and self.has_local_group()
+        return (
+            self.has_user_identifier()
+            and self.has_local_user()
+            and self.has_local_group()
+        )
 
     def set_mapping(self, mapping: openportal.UserMapping):
         if not isinstance(mapping, openportal.UserMapping):
@@ -202,13 +215,17 @@ class Association(core_models.UuidMixin):
 
         if self.has_local_user():
             if mapping.local_user != self.get_local_user():
-                raise ValueError(f"Local user {mapping.local_user} does not match association {self.username}")
+                raise ValueError(
+                    f"Local user {mapping.local_user} does not match association {self.username}"
+                )
         else:
             self.username = mapping.local_user
 
         if self.has_local_group():
             if mapping.local_group != self.get_local_group():
-                raise ValueError(f"Local group {mapping.local_group} does not match association {self.groupname}")
+                raise ValueError(
+                    f"Local group {mapping.local_group} does not match association {self.groupname}"
+                )
         else:
             self.groupname = mapping.local_group
 
@@ -219,7 +236,9 @@ class Association(core_models.UuidMixin):
         if not self.has_local_user():
             raise ValueError("Local user is not set!")
 
-        return openportal.UserMapping(f"{self.get_user_identifier()}:{self.get_local_user()}:{self.get_local_group()}")
+        return openportal.UserMapping(
+            f"{self.get_user_identifier()}:{self.get_local_user()}:{self.get_local_group()}"
+        )
 
     def __str__(self):
         if self.has_mapping():
@@ -238,7 +257,11 @@ class AllocationUserUsage(UsageMixin):
     Allocation usage per user. This model is responsible for the allocation usage definition for particular user.
     """
 
-    allocation = models.ForeignKey(to=Allocation, on_delete=models.CASCADE, related_name="op-allocationuser-allocation+")
+    allocation = models.ForeignKey(
+        to=Allocation,
+        on_delete=models.CASCADE,
+        related_name="op-allocationuser-allocation+",
+    )
     year = models.PositiveSmallIntegerField()
     month = models.PositiveSmallIntegerField(
         validators=[MinValueValidator(1), MaxValueValidator(12)]
@@ -249,7 +272,7 @@ class AllocationUserUsage(UsageMixin):
         related_name="op-allocationuser-user+",
         on_delete=models.CASCADE,
         blank=True,
-        null=True
+        null=True,
     )
 
     # This is the local username on the instance being allocated
@@ -272,7 +295,10 @@ class HistoricalAllocation(UsageMixin):
     month is "complete" (i.e. the report from OpenPortal is complete
     for that month, and no more usage will be added).
     """
-    allocation = models.ForeignKey(to=Allocation, on_delete=models.CASCADE, related_name="op-historicalallocation+")
+
+    allocation = models.ForeignKey(
+        to=Allocation, on_delete=models.CASCADE, related_name="op-historicalallocation+"
+    )
     year = models.PositiveSmallIntegerField()
     month = models.PositiveSmallIntegerField(
         validators=[MinValueValidator(1), MaxValueValidator(12)]
@@ -281,7 +307,9 @@ class HistoricalAllocation(UsageMixin):
 
     def __str__(self):
         if self.is_complete:
-            return f"{self.allocation.name} [{self.year}-{self.month}]: {self.node_usage}"
+            return (
+                f"{self.allocation.name} [{self.year}-{self.month}]: {self.node_usage}"
+            )
         else:
             return f"{self.allocation.name} [{self.year}-{self.month}]: {self.node_usage} (incomplete)"
 
@@ -339,7 +367,10 @@ class UserInfo(models.Model):
         if this field exists
         """
         if hasattr(self.user, "unix_username"):
-            if self.shortname != self.user.unix_username and self.user.unix_username is not None:
+            if (
+                self.shortname != self.user.unix_username
+                and self.user.unix_username is not None
+            ):
                 self.set_shortname(self.user.unix_username)
                 self.save()
 
@@ -353,15 +384,22 @@ class UserInfo(models.Model):
             raise ValueError("Shortname cannot be empty.")
 
         if hasattr(self.user, "unix_username"):
-            if shortname != self.user.unix_username and self.user.unix_username is not None:
+            if (
+                shortname != self.user.unix_username
+                and self.user.unix_username is not None
+            ):
                 self.user.unix_username = self.shortname
                 self.user.save()
 
             self.shortname = self.user.unix_username
 
         if self.shortname and self.shortname != shortname:
-            logger.error(f"Cannot change shortname of user {self.user} from {self.shortname} to {shortname}")
-            raise ValueError(f"Cannot change shortname of user {self.user} from {self.shortname} to {shortname}")
+            logger.error(
+                f"Cannot change shortname of user {self.user} from {self.shortname} to {shortname}"
+            )
+            raise ValueError(
+                f"Cannot change shortname of user {self.user} from {self.shortname} to {shortname}"
+            )
 
         self.shortname = shortname
 
@@ -411,11 +449,11 @@ class ProjectInfo(models.Model):
         validators=[
             validators.RegexValidator(
                 regex=r"^[a-z0-9\-_]+$",
-                ),
+            ),
             validators.RegexValidator(
                 regex=r"(-admin)|(-root)$",
                 inverse_match=True,
-                ),
+            ),
             validators.MinLengthValidator(3),
             validators.MaxLengthValidator(MAX_PROJECT_SHORTNAME_LENGTH),
         ],
@@ -451,7 +489,10 @@ class ProjectInfo(models.Model):
         if this field exists
         """
         if hasattr(self.project, "short_name"):
-            if self.shortname != self.project.short_name and self.project.short_name is not None:
+            if (
+                self.shortname != self.project.short_name
+                and self.project.short_name is not None
+            ):
                 self.set_shortname(self.project.short_name)
                 self.save()
 
@@ -465,15 +506,22 @@ class ProjectInfo(models.Model):
             raise ValueError("Shortname cannot be empty.")
 
         if hasattr(self.project, "short_name"):
-            if shortname != self.project.short_name and self.project.short_name is not None:
+            if (
+                shortname != self.project.short_name
+                and self.project.short_name is not None
+            ):
                 self.project.short_name = self.shortname
                 self.project.save()
 
             self.shortname = self.project.short_name
 
         if self.shortname and self.shortname != shortname:
-            logger.error(f"Cannot change shortname of project {self.project} from {self.shortname} to {shortname}")
-            raise ValueError(f"Cannot change shortname of project {self.project} from {self.shortname} to {shortname}")
+            logger.error(
+                f"Cannot change shortname of project {self.project} from {self.shortname} to {shortname}"
+            )
+            raise ValueError(
+                f"Cannot change shortname of project {self.project} from {self.shortname} to {shortname}"
+            )
 
         self.shortname = shortname
 

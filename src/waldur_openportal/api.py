@@ -4,7 +4,11 @@ from django.contrib import auth
 from django.utils.translation import gettext_lazy as _
 from django.http import JsonResponse
 
-from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.decorators import (
+    api_view,
+    authentication_classes,
+    permission_classes,
+)
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.permissions import IsAuthenticated
 
@@ -21,7 +25,8 @@ logger = logging.getLogger(__name__)
 
 User = auth.get_user_model()
 
-@api_view(['GET'])
+
+@api_view(["GET"])
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
 def access_for_email(request):
@@ -108,13 +113,13 @@ def access_for_email(request):
     can_query_all_emails = user.is_staff or user.is_support
 
     if (not can_query_all_emails) and user.email != email:
-        response = JsonResponse(
-            {"error": "You can only query your own email"}
-        )
+        response = JsonResponse({"error": "You can only query your own email"})
         response.status_code = status.FORBIDDEN
         return response
 
-    logger.info(f"api/openportal/access_for_email request for {email} from {user} ({user.email})")
+    logger.info(
+        f"api/openportal/access_for_email request for {email} from {user} ({user.email})"
+    )
 
     qs = User.all_objects.all()
 
@@ -155,7 +160,7 @@ def access_for_email(request):
             if short_name_in_waldur is None:
                 short_name_in_waldur = userinfo.shortname
 
-            # special case - brics users can access everything
+            # special case - brics users can access the notebook
             for project in member_of_projects:
                 if project.short_name == "brics":
                     if "brics.brics" not in projects:
@@ -171,32 +176,12 @@ def access_for_email(request):
                         }
                     )
 
-                    projects["brics.brics"]["resources"].append(
-                        {
-                            "name": "brics.aip1.clusters.shared",
-                            "username": f"{userinfo.shortname}.brics",
-                        }
-                    )
-
-                    projects["brics.brics"]["resources"].append(
-                        {
-                            "name": "brics.i3.clusters.shared",
-                            "username": f"{userinfo.shortname}.brics",
-                        }
-                    )
-
-                    projects["brics.brics"]["resources"].append(
-                        {
-                            "name": "brics.i3.macs.shared",
-                            "username": f"{userinfo.shortname}.brics",
-                        }
-                    )
-
-
-            # loop over all of the allocations for this user
+            # loop over all of the allocations for this user
             for allocation in utils.get_project_allocations(user):
                 if not allocation.has_project_identifier():
-                    logger.warning(f"OpenPortal - {allocation} has no project identifier, skipping")
+                    logger.warning(
+                        f"OpenPortal - {allocation} has no project identifier, skipping"
+                    )
                     continue
 
                 project = str(allocation.get_project_identifier())
@@ -204,15 +189,21 @@ def access_for_email(request):
 
                 # find the association between the user and the allocation
                 try:
-                    association = models.Association.objects.get(user=user, allocation=allocation)
+                    association = models.Association.objects.get(
+                        user=user, allocation=allocation
+                    )
                 except models.Association.DoesNotExist:
-                    logger.warning(f"Association between {user} and {allocation} not found - skipping")
+                    logger.warning(
+                        f"Association between {user} and {allocation} not found - skipping"
+                    )
                     continue
 
                 username = association.username
 
                 if username is None:
-                    logger.warning(f"Association between {user} and {allocation} has no username '{username}' - skipping")
+                    logger.warning(
+                        f"Association between {user} and {allocation} has no username '{username}' - skipping"
+                    )
                     continue
 
                 if project not in projects:

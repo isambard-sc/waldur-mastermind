@@ -1,4 +1,3 @@
-
 import logging
 import re
 
@@ -7,6 +6,8 @@ from django.db import transaction
 
 from waldur_core.structure.backend import ServiceBackend
 from waldur_core.structure.exceptions import ServiceBackendError
+from waldur_core.core import utils as core_utils
+
 from waldur_openportal import signals
 from waldur_openportal.client import OpenPortalClient
 
@@ -46,7 +47,7 @@ class OpenPortalBackend(ServiceBackend):
                 logger.error("Error while pulling allocation [%s]: %s", allocation, e)
 
     def ping(self, raise_exception=False):
-        logger.info(f"Pinging OpenPortal")
+        logger.info("Pinging OpenPortal")
         try:
             self.client.health()
         except openportal.OpenPortalError as e:
@@ -63,7 +64,9 @@ class OpenPortalBackend(ServiceBackend):
         """
         # look up the short name from the models.ProjectInfo object
         # associated with this project
-        project_info, created = models.ProjectInfo.objects.get_or_create(project=project)
+        project_info, created = models.ProjectInfo.objects.get_or_create(
+            project=project
+        )
 
         project = project_info.project
 
@@ -71,7 +74,9 @@ class OpenPortalBackend(ServiceBackend):
         # property (which may disappear in the future)
         if project_info.shortname is None and hasattr(project, "short_name"):
             if project.short_name is not None:
-                logger.info(f"Copying shortname from the project's short_name for {project}")
+                logger.info(
+                    f"Copying shortname from the project's short_name for {project}"
+                )
                 project_info.set_shortname(project.shortname)
                 project_info.save()
 
@@ -94,7 +99,9 @@ class OpenPortalBackend(ServiceBackend):
         # property (which may disappear in the future)
         if user_info.shortname is None and hasattr(user, "unix_username"):
             if user.unix_username is not None:
-                logger.info(f"Copying shortname from the user's unix_username for {user}")
+                logger.info(
+                    f"Copying shortname from the user's unix_username for {user}"
+                )
                 user_info.set_shortname(user.unix_username)
                 user_info.save()
 
@@ -105,14 +112,16 @@ class OpenPortalBackend(ServiceBackend):
 
     def sync_users(self, allocation: models.Allocation) -> None:
         if not isinstance(allocation, models.Allocation):
-            raise ServiceBackendError(
-                "Invalid allocation type %s" % type(allocation)
-            )
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
 
-        if not allocation.has_project_identifier():
-            logger.warning(f"Allocation {allocation} has no project identifier - creating now!")
+        if not (
+            allocation.has_project_identifier() or allocation.is_added_to_openportal()
+        ):
+            logger.warning(
+                f"Allocation {allocation} is not in OpenPortal - adding now!"
+            )
             # this already calls 'sync_users' on the created allocation
-            self.create_allocation(allocation)
+            self.add_allocated_project(allocation)
             return
 
         project = allocation.get_project_identifier()
@@ -131,7 +140,9 @@ class OpenPortalBackend(ServiceBackend):
         for user in users:
             try:
                 # get the association between the user and the allocation
-                (association, created) = models.Association.objects.get_or_create(user=user, allocation=allocation)
+                (association, created) = models.Association.objects.get_or_create(
+                    user=user, allocation=allocation
+                )
 
                 mapping = None
 
@@ -143,15 +154,23 @@ class OpenPortalBackend(ServiceBackend):
                     shortname = self.get_user_shortname(user)
 
                     if shortname is None or not shortname.strip():
-                        logger.error(f"Empty shortname for user: {user} - cannot add to OpenPortal")
+                        logger.error(
+                            f"Empty shortname for user: {user} - cannot add to OpenPortal"
+                        )
                         continue
 
-                    new_mapping = self.client.add_user(shortname=shortname, project=project)
+                    new_mapping = self.client.add_user(
+                        shortname=shortname, project=project
+                    )
 
-                    logger.info(f"Added user {user} to OpenPortal project {project} with mapping {new_mapping}")
+                    logger.info(
+                        f"Added user {user} to OpenPortal project {project} with mapping {new_mapping}"
+                    )
 
                     if (mapping is not None) and (new_mapping != mapping):
-                        logger.warning(f"User {user} has a changing username in OpenPortal: {mapping} -> {new_mapping}")
+                        logger.warning(
+                            f"User {user} has a changing username in OpenPortal: {mapping} -> {new_mapping}"
+                        )
 
                     mapping = new_mapping
 
@@ -168,7 +187,9 @@ class OpenPortalBackend(ServiceBackend):
             except Exception as e:
                 logger.error(f"Unable to add user {user} to OpenPortal: {e}")
 
-        stale_mappings = [mapping for mapping in user_mappings if mapping not in allocated_mappings]
+        stale_mappings = [
+            mapping for mapping in user_mappings if mapping not in allocated_mappings
+        ]
 
         if len(stale_mappings) > 0:
             logger.info(f"Stale users in OpenPortal: {stale_mappings}")
@@ -178,7 +199,9 @@ class OpenPortalBackend(ServiceBackend):
                 self.client.delete_user(mapping.user)
                 # no need to signal as the user has already been removed from the association
             except Exception as e:
-                logger.error(f"Unable to delete user with mapping {mapping} from OpenPortal: {e}")
+                logger.error(
+                    f"Unable to delete user with mapping {mapping} from OpenPortal: {e}"
+                )
 
     def assert_can_create_allocation_for_project(self, project):
         """
@@ -189,36 +212,52 @@ class OpenPortalBackend(ServiceBackend):
         """
         destination = str(self.client.destination())
 
-        logger.info(f"Asserting that project {project} can create an allocation for {destination}")
+        logger.info(
+            f"Asserting that project {project} can create an allocation for {destination}"
+        )
 
         existing_allocations = self.get_allocation_queryset().filter(project=project)
 
         for allocation in existing_allocations:
-            logger.info(f"Existing allocation: {allocation} | {allocation.state} | {allocation.is_active} | {allocation.has_project_identifier()}")
+            logger.info(
+                f"Existing allocation: {allocation} | {allocation.state} | {allocation.is_active} | {allocation.has_project_identifier()}"
+            )
 
         # find all of these allocations that are active and that have a project identifier
         existing_allocations = [
-            allocation for allocation in existing_allocations
-            if allocation.has_project_identifier() and allocation.state != models.Allocation.States.ERRED
+            allocation
+            for allocation in existing_allocations
+            if allocation.has_project_identifier()
+            and allocation.state != models.Allocation.States.ERRED
         ]
 
         if len(existing_allocations) > 0:
-            logger.error(f"Project {project} already has existing allocation(s) in OpenPortal for {destination}")
+            logger.error(
+                f"Project {project} already has existing allocation(s) in OpenPortal for {destination}"
+            )
             logger.error(f"These are {existing_allocations}")
             raise ServiceBackendError(
-                f"Project {project} already has an allocation for {destination} in OpenPortal. " +
-                 "You may only have a single active allocation per destination per project. " +
-                 f"The existing allocation(s) are: {existing_allocations}")
+                f"Project {project} already has an allocation for {destination} in OpenPortal. "
+                + "You may only have a single active allocation per destination per project. "
+                + f"The existing allocation(s) are: {existing_allocations}"
+            )
 
         # now look at the allowed destinations for this project, from its
         # project-info object
-        project_info, created = models.ProjectInfo.objects.get_or_create(project=project)
+        project_info, created = models.ProjectInfo.objects.get_or_create(
+            project=project
+        )
         project_info.sanitise()
 
-        if project_info.allowed_destinations is None or len(project_info.allowed_destinations.strip()) == 0:
+        if (
+            project_info.allowed_destinations is None
+            or len(project_info.allowed_destinations.strip()) == 0
+        ):
             # by default, projects can connect to any destination - this can be refined
             # down as needed by the admin
-            logger.info(f"Project {project} is allowed to create an allocation for any destination")
+            logger.info(
+                f"Project {project} is allowed to create an allocation for any destination"
+            )
             return
 
         allowed_destinations = project_info.allowed_destinations.split(",")
@@ -238,68 +277,114 @@ class OpenPortalBackend(ServiceBackend):
                     # this is a match
                     return
 
-        logger.error(f"Project {project} is not allowed to create an allocation for {destination}")
+        logger.error(
+            f"Project {project} is not allowed to create an allocation for {destination}"
+        )
         logger.error(f"Allowed destinations are: {allowed_destinations}")
 
         raise ServiceBackendError(
-            f"Project {project} is not allowed to create an allocation for {destination}. " +
-            f"Allowed destinations are: {allowed_destinations}")
+            f"Project {project} is not allowed to create an allocation for {destination}. "
+            + f"Allowed destinations are: {allowed_destinations}"
+        )
 
-    def create_allocation(self, allocation):
+    def add_allocated_project(self, allocation: models.Allocation) -> models.Allocation:
+        self.assert_can_create_allocation_for_project(allocation.project)
+
         if allocation.has_project_identifier():
             project = allocation.get_project_identifier()
             logger.info(f"Allocation already exists: {allocation} | {project}")
 
             # add it again just to be sure
-            mapping = self.client.add_project(project)
+            try:
+                mapping = self.client.add_project(project)
+            except Exception as e:
+                logger.warning(
+                    f"Unable to re-add project {project} to OpenPortal: {e}. This will be re-added later..."
+                )
+                return allocation
 
-            logger.info(f"Re-added allocation {allocation} to OpenPortal with mapping {mapping}")
+            logger.info(
+                f"Re-added allocation {allocation} to OpenPortal with mapping {mapping}"
+            )
+            allocation.is_added = True
 
             if allocation.has_mapping():
                 if allocation.get_mapping() != mapping:
-                    logger.warning(f"Allocation {allocation} has a changing project name in OpenPortal: {mapping} -> {allocation.get_mapping()}")
+                    logger.warning(
+                        f"Allocation {allocation} has a changing project name in OpenPortal: {mapping} -> {allocation.get_mapping()}"
+                    )
                 else:
                     allocation.set_mapping(mapping)
         else:
-            self.assert_can_create_allocation_for_project(allocation.project)
-
             project = allocation.project
             project_name = self.get_project_shortname(project)
 
             logger.info(f"Creating allocation: {allocation} for project {project_name}")
 
             if project_name is None or not project_name.strip():
-                logger.error(f"Empty project_name for allocation: {allocation} - cannot create in OpenPortal")
-                raise ServiceBackendError(f"Empty project_name for allocation. Please set a short name for {project}")
+                logger.error(
+                    f"Empty project_name for allocation: {allocation} - cannot create in OpenPortal"
+                )
+                raise ServiceBackendError(
+                    f"Empty project_name for allocation. Please set a short name for {project}"
+                )
 
-            mapping = self.client.add_project(project_name)
+            try:
+                mapping = self.client.add_project(project_name)
+            except Exception as e:
+                logger.warning(
+                    f"Unable to create OpenPortal project {project_name}: {e}. This will be created later..."
+                )
+                return allocation
 
-            logger.info(f"Created OpenPortal project {project_name} with mapping {mapping}")
-
+            logger.info(
+                f"Created OpenPortal project {project_name} with mapping {mapping}"
+            )
             allocation.set_mapping(mapping)
+            allocation.is_added = True
 
-        allocation.node_limit = 0
         allocation.save()
+
+        logger.info(f"Allocation node limit is {allocation.node_limit}")
 
         self.set_resource_limits(allocation)
 
         if allocation.has_project_identifier():
             self.sync_users(allocation)
         else:
-            logger.error(f"Program bug? Allocation {allocation} has no project identifier - cannot sync users")
-            raise ServiceBackendError(f"Allocation {allocation} for {project} has no project identifier - cannot sync users")
+            logger.error(
+                f"Program bug? Allocation {allocation} has no project identifier - cannot sync users"
+            )
+            raise ServiceBackendError(
+                f"Allocation {allocation} for {project} has no project identifier - cannot sync users"
+            )
+
+        return allocation
+
+    def create_allocation(self, allocation):
+        self.assert_can_create_allocation_for_project(allocation.project)
+
+        # schedule this as a background task so that we don't block the Waldur GUI
+        # If this fails, then another sync process will fix things later
+        from . import tasks
+
+        tasks.add_allocated_project.delay(core_utils.serialize_instance(allocation))
 
     def delete_allocation(self, allocation):
         logger.info(f"Deleting allocation: {allocation}")
 
-        if not allocation.has_project_identifier():
+        if not (
+            allocation.has_project_identifier() or allocation.is_added_to_openportal()
+        ):
             logger.info(f"Allocation already deleted: {allocation}")
         else:
             try:
                 project = allocation.get_project_identifier()
                 self.client.delete_project(project)
             except Exception as e:
-                logger.error(f"Unable to delete allocation {allocation} from OpenPortal: {e}")
+                logger.error(
+                    f"Unable to delete allocation {allocation} from OpenPortal: {e}"
+                )
 
         project = allocation.project
         if self.get_allocation_queryset().filter(project=project).count() == 0:
@@ -311,12 +396,22 @@ class OpenPortalBackend(ServiceBackend):
         The allocation contains the information of which project the user is in.
         """
         if not isinstance(allocation, models.Allocation):
-            raise ServiceBackendError(
-                "Invalid allocation type %s" % type(allocation)
-            )
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        if not allocation.is_added_to_openportal():
+            # try to add now
+            allocation = self.add_allocated_project(allocation)
+
+            if not allocation.is_added_to_openportal():
+                logger.error(
+                    f"Allocation {allocation} is not in OpenPortal - cannot add user {user}"
+                )
+                return False
 
         if not allocation.has_project_identifier():
-            logger.error(f"Allocation {allocation} has no project identifier - cannot add user {user} to OpenPortal")
+            logger.error(
+                f"Allocation {allocation} has no project identifier - cannot add user {user} to OpenPortal"
+            )
             return False
 
         project = allocation.get_project_identifier()
@@ -326,12 +421,16 @@ class OpenPortalBackend(ServiceBackend):
         shortname = self.get_user_shortname(user)
 
         if shortname is None or not shortname.strip():
-            logger.error(f"Empty shortname for user: {user} - they cannot be added to OpenPortal")
+            logger.error(
+                f"Empty shortname for user: {user} - they cannot be added to OpenPortal"
+            )
             return False
 
         # get or create the association between the user and the allocation
         # This association holds the username of the user in OpenPortal on this instance
-        (association, created) = models.Association.objects.get_or_create(user=user, allocation=allocation)
+        (association, created) = models.Association.objects.get_or_create(
+            user=user, allocation=allocation
+        )
 
         mapping = None
 
@@ -339,7 +438,9 @@ class OpenPortalBackend(ServiceBackend):
             mapping = association.get_mapping()
 
         if mapping is not None:
-            logger.info(f"User {user} has previously been in {project} with mapping {mapping}")
+            logger.info(
+                f"User {user} has previously been in {project} with mapping {mapping}"
+            )
             logger.info("Re-adding them to OpenPortal with the same mapping.")
 
         try:
@@ -347,7 +448,9 @@ class OpenPortalBackend(ServiceBackend):
             logger.info(f"Added user {user} with mapping {new_mapping}")
 
             if (mapping is not None) and (new_mapping != mapping):
-                logger.warning(f"User {user} has a changing mapping in OpenPortal: {mapping} -> {new_mapping}")
+                logger.warning(
+                    f"User {user} has a changing mapping in OpenPortal: {mapping} -> {new_mapping}"
+                )
 
             association.set_mapping(new_mapping)
             association.save()
@@ -358,7 +461,9 @@ class OpenPortalBackend(ServiceBackend):
                 user=user,
             )
         except Exception as e:
-            logger.error(f"Unable to add user {user} to allocation {allocation} in OpenPortal: {e}")
+            logger.error(
+                f"Unable to add user {user} to allocation {allocation} in OpenPortal: {e}"
+            )
             return False
 
         return True
@@ -368,12 +473,18 @@ class OpenPortalBackend(ServiceBackend):
         Delete association between user and OpenPortal account if it exists.
         """
         if not isinstance(allocation, models.Allocation):
-            raise ServiceBackendError(
-                "Invalid allocation type %s" % type(allocation)
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        if not allocation.is_added_to_openportal():
+            logger.error(
+                f"Allocation {allocation} is not in OpenPortal - cannot delete user {user}"
             )
+            return False
 
         if not allocation.has_project_identifier():
-            logger.error(f"Allocation {allocation} has no project identifier - cannot delete user {user} from OpenPortal")
+            logger.error(
+                f"Allocation {allocation} has no project identifier - cannot delete user {user} from OpenPortal"
+            )
             return False
 
         project = allocation.get_project_identifier()
@@ -382,9 +493,13 @@ class OpenPortalBackend(ServiceBackend):
 
         # find the association between the user and the allocation
         try:
-            association = models.Association.objects.get(user=user, allocation=allocation)
+            association = models.Association.objects.get(
+                user=user, allocation=allocation
+            )
         except Exception as e:
-            logger.error(f"Unable to find association between user {user} and allocation {allocation}: {e}")
+            logger.error(
+                f"Unable to find association between user {user} and allocation {allocation}: {e}"
+            )
             return False
 
         if not association.has_mapping():
@@ -399,13 +514,17 @@ class OpenPortalBackend(ServiceBackend):
             try:
                 self.client.delete_user(op_user)
             except Exception as e:
-                logger.error(f"Unable to delete user {op_user} from project {project} in OpenPortal: {e}")
+                logger.error(
+                    f"Unable to delete user {op_user} from project {project} in OpenPortal: {e}"
+                )
 
                 # see if this user still exists in the project - if not, we can continue
                 mappings = self.client.get_users(project)
 
                 if association.get_mapping() in mappings:
-                    logger.error(f"User {op_user} still exists in project {project} - cannot delete")
+                    logger.error(
+                        f"User {op_user} still exists in project {project} - cannot delete"
+                    )
                     return False
 
             # delete this association
@@ -417,17 +536,28 @@ class OpenPortalBackend(ServiceBackend):
 
             return True
         except Exception as e:
-            logger.error(f"Unable to delete user {user} from allocation {allocation} in OpenPortal: {e}")
+            logger.error(
+                f"Unable to delete user {user} from allocation {allocation} in OpenPortal: {e}"
+            )
             return False
 
     def set_resource_limits(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):
-            raise ServiceBackendError(
-                "Invalid allocation type %s" % type(allocation)
-            )
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        if not allocation.is_added_to_openportal():
+            allocation = self.add_allocated_project(allocation)
+
+            if not allocation.is_added_to_openportal():
+                logger.error(
+                    f"Allocation {allocation} is not in OpenPortal - cannot set resource limits"
+                )
+                return
 
         if not allocation.has_project_identifier():
-            logger.error(f"Allocation {allocation} has no project identifier - cannot set resource limits")
+            logger.error(
+                f"Allocation {allocation} has no project identifier - cannot set resource limits"
+            )
             return
 
         project = allocation.get_project_identifier()
@@ -438,18 +568,26 @@ class OpenPortalBackend(ServiceBackend):
         set_limit = self.client.set_resource_limits(project, limit)
 
         if set_limit.seconds != limit.seconds:
-            logger.error(f"Unable to set limit for project {project} to {limit} - got {set_limit}")
+            logger.error(
+                f"Unable to set limit for project {project} to {limit} - got {set_limit}"
+            )
 
-    def get_resource_limits(self, project: openportal.ProjectIdentifier) -> openportal.Usage:
+    def get_resource_limits(
+        self, project: openportal.ProjectIdentifier
+    ) -> openportal.Usage:
         logger.info(f"Getting OpenPortal limits for account: {project}")
         limit = self.client.get_resource_limits(project)
         logger.info(f"OpenPortal limits for project {project}: {limit}")
         return limit
 
     @transaction.atomic()
-    def _update_usage_from_report(self, allocation, report: openportal.ProjectUsageReport,
-                                  update_current: bool = True):
-        # this will be the total usage this month - check that we have
+    def _update_usage_from_report(
+        self,
+        allocation,
+        report: openportal.ProjectUsageReport,
+        update_current: bool = True,
+    ):
+        # this will be the total usage this month - check that we have
         # dates that are all in the same month...
         if len(report.dates) == 0:
             logger.error(f"Empty usage report for {allocation}")
@@ -464,14 +602,19 @@ class OpenPortalBackend(ServiceBackend):
 
         if report.is_complete:
             logger.info(f"Forced update as usage report for {allocation} is complete")
-        elif abs(float(allocation.node_usage) - float(report.total_usage.hours)) > 0.00001:
+        elif (
+            abs(float(allocation.node_usage) - float(report.total_usage.hours))
+            > 0.00001
+        ):
             # check whether or not there has been any change in total usage.
             # If not, then no need to update the usage for the allocation
-            logger.info(f"Usage for allocation {allocation} has not changed: {allocation.node_usage} == {report.total_usage.hours}. Not updating.")
+            logger.info(
+                f"Usage for allocation {allocation} has not changed: {allocation.node_usage} == {report.total_usage.hours}. Not updating."
+            )
             return
 
         if update_current:
-            # only update this month's usage if we are updating the current month
+            # only update this month's usage if we are updating the current month
             allocation.node_usage = report.total_usage.hours
             allocation.save(update_fields=["node_usage"])
 
@@ -501,31 +644,44 @@ class OpenPortalBackend(ServiceBackend):
                 month=day.month,
                 user=user,
                 username=str(user_identifier),
-                defaults={
-                    "node_usage": usage
-                },
+                defaults={"node_usage": usage},
             )
 
     def sync_usage(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):
-            raise ServiceBackendError(
-                "Invalid allocation type %s" % type(allocation)
-            )
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        if not allocation.is_added_to_openportal():
+            allocation = self.add_allocated_project(allocation)
+
+            if not allocation.is_added_to_openportal():
+                logger.error(
+                    f"Allocation {allocation} is not in OpenPortal - cannot sync usage"
+                )
+                return
 
         if not allocation.has_project_identifier():
-            logger.error(f"Allocation {allocation} has no project identifier - cannot sync usage")
+            logger.error(
+                f"Allocation {allocation} has no project identifier - cannot sync usage"
+            )
             return
 
         project = allocation.get_project_identifier()
-        logger.info(f"Syncing OpenPortal usage for allocation {allocation} and project {project}")
+        logger.info(
+            f"Syncing OpenPortal usage for allocation {allocation} and project {project}"
+        )
 
         # accounting is based on collecting monthly reports - make sure we have all
         # of the reports since the start date of accounting
         accounting_start_date = allocation.project.customer.accounting_start_date
-        logger.info(f"Accounting start date for project {project}: {accounting_start_date}")
+        logger.info(
+            f"Accounting start date for project {project}: {accounting_start_date}"
+        )
 
         # get all of the months since that start date and today
-        months = openportal.DateRange(accounting_start_date, openportal.DateRange.today().days[0]).months
+        months = openportal.DateRange(
+            accounting_start_date, openportal.DateRange.today().days[0]
+        ).months
 
         logger.info(f"Months since accounting start date: {months}")
 
@@ -533,14 +689,16 @@ class OpenPortalBackend(ServiceBackend):
             # get the historical report for this month
             first_day = month.days[0]
 
-            historical_report, created = models.HistoricalAllocation.objects.get_or_create(
-                allocation=allocation,
-                year=first_day.year,
-                month=first_day.month,
-                defaults={
-                    "node_usage": 0,
-                    "is_complete": False,
-                }
+            historical_report, created = (
+                models.HistoricalAllocation.objects.get_or_create(
+                    allocation=allocation,
+                    year=first_day.year,
+                    month=first_day.month,
+                    defaults={
+                        "node_usage": 0,
+                        "is_complete": False,
+                    },
+                )
             )
 
             if created:
@@ -549,7 +707,9 @@ class OpenPortalBackend(ServiceBackend):
             is_current_month: bool = month == openportal.DateRange.this_month()
 
             # The current month's report cannot be complete
-            is_report_complete: bool = (not is_current_month) and historical_report.is_complete
+            is_report_complete: bool = (
+                not is_current_month
+            ) and historical_report.is_complete
 
             if is_report_complete:
                 logger.info(f"Skipping {month} as report is complete")
@@ -558,7 +718,9 @@ class OpenPortalBackend(ServiceBackend):
             report = self.client.get_usage_report(project, month)
 
             logger.info(f"Total usage for project in {month} = {report.total_usage}")
-            self._update_usage_from_report(allocation, report, update_current=is_current_month)
+            self._update_usage_from_report(
+                allocation, report, update_current=is_current_month
+            )
 
             historical_report.node_usage = report.total_usage.hours
             historical_report.is_complete = is_report_complete
@@ -570,21 +732,33 @@ class OpenPortalBackend(ServiceBackend):
         expected_limit = openportal.Usage.from_hours(allocation.node_limit)
 
         if limit.seconds != expected_limit.seconds:
-            logger.warning(f"Limit for project {project} does not match expected limit: {limit} != {expected_limit}")
+            logger.warning(
+                f"Limit for project {project} does not match expected limit: {limit} != {expected_limit}"
+            )
             new_limit = self.client.set_resource_limits(project, expected_limit)
 
             if new_limit.seconds != expected_limit.seconds:
-                logger.error(f"Unable to set limit for project {project} to {expected_limit} - got {new_limit}")
+                logger.error(
+                    f"Unable to set limit for project {project} to {expected_limit} - got {new_limit}"
+                )
 
     def pull_allocation(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):
-            raise ServiceBackendError(
-                "Invalid allocation type %s" % type(allocation)
-            )
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        if not allocation.is_added_to_openportal():
+            allocation = self.add_allocated_project(allocation)
+
+            if not allocation.is_added_to_openportal():
+                logger.error(
+                    f"Allocation {allocation} is not in OpenPortal - cannot pull"
+                )
+                return
 
         if not allocation.has_project_identifier():
             raise ServiceBackendError(
-                "Allocation %s has no project identifier - cannot pull from OpenPortal" % allocation
+                "Allocation %s has no project identifier - cannot pull from OpenPortal"
+                % allocation
             )
 
         logger.info(f"Pulling OpenPortal allocation {allocation}")
@@ -597,6 +771,15 @@ class OpenPortalBackend(ServiceBackend):
 
     def _update_allocation_associations(self, allocation):
         logger.info(f"Updating associations for allocation {allocation}")
+
+        if not (
+            allocation.has_project_identifier() or allocation.is_added_to_openportal()
+        ):
+            logger.error(
+                f"Allocation {allocation} is not in OpenPortal - cannot update associations"
+            )
+            return
+
         project = allocation.get_project_identifier()
 
         # get the UserMappings for all users that are registered with
@@ -606,7 +789,9 @@ class OpenPortalBackend(ServiceBackend):
         # get the UserMappings for all users that Waldur says should
         # be associated with this allocation
         local_users = [
-            association.get_mapping() for association in allocation.associations.all() if association.has_mapping()
+            association.get_mapping()
+            for association in allocation.associations.all()
+            if association.has_mapping()
         ]
 
         # Get the UserIdentifiers for all users that are in OpenPortal
