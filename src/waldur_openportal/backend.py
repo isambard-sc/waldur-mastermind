@@ -679,19 +679,12 @@ class OpenPortalBackend(ServiceBackend):
             f"Syncing OpenPortal usage for allocation {allocation} and project {project}"
         )
 
-        # accounting is based on collecting monthly reports - make sure we have all
-        # of the reports since the start date of accounting
-        accounting_start_date = allocation.project.customer.accounting_start_date
-        logger.info(
-            f"Accounting start date for project {project}: {accounting_start_date}"
-        )
+        # accounting is based on collecting monthly reports - make sure to do this
+        # month and last month, just in case we missed any data from the month
+        # changeover
+        months = [openportal.DateRange.last_month(), openportal.DateRange.this_month()]
 
-        # get all of the months since that start date and today
-        months = openportal.DateRange(
-            accounting_start_date, openportal.DateRange.today().days[0]
-        ).months
-
-        logger.info(f"Months since accounting start date: {months}")
+        logger.info(f"Months to get accounts: {months}")
 
         for month in months:
             # get the historical report for this month
@@ -731,7 +724,9 @@ class OpenPortalBackend(ServiceBackend):
             )
 
             historical_report.node_usage = report.total_usage.hours
-            historical_report.is_complete = is_report_complete
+            historical_report.is_complete = (
+                not is_current_month
+            ) and report.is_complete
             historical_report.save()
 
         # check that the limits in the resource match the limits in the allocation
