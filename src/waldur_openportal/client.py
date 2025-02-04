@@ -12,6 +12,7 @@ class OpenPortalRunner:
     """
     This class is actually responsible for running OpenPortal commands
     """
+
     def __init__(self):
         # make sure that the OpenPortal config is loaded
         if not openportal.have_openportal:
@@ -32,17 +33,23 @@ class OpenPortalRunner:
         try:
             config_file = os.environ.get("OPENPORTAL_CONFIG")
         except KeyError:
-            raise openportal.OpenPortalError("OPENPORTAL_CONFIG environment variable not set")
+            raise openportal.OpenPortalError(
+                "OPENPORTAL_CONFIG environment variable not set"
+            )
 
         if not config_file:
-            raise openportal.OpenPortalError("OPENPORTAL_CONFIG environment variable not set")
+            raise openportal.OpenPortalError(
+                "OPENPORTAL_CONFIG environment variable not set"
+            )
 
         try:
             # this isn't thread-safe - we should make it thread-save
             # in the OpenPortal python layer
             openportal.load_config(config_file)
         except Exception as e:
-            raise openportal.OpenPortalError(f"Failed to load OpenPortal config from '{config_file}': {e}")
+            raise openportal.OpenPortalError(
+                f"Failed to load OpenPortal config from '{config_file}': {e}"
+            )
 
     def health(self):
         if not openportal.have_openportal:
@@ -62,7 +69,9 @@ class OpenPortalRunner:
         Return the OpenPortal job with the specified UID
         """
         if not openportal.have_openportal:
-            raise openportal.OpenPortalError(f"OpenPortal is not available - cannot get job with UID '{uid}'")
+            raise openportal.OpenPortalError(
+                f"OpenPortal is not available - cannot get job with UID '{uid}'"
+            )
 
         try:
             job = openportal.get(str(uid))
@@ -78,7 +87,9 @@ class OpenPortalRunner:
         goes wrong
         """
         if not openportal.have_openportal:
-            raise openportal.OpenPortalError(f"OpenPortal is not available - cannot run '{command}'")
+            raise openportal.OpenPortalError(
+                f"OpenPortal is not available - cannot run '{command}'"
+            )
 
         try:
             job = openportal.run(command, 100)
@@ -93,6 +104,7 @@ class OpenPortalClient:
     This class implements Python client for OpenPortal.
     See also: https://github.com/isambard-sc/openportal
     """
+
     def __init__(self, instance_name):
         if instance_name is None:
             raise openportal.OpenPortalError("Instance name cannot be None")
@@ -154,10 +166,16 @@ class OpenPortalClient:
         try:
             return openportal.PortalIdentifier(self._destination.agents[0])
         except Exception as e:
-            logger.error(f"Failed to get portal name from destination {self._destination}: {e}")
-            raise openportal.OpenPortalError(f"Failed to get portal name from destination {self._destination}: {e}")
+            logger.error(
+                f"Failed to get portal name from destination {self._destination}: {e}"
+            )
+            raise openportal.OpenPortalError(
+                f"Failed to get portal name from destination {self._destination}: {e}"
+            )
 
-    def add_user(self, shortname: str, project: openportal.ProjectIdentifier) -> openportal.UserMapping:
+    def add_user(
+        self, shortname: str, project: openportal.ProjectIdentifier
+    ) -> openportal.UserMapping:
         """
         Tell OpenPortal to add the specified short (unix) name to the project.
         The username should be unique on the caller
@@ -174,7 +192,9 @@ class OpenPortalClient:
 
         mapping = self.run(f"{self.destination()} add_user {user}")
 
-        logger.info(f"Added OpenPortal user to project {project} with mapping {mapping}")
+        logger.info(
+            f"Added OpenPortal user to project {project} with mapping {mapping}"
+        )
 
         return mapping
 
@@ -188,7 +208,9 @@ class OpenPortalClient:
 
         logger.info(f"Deleted OpenPortal user '{user}'")
 
-    def add_project(self, project: openportal.ProjectIdentifier) -> openportal.ProjectMapping:
+    def add_project(
+        self, project: openportal.ProjectIdentifier
+    ) -> openportal.ProjectMapping:
         """
         Tell OpenPortal to create a project with the specified name.
         This name should be unique on the caller side. OpenPortal will
@@ -211,19 +233,23 @@ class OpenPortalClient:
 
         self.run(f"{self.destination()} remove_project {project}")
 
-    def set_resource_limits(self, project: openportal.ProjectIdentifier, limit: openportal.Usage) -> openportal.Usage:
+    def set_resource_limits(
+        self, project: openportal.ProjectIdentifier, limit: openportal.Usage
+    ) -> openportal.Usage:
         """
         Set the resource usage limit for the specified project to the specified limit.
         This returns the limit that has actually been set.
         """
         project = self._to_project_identifier(project)
-        usage = self._to_usage(limit)
+        usage = self._to_usage(limit).seconds
 
-        new_limit = self.run(f"{self.destination()} set_limit {project} {limit}")
+        new_limit = self.run(f"{self.destination()} set_limit {project} {usage}")
 
         return new_limit
 
-    def get_resource_limits(self, project: openportal.ProjectIdentifier) -> openportal.Usage:
+    def get_resource_limits(
+        self, project: openportal.ProjectIdentifier
+    ) -> openportal.Usage:
         """
         Get the resource usage limit for the specified project
         """
@@ -233,16 +259,22 @@ class OpenPortalClient:
 
         return limit
 
-    def get_usage_report(self, project: openportal.ProjectIdentifier, date_range: openportal.DateRange):
+    def get_usage_report(
+        self, project: openportal.ProjectIdentifier, date_range: openportal.DateRange
+    ):
         """
         Return the usage report for the specified project and date range
         """
         project = self._to_project_identifier(project)
 
-        report = self.run(f"{self.destination()} get_usage_report {project} {date_range}")
+        report = self.run(
+            f"{self.destination()} get_usage_report {project} {date_range}"
+        )
         return report
 
-    def get_users(self, project: openportal.ProjectIdentifier) -> list[openportal.UserMapping]:
+    def get_users(
+        self, project: openportal.ProjectIdentifier
+    ) -> list[openportal.UserMapping]:
         """
         Return the mappings for all users on the resource for the specified project
         """
@@ -261,7 +293,9 @@ class OpenPortalClient:
 
         if op_job.is_error:
             logger.error(f"Job {command} has failed: {op_job.error_message}")
-            raise openportal.OpenPortalError(f"Job '{command}' failed: {op_job.error_message}")
+            raise openportal.OpenPortalError(
+                f"Job '{command}' failed: {op_job.error_message}"
+            )
         else:
             logger.info(f"Job finished: {command} - SUCCESS")
             return op_job.result
@@ -271,18 +305,27 @@ class OpenPortalClient:
         Return the Account objects for all projects active on the resource
         """
         projects = self.run(f"{self.destination()} get_projects")
-        return [Account(name=project, description="", organization="") for project in projects]
+        return [
+            Account(name=project, description="", organization="")
+            for project in projects
+        ]
 
-    def create_account(self, name: str, description: str, organization: str, parent_name: str=None) -> openportal.ProjectMapping:
+    def create_account(
+        self, name: str, description: str, organization: str, parent_name: str = None
+    ) -> openportal.ProjectMapping:
         """
         Create an account with the specified name, description, organization and parent account.
         However, OpenPortal only cares about the project name, and ignores the description,
         organisation and parent name. This just creates a project with the specified name,
         returning the project mapping for that project
         """
-        logger.info(f"Creating account '{name}' with description '{description}' and organization '{organization}'")
+        logger.info(
+            f"Creating account '{name}' with description '{description}' and organization '{organization}'"
+        )
 
         if parent_name is not None:
-            logger.warning(f"Ignoring parent_name '{parent_name}' as OpenPortal does not support account hierarchies")
+            logger.warning(
+                f"Ignoring parent_name '{parent_name}' as OpenPortal does not support account hierarchies"
+            )
 
         return self.add_project(name)

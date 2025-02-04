@@ -34,7 +34,9 @@ class MarketplaceOpenPortalConfig(AppConfig):
         )
 
         marketplace_handlers.connect_resource_handlers(openportal_models.Allocation)
-        marketplace_handlers.connect_resource_metadata_handlers(openportal_models.Allocation)
+        marketplace_handlers.connect_resource_metadata_handlers(
+            openportal_models.Allocation
+        )
 
         USAGE = marketplace_models.OfferingComponent.BillingTypes.USAGE
         TOTAL = marketplace_models.OfferingComponent.LimitPeriods.TOTAL
@@ -43,7 +45,6 @@ class MarketplaceOpenPortalConfig(AppConfig):
         manager.register(
             PLUGIN_NAME,
             create_resource_processor=processor.CreateAllocationProcessor,
-            update_resource_processor=processor.UpdateAllocationLimitsProcessor,
             delete_resource_processor=processor.DeleteAllocationProcessor,
             can_update_limits=True,
             components=(

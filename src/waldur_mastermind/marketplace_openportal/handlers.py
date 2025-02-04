@@ -39,8 +39,8 @@ def update_component_quota(sender, instance, created=False, **kwargs):
     new_limits = {}
     new_usages = {}
     for component in manager.get_components(PLUGIN_NAME):
-        usage = getattr(allocation, component.type + "_usage")
-        limit = getattr(allocation, component.type + "_limit")
+        usage = float(getattr(allocation, component.type + "_usage"))
+        limit = float(getattr(allocation, component.type + "_limit"))
 
         try:
             offering_component = marketplace_models.OfferingComponent.objects.get(
@@ -81,6 +81,8 @@ def update_component_quota(sender, instance, created=False, **kwargs):
                     plan_period=plan_period,
                     defaults={"usage": usage, "date": date},
                 )
+
+    logger.info(f"Old limits: {resource.limits}, new limits: {new_limits}")
 
     if resource.limits != new_limits:
         logger.debug(

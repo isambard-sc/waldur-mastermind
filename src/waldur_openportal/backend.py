@@ -283,7 +283,9 @@ class OpenPortalBackend(ServiceBackend):
             + f"Allowed destinations are: {allowed_destinations}"
         )
 
-    def add_allocated_project(self, allocation: models.Allocation) -> models.Allocation:
+    def _add_allocated_project(
+        self, allocation: models.Allocation
+    ) -> models.Allocation:
         self.assert_can_create_allocation_for_project(allocation.project)
 
         if allocation.has_project_identifier():
@@ -340,6 +342,10 @@ class OpenPortalBackend(ServiceBackend):
             allocation.is_added = True
 
         allocation.save()
+        return allocation
+
+    def add_allocated_project(self, allocation: models.Allocation) -> models.Allocation:
+        allocation = self._add_allocated_project(allocation)
 
         logger.info(f"Allocation node limit is {allocation.node_limit}")
 
@@ -358,13 +364,19 @@ class OpenPortalBackend(ServiceBackend):
         return allocation
 
     def create_allocation(self, allocation):
-        self.assert_can_create_allocation_for_project(allocation.project)
+        allocation = self._add_allocated_project(allocation)
 
-        # schedule this as a background task so that we don't block the Waldur GUI
+        default_limits = django_settings.WALDUR_OPENPORTAL["DEFAULT_LIMITS"]
+        allocation.node_limit = default_limits["NODE"]
+        allocation.save()
+
+        self.set_resource_limits(allocation)
+
+        # schedule syncing users as a background task so that we don't block the Waldur GUI
         # If this fails, then another sync process will fix things later
         from . import tasks
 
-        tasks.add_allocated_project.delay(core_utils.serialize_instance(allocation))
+        tasks.sync_allocation_users.delay(core_utils.serialize_instance(allocation))
 
     def delete_allocation(self, allocation):
         logger.info(f"Deleting allocation: {allocation}")
@@ -600,7 +612,7 @@ class OpenPortalBackend(ServiceBackend):
             logger.info(f"Forced update as usage report for {allocation} is complete")
         elif (
             abs(float(allocation.node_usage) - float(report.total_usage.hours))
-            > 0.00001
+            < 0.00001
         ):
             # check whether or not there has been any change in total usage.
             # If not, then no need to update the usage for the allocation

@@ -26,8 +26,8 @@ def update_component_quota(sender, instance, created=False, **kwargs):
     if created:
         return
 
-    if not set(instance.tracker.changed()) & COMPONENT_FIELDS:
-        return
+    # if not set(instance.tracker.changed()) & COMPONENT_FIELDS:
+    #    return
 
     allocation = instance
 
