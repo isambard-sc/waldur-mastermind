@@ -358,7 +358,7 @@ class OpenPortalBackend(ServiceBackend):
                 f"Program bug? Allocation {allocation} has no project identifier - cannot sync users"
             )
             raise ServiceBackendError(
-                f"Allocation {allocation} for {project} has no project identifier - cannot sync users"
+                f"Allocation {allocation} for {allocation.project} has no project identifier - cannot sync users"
             )
 
         return allocation
@@ -370,13 +370,18 @@ class OpenPortalBackend(ServiceBackend):
         allocation.node_limit = default_limits["NODE"]
         allocation.save()
 
-        self.set_resource_limits(allocation)
+        if allocation.has_project_identifier():
+            self.set_resource_limits(allocation)
 
-        # schedule syncing users as a background task so that we don't block the Waldur GUI
-        # If this fails, then another sync process will fix things later
-        from . import tasks
+            # schedule syncing users as a background task so that we don't block the Waldur GUI
+            # If this fails, then another sync process will fix things later
+            from . import tasks
 
-        tasks.sync_allocation_users.delay(core_utils.serialize_instance(allocation))
+            tasks.sync_allocation_users.delay(core_utils.serialize_instance(allocation))
+        else:
+            logger.warning(
+                f"Allocation {allocation} for project {allocation.project} has no project identifier - will try again later..."
+            )
 
     def delete_allocation(self, allocation):
         logger.info(f"Deleting allocation: {allocation}")
