@@ -34,7 +34,11 @@ def add_allocated_project(serialized_allocation):
     Add the allocated project to the OpenPortal backend
     """
     logger.info(f"task.add_allocated_project: {serialized_allocation}")
-    allocation = core_utils.deserialize_instance(serialized_allocation)
+
+    if isinstance(serialized_allocation, models.Allocation):
+        allocation = serialized_allocation
+    else:
+        allocation = core_utils.deserialize_instance(serialized_allocation)
 
     openportal_backend: backend.OpenPortalBackend = allocation.get_backend()
     openportal_backend.add_allocated_project(allocation)
@@ -47,32 +51,30 @@ def update_user(serialized_user):
     resources to which they have allocations.
     """
     logger.info(f"task.update_user: {serialized_user}")
-    user = core_utils.deserialize_instance(serialized_user)
+
+    if isinstance(serialized_user, User):
+        user = serialized_user
+    else:
+        user = core_utils.deserialize_instance(serialized_user)
 
     if not isinstance(user, User):
         logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
         return
 
     for allocation in utils.get_project_allocations(user):
-        # adding and updating are the same thing in OpenPortal
-        backend = allocation.get_backend()
+        try:
+            # adding and updating are the same thing in OpenPortal
+            backend = allocation.get_backend()
 
-        if not allocation.is_added_to_openportal():
-            allocation = backend.add_allocated_project(allocation)
+            # This call will make sure to create the project if it
+            # failed creation before
+            allocation = backend.check_added_allocation(allocation)
 
-        if not (
-            allocation.has_project_identifier() or allocation.is_added_to_openportal()
-        ):
-            logger.warning(
-                f"Cannot add {user} to {allocation} as it is not in OpenPortal - skipping"
-            )
-            continue
+            logger.info(f"Adding user {user} to {allocation}")
 
-        logger.info(
-            f"Adding user {user} to project {allocation.get_project_identifier()}"
-        )
-
-        backend.add_user(allocation, user)
+            backend.add_user(allocation, user)
+        except Exception as e:
+            logger.error(f"Failed to add {user} to {allocation}: {e}")
 
 
 @shared_task(name="waldur_openportal.delete_user")
@@ -83,29 +85,30 @@ def delete_user(serialized_user):
     completely delete the user.
     """
     logger.info(f"task.delete_user: {serialized_user}")
-    user = core_utils.deserialize_instance(serialized_user)
+
+    if isinstance(serialized_user, User):
+        user = serialized_user
+    else:
+        user = core_utils.deserialize_instance(serialized_user)
 
     if not isinstance(user, User):
         logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
         return
 
     for allocation in utils.get_project_allocations(user):
-        if not allocation.has_project_identifier():
-            logger.warning(
-                f"OpenPortal - {allocation} has no project identifier, skipping"
-            )
-            continue
+        try:
+            if not allocation.is_added_to_openportal():
+                logger.warning(f"{allocation} not in OpenPortal - skipping")
+                continue
 
-        backend = allocation.get_backend()
+            backend = allocation.get_backend()
+            allocation = backend.check_added_allocation(allocation)
 
-        if not allocation.is_added_to_openportal():
-            allocation = backend.add_allocated_project(allocation)
+            logger.info(f"Deleting user {user} from project {allocation}")
 
-        if allocation.is_added_to_openportal():
-            print(
-                f"Deleting user {user} from project {allocation.get_project_identifier()}"
-            )
             backend.delete_user(allocation, user)
+        except Exception as e:
+            logger.error(f"Failed to delete {user} from {allocation}: {e}")
 
 
 @shared_task(name="waldur_openportal.sync_allocation_usage")
@@ -114,15 +117,16 @@ def sync_allocation_usage(serialized_allocation):
     This task is called to synchronise the usage for the passed allocation
     """
     logger.info(f"task.sync_allocation_usage: {serialized_allocation}")
-    allocation = core_utils.deserialize_instance(serialized_allocation)
 
-    openportal_backend: backend.OpenPortalBackend = allocation.get_backend()
+    if isinstance(serialized_allocation, models.Allocation):
+        allocation = serialized_allocation
+    else:
+        allocation = core_utils.deserialize_instance(serialized_allocation)
 
-    if not allocation.is_added_to_openportal():
-        allocation = openportal_backend.add_allocated_project(allocation)
+    backend = allocation.get_backend()
 
-    if allocation.is_added_to_openportal():
-        openportal_backend.sync_usage(allocation)
+    allocation = backend.check_added_allocation(allocation)
+    backend.sync_usage(allocation)
 
 
 @shared_task(name="waldur_openportal.sync_allocation_users")
@@ -132,15 +136,17 @@ def sync_allocation_users(serialized_allocation):
     associated with all allocations
     """
     logger.info(f"task.sync_allocation_users: {serialized_allocation}")
-    allocation = core_utils.deserialize_instance(serialized_allocation)
 
-    openportal_backend: backend.OpenPortalBackend = allocation.get_backend()
+    if isinstance(serialized_allocation, models.Allocation):
+        allocation = serialized_allocation
+    else:
+        allocation = core_utils.deserialize_instance(serialized_allocation)
 
-    if not allocation.is_added_to_openportal():
-        allocation = openportal_backend.add_allocated_project(allocation)
+    backend = allocation.get_backend()
 
-    if allocation.is_added_to_openportal():
-        openportal_backend.sync_users(allocation)
+    allocation = backend.check_added_allocation(allocation)
+
+    backend.sync_users(allocation)
 
 
 @shared_task(name="waldur_openportal.sync_usage")
@@ -150,7 +156,10 @@ def sync_usage():
     """
     logger.info("OpenPortal task.sync_usage")
     for allocation in models.Allocation.objects.filter(is_active=True):
-        sync_allocation_usage.delay(core_utils.serialize_instance(allocation))
+        try:
+            sync_allocation_usage(allocation)
+        except Exception as e:
+            logger.error(f"Failed to sync usage for {allocation}: {e}")
 
 
 @shared_task(name="waldur_openportal.sync")
@@ -164,7 +173,10 @@ def sync():
     logger.info("OpenPortal task.sync")
     for customer in structure_models.Customer.objects.all():
         for allocation in get_structure_allocations(customer):
-            sync_allocation_users.delay(core_utils.serialize_instance(allocation))
+            try:
+                sync_allocation_users(allocation)
+            except Exception as e:
+                logger.error(f"Failed to sync users for {allocation}: {e}")
 
 
 @shared_task(name="waldur_openportal.sync_project")
@@ -175,7 +187,14 @@ def sync_project(serialized_project):
     with any OpenPortal allocations. This will add and remove users as needed.
     """
     logger.info(f"OpenPortal task.sync_project: {serialized_project}")
-    project = core_utils.deserialize_instance(serialized_project)
+
+    if isinstance(serialized_project, structure_models.Project):
+        project = serialized_project
+    else:
+        project = core_utils.deserialize_instance(serialized_project)
 
     for allocation in get_structure_allocations(project):
-        sync_allocation_users.delay(core_utils.serialize_instance(allocation))
+        try:
+            sync_allocation_users(allocation)
+        except Exception as e:
+            logger.error(f"Failed to sync users for {allocation}: {e}")

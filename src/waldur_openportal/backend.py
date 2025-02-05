@@ -349,16 +349,62 @@ class OpenPortalBackend(ServiceBackend):
 
         logger.info(f"Allocation node limit is {allocation.node_limit}")
 
-        self.set_resource_limits(allocation)
-
         if allocation.has_project_identifier():
-            self.sync_users(allocation)
+            if allocation.is_added_to_openportal():
+                self.sync_users(allocation)
+                self.set_resource_limits(allocation)
+            else:
+                logger.warning(
+                    f"Allocation {allocation} is not yet in OpenPortal - not syncing users yet"
+                )
         else:
             logger.error(
-                f"Program bug? Allocation {allocation} has no project identifier - cannot sync users"
+                f"Unable to create OpenPortal allocation for {allocation}: This will be created later..."
             )
             raise ServiceBackendError(
-                f"Allocation {allocation} for {allocation.project} has no project identifier - cannot sync users"
+                f"Unable to create OpenPortal allocation for {allocation}"
+            )
+
+        return allocation
+
+    def check_added_allocation(
+        self, allocation: models.Allocation
+    ) -> models.Allocation:
+        logger.info(
+            f"Allocation {allocation} is in state {allocation.state}: {allocation.has_project_identifier()} / {allocation.is_added_to_openportal()}"
+        )
+
+        if allocation.has_project_identifier() and allocation.is_added_to_openportal():
+            # all good
+            return allocation
+
+        # only try to add the project if the allocation is still valid.
+        # We don't want to get stuck in a loop continually trying
+        # to add an allocation that has been deleted
+        if allocation.state not in [
+            models.Allocation.States.CREATION_SCHEDULED,
+            models.Allocation.States.CREATING,
+            models.Allocation.States.UPDATE_SCHEDULED,
+            models.Allocation.States.UPDATING,
+            models.Allocation.States.OK,
+        ]:
+            logger.warning(
+                f"Allocation {allocation} is in state {allocation.state} - cannot add to OpenPortal"
+            )
+            raise ServiceBackendError(
+                f"Allocation {allocation} is in state {allocation.state} - cannot add to OpenPortal"
+            )
+
+        allocation = self._add_allocated_project(allocation)
+
+        if not (
+            allocation.has_project_identifier() and allocation.is_added_to_openportal()
+        ):
+            logger.error(
+                f"Allocation {allocation} could not be added to OpenPortal. Try again later."
+            )
+            raise ServiceBackendError(
+                f"Allocation {allocation} could not be added to OpenPortal. Try again later."
             )
 
         return allocation
@@ -373,11 +419,18 @@ class OpenPortalBackend(ServiceBackend):
         if allocation.has_project_identifier():
             self.set_resource_limits(allocation)
 
-            # schedule syncing users as a background task so that we don't block the Waldur GUI
-            # If this fails, then another sync process will fix things later
-            from . import tasks
+            if allocation.is_added_to_openportal():
+                # schedule syncing users as a background task so that we don't block the Waldur GUI
+                # If this fails, then another sync process will fix things later
+                from . import tasks
 
-            tasks.sync_allocation_users.delay(core_utils.serialize_instance(allocation))
+                tasks.sync_allocation_users.delay(
+                    core_utils.serialize_instance(allocation)
+                )
+            else:
+                logger.warning(
+                    f"Allocation {allocation} for project {allocation.project} is not in OpenPortal - cannot sync users"
+                )
         else:
             logger.warning(
                 f"Allocation {allocation} for project {allocation.project} has no project identifier - will try again later..."
@@ -394,6 +447,8 @@ class OpenPortalBackend(ServiceBackend):
             try:
                 project = allocation.get_project_identifier()
                 self.client.delete_project(project)
+                allocation.is_added = False
+                allocation.save()
             except Exception as e:
                 logger.error(
                     f"Unable to delete allocation {allocation} from OpenPortal: {e}"
@@ -558,14 +613,7 @@ class OpenPortalBackend(ServiceBackend):
         if not isinstance(allocation, models.Allocation):
             raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
 
-        if not allocation.is_added_to_openportal():
-            allocation = self.add_allocated_project(allocation)
-
-            if not allocation.is_added_to_openportal():
-                logger.error(
-                    f"Allocation {allocation} is not in OpenPortal - cannot set resource limits"
-                )
-                return
+        allocation = self.check_added_allocation(allocation)
 
         if not allocation.has_project_identifier():
             logger.error(

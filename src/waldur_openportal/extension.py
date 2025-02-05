@@ -9,6 +9,7 @@ class OpenPortalExtension(WaldurExtension):
     @staticmethod
     def django_urls():
         from .urls import urlpatterns
+
         return urlpatterns
 
     @staticmethod

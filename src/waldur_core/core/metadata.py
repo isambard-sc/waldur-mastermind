@@ -423,11 +423,10 @@ class WaldurOpenPortal(BaseModel):
     )
     DEFAULT_LIMITS = Field(
         {
-            "NODE": 1, # Measured unit is node-hours
+            "NODE": 1000,  # Measured unit is node-hours
         },
         description="Default limits of account that are set when OpenPortal account is provisioned.",
     )
-
 
 
 class WaldurSlurm(BaseModel):
