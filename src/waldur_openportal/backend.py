@@ -1,5 +1,6 @@
 import logging
 import re
+import decimal
 
 from django.conf import settings as django_settings
 from django.db import transaction
@@ -134,17 +135,23 @@ class OpenPortalBackend(ServiceBackend):
 
         # go through and add the users who are not in OpenPortal
         for user in users:
-            try:
-                # get the association between the user and the allocation
-                (association, created) = models.Association.objects.get_or_create(
-                    user=user, allocation=allocation
+            if not user.is_active:
+                logger.warning(
+                    f"Removing {user} as they are no longer listed as active"
                 )
+                continue
 
-                mapping = None
+            # get the association between the user and the allocation
+            (association, created) = models.Association.objects.get_or_create(
+                user=user, allocation=allocation
+            )
 
-                if association.has_mapping():
-                    mapping = association.get_mapping()
+            mapping = None
 
+            if association.has_mapping():
+                mapping = association.get_mapping()
+
+            try:
                 if mapping is None or mapping not in user_mappings:
                     logger.info(f"Adding user {user} to OpenPortal")
                     shortname = self.get_user_shortname(user)
@@ -182,6 +189,13 @@ class OpenPortalBackend(ServiceBackend):
                 allocated_mappings.append(mapping)
             except Exception as e:
                 logger.error(f"Unable to add user {user} to OpenPortal: {e}")
+
+                if mapping is not None:
+                    # make sure we keep any existing mapping, so that we don't flap
+                    # back and forth trying to delete an existing user who we failed
+                    # to add
+                    logger.warning(f"Keeping existing user with mapping {mapping}")
+                    allocated_mappings.append(mapping)
 
         stale_mappings = [
             mapping for mapping in user_mappings if mapping not in allocated_mappings
@@ -413,7 +427,7 @@ class OpenPortalBackend(ServiceBackend):
         allocation = self._add_allocated_project(allocation)
 
         default_limits = django_settings.WALDUR_OPENPORTAL["DEFAULT_LIMITS"]
-        allocation.node_limit = default_limits["NODE"]
+        allocation.node_limit = decimal.Decimal(default_limits["NODE"])
         allocation.save()
 
         if allocation.has_project_identifier():
@@ -663,21 +677,26 @@ class OpenPortalBackend(ServiceBackend):
 
         if report.is_complete:
             logger.info(f"Forced update as usage report for {allocation} is complete")
-        elif (
-            abs(float(allocation.node_usage) - float(report.total_usage.hours))
-            < 0.00001
-        ):
-            # check whether or not there has been any change in total usage.
-            # If not, then no need to update the usage for the allocation
+        else:
+            delta = float(allocation.node_usage) - float(report.total_usage.hours)
+
+            # usage is a decimal with 2 d.p. - only changes of more than 0.01 are significant
+            if abs(delta) < 0.015:
+                logger.info(
+                    f"Usage for {allocation} changed by {delta} hours. This is too small to consider updating."
+                )
+                return
+
             logger.info(
-                f"Usage for allocation {allocation} has not changed: {allocation.node_usage} == {report.total_usage.hours}. Not updating."
+                f"Usage for {allocation} changed by {delta} hours - updating accounts..."
             )
-            return
 
         if update_current:
             # only update this month's usage if we are updating the current month
             allocation.node_usage = report.total_usage.hours
             allocation.save(update_fields=["node_usage"])
+
+            # TODO - check if we need to update anything missed during a change of month?
 
         associations = models.Association.objects.filter(allocation=allocation)
 

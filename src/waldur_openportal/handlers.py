@@ -37,7 +37,7 @@ def schedule_sync(*args, **kwargs):
     """
 
     logger.info("Scheduling OpenPortal synchronization.")
-    tasks.sync()
+    transaction.on_commit(tasks.sync.delay())
 
 
 @if_plugin_enabled
@@ -49,7 +49,9 @@ def schedule_project_sync(project):
     """
 
     logger.info(f"Scheduling OpenPortal synchronization for project {project}")
-    tasks.sync_project(core_utils.serialize_instance(project))
+    transaction.on_commit(
+        lambda: tasks.sync_project.delay(core_utils.serialize_instance(project))
+    )
 
 
 @if_plugin_enabled
@@ -72,7 +74,9 @@ def update_user(sender, instance, force_add=False, **kwargs):
 
     user = instance
 
-    logger.info(f"OpenPortal - updating user {user} - tracker {user.tracker.changed()} - force_add {force_add}")
+    logger.info(
+        f"OpenPortal - updating user {user} - tracker {user.tracker.changed()} - force_add {force_add}"
+    )
 
     if force_add or set(user.tracker.changed()) & {"unix_username"}:
         # Either the user's unix_username has changed, or the user has
@@ -82,7 +86,9 @@ def update_user(sender, instance, force_add=False, **kwargs):
 
         # check if this is a User type
         if not isinstance(user, User):
-            logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
+            logger.error(
+                f"OpenPortal - {user} is not a User instance - it is {type(user)}"
+            )
             return
 
         transaction.on_commit(
@@ -119,7 +125,9 @@ def role_granted(sender, instance: UserRole, **kwargs):
     an `update_user` for the user, which will ensure that the user
     is correctly added to all projects to which they should have access.
     """
-    logger.info(f"OpenPortal - granting role {instance.role} for user {instance.user} in {instance.scope}")
+    logger.info(
+        f"OpenPortal - granting role {instance.role} for user {instance.user} in {instance.scope}"
+    )
 
     user = instance.user
 
@@ -127,20 +135,30 @@ def role_granted(sender, instance: UserRole, **kwargs):
         logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
         return
 
-    # Skip synchronization of custom roles
-    if not instance.role.is_system_role:
-        logger.warning(f"Cannot synchronize custom role {instance.role} for user {instance.user} as not a system role.")
+    if not user.is_active:
+        logger.warning(
+            f"Cannot synchronize role {instance.role} for user {instance.user} as user is not active."
+        )
         return
 
+    # Skip synchronization of custom roles
+    if not instance.role.is_system_role:
+        logger.warning(f"{instance.role} is not a system role - synchronising anyway")
+
     if not instance.role.is_active:
-        logger.warning(f"Cannot synchronize role {instance.role} for user {instance.user} as role is not active.")
+        logger.warning(
+            f"Cannot synchronize role {instance.role} for user {instance.user} as role is not active."
+        )
         return
 
     if not isinstance(instance.scope, Customer | Project):
+        logger.warning(f"Skipping as {instance.scope} is not a Customer or Project")
         return
 
     # let's just update the user...
-    logger.info(f"Really sending update_user({sender}, {user}, force_add=True, **{kwargs})")
+    logger.info(
+        f"Really sending update_user({sender}, {user}, force_add=True, **{kwargs})"
+    )
     update_user(sender, user, force_add=True, **kwargs)
 
 
@@ -151,13 +169,16 @@ def role_revoked(sender, instance, **kwargs):
     OpenPortal synchronization, which will ensure that all users are
     removed from projects from which they are not allocated.
     """
-    logger.info(f"OpenPortal - revoking role {instance.role} for user {instance.user} in {instance.scope}")
+    logger.info(
+        f"OpenPortal - revoking role {instance.role} for user {instance.user} in {instance.scope}"
+    )
 
     # Skip synchronization of custom roles
     if not instance.role.is_system_role:
-        return
+        logger.warning(f"{instance.role} is not a system role - synchronising anyway")
 
     if not isinstance(instance.scope, Customer | Project):
+        logger.warning(f"Skipping as {instance.scope} is not a Customer or Project")
         return
 
     # re-sync everyone in the project - this is safe as it will catch
