@@ -37,7 +37,7 @@ def schedule_sync(*args, **kwargs):
     """
 
     logger.info("Scheduling OpenPortal synchronization.")
-    transaction.on_commit(tasks.sync.delay())
+    transaction.on_commit(lambda: tasks.sync.delay())
 
 
 @if_plugin_enabled
