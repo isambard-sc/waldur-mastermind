@@ -1,4 +1,5 @@
 import logging
+import datetime
 
 from celery import shared_task
 
@@ -155,11 +156,22 @@ def sync_usage():
     This task is called to synchronise the usage for all allocations
     """
     logger.info("OpenPortal task.sync_usage")
+    now = datetime.datetime.now()
+    fail_count = 0
+
     for allocation in models.Allocation.objects.filter(is_active=True):
         try:
             sync_allocation_usage(allocation)
         except Exception as e:
             logger.error(f"Failed to sync usage for {allocation}: {e}")
+            fail_count += 1
+
+            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                logger.error("Too many failures - aborting")
+                break
+            elif (datetime.datetime.now() - now).seconds > 120:
+                logger.error("Took too long - aborting")
+                break
 
 
 @shared_task(name="waldur_openportal.sync")
@@ -171,12 +183,24 @@ def sync():
     This will add and remove users as needed.
     """
     logger.info("OpenPortal task.sync")
+
+    now = datetime.datetime.now()
+    fail_count = 0
+
     for customer in structure_models.Customer.objects.all():
         for allocation in get_structure_allocations(customer):
             try:
                 sync_allocation_users(allocation)
             except Exception as e:
                 logger.error(f"Failed to sync users for {allocation}: {e}")
+                fail_count += 1
+
+                if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                    logger.error("Too many failures - aborting")
+                    break
+                elif (datetime.datetime.now() - now).seconds > 120:
+                    logger.error("Took too long - aborting")
+                    break
 
 
 @shared_task(name="waldur_openportal.sync_project")
@@ -193,8 +217,19 @@ def sync_project(serialized_project):
     else:
         project = core_utils.deserialize_instance(serialized_project)
 
+    now = datetime.datetime.now()
+    fail_count = 0
+
     for allocation in get_structure_allocations(project):
         try:
             sync_allocation_users(allocation)
         except Exception as e:
             logger.error(f"Failed to sync users for {allocation}: {e}")
+            fail_count += 1
+
+            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                logger.error("Too many failures - aborting")
+                break
+            elif (datetime.datetime.now() - now).seconds > 120:
+                logger.error("Took too long - aborting")
+                break

@@ -1,5 +1,6 @@
 import logging
 import os
+import datetime
 
 from . import op as openportal
 
@@ -288,8 +289,16 @@ class OpenPortalClient:
         logger.info(f"Running command '{command}'")
         op_job = self._runner.run(command)
 
+        now = datetime.datetime.now()
+        last_update = now
+
         while not op_job.wait(2500):
-            logger.info(f"Job {command} is still running...")
+            check_time = datetime.datetime.now()
+
+            if check_time - last_update > datetime.timedelta(seconds=30):
+                total_duration = check_time - now
+                logger.info(f"Job {command} is still running... for {total_duration}")
+                last_update = check_time
 
         if op_job.is_error:
             logger.error(f"Job {command} has failed: {op_job.error_message}")
