@@ -226,6 +226,7 @@ class Association(core_models.UuidMixin):
             if mapping.local_group != self.get_local_group():
                 logger.warning(
                     f"Changing local group from {self.groupname} to {mapping.local_group} for {self}"
+                )
 
         self.groupname = mapping.local_group
 
