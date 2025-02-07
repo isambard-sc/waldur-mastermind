@@ -216,19 +216,18 @@ class Association(core_models.UuidMixin):
 
         if self.has_local_user():
             if mapping.local_user != self.get_local_user():
-                raise ValueError(
-                    f"Local user {mapping.local_user} does not match association {self.username}"
+                logger.warning(
+                    f"Changing local user from {self.username} to {mapping.local_user} for {self}"
                 )
-        else:
-            self.username = mapping.local_user
+
+        self.username = mapping.local_user
 
         if self.has_local_group():
             if mapping.local_group != self.get_local_group():
-                raise ValueError(
-                    f"Local group {mapping.local_group} does not match association {self.groupname}"
-                )
-        else:
-            self.groupname = mapping.local_group
+                logger.warning(
+                    f"Changing local group from {self.groupname} to {mapping.local_group} for {self}"
+
+        self.groupname = mapping.local_group
 
     def get_mapping(self) -> openportal.UserMapping:
         if not self.has_user_identifier():
