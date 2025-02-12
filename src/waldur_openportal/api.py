@@ -151,6 +151,9 @@ def access_for_email(request):
                 reason = "User account is not a member of any projects."
                 continue
 
+            # this is an active user
+            is_authorised = True
+
             # get the UserInfo object for the user
             userinfo, created = models.UserInfo.objects.get_or_create(user=user)
             userinfo.sanitise()
@@ -158,6 +161,10 @@ def access_for_email(request):
             email_in_waldur = user.email
 
             if short_name_in_waldur is None:
+                if userinfo.shortname is None:
+                    logger.warning(f"User {user} has not set their short name")
+                    break
+
                 short_name_in_waldur = str(userinfo.shortname).strip()
 
             # special case - brics users can access the notebook
@@ -255,8 +262,6 @@ def access_for_email(request):
                     }
                 )
 
-            # this is an active user
-            is_authorised = True
             break
         elif reason is None:
             reason = "User account is not active"
