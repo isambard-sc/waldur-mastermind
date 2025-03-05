@@ -167,22 +167,6 @@ def access_for_email(request):
 
                 short_name_in_waldur = str(userinfo.shortname).strip()
 
-            # special case - brics users can access the notebook
-            for project in member_of_projects:
-                if project.short_name == "brics":
-                    if "brics.brics" not in projects:
-                        projects["brics.brics"] = {
-                            "name": str(project.name),
-                            "resources": [],
-                        }
-
-                    projects["brics.brics"]["resources"].append(
-                        {
-                            "name": "brics.aip1.notebooks.shared",
-                            "username": f"{userinfo.shortname}.brics",
-                        }
-                    )
-
             # loop over all of the allocations for this user
             for allocation in utils.get_project_allocations(user):
                 if allocation.has_project_identifier():

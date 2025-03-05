@@ -699,3 +699,31 @@ class ProjectCreditViewSet(core_views.ActionsViewSet):
     ).order_by("created")
     serializer_class = serializers.ProjectCreditSerializer
     filterset_class = filters.ProjectCreditFilter
+
+    def list(self, request, *args, **kwargs):
+        """
+        The default permissions above prevent users from querying the
+        project credits in the projects they belong to. This is a quick
+        hack that gives them permission to view the project credits in the
+        projects - so that the accounting circle widget is visible in
+        homeport
+        """
+        filter = filters.ProjectCreditFilter(request.query_params, request=request)
+
+        if not filter.is_valid():
+            return Response(filter.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        queryset = filter.filter_queryset(self.get_queryset())
+
+        page = self.paginate_queryset(queryset)
+
+        try:
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+
+            serializer = self.get_serializer(queryset, many=True)
+
+            return Response(serializer.data)
+        except Exception as e:
+            raise e
