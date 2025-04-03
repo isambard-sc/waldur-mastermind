@@ -6,6 +6,7 @@ from celery import shared_task
 from waldur_core.core import utils as core_utils
 from waldur_core.core.models import User
 from waldur_core.structure import models as structure_models
+from waldur_mastermind.invoices import models as invoice_models
 
 from . import backend, models, utils
 
@@ -168,10 +169,92 @@ def sync_usage():
 
             if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                 logger.error("Too many failures - aborting")
-                break
+                return
             elif (datetime.datetime.now() - now).seconds > 120:
                 logger.error("Took too long - aborting")
-                break
+                return
+
+    # Now update any limits that will be changed by the above usage
+    logger.info("OpenPortal task.sync_usage [limits]")
+
+    for project_credit in invoice_models.ProjectCredit.objects.all():
+        project = project_credit.project
+
+        if project.is_expired:
+            continue
+
+        credits_available = project_credit.value
+
+        if credits_available is None or credits_available <= 0:
+            credits_available = 0
+        else:
+            credits_available = float(credits_available)
+
+        logger.info(
+            f"Project {project} with {project_credit} has {credits_available} credits available"
+        )
+
+        # find any openportal allocations associated with the project
+        allocations = models.Allocation.objects.filter(project=project, is_active=True)
+
+        if not allocations:
+            logger.warning(
+                f"Project {project} has no OpenPortal allocations - skipping"
+            )
+            continue
+
+        # Calculate the total usage so far this month across OpenPortal allocations
+        # for this project - if it exceeds the number of project credits available
+        # then we have to set the limits to zero to prevent any more spend
+        if credits_available > 0:
+            total_spend = 0.0
+
+            for allocation in allocations:
+                total_spend += float(allocation.node_usage)
+
+            logger.info(
+                f"Total spend for {project} is {total_spend} hours - {credits_available} available"
+            )
+
+            if total_spend >= credits_available:
+                logger.warning(
+                    f"Total spend for {project} exceeds available credits - setting limits to zero"
+                )
+                credits_available = 0
+
+        for allocation in allocations:
+            try:
+                if not allocation.is_added_to_openportal():
+                    logger.warning(
+                        f"Allocation {allocation} not in OpenPortal - skipping"
+                    )
+                    continue
+
+                if allocation.node_limit is None or allocation.node_limit <= 0:
+                    node_limit = 0
+                else:
+                    node_limit = float(allocation.node_limit)
+
+                if abs(node_limit - credits_available) > 0.001:
+                    logger.info(
+                        f"Setting node limit for {allocation} to {credits_available} hours"
+                    )
+
+                    backend = allocation.get_backend()
+                    allocation.node_limit = credits_available
+                    backend.set_resource_limits(allocation)
+                    allocation.save()
+
+            except Exception as e:
+                logger.error(f"Failed to sync limits for {allocation}: {e}")
+                fail_count += 1
+
+                if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                    logger.error("Too many failures - aborting")
+                    return
+                elif (datetime.datetime.now() - now).seconds > 120:
+                    logger.error("Took too long - aborting")
+                    return
 
 
 @shared_task(name="waldur_openportal.sync")
@@ -187,6 +270,7 @@ def sync():
     now = datetime.datetime.now()
     fail_count = 0
 
+    # First, sync all of the usage, so we have up-to-date accounting data
     for customer in structure_models.Customer.objects.all():
         for allocation in get_structure_allocations(customer):
             try:
