@@ -190,10 +190,6 @@ def sync_usage():
         else:
             credits_available = float(credits_available)
 
-        logger.info(
-            f"Project {project} with {project_credit} has {credits_available} credits available"
-        )
-
         # find any openportal allocations associated with the project
         allocations = models.Allocation.objects.filter(project=project, is_active=True)
 
