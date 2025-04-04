@@ -231,15 +231,30 @@ def sync_usage():
                 else:
                     node_limit = float(allocation.node_limit)
 
+                backend = allocation.get_backend()
+
                 if abs(node_limit - credits_available) > 0.001:
                     logger.info(
                         f"Setting node limit for {allocation} to {credits_available} hours"
                     )
 
-                    backend = allocation.get_backend()
                     allocation.node_limit = credits_available
                     backend.set_resource_limits(allocation)
                     allocation.save()
+                else:
+                    # double check that the limit is set correctly
+                    current_limit = backend.get_resource_limits(
+                        allocation.get_project_identifier()
+                    )
+
+                    if (
+                        current_limit is None
+                        or abs(current_limit.hours - allocation.node_limit) > 0.001
+                    ):
+                        logger.warning(
+                            f"Node limit for {allocation} is not set correctly - changing from {current_limit} to {allocation.node_limit}"
+                        )
+                        backend.set_resource_limits(allocation)
 
             except Exception as e:
                 logger.error(f"Failed to sync limits for {allocation}: {e}")

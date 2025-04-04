@@ -248,11 +248,9 @@ class OpenPortalClient:
 
         logger.info(f"{self.destination()} set_limit {project} {usage.seconds} seconds")
 
-        # Disabling this for now while debugging
-
-        # new_limit = self.run(
-        #    f"{self.destination()} set_limit {project} {usage.seconds} seconds"
-        # )
+        new_limit = self.run(
+            f"{self.destination()} set_limit {project} {usage.seconds} seconds"
+        )
 
         new_limit = usage
 
