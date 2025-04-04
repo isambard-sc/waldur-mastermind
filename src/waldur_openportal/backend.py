@@ -363,7 +363,6 @@ class OpenPortalBackend(ServiceBackend):
         if allocation.has_project_identifier():
             if allocation.is_added_to_openportal():
                 self.sync_users(allocation)
-                self.set_resource_limits(allocation)
             else:
                 logger.warning(
                     f"Allocation {allocation} is not yet in OpenPortal - not syncing users yet"
@@ -424,8 +423,6 @@ class OpenPortalBackend(ServiceBackend):
         allocation.save()
 
         if allocation.has_project_identifier():
-            self.set_resource_limits(allocation)
-
             if allocation.is_added_to_openportal():
                 # schedule syncing users as a background task so that we don't block the Waldur GUI
                 # If this fails, then another sync process will fix things later
@@ -633,12 +630,12 @@ class OpenPortalBackend(ServiceBackend):
         limit = openportal.Usage.from_hours(allocation.node_limit)
 
         logger.debug(f"Setting resource limit for allocation {project} to {limit}")
-        set_limit = self.client.set_resource_limits(project, limit)
+        # set_limit = self.client.set_resource_limits(project, limit)
 
-        if set_limit.seconds != limit.seconds:
-            logger.error(
-                f"Unable to set limit for project {project} to {limit} - got {set_limit}"
-            )
+        # if set_limit.seconds != limit.seconds:
+        #     logger.error(
+        #         f"Unable to set limit for project {project} to {limit} - got {set_limit}"
+        #     )
 
     def get_resource_limits(
         self, project: openportal.ProjectIdentifier
