@@ -28,55 +28,16 @@ logger = logging.getLogger(__name__)
 User = auth.get_user_model()
 
 
-@api_view(["GET"])
-@authentication_classes([TokenAuthentication])
-@permission_classes([IsAuthenticated])
-def project_spend_info(request):
-    """
-    Return the monthly spend for the user in the format:
-
-    {
-        "spend": 123.45
-        "credit": 205.52
-        "end_date": "2025-10-31"
-    }
-
-    given the argument 'username' in the query string.
-
-    This returns the current spend, and credit limit for the current month
-    for the project containing the local username passed in the
-    query string, as well as the project end date (when the credits
-    expire).
-
-    Note that the only staff or support users can query any username.
-    Non-staff users can only query their own username.
-    """
-    user = request.user
-
-    if not (user.is_authenticated or user.is_active):
-        response = JsonResponse({})
-        response.status_code = status.UNAUTHORIZED
-        return response
-
-    username = request.query_params.get("username")
-
-    if not username:
-        response = JsonResponse({"error": "A username must be provided."})
-        response.status_code = status.BAD_REQUEST
-        return response
-
-    username = str(username).lstrip().rstrip()
-
-    if len(username) == 0:
-        response = JsonResponse({"error": "A valid username must be provided."})
-        response.status_code = status.BAD_REQUEST
-        return response
-
-    logger.info(f"api/openportal/monthly_spend request for {username}")
+def _get_project_spend_info_by_username(request, user, username):
+    logger.info(f"api/openportal/monthly_spend request for username: {username}")
 
     # use the association to find the project_info, from which we can get the project
     project = None
+    project_id = None
 
+    # Note that there could be many projects associated with this username
+    # in the general case, but we will only return the first one for now
+    # as in BriCS we use project-specific user names
     try:
         associations = models.Association.objects.filter(username=username)
 
@@ -148,14 +109,108 @@ def project_spend_info(request):
         pass
 
     data = {
-        "spend": total_spend,
-        "credit": credit,
-        "end_date": end_date,
+        "projects": [
+            {
+                "name": str(project.name),
+                "identifier": str(project_id),
+                "usage": total_spend,
+                "limit": credit,
+                "end_date": end_date,
+            }
+        ]
     }
 
     logger.info(f"project_spend_info({username}) {data}")
 
     return JsonResponse(data)
+
+
+def _get_project_spend_info_by_email(request, user, email):
+    logger.info(f"api/openportal/monthly_spend request for email: {email}")
+    # TODO
+
+    return JsonResponse(None)
+
+
+def _get_project_spend_info_by_project_id(request, user, project_id):
+    logger.info(f"api/openportal/monthly_spend request for project_id: {project_id}")
+    # TODO
+
+    return JsonResponse(None)
+
+
+@api_view(["GET"])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def project_spend_info(request):
+    """
+    Return the monthly spend for the user in the format:
+
+    {
+        projects: [
+            {
+                "name": "Project human name"
+                "identifier": "Project identifier"
+                "usage": 123.45
+                "limit": 205.52
+                "end_date": "2025-10-31"
+            },
+            ...
+        ]
+    }
+
+    This will either search for projects by local username,
+    or by email address, or for the current Waldur user,
+    or by the project identifier.
+
+    This returns the current spend, and credit limit for the current month
+    for each matching project, as well as the project end date (when the
+    credits expire).
+
+    Note that the only staff or support users can query any project.
+    Non-staff users can only query the projects to which they belong.
+    """
+    user = request.user
+
+    if not (user.is_authenticated or user.is_active):
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    username = request.query_params.get("username")
+
+    if username:
+        username = str(username).lstrip().rstrip()
+        if len(username) == 0:
+            username = None
+
+    email = request.query_params.get("email")
+
+    if email:
+        email = str(email).lstrip().rstrip()
+        if len(email) == 0:
+            email = None
+
+    project_id = request.query_params.get("project_id")
+
+    if project_id:
+        project_id = str(project_id).lstrip().rstrip()
+        if len(project_id) == 0:
+            project_id = None
+
+    if username is None and email is None and project_id is None:
+        email = user.email
+
+    if username is not None:
+        return _get_project_spend_info_by_username(request, user, username=username)
+    elif email is not None:
+        return _get_project_spend_info_by_email(request, user, email=email)
+    elif project_id is not None:
+        return _get_project_spend_info_by_project_id(
+            request, user, project_id=project_id
+        )
+    else:
+        return JsonResponse(None)
 
 
 @api_view(["GET"])
