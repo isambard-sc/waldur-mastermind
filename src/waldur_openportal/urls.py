@@ -1,11 +1,14 @@
 from django.urls import re_path
 
 from . import views
-from .api import access_for_email
+from .api import access_for_email, project_spend_info
+
 
 def register_in(router):
     router.register(
-        r"openportal-allocations", views.AllocationViewSet, basename="openportal-allocation"
+        r"openportal-allocations",
+        views.AllocationViewSet,
+        basename="openportal-allocation",
     )
     router.register(
         r"openportal-allocation-user-usage",
@@ -28,10 +31,16 @@ def register_in(router):
         basename="openportal-projectinfo",
     )
 
+
 urlpatterns = [
     re_path(
         r"^api/openportal/access_for_email/",
         access_for_email,
         name="access-for-email",
+    ),
+    re_path(
+        r"^api/openportal/project_spend_info/",
+        project_spend_info,
+        name="project-spend-info",
     ),
 ]

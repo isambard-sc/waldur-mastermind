@@ -17,6 +17,8 @@ from http import HTTPStatus as status
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import get_connected_projects
 
+from waldur_mastermind.invoices import models as invoice_models
+
 from . import models
 from . import utils
 
@@ -24,6 +26,136 @@ from . import utils
 logger = logging.getLogger(__name__)
 
 User = auth.get_user_model()
+
+
+@api_view(["GET"])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def project_spend_info(request):
+    """
+    Return the monthly spend for the user in the format:
+
+    {
+        "spend": 123.45
+        "credit": 205.52
+        "end_date": "2025-10-31"
+    }
+
+    given the argument 'username' in the query string.
+
+    This returns the current spend, and credit limit for the current month
+    for the project containing the local username passed in the
+    query string, as well as the project end date (when the credits
+    expire).
+
+    Note that the only staff or support users can query any username.
+    Non-staff users can only query their own username.
+    """
+    user = request.user
+
+    if not (user.is_authenticated or user.is_active):
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    username = request.query_params.get("username")
+
+    if not username:
+        response = JsonResponse({"error": "A username must be provided."})
+        response.status_code = status.BAD_REQUEST
+        return response
+
+    username = str(username).lstrip().rstrip()
+
+    if len(username) == 0:
+        response = JsonResponse({"error": "A valid username must be provided."})
+        response.status_code = status.BAD_REQUEST
+        return response
+
+    logger.info(f"api/openportal/monthly_spend request for {username}")
+
+    # use the association to find the project_info, from which we can get the project
+    project = None
+
+    try:
+        associations = models.Association.objects.filter(username=username)
+
+        for association in associations:
+            if not (user.is_staff or user.is_support):
+                if association.user != user:
+                    logger.warning(
+                        f"User {user} is not the owner of the association {association}"
+                    )
+                    continue
+
+            if association.has_project_identifier():
+                project_id = association.get_project_identifier()
+
+                try:
+                    project_info = models.ProjectInfo.objects.filter(
+                        shortname=project_id.project
+                    ).first()
+                except Exception:
+                    continue
+
+                if project_info is not None:
+                    if project_info.project is not None:
+                        project = project_info.project
+                        break
+    except Exception as e:
+        logger.error(f"Error looking up username {username}: {e}")
+        response = JsonResponse({"error": "Username not found."})
+        response.status_code = status.NOT_FOUND
+        return response
+
+    if project is None:
+        logger.error(f"Username {username} not found.")
+        response = JsonResponse({"error": "Username not found."})
+        response.status_code = status.NOT_FOUND
+        return response
+
+    # get the total credit available for this project
+    credit = None
+
+    try:
+        project_credit = invoice_models.ProjectCredit.objects.get(project=project)
+
+        if project_credit.value is not None:
+            credit = float(project_credit.value)
+
+    except Exception:
+        pass
+
+    try:
+        end_date = project.end_date.strftime("%Y-%m-%d")
+    except Exception:
+        end_date = None
+
+    # now calculate the total spend across all OpenPortal allocations
+    # for this project
+    total_spend = None
+
+    # find any openportal allocations associated with the project
+    try:
+        allocations = models.Allocation.objects.filter(project=project, is_active=True)
+
+        if allocations:
+            total_spend = 0.0
+
+            for allocation in allocations:
+                total_spend += float(allocation.node_usage)
+    except Exception:
+        pass
+
+    data = {
+        "spend": total_spend,
+        "credit": credit,
+        "end_date": end_date,
+    }
+
+    logger.info(f"project_spend_info({username}) {data}")
+
+    return JsonResponse(data)
 
 
 @api_view(["GET"])
@@ -91,7 +223,7 @@ def access_for_email(request):
     """
     user = request.user
 
-    if not user.is_authenticated:
+    if not (user.is_authenticated or user.is_active):
         response = JsonResponse({})
         response.status_code = status.UNAUTHORIZED
         return response
