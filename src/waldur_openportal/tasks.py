@@ -340,12 +340,12 @@ def send_notifications():
     logger.info("OpenPortal task.send_notifications")
 
     # make sure that we only run during "office hours"
-    # (9am to 5pm) - this is a bit of a hack, but it will do for now
+    # (10am to 3pm) - this is a bit of a hack, but it will do for now
     now = datetime.datetime.now()
 
-    if now.hour < 9 or now.hour > 17:
-        logger.info("Not sending notifications - outside office hours")
-        # return
+    if now.hour < 10 or now.hour > 15:
+        logger.debug("Not sending notifications - outside office hours")
+        return
 
     # Get today's date
     today = datetime.date.today()
@@ -427,14 +427,9 @@ def send_notifications():
         # notification to avoid overwhelming the mail server
         for user in project.get_users():
             try:
-                logger.info(f"Sending notification to {user}")
-                logger.info(f"Notification subject: {notification_subject}")
-                logger.info(f"Notification body: {notification_body}")
-
-                if "woods" not in user.email.lower():
-                    # debugging - only send to me
-                    logger.info(f"Skipping email to {user.email}")
-                    continue
+                logger.info(f"Sending notification to {user} in {project}")
+                logger.debug(f"Notification subject: {notification_subject}")
+                logger.debug(f"Notification body: {notification_body}")
 
                 core_utils.send_mail(
                     subject=notification_subject,
