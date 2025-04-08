@@ -33,6 +33,11 @@ class OpenPortalExtension(WaldurExtension):
                 "schedule": timedelta(minutes=17),
                 "args": (),
             },
+            "waldur-openportal-send-notifications": {
+                "task": "waldur_openportal.send_notifications",
+                "schedule": timedelta(minutes=1),
+                "args": (),
+            },
         }
 
     @staticmethod

@@ -551,3 +551,47 @@ class ProjectInfo(models.Model):
             )
 
         super().save(*args, **kwargs)
+
+
+class ProjectNotification(models.Model):
+    """
+    This model is responsible for storing data about when and how often
+    members of a project should be sent notifications about the current
+    spending of the project and the end date.
+
+    This is here rather than in invoices or notifications as our notification
+    needs are quite bespoke, we will use data that comes directly from
+    OpenPortal, and we need to isolate this code from the evolution of the
+    rest of Waldur. Note that we could migrate this functionality into
+    core Waldur if desired.
+    """
+
+    # Which project does this relate to?
+    project = models.OneToOneField(
+        to=structure_models.Project,
+        related_name="op-projectnotification-project+",
+        on_delete=models.CASCADE,
+    )
+
+    # How many days between notifications (0 = no notifications)
+    frequency = models.PositiveSmallIntegerField(
+        verbose_name=_("frequency"),
+        default=0,
+        help_text=_("How many days between notifications (0 = no notifications)."),
+    )
+
+    # When was the last notification sent?
+    # This is a date, not a datetime, as we don't care about the time
+    # of the notification, just the date.
+    last_notification = models.DateField(
+        verbose_name=_("last notification"),
+        blank=True,
+        null=True,
+        help_text=_("When was the last notification sent?"),
+    )
+
+    def __str__(self) -> str:
+        return f"{self.project}: Last notification {self.last_notification}, frequency {self.frequency}"
+
+    def __repr__(self) -> str:
+        return self.__str__()

@@ -1,5 +1,6 @@
 import logging
 import datetime
+import time
 
 from celery import shared_task
 
@@ -328,3 +329,199 @@ def sync_project(serialized_project):
             elif (datetime.datetime.now() - now).seconds > 120:
                 logger.error("Took too long - aborting")
                 break
+
+
+@shared_task(name="waldur_openportal.send_notifications")
+def send_notifications():
+    """
+    This task is called to send notifications to all users associated
+    with any OpenPortal allocations.
+    """
+    logger.info("OpenPortal task.send_notifications")
+
+    # make sure that we only run during "office hours"
+    # (9am to 5pm) - this is a bit of a hack, but it will do for now
+    now = datetime.datetime.now()
+
+    if now.hour < 9 or now.hour > 17:
+        logger.info("Not sending notifications - outside office hours")
+        # return
+
+    # Get today's date
+    today = datetime.date.today()
+
+    num_emails_sent = 0
+
+    # Loop over all ProjectCredit objects - no need to send notifications
+    # to projects that don't have any credits allocated
+    for project_credit in invoice_models.ProjectCredit.objects.all():
+        if num_emails_sent > 500:
+            logger.warning("Sent over 500 emails already - stopping")
+            return
+
+        project = project_credit.project
+
+        if project.is_expired:
+            continue
+
+        # get the end date for this project
+        end_date = project.end_date
+
+        # check that the project is not expired (sometimes expired hasn't worked?)
+        if end_date is not None and end_date < today:
+            # project is expired - no need to send notifications
+            continue
+
+        # Check to see if this project should be notified
+        notification, created = models.ProjectNotification.objects.get_or_create(
+            project=project
+        )
+
+        if notification.frequency == 0:
+            # No notifications - skip
+            continue
+
+        should_notify = False
+
+        if created or notification.last_notification is None:
+            should_notify = True
+        elif (
+            notification.last_notification
+            + datetime.timedelta(days=notification.frequency)
+            <= today
+        ):
+            should_notify = True
+
+        if not should_notify:
+            continue
+
+        # Check to see if this project has any credits available
+        credits_available = float(project_credit.value)
+
+        if credits_available is None or credits_available <= 0:
+            credits_available = 0
+        else:
+            credits_available = float(credits_available)
+
+        # find any openportal allocations associated with the project
+        allocations = models.Allocation.objects.filter(project=project, is_active=True)
+
+        # Calculate the total usage so far this month across OpenPortal allocations
+        total_spend = 0.0
+
+        for allocation in allocations:
+            total_spend += float(allocation.node_usage)
+
+        notification_subject = _notification_subject(project, today)
+
+        notification_body = _notification_body(
+            project,
+            today,
+            credits_available,
+            total_spend,
+            end_date,
+            notification.frequency,
+        )
+
+        # Send the notification to each user - wait 50ms between each
+        # notification to avoid overwhelming the mail server
+        for user in project.get_users():
+            try:
+                logger.info(f"Sending notification to {user}")
+                logger.info(f"Notification subject: {notification_subject}")
+                logger.info(f"Notification body: {notification_body}")
+
+                if "woods" not in user.email.lower():
+                    # debugging - only send to me
+                    logger.info(f"Skipping email to {user.email}")
+                    continue
+
+                core_utils.send_mail(
+                    subject=notification_subject,
+                    body=notification_body,
+                    to=[user.email],
+                )
+                num_emails_sent += 1
+                time.sleep(0.05)
+            except Exception as e:
+                logger.error(f"Failed to send notification to {user.email}: {e}")
+
+        # Update the last notification date
+        notification.last_notification = today
+        notification.save()
+
+
+def _notification_subject(project, today):
+    """
+    This function returns the subject for the notification email
+    for the passed project generated on the passed date
+    """
+    return f"Isambard Project Status Update - {today.strftime('%d %B %Y')}"
+
+
+def _notification_body(
+    project, today, credits_available, total_spend, end_date, update_frequency
+):
+    """
+    This function returns the body for the notification email
+    for the passed project generated on the passed date. This
+    communicates the number of credits available, the total spend
+    on the project, and when the project will end.
+    """
+
+    remaining = credits_available - total_spend
+    if remaining < 0:
+        remaining = 0
+
+    if end_date is None:
+        date_info = ""
+    else:
+        date = end_date.strftime("%d %B %Y")
+
+        days_remaining = (end_date - today).days
+
+        if days_remaining < 0:
+            days_remaining = "today"
+        elif days_remaining == 1:
+            days_remaining = "tomorrow"
+        else:
+            days_remaining = f"in {days_remaining} days time"
+
+        date_info = f"""
+
+All node hours must be consumed before the {date}, which is {days_remaining}.
+
+Note that you must copy back all data before this date."""
+
+    if update_frequency < 1:
+        update_frequency = 1
+
+    if update_frequency == 1:
+        update_frequency = "day"
+    elif update_frequency == 7:
+        update_frequency = "week"
+    elif update_frequency == 14:
+        update_frequency = "fortnight"
+    else:
+        update_frequency = f"{update_frequency} days"
+
+    # This would eventually be better templated ;-)
+    body = f"""
+
+Here is your regular update for your Isambard project “{project.name}”
+
+To date, {total_spend:.2f} node hours have been used, leaving {remaining:.2f} remaining to consume before the end of your project.{date_info}
+
+For more detail, view your project at https://portal.isambard.ac.uk.
+
+To learn more about project accounting, read the documentation at https://docs.isambard.ac.uk/user-documentation/guides/accounting.
+
+If you have any queries, please raise a ticket at https://support.isambard.ac.uk.
+
+We will send you an update every {update_frequency}.
+
+If you want to change the frequency of these updates please ask the project PI to raise a request at https://support.isambard.ac.uk.
+
+"""
+
+    return body
