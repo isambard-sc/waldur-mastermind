@@ -507,7 +507,6 @@ Note that you must copy back all data before this date."""
 
     # This would eventually be better templated ;-)
     body = f"""
-
 Here is your regular update for your Isambard project “{project.name}”
 
 To date, {total_spend:.2f} node hours have been used, leaving {remaining:.2f} remaining to consume before the end of your project.{date_info}
