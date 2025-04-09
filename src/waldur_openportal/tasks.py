@@ -486,7 +486,7 @@ def _notification_body(
 
 All node hours must be consumed before the {date}, which is {days_remaining}.
 
-Note that you must copy back all data before this date."""
+You must copy back all data before this date. You won't be able to login after your project ends and all remaining data will be deleted."""
 
     if update_frequency < 1:
         update_frequency = 1
