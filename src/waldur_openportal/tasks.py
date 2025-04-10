@@ -514,7 +514,7 @@ If you have any queries, please raise a ticket at https://support.isambard.ac.uk
 
 We will send you an update every {update_frequency}.
 
-If you want to change the frequency of these updates please ask the project PI to raise a request at https://support.isambard.ac.uk.
+If you want to change the frequency of these updates, please ask the project PI to raise a request at https://support.isambard.ac.uk.
 
 """
 

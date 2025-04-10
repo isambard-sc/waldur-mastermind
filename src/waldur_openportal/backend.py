@@ -630,12 +630,12 @@ class OpenPortalBackend(ServiceBackend):
         limit = openportal.Usage.from_hours(allocation.node_limit)
 
         logger.debug(f"Setting resource limit for allocation {project} to {limit}")
-        # set_limit = self.client.set_resource_limits(project, limit)
+        set_limit = self.client.set_resource_limits(project, limit)
 
-        # if set_limit.seconds != limit.seconds:
-        #     logger.error(
-        #         f"Unable to set limit for project {project} to {limit} - got {set_limit}"
-        #     )
+        if set_limit.seconds != limit.seconds:
+            logger.error(
+                f"Unable to set limit for project {project} to {limit} - got {set_limit}"
+            )
 
     def get_resource_limits(
         self, project: openportal.ProjectIdentifier
