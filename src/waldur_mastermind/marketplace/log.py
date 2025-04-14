@@ -217,7 +217,6 @@ class MarketplaceResourceLogger(EventLogger):
             "marketplace_resource_downscaled",
             "marketplace_resource_paused",
             "marketplace_resource_erred_on_backend",
-            "marketplace_resource_has_been_changed",
             "marketplace_resource_unlinked",
         )
         nullable_fields = ["old_name"]
@@ -251,6 +250,7 @@ class RobotAccountEventLogger(EventLogger):
             "resource_robot_account_created",
             "resource_robot_account_updated",
             "resource_robot_account_deleted",
+            "resource_robot_account_state_changed",
         )
         event_groups = {
             "resources": event_types,
@@ -270,6 +270,7 @@ class MarketplaceServiceProviderLogger(EventLogger):
             "resource_robot_account_created",
             "resource_robot_account_updated",
             "resource_robot_account_deleted",
+            "resource_robot_account_state_changed",
             "marketplace_resource_create_succeeded",
             "marketplace_resource_update_limits_succeeded",
             "marketplace_resource_terminate_requested",
@@ -416,14 +417,6 @@ def log_resource_update_requested(resource):
     event_logger.marketplace_resource.info(
         "Resource {resource_name} update has been requested.",
         event_type="marketplace_resource_update_requested",
-        event_context={"resource": resource},
-    )
-
-
-def log_resource_update_succeeded(resource):
-    event_logger.marketplace_resource.info(
-        "Resource {resource_name} has been updated successfully.",
-        event_type="marketplace_resource_update_succeeded",
         event_context={"resource": resource},
     )
 
@@ -576,7 +569,7 @@ def log_resource_erred_on_backend(resource):
     )
 
 
-def log_marketplace_resource_has_been_changed(resource, changed):
+def log_resource_update_succeeded(resource, changed):
     if not changed:
         return
 
@@ -603,7 +596,7 @@ def log_marketplace_resource_has_been_changed(resource, changed):
         .render(Context(context))
         .replace("{", "{{")
         .replace("}", "}}"),
-        event_type="marketplace_resource_has_been_changed",
+        event_type="marketplace_resource_update_succeeded",
         event_context=event_context,
     )
 

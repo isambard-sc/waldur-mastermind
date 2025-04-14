@@ -21,14 +21,6 @@ SECRET_KEY = env.get("GLOBAL_SECRET_KEY")
 
 media_root: str = os.path.join(work_dir, "media")
 
-redis_password: str = env.get("REDIS_PASSWORD")
-redis_host: str = env.get("REDIS_HOST", "localhost")
-redis_port: str = env.get("REDIS_PORT", "6379")
-if redis_password:
-    redis_url = "redis://:%s@%s:%s/1" % (redis_password, redis_host, redis_port)
-else:
-    redis_url = "redis://%s:%s/1" % (redis_host, redis_port)
-
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = env.get("GLOBAL_DEBUG", "false").lower() == "true"
 
@@ -41,8 +33,10 @@ TEMPLATES[0]["DIRS"].insert(0, templates_dir)
 
 # For security reason disable browsable API rendering in production
 if not DEBUG:
-    REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"] = (
-        "rest_framework.renderers.JSONRenderer",
+    REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"] = tuple(
+        renderer
+        for renderer in REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"]
+        if renderer != "waldur_core.core.renderers.BrowsableAPIRenderer"
     )
 
 MEDIA_ROOT = media_root
@@ -72,13 +66,11 @@ DATABASES = {
     },
 }
 
+CELERY_RESULT_BACKEND = f"db+postgresql+psycopg://{DATABASES['default']['USER']}:{DATABASES['default']['PASSWORD']}@{DATABASES['default']['HOST']}:{DATABASES['default']['PORT']}/{DATABASES['default']['NAME']}"
+
 # Static files
 # See also: https://docs.djangoproject.com/en/4.2/ref/settings/#static-files
 STATIC_ROOT = env.get("GLOBAL_STATIC_ROOT", os.path.join(data_dir, "static"))
-
-# Django cache
-# https://docs.djangoproject.com/en/4.2/topics/cache/
-CACHES["default"]["LOCATION"] = redis_url
 
 # Email
 # See also: https://docs.djangoproject.com/en/4.2/ref/settings/#default-from-email
@@ -93,14 +85,6 @@ EMAIL_HOOK_FROM_EMAIL = env.get("GLOBAL_EMAIL_HOOK_FROM_EMAIL", "")
 # https://docs.djangoproject.com/en/4.2/ref/settings/#sessions
 SESSION_COOKIE_AGE = env.get("AUTH_COOKIE_AGE", 3600)
 
-# Celery
-# See also:
-#  - http://docs.celeryproject.org/en/latest/userguide/configuration.html
-#  - http://docs.celeryproject.org/en/latest/userguide/configuration.html#broker-settings
-#  - http://docs.celeryproject.org/en/latest/userguide/configuration.html#std:setting-result_backend
-CELERY_BROKER_URL = redis_url
-CELERY_RESULT_BACKEND = redis_url
-
 # Waldur Core internal configuration
 # See also: http://docs.waldur.com/latest/
 token_lifetime = env.get("AUTH_TOKEN_LIFETIME", 3600)
@@ -109,12 +93,6 @@ WALDUR_CORE.update(
         "TOKEN_LIFETIME": timedelta(seconds=token_lifetime),
     }
 )
-
-# Swagger uses DRF session authentication which can be enabled in DEBUG mode
-if DEBUG:
-    SWAGGER_SETTINGS["USE_SESSION_AUTH"] = True
-    SWAGGER_SETTINGS["LOGIN_URL"] = "rest_framework:login"
-    SWAGGER_SETTINGS["LOGOUT_URL"] = "rest_framework:logout"
 
 # Sentry integration
 # See also: https://docs.sentry.io/platforms/python/guides/django/

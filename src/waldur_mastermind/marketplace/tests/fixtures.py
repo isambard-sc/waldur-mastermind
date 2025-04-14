@@ -1,6 +1,10 @@
 from django.utils.functional import cached_property
 
-from waldur_core.permissions.fixtures import CustomerRole, OfferingRole
+from waldur_core.permissions.fixtures import (
+    CustomerRole,
+    OfferingRole,
+    ServiceProviderRole,
+)
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.marketplace import PLUGIN_NAME
@@ -18,7 +22,6 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
     def offering(self):
         return marketplace_factories.OfferingFactory(
             type=PLUGIN_NAME,
-            options={"order": []},
             state=marketplace_models.Offering.States.ACTIVE,
             project=self.offering_project,
             customer=self.offering_customer,
@@ -78,6 +81,18 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
         )
 
     @cached_property
+    def update_order(self):
+        """Order specifically for testing resource updates"""
+        return marketplace_factories.OrderFactory(
+            project=self.project,
+            offering=self.offering,
+            resource=self.resource,
+            plan=self.plan,
+            state=marketplace_models.Order.States.EXECUTING,
+            type=marketplace_models.Order.Types.UPDATE,
+        )
+
+    @cached_property
     def service_provider(self):
         return marketplace_factories.ServiceProviderFactory(
             customer=self.offering_customer,
@@ -114,7 +129,9 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
 
     @cached_property
     def offering_manager(self):
-        return self.offering_fixture.manager
+        manager = structure_factories.UserFactory()
+        self.offering.add_user(manager, OfferingRole.MANAGER)
+        return manager
 
     @cached_property
     def offering_project(self):
@@ -137,6 +154,6 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
     @cached_property
     def provider_manager(self):
         user = structure_factories.UserFactory()
-        self.offering_customer.add_user(user, CustomerRole.MANAGER)
+        self.offering_customer.add_user(user, ServiceProviderRole.MANAGER)
         self.offering.add_user(user, OfferingRole.MANAGER)
         return user

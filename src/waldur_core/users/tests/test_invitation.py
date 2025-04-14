@@ -1,7 +1,7 @@
 import datetime
 from datetime import timedelta
 
-from constance.test.pytest import override_config
+from constance.test.unittest import override_config
 from ddt import data, ddt
 from django.conf import settings
 from django.core import mail
@@ -11,6 +11,7 @@ from freezegun import freeze_time
 from rest_framework import status, test
 
 from waldur_core.core.tests.helpers import override_waldur_core_settings
+from waldur_core.logging import models as logging_models
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole, ProposalRole
 from waldur_core.permissions.models import Role
@@ -589,9 +590,9 @@ class InvitationCancelTest(BaseInvitationTest):
         WALDUR_CORE={
             "INVITATION_LIFETIME": timedelta(weeks=1),
             "TRANSLATION_DOMAIN": "TEST",
-            "HOMEPORT_URL": "TEST",
         }
     )
+    @override_config(HOMEPORT_URL="TEST")
     def test_send_reminder_for_pending_invitations(self):
         waldur_section = settings.WALDUR_CORE.copy()
         waldur_section["INVITATION_LIFETIME"] = timedelta(weeks=1)
@@ -710,6 +711,26 @@ class InvitationSendTest(BaseInvitationTest):
         )
         self.assertEqual(customer_expired_invitation.created, timezone.now())
 
+    @override_settings(task_always_eager=True)
+    def test_creating_of_email_log(self):
+        structure_factories.NotificationFactory(key="users.invitation_created")
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_CUSTOMER_PERMISSION)
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.post(
+            factories.CustomerInvitationFactory.get_url(
+                self.customer_invitation, action="send"
+            )
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.customer_invitation.refresh_from_db()
+        self.assertTrue(
+            logging_models.EmailLog.objects.filter(
+                emails=[self.customer_invitation.email],
+                subject=f"Invitation to {self.customer_invitation.customer.name} organization",
+            ).exists()
+        )
+
 
 class InvitationAcceptTest(BaseInvitationTest):
     def test_authenticated_user_can_accept_project_invitation(self):
@@ -794,7 +815,7 @@ class InvitationAcceptTest(BaseInvitationTest):
             response.data, ["User has already the same role in this scope."]
         )
 
-    @override_waldur_core_settings(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
     def test_user_can_have_only_single_role_in_any_project_or_customer(self):
         self.client.force_authenticate(user=self.customer_owner)
         response = self.client.post(

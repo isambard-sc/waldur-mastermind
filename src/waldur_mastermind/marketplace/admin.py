@@ -336,6 +336,7 @@ class OfferingAdmin(VersionAdmin, admin.ModelAdmin):
         "shared",
         "billable",
         "type",
+        ("customer", RelatedOnlyDropdownFilter),
         ("category", RelatedOnlyDropdownFilter),
     )
     date_hierarchy = "created"
@@ -346,15 +347,12 @@ class OfferingAdmin(VersionAdmin, admin.ModelAdmin):
         "customer",
         "category",
         "name",
-        "native_name",
         "description",
-        "native_description",
         "full_description",
         "country",
         "terms_of_service",
         "terms_of_service_link",
         "privacy_policy_link",
-        "rating",
         "thumbnail",
         "attributes",
         "options",
@@ -375,7 +373,6 @@ class OfferingAdmin(VersionAdmin, admin.ModelAdmin):
         "image",
     )
     readonly_fields = (
-        "rating",
         "scope_link",
         "citation_count",
         "uuid",
@@ -500,7 +497,6 @@ class OfferingUserAdmin(admin.ModelAdmin):
         "offering",
         "user",
         "username",
-        "propagation_date",
     )
 
 

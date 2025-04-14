@@ -5,6 +5,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import extend_schema
 from rest_framework import permissions as rf_permissions
 from rest_framework import status
 from rest_framework.decorators import action
@@ -66,6 +67,7 @@ class InvitationViewSet(ProtectedViewSet):
                 lambda: tasks.process_invitation.delay(invitation.uuid.hex, sender)
             )
 
+    @extend_schema(request=serializers.TokenSerializer, responses=None)
     @action(detail=False, methods=["post"], permission_classes=[])
     def approve(self, request):
         """
@@ -90,6 +92,7 @@ class InvitationViewSet(ProtectedViewSet):
             {"detail": _("Invitation has been approved.")}, status=status.HTTP_200_OK
         )
 
+    @extend_schema(request=serializers.TokenSerializer, responses=None)
     @action(detail=False, methods=["post"], permission_classes=[])
     def reject(self, request):
         """
@@ -113,6 +116,7 @@ class InvitationViewSet(ProtectedViewSet):
             {"detail": _("Invitation has been rejected.")}, status=status.HTTP_200_OK
         )
 
+    @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def send(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
@@ -143,6 +147,7 @@ class InvitationViewSet(ProtectedViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def cancel(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
@@ -163,6 +168,7 @@ class InvitationViewSet(ProtectedViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def delete(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
@@ -176,6 +182,7 @@ class InvitationViewSet(ProtectedViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(request=None, responses=None)
     @action(
         detail=True, methods=["post"], filter_backends=[filters.PendingInvitationFilter]
     )
@@ -192,7 +199,7 @@ class InvitationViewSet(ProtectedViewSet):
                     _("User’s email and email of the invitation are not equal.")
                 )
 
-        if settings.WALDUR_CORE["INVITATION_DISABLE_MULTIPLE_ROLES"]:
+        if config.INVITATION_DISABLE_MULTIPLE_ROLES:
             if UserRole.objects.filter(user=request.user, is_active=True).exists():
                 raise ValidationError(_("User already has role within another scope."))
 
@@ -203,6 +210,9 @@ class InvitationViewSet(ProtectedViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        request=None, responses=serializers.InvitationCheckSerializer, parameters=[]
+    )
     @action(detail=True, methods=["post"], filter_backends=[], permission_classes=[])
     def check(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
@@ -217,6 +227,10 @@ class InvitationViewSet(ProtectedViewSet):
         else:
             return Response({"email": invitation.email}, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        request=None,
+        responses=serializers.VisibleInvitationDetailsSerializer,
+    )
     @action(detail=True, filter_backends=[filters.VisibleInvitationFilter])
     def details(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
@@ -236,6 +250,14 @@ class GroupInvitationViewSet(ProtectedViewSet):
     filterset_class = filters.GroupInvitationFilter
     lookup_field = "uuid"
 
+    @extend_schema(
+        request=None,
+        responses=structure_serializers.NestedProjectSerializer(
+            many=True, read_only=True
+        ),
+        description="Return projects for group invitation",
+        filters=False,
+    )
     @action(detail=True, methods=["get"], filter_backends=[])
     def projects(self, request, uuid=None):
         invitation: models.GroupInvitation = self.get_object()
@@ -251,6 +273,12 @@ class GroupInvitationViewSet(ProtectedViewSet):
         )
         return Response(projects.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        request=None,
+        responses=None,
+        description="Cancel group invitation",
+        parameters=[],
+    )
     @action(detail=True, methods=["post"], filter_backends=[])
     def cancel(self, request, uuid=None):
         invitation: models.GroupInvitation = self.get_object()
@@ -266,8 +294,9 @@ class GroupInvitationViewSet(ProtectedViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(request=None)
     @action(detail=True, methods=["post"], filter_backends=[])
-    def request(self, request, uuid=None):
+    def submit_request(self, request, uuid=None):
         invitation: models.GroupInvitation = self.get_object()
 
         if not invitation.is_active:

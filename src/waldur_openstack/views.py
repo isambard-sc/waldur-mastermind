@@ -1,19 +1,18 @@
 import logging
 
 from django.conf import settings
-from django.db.models import Count, OuterRef, Value
-from django.db.models.functions import Coalesce
+from django.db.models import Count
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import OpenApiExample, OpenApiParameter, extend_schema
 from keystoneauth1.exceptions.connection import ConnectFailure
 from rest_framework import decorators, exceptions, generics, response, status
-from rest_framework import serializers as rf_serializers
 
-import waldur_openstack.serializers
 from waldur_core.core import exceptions as core_exceptions
 from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
+from waldur_core.core.serializers import EmptySerializer
 from waldur_core.logging.loggers import event_logger
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.utils import has_permission
@@ -23,6 +22,7 @@ from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import signals as structure_signals
 from waldur_core.structure import views as structure_views
 from waldur_core.structure.managers import filter_queryset_for_user
+from waldur_core.structure.serializers import ConsoleUrlSerializer
 from waldur_core.structure.signals import resource_imported
 from waldur_openstack.apps import OpenStackConfig
 from waldur_openstack.backend import OpenStackBackend
@@ -86,7 +86,7 @@ class UsageReporter:
         return qs
 
     def parse_query(self, request):
-        serializer_class = serializers.UsageStatsSerializer
+        serializer_class = serializers.OpenStackUsageStatsSerializer
         serializer = serializer_class(data=request.query_params)
         serializer.is_valid(raise_exception=True)
         query = serializer.validated_data
@@ -141,7 +141,7 @@ class FlavorViewSet(structure_views.BaseServicePropertyViewSet):
     """
 
     queryset = models.Flavor.objects.all().order_by("settings", "cores", "ram", "disk")
-    serializer_class = serializers.FlavorSerializer
+    serializer_class = serializers.OpenStackFlavorSerializer
     lookup_field = "uuid"
     filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
     filterset_class = filters.FlavorFilter
@@ -153,7 +153,7 @@ class FlavorViewSet(structure_views.BaseServicePropertyViewSet):
 
 class ImageViewSet(structure_views.BaseServicePropertyViewSet):
     queryset = models.Image.objects.all().order_by("name")
-    serializer_class = serializers.ImageSerializer
+    serializer_class = serializers.OpenStackImageSerializer
     lookup_field = "uuid"
     filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
     filterset_class = filters.ImageFilter
@@ -167,14 +167,14 @@ class VolumeTypeViewSet(structure_views.BaseServicePropertyViewSet):
     queryset = models.VolumeType.objects.filter(disabled=False).order_by(
         "settings", "name"
     )
-    serializer_class = serializers.VolumeTypeSerializer
+    serializer_class = serializers.OpenStackVolumeTypeSerializer
     lookup_field = "uuid"
     filterset_class = filters.VolumeTypeFilter
 
 
 class SecurityGroupViewSet(structure_views.ResourceViewSet):
     queryset = models.SecurityGroup.objects.all().order_by("tenant__name")
-    serializer_class = serializers.SecurityGroupSerializer
+    serializer_class = serializers.OpenStackSecurityGroupSerializer
     filterset_class = filters.SecurityGroupFilter
     disabled_actions = ["create"]
     pull_executor = executors.SecurityGroupPullExecutor
@@ -191,7 +191,7 @@ class SecurityGroupViewSet(structure_views.ResourceViewSet):
     )
     update_executor = executors.SecurityGroupUpdateExecutor
     partial_update_serializer_class = update_serializer_class = (
-        serializers.SecurityGroupUpdateSerializer
+        serializers.OpenStackSecurityGroupUpdateSerializer
     )
 
     destroy_validators = structure_views.ResourceViewSet.destroy_validators + [
@@ -199,20 +199,27 @@ class SecurityGroupViewSet(structure_views.ResourceViewSet):
     ]
     delete_executor = executors.SecurityGroupDeleteExecutor
 
+    @extend_schema(
+        description="Update security group rules",
+        request=serializers.OpenStackSecurityGroupRuleListUpdateSerializer,
+        responses=None,
+        examples=[
+            OpenApiExample(
+                request_only=True,
+                name="openstack-security-group-set-rules",
+                value=[
+                    {
+                        "protocol": "tcp",
+                        "from_port": 1,
+                        "to_port": 10,
+                        "cidr": "10.1.1.0/24",
+                    }
+                ],
+            )
+        ],
+    )
     @decorators.action(detail=True, methods=["POST"])
     def set_rules(self, request, uuid=None):
-        """WARNING! Auto-generated HTML form is wrong for this endpoint. List should be defined as input.
-
-        Example:
-        [
-            {
-                "protocol": "tcp",
-                "from_port": 1,
-                "to_port": 10,
-                "cidr": "10.1.1.0/24"
-            }
-        ]
-        """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -238,12 +245,14 @@ class SecurityGroupViewSet(structure_views.ResourceViewSet):
         )
 
     set_rules_validators = [core_validators.StateValidator(models.Tenant.States.OK)]
-    set_rules_serializer_class = serializers.SecurityGroupRuleListUpdateSerializer
+    set_rules_serializer_class = (
+        serializers.OpenStackSecurityGroupRuleListUpdateSerializer
+    )
 
 
 class ServerGroupViewSet(structure_views.ResourceViewSet):
     queryset = models.ServerGroup.objects.all().order_by("tenant__name")
-    serializer_class = serializers.CreateServerGroupSerializer
+    serializer_class = serializers.OpenStackServerGroupSerializer
     filterset_class = filters.ServerGroupFilter
     pull_executor = executors.ServerGroupPullExecutor
     delete_executor = executors.ServerGroupDeleteExecutor
@@ -251,7 +260,7 @@ class ServerGroupViewSet(structure_views.ResourceViewSet):
 
 class FloatingIPViewSet(structure_views.ResourceViewSet):
     queryset = models.FloatingIP.objects.all().order_by("address")
-    serializer_class = serializers.FloatingIPSerializer
+    serializer_class = serializers.OpenStackFloatingIPSerializer
     filterset_class = filters.FloatingIPFilter
     disabled_actions = ["update", "partial_update", "create"]
     delete_executor = executors.FloatingIPDeleteExecutor
@@ -259,14 +268,15 @@ class FloatingIPViewSet(structure_views.ResourceViewSet):
 
     def list(self, request, *args, **kwargs):
         """
-        To get a list of all available floating IPs, issue **GET** against */api/floating-ips/*.
-        Floating IPs are read only. Each floating IP has fields: 'address', 'status'.
-
         Status *DOWN* means that floating IP is not linked to a VM, status *ACTIVE* means that it is in use.
         """
-
         return super().list(request, *args, **kwargs)
 
+    @extend_schema(
+        description="Attach floating IP to port",
+        request=serializers.OpenStackFloatingIPAttachSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def attach_to_port(self, request, uuid=None):
         floating_ip: models.FloatingIP = self.get_object()
@@ -301,11 +311,16 @@ class FloatingIPViewSet(structure_views.ResourceViewSet):
             {"status": _("attaching was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
-    attach_to_port_serializer_class = serializers.FloatingIPAttachSerializer
+    attach_to_port_serializer_class = serializers.OpenStackFloatingIPAttachSerializer
     attach_to_port_validators = [
         core_validators.StateValidator(models.FloatingIP.States.OK)
     ]
 
+    @extend_schema(
+        description="Detach floating IP from port",
+        request=None,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def detach_from_port(self, request=None, uuid=None):
         floating_ip: models.FloatingIP = self.get_object()
@@ -325,6 +340,11 @@ class FloatingIPViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.FloatingIP.States.OK)
     ]
 
+    @extend_schema(
+        description="Update description of the floating IP",
+        request=serializers.OpenStackFloatingIPDescriptionUpdateSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def update_description(self, request=None, uuid=None):
         floating_ip: models.FloatingIP = self.get_object()
@@ -341,7 +361,7 @@ class FloatingIPViewSet(structure_views.ResourceViewSet):
         )
 
     update_description_serializer_class = (
-        serializers.FloatingIPDescriptionUpdateSerializer
+        serializers.OpenStackFloatingIPDescriptionUpdateSerializer
     )
     update_description_validators = [
         core_validators.StateValidator(models.FloatingIP.States.OK)
@@ -350,7 +370,7 @@ class FloatingIPViewSet(structure_views.ResourceViewSet):
 
 class TenantViewSet(structure_views.ResourceViewSet):
     queryset = models.Tenant.objects.all().order_by("name")
-    serializer_class = serializers.TenantSerializer
+    serializer_class = serializers.OpenStackTenantSerializer
     filterset_class = structure_filters.BaseResourceFilter
 
     create_executor = executors.TenantCreateExecutor
@@ -378,11 +398,29 @@ class TenantViewSet(structure_views.ResourceViewSet):
     delete_executor = executors.TenantDeleteExecutor
     destroy_permissions = [delete_permission_check]
 
+    @extend_schema(
+        examples=[
+            OpenApiExample(
+                request_only=True,
+                name="openstack-tenant-set-quotas",
+                value={
+                    "instances": 30,
+                    "ram": 100000,
+                    "storage": 1000000,
+                    "vcpu": 30,
+                    "security_group_count": 100,
+                    "security_group_rule_count": 100,
+                    "volumes": 10,
+                    "snapshots": 20,
+                },
+            )
+        ]
+    )
     @decorators.action(detail=True, methods=["post"])
     def set_quotas(self, request, uuid=None):
         """
         A quota can be set for a particular tenant. Only staff users can do that.
-        In order to set quota submit **POST** request to */api/openstack-tenants/<uuid>/set_quotas/*.
+        In order to set quota submit POST request to /api/openstack-tenants/<uuid>/set_quotas/.
         The quota values are propagated to the backend.
 
         The following quotas are supported. All values are expected to be integers:
@@ -402,26 +440,6 @@ class TenantViewSet(structure_views.ResourceViewSet):
         some quotas might not be applied.
 
         .. _MiB: http://en.wikipedia.org/wiki/Mebibyte
-
-        Example of a valid request (token is user specific):
-
-        .. code-block:: http
-
-            POST /api/openstack-tenants/c84d653b9ec92c6cbac41c706593e66f567a7fa4/set_quotas/ HTTP/1.1
-            Content-Type: application/json
-            Accept: application/json
-            Host: example.com
-
-            {
-                "instances": 30,
-                "ram": 100000,
-                "storage": 1000000,
-                "vcpu": 30,
-                "security_group_count": 100,
-                "security_group_rule_count": 100,
-                "volumes": 10,
-                "snapshots": 20
-            }
 
         Response code of a successful request is **202 ACCEPTED**.
         In case tenant is in a non-stable status, the response would be **409 CONFLICT**.
@@ -445,8 +463,11 @@ class TenantViewSet(structure_views.ResourceViewSet):
 
     set_quotas_permissions = [structure_permissions.is_staff]
     set_quotas_validators = [core_validators.StateValidator(models.Tenant.States.OK)]
-    set_quotas_serializer_class = serializers.TenantQuotaSerializer
+    set_quotas_serializer_class = serializers.OpenStackTenantQuotaSerializer
 
+    @extend_schema(
+        description="Create network for tenant",
+    )
     @decorators.action(detail=True, methods=["post"])
     def create_network(self, request, uuid=None):
         serializer = self.get_serializer(data=request.data)
@@ -459,7 +480,7 @@ class TenantViewSet(structure_views.ResourceViewSet):
     create_network_validators = [
         core_validators.StateValidator(models.Tenant.States.OK)
     ]
-    create_network_serializer_class = serializers.NetworkSerializer
+    create_network_serializer_class = serializers.OpenStackNetworkSerializer
 
     def external_network_is_defined(tenant):
         if not tenant.external_network_id:
@@ -469,6 +490,11 @@ class TenantViewSet(structure_views.ResourceViewSet):
                 )
             )
 
+    @extend_schema(
+        description="Create floating IP for tenant",
+        request=serializers.OpenStackFloatingIPSerializer,
+        responses=serializers.OpenStackFloatingIPSerializer,
+    )
     @decorators.action(detail=True, methods=["post"])
     def create_floating_ip(self, request, uuid=None):
         serializer = self.get_serializer(data=request.data)
@@ -482,8 +508,13 @@ class TenantViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Tenant.States.OK),
         external_network_is_defined,
     ]
-    create_floating_ip_serializer_class = serializers.FloatingIPSerializer
+    create_floating_ip_serializer_class = serializers.OpenStackFloatingIPSerializer
 
+    @extend_schema(
+        description="Trigger job to pull floating IPs from remote VPC",
+        request=None,
+        responses={202: None},
+    )
     @decorators.action(detail=True, methods=["post"])
     def pull_floating_ips(self, request, uuid=None):
         tenant = self.get_object()
@@ -494,34 +525,37 @@ class TenantViewSet(structure_views.ResourceViewSet):
     pull_floating_ips_validators = [
         core_validators.StateValidator(models.Tenant.States.OK)
     ]
-    pull_floating_ips_serializer_class = rf_serializers.Serializer
+    pull_floating_ips_serializer_class = EmptySerializer
 
+    @extend_schema(
+        examples=[
+            OpenApiExample(
+                request_only=True,
+                name="openstack-tenant-create-security-group",
+                description="Example of creating a security group with rules",
+                value={
+                    "name": "Security group name",
+                    "description": "description",
+                    "rules": [
+                        {
+                            "protocol": "tcp",
+                            "from_port": 1,
+                            "to_port": 10,
+                            "cidr": "10.1.1.0/24",
+                        },
+                        {
+                            "protocol": "udp",
+                            "from_port": 10,
+                            "to_port": 8000,
+                            "cidr": "10.1.1.0/24",
+                        },
+                    ],
+                },
+            )
+        ]
+    )
     @decorators.action(detail=True, methods=["post"])
     def create_security_group(self, request, uuid=None):
-        """
-        Example of a request:
-
-        .. code-block:: http
-
-            {
-                "name": "Security group name",
-                "description": "description",
-                "rules": [
-                    {
-                        "protocol": "tcp",
-                        "from_port": 1,
-                        "to_port": 10,
-                        "cidr": "10.1.1.0/24"
-                    },
-                    {
-                        "protocol": "udp",
-                        "from_port": 10,
-                        "to_port": 8000,
-                        "cidr": "10.1.1.0/24"
-                    }
-                ]
-            }
-        """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         security_group = serializer.save()
@@ -532,8 +566,14 @@ class TenantViewSet(structure_views.ResourceViewSet):
     create_security_group_validators = [
         core_validators.StateValidator(models.Tenant.States.OK)
     ]
-    create_security_group_serializer_class = serializers.SecurityGroupSerializer
+    create_security_group_serializer_class = (
+        serializers.OpenStackSecurityGroupSerializer
+    )
 
+    @extend_schema(
+        description="Trigger job to pull security groups from remote VPC",
+        request=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def pull_security_groups(self, request, uuid=None):
         executors.TenantPullSecurityGroupsExecutor.execute(self.get_object())
@@ -546,6 +586,10 @@ class TenantViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Tenant.States.OK)
     ]
 
+    @extend_schema(
+        description="Trigger job to pull server groups from remote VPC",
+        request=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def pull_server_groups(self, request, uuid=None):
         executors.TenantPullServerGroupsExecutor.execute(self.get_object())
@@ -558,18 +602,17 @@ class TenantViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Tenant.States.OK)
     ]
 
+    @extend_schema(
+        examples=[
+            OpenApiExample(
+                request_only=True,
+                name="openstack-tenant-create-server-group",
+                value={"name": "Server group name", "policy": "affinity"},
+            )
+        ]
+    )
     @decorators.action(detail=True, methods=["post"])
     def create_server_group(self, request, uuid=None):
-        """
-        Example of a request:
-
-        .. code-block:: http
-
-            {
-                "name": "Server group name",
-                "policy": "affinity"
-            }
-        """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         server_group = serializer.save()
@@ -580,8 +623,13 @@ class TenantViewSet(structure_views.ResourceViewSet):
     create_server_group_validators = [
         core_validators.StateValidator(models.Tenant.States.OK)
     ]
-    create_server_group_serializer_class = serializers.CreateServerGroupSerializer
+    create_server_group_serializer_class = serializers.OpenStackServerGroupSerializer
 
+    @extend_schema(
+        description="Change password for tenant user",
+        request=serializers.OpenStackTenantChangePasswordSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def change_password(self, request, uuid=None):
         serializer = self.get_serializer(instance=self.get_object(), data=request.data)
@@ -594,11 +642,18 @@ class TenantViewSet(structure_views.ResourceViewSet):
             status=status.HTTP_202_ACCEPTED,
         )
 
-    change_password_serializer_class = serializers.TenantChangePasswordSerializer
+    change_password_serializer_class = (
+        serializers.OpenStackTenantChangePasswordSerializer
+    )
     change_password_validators = [
         core_validators.StateValidator(models.Tenant.States.OK)
     ]
 
+    @extend_schema(
+        description="It triggers celery job to pull quotas from remote VPC",
+        request=None,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def pull_quotas(self, request, uuid=None):
         executors.TenantPullQuotasExecutor.execute(self.get_object())
@@ -609,24 +664,34 @@ class TenantViewSet(structure_views.ResourceViewSet):
 
     pull_quotas_validators = [core_validators.StateValidator(models.Tenant.States.OK)]
 
+    @extend_schema(
+        description="Return a list of volumes from backend",
+        responses=serializers.OpenStackBackendInstanceSerializer(many=True),
+        request=None,
+    )
     @decorators.action(detail=True)
     def backend_instances(self, request, uuid=None):
         tenant: models.Tenant = self.get_object()
         backend = OpenStackBackend(tenant.service_settings)
         try:
-            serializer = serializers.BackendInstanceSerializer(
+            serializer = serializers.OpenStackBackendInstanceSerializer(
                 backend.get_instances(tenant), many=True
             )
         except (ConnectFailure, OpenStackBackendError) as e:
             raise exceptions.ValidationError(e)
         return response.Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        description="Return a list of volumes from backend",
+        request=None,
+        responses=serializers.OpenStackBackendVolumesSerializer(many=True),
+    )
     @decorators.action(detail=True)
     def backend_volumes(self, request, uuid=None):
         tenant: models.Tenant = self.get_object()
         backend = OpenStackBackend(tenant.service_settings)
         try:
-            serializer = serializers.BackendVolumesSerializer(
+            serializer = serializers.OpenStackBackendVolumesSerializer(
                 backend.get_volumes(tenant), many=True
             )
         except (ConnectFailure, OpenStackBackendError) as e:
@@ -639,7 +704,7 @@ class RouterViewSet(core_views.ReadOnlyActionsViewSet):
     queryset = models.Router.objects.all().order_by("tenant__name")
     filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
     filterset_class = filters.RouterFilter
-    serializer_class = serializers.RouterSerializer
+    serializer_class = serializers.OpenStackRouterSerializer
 
     @decorators.action(detail=True, methods=["POST"])
     def set_routes(self, request, uuid=None):
@@ -675,7 +740,7 @@ class RouterViewSet(core_views.ReadOnlyActionsViewSet):
             status=status.HTTP_202_ACCEPTED,
         )
 
-    set_routes_serializer_class = serializers.RouterSetRoutesSerializer
+    set_routes_serializer_class = serializers.OpenStackRouterSetRoutesSerializer
     set_routes_validators = [
         core_validators.StateValidator(
             models.Router.States.OK, models.Router.States.ERRED
@@ -687,7 +752,7 @@ class PortViewSet(structure_views.ResourceViewSet):
     queryset = models.Port.objects.all().order_by("network__name")
     filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
     filterset_class = filters.PortFilter
-    serializer_class = serializers.PortSerializer
+    serializer_class = serializers.OpenStackPortSerializer
 
     disabled_actions = ["create", "update", "partial_update"]
     delete_executor = executors.PortDeleteExecutor
@@ -695,7 +760,7 @@ class PortViewSet(structure_views.ResourceViewSet):
 
 class NetworkViewSet(structure_views.ResourceViewSet):
     queryset = models.Network.objects.all().order_by("name")
-    serializer_class = serializers.NetworkSerializer
+    serializer_class = serializers.OpenStackNetworkSerializer
     filterset_class = filters.NetworkFilter
 
     disabled_actions = ["create"]
@@ -714,7 +779,7 @@ class NetworkViewSet(structure_views.ResourceViewSet):
     create_subnet_validators = [
         core_validators.StateValidator(models.Network.States.OK)
     ]
-    create_subnet_serializer_class = serializers.SubNetSerializer
+    create_subnet_serializer_class = serializers.OpenStackSubNetSerializer
 
     @decorators.action(detail=True, methods=["post"])
     def set_mtu(self, request, uuid=None):
@@ -739,14 +804,14 @@ class NetworkViewSet(structure_views.ResourceViewSet):
         )
         return response.Response(serializer.data, status=status.HTTP_201_CREATED)
 
-    create_port_serializer_class = serializers.PortSerializer
+    create_port_serializer_class = serializers.OpenStackPortSerializer
 
     create_port_validators = [core_validators.StateValidator(models.Network.States.OK)]
 
 
 class SubNetViewSet(structure_views.ResourceViewSet):
     queryset = models.SubNet.objects.all().order_by("network")
-    serializer_class = serializers.SubNetSerializer
+    serializer_class = serializers.OpenStackSubNetSerializer
     filterset_class = filters.SubNetFilter
 
     disabled_actions = ["create"]
@@ -760,7 +825,7 @@ class SubNetViewSet(structure_views.ResourceViewSet):
         return response.Response(status=status.HTTP_202_ACCEPTED)
 
     connect_validators = [core_validators.StateValidator(models.SubNet.States.OK)]
-    connect_serializer_class = rf_serializers.Serializer
+    connect_serializer_class = EmptySerializer
 
     @decorators.action(detail=True, methods=["post"])
     def disconnect(self, request, uuid=None):
@@ -768,22 +833,17 @@ class SubNetViewSet(structure_views.ResourceViewSet):
         return response.Response(status=status.HTTP_202_ACCEPTED)
 
     disconnect_validators = [core_validators.StateValidator(models.SubNet.States.OK)]
-    disconnect_serializer_class = rf_serializers.Serializer
+    disconnect_serializer_class = EmptySerializer
 
 
 class VolumeViewSet(structure_views.ResourceViewSet):
     queryset = models.Volume.objects.all().order_by("name")
-    serializer_class = serializers.VolumeSerializer
+    serializer_class = serializers.OpenStackVolumeSerializer
     filterset_class = filters.VolumeFilter
 
     update_executor = executors.VolumeUpdateExecutor
     pull_executor = executors.VolumePullExecutor
-
-    def create(self, request, *args, **kwargs):
-        return response.Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
-    def destroy(self, request, *args, **kwargs):
-        return response.Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    disabled_actions = ["create", "destroy"]
 
     def _is_volume_bootable(volume):
         if volume.bootable:
@@ -812,9 +872,13 @@ class VolumeViewSet(structure_views.ResourceViewSet):
                 _("Volume instance should be in OK state.")
             )
 
+    @extend_schema(
+        description="Increase volume size",
+        request=serializers.OpenStackVolumeExtendSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def extend(self, request, uuid=None):
-        """Increase volume size"""
         volume = self.get_object()
         old_size = volume.size
         serializer = self.get_serializer(volume, data=request.data)
@@ -836,11 +900,15 @@ class VolumeViewSet(structure_views.ResourceViewSet):
         _is_volume_instance_shutoff,
         core_validators.StateValidator(models.Volume.States.OK),
     ]
-    extend_serializer_class = serializers.VolumeExtendSerializer
+    extend_serializer_class = serializers.OpenStackVolumeExtendSerializer
 
+    @extend_schema(
+        description="Create snapshot from volume",
+        request=serializers.OpenStackSnapshotSerializer,
+        responses=serializers.OpenStackSnapshotSerializer,
+    )
     @decorators.action(detail=True, methods=["post"])
     def snapshot(self, request, uuid=None):
-        """Create snapshot from volume"""
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         snapshot = serializer.save()
@@ -848,23 +916,15 @@ class VolumeViewSet(structure_views.ResourceViewSet):
         executors.SnapshotCreateExecutor().execute(snapshot)
         return response.Response(serializer.data, status=status.HTTP_201_CREATED)
 
-    snapshot_serializer_class = serializers.SnapshotSerializer
+    snapshot_serializer_class = serializers.OpenStackSnapshotSerializer
 
-    @decorators.action(detail=True, methods=["post"])
-    def create_snapshot_schedule(self, request, uuid=None):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return response.Response(serializer.data, status=status.HTTP_201_CREATED)
-
-    create_snapshot_schedule_validators = [
-        core_validators.StateValidator(models.Volume.States.OK)
-    ]
-    create_snapshot_schedule_serializer_class = serializers.SnapshotScheduleSerializer
-
+    @extend_schema(
+        description="Attach volume to instance",
+        request=serializers.VolumeAttachSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def attach(self, request, uuid=None):
-        """Attach volume to instance"""
         volume = self.get_object()
         serializer = self.get_serializer(volume, data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -881,9 +941,13 @@ class VolumeViewSet(structure_views.ResourceViewSet):
     ]
     attach_serializer_class = serializers.VolumeAttachSerializer
 
+    @extend_schema(
+        description="Detach instance from volume",
+        request=None,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def detach(self, request, uuid=None):
-        """Detach instance from volume"""
         volume = self.get_object()
         executors.VolumeDetachExecutor().execute(volume)
         return response.Response(
@@ -897,9 +961,13 @@ class VolumeViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Volume.States.OK),
     ]
 
+    @extend_schema(
+        description="Retype detached volume",
+        request=serializers.OpenStackVolumeRetypeSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def retype(self, request, uuid=None):
-        """Retype detached volume"""
         volume = self.get_object()
         serializer = self.get_serializer(volume, data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -915,18 +983,23 @@ class VolumeViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Volume.States.OK),
     ]
 
-    retype_serializer_class = serializers.VolumeRetypeSerializer
+    retype_serializer_class = serializers.OpenStackVolumeRetypeSerializer
 
 
 class SnapshotViewSet(structure_views.ResourceViewSet):
     queryset = models.Snapshot.objects.all().order_by("name")
-    serializer_class = serializers.SnapshotSerializer
+    serializer_class = serializers.OpenStackSnapshotSerializer
     update_executor = executors.SnapshotUpdateExecutor
     delete_executor = executors.SnapshotDeleteExecutor
     pull_executor = executors.SnapshotPullExecutor
     filterset_class = filters.SnapshotFilter
     disabled_actions = ["create"]
 
+    @extend_schema(
+        description="Restore volume from snapshot",
+        request=serializers.OpenStackSnapshotRestorationSerializer,
+        responses=serializers.OpenStackVolumeSerializer,
+    )
     @decorators.action(detail=True, methods=["post"])
     def restore(self, request, uuid=None):
         serializer = self.get_serializer(data=request.data)
@@ -934,7 +1007,7 @@ class SnapshotViewSet(structure_views.ResourceViewSet):
         restoration = serializer.save()
 
         executors.SnapshotRestorationExecutor().execute(restoration)
-        serialized_volume = serializers.VolumeSerializer(
+        serialized_volume = serializers.OpenStackVolumeSerializer(
             restoration.volume, context={"request": self.request}
         )
         resource_imported.send(
@@ -943,23 +1016,29 @@ class SnapshotViewSet(structure_views.ResourceViewSet):
         )
         return response.Response(serialized_volume.data, status=status.HTTP_201_CREATED)
 
-    restore_serializer_class = serializers.SnapshotRestorationSerializer
+    restore_serializer_class = serializers.OpenStackSnapshotRestorationSerializer
     restore_validators = [core_validators.StateValidator(models.Snapshot.States.OK)]
 
+    @extend_schema(
+        description="Get a list of snapshot restorations",
+        request=None,
+        responses=serializers.OpenStackSnapshotRestorationSerializer(many=True),
+        filters=False,
+    )
     @decorators.action(detail=True, methods=["get"])
     def restorations(self, request, uuid=None):
         snapshot = self.get_object()
         serializer = self.get_serializer(snapshot.restorations.all(), many=True)
         return response.Response(serializer.data, status=status.HTTP_200_OK)
 
-    restorations_serializer_class = serializers.SnapshotRestorationSerializer
+    restorations_serializer_class = serializers.OpenStackSnapshotRestorationSerializer
 
 
 class InstanceAvailabilityZoneViewSet(structure_views.BaseServicePropertyViewSet):
     queryset = models.InstanceAvailabilityZone.objects.all().order_by(
         "settings", "name"
     )
-    serializer_class = serializers.InstanceAvailabilityZoneSerializer
+    serializer_class = serializers.OpenStackInstanceAvailabilityZoneSerializer
     lookup_field = "uuid"
     filterset_class = filters.InstanceAvailabilityZoneFilter
 
@@ -978,24 +1057,18 @@ class InstanceViewSet(structure_views.ResourceViewSet):
     """
 
     queryset = models.Instance.objects.all()
-    serializer_class = serializers.InstanceSerializer
+    serializer_class = serializers.OpenStackInstanceSerializer
     filterset_class = filters.InstanceFilter
     filter_backends = structure_views.ResourceViewSet.filter_backends + (
         structure_filters.StartTimeFilter,
     )
     pull_executor = executors.InstancePullExecutor
-    pull_serializer_class = rf_serializers.Serializer
 
     update_executor = executors.InstanceUpdateExecutor
     update_validators = partial_update_validators = [
         core_validators.StateValidator(models.Instance.States.OK)
     ]
-
-    def create(self, request, *args, **kwargs):
-        return response.Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
-    def destroy(self, request, *args, **kwargs):
-        return response.Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    disabled_actions = ["create", "destroy"]
 
     def _has_backups(instance):
         if instance.backups.exists():
@@ -1026,9 +1099,14 @@ class InstanceViewSet(structure_views.ResourceViewSet):
                 _("Please stop the instance before its removal.")
             )
         raise core_exceptions.IncorrectStateException(
-            _("Instance should be shutoff and OK or erred. " "Please contact support.")
+            _("Instance should be shutoff and OK or erred. Please contact support.")
         )
 
+    @extend_schema(
+        description="Change flavor of the instance",
+        request=serializers.InstanceFlavorChangeSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def change_flavor(self, request, uuid=None):
         instance = self.get_object()
@@ -1062,6 +1140,11 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         core_validators.RuntimeStateValidator(models.Instance.RuntimeStates.SHUTOFF),
     ]
 
+    @extend_schema(
+        description="Start the instance",
+        request=None,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def start(self, request, uuid=None):
         instance = self.get_object()
@@ -1084,8 +1167,13 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Instance.States.OK),
         core_validators.RuntimeStateValidator(models.Instance.RuntimeStates.SHUTOFF),
     ]
-    start_serializer_class = rf_serializers.Serializer
+    start_serializer_class = EmptySerializer
 
+    @extend_schema(
+        description="Stop the instance",
+        request=None,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def stop(self, request, uuid=None):
         instance = self.get_object()
@@ -1108,8 +1196,13 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Instance.States.OK),
         core_validators.RuntimeStateValidator(models.Instance.RuntimeStates.ACTIVE),
     ]
-    stop_serializer_class = rf_serializers.Serializer
+    stop_serializer_class = EmptySerializer
 
+    @extend_schema(
+        description="Restart the instance",
+        request=None,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def restart(self, request, uuid=None):
         instance = self.get_object()
@@ -1132,8 +1225,13 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Instance.States.OK),
         core_validators.RuntimeStateValidator(models.Instance.RuntimeStates.ACTIVE),
     ]
-    restart_serializer_class = rf_serializers.Serializer
+    restart_serializer_class = EmptySerializer
 
+    @extend_schema(
+        description="Update security groups of the instance",
+        request=serializers.OpenStackInstanceSecurityGroupsUpdateSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def update_security_groups(self, request, uuid=None):
         instance = self.get_object()
@@ -1151,9 +1249,14 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Instance.States.OK)
     ]
     update_security_groups_serializer_class = (
-        serializers.InstanceSecurityGroupsUpdateSerializer
+        serializers.OpenStackInstanceSecurityGroupsUpdateSerializer
     )
 
+    @extend_schema(
+        description="Create backup from instance",
+        request=serializers.OpenStackBackupSerializer,
+        responses=serializers.OpenStackBackupSerializer,
+    )
     @decorators.action(detail=True, methods=["post"])
     def backup(self, request, uuid=None):
         serializer = self.get_serializer(data=request.data)
@@ -1164,20 +1267,13 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         return response.Response(serializer.data, status=status.HTTP_201_CREATED)
 
     backup_validators = [core_validators.StateValidator(models.Instance.States.OK)]
-    backup_serializer_class = serializers.BackupSerializer
+    backup_serializer_class = serializers.OpenStackBackupSerializer
 
-    @decorators.action(detail=True, methods=["post"])
-    def create_backup_schedule(self, request, uuid=None):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return response.Response(serializer.data, status=status.HTTP_201_CREATED)
-
-    create_backup_schedule_validators = [
-        core_validators.StateValidator(models.Instance.States.OK)
-    ]
-    create_backup_schedule_serializer_class = serializers.BackupScheduleSerializer
-
+    @extend_schema(
+        description="Update allowed address pairs of the instance",
+        request=serializers.OpenStackInstanceAllowedAddressPairsUpdateSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def update_allowed_address_pairs(self, request, uuid=None):
         instance = self.get_object()
@@ -1213,9 +1309,14 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Instance.States.OK)
     ]
     update_allowed_address_pairs_serializer_class = (
-        serializers.InstanceAllowedAddressPairsUpdateSerializer
+        serializers.OpenStackInstanceAllowedAddressPairsUpdateSerializer
     )
 
+    @extend_schema(
+        description="Update ports of the instance",
+        request=serializers.OpenStackInstancePortsUpdateSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def update_ports(self, request, uuid=None):
         instance = self.get_object()
@@ -1232,16 +1333,27 @@ class InstanceViewSet(structure_views.ResourceViewSet):
     update_ports_validators = [
         core_validators.StateValidator(models.Instance.States.OK)
     ]
-    update_ports_serializer_class = serializers.InstancePortsUpdateSerializer
+    update_ports_serializer_class = serializers.OpenStackInstancePortsUpdateSerializer
 
+    @extend_schema(
+        description="Get a list of instance ports",
+        request=None,
+        responses=serializers.OpenStackNestedPortSerializer(many=True),
+        filters=False,
+    )
     @decorators.action(detail=True, methods=["get"])
     def ports(self, request, uuid=None):
         instance = self.get_object()
         serializer = self.get_serializer(instance.ports.all(), many=True)
         return response.Response(serializer.data, status=status.HTTP_200_OK)
 
-    ports_serializer_class = waldur_openstack.serializers.NestedPortSerializer
+    ports_serializer_class = serializers.OpenStackNestedPortSerializer
 
+    @extend_schema(
+        description="Update floating IPs of the instance",
+        request=serializers.OpenStackInstanceFloatingIPsUpdateSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def update_floating_ips(self, request, uuid=None):
         instance = self.get_object()
@@ -1259,23 +1371,32 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Instance.States.OK)
     ]
     update_floating_ips_serializer_class = (
-        serializers.InstanceFloatingIPsUpdateSerializer
+        serializers.OpenStackInstanceFloatingIPsUpdateSerializer
     )
 
+    @extend_schema(
+        description="Get a list of instance floating IPs",
+        request=None,
+        responses=serializers.OpenStackInstanceFloatingIpsSerializer,
+        filters=False,
+    )
     @decorators.action(detail=True, methods=["get"])
     def floating_ips(self, request, uuid=None):
         instance = self.get_object()
-        serializer = self.get_serializer(
+        serializer = serializers.OpenStackNestedFloatingIPSerializer(
             instance=instance.floating_ips.all(),
             queryset=models.FloatingIP.objects.all(),
             many=True,
+            context=self.get_serializer_context(),
         )
         return response.Response(serializer.data, status=status.HTTP_200_OK)
 
-    floating_ips_serializer_class = (
-        waldur_openstack.serializers.NestedFloatingIPSerializer
+    @extend_schema(
+        description="Get console url for the instance",
+        request=None,
+        responses=ConsoleUrlSerializer,
+        filters=False,
     )
-
     @decorators.action(detail=True, methods=["get"])
     def console(self, request, uuid=None):
         instance = self.get_object()
@@ -1303,6 +1424,13 @@ class InstanceViewSet(structure_views.ResourceViewSet):
 
     console_permissions = [check_permissions_for_console]
 
+    @extend_schema(
+        description="Get console log for the instance",
+        parameters=[OpenApiParameter("length", int, OpenApiParameter.QUERY)],
+        request=None,
+        responses={200: str},
+        filters=False,
+    )
     @decorators.action(detail=True, methods=["get"])
     def console_log(self, request, uuid=None):
         instance = self.get_object()
@@ -1318,20 +1446,20 @@ class InstanceViewSet(structure_views.ResourceViewSet):
 
         return response.Response(log, status=status.HTTP_200_OK)
 
-    console_log_serializer_class = serializers.ConsoleLogSerializer
+    console_log_serializer_class = serializers.OpenStackConsoleLogSerializer
     console_log_permissions = [structure_permissions.is_administrator]
 
 
 class MarketplaceInstanceViewSet(structure_views.ResourceViewSet):
     queryset = models.Instance.objects.all()
-    serializer_class = serializers.InstanceSerializer
+    serializer_class = serializers.OpenStackInstanceSerializer
     filter_backends = structure_views.ResourceViewSet.filter_backends + (
         structure_filters.StartTimeFilter,
     )
 
     def destroy(self, request, uuid=None):
         """
-        Deletion of an instance is done through sending a **DELETE** request to the instance URI.
+        Deletion of an instance is done through sending a DELETE request to the instance URI.
         Valid request example (token is user specific):
 
         .. code-block:: http
@@ -1382,7 +1510,7 @@ class MarketplaceInstanceViewSet(structure_views.ResourceViewSet):
         InstanceViewSet._has_backups,
         InstanceViewSet._has_snapshots,
     ]
-    destroy_serializer_class = serializers.InstanceDeleteSerializer
+    destroy_serializer_class = serializers.OpenStackInstanceDeleteSerializer
 
     @decorators.action(detail=True, methods=["delete"])
     def force_destroy(self, request, uuid=None):
@@ -1415,7 +1543,7 @@ class MarketplaceInstanceViewSet(structure_views.ResourceViewSet):
 
 class MarketplaceVolumeViewSet(structure_views.ResourceViewSet):
     queryset = models.Volume.objects.all().order_by("name")
-    serializer_class = serializers.VolumeSerializer
+    serializer_class = serializers.OpenStackVolumeSerializer
     filterset_class = filters.VolumeFilter
 
     create_executor = executors.VolumeCreateExecutor
@@ -1446,7 +1574,7 @@ class MarketplaceVolumeViewSet(structure_views.ResourceViewSet):
 
 class BackupViewSet(structure_views.ResourceViewSet):
     queryset = models.Backup.objects.all().order_by("name")
-    serializer_class = serializers.BackupSerializer
+    serializer_class = serializers.OpenStackBackupSerializer
     filterset_class = filters.BackupFilter
     disabled_actions = ["create"]
 
@@ -1457,6 +1585,11 @@ class BackupViewSet(structure_views.ResourceViewSet):
     def perform_update(self, serializer):
         serializer.save()
 
+    @extend_schema(
+        description="Restore instance from backup",
+        request=serializers.OpenStackBackupRestorationSerializer,
+        responses=serializers.OpenStackInstanceSerializer,
+    )
     @decorators.action(detail=True, methods=["post"])
     def restore(self, request, uuid=None):
         instance = self.get_object()
@@ -1478,7 +1611,7 @@ class BackupViewSet(structure_views.ResourceViewSet):
             is_heavy_task=True,
         )
 
-        instance_serializer = serializers.InstanceSerializer(
+        instance_serializer = serializers.OpenStackInstanceSerializer(
             backup_restoration.instance, context={"request": self.request}
         )
         return response.Response(
@@ -1486,89 +1619,7 @@ class BackupViewSet(structure_views.ResourceViewSet):
         )
 
     restore_validators = [core_validators.StateValidator(models.Backup.States.OK)]
-    restore_serializer_class = serializers.BackupRestorationSerializer
-
-
-class BaseScheduleViewSet(structure_views.ResourceViewSet):
-    disabled_actions = ["create"]
-
-    # method has to be overridden in order to avoid triggering of UpdateExecutor
-    # which is a default action for all ResourceViewSet(s)
-    def perform_update(self, serializer):
-        serializer.save()
-
-    # method has to be overridden in order to avoid triggering of DeleteExecutor
-    # which is a default action for all ResourceViewSet(s)
-    def destroy(self, request, *args, **kwargs):
-        resource = self.get_object()
-        resource.delete()
-        return response.Response(status=status.HTTP_204_NO_CONTENT)
-
-    def list(self, request, *args, **kwargs):
-        """
-        For schedule to work, it should be activated - it's flag is_active set to true. If it's not, it won't be used
-        for triggering the next operations. Schedule will be deactivated if operation fails.
-
-        - **retention time** is a duration in days during which resource is preserved.
-        - **maximal_number_of_resources** is a maximal number of active resources connected to this schedule.
-        - **schedule** is a resource schedule defined in a cron format.
-        - **timezone** is used for calculating next run of the resource schedule (optional).
-
-        A schedule can be it two states: active or not. Non-active states are not used for scheduling the new tasks.
-        Only users with write access to schedule resource can activate or deactivate a schedule.
-        """
-        return super().list(self, request, *args, **kwargs)
-
-    def _is_schedule_active(resource_schedule):
-        if resource_schedule.is_active:
-            raise core_exceptions.IncorrectStateException(
-                _("Resource schedule is already activated.")
-            )
-
-    @decorators.action(detail=True, methods=["post"])
-    def activate(self, request, uuid):
-        """
-        Activate a resource schedule. Note that
-        if a schedule is already active, this will result in **409 CONFLICT** code.
-        """
-        schedule = self.get_object()
-        schedule.is_active = True
-        schedule.error_message = ""
-        schedule.save()
-        return response.Response({"status": _("A schedule was activated")})
-
-    activate_validators = [_is_schedule_active]
-
-    def _is_schedule_deactivated(resource_schedule):
-        if not resource_schedule.is_active:
-            raise core_exceptions.IncorrectStateException(
-                _("A schedule is already deactivated.")
-            )
-
-    @decorators.action(detail=True, methods=["post"])
-    def deactivate(self, request, uuid):
-        """
-        Deactivate a resource schedule. Note that
-        if a schedule was already deactivated, this will result in **409 CONFLICT** code.
-        """
-        schedule = self.get_object()
-        schedule.is_active = False
-        schedule.save()
-        return response.Response({"status": _("Backup schedule was deactivated")})
-
-    deactivate_validators = [_is_schedule_deactivated]
-
-
-class BackupScheduleViewSet(BaseScheduleViewSet):
-    queryset = models.BackupSchedule.objects.all().order_by("name")
-    serializer_class = serializers.BackupScheduleSerializer
-    filterset_class = filters.BackupScheduleFilter
-
-
-class SnapshotScheduleViewSet(BaseScheduleViewSet):
-    queryset = models.SnapshotSchedule.objects.all().order_by("name")
-    serializer_class = serializers.SnapshotScheduleSerializer
-    filterset_class = filters.SnapshotScheduleFilter
+    restore_serializer_class = serializers.OpenStackBackupRestorationSerializer
 
 
 class SharedSettingsBaseView(generics.GenericAPIView):
@@ -1598,33 +1649,8 @@ class SharedSettingsBaseView(generics.GenericAPIView):
         return self.get_paginated_response(serializer.data)
 
 
-class SharedSettingsInstances(SharedSettingsBaseView):
-    serializer_class = serializers.InstanceSerializer
-
-    def get_queryset(self):
-        tenants = self.get_tenants()
-        return models.Instance.objects.order_by("project__customer__name").filter(
-            tenant__in=tenants
-        )
-
-
-class SharedSettingsCustomers(SharedSettingsBaseView):
-    serializer_class = serializers.SharedSettingsCustomerSerializer
-
-    def get_queryset(self):
-        tenants = self.get_tenants()
-        vms = models.Instance.objects.filter(
-            tenant__in=tenants,
-            project__customer=OuterRef("pk"),
-        )
-        vm_count = Coalesce(core_utils.SubqueryCount(vms), Value(0))
-        return structure_models.Customer.objects.filter(
-            pk__in=tenants.values("customer")
-        ).annotate(vm_count=vm_count)
-
-
 class VolumeAvailabilityZoneViewSet(structure_views.BaseServicePropertyViewSet):
     queryset = models.VolumeAvailabilityZone.objects.all().order_by("settings", "name")
-    serializer_class = serializers.VolumeAvailabilityZoneSerializer
+    serializer_class = serializers.OpenStackVolumeAvailabilityZoneSerializer
     lookup_field = "uuid"
     filterset_class = filters.VolumeAvailabilityZoneFilter

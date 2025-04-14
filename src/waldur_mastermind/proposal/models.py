@@ -1,5 +1,6 @@
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
+from typing import Literal
 
 from django.conf import settings
 from django.core.validators import MinValueValidator
@@ -13,11 +14,17 @@ from model_utils.models import TimeStampedModel
 import waldur_core.media.mixins
 from waldur_core.core import models as core_models
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
+from waldur_core.permissions.mixins import PermissionMixin
 from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.models import SafeAttributesMixin
+from waldur_mastermind.proposal.enums import (
+    CallStates,
+    ProposalStates,
+    RequestedOfferingStates,
+)
 
 from . import managers
 
@@ -71,17 +78,10 @@ class Call(
     core_models.DescribableMixin,
     structure_models.StructureLoggableMixin,
     core_models.BackendMixin,
+    core_models.SlugMixin,
 ):
-    class States:
-        DRAFT = "draft"
-        ACTIVE = "active"
-        ARCHIVED = "archived"
-
-        CHOICES = (
-            (DRAFT, "Draft"),
-            (ACTIVE, "Active"),
-            (ARCHIVED, "Archived"),
-        )
+    class States(CallStates):
+        pass
 
     manager = models.ForeignKey(CallManagingOrganisation, on_delete=models.PROTECT)
     created_by = models.ForeignKey(
@@ -104,6 +104,7 @@ class Call(
 
     class Permissions:
         customer_path = "manager__customer"
+        list_permission = PermissionEnum.LIST_CALLS
 
     def __str__(self):
         return f"{self.name} | {self.manager.customer}"
@@ -119,19 +120,11 @@ class RequestedOffering(
     TimeStampedModel,
     core_models.DescribableMixin,
 ):
-    class States:
-        REQUESTED = "requested"
-        ACCEPTED = "accepted"
-        CANCELED = "canceled"
-
-        CHOICES = (
-            (REQUESTED, "Requested"),
-            (ACCEPTED, "Accepted"),
-            (CANCELED, "Canceled"),
-        )
-
     class Permissions:
         customer_path = "offering__customer"
+
+    class States(RequestedOfferingStates):
+        pass
 
     approved_by = models.ForeignKey(
         core_models.User,
@@ -193,8 +186,8 @@ class Round(
 
         CHOICES = (
             (SCHEDULED, "Round is scheduled"),
-            (OPEN, "Round is open."),
-            (ENDED, "Round is ended."),
+            (OPEN, "Round is open"),
+            (ENDED, "Round is ended"),
         )
 
     review_strategy = models.CharField(
@@ -228,16 +221,17 @@ class Round(
 
     class Permissions:
         customer_path = "call__manager__customer"
+        list_permission = PermissionEnum.LIST_ROUNDS
 
     def __str__(self):
         return f"{self.call.name} | {self.start_time} - {self.cutoff_time}"
 
     @property
-    def name(self):
+    def name(self) -> str:
         return f"Round {self.start_time.strftime('%d.%m.%Y')}-{self.cutoff_time.strftime('%d.%m.%Y')}"
 
     @property
-    def status(self):
+    def status(self) -> Literal["scheduled", "open", "ended"]:
         now = timezone.now()
 
         if self.start_time > now:
@@ -267,40 +261,22 @@ def filter_proposals(user):
 
 class Proposal(
     TimeStampedModel,
-    structure_models.PermissionMixin,
+    PermissionMixin,
     core_models.UuidMixin,
     core_models.NameMixin,
     core_models.DescribableMixin,
     structure_models.StructureLoggableMixin,
     structure_models.ProjectOECDFOS2007CodeMixin,
 ):
-    class States:
-        DRAFT = "draft"
-        TEAM_VERIFICATION = "team_verification"
-        SUBMITTED = "submitted"
-        IN_REVIEW = "in_review"
-        IN_REVISION = "in_revision"
-        ACCEPTED = "accepted"
-        REJECTED = "rejected"
-        CANCELED = "canceled"
-
-        CHOICES = (
-            (DRAFT, "Draft"),
-            (TEAM_VERIFICATION, "Team verification"),
-            (SUBMITTED, "Submitted"),
-            (IN_REVIEW, "In review"),
-            (IN_REVISION, "In revision"),
-            (ACCEPTED, "Accepted"),
-            (REJECTED, "Rejected"),
-            (CANCELED, "Canceled"),
-        )
+    class States(ProposalStates):
+        pass
 
     round = models.ForeignKey(Round, on_delete=models.CASCADE)
     state = models.CharField(
         default=States.DRAFT, choices=States.CHOICES, db_index=True
     )
     project = models.ForeignKey(
-        structure_models.Project, on_delete=models.PROTECT, editable=False
+        structure_models.Project, on_delete=models.PROTECT, editable=False, null=True
     )
     duration_in_days = models.PositiveIntegerField(
         null=True,
@@ -432,7 +408,7 @@ class Review(
         return "proposal-review"
 
     @property
-    def review_end_date(self):
+    def review_end_date(self) -> datetime:
         if not self.proposal.round.review_duration_in_days:
             return
 

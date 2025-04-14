@@ -233,7 +233,7 @@ def map_limits_to_quotas(limits, offering: marketplace_models.Offering, is_creat
         quotas["storage"] = ServiceBackend.gb2mb(sum(list(volume_type_quotas.values())))
 
     # Convert quota value from float to integer because OpenStack API fails otherwise
-    quotas = {k: int(v) for k, v in quotas.items()}
+    quotas = {k: isinstance(v, float) and int(v) or v for k, v in quotas.items()}
 
     return quotas
 
@@ -443,6 +443,7 @@ def create_marketplace_resource_for_imported_resources(
         resource.init_cost()
         resource.save()
         import_instance_metadata(resource)
+        update_external_addresses_of_resource(resource)
 
     if isinstance(instance, openstack_models.Volume):
         offering = offering or get_offering(VOLUME_TYPE, instance.tenant)
@@ -470,28 +471,24 @@ def create_marketplace_resource_for_imported_resources(
         create_offerings_for_volume_and_instance(instance)
 
 
-def get_external_ips(offering, ips):
-    external_ips = []
+def get_external_ip(offering, floating_ip_address):
     ipv4_external_ip_mapping = offering.secret_options.get(
         "ipv4_external_ip_mapping", []
     )
-    if not (ipv4_external_ip_mapping or ips or offering):
-        return external_ips
+    if not ipv4_external_ip_mapping:
+        return
 
-    for ip in ips:
-        ip_address = ipaddress.ip_address(ip)
+    ip_address = ipaddress.ip_address(floating_ip_address)
 
-        for offering_external_ip in ipv4_external_ip_mapping:
-            ip_network = ipaddress.ip_network(offering_external_ip["floating_ip"])
+    for offering_external_ip in ipv4_external_ip_mapping:
+        ip_network = ipaddress.ip_network(offering_external_ip["floating_ip"])
 
-            if ip_address in ip_network:
-                external_ips.append(
-                    ".".join(offering_external_ip["external_ip"].split(".")[:-1])
-                    + "."
-                    + ip.split(".")[-1]
-                )
-
-    return external_ips
+        if ip_address in ip_network:
+            return (
+                ".".join(offering_external_ip["external_ip"].split(".")[:-1])
+                + "."
+                + floating_ip_address.split(".")[-1]
+            )
 
 
 def update_external_addresses_of_resource(resource):
@@ -509,13 +506,13 @@ def update_external_addresses_of_resource(resource):
         if not resource.offering.parent:
             continue
 
-        external_ips = get_external_ips(
+        external_ip = get_external_ip(
             resource.offering.parent,
-            [floating_ip.address],
+            floating_ip.address,
         )
 
-        floating_ip.external_address = external_ips
-        resource.backend_metadata["external_address"].extend(external_ips)
+        floating_ip.external_address = external_ip
+        resource.backend_metadata["external_address"].append(external_ip)
 
         floating_ip.save()
         resource.save()

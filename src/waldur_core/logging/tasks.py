@@ -14,9 +14,8 @@ logger = logging.getLogger(__name__)
 @shared_task(name="waldur_core.logging.process_event")
 def process_event(event_id):
     event = Event.objects.get(id=event_id)
-    for hook in BaseHook.get_active_hooks():
-        if check_event(event, hook):
-            hook.process(event)
+    for hook in get_matching_hooks(event):
+        hook.process(event)
 
     process_system_notification(event)
 
@@ -35,6 +34,14 @@ def process_system_notification(event):
     ):
         if check_event(event, hook):
             hook.process(event)
+
+
+def get_matching_hooks(event):
+    """
+    Returns a list of hooks that match the event.
+    """
+    active_hooks = BaseHook.get_active_hooks()
+    return [hook for hook in active_hooks if check_event(event, hook)]
 
 
 def check_event(event, hook):
@@ -67,8 +74,15 @@ def delete_stale_event_subscriptions():
 
 
 @shared_task
-def publish_mqtt_messages(messages: list[dict[str, str]]) -> None:
-    utils.publish_mqtt_messages(messages)
+def publish_messages(messages: list[dict[str, str]]) -> None:
+    try:
+        utils.publish_mqtt_messages(messages)
+    except Exception as e:
+        logger.error("Error publishing MQTT messages: %s", e)
+    try:
+        utils.publish_stomp_messages(messages)
+    except Exception as e:
+        logger.error("Error publishing STOMP messages: %s", e)
 
 
 @shared_task(name="waldur_core.logging.delete_dangling_event_subscriptions")

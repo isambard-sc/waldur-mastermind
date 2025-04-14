@@ -1,5 +1,6 @@
 import copy
 
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from waldur_core.core import signals as core_signals
@@ -7,6 +8,7 @@ from waldur_core.structure.managers import get_connected_customers
 from waldur_mastermind.booking import models as booking_models
 from waldur_mastermind.google import serializers as google_serializers
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
+from waldur_mastermind.marketplace.models import Offering
 
 from . import PLUGIN_NAME
 
@@ -63,9 +65,10 @@ class BookingResourceSerializer(marketplace_serializers.ResourceSerializer):
         )
         extra_kwargs["url"] = {"lookup_field": "uuid", "read_only": True}
 
-    def get_description(self, resource):
+    def get_description(self, resource) -> str:
         return resource.attributes.get("description", "")
 
+    @extend_schema_field(BookingSlotSerializer(many=True))
     def get_slots(self, resource):
         slots = booking_models.BookingSlot.objects.filter(resource=resource).order_by(
             "start"
@@ -78,7 +81,7 @@ class BookingSerializer(serializers.Serializer):
     start = serializers.DateTimeField()
     end = serializers.DateTimeField()
 
-    def get_created_by_full_name(self, booking):
+    def get_created_by_full_name(self, booking) -> str | None:
         order = booking.order
 
         if not order:
@@ -101,7 +104,7 @@ class OfferingSerializer(marketplace_serializers.PublicOfferingDetailsSerializer
         view_name = "booking-offering-detail"
 
 
-def get_google_calendar_public(serializer, offering):
+def get_google_calendar_public(serializer, offering: Offering) -> bool | None:
     if offering.type != PLUGIN_NAME or not hasattr(offering, "googlecalendar"):
         return
 
@@ -124,7 +127,7 @@ core_signals.pre_serializer_fields.connect(
 )
 
 
-def get_google_calendar_link(serializer, offering):
+def get_google_calendar_link(serializer, offering) -> str | None:
     try:
         return offering.googlecalendar.http_link
     except AttributeError:

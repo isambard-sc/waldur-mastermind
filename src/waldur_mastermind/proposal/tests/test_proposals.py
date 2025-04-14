@@ -86,14 +86,14 @@ class ProposalCreateTest(test.APITransactionTestCase):
             has_user(proposal, getattr(self.fixture, user), ProposalRole.MANAGER)
         )
 
-    def test_create_project_if_proposal_has_been_created(self):
+    def test_project_has_not_been_created_if_proposal_has_been_created(self):
         response = self.create_proposal("staff")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertTrue(
             models.Proposal.objects.filter(uuid=response.data["uuid"]).exists()
         )
         proposal = models.Proposal.objects.get(uuid=response.data["uuid"])
-        self.assertTrue(proposal.project)
+        self.assertFalse(proposal.project)
 
     def create_proposal(self, user, **kwargs):
         user = getattr(self.fixture, user)
@@ -211,18 +211,15 @@ class ActionTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.proposal = self.fixture.proposal
-        self.proposal.state = models.Proposal.States.TEAM_VERIFICATION
+        self.proposal.state = models.Proposal.States.DRAFT
         self.proposal.save()
         self.url = factories.ProposalFactory.get_url(self.proposal, "submit")
-        self.url_team_verification = factories.ProposalFactory.get_url(
-            self.proposal, "switch_to_team_verification"
-        )
 
     @data(
         "staff",
         "proposal_creator",
     )
-    def test_user_can_submit_proposal(self, user):
+    def test_force_approval_of_proposal_creates_project(self, user):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
         response = self.client.post(self.url)
@@ -240,22 +237,21 @@ class ActionTest(test.APITransactionTestCase):
         response = self.client.post(self.url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_set_project_start_date_if_proposal_has_been_allocated(self):
+    def test_set_project_start_date_if_proposal_has_been_approved(self):
         self.proposal.state = models.Proposal.States.IN_REVIEW
         self.proposal.save()
 
         self.client.force_authenticate(self.fixture.staff)
 
-        url_allocate = factories.ProposalFactory.get_url(self.proposal, "allocate")
-        response = self.client.post(url_allocate)
+        url_approve = factories.ProposalFactory.get_url(self.proposal, "approve")
+        response = self.client.post(url_approve)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.proposal.project.refresh_from_db()
+        self.proposal.refresh_from_db()
+        self.assertTrue(self.proposal.project)
         self.assertEqual(self.proposal.project.start_date, None)
 
-        new_project = structure_factories.ProjectFactory(customer=self.fixture.customer)
         new_proposal = factories.ProposalFactory(
             round=self.fixture.round,
-            project=new_project,
             state=models.Proposal.States.IN_REVIEW,
         )
         allocation_date = datetime.datetime.now() + datetime.timedelta(weeks=1)
@@ -263,94 +259,11 @@ class ActionTest(test.APITransactionTestCase):
         new_proposal.round.allocation_time = models.Round.AllocationTimes.FIXED_DATE
         new_proposal.round.save()
 
-        new_url_allocate = factories.ProposalFactory.get_url(new_proposal, "allocate")
-        response = self.client.post(new_url_allocate)
+        new_url_approve = factories.ProposalFactory.get_url(new_proposal, "approve")
+        response = self.client.post(new_url_approve)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        new_project.refresh_from_db()
-        self.assertEqual(new_project.start_date, allocation_date.date())
-
-
-@ddt
-class ActionSwitchToTeamVerificationTest(test.APITransactionTestCase):
-    def setUp(self):
-        self.fixture = fixtures.ProposalFixture()
-        self.proposal = self.fixture.proposal
-        self.proposal.state = models.Proposal.States.DRAFT
-        self.proposal.save()
-        self.url = factories.ProposalFactory.get_url(
-            self.proposal, "switch_to_team_verification"
-        )
-
-    @data(
-        "staff",
-        "proposal_creator",
-    )
-    def test_user_can_switch_to_team_verification(self, user):
-        user = getattr(self.fixture, user)
-        self.client.force_authenticate(user)
-        response = self.client.post(self.url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.proposal.refresh_from_db()
-        self.assertTrue(self.proposal.state, models.Proposal.States.TEAM_VERIFICATION)
-
-    @data(
-        "owner",
-        "customer_support",
-    )
-    def test_user_can_not_switch_to_team_verification(self, user):
-        user = getattr(self.fixture, user)
-        self.client.force_authenticate(user)
-        response = self.client.post(self.url)
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-
-    def test_validate_switch_to_team_verification(self):
-        proposal = factories.ProposalFactory()
-        url = factories.ProposalFactory.get_url(proposal, "switch_to_team_verification")
-        user = self.fixture.staff
-        self.client.force_authenticate(user)
-        response = self.client.post(url)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-
-@ddt
-class ForceApproveTest(test.APITransactionTestCase):
-    def setUp(self):
-        self.fixture = fixtures.ProposalFixture()
-        self.proposal = self.fixture.proposal
-        self.proposal.state = models.Proposal.States.REJECTED
-        self.proposal.save()
-        self.url = factories.ProposalFactory.get_url(self.proposal, "force_approve")
-
-    @data(
-        "staff",
-        "call_manager",
-    )
-    def test_user_can_submit_proposal(self, user):
-        user = getattr(self.fixture, user)
-        self.client.force_authenticate(user)
-        response = self.client.post(self.url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.proposal.refresh_from_db()
-        self.assertTrue(self.proposal.state, models.Proposal.States.ACCEPTED)
-
-    @data(
-        "proposal_creator",
-    )
-    def test_user_can_not_submit_proposal(self, user):
-        user = getattr(self.fixture, user)
-        self.client.force_authenticate(user)
-        response = self.client.post(self.url)
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-    @data(
-        "customer_support",
-        "owner",
-    )
-    def test_customer_user_can_not_submit_proposal(self, user):
-        user = getattr(self.fixture, user)
-        self.client.force_authenticate(user)
-        response = self.client.post(self.url)
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        new_proposal.refresh_from_db()
+        self.assertEqual(new_proposal.project.start_date, allocation_date.date())
 
 
 @ddt
@@ -548,7 +461,7 @@ class TaskTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.proposal = self.fixture.proposal
-        self.proposal.state = models.Proposal.States.TEAM_VERIFICATION
+        self.proposal.state = models.Proposal.States.DRAFT
         self.proposal.save()
         self.round = self.fixture.round
 
@@ -557,7 +470,7 @@ class TaskTest(test.APITransactionTestCase):
         self.round.save()
         tasks.proposals_for_ended_rounds_should_be_cancelled()
         self.proposal.refresh_from_db()
-        self.assertEqual(self.proposal.state, models.Proposal.States.TEAM_VERIFICATION)
+        self.assertEqual(self.proposal.state, models.Proposal.States.DRAFT)
 
         self.round.cutoff_time = datetime.datetime.now() - datetime.timedelta(days=1)
         self.round.save()

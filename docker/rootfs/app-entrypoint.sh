@@ -4,47 +4,39 @@ set -eo pipefail
 # uwsgi
 : ${UWSGI_SOCKET:=":8000"}
 
-# user / group ids
-: ${WALDUR_UID:=984}
-: ${WALDUR_GID:=984}
-
-
 echo "INFO: Welcome to Waldur Mastermind!"
 
-/usr/bin/getent group waldur 2>&1 > /dev/null || /usr/sbin/groupadd -g $WALDUR_GID waldur
+# Only handle docker.sock in non-K8s environments
+if [ -z "$KUBERNETES_SERVICE_HOST" ] && [ -e /var/run/docker.sock ]; then
+    echo "INFO: Docker socket found."
+    SOCKET_PERMS=$(stat -c '%a:%u:%g' /var/run/docker.sock)
+    USER_UID=$(id -u)
+    USER_GID=$(id -g)
+    USER_GROUPS=$(id -G | tr ' ' ',')
 
-if ! id waldur 2> /dev/null > /dev/null; then
-  # Create user and group if it does not exist yet
-  echo "INFO: Creating user waldur ${WALDUR_UID}:${WALDUR_GID} "
-  useradd --home /var/lib/waldur --shell /bin/sh --system --uid $WALDUR_UID --gid $WALDUR_GID waldur
+    if ! [ -r /var/run/docker.sock ] || ! [ -w /var/run/docker.sock ]; then
+        echo "Warning: Container user $USER_UID must have read/write access to /var/run/docker.sock"
+        echo "Current socket permissions: $SOCKET_PERMS (mode:uid:gid)"
+        echo "Container user details:"
+        echo "  - UID: $USER_UID"
+        echo "  - Primary GID: $USER_GID"
+        echo "  - All group IDs: $USER_GROUPS"
+        echo "Please ensure the container user is part of the docker group on the host system for custom scripts to run"
+    fi
 fi
 
-if [[ ! -d "/var/log/waldur" ]] ; then
-  echo "INFO: Create logging directory"
-  mkdir -p /var/log/waldur/
-fi
-chmod 750 /var/log/waldur/
-chown -R waldur:waldur /var/log/waldur/
 
-if [[ ! -d "/var/lib/waldur/media" ]] ; then
-  echo "INFO: Create media assets directory"
-  mkdir -p /var/lib/waldur/media/
-fi
-
-chmod 750 /var/lib/waldur/
-chown -R waldur:waldur /var/lib/waldur/
-
-if [[ -f "/etc/waldur/id_rsa" ]] ; then
-  # assure that ssh private is owned by waldur and avoid modifying permissions of the original key
-  cp -vf /etc/waldur/id_rsa /var/lib/waldur/id_rsa
-  chown waldur:waldur /var/lib/waldur/id_rsa
-fi
-
-if [[ -f "/etc/waldur/saml2/sp.pem" ]] ; then
-  # assure that signing private is owned by waldur and avoid modifying permissions of the original key
-  cp -vf /etc/waldur/saml2/sp.pem /var/lib/waldur/sp.pem
-  chown waldur:waldur /var/lib/waldur/sp.pem
+if [[ -f "/etc/waldur/saml2/sp.pem" ]]; then
+    cp -vf "/etc/waldur/saml2/sp.pem" "/var/lib/waldur/sp.pem" || {
+        SRC_PERMS=$(stat -c '%a %u:%g' "/etc/waldur/saml2/sp.pem")
+        echo "Warning: Failed to copy SAML key"
+        echo "Source permissions: $SRC_PERMS (mode:uid:gid)"
+        echo "Container user: $(id)"
+        echo "Container user groups: $(id -G)"
+        echo "Primary group: $(id -g)"
+        echo "Required: read permission for user $(id -u) or group $(id -g)"
+    }
 fi
 
 echo "INFO: Spawning $@"
-exec tini -- "$@"
+exec "$@"

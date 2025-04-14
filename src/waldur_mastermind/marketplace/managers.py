@@ -164,8 +164,12 @@ class ResourceQuerySet(django_models.QuerySet["models.Resource"]):
             return self
 
         connected_customers = get_connected_customers(user)
+        connected_service_providers = get_connected_serviceproviders(user)
 
-        return self.filter(offering__customer__in=connected_customers).distinct()
+        return self.filter(
+            Q(offering__customer__in=connected_customers)
+            | Q(offering__customer__serviceprovider__in=connected_service_providers)
+        ).distinct()
 
 
 class ResourceManager(MixinManager):
@@ -226,7 +230,15 @@ def get_connected_offerings(user, role=None):
     return get_scope_ids(user, content_type, role)
 
 
+def get_connected_serviceproviders(user, role=None):
+    content_type = ContentType.objects.get_for_model(models.ServiceProvider)
+    return get_scope_ids(user, content_type, role)
+
+
 def filter_offering_permissions(user, is_active=True):
+    if user.is_anonymous:
+        return UserRole.objects.none()
+
     queryset = UserRole.objects.filter(
         content_type=ContentType.objects.get_for_model(models.Offering),
         role__name=RoleEnum.OFFERING_MANAGER,

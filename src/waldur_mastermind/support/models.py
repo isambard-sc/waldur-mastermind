@@ -4,6 +4,7 @@ import re
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
+from django.core import validators
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 from django_fsm import FSMIntegerField
@@ -172,7 +173,7 @@ class Issue(
         )
 
     @property
-    def resolved(self):
+    def resolved(self) -> bool | None:
         return IssueStatus.check_success_status(self.status)
 
     def set_resolved(self):
@@ -318,7 +319,30 @@ class Comment(
         return self.description[:50]
 
 
+class FileMixin:
+    @property
+    def file_size(self) -> int:
+        if self.file:
+            return (
+                media_models.File.objects.filter(name=self.file.name)
+                .only("size")
+                .get()
+                .size
+            )
+
+    @property
+    def mime_type(self) -> str:
+        if self.file:
+            return (
+                media_models.File.objects.filter(name=self.file.name)
+                .only("mime_type")
+                .get()
+                .mime_type
+            )
+
+
 class Attachment(
+    FileMixin,
     BackendNameMixin,
     core_models.UuidMixin,
     TimeStampedModel,
@@ -356,26 +380,6 @@ class Attachment(
     def get_log_fields(self):
         return ("uuid", "issue", "author", "backend_id")
 
-    @property
-    def file_size(self):
-        if self.file:
-            return (
-                media_models.File.objects.filter(name=self.file.name)
-                .only("size")
-                .get()
-                .size
-            )
-
-    @property
-    def mime_type(self):
-        if self.file:
-            return (
-                media_models.File.objects.filter(name=self.file.name)
-                .only("mime_type")
-                .get()
-                .mime_type
-            )
-
 
 class Template(core_models.UuidMixin, core_models.NameMixin, TimeStampedModel):
     class IssueTypes:
@@ -391,9 +395,7 @@ class Template(core_models.UuidMixin, core_models.NameMixin, TimeStampedModel):
             (INCIDENT, "Incident"),
         )
 
-    native_name = models.CharField(max_length=150, blank=True)
     description = models.TextField()
-    native_description = models.TextField(blank=True)
     issue_type = models.CharField(
         max_length=30, choices=IssueTypes.CHOICES, default=IssueTypes.INFORMATIONAL
     )
@@ -407,7 +409,7 @@ class Template(core_models.UuidMixin, core_models.NameMixin, TimeStampedModel):
 
 
 class TemplateAttachment(
-    core_models.UuidMixin, core_models.NameMixin, TimeStampedModel
+    FileMixin, core_models.UuidMixin, core_models.NameMixin, TimeStampedModel
 ):
     template = models.ForeignKey(
         Template, on_delete=models.CASCADE, related_name="attachments"
@@ -531,22 +533,13 @@ class Feedback(
     TimeStampedModel,
     core_models.StateMixin,
 ):
-    class Evaluation:
-        CHOICES = (
-            (1, "1"),
-            (2, "2"),
-            (3, "3"),
-            (4, "4"),
-            (5, "5"),
-            (6, "6"),
-            (7, "7"),
-            (8, "8"),
-            (9, "9"),
-            (10, "10"),
-        )
-
     issue = models.OneToOneField(Issue, on_delete=models.CASCADE)
-    evaluation = models.SmallIntegerField(choices=Evaluation.CHOICES)
+    evaluation = models.SmallIntegerField(
+        validators=[
+            validators.MinValueValidator(1),
+            validators.MaxValueValidator(10),
+        ]
+    )
     comment = models.TextField(blank=True)
 
     def __str__(self):

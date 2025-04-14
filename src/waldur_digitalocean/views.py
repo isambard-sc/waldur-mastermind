@@ -1,9 +1,10 @@
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import OpenApiExample, extend_schema
 from rest_framework import decorators, response, status
-from rest_framework import serializers as rf_serializers
 
 from waldur_core.core import executors as core_executors
 from waldur_core.core import validators as core_validators
+from waldur_core.core.serializers import EmptySerializer
 from waldur_core.structure import views as structure_views
 
 from . import executors, filters, log, models, serializers
@@ -11,14 +12,14 @@ from . import executors, filters, log, models, serializers
 
 class ImageViewSet(structure_views.BaseServicePropertyViewSet):
     queryset = models.Image.objects.all().order_by("name")
-    serializer_class = serializers.ImageSerializer
+    serializer_class = serializers.DigitalOceanImageSerializer
     filterset_class = filters.ImageFilter
     lookup_field = "uuid"
 
 
 class RegionViewSet(structure_views.BaseServicePropertyViewSet):
     queryset = models.Region.objects.all()
-    serializer_class = serializers.RegionSerializer
+    serializer_class = serializers.DigitalOceanRegionSerializer
     filterset_class = filters.RegionFilter
     lookup_field = "uuid"
 
@@ -28,14 +29,14 @@ class RegionViewSet(structure_views.BaseServicePropertyViewSet):
 
 class SizeViewSet(structure_views.BaseServicePropertyViewSet):
     queryset = models.Size.objects.all().order_by("name")
-    serializer_class = serializers.SizeSerializer
+    serializer_class = serializers.DigitalOceanSizeSerializer
     filterset_class = filters.SizeFilter
     lookup_field = "uuid"
 
 
 class DropletViewSet(structure_views.ResourceViewSet):
     queryset = models.Droplet.objects.all().order_by("name")
-    serializer_class = serializers.DropletSerializer
+    serializer_class = serializers.DigitalOceanDropletSerializer
     filterset_class = filters.DropletFilter
     create_executor = executors.DropletCreateExecutor
     update_executor = core_executors.EmptyExecutor
@@ -79,7 +80,7 @@ class DropletViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Droplet.States.OK),
         core_validators.RuntimeStateValidator(models.Droplet.RuntimeStates.OFFLINE),
     ]
-    start_serializer_class = rf_serializers.Serializer
+    start_serializer_class = EmptySerializer
 
     @decorators.action(detail=True, methods=["post"])
     def stop(self, request, uuid=None):
@@ -93,7 +94,7 @@ class DropletViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Droplet.States.OK),
         core_validators.RuntimeStateValidator(models.Droplet.RuntimeStates.ONLINE),
     ]
-    stop_serializer_class = rf_serializers.Serializer
+    stop_serializer_class = EmptySerializer
 
     @decorators.action(detail=True, methods=["post"])
     def restart(self, request, uuid=None):
@@ -107,12 +108,23 @@ class DropletViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(models.Droplet.States.OK),
         core_validators.RuntimeStateValidator(models.Droplet.RuntimeStates.ONLINE),
     ]
-    restart_serializer_class = rf_serializers.Serializer
+    restart_serializer_class = EmptySerializer
 
+    @extend_schema(
+        examples=[
+            OpenApiExample(
+                request_only=True,
+                name="digitalocean-droplet-resize",
+                value={
+                    "size": "http://example.com/api/digitalocean-sizes/1ee385bc043249498cfeb8c7e3e079f0/"
+                },
+            )
+        ]
+    )
     @decorators.action(detail=True, methods=["post"])
     def resize(self, request, uuid=None):
         """
-        To resize droplet, submit a **POST** request to the instance URL, specifying URI of a target size.
+        To resize droplet, submit a POST request to the instance URL, specifying URI of a target size.
 
         Pass {'disk': true} along with target size in order to perform permanent resizing,
         which allows you to resize your disk space as well as CPU and RAM.
@@ -121,19 +133,7 @@ class DropletViewSet(structure_views.ResourceViewSet):
         Pass {'disk': false} along with target size in order to perform flexible resizing,
         which only upgrades your CPU and RAM. This option is reversible.
 
-        Note that instance must be OFFLINE. Example of a valid request:
-
-        .. code-block:: http
-
-            POST /api/digitalocean-droplets/6c9b01c251c24174a6691a1f894fae31/resize/ HTTP/1.1
-            Content-Type: application/json
-            Accept: application/json
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-            {
-                "size": "http://example.com/api/digitalocean-sizes/1ee385bc043249498cfeb8c7e3e079f0/"
-            }
+        Note that instance must be OFFLINE.
         """
         droplet = self.get_object()
         serializer = self.get_serializer(droplet, data=request.data)
@@ -172,4 +172,4 @@ class DropletViewSet(structure_views.ResourceViewSet):
         )
 
     resize_validators = [core_validators.StateValidator(models.Droplet.States.OK)]
-    resize_serializer_class = serializers.DropletResizeSerializer
+    resize_serializer_class = serializers.DigitalOceanDropletResizeSerializer

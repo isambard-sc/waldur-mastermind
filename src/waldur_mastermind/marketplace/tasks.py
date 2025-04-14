@@ -7,7 +7,6 @@ import requests
 from celery import shared_task
 from constance import config
 from dateutil.relativedelta import relativedelta
-from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
@@ -18,7 +17,7 @@ from rest_framework import status
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.logging import models as logging_models
-from waldur_core.permissions.enums import RoleEnum
+from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.log import event_logger
 from waldur_mastermind import __version__ as mastermind_version
@@ -260,6 +259,54 @@ def terminate_resources_if_project_end_date_has_been_reached():
         )
 
 
+@shared_task(
+    name="waldur_mastermind.marketplace.terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_order"
+)
+def terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_order():
+    termination_offerings_types = ["Marketplace.Slurm"]
+    resources = models.Resource.objects.filter(
+        state=models.Resource.States.ERRED,
+        backend_id="",
+        offering__type__in=termination_offerings_types,
+    )
+    # Get the uuids of resources that have a failed creation order
+    failed_creation_resources = (
+        models.Order.objects.filter(
+            resource__in=resources,
+            type=models.Order.Types.CREATE,
+            state=models.Order.States.ERRED,
+        )
+        .order_by("-created")
+        .values_list("resource__uuid", flat=True)
+    )
+
+    # Get the uuids of resources that have a failed latest termination order
+    resources_with_last_termination_order_erred = (
+        models.Order.objects.filter(
+            resource__in=resources,
+            type=models.Order.Types.TERMINATE,
+            state=models.Order.States.ERRED,
+        )
+        .order_by("-created")
+        .values_list("resource__uuid", flat=True)
+    )
+
+    # Get the uuids of resources that have a failed creation order and the latest termination order is in ERRED state
+    uuids_resources_to_terminate = list(
+        set(failed_creation_resources)
+        & set(resources_with_last_termination_order_erred)
+    )
+
+    # Get the resources that have a failed creation order and the latest termination order is in ERRED state
+    resources_to_terminate = models.Resource.objects.filter(
+        uuid__in=uuids_resources_to_terminate
+    )
+    logger.info(f"Resources to delete during daily cleanup: {resources_to_terminate}")
+    # Delete the resources, associated orders should be deleted automatically due to CASCADE delete
+    for resource in resources_to_terminate:
+        resource.delete()
+
+
 @shared_task(name="waldur_mastermind.marketplace.notify_about_stale_resource")
 def notify_about_stale_resource():
     if not config.ENABLE_STALE_RESOURCE_NOTIFICATIONS:
@@ -335,12 +382,8 @@ def terminate_expired_resources():
 def notify_about_resource_termination(resource_uuid, user_uuid, is_staff_action=None):
     resource = models.Resource.objects.get(uuid=resource_uuid)
     user = User.objects.get(uuid=user_uuid)
-    admin_emails = set(
-        resource.project.get_user_mails(structure_models.ProjectRole.ADMINISTRATOR)
-    )
-    manager_emails = set(
-        resource.project.get_user_mails(structure_models.ProjectRole.MANAGER)
-    )
+    admin_emails = set(resource.project.get_user_mails(ProjectRole.ADMIN))
+    manager_emails = set(resource.project.get_user_mails(ProjectRole.MANAGER))
     emails = admin_emails | manager_emails
     bcc = []
     if user.email and user.notifications_enabled:
@@ -373,42 +416,10 @@ def notify_about_resource_termination(resource_uuid, user_uuid, is_staff_action=
 @shared_task(name="waldur_mastermind.marketplace.notification_about_project_ending")
 def notification_about_project_ending():
     date_1 = timezone.datetime.today().date() + datetime.timedelta(days=1)
+    utils.notification_about_project_ending(date_1)
+
     date_7 = timezone.datetime.today().date() + datetime.timedelta(days=7)
-    expired_projects = structure_models.Project.available_objects.exclude(
-        end_date__isnull=True
-    ).filter(Q(end_date=date_1) | Q(end_date=date_7))
-
-    for project in expired_projects:
-        managers = (
-            project.get_users(structure_models.ProjectRole.MANAGER)
-            .exclude(email="")
-            .exclude(notifications_enabled=False)
-        )
-        owners = (
-            project.customer.get_users(RoleEnum.CUSTOMER_OWNER)
-            .exclude(email="")
-            .exclude(notifications_enabled=False)
-        )
-        users = set(managers) | set(owners)
-
-        project_url = core_utils.format_homeport_link(
-            "projects/{project_uuid}/",
-            project_uuid=project.uuid.hex,
-        )
-
-        for user in users:
-            context = {
-                "project_url": project_url,
-                "project": project,
-                "user": user,
-                "delta": (project.end_date - timezone.datetime.today().date()).days,
-            }
-            core_utils.broadcast_mail(
-                "marketplace",
-                "notification_about_project_ending",
-                context,
-                [user.email],
-            )
+    utils.notification_about_project_ending(date_7)
 
 
 @shared_task(name="waldur_mastermind.marketplace.notification_about_resource_ending")
@@ -451,7 +462,7 @@ def send_metrics():
     if not core_models.Feature.objects.filter(key="telemetry.send_metrics").exists():
         return
 
-    site_name = settings.WALDUR_CORE["HOMEPORT_URL"]
+    site_name = config.HOMEPORT_URL
     deployment_type = core_utils.get_deployment_type()
     first_event = logging_models.Event.objects.order_by("created").first()
     installation_date = (
@@ -553,3 +564,56 @@ def mark_resources_as_erred_after_timeout():
         if scope:
             scope.set_erred()
             scope.save(update_fields=["state"])
+
+
+@shared_task
+def notify_user_that_order_been_rejected(order_uuid):
+    try:
+        order: models.Order = models.Order.objects.get(uuid=order_uuid)
+    except models.Order.DoesNotExist:
+        logger.warning(
+            f"Cannot send rejection notification: Order {order_uuid} not found."
+        )
+        return
+
+    if not order.created_by.email:
+        logger.warning(
+            f"Cannot send rejection notification: Order {order_uuid} has no valid user email."
+        )
+        return
+
+    link = core_utils.format_homeport_link(
+        "marketplace-order-details/{order_uuid}/",
+        order_uuid=order.uuid,
+    )
+
+    context = {
+        "order_url": link,
+        "order": order,
+        "site_name": config.SITE_NAME,
+        "order_type": order.get_type_display().lower(),
+    }
+
+    core_utils.broadcast_mail(
+        "marketplace",
+        "notification_to_user_that_order_been_rejected",
+        context,
+        [order.created_by.email],
+    )
+
+
+@shared_task(name="waldur_mastermind.marketplace.remove_deleted_robot_accounts")
+def remove_deleted_robot_accounts():
+    """
+    Remove robot accounts that are in DELETED state.
+    This task runs daily to clean up robot accounts that have been marked for deletion.
+    """
+    logger.info("Daily task: Removing deleted robot accounts")
+    deleted_accounts = marketplace_models.RobotAccount.objects.filter(
+        state=marketplace_models.RobotAccount.States.DELETED
+    )
+    count = deleted_accounts.count()
+    deleted_accounts.delete()
+
+    if count > 0:
+        logger.info(f"Removed {count} robot accounts that were in DELETED state")

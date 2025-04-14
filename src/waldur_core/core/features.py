@@ -128,10 +128,6 @@ class SupportSection(FeatureSection):
 
     users = Feature("Render list of users in support workspace.")
 
-    shared_providers = Feature(
-        "Render overview of shared marketplace service providers in support workspace."
-    )
-
     vm_type_overview = Feature("Enable VM type overview in support workspace.")
 
     conceal_change_request = Feature(
@@ -147,19 +143,8 @@ class InvitationsSection(FeatureSection):
     conceal_civil_number = Feature(
         "Conceal civil number in invitation creation dialog."
     )
-
-    show_tax_number = Feature("Show tax number field in invitation creation form.")
-
-    tax_number_required = Feature(
-        "Make tax number field mandatory in invitation creation form."
-    )
-
     civil_number_required = Feature(
         "Make civil number field mandatory in invitation creation form."
-    )
-
-    require_user_details = Feature(
-        'Render "Show user details" button in invitation creation form.'
     )
 
 

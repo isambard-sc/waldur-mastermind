@@ -243,27 +243,63 @@ class OpenStackBackend(ServiceBackend):
 
     def pull_tenants(self):
         keystone = get_keystone_client(self.admin_session)
+        logger.info("Starting to pull tenants for service settings %s", self.settings)
 
         try:
-            backend_tenants = keystone.projects.list(domain=self._get_domain())
+            domain = self._get_domain()
+            logger.debug("Using domain: %s (type: %s)", domain, type(domain).__name__)
+            backend_tenants = keystone.projects.list(domain=domain)
+        except keystone_exceptions.Forbidden as e:
+            if "identity:list_projects" in str(e):
+                logger.warning(
+                    "User is not authorized to list all projects. This might be expected if the user only has access to specific projects. Error: %s",
+                    str(e),
+                )
+                # Get only the projects the user has access to
+                try:
+                    backend_tenants = keystone.projects.list()
+                    logger.info(
+                        "Successfully retrieved accessible projects. Count: %d",
+                        len(backend_tenants),
+                    )
+                except keystone_exceptions.ClientException as e2:
+                    logger.error("Failed to list accessible projects: %s", str(e2))
+                    raise OpenStackBackendError(e2)
+            else:
+                logger.error("Permission denied while listing projects: %s", str(e))
+                raise OpenStackBackendError(e)
         except keystone_exceptions.ClientException as e:
+            logger.error("Failed to list projects: %s", str(e))
             raise OpenStackBackendError(e)
 
         backend_tenants_mapping = {tenant.id: tenant for tenant in backend_tenants}
+        logger.info("Retrieved %d tenants from backend", len(backend_tenants_mapping))
 
         tenants = models.Tenant.objects.filter(
             state__in=[models.Tenant.States.OK, models.Tenant.States.ERRED],
             service_settings=self.settings,
         )
+        logger.info("Found %d tenants in database to sync", tenants.count())
+
         for tenant in tenants:
             backend_tenant = backend_tenants_mapping.get(tenant.backend_id)
             if backend_tenant is None:
+                logger.warning(
+                    "Tenant %s (backend_id: %s) not found in backend",
+                    tenant.name,
+                    tenant.backend_id,
+                )
                 handle_resource_not_found(tenant)
                 signals.tenant_does_not_exist_in_backend.send(
                     models.Tenant, instance=tenant
                 )
                 continue
 
+            logger.debug(
+                "Updating tenant %s (backend_id: %s) from backend data",
+                tenant.name,
+                tenant.backend_id,
+            )
             imported_backend_tenant = models.Tenant(
                 name=backend_tenant.name,
                 description=backend_tenant.description,
@@ -278,7 +314,26 @@ class OpenStackBackend(ServiceBackend):
     def _get_domain(self):
         """Get current domain"""
         keystone = get_keystone_client(self.admin_session)
-        return keystone.domains.find(name=self.settings.domain or "Default")
+        domain_name = self.settings.domain or "Default"
+        logger.debug("Attempting to get domain with name: %s", domain_name)
+
+        try:
+            domain = keystone.domains.find(name=domain_name)
+            logger.debug("Successfully found domain object for %s", domain_name)
+            return domain
+        except keystone_exceptions.Forbidden as e:
+            if "identity:list_domains" in str(e):
+                logger.warning(
+                    "User is not authorized to list domains. Using domain name as string: %s. Error: %s",
+                    domain_name,
+                    str(e),
+                )
+                return domain_name
+            logger.error("Permission denied while getting domain: %s", str(e))
+            raise OpenStackBackendError(e)
+        except keystone_exceptions.ClientException as e:
+            logger.error("Failed to get domain: %s", str(e))
+            raise OpenStackBackendError(e)
 
     def remove_ssh_key_from_tenant(
         self, tenant: models.Tenant, key_name, fingerprint_md5
@@ -946,8 +1001,10 @@ class OpenStackBackend(ServiceBackend):
         for backend_port in backend_ports:
             backend_id = backend_port["id"]
 
+            subnet_id = None
             try:
                 subnet_backend_id = backend_port["fixed_ips"][0]["subnet_id"]
+                subnet_id = subnet_mapping.get(subnet_backend_id)
             except (AttributeError, KeyError, IndexError):
                 pass
 
@@ -960,7 +1017,7 @@ class OpenStackBackend(ServiceBackend):
                 "service_settings": tenant.service_settings,
                 "project": tenant.project,
                 "instance_id": instance_id,
-                "subnet_id": subnet_mapping.get(subnet_backend_id),
+                "subnet_id": subnet_id,
                 "state": models.Port.States.OK,
                 "mac_address": backend_port["mac_address"],
                 "fixed_ips": backend_port["fixed_ips"],
@@ -1211,7 +1268,7 @@ class OpenStackBackend(ServiceBackend):
         subnet = models.SubNet(
             name=backend_subnet["name"],
             description=backend_subnet["description"],
-            allocation_pools=backend_subnet["allocation_pools"],
+            allocation_pools=backend_subnet.get("allocation_pools"),
             cidr=backend_subnet["cidr"],
             ip_version=backend_subnet["ip_version"],
             enable_dhcp=backend_subnet["enable_dhcp"],
@@ -2235,9 +2292,11 @@ class OpenStackBackend(ServiceBackend):
 
     @log_backend_action()
     def update_network(self, network: models.Network):
-        self._update_network(network, {"name": network.name})
+        self._update_network(
+            network, {"name": network.name, "description": network.description}
+        )
         event_logger.openstack_network.info(
-            "Network name %s has been updated." % network.name,
+            f"Network name {network.name} and description {network.description} have been updated.",
             event_type="openstack_network_updated",
             event_context={"network": network},
         )
@@ -2320,10 +2379,11 @@ class OpenStackBackend(ServiceBackend):
             "network_id": subnet.network.backend_id,
             "tenant_id": subnet.network.tenant.backend_id,
             "cidr": subnet.cidr,
-            "allocation_pools": subnet.allocation_pools,
             "ip_version": subnet.ip_version,
             "enable_dhcp": subnet.enable_dhcp,
         }
+        if subnet.allocation_pools:
+            data["allocation_pools"] = subnet.allocation_pools
         if subnet.dns_nameservers:
             data["dns_nameservers"] = subnet.dns_nameservers
         if subnet.host_routes:
@@ -2372,6 +2432,12 @@ class OpenStackBackend(ServiceBackend):
 
         if backend_subnet["gateway_ip"] != subnet.gateway_ip:
             data["gateway_ip"] = subnet.gateway_ip
+
+        if backend_subnet["cidr"] != subnet.cidr:
+            data["cidr"] = subnet.cidr
+
+        if backend_subnet["allocation_pools"] != subnet.allocation_pools:
+            data["allocation_pools"] = subnet.allocation_pools
 
         neutron.update_subnet(subnet.backend_id, {"subnet": data})
         event_logger.openstack_subnet.info(
@@ -3249,6 +3315,7 @@ class OpenStackBackend(ServiceBackend):
         session = get_tenant_session(volume.tenant)
         cinder = get_cinder_client(session)
         try:
+            logger.info("Creating volume with parameters: %s", kwargs)
             backend_volume = cinder.volumes.create(**kwargs)
         except cinder_exceptions.ClientException as e:
             raise OpenStackBackendError(e)
@@ -3761,6 +3828,9 @@ class OpenStackBackend(ServiceBackend):
             if server_group is not None:
                 server_create_parameters["scheduler_hints"] = {"group": server_group}
 
+            logger.info(
+                "Creating instance with parameters: %s", server_create_parameters
+            )
             server = nova.servers.create(**server_create_parameters)
             instance.backend_id = server.id
             instance.save()

@@ -14,6 +14,7 @@ class MarketplaceConfig(AppConfig):
         from waldur_core.structure import models as structure_models
         from waldur_core.structure import signals as structure_signals
         from waldur_core.structure.serializers import BaseResourceSerializer
+        from waldur_freeipa import models as freeipa_models
 
         from . import PLUGIN_NAME, handlers, models, processors, utils
         from . import registrators as marketplace_registrators
@@ -48,6 +49,12 @@ class MarketplaceConfig(AppConfig):
             handlers.sync_resource_limit_when_order,
             sender=models.Order,
             dispatch_uid="waldur_mastermind.marketplace.sync_resource_limit_when_order",
+        )
+
+        signals.post_save.connect(
+            handlers.set_order_completion_timestamp,
+            sender=models.Order,
+            dispatch_uid="waldur_mastermind.marketplace.set_order_completion_timestamp",
         )
 
         signals.post_save.connect(
@@ -197,16 +204,6 @@ class MarketplaceConfig(AppConfig):
 
         marketplace_registrators.MarketplaceRegistrator.connect()
 
-        permission_signals.role_granted.connect(
-            handlers.add_service_manager_role_to_customer,
-            dispatch_uid="waldur_mastermind.marketplace.add_service_manager_role_to_customer",
-        )
-
-        permission_signals.role_revoked.connect(
-            handlers.drop_service_manager_role_from_customer,
-            dispatch_uid="waldur_mastermind.marketplace.drop_service_manager_role_from_customer",
-        )
-
         structure_signals.project_moved.connect(
             handlers.update_customer_of_offering_if_project_has_been_moved,
             sender=structure_models.Project,
@@ -277,6 +274,12 @@ class MarketplaceConfig(AppConfig):
             handlers.update_offering_user_username_after_offering_settings_change,
             sender=models.Offering,
             dispatch_uid="waldur_mastermind.marketplace.update_offering_user_username_after_offering_settings_change",
+        )
+
+        signals.post_save.connect(
+            handlers.update_offering_user_username_after_freeipa_profile_update,
+            sender=freeipa_models.Profile,
+            dispatch_uid="waldur_mastermind.marketplace.update_offering_user_username_after_freeipa_profile_update",
         )
 
         signals.post_save.connect(

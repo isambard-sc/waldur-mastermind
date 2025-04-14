@@ -8,12 +8,15 @@ from django.db import transaction
 from django.db.models import F, Q, QuerySet, Sum
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import exceptions, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
+from waldur_core.core.serializers import EmptySerializer
+from waldur_core.core.utils import is_uuid_like
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
@@ -43,6 +46,52 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
                 _("Notification only for the created invoice can be sent.")
             )
 
+    @extend_schema(
+        summary="Get invoice items",
+        description="Retrieve a list of invoice items for the specified invoice.",
+        responses=serializers.InvoiceItemSerializer,
+        parameters=[
+            OpenApiParameter("query", str, OpenApiParameter.QUERY),
+            OpenApiParameter("provider_uuid", str, OpenApiParameter.QUERY),
+            OpenApiParameter("project_uuid", str, OpenApiParameter.QUERY),
+            OpenApiParameter("offering_uuid", str, OpenApiParameter.QUERY),
+            OpenApiParameter(
+                "conceal_compensation_items",
+                bool,
+                OpenApiParameter.QUERY,
+                description="Conceal compensation items",
+            ),
+        ],
+    )
+    @action(detail=True)
+    def items(self, request, uuid=None):
+        invoice = self.get_object()
+        queryset = invoice.items.all()
+        query = request.query_params.get("query", "").strip()
+        provider_uuid = request.query_params.get("provider_uuid", None)
+        project_uuid = request.query_params.get("project_uuid", None)
+        offering_uuid = request.query_params.get("offering_uuid", None)
+        conceal_compensation_items = (
+            request.query_params.get("conceal_compensation_items") == "true"
+        )
+
+        items = utils.filter_invoice_items(
+            queryset,
+            query,
+            provider_uuid,
+            project_uuid,
+            offering_uuid,
+            conceal_compensation_items,
+        )
+        serializer = serializers.InvoiceItemSerializer(
+            items, many=True, context={"request": request}
+        )
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="Send invoice notification",
+        description="Schedule sending of a notification for the specified invoice.",
+    )
     @action(detail=True, methods=["post"])
     def send_notification(self, request, uuid=None):
         invoice = self.get_object()
@@ -59,7 +108,12 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
 
     send_notification_permissions = [structure_permissions.is_staff]
     send_notification_validators = [_is_invoice_created]
+    send_notification_serializer_class = EmptySerializer
 
+    @extend_schema(
+        description="Mark invoice as paid and optionally create payment record with proof of payment.",
+        request=serializers.PaidSerializer,
+    )
     @transaction.atomic
     @action(detail=True, methods=["post"])
     def paid(self, request, uuid=None):
@@ -109,6 +163,11 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
     paid_permissions = [structure_permissions.is_staff]
     paid_validators = [core_validators.StateValidator(models.Invoice.States.CREATED)]
 
+    @extend_schema(
+        description="Spendings grouped by offerings and filtered by provider.",
+        responses=serializers.InvoiceStatsSerializer,
+        parameters=[OpenApiParameter("provider_uuid", str, OpenApiParameter.QUERY)],
+    )
     @action(detail=True)
     def stats(self, request, uuid=None):
         invoice = self.get_object()
@@ -164,6 +223,15 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
         page = self.paginate_queryset(queryset)
         return self.get_paginated_response(page)
 
+    @extend_schema(
+        description="Analyze invoice trends over time by comparing monthly totals for major customers versus others over the past year.",
+        responses=serializers.InvoiceGrowthSerializer,
+        parameters=[
+            OpenApiParameter("accounting_is_running", bool, OpenApiParameter.QUERY),
+            OpenApiParameter("customers_count", int, OpenApiParameter.QUERY),
+            OpenApiParameter("accounting_mode", str, OpenApiParameter.QUERY),
+        ],
+    )
     @action(detail=False)
     def growth(self, request):
         queryset = structure_models.Customer.objects.all()
@@ -241,6 +309,11 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
 
         return Response(result, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        description="Set backend ID for invoice.",
+        request=serializers.BackendIdSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def set_backend_id(self, request, uuid=None):
         serializer = self.get_serializer(instance=self.get_object(), data=request.data)
@@ -251,6 +324,11 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
     set_backend_id_permissions = [structure_permissions.is_staff]
     set_backend_id_serializer_class = serializers.BackendIdSerializer
 
+    @extend_schema(
+        description="Set payment URL for invoice.",
+        request=serializers.PaymentURLSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def set_payment_url(self, request, uuid=None):
         serializer = self.get_serializer(instance=self.get_object(), data=request.data)
@@ -261,6 +339,11 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
     set_payment_url_permissions = [structure_permissions.is_staff]
     set_payment_url_serializer_class = serializers.PaymentURLSerializer
 
+    @extend_schema(
+        description="Set reference number for invoice.",
+        request=serializers.ReferenceNumberSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def set_reference_number(self, request, uuid=None):
         serializer = self.get_serializer(instance=self.get_object(), data=request.data)
@@ -280,6 +363,27 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.InvoiceItemFilter
 
+    @extend_schema(
+        description="Calculate total price for filtered invoice items.",
+        responses=serializers.InvoiceItemTotalPriceSerializer,
+        filters=True,
+    )
+    @action(detail=False, methods=["get"], filterset_class=filters.InvoiceItemFilter)
+    def total_price(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        total_price = queryset.aggregate(
+            total_price=Sum(F("unit_price") * F("quantity"))
+        )["total_price"]
+        total_price = total_price or 0
+        serializer = serializers.InvoiceItemTotalPriceSerializer(
+            {"total_price": total_price}
+        )
+        return Response(serializer.data)
+
+    @extend_schema(
+        request=serializers.InvoiceItemCompensationSerializer,
+        description="Create compensation invoice item for selected invoice item.",
+    )
     @transaction.atomic
     @action(detail=True, methods=["post"])
     def create_compensation(self, request, **kwargs):
@@ -319,6 +423,10 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @extend_schema(
+        description="Move invoice item from one invoice to another one.",
+        request=serializers.InvoiceItemMigrateToSerializer,
+    )
     @action(detail=True, methods=["post"])
     def migrate_to(self, request, **kwargs):
         invoice_item: models.InvoiceItem = self.get_object()
@@ -360,20 +468,50 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
         for invoice in paginated_invoices:
             data = {
                 "price": "{:.2f}".format(invoice["price"]),
+                "compensation": "{:.2f}".format(invoice["compensation"]),
+                "incurred": "{:.2f}".format(invoice["incurred"]),
                 "year": invoice["invoice__year"],
                 "month": invoice["invoice__month"],
             }
             result_list.append(data)
         return result_list
 
-    @action(detail=False, methods=["get"], filterset_class=filters.InvoiceItemFilter)
+    @extend_schema(
+        description="Get costs breakdown for a project by year and month.",
+        parameters=[
+            OpenApiParameter(
+                "project_uuid",
+                type=uuid.UUID,
+                location=OpenApiParameter.QUERY,
+                description="UUID of the project for which statistics should be calculated.",
+            )
+        ],
+        responses=serializers.InvoiceCostSerializer(many=True),
+    )
+    @action(detail=False, methods=["get"], filter_backends=[])
     def costs(self, request, *args, **kwargs):
         project_uuid = request.GET.get("project_uuid", "")
+        if not is_uuid_like(project_uuid):
+            raise exceptions.ValidationError("project_uuid is not a valid UUID.")
         invoices = (
             InvoiceItem.objects.filter(project_uuid=project_uuid)
             .values("invoice__year", "invoice__month")
-            .annotate(price=Sum(F("unit_price") * F("quantity")))
-            .values("invoice__year", "invoice__month", "price")
+            .annotate(
+                price=Sum(F("unit_price") * F("quantity")),
+                compensation=Sum(
+                    F("unit_price") * F("quantity"),
+                    filter=Q(unit_price__lt=0),
+                    default=0,
+                ),
+                incurred=Sum(
+                    F("unit_price") * F("quantity"),
+                    filter=Q(unit_price__gt=0),
+                    default=0,
+                ),
+            )
+            .values(
+                "invoice__year", "invoice__month", "price", "compensation", "incurred"
+            )
             .order_by("-invoice__year", "-invoice__month")
         )
         page = self.paginate_queryset(invoices)
@@ -433,7 +571,25 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
 
         return self._get_costs_for_periods_data(invoices, period, month_start)
 
-    @action(detail=False, methods=["get"], filterset_class=filters.InvoiceItemFilter)
+    @extend_schema(
+        description="Get resource cost breakdown for a project over a specified period.",
+        parameters=[
+            OpenApiParameter(
+                name="period",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                description="Period for which statistics should be calculated (1, 3 or 12 months).",
+            ),
+            OpenApiParameter(
+                name="project_uuid",
+                type=uuid.UUID,
+                location=OpenApiParameter.QUERY,
+                description="UUID of the project for which statistics should be calculated.",
+            ),
+        ],
+        responses=serializers.CostsForPeriodSerializer,
+    )
+    @action(detail=False, methods=["get"], filter_backends=[])
     def project_costs_for_period(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.GET, context={"request": request})
         serializer.is_valid(raise_exception=True)
@@ -454,7 +610,24 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
         data = self._get_costs_for_entity(invoices, period, month_start)
         return Response(data)
 
-    @action(detail=False, methods=["get"], filterset_class=filters.InvoiceItemFilter)
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="period",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                description="Period for which statistics should be calculated.",
+            ),
+            OpenApiParameter(
+                name="customer_uuid",
+                type=uuid.UUID,
+                location=OpenApiParameter.QUERY,
+                description="UUID of the project for which statistics should be calculated.",
+            ),
+        ],
+        responses=serializers.CostsForPeriodSerializer,
+    )
+    @action(detail=False, methods=["get"], filter_backends=[])
     def customer_costs_for_period(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.GET, context={"request": request})
         serializer.is_valid(raise_exception=True)
@@ -508,6 +681,7 @@ class PaymentProfileViewSet(core_views.ActionsViewSet):
     ) = enable_permissions = [structure_permissions.is_staff]
     queryset = models.PaymentProfile.objects.all().order_by("name")
     serializer_class = serializers.PaymentProfileSerializer
+    enable_serializer_class = EmptySerializer
 
     @action(detail=True, methods=["post"])
     def enable(self, request, uuid=None):
@@ -536,6 +710,9 @@ class PaymentViewSet(core_views.ActionsViewSet):
     queryset = models.Payment.objects.all().order_by("created")
     serializer_class = serializers.PaymentSerializer
 
+    @extend_schema(
+        description="Link a payment to an invoice. Payment can be linked to an invoice only if they belong to the same customer."
+    )
     @action(detail=True, methods=["post"])
     def link_to_invoice(self, request, uuid=None):
         payment: models.Payment = self.get_object()
@@ -573,11 +750,15 @@ class PaymentViewSet(core_views.ActionsViewSet):
 
     link_to_invoice_validators = [_link_to_invoice_exists]
     link_to_invoice_serializer_class = serializers.LinkToInvoiceSerializer
+    unlink_from_invoice_serializer_class = EmptySerializer
 
     def _link_to_invoice_does_not_exist(payment):
         if not payment.invoice:
             raise exceptions.ValidationError(_("Link to an invoice does not exist."))
 
+    @extend_schema(
+        description="Unlink a payment from an invoice. Remove connection between payment and existing linked invoice."
+    )
     @action(detail=True, methods=["post"])
     def unlink_from_invoice(self, request, uuid=None):
         payment: models.Payment = self.get_object()
@@ -632,6 +813,7 @@ class PaymentViewSet(core_views.ActionsViewSet):
         )
 
 
+@extend_schema(request=serializers.FinancialReportEmailSerializer, responses=None)
 @api_view(["POST"])
 @permission_classes((IsStaffOrSupportUser,))
 def send_financial_report_by_mail(request):

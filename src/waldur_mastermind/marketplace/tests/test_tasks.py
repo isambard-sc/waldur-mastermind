@@ -1,7 +1,7 @@
 import datetime
 from unittest.mock import patch
 
-from constance.test.pytest import override_config
+from constance.test.unittest import override_config
 from django.core import mail
 from django.utils import timezone
 from freezegun import freeze_time
@@ -81,6 +81,49 @@ class NotificationTest(test.APITransactionTestCase):
         self.assertEqual(mail.outbox[0].to[0], admin.email)
         self.assertTrue(resource.name in mail.outbox[0].body)
         self.assertTrue(resource.name in mail.outbox[0].subject)
+
+    @patch("waldur_mastermind.marketplace.tasks.core_utils.broadcast_mail")
+    def test_notify_user_that_order_been_rejected(self, mock_broadcast_mail):
+        """
+        Test that when an order is rejected, a notification is sent to the user who created the order.
+
+        This test verifies:
+        1. The notification task is called with the correct template
+        2. The email is sent to the user who created the order
+        3. The context contains the necessary information about the rejected order
+        """
+        fixture = fixtures.MarketplaceFixture()
+        order = fixture.order
+
+        # Call the task that sends the notification
+        tasks.notify_user_that_order_been_rejected(order.uuid.hex)
+
+        # Verify that broadcast_mail was called
+        mock_broadcast_mail.assert_called_once(), "Notification email was not sent"
+
+        # Verify the correct template was used
+        self.assertEqual(
+            mock_broadcast_mail.call_args[0][1],
+            "notification_to_user_that_order_been_rejected",
+            "Wrong email template was used for notification",
+        )
+
+        # Verify the email was sent to the user who created the order
+        recipients = mock_broadcast_mail.call_args[0][3]
+        self.assertEqual(len(recipients), 1, "There should be exactly one recipient")
+        self.assertEqual(
+            recipients[0],
+            order.created_by.email,
+            "Notification was not sent to the user who created the order",
+        )
+
+        # Verify the context contains the necessary information
+        context = mock_broadcast_mail.call_args[0][2]
+        self.assertIn("order", context, "Context is missing the order object")
+        self.assertEqual(context["order"], order, "Context contains wrong order object")
+        self.assertIn("order_url", context, "Context is missing the order URL")
+        self.assertIn("site_name", context, "Context is missing the site name")
+        self.assertIn("order_type", context, "Context is missing the order type")
 
 
 class ResourceEndDateTest(test.APITransactionTestCase):
@@ -182,19 +225,34 @@ class ProjectEndDate(test.APITransactionTestCase):
             self.assertTrue(order.state, models.Order.States.EXECUTING)
 
     def test_notification_about_project_ending(self):
+        project_2 = structure_factories.ProjectFactory(
+            customer=self.fixture.customer,
+            end_date=datetime.datetime(day=1, month=1, year=2020),
+        )
+        project_2.add_user(self.fixture.manager, ProjectRole.MANAGER)
+
         with freeze_time("2019-12-25"):
             event_type = "notification_about_project_ending"
             structure_factories.NotificationFactory(key=f"marketplace.{event_type}")
             tasks.notification_about_project_ending()
 
-            self.assertEqual(len(mail.outbox), 2)
-            subject = "Project %s will be deleted." % self.fixture.project.name
+            self.assertEqual(
+                len(mail.outbox), 2
+            )  # we only have 2 emails, not 4, because batch sending is used
+
+            subject = "Your 2 projects will be deleted on 01/01/2020."
             self.assertEqual(mail.outbox[0].subject, subject)
+            self.assertEqual(mail.outbox[1].subject, subject)
+
             self.assertEqual(
                 {mail.outbox[0].to[0], mail.outbox[1].to[0]},
                 {self.fixture.manager.email, self.fixture.owner.email},
             )
+
             self.assertTrue(self.fixture.project.uuid.hex in mail.outbox[0].body)
+            self.assertTrue(project_2.uuid.hex in mail.outbox[0].body)
+            self.assertTrue(self.fixture.project.uuid.hex in mail.outbox[1].body)
+            self.assertTrue(project_2.uuid.hex in mail.outbox[1].body)
 
     def test_member_of_other_project_is_excluded(self):
         other_project = structure_factories.ProjectFactory(
@@ -408,7 +466,7 @@ class MarkResourcesAsErredAfterTimeoutTest(test.APITransactionTestCase):
         self.assertEqual(self.order.state, models.Order.States.ERRED)
         self.assertEqual(self.order.error_message, "Execution has timed out.")
         self.assertEqual(self.resource.state, models.Resource.States.ERRED)
-        self.assertEqual(self.resource.backend_metadata["state"], "Erred")
+        self.assertEqual(self.resource.backend_metadata["state"], "ERRED")
         self.assertEqual(
             self.fixture.instance.state, self.fixture.instance.States.ERRED
         )
@@ -432,4 +490,60 @@ class MarkResourcesAsErredAfterTimeoutTest(test.APITransactionTestCase):
         self.assertNotEqual(self.resource.state, models.Resource.States.ERRED)
         self.assertNotEqual(
             self.fixture.instance.state, self.fixture.instance.States.ERRED
+        )
+
+
+class RemoveDeletedRobotAccountsTest(test.APITransactionTestCase):
+    """
+    Test daily task that removes deleted robot accounts from the database.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.robot_account = models.RobotAccount.objects.create(
+            username="test-robot",
+            state=models.RobotAccount.States.OK,
+            resource=self.resource,
+        )
+
+    def test_remove_deleted_robot_accounts(self):
+        """
+        Test that robot accounts with state DELETED are removed from the database.
+        """
+        # Set robot account to DELETED state
+        self.robot_account.state = models.RobotAccount.States.DELETED
+        self.robot_account.save()
+
+        # Call task to remove deleted robot accounts
+        tasks.remove_deleted_robot_accounts()
+
+        # Assert that robot account is removed from the database
+        with self.assertRaises(models.RobotAccount.DoesNotExist):
+            self.robot_account.refresh_from_db()
+
+        self.assertIsNone(
+            models.RobotAccount.objects.filter(
+                uuid=self.robot_account.uuid.hex
+            ).first(),
+            f"Robot account {self.robot_account.uuid.hex} should not exist",
+        )
+
+    def test_do_not_remove_active_robot_accounts(self):
+        """
+        Test that robot accounts with other states, for example REQUESTED, are not removed from the database.
+        """
+        # Set robot account to OK state
+        self.robot_account.state = models.RobotAccount.States.REQUESTED
+        self.robot_account.save()
+
+        # Call task to remove deleted robot accounts
+        tasks.remove_deleted_robot_accounts()
+
+        # Assert that robot account is not removed from the database
+        self.robot_account.refresh_from_db()
+        self.assertEqual(
+            self.robot_account.state,
+            models.RobotAccount.States.REQUESTED,
+            f"Robot account {self.robot_account.uuid.hex} should not be removed from the database",
         )

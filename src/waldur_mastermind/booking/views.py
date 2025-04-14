@@ -2,6 +2,7 @@ from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import extend_schema
 from rest_framework import status, views
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -9,6 +10,7 @@ from rest_framework.response import Response
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
+from waldur_core.core.serializers import EmptySerializer
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.utils import permission_factory
 from waldur_mastermind.booking.utils import get_offering_bookings_and_busy_slots
@@ -33,6 +35,7 @@ class ResourceViewSet(core_views.ReadOnlyActionsViewSet):
     filterset_class = filters.BookingResourceFilter
     lookup_field = "uuid"
     serializer_class = serializers.BookingResourceSerializer
+    accept_serializer_class = reject_serializer_class = EmptySerializer
 
     @action(detail=True, methods=["post"])
     def reject(self, request, uuid=None):
@@ -75,6 +78,7 @@ class OfferingViewSet(core_views.ReadOnlyActionsViewSet):
     lookup_field = "uuid"
     serializer_class = serializers.OfferingSerializer
 
+    @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def google_calendar_sync(self, request, uuid=None):
         offering = self.get_object()
@@ -86,6 +90,7 @@ class OfferingViewSet(core_views.ReadOnlyActionsViewSet):
         )
         return Response("OK", status=status.HTTP_202_ACCEPTED)
 
+    @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def share_google_calendar(self, request, uuid=None):
         offering = self.get_object()
@@ -97,6 +102,7 @@ class OfferingViewSet(core_views.ReadOnlyActionsViewSet):
         )
         return Response("OK", status=status.HTTP_202_ACCEPTED)
 
+    @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def unshare_google_calendar(self, request, uuid=None):
         offering = self.get_object()
@@ -179,6 +185,7 @@ class OfferingViewSet(core_views.ReadOnlyActionsViewSet):
 
 
 class OfferingBookingsViewSet(views.APIView):
+    @extend_schema(request=None, responses=serializers.BookingSerializer(many=True))
     def get(self, request, uuid):
         offerings = (
             models.Offering.objects.all().filter_by_ordering_availability_for_user(

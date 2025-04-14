@@ -1,14 +1,20 @@
 import base64
+import hashlib
 import logging
+import secrets
+from urllib.parse import urlencode
 
 import requests
 from constance import config
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.shortcuts import redirect
 from django.utils import timezone
-from rest_framework import status, views, viewsets
+from drf_spectacular.utils import OpenApiParameter, extend_schema
+from rest_framework import generics, status, viewsets
 from rest_framework.exceptions import AuthenticationFailed, NotFound, ValidationError
 from rest_framework.response import Response
+from rest_framework.reverse import reverse
 
 from waldur_auth_social.exceptions import OAuthException
 from waldur_auth_social.models import OAuthToken, ProviderChoices
@@ -17,8 +23,9 @@ from waldur_auth_social.utils import (
     pull_remote_eduteams_user,
 )
 from waldur_core.core import permissions as core_permissions
-from waldur_core.core.authentication import set_authentication_method
-from waldur_core.core.views import RefreshTokenMixin
+from waldur_core.core.authentication import refresh_token, set_authentication_method
+from waldur_core.core.serializers import EmptySerializer
+from waldur_core.core.utils import format_homeport_link
 
 from . import models
 from .log import event_logger
@@ -26,19 +33,33 @@ from .serializers import (
     AuthSerializer,
     IdentityProviderSerializer,
     RemoteEduteamsRequestSerializer,
+    RemoteEduteamsUUIDSerializer,
 )
 
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
+OIDC_STATE_KEY = "oidc_state"
 
-class OAuthView(RefreshTokenMixin, views.APIView):
+OIDC_CODE_VERIFIER_KEY = "oidc_code_verifier"
+
+
+def generate_code_challenge(code_verifier):
+    """
+    Generate a code challenge from the code verifier using S256 method.
+    """
+    code_challenge = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(code_challenge).decode("utf-8").replace("=", "")
+
+
+class BaseOAuthView(generics.GenericAPIView):
     permission_classes = []
     authentication_classes = []
     throttle_scope = "oauth"
+    serializer_class = EmptySerializer
 
-    def post(self, request, provider, format=None):
+    def validate_config(self, provider):
         if not self.request.user.is_anonymous:
             raise ValidationError("This view is for anonymous users only.")
 
@@ -54,17 +75,69 @@ class OAuthView(RefreshTokenMixin, views.APIView):
         if not self.config.is_active:
             raise AuthenticationFailed("Identity provider is disabled.")
 
+
+class OAuthViewInit(BaseOAuthView):
+    def get(self, request, provider, format=None):
+        """
+        Redirect user to OIDC authorization endpoint
+        """
+        self.validate_config(provider)
+        redirect_uri = reverse(f"auth_{provider}_complete", request=request)
+        scope = "openid"
+        if provider == ProviderChoices.EDUTEAMS:
+            scope = "openid profile email eduperson_assurance ssh_public_key"
+
+        oidc_state = secrets.token_urlsafe(32)
+        request.session[OIDC_STATE_KEY] = oidc_state
+
+        params = {
+            "response_type": "code",
+            "client_id": self.config.client_id,
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "state": oidc_state,
+        }
+
+        if self.config.enable_pkce:
+            code_verifier = secrets.token_urlsafe(32)
+            code_challenge = generate_code_challenge(code_verifier)
+
+            request.session[OIDC_CODE_VERIFIER_KEY] = code_verifier
+
+            params["code_challenge"] = code_challenge
+            params["code_challenge_method"] = "S256"
+
+        authorization_url = f"{self.config.auth_url}?{urlencode(params)}"
+        return redirect(authorization_url)
+
+
+class OAuthViewComplete(BaseOAuthView):
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(name="state", type=str, location=OpenApiParameter.QUERY),
+            OpenApiParameter(name="code", type=str, location=OpenApiParameter.QUERY),
+        ]
+    )
+    def get(self, request, provider, format=None):
+        self.validate_config(provider)
+
+        stored_state = self.request.session.get(OIDC_STATE_KEY)
+        returned_state = request.query_params.get("state")
+        if not stored_state or stored_state != returned_state:
+            # Potential CSRF attack - reject the request
+            raise OAuthException(self.config.provider, "Invalid auth state.")
+        redirect_uri = reverse(f"auth_{provider}_complete", request=request)
         serializer = AuthSerializer(
             data={
-                "client_id": request.data.get("clientId"),
-                "redirect_uri": request.data.get("redirectUri"),
-                "code": request.data.get("code"),
+                "client_id": self.config.client_id,
+                "redirect_uri": redirect_uri,
+                "code": request.query_params.get("code"),
             }
         )
         serializer.is_valid(raise_exception=True)
 
         user, created = self.authenticate_user(serializer.validated_data)
-        token = self.refresh_token(user)
+        token = refresh_token(user)
         user.last_login = timezone.now()
         user.save(update_fields=["last_login"])
         set_authentication_method(request, provider)
@@ -78,9 +151,8 @@ class OAuthView(RefreshTokenMixin, views.APIView):
                 "request": request,
             },
         )
-        return Response(
-            {"token": token.key},
-            status=created and status.HTTP_201_CREATED or status.HTTP_200_OK,
+        return redirect(
+            format_homeport_link(f"oauth_login_completed/{provider}/?token={token.key}")
         )
 
     def get(self, request, provider):
@@ -192,6 +264,11 @@ class OAuthView(RefreshTokenMixin, views.APIView):
             "redirect_uri": validated_data["redirect_uri"],
             "code": validated_data["code"],
         }
+        if self.config.enable_pkce:
+            code_verifier = self.request.session.get(OIDC_CODE_VERIFIER_KEY)
+            if not code_verifier:
+                raise OAuthException(self.config.provider, "PKCE verification failed.")
+            data["code_verifier"] = code_verifier
         headers = None
         if self.config.provider == ProviderChoices.TARA:
             raw_token = f"{self.config.client_id}:{self.config.client_secret}"
@@ -238,7 +315,15 @@ class IdentityProvidersViewSet(viewsets.ModelViewSet):
         return qs
 
 
-class RemoteEduteamsView(views.APIView):
+class RemoteEduteamsView(generics.GenericAPIView):
+    filter_backends = []
+    pagination_class = None
+
+    @extend_schema(
+        description="Allows to pull user details from remote eduTEAMS instance.",
+        request=RemoteEduteamsRequestSerializer,
+        responses={200: RemoteEduteamsUUIDSerializer},
+    )
     def post(self, request, *args, **kwargs):
         if not request.user.is_staff and not request.user.is_identity_manager:
             return Response(

@@ -118,49 +118,50 @@ def resource_update_succeeded(resource: models.Resource, validate=False):
             }
         )
 
-    if order and order.plan:
-        if resource.plan != order.plan:
+        plan_changed = bool(order.plan and resource.plan != order.plan)
+        limits_changed = bool(order.limits and resource.limits != order.limits)
+        if plan_changed:
             email_context.update(
                 {
                     "resource_old_plan": resource.plan.name,
                     "resource_plan": order.plan.name,
                 }
             )
-
-        resource.plan = order.plan
-        resource.init_cost()
-        resource.save()
-
-        transaction.on_commit(
-            lambda: tasks.notify_about_resource_change.delay(
-                "marketplace_resource_update_succeeded", email_context, resource.uuid
+            resource.plan = order.plan
+            transaction.on_commit(
+                lambda: tasks.notify_about_resource_change.delay(
+                    "marketplace_resource_update_succeeded",
+                    email_context,
+                    resource.uuid,
+                )
             )
-        )
-    if order and order.limits:
-        components_map = order.offering.get_limit_components()
-        email_context.update(
-            {
-                "resource_old_limits": utils.format_limits_list(
-                    components_map, resource.limits
-                ),
-                "resource_limits": utils.format_limits_list(
-                    components_map, order.limits
-                ),
-            }
-        )
-        resource.limits = order.limits
-        resource.init_cost()
-        resource.save()
-        log.log_resource_limit_update_succeeded(resource)
-        transaction.on_commit(
-            lambda: tasks.notify_about_resource_change.delay(
-                "marketplace_resource_update_limits_succeeded",
-                email_context,
-                resource.uuid,
+        if limits_changed:
+            components_map = order.offering.get_limit_components()
+            email_context.update(
+                {
+                    "resource_old_limits": utils.format_limits_list(
+                        components_map, resource.limits
+                    ),
+                    "resource_limits": utils.format_limits_list(
+                        components_map, order.limits
+                    ),
+                }
             )
-        )
+            resource.limits = order.limits
+            transaction.on_commit(
+                lambda: tasks.notify_about_resource_change.delay(
+                    "marketplace_resource_update_limits_succeeded",
+                    email_context,
+                    resource.uuid,
+                )
+            )
 
-    log.log_resource_update_succeeded(resource)
+        if plan_changed or limits_changed:
+            resource.init_cost()
+            resource.save()
+            if limits_changed:
+                log.log_resource_limit_update_succeeded(resource)
+
     return order
 
 
@@ -171,8 +172,11 @@ def resource_update_failed(resource: models.Resource, validate=False):
         models.Order.States.ERRED,
         validate,
     )
-    resource.set_state_erred()
-    resource.save(update_fields=["state"])
+    if resource.state != resource.States.ERRED:
+        resource.set_state_erred()
+        resource.save(update_fields=["state"])
+    else:
+        logger.info("Resource %s is already in erred state, skip transition", resource)
 
     log.log_resource_update_failed(resource)
     return order
@@ -189,6 +193,8 @@ def resource_update_canceled(resource: models.Resource, validate=False):
     if resource.state != resource.States.OK:
         resource.set_state_ok()
         resource.save(update_fields=["state"])
+    else:
+        logger.info("Resource %s is already in OK state, skip transition", resource)
 
     log.log_resource_update_canceled(resource)
     return order
@@ -201,8 +207,13 @@ def resource_deletion_succeeded(resource: models.Resource, validate=False):
         models.Order.States.DONE,
         validate,
     )
-    resource.set_state_terminated()
-    resource.save(update_fields=["state"])
+    if resource.state != resource.States.TERMINATED:
+        resource.set_state_terminated()
+        resource.save(update_fields=["state"])
+    else:
+        logger.info(
+            "Resource %s is already in terminated state, skip transition", resource
+        )
 
     signals.resource_deletion_succeeded.send(models.Resource, instance=resource)
     log.log_resource_terminate_succeeded(resource)
@@ -216,8 +227,11 @@ def resource_deletion_failed(resource: models.Resource, validate=False):
         models.Order.States.ERRED,
         validate,
     )
-    resource.set_state_ok()
-    resource.save(update_fields=["state"])
+    if resource.state != resource.States.OK:
+        resource.set_state_ok()
+        resource.save(update_fields=["state"])
+    else:
+        logger.info("Resource %s is already in OK state, skip transition", resource)
 
     log.log_resource_terminate_failed(resource)
     return order

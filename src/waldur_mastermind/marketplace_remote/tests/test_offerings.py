@@ -74,8 +74,8 @@ class OfferingDetailsPullTest(test.APITransactionTestCase):
         self.offering.backend_id = "offering-backend-id"
         self.offering.secret_options = {
             "api_url": "https://remote-waldur.com/",
-            "token": "123",
-            "customer_uuid": "456",
+            "token": uuid4().hex,
+            "customer_uuid": uuid4().hex,
         }
         self.task = OfferingPullTask()
         self.remote_plan_uuid = uuid4().hex
@@ -138,6 +138,7 @@ class OfferingDetailsPullTest(test.APITransactionTestCase):
                     "url": "https://existing-endpoint.example.com/",
                 },
             ],
+            "access_url": "http://test-access-url.example.com/",
         }
 
     def tearDown(self) -> None:
@@ -358,6 +359,8 @@ class OfferingRemoteVersionTest(test.APITransactionTestCase):
             "token": "0b67edfecdda37fe4b6e7d6c3e6360acb3a1f2bf",
             "api_url": "http://localhost/api/",
             "customer_uuid": remote_offering.customer.uuid.hex,
+        }
+        self.offering.plugin_options = {
             "service_provider_can_create_offering_user": False,
         }
         self.offering.backend_id = remote_offering.uuid.hex
@@ -391,7 +394,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
         ).start()
         mock.patch("waldur_mastermind.marketplace_remote.utils.import_plans").start()
         client_mock().get_marketplace_public_offering.return_value = {
-            "uuid": "456",
+            "uuid": uuid4().hex,
             "name": "Offering",
             "description": "Description",
             "full_description": "",
@@ -403,6 +406,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
             "country": "",
             "options": "",
             "resource_options": "",
+            "access_url": "",
         }
         self.client_mock = client_mock
 
@@ -411,8 +415,8 @@ class OfferingCreateTest(test.APITransactionTestCase):
         self.customer.add_user(self.user, CustomerRole.OWNER)
         self.payload = {
             "api_url": "https://remote-waldur.com/",
-            "token": "123",
-            "remote_offering_uuid": "456",
+            "token": uuid4().hex,
+            "remote_offering_uuid": uuid4().hex,
             "remote_customer_uuid": self.customer.uuid.hex,
             "local_customer_uuid": self.customer.uuid.hex,
             "local_category_uuid": factories.CategoryFactory().uuid.hex,
@@ -431,5 +435,41 @@ class OfferingCreateTest(test.APITransactionTestCase):
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
 
         response = self.client.post(self.url, self.payload)
-        self.client_mock().get_marketplace_public_offering.assert_called_once()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.client_mock().get_marketplace_public_offering.assert_called_once()
+
+    def test_multiple_remote_offerings_can_be_mapped_to_single_local_category(
+        self,
+    ) -> None:
+        self.client.force_authenticate(self.user)
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
+
+        response = self.client.post(self.url, self.payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            marketplace_models.Offering.objects.filter(
+                uuid=response.data["uuid"]
+            ).exists()
+        )
+        offering = marketplace_models.Offering.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(
+            offering.category.uuid.hex, self.payload["local_category_uuid"]
+        )
+
+        new_payload = {
+            "api_url": "https://other-remote-waldur.com/",
+            "token": uuid4().hex,
+            "remote_offering_uuid": uuid4().hex,
+            "remote_customer_uuid": uuid4().hex,
+            "local_customer_uuid": self.customer.uuid.hex,
+            "local_category_uuid": self.payload["local_category_uuid"],
+        }
+        response = self.client.post(self.url, new_payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            marketplace_models.Offering.objects.filter(
+                uuid=response.data["uuid"]
+            ).exists()
+        )
+        offering = marketplace_models.Offering.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(offering.category.uuid.hex, new_payload["local_category_uuid"])

@@ -10,9 +10,25 @@ import warnings
 from datetime import timedelta
 
 from waldur_core.core import WaldurExtension
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.metadata import WaldurConfiguration
-from waldur_core.server.admin.settings import *  # noqa: F403
+from waldur_core.permissions.enums import TYPE_MAP
+from waldur_core.server.admin.settings import *
 
+from waldur_core.users.enums import InvitationState
+from waldur_mastermind.common.enums import Units
+from waldur_mastermind.marketplace.enums import (
+    OfferingStates,
+    OrderStates,
+    RequestTypes,
+    ResourceStates,
+)
+from waldur_mastermind.proposal.enums import (
+    CallStates,
+    ProposalStates,
+    RequestedOfferingStates,
+)
+from waldur_rancher.enums import RANCHER_TEMPLATE_QUESTION_TYPE
 
 encoding = locale.getpreferredencoding()
 if encoding.lower() != "utf-8":
@@ -59,7 +75,6 @@ INSTALLED_APPS = (
     "waldur_core.media",
     "rest_framework",
     "rest_framework.authtoken",
-    "rest_framework_swagger",
     "django_filters",
     "axes",
     "django_fsm",
@@ -76,10 +91,12 @@ INSTALLED_APPS = (
     "netfields",
     "constance",
     "constance.backends.database",
+    "drf_spectacular",
 )
 INSTALLED_APPS += ADMIN_INSTALLED_APPS  # noqa: F405
 
 MIDDLEWARE = (
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "waldur_core.server.middleware.cors_middleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.locale.LocaleMiddleware",
@@ -100,9 +117,14 @@ REST_FRAMEWORK = {
         "waldur_core.core.authentication.SessionAuthentication",
     ),
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
+    "DEFAULT_PARSER_CLASSES": [
+        "drf_orjson_renderer.parsers.ORJSONParser",
+        "rest_framework.parsers.FormParser",
+        "rest_framework.parsers.MultiPartParser",
+    ],
     "DEFAULT_FILTER_BACKENDS": ("django_filters.rest_framework.DjangoFilterBackend",),
     "DEFAULT_RENDERER_CLASSES": (
-        "rest_framework.renderers.JSONRenderer",
+        "drf_orjson_renderer.renderers.ORJSONRenderer",
         "waldur_core.core.renderers.BrowsableAPIRenderer",
     ),
     "DEFAULT_THROTTLE_CLASSES": [
@@ -112,7 +134,7 @@ REST_FRAMEWORK = {
         "oauth": "10/s",
     },
     "DEFAULT_PAGINATION_CLASS": "waldur_core.core.pagination.LinkHeaderPagination",
-    "DEFAULT_SCHEMA_CLASS": "rest_framework.schemas.coreapi.AutoSchema",
+    "DEFAULT_SCHEMA_CLASS": "waldur_core.core.openapi_inspector.WaldurOpenApiInspector",
     "PAGE_SIZE": 10,
     "EXCEPTION_HANDLER": "waldur_core.core.views.exception_handler",
     # Return native `Date` and `Time` objects in `serializer.data`
@@ -198,18 +220,16 @@ STATIC_URL = "/static/"
 # RabbitMQ requirements:
 # rabbitmq-plugins enable rabbitmq_mqtt
 # rabbitmq-plugins enable rabbitmq_web_mqtt (for websockets)
-RABBITMQ_MQTT = {
+RABBITMQ = {
     "HOST": "localhost",
-    "PORT": 1883,
+    "MQTT_PORT": 1883,
+    "STOMP_PORT": 61613,
     "USER": "test",
     "PASSWORD": "test",
     "MANAGEMENT_PORT": 15672,
 }
 
 # Celery
-CELERY_BROKER_URL = "redis://localhost"
-CELERY_RESULT_BACKEND = "redis://localhost"
-
 CELERY_TASK_QUEUES = {
     "tasks": {"exchange": "tasks"},
     "heavy": {"exchange": "heavy"},
@@ -219,16 +239,6 @@ CELERY_TASK_DEFAULT_QUEUE = "tasks"
 CELERY_TASK_ROUTES = ("waldur_core.server.celery.PriorityRouter",)
 CELERY_TRACK_STARTED = True
 CELERY_SEND_EVENTS = True
-
-CACHES = {
-    "default": {
-        "BACKEND": "django_redis.cache.RedisCache",
-        "LOCATION": "redis://127.0.0.1:6379/1",
-        "OPTIONS": {
-            "CLIENT_CLASS": "django_redis.client.DefaultClient",
-        },
-    }
-}
 
 # Regular tasks
 CELERY_BEAT_SCHEDULE = {
@@ -326,12 +336,21 @@ CONSTANCE_ADDITIONAL_FIELDS = {
     "url_field": ["django.forms.URLField", {"required": False}],
     "secret_field": ["django.forms.CharField", {"required": False}],
     "dict_field": ["waldur_core.core.serializers.DictField", {"required": False}],
+    "list_field": ["waldur_core.core.serializers.ListField", {"required": False}],
+    "country_list_field": [
+        "waldur_core.core.serializers.ListField",
+        {"required": False},
+    ],
 }
 CONSTANCE_CONFIG = {
     "SITE_NAME": ("Waldur", "Human-friendly name of the Waldur deployment."),
     "SITE_DESCRIPTION": (
         "Your single pane of control for managing projects, teams and resources in a self-service manner.",
         "Description of the Waldur deployment.",
+    ),
+    "HOMEPORT_URL": (
+        "https://example.com/",
+        "It is used for rendering callback URL in HomePort",
     ),
     "SITE_ADDRESS": ("", "It is used in marketplace order header."),
     "SITE_EMAIL": ("", "It is used in marketplace order header and UI footer."),
@@ -402,6 +421,10 @@ CONSTANCE_CONFIG = {
         "Key is command to execute script, value is a dictionary of image name and command.",
         "dict_field",
     ),
+    "DOCKER_VOLUME_NAME": (
+        "waldur-docker-compose_waldur_script_launchzone",
+        "A name of the shared volume to store scripts",
+    ),
     "K8S_NAMESPACE": ("default", "Kubernetes namespace where jobs will be executed"),
     "K8S_CONFIG_PATH": ("~/.kube/config", "Path to Kubernetes configuration file"),
     "K8S_JOB_TIMEOUT": (
@@ -410,8 +433,13 @@ CONSTANCE_CONFIG = {
     ),
     "ENABLE_STRICT_CHECK_ACCEPTING_INVITATION": (
         False,
-        "If this is true and user email is pre-validated then accepting invitation to only do that if user’s email and email of the invitation fully match.",
+        "If true, user email in Waldur database and in invitatation must strictly match.",
     ),
+    "INVITATION_DISABLE_MULTIPLE_ROLES": (
+        False,
+        "Do not allow user to grant multiple roles in the same project or organization using invitation.",
+    ),
+    "DEFAULT_IDP": ("", "Triggers authentication flow at once."),
     "DOCS_URL": ("", "Renders link to docs in header", "url_field"),
     "SHORT_PAGE_TITLE": ("Waldur", "It is used as prefix for page title."),
     "FULL_PAGE_TITLE": (
@@ -419,13 +447,8 @@ CONSTANCE_CONFIG = {
         "It is used as default page title if it's not specified explicitly.",
     ),
     "BRAND_COLOR": (
-        "#3a8500",
-        "Hex color definition is used in HomePort landing page for login button.",
-        "color_field",
-    ),
-    "BRAND_LABEL_COLOR": (
-        "#000000",
-        "Hex color definition is used in HomePort landing page for font color of login button.",
+        "#307300",
+        "Brand color is used for button background.",
         "color_field",
     ),
     "HERO_LINK_LABEL": (
@@ -456,7 +479,7 @@ CONSTANCE_CONFIG = {
         ",".join(LANGUAGE_CHOICES),
         "List of enabled languages",
     ),
-    "DISABLE_DARK_THEME": (False, "Toggler for dark theme."),
+    "DISABLE_DARK_THEME": (False, "Toggler to disable dark theme."),
     # images, logos, favicons
     "POWERED_BY_LOGO": (
         "",
@@ -523,7 +546,7 @@ CONSTANCE_CONFIG = {
     ),
     "ATLASSIAN_STRANGE_SETTING": (1, "A constant in the API path, sometimes differs"),
     "ATLASSIAN_API_URL": (
-        "http://example.com/",
+        "https://example.com/",
         "Atlassian API server URL",
         "url_field",
     ),
@@ -532,7 +555,7 @@ CONSTANCE_CONFIG = {
     "ATLASSIAN_EMAIL": ("", "Email for access user", "email_field"),
     "ATLASSIAN_TOKEN": ("", "Token for access user", "secret_field"),
     "ATLASSIAN_VERIFY_SSL": (
-        False,
+        True,
         "Toggler for SSL verification",
     ),
     "ATLASSIAN_PROJECT_ID": ("", "Service desk ID or key"),
@@ -583,7 +606,7 @@ CONSTANCE_CONFIG = {
     # Zammad settings
     "ZAMMAD_API_URL": (
         "",
-        "Zammad API server URL. For example <http://localhost:8080/>",
+        "Zammad API server URL. For example <https://localhost:8080/>",
         "url_field",
     ),
     "ZAMMAD_TOKEN": ("", "Authorization token.", "secret_field"),
@@ -615,7 +638,7 @@ CONSTANCE_CONFIG = {
     # SMAX settings
     "SMAX_API_URL": (
         "",
-        "SMAX API server URL. For example <http://localhost:8080/>",
+        "SMAX API server URL. For example <https://localhost:8080/>",
         "url_field",
     ),
     "SMAX_TENANT_ID": ("", "User tenant ID."),
@@ -642,6 +665,92 @@ CONSTANCE_CONFIG = {
         False,
         "Mark terms of services as approved for new users.",
     ),
+    # FREEIPA settings
+    "FREEIPA_ENABLED": (
+        False,
+        "Enable integration of identity provisioning in configured FreeIPA.",
+    ),
+    "FREEIPA_HOSTNAME": ("ipa.example.com", "Hostname of FreeIPA server."),
+    "FREEIPA_USERNAME": (
+        "admin",
+        "Username of FreeIPA user with administrative privileges.",
+    ),
+    "FREEIPA_PASSWORD": (
+        "secret",
+        "Password of FreeIPA user with administrative privileges",
+        "secret_field",
+    ),
+    "FREEIPA_VERIFY_SSL": (
+        True,
+        "Validate TLS certificate of FreeIPA web interface / REST API",
+    ),
+    "FREEIPA_USERNAME_PREFIX": (
+        "waldur_",
+        "Prefix to be appended to all usernames created in FreeIPA by Waldur",
+    ),
+    "FREEIPA_GROUPNAME_PREFIX": (
+        "waldur_",
+        "Prefix to be appended to all group names created in FreeIPA by Waldur",
+    ),
+    "FREEIPA_BLACKLISTED_USERNAMES": (
+        ["root"],
+        "List of username that users are not allowed to select",
+        "list_field",
+    ),
+    "FREEIPA_GROUP_SYNCHRONIZATION_ENABLED": (
+        True,
+        "Optionally disable creation of user groups in FreeIPA matching Waldur structure",
+    ),
+    "KEYCLOAK_ICON": (
+        "",
+        "A custom PNG icon for Keycloak login button",
+        "image_field",
+    ),
+    "COUNTRIES": (
+        [
+            "AL",
+            "AT",
+            "BA",
+            "BE",
+            "BG",
+            "CH",
+            "CY",
+            "CZ",
+            "DE",
+            "DK",
+            "EE",
+            "ES",
+            "EU",
+            "FI",
+            "FR",
+            "GB",
+            "GE",
+            "GR",
+            "HR",
+            "HU",
+            "IE",
+            "IS",
+            "IT",
+            "LT",
+            "LU",
+            "LV",
+            "MC",
+            "MK",
+            "MT",
+            "NL",
+            "NO",
+            "PL",
+            "PT",
+            "RO",
+            "RS",
+            "SE",
+            "SI",
+            "SK",
+            "UA",
+        ],
+        "It is used in organization creation dialog in order to limit country choices to predefined set.",
+        "country_list_field",
+    ),
 }
 
 CONSTANCE_CONFIG_FIELDSETS = {
@@ -650,6 +759,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "SHORT_PAGE_TITLE",
         "FULL_PAGE_TITLE",
         "SITE_DESCRIPTION",
+        "HOMEPORT_URL",
     ),
     "Marketplace Branding": (
         "SITE_ADDRESS",
@@ -657,6 +767,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "SITE_PHONE",
         "CURRENCY_NAME",
         "MARKETPLACE_LANDING_PAGE",
+        "COUNTRIES",
     ),
     "Marketplace": (
         "THUMBNAIL_SIZE",
@@ -679,6 +790,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "DOCKER_SCRIPT_DIR",
         "DOCKER_REMOVE_CONTAINER",
         "DOCKER_IMAGES",
+        "DOCKER_VOLUME_NAME",
         "K8S_NAMESPACE",
         "K8S_CONFIG_PATH",
         "K8S_JOB_TIMEOUT",
@@ -696,7 +808,6 @@ CONSTANCE_CONFIG_FIELDSETS = {
     "Theme": (
         "SIDEBAR_STYLE",
         "BRAND_COLOR",
-        "BRAND_LABEL_COLOR",
         "DISABLE_DARK_THEME",
     ),
     "Images": (
@@ -709,6 +820,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "LOGIN_LOGO",
         "FAVICON",
         "OFFERING_LOGO_PLACEHOLDER",
+        "KEYCLOAK_ICON",
     ),
     "Service desk integration settings": (
         "WALDUR_SUPPORT_ENABLED",
@@ -778,6 +890,19 @@ CONSTANCE_CONFIG_FIELDSETS = {
     "User settings": (
         "AUTO_APPROVE_USER_TOS",
         "ENABLE_STRICT_CHECK_ACCEPTING_INVITATION",
+        "INVITATION_DISABLE_MULTIPLE_ROLES",
+        "DEFAULT_IDP",
+    ),
+    "FreeIPA settings": (
+        "FREEIPA_ENABLED",
+        "FREEIPA_HOSTNAME",
+        "FREEIPA_USERNAME",
+        "FREEIPA_PASSWORD",
+        "FREEIPA_VERIFY_SSL",
+        "FREEIPA_USERNAME_PREFIX",
+        "FREEIPA_GROUPNAME_PREFIX",
+        "FREEIPA_BLACKLISTED_USERNAMES",
+        "FREEIPA_GROUP_SYNCHRONIZATION_ENABLED",
     ),
 }
 
@@ -795,7 +920,6 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "SHORT_PAGE_TITLE",
     "FULL_PAGE_TITLE",
     "BRAND_COLOR",
-    "BRAND_LABEL_COLOR",
     "HERO_LINK_LABEL",
     "HERO_LINK_URL",
     "SUPPORT_PORTAL_URL",
@@ -822,6 +946,12 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "PROPOSAL_REVIEW_DURATION",
     # Tables
     "USER_TABLE_COLUMNS",
+    # FreeIPA
+    "FREEIPA_ENABLED",
+    "FREEIPA_USERNAME_PREFIX",
+    "DEFAULT_IDP",
+    "HOMEPORT_URL",
+    "KEYCLOAK_ICON",
 )
 
 for ext in WaldurExtension.get_extensions():
@@ -842,22 +972,6 @@ for ext in WaldurExtension.get_extensions():
             globals()[key] = val
 
     ext.update_settings(globals())
-
-# Swagger
-SWAGGER_SETTINGS = {
-    # USE_SESSION_AUTH parameter should be equal to DEBUG parameter.
-    # If it is True, LOGIN_URL and LOGOUT_URL must be specified.
-    "USE_SESSION_AUTH": False,
-    "APIS_SORTER": "alpha",
-    "JSON_EDITOR": True,
-    "SECURITY_DEFINITIONS": {
-        "api_key": {
-            "type": "apiKey",
-            "name": "Authorization",
-            "in": "header",
-        },
-    },
-}
 
 AXES_LOCKOUT_PARAMETERS = ["username"]
 AXES_COOLOFF_TIME = timedelta(minutes=10)
@@ -892,3 +1006,37 @@ LANGUAGES = (
 
 # Disable SAML2 CSP warnings
 SAML_CSP_HANDLER = ""
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Waldur API",
+    "SWAGGER_UI_DIST": "SIDECAR",
+    "SWAGGER_UI_FAVICON_HREF": "SIDECAR",
+    "POSTPROCESSING_HOOKS": [
+        "drf_spectacular.hooks.postprocess_schema_enums",
+        "waldur_core.core.schema_hooks.postprocess_drop_description",
+        "waldur_core.core.schema_hooks.postprocess_fix_enum",
+        "waldur_core.core.schema_hooks.refactor_pagination_parameters",
+        "waldur_core.core.schema_hooks.transform_paginated_arrays",
+        "waldur_core.core.schema_hooks.make_fields_optional",
+        "waldur_core.core.schema_hooks.remove_waldur_cookie_auth",
+        "waldur_core.core.schema_hooks.adjust_request_body_content_types",
+    ],
+    "DEFAULT_GENERATOR_CLASS": "waldur_core.core.openapi_generators.WaldurSchemaGenerator",
+    "ENUM_GENERATE_CHOICE_DESCRIPTION": False,
+    "COMPONENT_SPLIT_REQUEST": True,
+    "SCHEMA_PATH_PREFIX": "/api/",
+    "ENUM_NAME_OVERRIDES": {
+        "RoleType": TYPE_MAP.keys(),
+        "InvitationState": InvitationState.VALUES,
+        "BillingUnit": Units.CHOICES,
+        "CoreStates": CoreStates.VALUES,
+        "OfferingState": OfferingStates.VALUES,
+        "OrderState": OrderStates.VALUES,
+        "ResourceState": ResourceStates.VALUES,
+        "CallStates": CallStates.CHOICES,
+        "ProposalStates": ProposalStates.CHOICES,
+        "RequestedOfferingStates": RequestedOfferingStates.CHOICES,
+        "RequestTypes": RequestTypes.VALUES,
+        "RancherTemplateQuestionType": RANCHER_TEMPLATE_QUESTION_TYPE,
+    },
+}

@@ -391,7 +391,7 @@ class ProjectApiPermissionTest(test.APITransactionTestCase):
 
     def test_user_can_filter_by_projects_where_he_has_manager_role(self):
         self.client.force_authenticate(user=self.users["multirole"])
-        response = self.client.get(reverse("project-list") + "?can_manage")
+        response = self.client.get(reverse("project-list"), {"can_manage": True})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         managed_project_url = self._get_project_url(self.projects["manager"])
@@ -598,7 +598,7 @@ class ProjectMoveTest(test.APITransactionTestCase):
 
     def get_response(self, role, customer):
         self.client.force_authenticate(role)
-        payload = {"customer": {"url": factories.CustomerFactory.get_url(customer)}}
+        payload = {"customer": factories.CustomerFactory.get_url(customer)}
         return self.client.post(self.url, payload)
 
     def test_move_project_rest(self):

@@ -1,10 +1,18 @@
 import logging
+import uuid
 
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q, QuerySet
 from django.utils.translation import gettext_lazy as _
-from django_filters.rest_framework import DjangoFilterBackend
+from django_filters import utils as django_filters_utils
+from django_filters.rest_framework.backends import DjangoFilterBackend
+from drf_spectacular.plumbing import (
+    OpenApiTypes,
+    build_array_type,
+    build_basic_type,
+)
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -14,6 +22,7 @@ from rest_framework.viewsets import ReadOnlyModelViewSet
 from waldur_core.core.permissions import IsAdminOrReadOnly
 from waldur_core.core.utils import get_ip_address, is_uuid_like
 from waldur_core.core.views import ActionsViewSet
+from waldur_core.permissions.filters import UserPermissionFilter
 from waldur_core.permissions.utils import (
     add_user,
     delete_user,
@@ -42,6 +51,10 @@ class RoleViewSet(ActionsViewSet):
     filterset_class = filters.RoleFilter
     destroy_validators = [can_destroy_role]
 
+    @extend_schema(
+        request=serializers.RoleModifySerializer,
+        responses=serializers.RoleDetailsSerializer,
+    )
     def create(self, request):
         serializer = serializers.RoleModifySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -49,6 +62,10 @@ class RoleViewSet(ActionsViewSet):
         serializer = serializers.RoleDetailsSerializer(instance=role)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
+    @extend_schema(
+        request=serializers.RoleModifySerializer,
+        responses=serializers.RoleDetailsSerializer,
+    )
     def update(self, request, **kwargs):
         instance = self.get_object()
         serializer = serializers.RoleModifySerializer(instance, data=request.data)
@@ -57,6 +74,10 @@ class RoleViewSet(ActionsViewSet):
         serializer = serializers.RoleDetailsSerializer(instance=role)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        request=serializers.RoleDescriptionSerializer,
+        responses=serializers.RoleDescriptionSerializer,
+    )
     @action(detail=True, methods=["PUT"])
     def update_descriptions(self, request, uuid=None):
         instance = self.get_object()
@@ -65,6 +86,10 @@ class RoleViewSet(ActionsViewSet):
         serializer.save()
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def enable(self, request, uuid=None):
         role: models.Role = self.get_object()
@@ -78,6 +103,10 @@ class RoleViewSet(ActionsViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def disable(self, request, uuid=None):
         role: models.Role = self.get_object()
@@ -93,10 +122,87 @@ class RoleViewSet(ActionsViewSet):
 
 
 class UserRoleMixin:
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="user",
+                type=uuid.UUID,
+                location=OpenApiParameter.QUERY,
+                description="User UUID",
+            ),
+            OpenApiParameter(
+                name="user_url",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="User URL",
+            ),
+            OpenApiParameter(
+                name="username",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="User username",
+            ),
+            OpenApiParameter(
+                name="full_name",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="User full name",
+            ),
+            OpenApiParameter(
+                name="native_name",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="User native name",
+            ),
+            OpenApiParameter(
+                name="user_slug",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="User slug",
+            ),
+            OpenApiParameter(
+                name="role",
+                type=uuid.UUID,
+                location=OpenApiParameter.QUERY,
+                description="Role UUID or name",
+            ),
+            OpenApiParameter(
+                name="search_string",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Search string for user",
+            ),
+            OpenApiParameter(
+                "field",
+                build_array_type(build_basic_type(OpenApiTypes.STR)),
+                OpenApiParameter.QUERY,
+                enum=serializers.UserRoleDetailsSerializer.Meta.fields,
+                description="Fields to include in response",
+            ),
+            OpenApiParameter(
+                "o",
+                build_array_type(build_basic_type(OpenApiTypes.STR)),
+                OpenApiParameter.QUERY,
+                enum=[
+                    "username",
+                    "full_name",
+                    "native_name",
+                    "email",
+                    "expiration_time",
+                    "created",
+                    "role",
+                ],
+                description="Ordering fields",
+            ),
+        ],
+        responses=serializers.UserRoleDetailsSerializer(many=True),
+        filters=False,
+    )
     @action(detail=True, methods=["GET"])
     def list_users(self, request, uuid=None):
         scope = self.get_object()
         user_uuid = request.query_params.get("user")
+
         user = None
         if user_uuid and is_uuid_like(user_uuid):
             try:
@@ -104,6 +210,15 @@ class UserRoleMixin:
             except User.DoesNotExist:
                 pass
         queryset = get_permissions(scope, user)
+
+        kwargs = DjangoFilterBackend().get_filterset_kwargs(request, queryset, self)
+        filterset = UserPermissionFilter(**kwargs)
+
+        if not filterset.is_valid():
+            raise django_filters_utils.translate_validation(filterset.errors)
+
+        queryset = filterset.qs
+
         role = request.query_params.get("role")
         search_string = request.query_params.get("search_string")
         if search_string:
@@ -124,6 +239,10 @@ class UserRoleMixin:
         )
         return self.get_paginated_response(serializer.data)
 
+    @extend_schema(
+        request=serializers.UserRoleCreateSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["POST"])
     def add_user(self, request, uuid=None):
         scope = self.get_object()
@@ -147,6 +266,10 @@ class UserRoleMixin:
             data={"expiration_time": perm.expiration_time},
         )
 
+    @extend_schema(
+        request=serializers.UserRoleUpdateSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["POST"])
     def update_user(self, request, uuid=None):
         scope = self.get_object()
@@ -169,6 +292,10 @@ class UserRoleMixin:
             status=status.HTTP_200_OK, data={"expiration_time": perm.expiration_time}
         )
 
+    @extend_schema(
+        request=serializers.UserRoleDeleteSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["POST"])
     def delete_user(self, request, uuid=None):
         scope = self.get_object()

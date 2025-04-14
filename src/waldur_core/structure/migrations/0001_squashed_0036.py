@@ -5,7 +5,6 @@ import django.utils.timezone
 import django_fsm
 import model_utils.fields
 import netfields.fields
-import upload_validator
 from django.conf import settings
 from django.db import migrations, models
 
@@ -14,6 +13,8 @@ import waldur_core.core.models
 import waldur_core.core.validators
 import waldur_core.logging.loggers
 import waldur_core.media.models
+import waldur_core.media.validators
+import waldur_core.permissions.mixins
 import waldur_core.structure.models
 
 
@@ -192,7 +193,7 @@ class Migration(migrations.Migration):
             },
             bases=(
                 waldur_core.core.models.DescendantMixin,
-                waldur_core.structure.models.PermissionMixin,
+                waldur_core.permissions.mixins.PermissionMixin,
                 waldur_core.logging.loggers.LoggableMixin,
                 models.Model,
             ),
@@ -284,7 +285,7 @@ class Migration(migrations.Migration):
                         null=True,
                         upload_to="certs",
                         validators=[
-                            upload_validator.FileTypeValidator(
+                            waldur_core.media.validators.FileTypeValidator(
                                 allowed_extensions=["pem"],
                                 allowed_types=[
                                     "application/x-pem-file",
@@ -498,7 +499,7 @@ class Migration(migrations.Migration):
             },
             bases=(
                 waldur_core.core.models.DescendantMixin,
-                waldur_core.structure.models.PermissionMixin,
+                waldur_core.permissions.mixins.PermissionMixin,
                 waldur_core.structure.models.StructureLoggableMixin,
                 models.Model,
             ),
@@ -676,15 +677,7 @@ class Migration(migrations.Migration):
                 ),
                 (
                     "role",
-                    waldur_core.structure.models.CustomerRole(
-                        choices=[
-                            ("owner", "Owner"),
-                            ("support", "Support"),
-                            ("service_manager", "Service manager"),
-                        ],
-                        db_index=True,
-                        max_length=30,
-                    ),
+                    models.CharField(db_index=True, max_length=30),
                 ),
                 (
                     "created_by",
@@ -743,15 +736,7 @@ class Migration(migrations.Migration):
                 ),
                 (
                     "role",
-                    waldur_core.structure.models.ProjectRole(
-                        choices=[
-                            ("admin", "Administrator"),
-                            ("manager", "Manager"),
-                            ("member", "Member"),
-                        ],
-                        db_index=True,
-                        max_length=30,
-                    ),
+                    models.CharField(db_index=True, max_length=30),
                 ),
                 (
                     "created_by",

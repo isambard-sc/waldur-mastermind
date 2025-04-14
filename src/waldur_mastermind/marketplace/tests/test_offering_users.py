@@ -4,7 +4,11 @@ from rest_framework.reverse import reverse
 
 from waldur_core.logging.models import Event
 from waldur_core.permissions.enums import PermissionEnum
-from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
+from waldur_core.permissions.fixtures import (
+    CustomerRole,
+    ProjectRole,
+    ServiceProviderRole,
+)
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_core.structure.tests.factories import UserFactory
 from waldur_mastermind.marketplace.models import OfferingUser, Resource
@@ -19,7 +23,7 @@ class ListOfferingUsersTest(test.APITransactionTestCase):
         self.offering = factories.OfferingFactory(
             shared=True, customer=self.fixture.customer
         )
-        self.offering.secret_options = {
+        self.offering.plugin_options = {
             "service_provider_can_create_offering_user": True
         }
         self.offering.save()
@@ -67,17 +71,16 @@ class ListOfferingUsersTest(test.APITransactionTestCase):
 
     def test_user_can_filter_offering_users(self):
         offering_user1 = OfferingUser.objects.get(username="user")
-        offering_user1.set_propagation_date()
         offering_user1.save()
 
         self.client.force_login(self.fixture.staff)
 
         response = self.client.get(
-            reverse("marketplace-offering-user-list"), {"is_not_propagated": False}
+            reverse("marketplace-offering-user-list"),
+            {"provider_uuid": self.offering.customer.uuid.hex},
         )
         self.assertEqual(1, len(response.data))
         self.assertEqual("user", response.data[0]["username"])
-        self.assertIsNotNone(response.data[0]["propagation_date"], response.data[0])
 
     def test_user_can_filter_by_user_username(self):
         offering_user = OfferingUser.objects.get(username="user")
@@ -103,7 +106,7 @@ class CreateOfferingUsersTest(test.APITransactionTestCase):
         self.offering = factories.OfferingFactory(
             shared=True, customer=self.fixture.customer
         )
-        self.offering.secret_options["service_provider_can_create_offering_user"] = True
+        self.offering.plugin_options["service_provider_can_create_offering_user"] = True
         self.offering.save()
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING_USER)
 
@@ -121,7 +124,7 @@ class CreateOfferingUsersTest(test.APITransactionTestCase):
 
     @data("staff", "owner")
     def test_offering_does_not_allow_to_create_user(self, user):
-        self.offering.secret_options["service_provider_can_create_offering_user"] = (
+        self.offering.plugin_options["service_provider_can_create_offering_user"] = (
             False
         )
         self.offering.save()
@@ -185,7 +188,7 @@ class OfferingUsersUpdateTest(test.APITransactionTestCase):
         self.offering = factories.OfferingFactory(
             shared=True, customer=self.fixture.customer
         )
-        self.offering.secret_options = {
+        self.offering.plugin_options = {
             "service_provider_can_create_offering_user": True
         }
         self.offering.save()
@@ -229,7 +232,7 @@ class OfferingUsersDeleteTest(test.APITransactionTestCase):
         self.offering = factories.OfferingFactory(
             shared=True, customer=self.fixture.customer
         )
-        self.offering.secret_options = {
+        self.offering.plugin_options = {
             "service_provider_can_create_offering_user": True
         }
         self.offering.save()
@@ -300,7 +303,7 @@ class OferingUserRestrictedUpdateTest(test.APITransactionTestCase):
         self.offering = factories.OfferingFactory(
             shared=True, customer=self.fixture.customer
         )
-        self.offering.secret_options = {
+        self.offering.plugin_options = {
             "service_provider_can_create_offering_user": True
         }
         self.offering.save()
@@ -312,7 +315,7 @@ class OferingUserRestrictedUpdateTest(test.APITransactionTestCase):
         CustomerRole.OWNER.add_permission(
             PermissionEnum.UPDATE_OFFERING_USER_RESTRICTION
         )
-        CustomerRole.MANAGER.add_permission(
+        ServiceProviderRole.MANAGER.add_permission(
             PermissionEnum.UPDATE_OFFERING_USER_RESTRICTION
         )
 

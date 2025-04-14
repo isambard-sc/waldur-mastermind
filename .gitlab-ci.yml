@@ -4,7 +4,7 @@ include:
   - project: "waldur/waldur-pipelines"
     file: "/templates/test/check-merge-compatibility.yml"
   - project: "waldur/waldur-pipelines"
-    file: "/templates/release/publish.yml"
+    file: "/templates/release/publish-multiarch.yml"
   - project: "waldur/waldur-pipelines"
     file: "/templates/validate/docker-compose-trigger.yml"
   - project: "waldur/waldur-pipelines"
@@ -106,10 +106,10 @@ Run unit tests:
         path: coverage.xml
   parallel: 10
 
-Run migration test:
+Run management command test:
   extends: .Unit test runner
   script:
-    - gitlab-ci-test/waldur-test MIGRATIONS
+    - gitlab-ci-test/waldur-test MANAGEMENT
 
 Try building docker image:
   image:
@@ -181,16 +181,56 @@ Build docker image for tests:
       --build-arg DOCKER_REGISTRY=$DOCKER_REGISTRY
       --destination "$WALDUR_MASTERMIND_TEST_IMAGE"
 
-Publish latest docker image:
+Publish the latest multiarch docker image:
+  extends: .Publish multiarch latest docker image template
   before_script:
+    # Merge the before_script from the template
+    - !reference [.Publish multiarch latest docker image template, before_script]
     - echo '[+] Build and publish latest docker image'
     - echo $CI_COMMIT_SHA > docker/rootfs/COMMIT_SHA
 
-Publish docker image with specific version:
+Publish multiarch docker image with specific version:
+  extends: .Publish multiarch docker image with specific version template
   before_script:
+    # Merge the before_script from the template
+    - !reference [.Publish multiarch docker image with specific version template, before_script]
     - echo "[+] Build and publish $CI_COMMIT_TAG docker image"
     - echo $CI_COMMIT_TAG > docker/rootfs/COMMIT_TAG
     - sed -i "s/version = \"0.0.0\"/version = \"$CI_COMMIT_TAG\"/" pyproject.toml
+
+Test Multi-arch docker image build:
+  stage: test
+  interruptible: true
+  image: registry.hpc.ut.ee/mirror/docker:latest
+  services:
+    - name: "docker:dind"
+      command: ["--mtu=1400"]
+  rules:
+    # Skip tests if said so
+    - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Dockerfile
+        - docker/**/*
+        - .gitlab-ci.yml
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_REGISTRY: registry.hpc.ut.ee/mirror/
+    DOCKER_HUB_REGISTRY: "docker.io"
+  cache: []
+  before_script:
+    - apk update
+    - apk add --no-cache gcc python3-dev musl-dev linux-headers openldap-dev openssl libffi-dev libjpeg-turbo-dev libxml2-dev libxslt-dev
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY --username "$CI_REGISTRY_USER" --password-stdin
+  script:
+    - docker context create builder
+    - docker buildx version
+    - docker buildx create builder --use
+    - docker buildx build --platform linux/amd64,linux/arm64 --build-arg DOCKER_REGISTRY=$DOCKER_REGISTRY -t ${CI_REGISTRY_IMAGE}:${CI_MERGE_REQUEST_ID}-multiarch --push .
+    - docker buildx imagetools inspect ${CI_REGISTRY_IMAGE}:${CI_MERGE_REQUEST_ID}-multiarch
+    - docker pull ${CI_REGISTRY_IMAGE}:${CI_MERGE_REQUEST_ID}-multiarch
+    - docker image inspect ${CI_REGISTRY_IMAGE}:${CI_MERGE_REQUEST_ID}-multiarch
 
 Lint docker image:
   extends: .Lint docker image template
@@ -227,7 +267,7 @@ Upload Source SBOM:
     SBOM_DIR: "source"
 
 Upload configuration guide:
-  stage: deploy
+  stage: postdeploy
   interruptible: true
   rules:
     - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
@@ -264,49 +304,57 @@ Upload configuration guide:
   before_script: []
 
 Upload HomePort enums:
-  stage: deploy
+  stage: postdeploy
   interruptible: true
   rules:
     - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
   image: registry.hpc.ut.ee/mirror/$WALDUR_MASTERMIND_TEST_IMAGE
   variables:
-    PERMISSIONS_ENUM_PATH: src/permissions/enums.ts
-    EVENTS_ENUM_PATH: src/EventsEnums.ts
-    FEATURES_ENUM_PATH: src/FeaturesEnums.ts
-    FEATURES_DESCRIPTION_PATH: src/features/FeaturesDescription.ts
-    PERMISSION_OPTIONS_PATH: src/administration/roles/PermissionOptions.tsx
-    SETTINGS_DESCRIPTION_PATH: src/SettingsDescription.ts
     DJANGO_SETTINGS_MODULE: waldur_core.server.doc_settings
   script:
     - poetry install
     - cd src/waldur_core/permissions
     - python print_permission_enums.py > /tmp/permission_enums.ts
-    - waldur print_events_enums > /tmp/events_enums.ts
-    - waldur print_features_enums > /tmp/features_enums.ts
-    - waldur print_features_description > /tmp/features_description.ts
-    - waldur print_settings_description > /tmp/settings_description.ts
-    - waldur print_permissions_description > /tmp/permission_options.ts
     - cd /tmp/
     - git clone "https://homeport-updates:$HOMEPORT_ACCESS_TOKEN@$CI_SERVER_HOST/waldur/waldur-homeport.git"
     - git config --global user.name "$GITLAB_USER_NAME"
     - git config --global user.email "$GITLAB_USER_EMAIL"
     - cd waldur-homeport
     - git checkout develop
-    - mv /tmp/permission_enums.ts $PERMISSIONS_ENUM_PATH
-    - mv /tmp/events_enums.ts $EVENTS_ENUM_PATH
-    - mv /tmp/features_enums.ts $FEATURES_ENUM_PATH
-    - mv /tmp/features_description.ts $FEATURES_DESCRIPTION_PATH
-    - mv /tmp/settings_description.ts $SETTINGS_DESCRIPTION_PATH
-    - mv /tmp/permission_options.ts $PERMISSION_OPTIONS_PATH
-    - git add $PERMISSIONS_ENUM_PATH
-    - git add $EVENTS_ENUM_PATH
-    - git add $FEATURES_ENUM_PATH
-    - git add $FEATURES_DESCRIPTION_PATH
-    - git add $SETTINGS_DESCRIPTION_PATH
-    - git add $PERMISSION_OPTIONS_PATH
+    - mv /tmp/permission_enums.ts src/permissions/enums.ts
+    - waldur print_events_enums > src/EventsEnums.ts
+    - waldur print_features_enums > src/FeaturesEnums.ts
+    - waldur print_features_description > src/features/FeaturesDescription.ts
+    - waldur print_settings_description > src/SettingsDescription.ts
+    - waldur print_permissions_description > src/administration/roles/PermissionOptions.tsx
+    - git add src/
     - git commit -m "Update enums" || exit 0
     - git branch new-enums
     - git push --set-upstream origin new-enums:develop
+  before_script: []
+
+Upload MCP metadata:
+  stage: postdeploy
+  interruptible: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+  image: registry.hpc.ut.ee/mirror/$WALDUR_MASTERMIND_TEST_IMAGE
+  variables:
+    DJANGO_SETTINGS_MODULE: waldur_core.server.doc_settings
+  script:
+    - poetry install
+    - waldur export_model_metadata > /tmp/meta.yaml
+    - cd /tmp/
+    - git clone "https://mastermind:$MCP_ACCESS_TOKEN@$CI_SERVER_HOST/waldur/waldur-mcp-server.git"
+    - git config --global user.name "$GITLAB_USER_NAME"
+    - git config --global user.email "$GITLAB_USER_EMAIL"
+    - cd waldur-mcp-server
+    - git checkout main
+    - mv /tmp/meta.yaml src/waldur_mcp_server/meta.yaml
+    - git add src/waldur_mcp_server/meta.yaml
+    - git commit -m "Update metadata" || exit 0
+    - git branch new-metadata
+    - git push --set-upstream origin new-metadata:main
   before_script: []
 
 Lint MD links:
@@ -314,3 +362,248 @@ Lint MD links:
     - touch docs/core_structure.png
     - touch docs/core_permissions.png
     - touch docs/marketplace.png
+
+Generate OpenAPI schema:
+  stage: deploy
+  interruptible: true
+  rules:
+      - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+      - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+  image: registry.hpc.ut.ee/mirror/$WALDUR_MASTERMIND_TEST_IMAGE
+  variables:
+    DJANGO_SETTINGS_MODULE: waldur_core.server.doc_settings
+  script:
+    - poetry install
+    - waldur spectacular --file waldur-openapi-schema.yaml --fail-on-warn
+  artifacts:
+    paths:
+      - waldur-openapi-schema.yaml
+    expire_in: 1 day
+  before_script: []
+
+Generate TypeScript SDK:
+  stage: deploy
+  interruptible: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+  image: registry.hpc.ut.ee/mirror/library/node:lts-alpine
+  needs:
+    - Generate OpenAPI schema
+  script: |
+    npx --yes @hey-api/openapi-ts@0.65.0 -c @hey-api/client-fetch -i waldur-openapi-schema.yaml -o waldur-typescript-sdk
+    # drop querySerializer because it is producing explode: false for multiple choice filter
+    sed -i '/querySerializer: {/,/},/d' waldur-typescript-sdk/sdk.gen.ts
+    ls -l waldur-typescript-sdk
+  artifacts:
+    paths:
+      - waldur-typescript-sdk/
+    expire_in: 1 day
+
+Generate Python SDK:
+  stage: deploy
+  interruptible: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+  image: registry.hpc.ut.ee/mirror/library/python:3.11-bullseye
+  needs:
+    - Generate OpenAPI schema
+  script: |
+    pip install openapi-python-client
+    openapi-python-client generate --path waldur-openapi-schema.yaml --output-path py-client --overwrite
+  artifacts:
+    paths:
+      - py-client/
+    expire_in: 1 day
+
+Generate Go SDK:
+  stage: deploy
+  interruptible: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+  image: registry.hpc.ut.ee/mirror/library/golang:tip-alpine
+  needs:
+    - Generate OpenAPI schema
+  script: |
+    go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@latest
+    oapi-codegen --package client --generate types,client -o client.go waldur-openapi-schema.yaml
+    ls -l client.go
+  artifacts:
+    paths:
+      - client.go
+    expire_in: 1 day
+
+Upload Go SDK:
+  stage: postdeploy
+  interruptible: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+  image:
+    name: registry.hpc.ut.ee/mirror/alpine/git:latest
+    entrypoint: [""]
+  needs:
+    - Generate Go SDK
+  script:
+    - cd /tmp/
+    - git clone git@github.com:waldur/go-client.git
+    - cd go-client
+    - git pull
+    - cp $CI_PROJECT_DIR/client.go client.go
+    - git add client.go
+    - git commit -m "Update Waldur Go SDK" || exit 0
+    - git push
+  before_script:
+    - echo "[+] Adding ssh keys to the home directory"
+    - mkdir -p ~/.ssh
+    - cat $SSH_JENKINS_GITHUB_PRIVATE_KEY | tr -d '\r' > ~/.ssh/id_rsa
+    - cat $SSH_JENKINS_GITHUB_PUBLIC_KEY | tr -d '\r' > ~/.ssh/id_rsa.pub
+    - chmod 600 ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa.pub
+    - ssh-keygen -lf ~/.ssh/id_rsa.pub
+    - ssh-keyscan -H "github.com" >> ~/.ssh/known_hosts
+    - git config --global user.email "ci@waldur.com"
+    - git config --global user.name "Waldur Gitlab Runner"
+
+Upload Python SDK:
+  stage: postdeploy
+  interruptible: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+  image:
+    name: registry.hpc.ut.ee/mirror/alpine/git:latest
+    entrypoint: [""]
+  needs:
+    - Generate Python SDK
+  script:
+    - cd /tmp/
+    - git clone --branch main git@github.com:waldur/py-client.git
+    - cd py-client
+    - git pull
+    - rm -rf waldur_api_client && cp -a "$CI_PROJECT_DIR/py-client/waldur_api_client" waldur_api_client
+    - git add waldur_api_client
+    - git commit -m "Update Waldur Python SDK" || exit 0
+    - git push
+  before_script:
+    - echo "[+] Adding ssh keys to the home directory"
+    - mkdir -p ~/.ssh
+    - cat $SSH_JENKINS_GITHUB_PRIVATE_KEY | tr -d '\r' > ~/.ssh/id_rsa
+    - cat $SSH_JENKINS_GITHUB_PUBLIC_KEY | tr -d '\r' > ~/.ssh/id_rsa.pub
+    - chmod 600 ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa.pub
+    - ssh-keygen -lf ~/.ssh/id_rsa.pub
+    - ssh-keyscan -H "github.com" >> ~/.ssh/known_hosts
+    - git config --global user.email "ci@waldur.com"
+    - git config --global user.name "Waldur Gitlab Runner"
+
+Generate OpenAPI schema diff:
+  stage: deploy
+  interruptible: true
+  image:
+    name: registry.hpc.ut.ee/mirror/tufin/oasdiff:latest
+    entrypoint: [""]
+  needs:
+    - Generate OpenAPI schema
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+  before_script:
+    - apk update
+    - apk add --no-cache git
+  script:
+    - ls -la
+    - echo "Cloning docs repository"
+    - git clone "https://github.com/waldur/waldur-docs.git"
+    - ls waldur-docs
+    - |
+      # First try to find the previous version if current tag exists
+      if [ -f "waldur-docs/docs/API/waldur-openapi-schema-${CI_COMMIT_TAG}.yaml" ]; then
+        echo "Current tag file exists, finding previous version"
+        PREV_SCHEMA=$(ls waldur-docs/docs/API/waldur-openapi-schema-*.yaml | sort -V | grep -B1 "waldur-openapi-schema-${CI_COMMIT_TAG}.yaml" | head -n1)
+      else
+        echo "Current tag file does not exist, getting latest version"
+        PREV_SCHEMA=$(ls waldur-docs/docs/API/waldur-openapi-schema-*.yaml | sort -V | tail -n1 || echo "")
+      fi
+
+    - echo "Previous schema $PREV_SCHEMA"
+    - |
+      if [ -z "$PREV_SCHEMA" ]; then
+        echo "No previous schema found. Skipping diff generation."
+        touch $CI_PROJECT_DIR/openapi-diff.md
+        echo "No previous schema found. Skipping diff generation." > $CI_PROJECT_DIR/openapi-diff.md
+      else
+        echo "Previous schema found: $PREV_SCHEMA"
+        /usr/bin/oasdiff diff -f markup $PREV_SCHEMA $CI_PROJECT_DIR/waldur-openapi-schema.yaml > $CI_PROJECT_DIR/openapi-diff.md
+        ls -la $CI_PROJECT_DIR/openapi-diff.md
+        head -n 30 $CI_PROJECT_DIR/openapi-diff.md || true
+      fi
+  artifacts:
+    paths:
+      - openapi-diff.md
+    expire_in: 1 day
+
+Upload OpenAPI schema and schema diff to docs:
+  stage: postdeploy
+  interruptible: true
+  needs:
+    - Generate OpenAPI schema
+    - Generate OpenAPI schema diff
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+  image:
+    name: registry.hpc.ut.ee/mirror/alpine/git:latest
+    entrypoint: [""]
+  script:
+    - cd /tmp/
+    - git clone "https://gitlab-ci-token:$GITLAB_TOKEN@$CI_SERVER_HOST/waldur/waldur-docs.git"
+    - git config --global user.name "$GITLAB_USER_NAME"
+    - git config --global user.email "$GITLAB_USER_EMAIL"
+    - cd waldur-docs
+    # Upload OpenAPI schema
+    - mkdir -p docs/API
+    - cp $CI_PROJECT_DIR/waldur-openapi-schema.yaml docs/API/waldur-openapi-schema-${CI_COMMIT_TAG}.yaml
+    - ls -la docs/API
+    # Upload OpenAPI schema diff
+    - mkdir -p docs/about/api-changes
+    - |
+      if [ -s "$CI_PROJECT_DIR/openapi-diff.md" ]; then
+        cp $CI_PROJECT_DIR/openapi-diff.md docs/about/api-changes/waldur-openapi-schema-${CI_COMMIT_TAG}-diff.md
+      else
+        echo "No API changes detected, skipping diff file upload"
+      fi
+    - ls -la docs/about/api-changes
+    # Commit and push changes
+    - git add docs/API docs/about/api-changes
+    - git commit -m "Add Waldur OpenAPI schema and diff for ${CI_COMMIT_TAG}" || exit 0
+    - git branch new-api-schema-${CI_COMMIT_TAG}
+    - git push --set-upstream origin new-api-schema-${CI_COMMIT_TAG}:master
+  before_script: []
+
+Upload TypeScript SDK:
+  stage: postdeploy
+  interruptible: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+  image:
+    name: registry.hpc.ut.ee/mirror/alpine/git:latest
+    entrypoint: [""]
+  needs:
+    - Generate TypeScript SDK
+  script:
+    - cd /tmp/
+    - git clone --branch main git@github.com:waldur/js-client.git
+    - cd js-client
+    - git pull
+    - rm -rf src/
+    - mv $CI_PROJECT_DIR/waldur-typescript-sdk src
+    - git add src
+    - git commit -m "Update Waldur TypeScript SDK" || exit 0
+    - git push
+  before_script:
+    - echo "[+] Adding ssh keys to the home directory"
+    - mkdir -p ~/.ssh
+    - cat $SSH_JENKINS_GITHUB_PRIVATE_KEY | tr -d '\r' > ~/.ssh/id_rsa
+    - cat $SSH_JENKINS_GITHUB_PUBLIC_KEY | tr -d '\r' > ~/.ssh/id_rsa.pub
+    - chmod 600 ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa.pub
+    - ssh-keygen -lf ~/.ssh/id_rsa.pub
+    - ssh-keyscan -H "github.com" >> ~/.ssh/known_hosts
+    - git config --global user.email "ci@waldur.com"
+    - git config --global user.name "Waldur Gitlab Runner"

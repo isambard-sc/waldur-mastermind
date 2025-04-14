@@ -7,6 +7,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
 from django.core.validators import (
     MaxLengthValidator,
     MinLengthValidator,
@@ -37,14 +38,8 @@ from waldur_core.core.validators import (
 from waldur_core.logging.mixins import LoggableMixin
 from waldur_core.media.mixins import ImageModelMixin
 from waldur_core.media.validators import CertificateValidator
-from waldur_core.permissions.enums import SYSTEM_PROJECT_ROLES, PermissionEnum, RoleEnum
-from waldur_core.permissions.models import Role
-from waldur_core.permissions.utils import (
-    add_user,
-    delete_user,
-    get_permissions,
-    has_user,
-)
+from waldur_core.permissions.enums import PermissionEnum, RoleEnum
+from waldur_core.permissions.mixins import PermissionMixin
 from waldur_core.quotas import fields as quotas_fields
 from waldur_core.quotas import models as quotas_models
 from waldur_core.structure.managers import (
@@ -63,8 +58,6 @@ from waldur_core.structure.registry import SupportedServices, get_resource_type
 
 
 def validate_service_type(service_type):
-    from django.core.exceptions import ValidationError
-
     if not SupportedServices.has_service_type(service_type):
         raise ValidationError(_("Invalid service type."))
 
@@ -102,17 +95,17 @@ class VATMixin(models.Model):
 
     country = models.CharField(max_length=2, blank=True)
 
-    def get_country_display(self):
+    def get_country_display(self) -> str:
         return COUNTRIES_DICT.get(self.country)
 
-    def get_vat_rate(self):
+    def get_vat_rate(self) -> float:
         charge = self.get_vat_charge()
         if charge.action == pyvat.VatChargeAction.charge:
             return charge.rate
 
         # Return None, if reverse_charge or no_charge action is applied
 
-    def get_vat_charge(self):
+    def get_vat_charge(self) -> float:
         if not self.country:
             raise VATException(
                 _(
@@ -171,70 +164,6 @@ class BasePermission(models.Model):
         raise NotImplementedError
 
 
-class PermissionMixin:
-    """
-    Base permission management mixin for customer and project.
-    It is expected that reverse `permissions` relation is created for this model.
-    Provides method to grant, revoke and check object permissions.
-    """
-
-    def get_or_create_role(self, role=None):
-        if role and isinstance(role, str):
-            return Role.objects.get_system_role(
-                name=get_new_role_name(self._meta.model, role),
-                content_type=ContentType.objects.get_for_model(self._meta.model),
-            )
-        return role
-
-    def has_user(self, user, role=None, timestamp=False):
-        role = self.get_or_create_role(role)
-        return has_user(self, user, role, timestamp)
-
-    @transaction.atomic()
-    def add_user(self, user, role, created_by=None, expiration_time=None):
-        role = self.get_or_create_role(role)
-        permission = add_user(self, user, role, created_by, expiration_time)
-        return permission
-
-    @transaction.atomic()
-    def remove_user(self, user, role=None, removed_by=None):
-        role = self.get_or_create_role(role)
-        if role:
-            delete_user(self, user, role, removed_by)
-        else:
-            for perm in get_permissions(self, user):
-                perm.revoke(removed_by)
-
-    def get_users(self, role=None):
-        """Return all connected to scope users"""
-        raise NotImplementedError
-
-    def get_user_mails(self, role=None):
-        return (
-            self.get_users(role)
-            .exclude(email="")
-            .exclude(notifications_enabled=False)
-            .values_list("email", flat=True)
-        )
-
-
-class CustomerRole(models.CharField):
-    OWNER = "owner"
-    SUPPORT = "support"
-    SERVICE_MANAGER = "service_manager"
-
-    CHOICES = (
-        (OWNER, "Owner"),
-        (SUPPORT, "Support"),
-        (SERVICE_MANAGER, "Service manager"),
-    )
-
-    def __init__(self, *args, **kwargs):
-        kwargs["max_length"] = 30
-        kwargs["choices"] = self.CHOICES
-        super().__init__(*args, **kwargs)
-
-
 class OrganizationGroup(core_models.UuidMixin, core_models.NameMixin, models.Model):
     parent = models.ForeignKey(
         on_delete=models.CASCADE, to="OrganizationGroup", null=True, blank=True
@@ -283,11 +212,16 @@ CUSTOMER_DETAILS_FIELDS = (
 )
 
 
+def validate_cidr_32(value):
+    if not value.endswith("/32"):
+        raise ValidationError("Only /32 mask is allowed.")
+
+
 class AccessSubnet(core_models.UuidMixin, core_models.DescribableMixin, LoggableMixin):
     customer = models.ForeignKey(
         on_delete=models.CASCADE, to="Customer", related_name="access_subnet_set"
     )
-    inet = CidrAddressField(null=True, blank=True)
+    inet = CidrAddressField(null=True, blank=True, validators=[validate_cidr_32])
     tracker = FieldTracker()
 
     class Meta:
@@ -450,23 +384,6 @@ class Customer(
             return f"{self.name} ({self.abbreviation})"
         else:
             return self.name
-
-
-class ProjectRole(models.CharField):
-    ADMINISTRATOR = "admin"
-    MANAGER = "manager"
-    MEMBER = "member"
-
-    CHOICES = (
-        (ADMINISTRATOR, "Administrator"),
-        (MANAGER, "Manager"),
-        (MEMBER, "Member"),
-    )
-
-    def __init__(self, *args, **kwargs):
-        kwargs["max_length"] = 30
-        kwargs["choices"] = self.CHOICES
-        super().__init__(*args, **kwargs)
 
 
 class ProjectType(
@@ -652,13 +569,10 @@ class Project(
         return self.end_date and self.end_date <= timezone.datetime.today().date()
 
     @property
-    def full_name(self):
+    def full_name(self) -> str:
         return self.name
 
     def get_users(self, role=None):
-        if isinstance(role, str):
-            if role not in SYSTEM_PROJECT_ROLES:
-                role = get_new_role_name(Project, role)
         project_users = get_project_users(self.id, role)
         return (
             get_user_model().objects.filter(id__in=project_users).order_by("username")
@@ -951,7 +865,7 @@ class BaseResource(
         return ("uuid", "name", "service_settings", "project", "full_name")
 
     @property
-    def full_name(self):
+    def full_name(self) -> str:
         return "{} {}".format(
             get_resource_type(self).replace(".", " "),
             self.name,
@@ -980,15 +894,15 @@ class BaseResource(
         pass
 
     @classmethod
-    def get_scope_type(cls):
+    def get_scope_type(cls) -> str:
         return get_resource_type(cls)
 
     @property
-    def customer(self):
+    def customer(self) -> Customer:
         return self.project.customer
 
     @property
-    def marketplace_uuid(self):
+    def marketplace_uuid(self) -> str:
         from waldur_mastermind.marketplace.models import Resource
 
         try:
@@ -1093,24 +1007,3 @@ class UserAgreement(core_models.UuidMixin, LoggableMixin, TimeStampedModel):
 
 
 reversion.register(Customer)
-
-
-ROLE_MAP = {
-    ("customer", "owner"): RoleEnum.CUSTOMER_OWNER,
-    ("customer", "service_manager"): RoleEnum.CUSTOMER_MANAGER,
-    ("customer", "support"): RoleEnum.CUSTOMER_SUPPORT,
-    ("project", "admin"): RoleEnum.PROJECT_ADMIN,
-    ("project", "manager"): RoleEnum.PROJECT_MANAGER,
-    ("project", "member"): RoleEnum.PROJECT_MEMBER,
-    ("offering", None): RoleEnum.OFFERING_MANAGER,
-}
-
-
-def get_new_role_name(type, old_role_name):
-    return ROLE_MAP.get((type._meta.model_name, old_role_name)) or old_role_name
-
-
-def get_old_role_name(new_role_name):
-    keys = [key for key, value in ROLE_MAP.items() if value == new_role_name]
-    if keys:
-        return keys[0][1]

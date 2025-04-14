@@ -1,6 +1,7 @@
 import io
 import logging
 from collections import defaultdict
+from decimal import Decimal
 
 import requests
 from django.db.models import Q
@@ -19,6 +20,7 @@ from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import plugins
+from waldur_mastermind.marketplace.enums import OfferingStates
 from waldur_mastermind.marketplace_remote.constants import (
     OFFERING_COMPONENT_FIELDS,
     OFFERING_FIELDS,
@@ -49,8 +51,23 @@ def get_project_backend_id(project):
 def pull_fields(fields, local_object, remote_object):
     changed_fields = set()
     for field in fields:
-        if remote_object[field] != getattr(local_object, field):
-            setattr(local_object, field, remote_object[field])
+        if field not in remote_object:
+            logger.warning(f'Remote offering does not expose field "{field}"')
+            continue
+        remote_value = remote_object[field]
+        local_value = getattr(local_object, field)
+
+        if isinstance(local_value, int | float | Decimal):
+            try:
+                remote_value = float(remote_value)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f'Unable to convert remote value "{remote_value}" to float for field "{field}"'
+                )
+                continue
+
+        if remote_value != local_value:
+            setattr(local_object, field, remote_value)
             changed_fields.add(field)
     if changed_fields:
         local_object.save(update_fields=changed_fields)
@@ -541,17 +558,51 @@ def get_remote_offerings(client, remote_customer_uuid, category_uuid=None, field
     return client.list_marketplace_public_offerings(params)
 
 
-def import_offering(remote_offering, local_customer, local_category, secret_options):
-    local_offering = marketplace_models.Offering.objects.create(
+def upsert_offering(
+    remote_offering: dict,
+    local_customer: structure_models.Customer,
+    local_category: marketplace_models.Category,
+    secret_options: dict,
+):
+    # Create mapping from OfferingStates.CHOICES
+    STATE_MAPPING = {
+        state_name: state_id for state_id, state_name in OfferingStates.CHOICES
+    }
+
+    # Extract only the fields that exist in remote_offering
+    offering_fields = {
+        key: remote_offering[key] for key in OFFERING_FIELDS if key in remote_offering
+    }
+
+    # Map the state if it exists in remote_offering
+    if "state" in remote_offering:
+        remote_state = remote_offering["state"].title()  # Normalize state string
+        state = STATE_MAPPING.get(
+            remote_state, OfferingStates.DRAFT
+        )  # Default to DRAFT if unknown state
+    else:
+        state = OfferingStates.DRAFT  # Default state if not provided
+
+    local_offering, _ = marketplace_models.Offering.objects.update_or_create(
         type=PLUGIN_NAME,
-        billable=True,
         backend_id=remote_offering["uuid"],
         customer=local_customer,
-        category=local_category,
-        secret_options=secret_options,
-        **{key: remote_offering[key] for key in OFFERING_FIELDS},
+        defaults={
+            "state": state,
+            **offering_fields,
+            "category": local_category,
+            "secret_options": secret_options,
+            "billable": True,
+        },
     )
-    import_offering_thumbnail(local_offering, remote_offering)
-    local_components_map = import_offering_components(local_offering, remote_offering)
-    import_plans(local_offering, remote_offering, local_components_map)
+    # Update related data
+    update_offering_related_data(local_offering, remote_offering)
     return local_offering
+
+
+def update_offering_related_data(existing_offering, remote_offering):
+    import_offering_thumbnail(existing_offering, remote_offering)
+    local_components_map = import_offering_components(
+        existing_offering, remote_offering
+    )
+    import_plans(existing_offering, remote_offering, local_components_map)

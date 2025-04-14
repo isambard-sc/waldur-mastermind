@@ -2,7 +2,7 @@ import datetime
 from datetime import timedelta
 
 import saml2
-from pydantic import BaseModel, Field
+from pydantic.v1 import BaseModel, Field
 from saml2.entity_category.edugain import COC
 
 
@@ -69,50 +69,6 @@ class WaldurCore(BaseModel):
         },
         description="Configure notifications about profile changes of organization owners.",
     )
-    COUNTRIES: list[str] = Field(
-        [
-            "AL",
-            "AT",
-            "BA",
-            "BE",
-            "BG",
-            "CH",
-            "CY",
-            "CZ",
-            "DE",
-            "DK",
-            "EE",
-            "ES",
-            "EU",
-            "FI",
-            "FR",
-            "GB",
-            "GE",
-            "GR",
-            "HR",
-            "HU",
-            "IE",
-            "IS",
-            "IT",
-            "LT",
-            "LU",
-            "LV",
-            "MC",
-            "MK",
-            "MT",
-            "NL",
-            "NO",
-            "PL",
-            "PT",
-            "RO",
-            "RS",
-            "SE",
-            "SI",
-            "SK",
-            "UA",
-        ],
-        description="It is used in organization creation dialog in order to limit country choices to predefined set.",
-    )
     ENABLE_ACCOUNTING_START_DATE = Field(
         False,
         description="Allows to enable accounting for organizations using value of accounting_start_date field.",
@@ -147,10 +103,6 @@ class WaldurCore(BaseModel):
         False,
         description="Allow to create FreeIPA user using details specified in invitation if user does not exist yet.",
     )
-    INVITATION_DISABLE_MULTIPLE_ROLES = Field(
-        False,
-        description="Do not allow user to grant multiple roles in the same project or organization using invitation.",
-    )
     INVITATION_USE_WEBHOOKS = Field(
         False,
         description="Allow sending of webhooks instead of sending of emails.",
@@ -176,10 +128,6 @@ class WaldurCore(BaseModel):
     )
     EMAIL_CHANGE_MAX_AGE = Field(
         timedelta(days=1), description="Max age of change email request."
-    )
-    HOMEPORT_URL = Field(
-        "https://example.com/",
-        description="It is used for rendering callback URL in HomePort.",
     )
     MASTERMIND_URL = Field(
         "",
@@ -231,11 +179,6 @@ class WaldurCore(BaseModel):
         description="Custom label for civil number field in invitation creation dialog.",
     )
 
-    INVITATION_TAX_NUMBER_LABEL = Field(
-        "",
-        description="Custom label for tax number field in invitation creation dialog.",
-    )
-
     HOMEPORT_SENTRY_DSN: str | None = Field(
         description="Sentry Data Source Name for Waldur HomePort project."
     )
@@ -263,8 +206,6 @@ class WaldurCore(BaseModel):
         description="The list of protected fields for local IdP.",
     )
 
-    DEFAULT_IDP: str = Field("", description="Triggers authentication flow at once.")
-
     OECD_FOS_2007_CODE_MANDATORY = Field(
         False,
         description="Field oecd_fos_2007_code must be required for project.",
@@ -286,13 +227,10 @@ class WaldurCore(BaseModel):
             "USER_MANDATORY_FIELDS",
             "USER_REGISTRATION_HIDDEN_FIELDS",
             "INVITATION_CIVIL_NUMBER_LABEL",
-            "INVITATION_TAX_NUMBER_LABEL",
             "HOMEPORT_SENTRY_DSN",
             "HOMEPORT_SENTRY_ENVIRONMENT",
             "HOMEPORT_SENTRY_TRACES_SAMPLE_RATE",
-            "HOMEPORT_URL",
             "OECD_FOS_2007_CODE_MANDATORY",
-            "DEFAULT_IDP",
             "INVITATION_USE_WEBHOOKS",
         ]
 
@@ -379,41 +317,6 @@ class WaldurHPC(BaseModel):
         "",
         description="UUID of a Waldur SLURM offering plan, which will be used for creating allocations for users",
     )
-
-
-class WaldurFreeipa(BaseModel):
-    ENABLED = Field(
-        False,
-        description="Enable integration of identity provisioning in configured FreeIPA",
-    )
-    HOSTNAME = Field("ipa.example.com", description="Hostname of FreeIPA server")
-    USERNAME = Field(
-        "admin", description="Username of FreeIPA user with administrative privileges"
-    )
-    PASSWORD = Field(
-        "secret", description="Password of FreeIPA user with administrative privileges"
-    )
-    VERIFY_SSL = Field(
-        True, description="Validate TLS certificate of FreeIPA web interface / REST API"
-    )
-    USERNAME_PREFIX = Field(
-        "waldur_",
-        description="Prefix to be appended to all usernames created in FreeIPA by Waldur",
-    )
-    GROUPNAME_PREFIX = Field(
-        "waldur_",
-        description="Prefix to be appended to all group names created in FreeIPA by Waldur",
-    )
-    BLACKLISTED_USERNAMES = Field(
-        ["root"], description="List of username that users are not allowed to select"
-    )
-    GROUP_SYNCHRONIZATION_ENABLED = Field(
-        True,
-        description="Optionally disable creation of user groups in FreeIPA matching Waldur structure",
-    )
-
-    class Meta:
-        public_settings = ["USERNAME_PREFIX", "ENABLED"]
 
 
 class WaldurOpenPortal(BaseModel):
@@ -686,7 +589,6 @@ class WaldurOpenstack(BaseModel):
 class WaldurConfiguration(BaseModel):
     WALDUR_CORE = WaldurCore()
     WALDUR_AUTH_SOCIAL = WaldurAuthSocial()
-    WALDUR_FREEIPA = WaldurFreeipa()
     WALDUR_HPC = WaldurHPC()
     WALDUR_SLURM = WaldurSlurm()
     WALDUR_PID = WaldurPID()

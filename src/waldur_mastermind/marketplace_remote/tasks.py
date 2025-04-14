@@ -56,21 +56,32 @@ LOGICAL_LOCAL_ORDER_STATES_MAP = {
     "done": models.Order.States.DONE,
     "erred": models.Order.States.ERRED,
     "canceled": models.Order.States.CANCELED,
-    "rejected": models.Order.States.REJECTED,
+    "rejected": models.Order.States.CANCELED,  # If a remote order is rejected, the local one should switch from "executing" to "canceled"
 }
 
 
 class OfferingPullTask(BackgroundPullTask):
     def pull(self, local_offering: models.Offering):
-        client = get_client_for_offering(local_offering)
-        remote_offering = client.get_marketplace_public_offering(
-            local_offering.backend_id
-        )
-        pull_fields(OFFERING_FIELDS, local_offering, remote_offering)
-        utils.import_offering_thumbnail(local_offering, remote_offering)
-        self.sync_offering_components(local_offering, remote_offering)
-        self.sync_plans(local_offering, remote_offering)
-        self.sync_access_endpoints(local_offering, remote_offering)
+        try:
+            client = get_client_for_offering(local_offering)
+            remote_offering = client.get_marketplace_public_offering(
+                local_offering.backend_id
+            )
+            pull_fields(OFFERING_FIELDS, local_offering, remote_offering)
+            utils.import_offering_thumbnail(local_offering, remote_offering)
+            self.sync_offering_components(local_offering, remote_offering)
+            self.sync_plans(local_offering, remote_offering)
+            self.sync_access_endpoints(local_offering, remote_offering)
+        except WaldurClientException as exc:
+            if "Status: 404" in str(exc):
+                if local_offering.state == models.Offering.States.ACTIVE:
+                    local_offering.archive()
+                    local_offering.save(update_fields=["state"])
+                    logger.warning(exc)
+                if local_offering.state == models.Offering.States.ARCHIVED:
+                    logger.debug("Offering %s is archived: ", local_offering)
+            else:
+                logger.exception(exc)
 
     def sync_access_endpoints(self, local_offering, remote_offering):
         if not remote_offering.get("endpoints"):
@@ -308,6 +319,23 @@ class OfferingUserPullTask(BackgroundPullTask):
 
         stale = set(local_offering_users.keys()) - set(remote_offering_users.keys())
         for local_username in stale:
+            if local_username not in user_map:
+                try:
+                    user = models.User.all_objects.get(username=local_username)
+                    if not user.is_active:
+                        logger.info(
+                            "Skipping offering user synchronization for deactivated user %s",
+                            local_username,
+                        )
+                        continue
+                except models.User.DoesNotExist:
+                    logger.debug(
+                        "Skipping missing offering user synchronization because user "
+                        "with username %s does not exist.",
+                        local_username,
+                    )
+                    continue
+            # Handle other stale users
             user = user_map[local_username]
             offering_user = models.OfferingUser.objects.get(
                 user=user, offering=local_offering
@@ -386,8 +414,9 @@ class OrderPullTask(BackgroundPullTask):
 
         if local_order.state != correct_local_order_state:
             logger.info(
-                "Local order state %s is different from remote order state %s. Updating local order state.",
+                "Local order state %s is different from remote order state %s. Setting local order state to %s.",
                 local_order.get_state_display(),
+                remote_order["state"],
                 ORDER_STATES_MAP[correct_local_order_state],
             )
             sync_order_state(local_order, correct_local_order_state)
@@ -713,13 +742,16 @@ class ResourceRobotAccountPullTask(BackgroundPullTask):
             account for account in remote_accounts if account["uuid"] in new_ids
         ]
         for account in new_accounts:
-            models.RobotAccount.objects.create(
+            robot_account = models.RobotAccount.objects.create(
                 resource=local_resource,
                 backend_id=account["uuid"],
                 type=account["type"],
                 username=account["username"],
                 keys=account["keys"],
             )
+            # Set state to OK
+            robot_account.state = models.RobotAccount.States.OK
+            robot_account.save()
 
         existing_accounts = [
             account for account in remote_accounts if account["uuid"] in existing_ids

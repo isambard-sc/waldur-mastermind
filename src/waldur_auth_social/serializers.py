@@ -114,3 +114,7 @@ class IdentityProviderSerializer(serializers.ModelSerializer):
             validated_data["discovery_url"], verify_ssl
         )
         return super().create(validated_data)
+
+
+class RemoteEduteamsUUIDSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField()

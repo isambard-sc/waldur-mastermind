@@ -6,6 +6,7 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 from waldur_core.core import serializers as core_serializers
+from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.permissions import _get_customer
 from waldur_mastermind.invoices.models import CustomerCredit, ProjectCredit
@@ -17,10 +18,14 @@ logger = logging.getLogger(__name__)
 
 
 class PolicySerializer(serializers.HyperlinkedModelSerializer):
-    scope_name = serializers.ReadOnlyField(source="scope.name")
-    scope_uuid = serializers.ReadOnlyField(source="scope.uuid")
-    created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
-    created_by_username = serializers.ReadOnlyField(source="created_by.username")
+    scope_name = serializers.CharField(read_only=True, source="scope.name")
+    scope_uuid = serializers.UUIDField(read_only=True, source="scope.uuid")
+    created_by_full_name = serializers.CharField(
+        read_only=True, source="created_by.full_name"
+    )
+    created_by_username = serializers.CharField(
+        read_only=True, source="created_by.username"
+    )
     has_fired = serializers.BooleanField(read_only=True)
     fired_datetime = serializers.DateTimeField(read_only=True)
 
@@ -129,14 +134,14 @@ class ProjectEstimatedCostPolicySerializer(
     project_credit = serializers.SerializerMethodField()
     customer_credit = serializers.SerializerMethodField()
 
-    def get_project_credit(self, instance):
+    def get_project_credit(self, instance) -> float | None:
         project: structure_models.Project = instance.scope
         try:
             return ProjectCredit.objects.get(project=project).value
         except ProjectCredit.DoesNotExist:
             return None
 
-    def get_customer_credit(self, instance):
+    def get_customer_credit(self, instance) -> float | None:
         customer: structure_models.Customer = instance.scope.customer
         try:
             return CustomerCredit.objects.get(customer=customer).value
@@ -150,9 +155,7 @@ class ProjectEstimatedCostPolicySerializer(
         user = self.context["request"].user
         customer = _get_customer(scope)
 
-        if user.is_staff or customer.has_user(
-            user, structure_models.CustomerRole.OWNER
-        ):
+        if user.is_staff or customer.has_user(user, CustomerRole.OWNER):
             return scope
 
         raise serializers.ValidationError(
@@ -177,7 +180,7 @@ class CustomerEstimatedCostPolicySerializer(
 
     customer_credit = serializers.SerializerMethodField()
 
-    def get_customer_credit(self, instance):
+    def get_customer_credit(self, instance) -> int:
         customer: structure_models.Customer = instance.scope
         try:
             return CustomerCredit.objects.get(customer=customer).value
@@ -214,9 +217,7 @@ class OfferingPolicySerializerMixin(core_serializers.AugmentedSerializerMixin):
 
         customer = _get_customer(scope)
 
-        if user.is_staff or customer.has_user(
-            user, structure_models.CustomerRole.OWNER
-        ):
+        if user.is_staff or customer.has_user(user, CustomerRole.OWNER):
             return scope
 
         raise serializers.ValidationError(

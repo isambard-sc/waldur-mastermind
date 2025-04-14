@@ -1,4 +1,5 @@
 from enum import Enum
+from typing import Literal
 
 
 class RoleEnum(str, Enum):
@@ -33,11 +34,23 @@ SYSTEM_PROJECT_ROLES = (
 
 TYPE_MAP = {
     "customer": ("structure", "customer"),
+    "service_provider": ("marketplace", "serviceprovider"),
+    "call_organizer": ("proposal", "callmanagingorganisation"),
     "project": ("structure", "project"),
     "offering": ("marketplace", "offering"),
     "call": ("proposal", "call"),
     "proposal": ("proposal", "proposal"),
 }
+
+TYPE_KEYS = Literal[
+    "customer",
+    "service_provider",
+    "call_organizer",
+    "project",
+    "offering",
+    "call",
+    "proposal",
+]
 
 
 class PermissionEnum(str, Enum):
@@ -152,6 +165,8 @@ class PermissionEnum(str, Enum):
     UPDATE_CUSTOMER = "CUSTOMER.UPDATE"
     DELETE_CUSTOMER = "CUSTOMER.DELETE"
 
+    LIST_CUSTOMER_USERS = "CUSTOMER.LIST_USERS"
+
     ACCEPT_REQUESTED_OFFERING = "OFFERING.ACCEPT_CALL_REQUEST"
     APPROVE_AND_REJECT_PROPOSALS = "CALL.APPROVE_AND_REJECT_PROPOSALS"
     CLOSE_ROUNDS = "CALL.CLOSE_ROUNDS"
@@ -164,6 +179,9 @@ class PermissionEnum(str, Enum):
 
     LIST_INVITATIONS = "INVITATION.LIST"
     LIST_CUSTOMER_PERMISSION_REVIEWS = "CUSTOMER.LIST_PERMISSION_REVIEWS"
+
+    LIST_CALLS = "CALL.LIST"
+    LIST_ROUNDS = "ROUND.LIST"
     LIST_PROPOSALS = "PROPOSAL.LIST"
 
 
@@ -173,6 +191,8 @@ CREATE_PERMISSIONS = {
     "offering": PermissionEnum.CREATE_OFFERING_PERMISSION,
     "call": PermissionEnum.CREATE_CALL_PERMISSION,
     "proposal": PermissionEnum.MANAGE_PROPOSAL,
+    "call_organizer": PermissionEnum.CREATE_CUSTOMER_PERMISSION,
+    "service_provider": PermissionEnum.CREATE_CUSTOMER_PERMISSION,
 }
 
 
@@ -182,6 +202,8 @@ UPDATE_PERMISSIONS = {
     "offering": PermissionEnum.UPDATE_OFFERING_PERMISSION,
     "call": PermissionEnum.UPDATE_CALL_PERMISSION,
     "proposal": PermissionEnum.UPDATE_PROPOSAL_PERMISSION,
+    "call_organizer": PermissionEnum.UPDATE_CUSTOMER_PERMISSION,
+    "service_provider": PermissionEnum.UPDATE_CUSTOMER_PERMISSION,
 }
 
 
@@ -191,6 +213,8 @@ DELETE_PERMISSIONS = {
     "offering": PermissionEnum.DELETE_OFFERING_PERMISSION,
     "call": PermissionEnum.DELETE_CALL_PERMISSION,
     "proposal": PermissionEnum.DELETE_PROPOSAL_PERMISSION,
+    "call_organizer": PermissionEnum.DELETE_CUSTOMER_PERMISSION,
+    "service_provider": PermissionEnum.DELETE_CUSTOMER_PERMISSION,
 }
 
 PERMISSION_DESCRIPTION = [
@@ -513,4 +537,66 @@ PERMISSION_DESCRIPTION = [
             },
         ],
     },
+    {
+        "label": "Call management",
+        "options": [
+            {
+                "label": "List calls",
+                "value": "CALL.LIST",
+            },
+            {
+                "label": "List rounds",
+                "value": "ROUND.LIST",
+            },
+            {
+                "label": "List proposals",
+                "value": "PROPOSAL.LIST",
+            },
+            {
+                "label": "Approve and reject proposals",
+                "value": "CALL.APPROVE_AND_REJECT_PROPOSALS",
+            },
+            {
+                "label": "Close rounds",
+                "value": "CALL.CLOSE_ROUNDS",
+            },
+            {
+                "label": "Create call permission",
+                "value": "CALL.CREATE_PERMISSION",
+            },
+            {
+                "label": "Update call permission",
+                "value": "CALL.UPDATE_PERMISSION",
+            },
+            {
+                "label": "Delete call permission",
+                "value": "CALL.DELETE_PERMISSION",
+            },
+            {
+                "label": "Manage proposal",
+                "value": "PROPOSAL.MANAGE",
+            },
+            {
+                "label": "Update proposal permission",
+                "value": "PROPOSAL.UPDATE_PERMISSION",
+            },
+            {
+                "label": "Delete proposal permission",
+                "value": "PROPOSAL.DELETE_PERMISSION",
+            },
+        ],
+    },
 ]
+
+ROLE_MAP = {
+    RoleEnum.CUSTOMER_OWNER: "owner",
+    RoleEnum.CUSTOMER_MANAGER: "service_manager",
+    RoleEnum.CUSTOMER_SUPPORT: "support",
+    RoleEnum.PROJECT_ADMIN: "admin",
+    RoleEnum.PROJECT_MANAGER: "manager",
+    RoleEnum.PROJECT_MEMBER: "member",
+}
+
+
+def get_old_role_name(new_role_name: RoleEnum) -> str | None:
+    return ROLE_MAP.get(new_role_name)

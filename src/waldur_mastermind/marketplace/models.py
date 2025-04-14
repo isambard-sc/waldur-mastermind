@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
+from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models
 from django.db.models.constraints import UniqueConstraint
 from django.utils import timezone
@@ -24,11 +24,19 @@ from waldur_core.logging.mixins import LoggableMixin
 from waldur_core.media.mixins import get_upload_path
 from waldur_core.media.validators import ImageValidator
 from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.mixins import PermissionMixin
 from waldur_core.permissions.utils import get_users
 from waldur_core.quotas import fields as quotas_fields
 from waldur_core.quotas import models as quotas_models
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.mixins import CoordinatesMixin
+from waldur_mastermind.marketplace.enums import (
+    CategoryColumnWidget,
+    OfferingStates,
+    OrderStates,
+    RequestTypes,
+    ResourceStates,
+)
 from waldur_mastermind.marketplace.exceptions import PolicyException
 from waldur_pid import mixins as pid_mixins
 
@@ -40,6 +48,7 @@ User = get_user_model()
 
 
 class ServiceProvider(
+    PermissionMixin,
     core_models.UuidMixin,
     core_models.DescribableMixin,
     waldur_core.media.mixins.ImageModelMixin,
@@ -60,13 +69,13 @@ class ServiceProvider(
         max_length=255,
         blank=True,
         help_text=_(
-            "Notification subject template. " "Django template variables can be used."
+            "Notification subject template. Django template variables can be used."
         ),
     )
     lead_body = models.TextField(
         blank=True,
         help_text=_(
-            "Notification body template. " "Django template variables can be used."
+            "Notification body template. Django template variables can be used."
         ),
         validators=[core_validators.validate_template_syntax],
     )
@@ -85,7 +94,7 @@ class ServiceProvider(
         return "marketplace-service-provider"
 
     @property
-    def has_active_offerings(self):
+    def has_active_offerings(self) -> bool:
         return (
             Offering.objects.filter(customer=self.customer)
             .exclude(state=Offering.States.ARCHIVED)
@@ -93,7 +102,7 @@ class ServiceProvider(
         )
 
     @property
-    def offering_count(self):
+    def offering_count(self) -> int:
         return Offering.objects.filter(
             customer=self.customer,
             state__in=[Offering.States.ACTIVE, Offering.States.PAUSED],
@@ -241,6 +250,7 @@ class CategoryColumn(
         null=True,
         max_length=255,
         help_text=_("Widget field allows to customise table cell rendering."),
+        choices=CategoryColumnWidget.CHOICES,
     )
 
     def __str__(self):
@@ -363,7 +373,7 @@ class Offering(
     core_models.SlugMixin,
     core_models.DescribableMixin,
     quotas_models.QuotaModelMixin,
-    structure_models.PermissionMixin,
+    PermissionMixin,
     TimeStampedModel,
     core_mixins.ScopeMixin,
     LoggableMixin,
@@ -372,18 +382,8 @@ class Offering(
     waldur_core.media.mixins.ImageModelMixin,
     common_mixins.BackendMetadataMixin,
 ):
-    class States:
-        DRAFT = 1
-        ACTIVE = 2
-        PAUSED = 3
-        ARCHIVED = 4
-
-        CHOICES = (
-            (DRAFT, "Draft"),
-            (ACTIVE, "Active"),
-            (PAUSED, "Paused"),
-            (ARCHIVED, "Archived"),
-        )
+    class States(OfferingStates):
+        pass
 
     thumbnail = models.FileField(
         upload_to="marketplace_service_offering_thumbnails",
@@ -395,11 +395,6 @@ class Offering(
     vendor_details = models.TextField(blank=True)
     getting_started = models.TextField(blank=True)
     integration_guide = models.TextField(blank=True)
-    rating = models.IntegerField(
-        null=True,
-        validators=[MaxValueValidator(5), MinValueValidator(1)],
-        help_text=_("Rating is value from 1 to 5."),
-    )
     category = models.ForeignKey(
         on_delete=models.CASCADE, to=Category, related_name="offerings"
     )
@@ -452,8 +447,6 @@ class Offering(
         ),
     )
 
-    native_name = models.CharField(max_length=160, default="", blank=True)
-    native_description = models.CharField(max_length=500, default="", blank=True)
     terms_of_service = models.TextField(blank=True)
     terms_of_service_link = models.URLField(blank=True)
     privacy_policy_link = models.URLField(blank=True)
@@ -539,25 +532,25 @@ class Offering(
         return "marketplace-provider-offering"
 
     @cached_property
-    def component_factors(self):
+    def component_factors(self) -> dict[str, int]:
         # get factor from plugin components
         plugin_components = plugins.manager.get_components(self.type)
         return {c.type: c.factor for c in plugin_components}
 
     @cached_property
-    def is_usage_based(self):
+    def is_usage_based(self) -> bool:
         return self.components.filter(
             billing_type=OfferingComponent.BillingTypes.USAGE,
         ).exists()
 
-    def get_limit_components(self):
+    def get_limit_components(self) -> dict[str, "OfferingComponent"]:
         components = self.components.filter(
             billing_type=OfferingComponent.BillingTypes.LIMIT
         )
         return {component.type: component for component in components}
 
     @cached_property
-    def is_limit_based(self):
+    def is_limit_based(self) -> bool:
         if not plugins.manager.can_update_limits(self.type):
             return False
         if not self.components.filter(
@@ -567,22 +560,22 @@ class Offering(
         return True
 
     @property
-    def is_private(self):
+    def is_private(self) -> bool:
         return not self.billable and not self.shared
 
-    def get_datacite_title(self):
+    def get_datacite_title(self) -> str:
         return self.name
 
-    def get_datacite_creators_name(self):
+    def get_datacite_creators_name(self) -> str:
         return self.customer.name
 
-    def get_datacite_description(self):
+    def get_datacite_description(self) -> str:
         return self.description
 
-    def get_datacite_publication_year(self):
+    def get_datacite_publication_year(self) -> int:
         return self.created.year
 
-    def get_datacite_url(self):
+    def get_datacite_url(self) -> str:
         return core_utils.format_homeport_link(
             "marketplace-public-offering/{offering_uuid}/", offering_uuid=self.uuid.hex
         )
@@ -698,7 +691,7 @@ class OfferingComponent(
             )
 
     @property
-    def is_builtin(self):
+    def is_builtin(self) -> bool:
         return self.type in [
             c.type for c in plugins.manager.get_components(self.offering.type)
         ]
@@ -780,27 +773,27 @@ class Plan(
         return str(self.name)
 
     @property
-    def fixed_price(self):
+    def fixed_price(self) -> float:
         return self.sum_components(OfferingComponent.BillingTypes.FIXED)
 
     @property
-    def init_price(self):
+    def init_price(self) -> float:
         return self.sum_components(OfferingComponent.BillingTypes.ONE_TIME)
 
     @property
-    def switch_price(self):
+    def switch_price(self) -> float:
         return self.sum_components(OfferingComponent.BillingTypes.ON_PLAN_SWITCH)
 
-    def sum_components(self, billing_type):
+    def sum_components(self, billing_type) -> float:
         components = self.components.filter(component__billing_type=billing_type)
         return components.aggregate(sum=models.Sum("price"))["sum"] or 0
 
     @property
-    def has_connected_resources(self):
+    def has_connected_resources(self) -> bool:
         return Resource.objects.filter(plan=self).exists()
 
     @property
-    def is_active(self):
+    def is_active(self) -> bool:
         if not self.max_amount:
             return True
         usage = (
@@ -915,16 +908,8 @@ class CostEstimateMixin(models.Model):
 
 
 class RequestTypeMixin(CostEstimateMixin):
-    class Types:
-        CREATE = 1
-        UPDATE = 2
-        TERMINATE = 3
-
-        CHOICES = (
-            (CREATE, "Create"),
-            (UPDATE, "Update"),
-            (TERMINATE, "Terminate"),
-        )
+    class Types(RequestTypes):
+        pass
 
     type = models.PositiveSmallIntegerField(choices=Types.CHOICES, default=Types.CREATE)
 
@@ -940,13 +925,13 @@ class RequestTypeMixin(CostEstimateMixin):
                 self.cost += self.plan.switch_price
 
     @property
-    def fixed_price(self):
+    def fixed_price(self) -> float:
         if self.type == RequestTypeMixin.Types.CREATE:
             return self.plan.fixed_price
         return 0
 
     @property
-    def activation_price(self):
+    def activation_price(self) -> float:
         if self.type == RequestTypeMixin.Types.CREATE:
             return self.plan.init_price
         elif self.type == RequestTypeMixin.Types.UPDATE:
@@ -962,7 +947,7 @@ class SafeAttributesMixin(models.Model):
     attributes = models.JSONField(blank=True, default=dict)
 
     @property
-    def safe_attributes(self):
+    def safe_attributes(self) -> dict:
         """
         Get attributes excluding secret attributes, such as username and password.
         """
@@ -1026,22 +1011,8 @@ class Resource(
     marketplace resource model as a primary mean.
     """
 
-    class States:
-        CREATING = 1
-        OK = 2
-        ERRED = 3
-        UPDATING = 4
-        TERMINATING = 5
-        TERMINATED = 6
-
-        CHOICES = (
-            (CREATING, "Creating"),
-            (OK, "OK"),
-            (ERRED, "Erred"),
-            (UPDATING, "Updating"),
-            (TERMINATING, "Terminating"),
-            (TERMINATED, "Terminated"),
-        )
+    class States(ResourceStates):
+        pass
 
     class Permissions:
         customer_path = "project__customer"
@@ -1072,8 +1043,22 @@ class Resource(
     restrict_member_access = models.BooleanField(default=False)
     paused = models.BooleanField(default=False)
 
+    NON_LOGGABLE_FIELDS = (
+        "modified",
+        "backend_metadata",
+        "action",
+        "report",
+        "action_details",
+        "plan",
+        "object_id",
+        "content_type_id",
+        "error_message",
+        "error_traceback",
+        "current_usages",
+    )
+
     @property
-    def customer(self):
+    def customer(self) -> structure_models.Customer:
         return self.project.customer
 
     @transition(
@@ -1101,12 +1086,12 @@ class Resource(
         pass
 
     @property
-    def backend_uuid(self):
+    def backend_uuid(self) -> str | None:
         if self.scope:
             return self.scope.uuid
 
     @property
-    def backend_type(self):
+    def backend_type(self) -> str | None:
         if self.scope:
             scope_type = self.scope.get_scope_type()
             return scope_type if scope_type else "Marketplace.Resource"
@@ -1133,7 +1118,7 @@ class Resource(
         )
 
     @property
-    def invoice_registrator_key(self):
+    def invoice_registrator_key(self) -> str:
         return self.offering.type
 
     @classmethod
@@ -1144,14 +1129,14 @@ class Resource(
     def get_url_name(cls):
         return "marketplace-resource"
 
-    def get_homeport_link(self):
+    def get_homeport_link(self) -> str:
         return core_utils.format_homeport_link(
             "resource-details/{resource_uuid}/",
             resource_uuid=self.uuid.hex,
         )
 
     @property
-    def is_expired(self):
+    def is_expired(self) -> bool:
         return self.end_date and self.end_date <= timezone.datetime.today().date()
 
     def __str__(self):
@@ -1163,7 +1148,7 @@ class Resource(
         return f"{self.uuid} ({self.offering.name})"
 
     @property
-    def creation_order(self):
+    def creation_order(self) -> "Order":
         return Order.objects.filter(resource=self, type=Order.Types.CREATE).first()
 
     @property
@@ -1207,28 +1192,8 @@ class Order(
     SafeAttributesMixin,
     TimeStampedModel,
 ):
-    class States:
-        PENDING_PROJECT = 8
-        PENDING_CONSUMER = 1
-        PENDING_PROVIDER = 7
-        EXECUTING = 2
-        DONE = 3
-        ERRED = 4
-        CANCELED = 5
-        REJECTED = 6
-
-        CHOICES = (
-            (PENDING_CONSUMER, "pending-consumer"),
-            (PENDING_PROVIDER, "pending-provider"),
-            (PENDING_PROJECT, "pending-project"),
-            (EXECUTING, "executing"),
-            (DONE, "done"),
-            (ERRED, "erred"),
-            (CANCELED, "canceled"),
-            (REJECTED, "rejected"),
-        )
-
-        TERMINAL_STATES = {DONE, ERRED, CANCELED, REJECTED}
+    class States(OrderStates):
+        pass
 
     old_plan = models.ForeignKey(
         on_delete=models.CASCADE, to=Plan, related_name="+", null=True, blank=True
@@ -1263,6 +1228,9 @@ class Order(
     provider_reviewed_at = models.DateTimeField(editable=False, null=True, blank=True)
     callback_url = models.URLField(null=True, blank=True)
     termination_comment = models.CharField(blank=True, null=True, max_length=255)
+    completed_at = models.DateTimeField(
+        _("completion time"), null=True, blank=True, editable=False
+    )
 
     class Permissions:
         customer_path = "project__customer"
@@ -1457,7 +1425,7 @@ class ComponentUserUsageLimit(
         unique_together = ("resource", "component", "user")
 
     class Permissions:
-        customer_path = "resource__project__customer"
+        customer_path = ["resource__project__customer", "resource__offering__customer"]
         project_path = "resource__project"
 
 
@@ -1491,7 +1459,6 @@ class OfferingUser(
     offering = models.ForeignKey(Offering, on_delete=models.CASCADE)
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     username = models.CharField(max_length=100, blank=True, null=True)
-    propagation_date = models.DateTimeField(blank=True, null=True)
     is_restricted = models.BooleanField(
         default=False,
         help_text=_("Signal to service if the user account is restricted or not"),
@@ -1504,10 +1471,6 @@ class OfferingUser(
 
     def get_log_fields(self):
         return ("offering", "user", "username", "is_restricted")
-
-    def set_propagation_date(self):
-        now = timezone.datetime.today()
-        self.propagation_date = now
 
     def __str__(self) -> str:
         return f"{self.offering.name}: {self.username}"
@@ -1536,7 +1499,25 @@ class RobotAccount(
     LoggableMixin,
     common_mixins.BackendMetadataMixin,
     core_models.BackendMixin,
+    core_models.ErrorMessageMixin,
 ):
+    class States:
+        REQUESTED = 1
+        CREATING = 2
+        OK = 3
+        REQUESTED_DELETION = 4
+        DELETED = 5
+        ERROR = 6
+
+        CHOICES = (
+            (REQUESTED, "Requested"),
+            (CREATING, "Creating"),
+            (OK, "OK"),
+            (REQUESTED_DELETION, "Requested deletion"),
+            (DELETED, "Deleted"),
+            (ERROR, "Error"),
+        )
+
     resource = models.ForeignKey(Resource, on_delete=models.CASCADE)
     type = models.CharField(max_length=5)
     # empty string should be allowed because name is set by
@@ -1551,8 +1532,31 @@ class RobotAccount(
         related_name="+",
     )
     keys = models.JSONField(blank=True, default=list)
+    state = FSMIntegerField(default=States.REQUESTED, choices=States.CHOICES)
 
-    tracker = FieldTracker(fields=["resource", "type", "username", "users", "keys"])
+    tracker = FieldTracker(
+        fields=["resource", "type", "username", "users", "state", "keys"]
+    )
+
+    @transition(field=state, source=States.REQUESTED, target=States.CREATING)
+    def begin_creating(self):
+        pass
+
+    @transition(field=state, source=[States.CREATING, States.ERROR], target=States.OK)
+    def set_ok(self):
+        pass
+
+    @transition(field=state, source=States.OK, target=States.REQUESTED_DELETION)
+    def request_deletion(self):
+        pass
+
+    @transition(field=state, source=States.REQUESTED_DELETION, target=States.DELETED)
+    def set_deleted(self):
+        pass
+
+    @transition(field=state, source="*", target=States.ERROR)
+    def set_error(self):
+        pass
 
     class Meta:
         unique_together = ("resource", "type")
@@ -1562,6 +1566,7 @@ class RobotAccount(
         return (
             "type",
             "username",
+            "state",
         )
 
     def __str__(self):
@@ -1629,15 +1634,19 @@ class IntegrationStatus(core_models.UuidMixin):
         ORDER_PROCESSING = 1
         USAGE_REPORTING = 2
         GLAUTH_SYNC = 3
+        RESOURCE_SYNC = 4
+        EVENT_PROCESSING = 5
 
         CHOICES = (
             (ORDER_PROCESSING, "Order processing"),
             (USAGE_REPORTING, "Usage reporting"),
             (GLAUTH_SYNC, "Glauth sync"),
+            (RESOURCE_SYNC, "Resource sync"),
+            (EVENT_PROCESSING, "Event processing"),
         )
 
     agent_type = models.CharField(
-        max_length=15, choices=AgentTypes.CHOICES, default=AgentTypes.ORDER_PROCESSING
+        max_length=20, choices=AgentTypes.CHOICES, default=AgentTypes.ORDER_PROCESSING
     )
     offering = models.ForeignKey(
         Offering,
@@ -1647,6 +1656,7 @@ class IntegrationStatus(core_models.UuidMixin):
     last_request_timestamp = models.DateTimeField(
         _("time of latest backend request"), null=True, blank=True, editable=False
     )
+    service_name = models.CharField(_("Service name"), max_length=150, default="")
 
     class Meta:
         unique_together = ("offering", "agent_type")
@@ -1669,9 +1679,6 @@ class IntegrationStatus(core_models.UuidMixin):
 
     def set_last_request_timestamp(self):
         self.last_request_timestamp = timezone.now()
-
-    def get_agent_type_display(self):
-        return dict(self.AgentTypes.CHOICES).get(int(self.agent_type))
 
 
 reversion.register(Screenshot)

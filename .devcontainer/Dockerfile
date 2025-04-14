@@ -1,6 +1,6 @@
 FROM mcr.microsoft.com/devcontainers/python:1-3.11-bullseye
 
-ENV PYTHONUNBUFFERED 1
+ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && \
     apt-get install -y \
@@ -24,6 +24,6 @@ COPY pyproject.toml /tmp/mnt/pyproject.toml
 COPY poetry.lock /tmp/mnt/poetry.lock
 
 RUN python3 -m pip install --upgrade pip && \
-    pip3 install poetry==1.8.3 && \
+    pip3 install poetry==2.1.2 && \
     poetry config virtualenvs.create false && \
     cd /tmp/mnt/ && poetry install

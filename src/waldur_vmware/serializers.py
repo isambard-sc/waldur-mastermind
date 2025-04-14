@@ -80,22 +80,30 @@ def get_int_or_none(options, key):
     return value
 
 
-class LimitSerializer(serializers.Serializer):
-    def to_representation(self, service_settings):
-        fields = (
-            "max_cpu",
-            "max_cores_per_socket",
-            "max_ram",
-            "max_disk",
-            "max_disk_total",
-        )
-        result = dict()
-        for field in fields:
-            result[field] = get_int_or_none(service_settings.options, field)
-        return result
+class VmwareLimitSerializer(serializers.Serializer):
+    max_cpu = serializers.SerializerMethodField()
+    max_cores_per_socket = serializers.SerializerMethodField()
+    max_ram = serializers.SerializerMethodField()
+    max_disk = serializers.SerializerMethodField()
+    max_disk_total = serializers.SerializerMethodField()
+
+    def get_max_cpu(self, service_settings) -> int:
+        return get_int_or_none(service_settings.options, "max_cpu")
+
+    def get_max_cores_per_socket(self, service_settings) -> int:
+        return get_int_or_none(service_settings.options, "max_cores_per_socket")
+
+    def get_max_ram(self, service_settings) -> int:
+        return get_int_or_none(service_settings.options, "max_ram")
+
+    def get_max_disk(self, service_settings) -> int:
+        return get_int_or_none(service_settings.options, "max_disk")
+
+    def get_max_disk_total(self, service_settings) -> int:
+        return get_int_or_none(service_settings.options, "max_disk_total")
 
 
-class NestedPortSerializer(serializers.HyperlinkedModelSerializer):
+class VmwareNestedPortSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = models.Port
         fields = ("url", "uuid", "name", "mac_address", "network")
@@ -106,7 +114,7 @@ class NestedPortSerializer(serializers.HyperlinkedModelSerializer):
         }
 
 
-class NestedDiskSerializer(serializers.HyperlinkedModelSerializer):
+class VmwareNestedDiskSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = models.Disk
         fields = ("url", "uuid", "size")
@@ -115,7 +123,7 @@ class NestedDiskSerializer(serializers.HyperlinkedModelSerializer):
         }
 
 
-class NestedNetworkSerializer(
+class VmwareNestedNetworkSerializer(
     core_serializers.AugmentedSerializerMixin,
     core_serializers.HyperlinkedRelatedModelSerializer,
 ):
@@ -127,7 +135,7 @@ class NestedNetworkSerializer(
         }
 
 
-class VirtualMachineSerializer(structure_serializers.BaseResourceSerializer):
+class VmwareVirtualMachineSerializer(structure_serializers.BaseResourceSerializer):
     guest_os = serializers.ChoiceField(
         choices=list(constants.GUEST_OS_CHOICES.items()),
         required=False,
@@ -136,9 +144,9 @@ class VirtualMachineSerializer(structure_serializers.BaseResourceSerializer):
 
     guest_os_name = serializers.SerializerMethodField()
 
-    disks = NestedDiskSerializer(many=True, read_only=True)
+    disks = VmwareNestedDiskSerializer(many=True, read_only=True)
 
-    ports = NestedPortSerializer(many=True, read_only=True, source="port_set")
+    ports = VmwareNestedPortSerializer(many=True, read_only=True, source="port_set")
 
     template = serializers.HyperlinkedRelatedField(
         view_name="vmware-template-detail",
@@ -181,21 +189,22 @@ class VirtualMachineSerializer(structure_serializers.BaseResourceSerializer):
 
     folder_name = serializers.ReadOnlyField(source="folder.name")
 
-    networks = NestedNetworkSerializer(
+    networks = VmwareNestedNetworkSerializer(
         queryset=models.Network.objects.all(),
         many=True,
         required=False,
         write_only=True,
     )
 
-    runtime_state = serializers.SerializerMethodField()
+    runtime_state = serializers.CharField(
+        source="get_runtime_state_display", read_only=True
+    )
 
-    tools_state = serializers.ReadOnlyField(source="get_tools_state_display")
+    tools_state = serializers.CharField(
+        source="get_tools_state_display", read_only=True
+    )
 
-    def get_runtime_state(self, vm):
-        return dict(models.VirtualMachine.RuntimeStates.CHOICES).get(vm.runtime_state)
-
-    def get_guest_os_name(self, vm):
+    def get_guest_os_name(self, vm: models.VirtualMachine) -> str:
         return constants.GUEST_OS_CHOICES.get(vm.guest_os)
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
@@ -633,7 +642,7 @@ class VirtualMachineSerializer(structure_serializers.BaseResourceSerializer):
         return vm
 
 
-class PortSerializer(structure_serializers.BaseResourceSerializer):
+class VmwarePortSerializer(structure_serializers.BaseResourceSerializer):
     service_settings = serializers.HyperlinkedRelatedField(
         view_name="servicesettings-detail",
         lookup_field="uuid",
@@ -647,7 +656,7 @@ class PortSerializer(structure_serializers.BaseResourceSerializer):
     )
 
     vm_name = serializers.ReadOnlyField(source="vm.name")
-    vm_uuid = serializers.ReadOnlyField(source="vm.uuid")
+    vm_uuid = serializers.UUIDField(read_only=True, source="vm.uuid")
     network_name = serializers.ReadOnlyField(source="network.name")
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
@@ -712,7 +721,7 @@ class PortSerializer(structure_serializers.BaseResourceSerializer):
         return super().create(validated_data)
 
 
-class DiskSerializer(structure_serializers.BaseResourceSerializer):
+class VmwareDiskSerializer(structure_serializers.BaseResourceSerializer):
     service_settings = serializers.HyperlinkedRelatedField(
         view_name="servicesettings-detail",
         lookup_field="uuid",
@@ -725,7 +734,7 @@ class DiskSerializer(structure_serializers.BaseResourceSerializer):
         read_only=True,
     )
 
-    vm_uuid = serializers.ReadOnlyField(source="vm.uuid")
+    vm_uuid = serializers.UUIDField(read_only=True, source="vm.uuid")
     vm_name = serializers.ReadOnlyField(source="vm.name")
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
@@ -818,7 +827,7 @@ class DiskSerializer(structure_serializers.BaseResourceSerializer):
         return super().validate(attrs)
 
 
-class DiskExtendSerializer(serializers.ModelSerializer):
+class VmwareDiskExtendSerializer(serializers.ModelSerializer):
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.Disk
         fields = ("size",)
@@ -873,7 +882,7 @@ class DiskExtendSerializer(serializers.ModelSerializer):
         return value
 
 
-class TemplateSerializer(structure_serializers.BasePropertySerializer):
+class VmwareTemplateSerializer(structure_serializers.BasePropertySerializer):
     class Meta(structure_serializers.BasePropertySerializer.Meta):
         model = models.Template
         fields = (
@@ -896,11 +905,11 @@ class TemplateSerializer(structure_serializers.BasePropertySerializer):
 
     guest_os_name = serializers.SerializerMethodField()
 
-    def get_guest_os_name(self, template):
+    def get_guest_os_name(self, template) -> str:
         return constants.GUEST_OS_CHOICES.get(template.guest_os)
 
 
-class ClusterSerializer(structure_serializers.BasePropertySerializer):
+class VmwareClusterSerializer(structure_serializers.BasePropertySerializer):
     class Meta(structure_serializers.BasePropertySerializer.Meta):
         model = models.Cluster
         fields = (
@@ -913,7 +922,7 @@ class ClusterSerializer(structure_serializers.BasePropertySerializer):
         }
 
 
-class NetworkSerializer(structure_serializers.BasePropertySerializer):
+class VmwareNetworkSerializer(structure_serializers.BasePropertySerializer):
     class Meta(structure_serializers.BasePropertySerializer.Meta):
         model = models.Network
         fields = (
@@ -927,7 +936,7 @@ class NetworkSerializer(structure_serializers.BasePropertySerializer):
         }
 
 
-class DatastoreSerializer(structure_serializers.BasePropertySerializer):
+class VmwareDatastoreSerializer(structure_serializers.BasePropertySerializer):
     class Meta(structure_serializers.BasePropertySerializer.Meta):
         model = models.Datastore
         fields = ("url", "uuid", "name", "type", "capacity", "free_space")
@@ -936,7 +945,7 @@ class DatastoreSerializer(structure_serializers.BasePropertySerializer):
         }
 
 
-class FolderSerializer(structure_serializers.BasePropertySerializer):
+class VmwareFolderSerializer(structure_serializers.BasePropertySerializer):
     class Meta(structure_serializers.BasePropertySerializer.Meta):
         model = models.Folder
         fields = (

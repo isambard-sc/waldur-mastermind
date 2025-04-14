@@ -5,7 +5,7 @@ from rest_framework import status, test
 from rest_framework.reverse import reverse
 
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
-from waldur_core.permissions.fixtures import CustomerRole
+from waldur_core.permissions.fixtures import CustomerRole, ServiceProviderRole
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
@@ -91,7 +91,9 @@ class OrderAcceptTest(test.APITransactionTestCase):
         self.fixture.order
 
         CustomerRole.OWNER.add_permission(PermissionEnum.ACCEPT_BOOKING_REQUEST)
-        CustomerRole.MANAGER.add_permission(PermissionEnum.ACCEPT_BOOKING_REQUEST)
+        ServiceProviderRole.MANAGER.add_permission(
+            PermissionEnum.ACCEPT_BOOKING_REQUEST
+        )
 
     def accept(self, resource, user=None):
         user = user or self.fixture.owner
@@ -275,7 +277,8 @@ class ResourceGetTest(test.APITransactionTestCase):
         self.assertEqual(1, len(response.data))
         self.assertEqual(self.resource_1.uuid.hex, response.data[0]["uuid"])
         self.assertEqual(
-            self.resource_1.offering.customer.uuid, response.data[0]["provider_uuid"]
+            self.resource_1.offering.customer.uuid.hex,
+            response.data[0]["provider_uuid"],
         )
 
         response = self.client.get(
@@ -285,5 +288,5 @@ class ResourceGetTest(test.APITransactionTestCase):
         self.assertEqual(1, len(response.data))
         self.assertEqual(self.resource_3.uuid.hex, response.data[0]["uuid"])
         self.assertEqual(
-            self.resource_3.project.customer.uuid, response.data[0]["customer_uuid"]
+            self.resource_3.project.customer.uuid.hex, response.data[0]["customer_uuid"]
         )

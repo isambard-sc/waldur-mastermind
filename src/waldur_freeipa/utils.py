@@ -1,4 +1,4 @@
-from django.conf import settings
+from constance import config
 from django.core.cache import cache
 
 QUOTA_NAME = "freeipa_quota"
@@ -27,15 +27,7 @@ def release_task_status():
 
 def generate_username(username):
     # Prepend username suffix
-    prefix = settings.WALDUR_FREEIPA["USERNAME_PREFIX"]
+    prefix = config.FREEIPA_USERNAME_PREFIX
     if prefix:
         username = f"{prefix}{username}"
     return username.lower()
-
-
-def is_profile_active_for_user(user):
-    from waldur_slurm import utils
-
-    project_allocations, customer_allocations = utils.get_user_allocations(user)
-
-    return project_allocations.exists() or customer_allocations.exists()

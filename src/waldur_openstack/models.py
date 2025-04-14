@@ -96,7 +96,7 @@ class Tenant(
             "runtime_state",
         )
 
-    def get_access_url(self):
+    def get_access_url(self) -> str:
         settings = self.service_settings
         access_url = settings.get_option("access_url")
         if access_url:
@@ -317,9 +317,9 @@ class FloatingIP(core_models.RuntimeStateMixin, structure_models.BaseResource):
     address = models.GenericIPAddressField(
         null=True, blank=True, protocol="IPv4", default=None
     )
-    external_address = models.JSONField(
+    external_address = models.GenericIPAddressField(
         editable=False,
-        default=list,
+        null=True,
         help_text="An optional address that maps to floating IP's address",
     )
 
@@ -705,13 +705,6 @@ class Snapshot(core_models.ActionMixin, TenantQuotaMixin, structure_models.Stora
         Volume, related_name="snapshots", null=True, on_delete=models.CASCADE
     )
     metadata = JSONField(blank=True)
-    snapshot_schedule = models.ForeignKey(
-        "SnapshotSchedule",
-        blank=True,
-        null=True,
-        on_delete=models.SET_NULL,
-        related_name="snapshots",
-    )
 
     tracker = FieldTracker()
 
@@ -839,7 +832,7 @@ class Instance(
         ordering = ["name", "created"]
 
     @property
-    def external_ips(self):
+    def external_ips(self) -> list[str]:
         floating_ips = set(self.floating_ips.values_list("address", flat=True))
         if self.directly_connected_ips:
             floating_ips = floating_ips.union(
@@ -848,13 +841,8 @@ class Instance(
         return list(floating_ips - set(self.internal_ips))
 
     @property
-    def external_address(self):
-        external_address = set()
-
-        for a in self.floating_ips.values_list("external_address", flat=True):
-            external_address.update(set(a))
-
-        return list(external_address)
+    def external_address(self) -> set[str]:
+        return set(self.floating_ips.values_list("external_address", flat=True))
 
     @property
     def internal_ips(self):
@@ -865,7 +853,7 @@ class Instance(
         ]
 
     @property
-    def size(self):
+    def size(self) -> int:
         return self.volumes.aggregate(models.Sum("size"))["size__sum"]
 
     @classmethod
@@ -891,7 +879,7 @@ class Instance(
         }
 
     @property
-    def floating_ips(self):
+    def floating_ips(self) -> models.QuerySet[FloatingIP]:
         return FloatingIP.objects.filter(port__instance=self)
 
     @classmethod
@@ -923,13 +911,6 @@ class Backup(structure_models.BaseResource):
     )
     instance = models.ForeignKey(
         Instance, related_name="backups", on_delete=models.CASCADE
-    )
-    backup_schedule = models.ForeignKey(
-        "BackupSchedule",
-        blank=True,
-        null=True,
-        on_delete=models.SET_NULL,
-        related_name="backups",
     )
     kept_until = models.DateTimeField(
         null=True,
@@ -965,52 +946,3 @@ class BackupRestoration(core_models.UuidMixin, TimeStampedModel):
     class Permissions:
         customer_path = "backup__project__customer"
         project_path = "backup__project"
-
-
-class BaseSchedule(structure_models.BaseResource, core_models.ScheduleMixin):
-    retention_time = models.PositiveIntegerField(
-        help_text=_("Retention time in days, if 0 - resource will be kept forever")
-    )
-    maximal_number_of_resources = models.PositiveSmallIntegerField()
-    call_count = models.PositiveSmallIntegerField(
-        default=0, help_text=_("How many times a resource schedule was called.")
-    )
-
-    class Meta:
-        abstract = True
-
-
-class BackupSchedule(BaseSchedule):
-    tenant = models.ForeignKey(
-        on_delete=models.CASCADE, to=Tenant, related_name="backup_schedules"
-    )
-    instance = models.ForeignKey(
-        on_delete=models.CASCADE, to=Instance, related_name="backup_schedules"
-    )
-
-    tracker = FieldTracker()
-
-    def __str__(self):
-        return f"BackupSchedule of {self.instance}. Active: {self.is_active}"
-
-    @classmethod
-    def get_url_name(cls):
-        return "openstack-backup-schedule"
-
-
-class SnapshotSchedule(BaseSchedule):
-    tenant = models.ForeignKey(
-        on_delete=models.CASCADE, to=Tenant, related_name="snapshot_schedules"
-    )
-    source_volume = models.ForeignKey(
-        on_delete=models.CASCADE, to=Volume, related_name="snapshot_schedules"
-    )
-
-    tracker = FieldTracker()
-
-    def __str__(self):
-        return f"SnapshotSchedule of {self.source_volume}. Active: {self.is_active}"
-
-    @classmethod
-    def get_url_name(cls):
-        return "openstack-snapshot-schedule"

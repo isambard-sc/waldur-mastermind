@@ -59,7 +59,11 @@ class ServiceProviderFilter(django_filters.FilterSet):
         )
 
 
-class OfferingFilter(structure_filters.NameFilterSet, django_filters.FilterSet):
+class OfferingFilter(
+    core_filters.CreatedModifiedFilter,
+    structure_filters.NameFilterSet,
+    django_filters.FilterSet,
+):
     class Meta:
         model = models.Offering
         fields = []
@@ -218,6 +222,9 @@ class OfferingFilterMixin(django_filters.FilterSet):
         field_name="offering__uuid",
     )
     offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
+    parent_offering_uuid = django_filters.UUIDFilter(
+        field_name="offering__parent__uuid"
+    )
 
     def filter_service_manager(self, queryset, name, value):
         if not is_uuid_like(value):
@@ -266,7 +273,9 @@ class ScreenshotFilter(OfferingFilterMixin, django_filters.FilterSet):
         fields = []
 
 
-class OrderFilter(OfferingFilterMixin, django_filters.FilterSet):
+class OrderFilter(
+    core_filters.CreatedModifiedFilter, OfferingFilterMixin, django_filters.FilterSet
+):
     query = django_filters.CharFilter(method="filter_query")
     project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
     offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
@@ -283,8 +292,6 @@ class OrderFilter(OfferingFilterMixin, django_filters.FilterSet):
         view_name="marketplace-resource-detail", field_name="resource__uuid"
     )
     resource_uuid = django_filters.UUIDFilter(field_name="resource__uuid")
-    created = django_filters.DateTimeFilter(lookup_expr="gte", label="Created after")
-    modified = django_filters.DateTimeFilter(lookup_expr="gte", label="Modified after")
     can_approve_as_consumer = django_filters.BooleanFilter(
         method="filter_can_approve_as_consumer",
     )
@@ -380,8 +387,10 @@ class ResourceFilter(
     )
     o = django_filters.OrderingFilter(
         fields=(
-            "name",
-            "created",
+            ("name", "name"),
+            ("created", "created"),
+            ("project__name", "project_name"),
+            ("state", "state"),
         )
     )
 
@@ -460,7 +469,7 @@ class ResourceScopeFilterBackend(core_filters.GenericKeyFilterBackend):
         return "scope"
 
 
-class RobotAccountFilter(django_filters.FilterSet):
+class RobotAccountFilter(core_filters.CreatedModifiedFilter, django_filters.FilterSet):
     resource = core_filters.URLFilter(
         view_name="marketplace-resource-detail", field_name="resource__uuid"
     )
@@ -472,10 +481,11 @@ class RobotAccountFilter(django_filters.FilterSet):
     provider_uuid = django_filters.UUIDFilter(
         field_name="resource__offering__customer__uuid"
     )
+    state = django_filters.ChoiceFilter(choices=models.RobotAccount.States.CHOICES)
 
     class Meta:
         model = models.RobotAccount
-        fields = ["type"]
+        fields = ["type", "state"]
 
 
 class ResourceUserFilter(django_filters.FilterSet):
@@ -566,6 +576,22 @@ class ComponentUserUsageFilter(django_filters.FilterSet):
     class Meta:
         model = models.ComponentUserUsage
         fields = ["component_usage__billing_period"]
+
+
+class ComponentUserUsageLimitFilter(django_filters.FilterSet):
+    resource = core_filters.URLFilter(
+        view_name="marketplace-resource-detail",
+        field_name="resource__uuid",
+        label="Resource URL",
+    )
+    resource_uuid = django_filters.UUIDFilter(field_name="resource__uuid")
+    offering_uuid = django_filters.UUIDFilter(field_name="resource__offering__uuid")
+    component_type = django_filters.CharFilter(field_name="component__type")
+    username = django_filters.CharFilter(field_name="user__username")
+
+    class Meta:
+        model = models.ComponentUserUsageLimit
+        fields = []
 
 
 class OfferingReferralFilter(django_filters.FilterSet):
@@ -662,20 +688,9 @@ class OfferingUserFilter(OfferingFilterMixin, core_filters.CreatedModifiedFilter
     user_username = django_filters.CharFilter(
         field_name="user__username", lookup_expr="iexact"
     )
-    is_not_propagated = django_filters.BooleanFilter(
-        field_name="propagation_date", widget=BooleanWidget, lookup_expr="isnull"
-    )
-    propagated_after = django_filters.DateTimeFilter(
-        field_name="propagation_date", lookup_expr="gte"
-    )
-    propagated_before = django_filters.DateTimeFilter(
-        field_name="propagation_date", lookup_expr="lte"
-    )
     provider_uuid = django_filters.UUIDFilter(field_name="offering__customer__uuid")
     is_restricted = django_filters.BooleanFilter(field_name="is_restricted")
-    o = django_filters.OrderingFilter(
-        fields=("created", "modified", "username", "propagation_date")
-    )
+    o = django_filters.OrderingFilter(fields=("created", "modified", "username"))
     query = django_filters.CharFilter(method="filter_query")
 
     class Meta:
@@ -730,6 +745,13 @@ class CategoryFilter(django_filters.FilterSet):
         field_name="offerings__name", lookup_expr="icontains"
     )
 
+    resource_customer_uuid = django_filters.UUIDFilter(
+        method="filter_resource_customer_uuid"
+    )
+    resource_project_uuid = django_filters.UUIDFilter(
+        method="filter_resource_project_uuid"
+    )
+
     def filter_customer_uuid(self, queryset, name, value):
         states = self.request.GET.getlist("customers_offerings_state")
         offerings = models.Offering.objects.filter(customer__uuid=value)
@@ -749,6 +771,24 @@ class CategoryFilter(django_filters.FilterSet):
             "category_id", flat=True
         )
         return queryset.filter(id__in=category_ids)
+
+    def filter_resource_customer_uuid(self, queryset, name, value):
+        valid_ids = (
+            models.Resource.objects.filter(project__customer__uuid=value)
+            .exclude(state=models.Resource.States.TERMINATED)
+            .values_list("offering__category_id", flat=True)
+            .distinct()
+        )
+        return queryset.filter(id__in=valid_ids)
+
+    def filter_resource_project_uuid(self, queryset, name, value):
+        valid_ids = (
+            models.Resource.objects.filter(project__uuid=value)
+            .exclude(state=models.Resource.States.TERMINATED)
+            .values_list("offering__category_id", flat=True)
+            .distinct()
+        )
+        return queryset.filter(id__in=valid_ids)
 
 
 class CategoryColumnFilter(django_filters.FilterSet):
@@ -828,7 +868,7 @@ class MarketplaceInvoiceItemsFilter(django_filters.FilterSet):
 
 
 class IntegrationStatusFilter(OfferingFilterMixin, django_filters.FilterSet):
-    o = django_filters.OrderingFilter(fields=("last_request_timestamp"))
+    o = django_filters.OrderingFilter(fields=["last_request_timestamp"])
     agent_type = django_filters.CharFilter(field_name="agent_type")
     status = core_filters.MappedMultipleChoiceFilter(
         models.IntegrationStatus.States.CHOICES

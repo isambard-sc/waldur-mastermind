@@ -7,6 +7,7 @@ import re
 import textwrap
 import traceback
 import unicodedata
+from collections import defaultdict
 from enum import Enum
 from io import BytesIO
 
@@ -29,7 +30,7 @@ from rest_framework import serializers, status
 from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import utils as core_utils
-from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import get_users_with_permission, has_permission
 from waldur_core.structure import filters as structure_filters
@@ -509,49 +510,49 @@ def get_resource_state(state):
     return mapping.get(state, DstStates.ERRED)
 
 
-def get_marketplace_offering_uuid(serializer, scope):
+def get_marketplace_offering_uuid(serializer, scope) -> str:
     try:
         return models.Resource.objects.get(scope=scope).offering.uuid
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_offering_plugin_options(serializer, scope):
+def get_marketplace_offering_plugin_options(serializer, scope) -> dict:
     try:
         return models.Resource.objects.get(scope=scope).offering.plugin_options
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_offering_name(serializer, scope):
+def get_marketplace_offering_name(serializer, scope) -> str:
     try:
         return models.Resource.objects.get(scope=scope).offering.name
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_category_uuid(serializer, scope):
+def get_marketplace_category_uuid(serializer, scope) -> str:
     try:
         return models.Resource.objects.get(scope=scope).offering.category.uuid
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_category_name(serializer, scope):
+def get_marketplace_category_name(serializer, scope) -> str:
     try:
         return models.Resource.objects.get(scope=scope).offering.category.title
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_resource_uuid(serializer, scope):
+def get_marketplace_resource_uuid(serializer, scope) -> str:
     try:
         return models.Resource.objects.get(scope=scope).uuid
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_plan_uuid(serializer, scope):
+def get_marketplace_plan_uuid(serializer, scope) -> str:
     try:
         resource = models.Resource.objects.get(scope=scope)
         if resource.plan:
@@ -560,21 +561,21 @@ def get_marketplace_plan_uuid(serializer, scope):
         return
 
 
-def get_marketplace_resource_state(serializer, scope):
+def get_marketplace_resource_state(serializer, scope) -> str:
     try:
         return models.Resource.objects.get(scope=scope).get_state_display()
     except ObjectDoesNotExist:
         return
 
 
-def get_is_usage_based(serializer, scope):
+def get_is_usage_based(serializer, scope) -> bool:
     try:
         return models.Resource.objects.get(scope=scope).offering.is_usage_based
     except ObjectDoesNotExist:
         return
 
 
-def get_is_limit_based(serializer, scope):
+def get_is_limit_based(serializer, scope) -> bool:
     try:
         return models.Resource.objects.get(scope=scope).offering.is_limit_based
     except ObjectDoesNotExist:
@@ -876,7 +877,7 @@ def get_service_provider_user_ids(user, service_provider, customer=None):
     qs = UserRole.objects.filter(
         content_type=content_type, object_id__in=project_ids, is_active=True
     )
-    if not user.is_staff and not user.is_support:
+    if user.is_authenticated and not user.is_staff and not user.is_support:
         qs = qs.filter(user__is_active=True)
     return qs.values_list("user_id", flat=True).distinct()
 
@@ -1063,7 +1064,7 @@ def count_resources_number_change(service_provider):
     return created - terminated
 
 
-def generate_offering_password_hash(offering):
+def generate_offering_password_hash(offering: models.Offering):
     password = offering.secret_options.get("shared_user_password")
     if password:
         password_hash = hashlib.sha256()
@@ -1153,6 +1154,12 @@ def generate_glauth_records_for_offering_users(offering, offering_users):
 
         other_groups = ", ".join(group_ids)
 
+        user_disabled_status = "false"
+        # Check if user has access to non-terminated resources in offering
+        has_access = is_user_related_to_offering(offering, user)
+        if not has_access:
+            user_disabled_status = "true"
+
         record = textwrap.dedent(
             f"""
         [[users]]
@@ -1167,6 +1174,7 @@ def generate_glauth_records_for_offering_users(offering, offering_users):
           loginShell = "{login_shell}"
           homeDir = "{home_dir}"
           passsha256 = "{password_sha256}"
+          disabled = {user_disabled_status}
             [[users.customattributes]]
             preferredUsername = ["{username}"]
         """
@@ -1185,6 +1193,13 @@ def generate_glauth_records_for_offering_users(offering, offering_users):
 
 
 def generate_glauth_records_for_robot_accounts(offering, robot_accounts):
+    # make sure that only accounts in OK and requested_deletion are exposed e.g. in glauth
+    valid_states = [
+        models.RobotAccount.States.OK,
+        models.RobotAccount.States.REQUESTED_DELETION,
+    ]
+    robot_accounts = robot_accounts.filter(state__in=valid_states)
+
     robot_account_records = []
     for robot_account in robot_accounts:
         ssh_keys = robot_account.keys
@@ -1333,7 +1348,6 @@ def user_offerings_mapping(offerings):
             offering_user = models.OfferingUser.objects.create(
                 user=user, offering=offering, username=username
             )
-            offering_user.set_propagation_date()
             offering_user.save()
             logger.info("Offering user %s has been created.")
 
@@ -1443,6 +1457,7 @@ def refresh_integration_agent_status(request, agent_type):
     )
     integration_status.set_last_request_timestamp()
     integration_status.set_backend_active()
+    integration_status.service_name = request.headers.get("User-Agent", "")
     integration_status.save()
 
 
@@ -1570,3 +1585,79 @@ def sync_component_user_usage(allocation_user_usage, plugin_name):
             logger.info("%s has been created", component_user_usage)
         else:
             logger.info("%s has been updated, new usage: %s", component_usage, usage)
+
+
+def generate_resource_name(
+    project: structure_models.Project, offering: models.Offering
+):
+    resource_count = models.Resource.objects.filter(
+        project=project, offering=offering
+    ).count()
+    parts = [
+        project.customer.slug,
+        project.slug,
+        offering.slug,
+    ]
+    result = "-".join(parts)
+
+    if resource_count:
+        result += "-" + str(resource_count + 1)
+
+    return core_utils.remove_duplicate_hyphens(result)
+
+
+def notification_about_project_ending(end_date):
+    projects_by_recipient = defaultdict(list)
+    expired_projects = structure_models.Project.available_objects.exclude(
+        end_date__isnull=True
+    ).filter(end_date=end_date)
+
+    # If there are no expired projects, we don't need to send notifications
+    if not expired_projects.exists():
+        logger.info("No projects found with end_date=%s", end_date)
+        return
+
+    for project in expired_projects:
+        logger.info(
+            "Project %s (uuid=%s) has end_date=%s",
+            project.name,
+            project.uuid,
+            project.end_date,
+        )
+        project_users = (
+            project.get_users().exclude(email="").exclude(notifications_enabled=False)
+        )
+        owners = (
+            project.customer.get_users(RoleEnum.CUSTOMER_OWNER)
+            .exclude(email="")
+            .exclude(notifications_enabled=False)
+        )
+        users = set(project_users) | set(owners)
+
+        for user in users:
+            projects_by_recipient[user].append(project)
+
+    for user, projects in projects_by_recipient.items():
+        for project in projects:
+            project.url = core_utils.format_homeport_link(
+                "projects/{project_uuid}/", project_uuid=project.uuid.hex
+            )
+
+        context = {
+            "projects": projects,
+            "user": user,
+            "end_date": end_date,
+            "count_projects": len(projects),
+            "delta": (end_date - timezone.datetime.today().date()).days,
+        }
+        logger.info(
+            "Sending notification to user %s about %d projects",
+            user.email,
+            len(projects),
+        )
+        core_utils.broadcast_mail(
+            "marketplace",
+            "notification_about_project_ending",
+            context,
+            [user.email],
+        )

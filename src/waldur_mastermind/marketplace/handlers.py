@@ -1,4 +1,5 @@
 import logging
+from decimal import Decimal
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
@@ -7,14 +8,9 @@ from django.db.models import signals
 from django.utils.timezone import now
 
 from waldur_core.core import utils as core_utils
-from waldur_core.permissions.enums import RoleEnum
-from waldur_core.permissions.models import UserRole
-from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure import models as structure_models
-from waldur_core.structure.models import Customer
 from waldur_core.users import models as users_models
 from waldur_core.users.tasks import process_invitation
-from waldur_mastermind.marketplace.managers import get_connected_offerings
 from waldur_mastermind.marketplace.permissions import (
     order_should_not_be_reviewed_by_consumer,
 )
@@ -504,38 +500,6 @@ def limit_update_failed(sender, order, error_message, **kwargs):
     log.log_resource_limit_update_failed(resource)
 
 
-def add_service_manager_role_to_customer(
-    sender, instance: UserRole, current_user=None, **kwargs
-):
-    if instance.role.name == RoleEnum.OFFERING_MANAGER:
-        customer: Customer = instance.scope.customer
-        if not customer.has_user(instance.user, RoleEnum.CUSTOMER_MANAGER):
-            customer.add_user(
-                instance.user,
-                RoleEnum.CUSTOMER_MANAGER,
-                current_user,
-                instance.expiration_time,
-            )
-
-
-def drop_service_manager_role_from_customer(
-    sender, instance: UserRole, current_user=None, **kwargs
-):
-    if instance.role.name == RoleEnum.OFFERING_MANAGER:
-        customer: Customer = instance.scope.customer
-        offerings = models.Offering.objects.filter(customer=customer).values_list(
-            "id", flat=True
-        )
-        connected_offerings = get_connected_offerings(instance.user)
-        if not connected_offerings.intersection(offerings).exists():
-            customer.remove_user(instance.user, RoleEnum.CUSTOMER_MANAGER, current_user)
-    elif instance.role.name == RoleEnum.CUSTOMER_MANAGER:
-        offerings = models.Offering.objects.filter(customer=instance.scope)
-        for offering in offerings:
-            for permission in get_permissions(offering, instance.user):
-                permission.revoke(current_user)
-
-
 def update_customer_of_offering_if_project_has_been_moved(
     sender, project, old_customer, new_customer, **kwargs
 ):
@@ -668,7 +632,9 @@ def plan_component_has_been_updated(sender, instance, created=False, **kwargs):
             event_context={
                 "plan_component": instance,
                 "old_value": instance.tracker.previous("price"),
-                "new_value": instance.price,
+                "new_value": Decimal(instance.price)
+                if isinstance(instance.price, str)
+                else instance.price,
             },
         )
     if instance.tracker.has_changed("future_price"):
@@ -678,7 +644,9 @@ def plan_component_has_been_updated(sender, instance, created=False, **kwargs):
             event_context={
                 "plan_component": instance,
                 "old_value": instance.tracker.previous("future_price"),
-                "new_value": instance.future_price,
+                "new_value": Decimal(instance.future_price)
+                if isinstance(instance.future_price, str)
+                else instance.future_price,
             },
         )
     if instance.tracker.has_changed("amount"):
@@ -688,7 +656,9 @@ def plan_component_has_been_updated(sender, instance, created=False, **kwargs):
             event_context={
                 "plan_component": instance,
                 "old_value": instance.tracker.previous("amount"),
-                "new_value": instance.amount,
+                "new_value": Decimal(instance.amount)
+                if isinstance(instance.amount, str)
+                else instance.amount,
             },
         )
 
@@ -781,15 +751,7 @@ def resource_has_been_changed(sender, instance, created=False, **kwargs):
         return
 
     changed_fields = instance.tracker.changed().copy()
-    for field in (
-        "modified",
-        "backend_metadata",
-        "object_id",
-        "content_type_id",
-        "options",
-        "error_message",
-        "current_usages",
-    ):
+    for field in models.Resource.NON_LOGGABLE_FIELDS:
         changed_fields.pop(field, None)
 
     if not changed_fields:
@@ -831,7 +793,7 @@ def resource_has_been_changed(sender, instance, created=False, **kwargs):
             continue
         changed.append({"name": field, "from": old_value, "to": new_value})
 
-    log.log_marketplace_resource_has_been_changed(instance, changed)
+    log.log_resource_update_succeeded(instance, changed)
 
 
 def resource_state_has_been_changed(sender, instance, created=False, **kwargs):
@@ -904,9 +866,12 @@ def generate_changes_string(changed_dict, instance):
         changes_string += f"Robot account {instance.username} has been updated. "
 
     for key in changed_dict:
-        change_string = (
-            f"{key} had changed from {changed_dict[key]} to {getattr(instance, key)}. "
-        )
+        if key == "state":
+            old_state = models.RobotAccount(state=changed_dict[key]).get_state_display()
+            new_state = instance.get_state_display()
+            change_string = f"Robot account '{instance.username}' state changed from '{old_state}' to '{new_state}'."
+        else:
+            change_string = f"{key} had changed from {changed_dict[key]} to {getattr(instance, key)}. "
         changes_string += change_string
     return changes_string
 
@@ -950,7 +915,7 @@ def create_offering_users_when_project_role_granted(sender, instance, **kwargs):
     offerings = models.Offering.objects.filter(id__in=offering_ids)
 
     for offering in offerings:
-        if not offering.secret_options.get("service_provider_can_create_offering_user"):
+        if not offering.plugin_options.get("service_provider_can_create_offering_user"):
             logger.info(
                 "It is not allowed to create users for current offering %s.", offering
             )
@@ -985,7 +950,7 @@ def create_offering_user_for_new_resource(sender, instance, **kwargs):
         )
         return
 
-    if not offering.secret_options.get("service_provider_can_create_offering_user"):
+    if not offering.plugin_options.get("service_provider_can_create_offering_user"):
         logger.info(
             "It is not allowed to create users for current offering %s.", offering
         )
@@ -1007,10 +972,8 @@ def create_offering_user_for_new_resource(sender, instance, **kwargs):
             username=username,
         )
 
-        offering_user.set_propagation_date()
-
         utils.setup_linux_related_data(offering_user, offering)
-        offering_user.save(update_fields=["propagation_date", "backend_metadata"])
+        offering_user.save(update_fields=["backend_metadata"])
 
         logger.info("The offering user %s has been created", offering_user)
 
@@ -1051,7 +1014,7 @@ def update_offering_user_username_after_user_change(sender, instance, **kwargs):
     offering_users = models.OfferingUser.objects.filter(
         user=user,
         offering__type__in=OFFERING_USER_ALLOWED_OFFERING_TYPES,
-        offering__plugin_options__username_generation_policy=utils.UsernameGenerationPolicy.IDENTITY_CLAIM.name,
+        offering__plugin_options__username_generation_policy=utils.UsernameGenerationPolicy.IDENTITY_CLAIM.value,
     )
 
     for offering_user in offering_users:
@@ -1062,6 +1025,56 @@ def update_offering_user_username_after_user_change(sender, instance, **kwargs):
 
         utils.setup_linux_related_data(offering_user, offering)
         offering_user.save(update_fields=["username", "backend_metadata"])
+
+
+def update_offering_user_username_after_freeipa_profile_update(
+    sender, instance, created=False, **kwargs
+):
+    from waldur_freeipa.models import Profile
+
+    profile: Profile = instance
+
+    if not profile.tracker.has_changed("username") or not created:
+        return
+
+    offering_users = models.OfferingUser.objects.filter(
+        user=profile.user,
+        is_restricted=False,
+        offering__plugin_options__username_generation_policy=utils.UsernameGenerationPolicy.FREEIPA.value,
+    )
+
+    for offering_user in offering_users:
+        logger.info(
+            "Updating %s username after FreeIPA profile %s change",
+            offering_user,
+            profile,
+        )
+        new_username = utils.generate_username(profile.user, offering_user.offering)
+
+        logger.info("Setting username for %s to %s", offering_user, new_username)
+        offering_user.username = new_username
+        offering_user.save(update_fields=["username"])
+
+
+def set_order_completion_timestamp(sender, instance, created=False, **kwargs):
+    if created:
+        return
+
+    order = instance
+
+    if order.completed_at is not None:
+        return
+
+    if (
+        order.tracker.has_changed("state")
+        and order.state in models.Order.States.TERMINAL_STATES
+    ):
+        logger.debug("Setting order %s completion time", order)
+        order.completed_at = now()
+        order.save(update_fields=["completed_at"])
+
+        if order.state == models.Order.States.REJECTED:
+            tasks.notify_user_that_order_been_rejected.delay(order.uuid.hex)
 
 
 def log_offering_role_created_or_updated(sender, instance, created=False, **kwargs):

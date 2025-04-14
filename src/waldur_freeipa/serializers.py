@@ -6,7 +6,7 @@ from waldur_core.core import serializers as core_serializers
 from . import models, utils
 
 
-class ProfileSerializer(
+class FreeipaProfileSerializer(
     core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
     user = serializers.HyperlinkedRelatedField(
@@ -15,7 +15,7 @@ class ProfileSerializer(
         lookup_field="uuid",
         read_only=True,
     )
-    user_uuid = serializers.ReadOnlyField(source="user.uuid")
+    user_uuid = serializers.UUIDField(read_only=True, source="user.uuid")
     user_username = serializers.ReadOnlyField(source="user.username")
     user_full_name = serializers.ReadOnlyField(source="user.full_name")
 
@@ -49,6 +49,6 @@ class ProfileSerializer(
 
         validated_data["username"] = utils.generate_username(validated_data["username"])
 
-        validated_data["is_active"] = utils.is_profile_active_for_user(user)
+        validated_data["is_active"] = True
 
         return super().create(validated_data)

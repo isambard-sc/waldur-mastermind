@@ -21,6 +21,7 @@ from waldur_core.structure.managers import (
     filter_queryset_by_user_ip,
     filter_queryset_for_user,
     get_connected_customers,
+    get_connected_projects,
     get_customer_users,
     get_nested_customer_users,
     get_project_users,
@@ -169,7 +170,7 @@ class CustomerInFilter(django_filters.BaseInFilter, django_filters.UUIDFilter):
     pass
 
 
-class ProjectFilter(NameFilterSet):
+class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
     customer = CustomerInFilter(
         field_name="customer__uuid",
         lookup_expr="in",
@@ -189,8 +190,25 @@ class ProjectFilter(NameFilterSet):
     )
 
     description = django_filters.CharFilter(lookup_expr="icontains")
+    conceal_finished_projects = django_filters.BooleanFilter(
+        widget=BooleanWidget,
+        method="filter_conceal_finished_projects",
+        label="Conceal finished projects",
+    )
 
     query = django_filters.CharFilter(method="filter_query")
+
+    can_manage = django_filters.BooleanFilter(
+        widget=BooleanWidget,
+        method="filter_can_manage",
+        label="Return a list of projects where current user is manager or a customer owner.",
+    )
+
+    can_admin = django_filters.BooleanFilter(
+        widget=BooleanWidget,
+        method="filter_can_admin",
+        label="Return a list of projects where current user is admin.",
+    )
 
     o = django_filters.OrderingFilter(
         fields=(
@@ -216,9 +234,29 @@ class ProjectFilter(NameFilterSet):
             "customer_abbreviation",
             "description",
             "created",
+            "modified",
             "query",
             "backend_id",
         ]
+
+    def filter_can_manage(self, queryset, name, value):
+        user = self.request.user
+
+        if value is not None:
+            connected_customers = get_connected_customers(user, RoleEnum.CUSTOMER_OWNER)
+            connected_projects = get_connected_projects(user, RoleEnum.PROJECT_MANAGER)
+            queryset = queryset.filter(
+                Q(customer__in=connected_customers) | Q(id__in=connected_projects)
+            ).distinct()
+        return queryset
+
+    def filter_can_admin(self, queryset, name, value):
+        user = self.request.user
+
+        if value is not None:
+            connected_projects = get_connected_projects(user, RoleEnum.PROJECT_ADMIN)
+            queryset = queryset.filter(id__in=connected_projects)
+        return queryset
 
     def filter_query(self, queryset, name, value):
         if is_uuid_like(value):
@@ -236,45 +274,14 @@ class ProjectFilter(NameFilterSet):
             )
         return queryset.distinct()
 
-
-class CustomerUserFilter(BaseFilterBackend):
-    def filter_queryset(self, request, queryset, view):
-        customer_uuid = request.query_params.get("customer_uuid")
-        if not customer_uuid:
-            return queryset
-
-        if not is_uuid_like(customer_uuid):
-            return queryset.none()
-
-        try:
-            customer = models.Customer.objects.get(uuid=customer_uuid)
-        except models.Customer.DoesNotExist:
-            return queryset.none()
-
-        return queryset.filter(id__in=get_nested_customer_users(customer)).distinct()
-
-
-class ProjectUserFilter(BaseFilterBackend):
-    def filter_queryset(self, request, queryset, view):
-        project_uuid = request.query_params.get("project_uuid")
-        if not project_uuid:
-            return queryset
-
-        if not is_uuid_like(project_uuid):
-            return queryset.none()
-
-        try:
-            project = models.Project.objects.get(uuid=project_uuid)
-        except models.Project.DoesNotExist:
-            return queryset.none()
-
-        project_users = get_project_users(project.id)
-
-        return queryset.filter(id__in=project_users).distinct()
+    def filter_conceal_finished_projects(self, queryset, name, value):
+        if value:
+            return queryset.exclude(end_date__lt=timezone.now())
+        return queryset
 
 
 def filter_visible_users(queryset, user, extra=None):
-    if user.is_staff or user.is_support:
+    if user is None or not user.is_authenticated or user.is_staff or user.is_support:
         return queryset
     return (
         queryset.filter(is_staff=False)
@@ -332,6 +339,15 @@ class BaseUserFilter(django_filters.FilterSet):
     job_title = django_filters.CharFilter(lookup_expr="icontains")
     email = django_filters.CharFilter(lookup_expr="icontains")
     is_active = django_filters.BooleanFilter(widget=BooleanWidget)
+    modified = django_filters.DateTimeFilter(
+        lookup_expr="gte", label="Date modified after"
+    )
+    date_joined = django_filters.DateTimeFilter(
+        lookup_expr="gte", label="Date joined after"
+    )
+    agreement_date = django_filters.DateTimeFilter(
+        lookup_expr="gte", label="Agreement date after"
+    )
 
     def filter_by_full_name(self, queryset, name, value):
         return core_filters.filter_by_full_name(queryset, value)
@@ -368,6 +384,8 @@ class UserFilter(BaseUserFilter):
         method="filter_project_roles", label="Project roles"
     )
     query = django_filters.CharFilter(method="filter_query")
+    customer_uuid = django_filters.UUIDFilter(method="filter_by_customer")
+    project_uuid = django_filters.UUIDFilter(method="filter_by_project")
 
     o = core_filters.ExtendedOrderingFilter(
         fields=(
@@ -385,6 +403,23 @@ class UserFilter(BaseUserFilter):
             "is_support",
         )
     )
+
+    def filter_by_customer(self, queryset, name, value):
+        try:
+            customer = models.Customer.objects.get(uuid=value)
+        except models.Customer.DoesNotExist:
+            return queryset.none()
+
+        return queryset.filter(id__in=get_nested_customer_users(customer)).distinct()
+
+    def filter_by_project(self, queryset, name, value):
+        try:
+            project = models.Project.objects.get(uuid=value)
+        except models.Project.DoesNotExist:
+            return queryset.none()
+
+        project_users = get_project_users(project.id)
+        return queryset.filter(id__in=project_users).distinct()
 
     def filter_organization_roles(self, queryset, name, value):
         roles = self.request.GET.getlist("organization_roles")
@@ -446,7 +481,7 @@ class CustomerPermissionReviewFilter(django_filters.FilterSet):
         ]
 
 
-class SshKeyFilter(NameFilterSet):
+class SshKeyFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
     uuid = django_filters.UUIDFilter()
     user_uuid = django_filters.UUIDFilter(field_name="user__uuid")
 
@@ -617,6 +652,14 @@ class OrganizationGroupFilter(NameFilterSet):
         ]
 
 
+class UserAgreementsFilter(django_filters.FilterSet):
+    class Meta:
+        model = models.UserAgreement
+        fields = [
+            "agreement_type",
+        ]
+
+
 class UserRolesFilter(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
         customer = view.get_object()
@@ -703,6 +746,7 @@ class AccessSubnetFilter(django_filters.FilterSet):
     )
     customer_uuid = django_filters.UUIDFilter(field_name="customer__uuid")
     inet = django_filters.CharFilter(lookup_expr="icontains")
+    description = django_filters.CharFilter(lookup_expr="icontains")
 
     class Meta:
         model = models.AccessSubnet
@@ -710,4 +754,5 @@ class AccessSubnetFilter(django_filters.FilterSet):
             "customer",
             "customer_uuid",
             "inet",
+            "description",
         ]

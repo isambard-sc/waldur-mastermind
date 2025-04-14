@@ -122,11 +122,23 @@ class Invoice(
         updates = {}
 
         current_total = self.total
-        if self.total_cost != current_total:
+        # Convert to Decimal if not already and compare numeric values
+        stored_total = (
+            decimal.Decimal(self.total_cost)
+            if not isinstance(self.total_cost, decimal.Decimal)
+            else self.total_cost
+        )
+        if stored_total != current_total:
             updates["total_cost"] = current_total
 
         current_price = self.price
-        if self.total_price != current_price:
+        # Convert to Decimal if not already and compare numeric values
+        stored_price = (
+            decimal.Decimal(self.total_price)
+            if not isinstance(self.total_price, decimal.Decimal)
+            else self.total_price
+        )
+        if stored_price != current_price:
             updates["total_price"] = current_price
 
         if updates:
@@ -135,40 +147,40 @@ class Invoice(
             self.save(update_fields=list(updates.keys()))
 
     @property
-    def tax(self):
+    def tax(self) -> decimal.Decimal:
         return self.price * self.tax_percent / 100
 
     @property
-    def total(self):
+    def total(self) -> decimal.Decimal:
         return self.price + self.tax
 
     @property
-    def price(self):
+    def price(self) -> decimal.Decimal:
         return quantize_price(
             decimal.Decimal(sum(item.price for item in self.items.all()))
         )
 
     @property
-    def tax_current(self):
+    def tax_current(self) -> decimal.Decimal:
         return self.price_current * self.tax_percent / 100
 
     @property
-    def total_current(self):
+    def total_current(self) -> decimal.Decimal:
         return self.price_current + self.tax_current
 
     @property
-    def price_current(self):
+    def price_current(self) -> decimal.Decimal:
         return sum(item.price_current for item in self.items.all())
 
     @property
-    def due_date(self):
+    def due_date(self) -> datetime.date:
         if self.invoice_date:
             return self.invoice_date + datetime.timedelta(
                 days=settings.WALDUR_INVOICES["PAYMENT_INTERVAL"]
             )
 
     @property
-    def number(self):
+    def number(self) -> int:
         return 100000 + self.id
 
     def set_created(self):
@@ -192,7 +204,7 @@ class Invoice(
         return f"{self.customer} | {self.year}-{self.month}"
 
 
-def get_quantity(unit, start, end):
+def get_quantity(unit, start, end) -> decimal.Decimal:
     """
     For fixed components this method computes number of billing periods resource
     was used from the time it was purchased or from the start of current month
@@ -302,18 +314,18 @@ class InvoiceItem(
     tracker = FieldTracker()
 
     @property
-    def tax(self):
+    def tax(self) -> decimal.Decimal:
         return self.price * self.invoice.tax_percent / 100
 
     @property
-    def tax_current(self):
+    def tax_current(self) -> decimal.Decimal:
         return self.price_current * self.invoice.tax_percent / 100
 
     @property
-    def total(self):
+    def total(self) -> decimal.Decimal:
         return self.price + self.tax
 
-    def _price(self, current=False):
+    def _price(self, current=False) -> decimal.Decimal:
         """
         For components billed daily and hourly this method returns estimated price if `current` is True.
         Otherwise, it returns total price calculated using `quantity` field.
@@ -332,7 +344,7 @@ class InvoiceItem(
 
         return quantize_price(self.unit_price * decimal.Decimal(quantity))
 
-    def get_measured_unit(self):
+    def get_measured_unit(self) -> str:
         if self.measured_unit:
             return self.measured_unit
 
@@ -363,12 +375,12 @@ class InvoiceItem(
         else:
             return _("percents from a month")
 
-    def get_project_uuid(self):
+    def get_project_uuid(self) -> str:
         if self.project_uuid:
             return self.project_uuid
         return self.project.uuid
 
-    def get_project_name(self):
+    def get_project_name(self) -> str:
         if self.project_name:
             return self.project_name
         if self.project:
@@ -376,14 +388,14 @@ class InvoiceItem(
         return "N/A"
 
     @property
-    def price(self):
+    def price(self) -> decimal.Decimal:
         return self._price()
 
     @property
-    def price_current(self):
+    def price_current(self) -> decimal.Decimal:
         return self._price(current=True)
 
-    def get_plan_component(self):
+    def get_plan_component(self) -> marketplace_models.PlanComponent | None:
         plan_component_id = self.details.get("plan_component_id")
         if not plan_component_id:
             return
@@ -559,7 +571,7 @@ class BaseCredit(core_models.UuidMixin, core_models.TimeStampedModel):
     )
 
     @property
-    def time_left_factor(self):
+    def time_left_factor(self) -> decimal.Decimal:
         today = datetime.date.today()
         days_until_credit_end = decimal.Decimal(
             (self.end_date.replace(day=1) - today).days
@@ -571,7 +583,9 @@ class BaseCredit(core_models.UuidMixin, core_models.TimeStampedModel):
         days_in_current_month = decimal.Decimal(monthrange(today.year, today.month)[1])
         return min(decimal.Decimal("1"), days_in_current_month / days_until_credit_end)
 
-    def calculate_linear_expected_consumption(self, total_compensation):
+    def calculate_linear_expected_consumption(
+        self, total_compensation
+    ) -> decimal.Decimal:
         return (
             max(decimal.Decimal("0"), self.expected_consumption - total_compensation)
             * (decimal.Decimal("1") - self.time_left_factor)
@@ -579,7 +593,7 @@ class BaseCredit(core_models.UuidMixin, core_models.TimeStampedModel):
         )
 
     @property
-    def minimal_consumption(self):
+    def minimal_consumption(self) -> decimal.Decimal:
         if not self.apply_as_minimal_consumption:
             return 0
 
@@ -606,7 +620,7 @@ class CustomerCredit(BaseCredit):
         customer_path = "customer"
 
     @property
-    def allocated_to_projects(self):
+    def allocated_to_projects(self) -> float:
         return (
             ProjectCredit.objects.filter(project__customer=self.customer).aggregate(
                 sum=Sum("value")
@@ -615,7 +629,7 @@ class CustomerCredit(BaseCredit):
         )
 
     @property
-    def consumption_last_month(self):
+    def consumption_last_month(self) -> float:
         last_month = core_utils.get_last_month()
         invoice = Invoice.objects.filter(
             year=last_month.year,
@@ -643,7 +657,7 @@ class ProjectCredit(BaseCredit):
     project = models.OneToOneField(structure_models.Project, on_delete=models.CASCADE)
 
     @property
-    def consumption_last_month(self):
+    def consumption_last_month(self) -> float:
         last_month = core_utils.get_last_month()
         invoice = Invoice.objects.filter(
             year=last_month.year,

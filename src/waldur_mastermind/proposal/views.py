@@ -7,6 +7,7 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone as timezone
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import extend_schema
 from rest_framework import decorators, exceptions, response, status, viewsets
 from rest_framework import permissions as rf_permissions
 
@@ -19,15 +20,13 @@ from waldur_core.core.views import (
     ReadOnlyActionsViewSet,
 )
 from waldur_core.permissions import utils as permissions_utils
-from waldur_core.permissions.enums import PermissionEnum, RoleEnum
+from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import ProposalRole
 from waldur_core.permissions.utils import add_user, permission_factory
 from waldur_core.permissions.views import UserRoleMixin
 from waldur_core.structure import filters as structure_filters
-from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions
 from waldur_core.structure.managers import get_connected_customers
-from waldur_core.structure.models import PROJECT_NAME_LENGTH
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.views import BaseMarketplaceView, PublicViewsetMixin
 from waldur_mastermind.proposal import (
@@ -36,17 +35,18 @@ from waldur_mastermind.proposal import (
     serializers,
     utils,
 )
-from waldur_mastermind.proposal import (
-    permissions as proposal_permissions,
-)
+from waldur_mastermind.proposal import permissions as proposal_permissions
 
 from . import log
+from .serializers import ReviewSubmitSerializer
 
 User = auth.get_user_model()
 logger = logging.getLogger(__name__)
 
 
-class CallManagingOrganisationViewSet(PublicViewsetMixin, BaseMarketplaceView):
+class CallManagingOrganisationViewSet(
+    UserRoleMixin, PublicViewsetMixin, BaseMarketplaceView
+):
     lookup_field = "uuid"
     queryset = models.CallManagingOrganisation.objects.all().order_by("customer__name")
     serializer_class = serializers.CallManagingOrganisationSerializer
@@ -65,6 +65,11 @@ class CallManagingOrganisationViewSet(PublicViewsetMixin, BaseMarketplaceView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+    @extend_schema(
+        description="Return statistics for call managing organisation.",
+        request=None,
+        responses=serializers.CallManagingOrganisationStatSerializer,
+    )
     @decorators.action(detail=True)
     def stats(self, request, uuid=None):
         instance = self.get_object()
@@ -86,7 +91,6 @@ class CallManagingOrganisationViewSet(PublicViewsetMixin, BaseMarketplaceView):
         ).count()
         pending_proposals = models.Proposal.objects.filter(
             state__in=[
-                models.Proposal.States.IN_REVISION,
                 models.Proposal.States.IN_REVIEW,
                 models.Proposal.States.SUBMITTED,
             ],
@@ -153,10 +157,23 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     queryset = models.Call.objects.all()
 
-    get_queryset = permissions_utils.queryset_factory(
-        models.Call, RoleEnum.CALL_MANAGER, ordering=["created"]
-    )
+    get_queryset = permissions_utils.queryset_factory(models.Call, ordering=["created"])
 
+    @extend_schema(
+        methods=["get"],
+        operation_id="proposal_protected_calls_offerings_list",
+        request=None,
+        responses=serializers.RequestedOfferingSerializer(many=True),
+        description="List offerings for a call.",
+        filters=False,
+    )
+    @extend_schema(
+        methods=["post"],
+        operation_id="proposal_protected_calls_offerings_set",
+        request=serializers.RequestedOfferingSerializer,
+        responses=serializers.RequestedOfferingSerializer,
+        description="Create offering for a call.",
+    )
     @decorators.action(detail=True, methods=["get", "post"])
     def offerings(self, request, uuid=None):
         return self.action_list_method("requestedoffering_set")(self, request, uuid)
@@ -176,16 +193,17 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     offering_detail_serializer_class = serializers.RequestedOfferingSerializer
 
+    @extend_schema(
+        description="Activate a call.",
+        request=None,
+        responses={status.HTTP_200_OK: None},
+    )
     @decorators.action(detail=True, methods=["post"])
     def activate(self, request, uuid=None):
         call = self.get_object()
         if call.round_set.count() == 0:
             raise exceptions.ValidationError(
                 _("Call must have a round to be activated.")
-            )
-        if call.reviewers.count() == 0:
-            raise exceptions.ValidationError(
-                _("Call must have reviewers to be activated.")
             )
         call.state = models.Call.States.ACTIVE
         call.save()
@@ -200,6 +218,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         )
     ]
 
+    @extend_schema(
+        description="Archive a call.",
+        request=None,
+        responses={status.HTTP_200_OK: None},
+    )
     @decorators.action(detail=True, methods=["post"])
     def archive(self, request, uuid=None):
         call = self.get_object()
@@ -216,6 +239,21 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         )
     ]
 
+    @extend_schema(
+        methods=["get"],
+        operation_id="proposal_protected_calls_rounds_list",
+        request=None,
+        responses=serializers.ProtectedRoundSerializer(many=True),
+        description="List rounds for a call.",
+        filters=False,
+    )
+    @extend_schema(
+        methods=["post"],
+        operation_id="proposal_protected_calls_rounds_set",
+        request=serializers.ProtectedRoundSerializer,
+        responses=serializers.ProtectedRoundSerializer,
+        description="Create a round for a call.",
+    )
     @decorators.action(detail=True, methods=["get", "post"])
     def rounds(self, request, uuid=None):
         # TODO: Will be better move this to method of serializer and add tests.
@@ -334,6 +372,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        request=serializers.CallAttachDocumentsSerializer,
+        responses=None,
+        description="Attach documents to call.",
+    )
     @decorators.action(detail=True, methods=["post"])
     def attach_documents(self, request, uuid=None):
         instance = self.get_object()
@@ -361,8 +404,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             status=status.HTTP_200_OK,
         )
 
-    attach_documents_serializer_class = serializers.CallDocumentSerializer
-
+    @extend_schema(
+        request=serializers.CallDetachDocumentsSerializer,
+        responses=None,
+        description="Detach documents from call.",
+    )
     @decorators.action(detail=True, methods=["post"])
     def detach_documents(self, request, uuid=None):
         instance = self.get_object()
@@ -393,10 +439,7 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     model = models.Proposal
 
     get_queryset = permissions_utils.queryset_factory(
-        models.Proposal,
-        RoleEnum.CALL_MANAGER,
-        "round.call",
-        created_by=True,
+        models.Proposal, path="round.call", created_by=True
     )
 
     def is_creator(request, view, obj=None):
@@ -417,6 +460,11 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         serializers.ProposalUpdateProjectDetailsSerializer
     )
 
+    @extend_schema(
+        description="Update project details of a proposal.",
+        request=serializers.ProposalUpdateProjectDetailsSerializer,
+        responses={status.HTTP_200_OK: None},
+    )
     @decorators.action(detail=True, methods=["post"])
     def update_project_details(self, request, uuid=None):
         proposal = self.get_object()
@@ -435,20 +483,11 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 )
             )
 
-    @decorators.action(detail=True, methods=["post"])
-    def switch_to_team_verification(self, request, uuid=None):
-        proposal = self.get_object()
-        proposal.state = models.Proposal.States.TEAM_VERIFICATION
-        proposal.save()
-        return response.Response(status=status.HTTP_200_OK)
-
-    switch_to_team_verification_validators = [
-        core_validators.StateValidator(models.Proposal.States.DRAFT),
-        validate_resource_requests_existing,
-    ]
-
-    switch_to_team_verification_permissions = [is_creator]
-
+    @extend_schema(
+        description="Submit a proposal.",
+        request=None,
+        responses={status.HTTP_200_OK: None},
+    )
     @decorators.action(detail=True, methods=["post"])
     def submit(self, request, uuid=None):
         proposal = self.get_object()
@@ -459,36 +498,34 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             status=status.HTTP_200_OK,
         )
 
-    submit_validators = [
-        core_validators.StateValidator(models.Proposal.States.TEAM_VERIFICATION)
-    ]
+    submit_validators = [core_validators.StateValidator(models.Proposal.States.DRAFT)]
 
     submit_permissions = [is_creator]
 
     def perform_create(self, serializer):
-        proposal_round = serializer.validated_data.get("round")
-        name = serializer.validated_data.get("name")
-        call_prefix = (
-            proposal_round.call.backend_id
-            if proposal_round.call.backend_id
-            else proposal_round.call.name
+        proposal = serializer.save()
+        add_user(
+            proposal,
+            self.request.user,
+            ProposalRole.MANAGER,
+            created_by=self.request.user,
         )
-        project_name = " - ".join(
-            [call_prefix, proposal_round.start_time.strftime("%Y-%m-%d"), name]
-        )[:PROJECT_NAME_LENGTH]
-        project = structure_models.Project.objects.create(
-            customer=proposal_round.call.manager.customer,
-            name=project_name,
-        )
-        proposal = serializer.save(project=project)
-        if proposal:
-            add_user(
-                proposal,
-                self.request.user,
-                ProposalRole.MANAGER,
-                created_by=self.request.user,
-            )
 
+    @extend_schema(
+        methods=["get"],
+        operation_id="proposal_proposals_resources_list",
+        request=None,
+        responses=serializers.RequestedResourceSerializer(many=True),
+        description="List resources for a proposal.",
+        filters=False,
+    )
+    @extend_schema(
+        methods=["post"],
+        operation_id="proposal_proposals_resources_set",
+        request=serializers.RequestedResourceSerializer,
+        responses=serializers.RequestedResourceSerializer,
+        description="Create resource for a proposal.",
+    )
     @decorators.action(detail=True, methods=["get", "post"])
     def resources(self, request, uuid=None):
         return self.action_list_method("requestedresource_set")(self, request, uuid)
@@ -510,6 +547,11 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     resource_detail_serializer_class = serializers.RequestedResourceSerializer
 
+    @extend_schema(
+        description="Attach document to proposal.",
+        request=serializers.ProposalDocumentationSerializer,
+        responses=None,
+    )
     @decorators.action(detail=True, methods=["post"])
     def attach_document(self, request, uuid=None):
         proposal = self.get_object()
@@ -529,8 +571,13 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     attach_document_serializer_class = serializers.ProposalDocumentationSerializer
 
+    @extend_schema(
+        description="Approve a proposal.",
+        request=serializers.ProposalApproveSerializer,
+        responses={status.HTTP_200_OK: None},
+    )
     @decorators.action(detail=True, methods=["post"])
-    def allocate(self, request, uuid=None):
+    def approve(self, request, uuid=None):
         proposal = self.get_object()
         utils.allocate_proposal(proposal)
         proposal.state = models.Proposal.States.ACCEPTED
@@ -541,10 +588,23 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         )
         proposal.save()
         return response.Response(
-            "Proposal has been allocated.",
+            "Proposal has been approved.",
             status=status.HTTP_200_OK,
         )
 
+    approve_validators = [
+        core_validators.StateValidator(
+            models.Proposal.States.SUBMITTED,
+            models.Proposal.States.IN_REVIEW,
+            models.Proposal.States.REJECTED,
+        )
+    ]
+
+    @extend_schema(
+        description="Reject a proposal.",
+        request=serializers.ProposalApproveSerializer,
+        responses={status.HTTP_200_OK: None},
+    )
     @decorators.action(detail=True, methods=["post"])
     def reject(self, request, uuid=None):
         proposal = self.get_object()
@@ -560,53 +620,25 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             status=status.HTTP_200_OK,
         )
 
-    reject_validators = allocate_validators = [
-        core_validators.StateValidator(
-            models.Proposal.States.IN_REVISION,
-            models.Proposal.States.IN_REVIEW,
-            models.Proposal.States.SUBMITTED,
-        )
-    ]
-    reject_permissions = allocate_permissions = [
-        permission_factory(PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, ["round.call"])
-    ]
-    reject_serializer_class = allocate_serializer_class = (
-        force_approve_serializer_class
-    ) = serializers.ProposalAllocateSerializer
-
-    @decorators.action(detail=True, methods=["post"])
-    def force_approve(self, request, uuid=None):
-        proposal = self.get_object()
-        utils.allocate_proposal(proposal)
-        proposal.state = models.Proposal.States.ACCEPTED
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        proposal.allocation_comment = serializer.validated_data.get(
-            "allocation_comment", ""
-        )
-        proposal.save()
-        return response.Response(
-            "Proposal has been allocated.",
-            status=status.HTTP_200_OK,
-        )
-
-    force_approve_validators = [
+    reject_validators = [
         core_validators.StateValidator(
             models.Proposal.States.SUBMITTED,
             models.Proposal.States.IN_REVIEW,
-            models.Proposal.States.REJECTED,
         )
     ]
-
-    force_approve_permissions = [
+    reject_permissions = approve_permissions = [
         permission_factory(PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, ["round.call"])
     ]
+    reject_serializer_class = approve_serializer_class = (
+        serializers.ProposalApproveSerializer
+    )
 
 
 class ReviewViewSet(ActionsViewSet):
     lookup_field = "uuid"
-    serializer_class = serializers.ReviewSerializer
+    serializer_class = serializers.ProposalReviewSerializer
     filterset_class = filters.ReviewFilter
+    queryset = models.Review.objects.all()
     create_permissions = destroy_permissions = [permissions.is_staff]
 
     update_validators = partial_update_validators = [
@@ -642,6 +674,11 @@ class ReviewViewSet(ActionsViewSet):
 
         raise exceptions.PermissionDenied()
 
+    @extend_schema(
+        description="Accept a review, changing its state to IN_REVIEW.",
+        request=None,
+        responses={status.HTTP_200_OK: None},
+    )
     @decorators.action(detail=True, methods=["post"])
     def accept(self, request, uuid=None):
         review = self.get_object()
@@ -656,6 +693,11 @@ class ReviewViewSet(ActionsViewSet):
         core_validators.StateValidator(models.Review.States.CREATED),
     ]
 
+    @extend_schema(
+        description="Reject a review, changing its state to REJECTED.",
+        request=None,
+        responses={status.HTTP_200_OK: None},
+    )
     @decorators.action(detail=True, methods=["post"])
     def reject(self, request, uuid=None):
         review = self.get_object()
@@ -672,11 +714,19 @@ class ReviewViewSet(ActionsViewSet):
         ),
     ]
 
+    @extend_schema(
+        description="Submit a review, changing its state to SUBMITTED.",
+        request=ReviewSubmitSerializer,
+        responses={status.HTTP_200_OK: None},
+    )
     @decorators.action(detail=True, methods=["post"])
     def submit(self, request, uuid=None):
         review = self.get_object()
-        review.state = models.Review.States.SUBMITTED
-        review.save()
+        serializer = ReviewSubmitSerializer(
+            instance=review, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save(state=models.Review.States.SUBMITTED)
         return response.Response(
             "Review has been submitted.",
             status=status.HTTP_200_OK,
@@ -699,6 +749,11 @@ class ProviderRequestedOfferingViewSet(ReadOnlyActionsViewSet):
     filterset_class = filters.RequestedOfferingFilter
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
 
+    @extend_schema(
+        description="Accept a requested offering.",
+        request=None,
+        responses={status.HTTP_200_OK: None},
+    )
     @decorators.action(detail=True, methods=["post"])
     def accept(self, request, uuid=None):
         requested_offering = self.get_object()
@@ -714,6 +769,11 @@ class ProviderRequestedOfferingViewSet(ReadOnlyActionsViewSet):
         core_validators.StateValidator(models.RequestedOffering.States.REQUESTED)
     ]
 
+    @extend_schema(
+        description="Cancel a requested offering.",
+        request=None,
+        responses={status.HTTP_200_OK: None},
+    )
     @decorators.action(detail=True, methods=["post"])
     def cancel(self, request, uuid=None):
         requested_offering = self.get_object()
@@ -760,14 +820,17 @@ class ProviderRequestedResourceViewSet(ReadOnlyActionsViewSet):
 
 class RoundViewSet(ReadOnlyActionsViewSet):
     lookup_field = "uuid"
-    serializer_class = serializers.RoundSerializer
+    serializer_class = serializers.CallRoundSerializer
     filterset_class = []
     filter_backends = (DjangoFilterBackend,)
 
-    get_queryset = permissions_utils.queryset_factory(
-        models.Round, RoleEnum.CALL_MANAGER, "call"
-    )
+    get_queryset = permissions_utils.queryset_factory(models.Round, path="call")
 
+    @extend_schema(
+        description="Return list of reviewers for round.",
+        request=None,
+        responses=serializers.RoundReviewerSerializer(many=True),
+    )
     @decorators.action(detail=True)
     def reviewers(self, request, uuid=None):
         round_obj = self.get_object()
@@ -804,7 +867,7 @@ class RoundViewSet(ReadOnlyActionsViewSet):
         )
 
         page = self.paginate_queryset(users)
-        serializer = serializers.ReviewerSerializer(
+        serializer = serializers.RoundReviewerSerializer(
             page, many=True, context={"round_obj": round_obj}
         )
         return self.get_paginated_response(serializer.data)
