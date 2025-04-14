@@ -574,9 +574,10 @@ class ProjectNotification(models.Model):
     )
 
     # How many days between notifications (0 = no notifications)
+    # We default to sending notifications every fortnight
     frequency = models.PositiveSmallIntegerField(
         verbose_name=_("frequency"),
-        default=0,
+        default=14,
         help_text=_("How many days between notifications (0 = no notifications)."),
     )
 
