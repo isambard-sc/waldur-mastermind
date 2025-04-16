@@ -174,6 +174,9 @@ class OAuthViewComplete(BaseOAuthView):
         if not self.config.is_active:
             raise AuthenticationFailed("Identity provider is disabled.")
 
+        logger.info(f"Headers: {request.headers}")
+        logger.info(f"Request: {request}")
+
         access_token = " ".join(request.headers["Authorization"].split()[1:])
         refresh_token = request.headers.get("refresh_token", "")
         user_info = self.get_user_info(access_token)
