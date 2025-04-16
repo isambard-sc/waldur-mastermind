@@ -155,7 +155,7 @@ class OAuthViewComplete(BaseOAuthView):
             format_homeport_link(f"oauth_login_completed/{provider}/?token={token.key}")
         )
 
-    def get(self, request, provider):
+    def _duplicate_get(self, request, provider):
         """
         Given an authorization token from an identity provider, return a Waldur API token
         """
