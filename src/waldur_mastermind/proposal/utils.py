@@ -55,10 +55,20 @@ def allocate_proposal(proposal: proposal_models.Proposal):
     ):
         start_date = proposal.round.allocation_date
 
+    # need to create a unique short name for the project
+    short_name = f"{call_prefix}_{proposal.uuid}".replace(" ", "").lower()
+
+    # remove everything except lower-case letters, digits, underscores and hyphens
+    short_name = "".join(c for c in short_name if c.isalnum() or c in ("_", "-"))
+
+    if len(short_name) > structure_models.PROJECT_SHORT_NAME_LENGTH:
+        short_name = short_name[: structure_models.PROJECT_SHORT_NAME_LENGTH]
+
     project = structure_models.Project.objects.create(
         customer=proposal_round.call.manager.customer,
         name=project_name,
         start_date=start_date,
+        short_name=short_name,
     )
 
     if start_date:
