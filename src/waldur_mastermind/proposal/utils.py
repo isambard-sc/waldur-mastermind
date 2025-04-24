@@ -61,8 +61,8 @@ def allocate_proposal(proposal: proposal_models.Proposal):
     # remove everything except lower-case letters, digits, underscores and hyphens
     short_name = "".join(c for c in short_name if c.isalnum() or c in ("_", "-"))
 
-    if len(short_name) > structure_models.PROJECT_SHORT_NAME_LENGTH:
-        short_name = short_name[: structure_models.PROJECT_SHORT_NAME_LENGTH]
+    if len(short_name) > 50:
+        short_name = short_name[:50]
 
     project = structure_models.Project.objects.create(
         customer=proposal_round.call.manager.customer,
