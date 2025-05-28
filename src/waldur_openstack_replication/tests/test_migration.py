@@ -1,6 +1,8 @@
 from django.urls import reverse
 from rest_framework import status, test
 
+from waldur_core.core.enums import CoreStates
+from waldur_mastermind.marketplace.enums import OrderStates
 from waldur_mastermind.marketplace.models import Order, Resource
 from waldur_mastermind.marketplace.tests.factories import (
     OfferingFactory,
@@ -134,7 +136,7 @@ class MigrationTest(test.APITransactionTestCase):
         self.client.force_login(self.fixture.staff)
 
         # Change state to OK and check order creation
-        migration.state = Migration.States.OK
+        migration.state = CoreStates.OK
         migration.save()
         self.assertTrue(Order.objects.filter(resource=dst_resource).exists())
 
@@ -149,11 +151,11 @@ class MigrationTest(test.APITransactionTestCase):
         self.client.force_login(self.fixture.staff)
 
         # Change state to ERRED and check order creation
-        migration.state = Migration.States.ERRED
+        migration.state = CoreStates.ERRED
         migration.save()
         self.assertTrue(
             Order.objects.filter(
-                resource=dst_resource, state=Order.States.ERRED
+                resource=dst_resource, state=OrderStates.ERRED
             ).exists()
         )
 

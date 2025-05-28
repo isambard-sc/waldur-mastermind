@@ -30,7 +30,9 @@ from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.validators import BackendURLValidator, validate_x509_certificate
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.quotas.models import SharedQuotaMixin
 from waldur_core.quotas.serializers import QuotaSerializer
 from waldur_core.structure import models as structure_models
@@ -384,6 +386,116 @@ class DebugSecurityGroupRuleSerializer(BaseSecurityGroupRuleSerializer):
         model = models.SecurityGroupRule
 
 
+def validate_security_group_rule(rule):
+    ethertype = rule.ethertype
+    protocol = rule.protocol
+    from_port = rule.from_port
+    to_port = rule.to_port
+    cidr = rule.cidr
+    # for managed rancher remote group is not used
+    remote_group = getattr(rule, "remote_group", None)
+
+    if cidr:
+        if ethertype == models.SecurityGroupRule.IPv4 and not is_valid_ipv4_cidr(cidr):
+            raise serializers.ValidationError(
+                {
+                    "cidr": _(
+                        "Expected CIDR format: <0-255>.<0-255>.<0-255>.<0-255>/<0-32>"
+                    )
+                }
+            )
+        elif ethertype == models.SecurityGroupRule.IPv6 and not is_valid_ipv6_cidr(
+            cidr
+        ):
+            raise serializers.ValidationError(
+                {
+                    "cidr": _(
+                        "IPv6 addresses are represented as eight groups, separated by colons."
+                    )
+                }
+            )
+
+    if cidr and remote_group:
+        raise serializers.ValidationError(
+            _("You can specify either the remote_group_id or cidr attribute, not both.")
+        )
+
+    if to_port is None:
+        raise serializers.ValidationError({"to_port": _("Empty value is not allowed.")})
+
+    if from_port is None:
+        raise serializers.ValidationError(
+            {"from_port": _("Empty value is not allowed.")}
+        )
+
+    if protocol == "icmp":
+        if from_port is not None and not -1 <= from_port <= 255:
+            raise serializers.ValidationError(
+                {
+                    "from_port": _("Value should be in range [-1, 255], found %d")
+                    % from_port
+                }
+            )
+        if to_port is not None and not -1 <= to_port <= 255:
+            raise serializers.ValidationError(
+                {"to_port": _("Value should be in range [-1, 255], found %d") % to_port}
+            )
+
+    elif protocol in ("tcp", "udp"):
+        if from_port is not None and to_port is not None:
+            if from_port > to_port:
+                raise serializers.ValidationError(
+                    _('"from_port" should be less or equal to "to_port"')
+                )
+        if from_port == -1 and to_port != -1:
+            raise serializers.ValidationError(
+                _('"from_port" should not be -1 if "to_port" is defined.')
+            )
+        if from_port is not None and from_port != -1 and from_port < 1:
+            raise serializers.ValidationError(
+                {
+                    "from_port": _("Value should be in range [1, 65535], found %d")
+                    % from_port
+                }
+            )
+        if to_port is not None and to_port != -1 and to_port < 1:
+            raise serializers.ValidationError(
+                {
+                    "to_port": _("Value should be in range [1, 65535], found %d")
+                    % to_port
+                }
+            )
+
+    elif protocol == "":
+        # See also: https://github.com/openstack/neutron/blob/af130e79cbe5d12b7c9f9f4dcbcdc8d972bfcfd4/neutron/db/securitygroups_db.py#L500
+
+        if from_port != -1:
+            raise serializers.ValidationError(
+                {
+                    "from_port": _(
+                        "Port range is not supported if protocol is not specified."
+                    )
+                }
+            )
+
+        if to_port != -1:
+            raise serializers.ValidationError(
+                {
+                    "to_port": _(
+                        "Port range is not supported if protocol is not specified."
+                    )
+                }
+            )
+
+    else:
+        raise serializers.ValidationError(
+            {
+                "protocol": _("Value should be one of (tcp, udp, icmp), found %s")
+                % protocol
+            }
+        )
+
+
 class OpenStackSecurityGroupRuleSerializer(
     BaseSecurityGroupRuleSerializer, serializers.HyperlinkedModelSerializer
 ):
@@ -399,122 +511,7 @@ class OpenStackSecurityGroupRuleSerializer(
         Please note that validate function accepts rule object instead of validated data
         because it is used as a child of list serializer.
         """
-        ethertype = rule.ethertype
-        protocol = rule.protocol
-        from_port = rule.from_port
-        to_port = rule.to_port
-        cidr = rule.cidr
-        remote_group = rule.remote_group
-
-        if cidr:
-            if ethertype == models.SecurityGroupRule.IPv4 and not is_valid_ipv4_cidr(
-                cidr
-            ):
-                raise serializers.ValidationError(
-                    {
-                        "cidr": _(
-                            "Expected CIDR format: <0-255>.<0-255>.<0-255>.<0-255>/<0-32>"
-                        )
-                    }
-                )
-            elif ethertype == models.SecurityGroupRule.IPv6 and not is_valid_ipv6_cidr(
-                cidr
-            ):
-                raise serializers.ValidationError(
-                    {
-                        "cidr": _(
-                            "IPv6 addresses are represented as eight groups, separated by colons."
-                        )
-                    }
-                )
-
-        if cidr and remote_group:
-            raise serializers.ValidationError(
-                _(
-                    "You can specify either the remote_group_id or cidr attribute, not both."
-                )
-            )
-
-        if to_port is None:
-            raise serializers.ValidationError(
-                {"to_port": _("Empty value is not allowed.")}
-            )
-
-        if from_port is None:
-            raise serializers.ValidationError(
-                {"from_port": _("Empty value is not allowed.")}
-            )
-
-        if protocol == "icmp":
-            if from_port is not None and not -1 <= from_port <= 255:
-                raise serializers.ValidationError(
-                    {
-                        "from_port": _("Value should be in range [-1, 255], found %d")
-                        % from_port
-                    }
-                )
-            if to_port is not None and not -1 <= to_port <= 255:
-                raise serializers.ValidationError(
-                    {
-                        "to_port": _("Value should be in range [-1, 255], found %d")
-                        % to_port
-                    }
-                )
-
-        elif protocol in ("tcp", "udp"):
-            if from_port is not None and to_port is not None:
-                if from_port > to_port:
-                    raise serializers.ValidationError(
-                        _('"from_port" should be less or equal to "to_port"')
-                    )
-            if from_port == -1 and to_port != -1:
-                raise serializers.ValidationError(
-                    _('"from_port" should not be -1 if "to_port" is defined.')
-                )
-            if from_port is not None and from_port != -1 and from_port < 1:
-                raise serializers.ValidationError(
-                    {
-                        "from_port": _("Value should be in range [1, 65535], found %d")
-                        % from_port
-                    }
-                )
-            if to_port is not None and to_port != -1 and to_port < 1:
-                raise serializers.ValidationError(
-                    {
-                        "to_port": _("Value should be in range [1, 65535], found %d")
-                        % to_port
-                    }
-                )
-
-        elif protocol == "":
-            # See also: https://github.com/openstack/neutron/blob/af130e79cbe5d12b7c9f9f4dcbcdc8d972bfcfd4/neutron/db/securitygroups_db.py#L500
-
-            if from_port != -1:
-                raise serializers.ValidationError(
-                    {
-                        "from_port": _(
-                            "Port range is not supported if protocol is not specified."
-                        )
-                    }
-                )
-
-            if to_port != -1:
-                raise serializers.ValidationError(
-                    {
-                        "to_port": _(
-                            "Port range is not supported if protocol is not specified."
-                        )
-                    }
-                )
-
-        else:
-            raise serializers.ValidationError(
-                {
-                    "protocol": _("Value should be one of (tcp, udp, icmp), found %s")
-                    % protocol
-                }
-            )
-
+        validate_security_group_rule(rule)
         return rule
 
 
@@ -1126,31 +1123,39 @@ class OpenStackFixedIpSerializer(serializers.Serializer):
     ip_address = serializers.IPAddressField()
     subnet_id = serializers.CharField()
 
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        subnet_id = attrs.get("subnet_id")
+        port_ip = attrs.get("ip_address")
+
+        try:
+            subnet = models.SubNet.objects.get(backend_id=subnet_id)
+        except models.SubNet.DoesNotExist:
+            raise serializers.ValidationError(_("Subnet with this ID does not exist."))
+
+        ip_addr = ip_address(port_ip)
+
+        if subnet.allocation_pools:
+            in_allocation_pool = False
+            for pool in subnet.allocation_pools:
+                start_ip = ip_address(pool["start"])
+                end_ip = ip_address(pool["end"])
+                if start_ip <= ip_addr <= end_ip:
+                    in_allocation_pool = True
+                    break
+
+            if not in_allocation_pool:
+                logger.info(
+                    "Requested IP address %s is outside the allocation pools.",
+                    ip_address,
+                )
+
+        return attrs
+
 
 @extend_schema_field(OpenStackFixedIpSerializer(many=True))
 class OpenStackFixedIpField(serializers.JSONField):
     pass
-
-
-class OpenStackRouterSerializer(structure_serializers.BaseResourceSerializer):
-    routes = OpenStackStaticRouteSerializer(many=True)
-    tenant_name = serializers.CharField(source="tenant.name", read_only=True)
-    tenant_uuid = serializers.UUIDField(source="tenant.uuid", read_only=True)
-    fixed_ips = OpenStackFixedIpField(read_only=True)
-
-    class Meta:
-        model = models.Router
-        fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
-            "tenant",
-            "tenant_name",
-            "tenant_uuid",
-            "routes",
-            "fixed_ips",
-        )
-        extra_kwargs = dict(
-            url={"lookup_field": "uuid", "view_name": "openstack-router-detail"},
-            tenant={"lookup_field": "uuid", "view_name": "openstack-tenant-detail"},
-        )
 
 
 class OpenStackPortNestedSecurityGroupSerializer(serializers.ModelSerializer):
@@ -1164,7 +1169,7 @@ class OpenStackPortSerializer(structure_serializers.BaseResourceActionSerializer
     tenant_uuid = serializers.UUIDField(source="tenant.uuid", read_only=True)
     network_name = serializers.CharField(source="network.name", read_only=True)
     network_uuid = serializers.UUIDField(source="network.uuid", read_only=True)
-    allowed_address_pairs = OpenStackAllowedAddressPairField(read_only=True)
+    allowed_address_pairs = OpenStackAllowedAddressPairField(required=False)
     floating_ips = serializers.HyperlinkedRelatedField(
         view_name="openstack-fip-detail",
         lookup_field="uuid",
@@ -1173,7 +1178,7 @@ class OpenStackPortSerializer(structure_serializers.BaseResourceActionSerializer
     )
     fixed_ips = OpenStackFixedIpField(required=False)
     security_groups = OpenStackPortNestedSecurityGroupSerializer(
-        many=True, read_only=True
+        many=True, required=False
     )
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
@@ -1193,31 +1198,51 @@ class OpenStackPortSerializer(structure_serializers.BaseResourceActionSerializer
             "device_owner",
             "port_security_enabled",
             "security_groups",
+            "admin_state_up",
+            "status",
+        )
+        protected_fields = (
+            structure_serializers.BaseResourceSerializer.Meta.protected_fields
+            + (
+                "network",
+                "port_security_enabled",
+                "fixed_ips",
+                "mac_address",
+                "allowed_address_pairs",
+            )
         )
         read_only_fields = (
             structure_serializers.BaseResourceSerializer.Meta.read_only_fields
             + (
                 "tenant",
                 "allowed_address_pairs",
-                "service_settings",
-                "project",
                 "device_id",
                 "device_owner",
-                "port_security_enabled",
                 "security_groups",
+                "admin_state_up",
+                "status",
             )
         )
+        # Network and subnet should be writable for creation
         extra_kwargs = dict(
             url={"lookup_field": "uuid", "view_name": "openstack-port-detail"},
             tenant={"lookup_field": "uuid", "view_name": "openstack-tenant-detail"},
             network={"lookup_field": "uuid", "view_name": "openstack-network-detail"},
+            subnet={"lookup_field": "uuid", "view_name": "openstack-subnet-detail"},
         )
 
     def validate(self, attrs):
         if self.instance:
             return attrs
+
         fixed_ips = attrs.get("fixed_ips")
-        network: models.Network = self.context["view"].get_object()
+        network = attrs.get("network")
+
+        if not network:
+            raise serializers.ValidationError(
+                _("Network must be specified for creation of a port.")
+            )
+
         if fixed_ips:
             for fixed_ip in fixed_ips:
                 if "ip_address" not in fixed_ip and "subnet_id" not in fixed_ip:
@@ -1239,13 +1264,6 @@ class OpenStackPortSerializer(structure_serializers.BaseResourceActionSerializer
                         _("ip_address field must not be blank. Got %(fixed_ip)s.")
                         % {"fixed_ip": fixed_ip}
                     )
-
-                if fixed_ip.get("subnet_id") == "":
-                    raise serializers.ValidationError(
-                        _("subnet_id field must not be blank. Got %(fixed_ip)s.")
-                        % {"fixed_ip": fixed_ip}
-                    )
-
                 if "ip_address" in fixed_ip:
                     validate_ipv46_address(fixed_ip["ip_address"])
 
@@ -1265,12 +1283,83 @@ class OpenStackPortSerializer(structure_serializers.BaseResourceActionSerializer
                                 }
                             }
                         )
+
         attrs["service_settings"] = network.service_settings
         attrs["project"] = network.project
         attrs["network"] = network
         attrs["tenant"] = network.tenant
 
         return super().validate(attrs)
+
+
+class NetworkRBACPolicySerializer(
+    core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
+):
+    network = serializers.HyperlinkedRelatedField(
+        view_name="openstack-network-detail",
+        lookup_field="uuid",
+        read_only=True,
+    )
+
+    target_tenant = serializers.HyperlinkedRelatedField(
+        view_name="openstack-tenant-detail",
+        lookup_field="uuid",
+        queryset=models.Tenant.objects.filter(state=CoreStates.OK).all(),
+    )
+    url = serializers.HyperlinkedIdentityField(
+        view_name="openstack-network-rbac-policy-detail", lookup_field="uuid"
+    )
+    network_name = serializers.CharField(source="network.name", read_only=True)
+    target_tenant_name = serializers.CharField(
+        source="target_tenant.name", read_only=True
+    )
+
+    class Meta:
+        model = models.NetworkRBACPolicy
+        fields = (
+            "url",
+            "uuid",
+            "network",
+            "network_name",
+            "target_tenant",
+            "target_tenant_name",
+            "backend_id",
+            "policy_type",
+            "created",
+        )
+        read_only_fields = ("uuid", "created", "backend_id")
+
+    def validate_target_tenant(self, target_tenant):
+        network = self.context.get("network")
+        if (
+            network
+            and target_tenant.service_settings != network.tenant.service_settings
+        ):
+            raise serializers.ValidationError(
+                _(
+                    "Target tenant must belong to the same service settings as the network's tenant."
+                )
+            )
+        return target_tenant
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        network = self.context.get("network")
+        if network:
+            target_tenant = attrs["target_tenant"]
+            policy_type = attrs["policy_type"]
+
+            # Check if policy with the same network, tenant and type already exists
+            if models.NetworkRBACPolicy.objects.filter(
+                network=network, target_tenant=target_tenant, policy_type=policy_type
+            ).exists():
+                raise serializers.ValidationError(
+                    _(
+                        "Policy with this network, target tenant and policy type already exists."
+                    )
+                )
+
+        return attrs
 
 
 class OpenStackNetworkSerializer(
@@ -1280,6 +1369,7 @@ class OpenStackNetworkSerializer(
     subnets = OpenStackNestedSubNetSerializer(many=True, read_only=True)
     tenant_name = serializers.CharField(source="tenant.name", read_only=True)
     tenant_uuid = serializers.UUIDField(source="tenant.uuid", read_only=True)
+    rbac_policies = NetworkRBACPolicySerializer(many=True, read_only=True)
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.Network
@@ -1292,6 +1382,7 @@ class OpenStackNetworkSerializer(
             "segmentation_id",
             "subnets",
             "mtu",
+            "rbac_policies",
         )
         read_only_fields = (
             structure_serializers.BaseResourceSerializer.Meta.read_only_fields
@@ -1303,6 +1394,7 @@ class OpenStackNetworkSerializer(
                 "mtu",
                 "service_settings",
                 "project",
+                "rbac_policies",
             )
         )
         extra_kwargs = dict(
@@ -1400,7 +1492,7 @@ class OpenStackSubNetSerializer(structure_serializers.BaseResourceActionSerializ
         fields = super().get_fields()
 
         # Make cidr read-only on update
-        if self.instance:
+        if self.instance and "cidr" in fields:
             fields["cidr"].read_only = True
 
         return fields
@@ -1412,6 +1504,10 @@ class OpenStackSubNetSerializer(structure_serializers.BaseResourceActionSerializ
                     "These parameters are mutually exclusive: disable_gateway and gateway_ip."
                 )
             )
+
+        if attrs.get("disable_gateway"):
+            # clean the gateway ip
+            attrs["gateway_ip"] = None
 
         if "cidr" not in attrs:
             attrs["cidr"] = (
@@ -1574,12 +1670,23 @@ class OpenStackTenantChangePasswordSerializer(serializers.Serializer):
 class OpenStackNestedPortSerializer(
     core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
+    url = serializers.HyperlinkedIdentityField(
+        view_name="openstack-port-detail", lookup_field="uuid"
+    )
     allowed_address_pairs = OpenStackAllowedAddressPairField(read_only=True)
-    fixed_ips = OpenStackFixedIpField(read_only=True)
+    fixed_ips = OpenStackFixedIpField(required=False)
+    port = serializers.HyperlinkedRelatedField(
+        view_name="openstack-port-detail",
+        lookup_field="uuid",
+        queryset=models.Port.objects.filter(status="DOWN"),
+        write_only=True,
+        required=False,
+    )
 
     class Meta:
         model = models.Port
         fields = (
+            "url",
             "fixed_ips",
             "mac_address",
             "subnet",
@@ -1590,9 +1697,9 @@ class OpenStackNestedPortSerializer(
             "allowed_address_pairs",
             "device_id",
             "device_owner",
+            "port",
         )
         read_only_fields = (
-            "fixed_ips",
             "mac_address",
             "subnet_uuid",
             "subnet_name",
@@ -1606,22 +1713,115 @@ class OpenStackNestedPortSerializer(
             "subnet": ("uuid", "name", "description", "cidr"),
         }
         extra_kwargs = {
+            "url": {"lookup_field": "uuid", "view_name": "openstack-port-detail"},
             "subnet": {
                 "lookup_field": "uuid",
                 "view_name": "openstack-subnet-detail",
             },
         }
 
+    def validate_fixed_ips(self, value):
+        OpenStackFixedIpSerializer(data=value, many=True).is_valid(raise_exception=True)
+        return value
+
     def to_internal_value(self, data):
         internal_value = super().to_internal_value(data)
-        subnet: models.SubNet = internal_value["subnet"]
+        port: models.Port = internal_value.get("port")
+
+        if port:
+            return port
+
+        subnet: models.SubNet = internal_value.get("subnet")
+        fixed_ips = internal_value.get("fixed_ips")
         return models.Port(
             subnet=subnet,
             network=subnet.network,
             tenant=subnet.tenant,
             project=subnet.project,
             service_settings=subnet.service_settings,
+            fixed_ips=fixed_ips,
         )
+
+
+class OpenStackRouterSerializer(structure_serializers.BaseResourceSerializer):
+    routes = OpenStackStaticRouteSerializer(many=True)
+    tenant_name = serializers.CharField(source="tenant.name", read_only=True)
+    tenant_uuid = serializers.UUIDField(source="tenant.uuid", read_only=True)
+    fixed_ips = OpenStackFixedIpField(read_only=True)
+    ports = OpenStackNestedPortSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = models.Router
+        fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
+            "tenant",
+            "tenant_name",
+            "tenant_uuid",
+            "routes",
+            "fixed_ips",
+            "ports",
+        )
+        extra_kwargs = dict(
+            url={"lookup_field": "uuid", "view_name": "openstack-router-detail"},
+            tenant={"lookup_field": "uuid", "view_name": "openstack-tenant-detail"},
+        )
+
+
+class CreateRouterSerializer(serializers.HyperlinkedModelSerializer):
+    name = serializers.CharField()
+    project = serializers.HyperlinkedRelatedField(
+        view_name="project-detail",
+        lookup_field="uuid",
+        read_only=True,
+    )
+    service_settings = serializers.HyperlinkedRelatedField(
+        view_name="servicesettings-detail",
+        lookup_field="uuid",
+        read_only=True,
+    )
+    uuid = serializers.UUIDField(read_only=True)
+    url = serializers.HyperlinkedIdentityField(
+        view_name="openstack-router-detail", lookup_field="uuid"
+    )
+
+    class Meta:
+        model = models.Router
+        fields = (
+            "url",
+            "uuid",
+            "tenant",
+            "name",
+            "project",
+            "service_settings",
+        )
+        extra_kwargs = dict(
+            tenant={"lookup_field": "uuid", "view_name": "openstack-tenant-detail"},
+        )
+
+    def validate_tenant(self, tenant):
+        user = self.context["request"].user
+        if not (
+            user.is_staff
+            or tenant.project.customer.has_user(user, CustomerRole.OWNER)
+            or tenant.project.has_user(user, ProjectRole.ADMIN)
+            or tenant.project.has_user(user, ProjectRole.MANAGER)
+        ):
+            raise serializers.ValidationError(
+                "You do not have permission to create router for this tenant."
+            )
+
+        if tenant.state != CoreStates.OK:
+            raise serializers.ValidationError(
+                "Router can be created only for tenant in OK state."
+            )
+
+        return tenant
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        tenant = attrs.get("tenant")
+        attrs["project"] = tenant.project
+        attrs["service_settings"] = tenant.service_settings
+        return attrs
 
 
 class OpenStackNestedFloatingIPSerializer(
@@ -1841,8 +2041,8 @@ class OpenStackVolumeSerializer(structure_serializers.BaseResourceSerializer):
                     }
                 )
             # type validation
-            type = attrs.get("type")
-            if type and not is_volume_type_valid_for_tenant(type, tenant):
+            volume_type = attrs.get("type")
+            if volume_type and not is_volume_type_valid_for_tenant(volume_type, tenant):
                 raise serializers.ValidationError(
                     {"type": _("Volume type is not visible in tenant.")}
                 )
@@ -1926,7 +2126,7 @@ class VolumeAttachSerializer(
 
     def validate_instance(self, instance):
         States, RuntimeStates = (
-            models.Instance.States,
+            CoreStates,
             models.Instance.RuntimeStates,
         )
         if instance.state != States.OK or instance.runtime_state not in (
@@ -1974,15 +2174,15 @@ class OpenStackVolumeRetypeSerializer(serializers.HyperlinkedModelSerializer):
         required=True,
     )
 
-    def validate_type(self, type: models.VolumeType):
+    def validate_type(self, volume_type: models.VolumeType):
         volume: models.Volume = self.instance
-        if type == volume.type:
+        if volume_type == volume.type:
             raise serializers.ValidationError(_("Volume already has requested type."))
-        if not is_volume_type_valid_for_tenant(type, volume.tenant):
+        if not is_volume_type_valid_for_tenant(volume_type, volume.tenant):
             raise serializers.ValidationError(
                 _("Volume type is not visible in tenant.")
             )
-        return type
+        return volume_type
 
     @transaction.atomic
     def update(self, instance: models.Volume, validated_data):
@@ -2210,8 +2410,15 @@ def _validate_instance_ports(ports, tenant):
     if not ports:
         return
     subnets = [port.subnet for port in ports]
+    tenants_ids = list(
+        models.NetworkRBACPolicy.objects.filter(target_tenant=tenant).values_list(
+            "network__tenant", flat=True
+        )
+    )
+    tenants_ids.append(tenant.id)
+
     for subnet in subnets:
-        if subnet.tenant != tenant:
+        if subnet.tenant.id not in tenants_ids:
             message = (
                 _("Subnet %s does not belong to the same tenant as instance.") % subnet
             )
@@ -2268,7 +2475,7 @@ def _validate_instance_floating_ips(
             raise serializers.ValidationError({"floating_ips": message})
         if not floating_ip:
             continue
-        if floating_ip.state == models.FloatingIP.States.CREATION_SCHEDULED:
+        if floating_ip.state == CoreStates.CREATION_SCHEDULED:
             message = gettext(
                 "Floating IP %s is already booked for another instance creation"
             )
@@ -2367,7 +2574,7 @@ def _connect_floating_ip_to_instance(
             )
             floating_ip.increase_backend_quotas_usage(validate=True)
     if floating_ip.backend_id:
-        floating_ip.state = models.FloatingIP.States.UPDATE_SCHEDULED
+        floating_ip.state = CoreStates.UPDATE_SCHEDULED
     floating_ip.port = models.Port.objects.filter(
         instance=instance, subnet=subnet
     ).first()
@@ -2422,7 +2629,7 @@ class OpenStackInstanceSerializer(structure_serializers.VirtualMachineSerializer
         queryset=models.SecurityGroup.objects.all(), many=True, required=False
     )
     server_group = OpenStackNestedServerGroupSerializer(
-        queryset=models.ServerGroup.objects.all(), required=False
+        queryset=models.ServerGroup.objects.all(), required=False, allow_null=True
     )
     ports = OpenStackNestedPortSerializer(many=True, required=True)
     floating_ips = OpenStackNestedFloatingIPSerializer(
@@ -2944,7 +3151,7 @@ class OpenStackInstancePortsUpdateSerializer(serializers.Serializer):
         ports = validated_data["ports"]
         new_subnets = [ip.subnet for ip in ports]
         # delete stale ports
-        models.Port.objects.filter(instance=instance).exclude(
+        models.Port.objects.filter(instance=instance, network__isnull=False).exclude(
             subnet__in=new_subnets
         ).delete()
         # create new ports
@@ -3348,3 +3555,80 @@ class OpenStackBackendVolumesSerializer(serializers.ModelSerializer):
 
 class OpenStackInstanceFloatingIpsSerializer(serializers.ListSerializer):
     child = OpenStackNestedFloatingIPSerializer(read_only=True)
+
+
+class OpenStackPortIPUpdateSerializer(serializers.Serializer):
+    subnet = serializers.HyperlinkedRelatedField(
+        queryset=models.SubNet.objects.all(),
+        view_name="openstack-subnet-detail",
+        lookup_field="uuid",
+        write_only=True,
+    )
+    ip_address = serializers.IPAddressField()
+
+    def validate(self, attrs):
+        subnet = attrs.get("subnet")
+        ip = attrs.get("ip_address")
+
+        port = self.context.get("port")
+        if port and subnet.network_id != port.network_id:
+            raise serializers.ValidationError(
+                {"subnet": "Subnet does not belong to the same network as the port."}
+            )
+
+        if subnet.allocation_pools:
+            ip_addr = ip_address(ip)
+            in_pool = False
+            for pool in subnet.allocation_pools:
+                start_ip = ip_address(pool["start"])
+                end_ip = ip_address(pool["end"])
+                if start_ip <= ip_addr and ip_addr <= end_ip:
+                    in_pool = True
+                    break
+            if not in_pool:
+                raise serializers.ValidationError(
+                    {"ip_address": "IP address is outside of allocation pools."}
+                )
+        return attrs
+
+
+class OpenStackRouterInterfaceSerializer(serializers.Serializer):
+    subnet = serializers.HyperlinkedRelatedField(
+        queryset=models.SubNet.objects.all(),
+        view_name="openstack-subnet-detail",
+        lookup_field="uuid",
+        required=False,
+    )
+    port = serializers.HyperlinkedRelatedField(
+        queryset=models.Port.objects.all(),
+        view_name="openstack-port-detail",
+        lookup_field="uuid",
+        required=False,
+    )
+
+    def validate(self, attrs):
+        if not attrs.get("subnet") and not attrs.get("port"):
+            raise serializers.ValidationError("Either subnet or port must be provided.")
+        if attrs.get("subnet") and attrs.get("port"):
+            raise serializers.ValidationError(
+                "Only one of subnet or port can be provided."
+            )
+        if isinstance(self.context, dict) and "view" in self.context:
+            view = self.context["view"]
+            router: models.Router = view.get_object()
+            tenant = router.tenant
+            if attrs.get("subnet"):
+                subnet: models.SubNet = attrs["subnet"]
+                if subnet.tenant != tenant:
+                    raise serializers.ValidationError(
+                        "Subnet must belong to the same tenant as the router."
+                    )
+            if attrs.get("port"):
+                port: models.Port = attrs["port"]
+
+                if port.tenant != tenant:
+                    raise serializers.ValidationError(
+                        "Port must belong to the same tenant as the router."
+                    )
+
+        return attrs

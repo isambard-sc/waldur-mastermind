@@ -1,3 +1,4 @@
+import base64
 import logging
 
 import requests
@@ -25,6 +26,7 @@ class RancherClient:
         :type verify_ssl: bool
         """
         self._host = host
+        # TODO: switch to the new API: https://github.com/rancher/rancher/issues/48563#issuecomment-2568360563
         self._base_url = f"{self._host}/v3"
         self._session = requests.Session()
         if not verify_ssl:
@@ -44,7 +46,7 @@ class RancherClient:
             content_type = response.headers["Content-Type"].lower()
             if content_type == "application/json":
                 data = response.json()
-            elif content_type == "text/plain":
+            elif content_type in ("text/plain", "application/yaml"):
                 data = data.decode("utf-8")
 
         status_code = response.status_code
@@ -102,36 +104,95 @@ class RancherClient:
         self._session.auth = (access_key, secret_key)
         logger.debug(f"Successfully logged in as {access_key}")
 
-    def list_clusters(self):
+    def list_clusters(self) -> list[dict]:
         return self._get("clusters")["data"]
 
-    def get_cluster(self, cluster_id):
+    def get_cluster(self, cluster_id) -> dict:
         return self._get(f"clusters/{cluster_id}")
 
-    def create_cluster(self, cluster_name, mtu=None, private_registry=None):
-        rancher_config = {}
-
-        if mtu:
-            rancher_config["network"] = {"mtu": mtu}
+    def create_cluster(self, cluster_name, k8s_version, private_registry=None) -> dict:
+        rancher_config = {
+            "chartValues": {"rke2-cilium": {}},
+            "dataDirectories": {
+                "systemAgent": "/opt/rke2_storage/agent",
+                "provisioning": "/opt/rke2_storage/provisioning",
+                "k8sDistro": "/opt/rke2_storage/rke2",
+            },
+            "machineGlobalConfig": {
+                "cni": "cilium",
+                "disable-kube-proxy": False,
+                "etcd-expose-metrics": False,
+            },
+        }
 
         if private_registry:
-            rancher_config["privateRegistries"] = [
+            registry_url = private_registry["url"]
+            registry_username = base64.b64encode(
+                private_registry["user"].encode("utf-8")
+            ).decode("utf-8")
+            registry_password = base64.b64encode(
+                private_registry["password"].encode("utf-8")
+            ).decode("utf-8")
+            secret_body = {
+                "type": "kubernetes.io/basic-auth",
+                "metadata": {
+                    "namespace": "fleet-default",
+                    "generateName": "registryconfig-auth-",
+                },
+                "data": {"username": registry_username, "password": registry_password},
+            }
+            private_registry_credentials_secret = self._post(
+                "secrets/fleet-default", json=secret_body
+            )
+            private_registry_credentials_secret_name = (
+                private_registry_credentials_secret["metadata"]["name"]
+            )
+            rancher_config["machineSelectorConfig"] = [
                 {
-                    "url": private_registry["url"],
-                    "user": private_registry["user"],
-                    "password": private_registry["password"],
+                    "config": {
+                        "protect-kernel-defaults": False,
+                        "system-default-registry": registry_url,
+                    }
                 }
             ]
+            rancher_config["registries"] = {
+                "configs": {
+                    registry_url: {
+                        "authConfigSecretName": private_registry_credentials_secret_name,
+                        "caBundle": None,
+                        "insecureSkipVerify": False,
+                        "tlsSecretName": None,
+                    }
+                },
+                "mirrors": {},
+            }
+
+        payload = {
+            "type": "provisioning.cattle.io.cluster",
+            "metadata": {"name": cluster_name, "namespace": "fleet-default"},
+            "spec": {
+                "rkeConfig": rancher_config,
+                "kubernetesVersion": k8s_version,
+            },
+        }
 
         return self._post(
-            "clusters",
-            json={
-                "name": cluster_name,
-                "rancherKubernetesEngineConfig": rancher_config,
-            },
+            "provisioning.cattle.io.clusters",
+            json=payload,
         )
 
-    def get_cluster_nodes(self, cluster_id):
+    def get_v3_cluster_id(self, v1_cluster_id) -> str:
+        """
+        Get v3 cluster id by v1 cluster id.
+        :param v1_cluster_url: v1 cluster id
+        :type v1_cluster_url: string
+        :return: v3 cluster id
+        :rtype: str
+        """
+        v1_cluster_info = self._get(f"provisioning.cattle.io.clusters/{v1_cluster_id}")
+        return v1_cluster_info["status"]["clusterName"]
+
+    def get_cluster_nodes(self, cluster_id) -> list[dict]:
         return self._get(f"clusters/{cluster_id}/nodes")["data"]
 
     def delete_cluster(self, cluster_id):
@@ -140,7 +201,7 @@ class RancherClient:
     def delete_node(self, node_id):
         return self._delete(f"nodes/{node_id}")
 
-    def list_cluster_registration_tokens(self):
+    def list_cluster_registration_tokens(self) -> list[dict]:
         return self._get("clusterregistrationtokens", params={"limit": -1})["data"]
 
     def create_cluster_registration_token(self, cluster_id):
@@ -149,17 +210,10 @@ class RancherClient:
             json={"type": "clusterRegistrationToken", "clusterId": cluster_id},
         )
 
-    def get_node_command(self, cluster_id):
-        cluster_list = self.list_cluster_registration_tokens()
-        cluster = list(filter(lambda x: x["clusterId"] == cluster_id, cluster_list))
-        if cluster:
-            node_command = cluster[0]["nodeCommand"]
-            return node_command
-
     def update_cluster(self, cluster_id, new_params):
         return self._put(f"clusters/{cluster_id}", json=new_params)
 
-    def get_node(self, node_id):
+    def get_node(self, node_id) -> dict:
         return self._get(f"nodes/{node_id}")
 
     def get_kubeconfig_file(self, cluster_id):
@@ -171,57 +225,6 @@ class RancherClient:
     def list_users(self):
         return self._get("users")["data"]
 
-    def create_user(self, name, username, password, mustChangePassword=True):
-        return self._post(
-            "users",
-            json={
-                "name": name,
-                "mustChangePassword": mustChangePassword,
-                "password": password,
-                "username": username,
-                "type": "user",
-                "enabled": True,
-            },
-        )
-
-    def enable_user(self, user_id):
-        return self._put(
-            f"users/{user_id}",
-            json={
-                "enabled": True,
-            },
-        )
-
-    def disable_user(self, user_id):
-        return self._put(
-            f"users/{user_id}",
-            json={
-                "enabled": False,
-            },
-        )
-
-    def create_global_role(self, user_id, role):
-        return self._post(
-            "globalrolebindings",
-            json={
-                "globalRoleId": role,
-                "userId": user_id,
-            },
-        )
-
-    def delete_global_role(self, role_id):
-        return self._delete(f"globalrolebindings/{role_id}")
-
-    def create_cluster_user_role(self, user_id, cluster_id, role):
-        return self._post(
-            "clusterroletemplatebindings",
-            json={
-                "roleTemplateId": role,
-                "clusterId": cluster_id,
-                "userId": user_id,
-            },
-        )
-
     def create_cluster_group_role(self, group_id, cluster_id, role):
         return self._post(
             "clusterroletemplatebindings",
@@ -232,7 +235,9 @@ class RancherClient:
             },
         )
 
-    def get_cluster_group_role(self, group_id, cluster_id, role):
+    def get_cluster_group_role(
+        self, group_id=None, cluster_id=None, role=None
+    ) -> list[dict]:
         return self._get(
             "clusterroletemplatebindings",
             params={
@@ -241,6 +246,9 @@ class RancherClient:
                 "groupPrincipalId": group_id,
             },
         )["data"]
+
+    def delete_cluster_group_role(self, cluster_id, binding_name):
+        return self._delete(f"clusterroletemplatebindings/{cluster_id}:{binding_name}")
 
     def create_project(self, cluster_id, project_name):
         return self._post(
@@ -263,6 +271,31 @@ class RancherClient:
             },
         )
 
+    def get_project_group_role(
+        self, group_id=None, project_id=None, role=None
+    ) -> list[dict]:
+        return self._get(
+            "projectroletemplatebindings",
+            params={
+                "roleTemplateId": role,
+                "clusterId": project_id,
+                "groupPrincipalId": group_id,
+            },
+        )["data"]
+
+    def create_project_group_role(self, group_id, project_id, role):
+        return self._post(
+            "projectroletemplatebindings",
+            json={
+                "roleTemplateId": role,
+                "projectId": project_id,
+                "groupPrincipalId": group_id,
+            },
+        )
+
+    def delete_project_group_role(self, project_id, binding_name):
+        return self._delete(f"projectroletemplatebindings/{project_id}:{binding_name}")
+
     def get_projects_roles(self, projectId=None, roleTemplateId=None):
         params = {}
         if projectId:
@@ -274,11 +307,8 @@ class RancherClient:
             params=params,
         )["data"]
 
-    def delete_user(self, user_id):
-        return self._delete(f"users/{user_id}")
-
-    def delete_cluster_role(self, cluster_role_id):
-        return self._delete(f"clusterroletemplatebindings/{cluster_role_id}")
+    def list_role_templates(self) -> list[dict]:
+        return self._get("roletemplates")["data"]
 
     def list_global_catalogs(self):
         return self._get("catalogs", params={"limit": -1})["data"]
@@ -313,13 +343,13 @@ class RancherClient:
     def delete_project_catalog(self, catalog_id):
         return self._delete(f"projectcatalogs/{catalog_id}")
 
-    def create_global_catalog(self, spec):
+    def create_global_catalog(self, spec) -> dict:
         return self._post("catalogs", json=spec)
 
-    def create_cluster_catalog(self, spec):
+    def create_cluster_catalog(self, spec) -> dict:
         return self._post("clustercatalogs", json=spec)
 
-    def create_project_catalog(self, spec):
+    def create_project_catalog(self, spec) -> dict:
         return self._post("projectcatalogs", json=spec)
 
     def update_global_catalog(self, catalog_id, spec):
@@ -337,18 +367,18 @@ class RancherClient:
             params["clusterId"] = cluster_id
         return self._get("projects", params=params)["data"]
 
-    def list_namespaces(self, cluster_id):
+    def list_namespaces(self, cluster_id) -> list[dict]:
         return self._get(f"cluster/{cluster_id}/namespaces", params={"limit": -1})[
             "data"
         ]
 
-    def list_templates(self, cluster_id=None):
+    def list_templates(self, cluster_id=None) -> list[dict]:
         params = {"limit": -1}
         if cluster_id:
             params["clusterId"] = cluster_id
         return self._get("templates", params=params)["data"]
 
-    def get_template_icon(self, template_id):
+    def get_template_icon(self, template_id) -> bytes | None:
         return self._get(f"templates/{template_id}/icon")
 
     def get_template_version_details(self, template_id, template_version):
@@ -370,10 +400,10 @@ class RancherClient:
         project_id: str,
         namespace_id: str,
         name: str,
-        answers: dict = None,
+        answers: dict | None = None,
         wait: bool = False,
         timeout: int = 300,
-    ):
+    ) -> dict:
         payload = {
             "prune": False,
             "timeout": timeout,
@@ -388,7 +418,7 @@ class RancherClient:
             payload["answers"] = answers
         return self._post(f"projects/{project_id}/app", json=payload)
 
-    def create_namespace(self, cluster_id: str, project_id: str, name: str):
+    def create_namespace(self, cluster_id: str, project_id: str, name: str) -> dict:
         return self._post(
             f"clusters/{cluster_id}/namespace",
             json={
@@ -401,19 +431,19 @@ class RancherClient:
             },
         )
 
-    def get_project_applications(self, project_id):
+    def get_project_applications(self, project_id) -> list[dict]:
         return self._get(f"project/{project_id}/apps", params={"limit": -1})["data"]
 
     def list_project_secrets(self, project_id):
         return self._get(f"project/{project_id}/secrets", params={"limit": -1})["data"]
 
-    def get_application(self, project_id, app_id):
+    def get_application(self, project_id, app_id) -> dict:
         return self._get(f"/project/{project_id}/apps/{app_id}")
 
     def destroy_application(self, project_id, app_id):
         return self._delete(f"/project/{project_id}/apps/{app_id}")
 
-    def list_workloads(self, project_id: str):
+    def list_workloads(self, project_id: str) -> list[dict]:
         return self._get(f"project/{project_id}/workloads", params={"limit": -1})[
             "data"
         ]
@@ -438,7 +468,7 @@ class RancherClient:
             yaml,
         )
 
-    def list_hpas(self, project_id: str):
+    def list_hpas(self, project_id: str) -> list[dict]:
         """
         List all horizontal pod autoscalers in project.
         """
@@ -456,7 +486,7 @@ class RancherClient:
         min_replicas: int,
         max_replicas: int,
         metrics: list[dict],
-    ):
+    ) -> dict:
         """
         Create horizontal pod autoscaler.
         """
@@ -518,7 +548,7 @@ class RancherClient:
             yaml,
         )
 
-    def list_ingresses(self, project_id: str):
+    def list_ingresses(self, project_id: str) -> list[dict]:
         return self._get(f"project/{project_id}/ingresses", params={"limit": -1})[
             "data"
         ]
@@ -537,7 +567,7 @@ class RancherClient:
     def delete_ingress(self, project_id: str, ingress_id: str):
         return self._delete(f"project/{project_id}/ingresses/{ingress_id}")
 
-    def list_services(self, project_id: str):
+    def list_services(self, project_id: str) -> list[dict]:
         return self._get(f"project/{project_id}/services", params={"limit": -1})["data"]
 
     def get_service_yaml(self, project_id: str, service_id: str):
@@ -558,8 +588,8 @@ class RancherClient:
         self,
         cluster_id: str,
         yaml: str,
-        default_namespace_id: str = None,
-        namespace_id: str = None,
+        default_namespace_id: str | None = None,
+        namespace_id: str | None = None,
     ):
         payload = {"yaml": yaml}
         if default_namespace_id:

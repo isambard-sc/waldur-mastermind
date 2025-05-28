@@ -9,9 +9,7 @@ import time
 import unicodedata
 import uuid
 import warnings
-from collections import OrderedDict
 from itertools import chain
-from operator import itemgetter
 from secrets import choice
 from string import ascii_letters, digits
 
@@ -34,6 +32,7 @@ from django.urls import resolve
 from django.utils import timezone
 from django.utils.crypto import get_random_string
 from requests.packages.urllib3 import exceptions
+from rest_framework.serializers import ValidationError
 from rest_framework.settings import api_settings
 
 import textile
@@ -45,17 +44,6 @@ logger = logging.getLogger(__name__)
 
 def flatten(*xs):
     return tuple(chain.from_iterable(xs))
-
-
-def sort_dict(unsorted_dict):
-    """
-    Return a OrderedDict ordered by key names from the :unsorted_dict:
-    """
-    sorted_dict = OrderedDict()
-    # sort items before inserting them into a dict
-    for key, value in sorted(unsorted_dict.items(), key=itemgetter(0)):
-        sorted_dict[key] = value
-    return sorted_dict
 
 
 def datetime_to_timestamp(datetime):
@@ -71,17 +59,6 @@ def timestamp_to_datetime(timestamp, replace_tz=True):
 
 def timeshift(**kwargs):
     return timezone.now().replace(microsecond=0) + datetime.timedelta(**kwargs)
-
-
-def hours_in_month(month=None, year=None):
-    now = datetime.datetime.now()
-    if not month:
-        month = now.month
-    if not year:
-        year = now.year
-
-    days_in_month = calendar.monthrange(year, month)[1]
-    return 24 * days_in_month
 
 
 def month_start(date):
@@ -180,16 +157,6 @@ def get_detail_view_name(model):
     return "%s-detail" % model.__name__.lower()
 
 
-def get_list_view_name(model):
-    if model is NotImplemented:
-        raise AttributeError("Cannot get list view name for not implemented model")
-
-    if hasattr(model, "get_url_name") and callable(model.get_url_name):
-        return "%s-list" % model.get_url_name()
-
-    return "%s-list" % model.__name__.lower()
-
-
 def get_fake_context(user=None):
     if not user:
         user = get_user_model()()
@@ -278,7 +245,7 @@ def broadcast_mail(
     """
     Shorthand to format email message from template file and sent it to all recipients.
 
-    It is assumed that there are there are 3 templates available for event type in application.
+    It is assumed that there are 3 templates available for event type in application.
     For example, if app is 'users' and event_type is 'invitation_rejected', then there should be 3 files:
 
     1) users/invitation_rejected_subject.txt is template for email subject
@@ -297,6 +264,7 @@ def broadcast_mail(
     :param filename: name of the attached file
     :param attachment: content of attachment
     :param content_type: the content type of attachment
+    :param bcc: list of emails for sending as bcc
     """
     from .models import Notification
 
@@ -352,6 +320,13 @@ def order_with_nulls(queryset, field):
         return queryset.order_by(F(col).desc(nulls_last=True))
     else:
         return queryset.order_by(F(col).asc(nulls_first=True))
+
+
+def validate_uuid(value):
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        raise ValidationError("Invalid UUID format")
 
 
 def is_uuid_like(val):

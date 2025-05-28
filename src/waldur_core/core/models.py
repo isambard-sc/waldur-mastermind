@@ -1,6 +1,7 @@
 import logging
 import re
 from functools import lru_cache
+from uuid import UUID
 
 from django.apps import apps
 from django.conf import settings
@@ -126,7 +127,7 @@ class UuidMixin(models.Model):
     class Meta:
         abstract = True
 
-    uuid = UUIDField()
+    uuid: UUID = UUIDField()
 
 
 class ErrorMessageMixin(models.Model):
@@ -335,7 +336,7 @@ class User(
 
     @property
     def full_name(self) -> str:
-        return (f"{self.first_name} {self.last_name}").strip()
+        return f"{self.first_name} {self.last_name}".strip()
 
     @full_name.setter
     def full_name(self, value: str):
@@ -508,7 +509,7 @@ class SshPublicKey(TimeStampedModel, LoggableMixin, UuidMixin, models.Model):
     Used for injection into VMs for remote access.
     """
 
-    user = models.ForeignKey(
+    user = models.ForeignKey[User](
         on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL, db_index=True
     )
     # Model doesn't inherit NameMixin, because name field can be blank.
@@ -596,50 +597,57 @@ class RuntimeStateMixin(models.Model):
 
 
 class StateMixin(ErrorMessageMixin, ConcurrentTransitionMixin):
-    class States(CoreStates):
-        pass
-
     class Meta:
         abstract = True
 
     state = FSMIntegerField(
-        default=States.CREATION_SCHEDULED,
-        choices=States.CHOICES,
+        default=CoreStates.CREATION_SCHEDULED,
+        choices=CoreStates.CHOICES,
     )
 
-    @transition(field=state, source=States.CREATION_SCHEDULED, target=States.CREATING)
+    @transition(
+        field=state, source=CoreStates.CREATION_SCHEDULED, target=CoreStates.CREATING
+    )
     def begin_creating(self):
         pass
 
-    @transition(field=state, source=States.UPDATE_SCHEDULED, target=States.UPDATING)
+    @transition(
+        field=state, source=CoreStates.UPDATE_SCHEDULED, target=CoreStates.UPDATING
+    )
     def begin_updating(self):
         pass
 
-    @transition(field=state, source=States.DELETION_SCHEDULED, target=States.DELETING)
+    @transition(
+        field=state, source=CoreStates.DELETION_SCHEDULED, target=CoreStates.DELETING
+    )
     def begin_deleting(self):
         pass
 
     @transition(
-        field=state, source=[States.OK, States.ERRED], target=States.UPDATE_SCHEDULED
+        field=state,
+        source=[CoreStates.OK, CoreStates.ERRED],
+        target=CoreStates.UPDATE_SCHEDULED,
     )
     def schedule_updating(self):
         pass
 
     @transition(
-        field=state, source=[States.OK, States.ERRED], target=States.DELETION_SCHEDULED
+        field=state,
+        source=[CoreStates.OK, CoreStates.ERRED],
+        target=CoreStates.DELETION_SCHEDULED,
     )
     def schedule_deleting(self):
         pass
 
-    @transition(field=state, source="*", target=States.OK)
+    @transition(field=state, source="*", target=CoreStates.OK)
     def set_ok(self):
         pass
 
-    @transition(field=state, source="*", target=States.ERRED)
+    @transition(field=state, source="*", target=CoreStates.ERRED)
     def set_erred(self):
         pass
 
-    @transition(field=state, source=States.ERRED, target=States.OK)
+    @transition(field=state, source=CoreStates.ERRED, target=CoreStates.OK)
     def recover(self):
         pass
 

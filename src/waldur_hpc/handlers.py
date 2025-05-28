@@ -8,6 +8,7 @@ from waldur_core.core.utils import is_uuid_like
 from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure.models import Customer, Project
 from waldur_core.structure.utils import move_project
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.models import Offering, Order, Plan, Resource
 from waldur_mastermind.marketplace.tasks import (
     notify_consumer_about_pending_order,
@@ -102,9 +103,6 @@ def get_or_create_project(customer, user, wrong_customer):
         project: Project = Project.objects.create(customer=customer, name=user.username)
         project.add_user(user, ProjectRole.ADMIN)
         return project
-    else:
-        logger.warning("Projects with name %s already exists.", user.username)
-        return
 
 
 def get_or_create_order(project: Project, user, offering, plan, limits=None):
@@ -117,10 +115,10 @@ def get_or_create_order(project: Project, user, offering, plan, limits=None):
             project=project,
             created_by=user,
             state__in=(
-                Order.States.DONE,
-                Order.States.PENDING_CONSUMER,
-                Order.States.PENDING_PROVIDER,
-                Order.States.EXECUTING,
+                OrderStates.DONE,
+                OrderStates.PENDING_CONSUMER,
+                OrderStates.PENDING_PROVIDER,
+                OrderStates.EXECUTING,
             ),
             id__in=order_ids,
         )
@@ -129,13 +127,13 @@ def get_or_create_order(project: Project, user, offering, plan, limits=None):
     )
     if order:
         if order.state in [
-            Order.States.PENDING_CONSUMER,
-            Order.States.PENDING_PROVIDER,
-            Order.States.EXECUTING,
+            OrderStates.PENDING_CONSUMER,
+            OrderStates.PENDING_PROVIDER,
+            OrderStates.EXECUTING,
         ]:
             return order, False
-        if order.state == Order.States.DONE:
-            if order.resource.state != Resource.States.ERRED:
+        if order.state == OrderStates.DONE:
+            if order.resource.state != ResourceStates.ERRED:
                 return order, False
 
     name = sanitize_allocation_name(user.username)
@@ -148,7 +146,7 @@ def get_or_create_order(project: Project, user, offering, plan, limits=None):
             limits=limits,
             attributes={"name": name},
             name=name,
-            state=Resource.States.CREATING,
+            state=ResourceStates.CREATING,
         )
         resource.init_cost()
         resource.save()
@@ -161,7 +159,7 @@ def get_or_create_order(project: Project, user, offering, plan, limits=None):
             plan=plan,
             limits=limits,
             attributes={"name": name},
-            state=Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
 
         order.init_cost()

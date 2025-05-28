@@ -453,6 +453,9 @@ class PullInstancePortsTest(BaseBackendTest):
                     "mac_address": "DC-D6-5E-9B-49-70",
                     "device_id": device_id,
                     "device_owner": "compute:nova",
+                    "admin_state_up": True,
+                    "name": "port_1",
+                    "description": "",
                     "fixed_ips": [
                         {
                             "ip_address": "10.0.0.2",
@@ -583,6 +586,8 @@ class PullPortsTest(BaseBackendTest):
                     "device_id": device_id,
                     "network_id": "network_id",
                     "device_owner": "compute:nova",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
                     "fixed_ips": [
                         {
                             "ip_address": "10.0.0.2",
@@ -666,6 +671,8 @@ class PullPortsTest(BaseBackendTest):
                     "device_id": instance.backend_id,
                     "network_id": "network_id",
                     "device_owner": "compute:nova",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
                     "fixed_ips": [],  # Empty fixed_ips array
                     "security_groups": [],
                 }
@@ -693,6 +700,8 @@ class PullPortsTest(BaseBackendTest):
                     "device_id": instance.backend_id,
                     "network_id": "network_id",
                     "device_owner": "compute:nova",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
                     "fixed_ips": [
                         {
                             "ip_address": "10.0.0.2",
@@ -738,6 +747,8 @@ class PullPortsTest(BaseBackendTest):
                     ],
                     "name": "",
                     "description": "",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
                     "network_id": "network_id",
                     "security_groups": [],
                 },
@@ -754,6 +765,8 @@ class PullPortsTest(BaseBackendTest):
                     ],
                     "name": "",
                     "description": "",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
                     "network_id": "network_id",
                     "security_groups": [],
                 },
@@ -811,6 +824,8 @@ class PullPortsTest(BaseBackendTest):
                     ],
                     "name": "",
                     "description": "",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
                     "network_id": "network_id",
                     "security_groups": [],
                 }

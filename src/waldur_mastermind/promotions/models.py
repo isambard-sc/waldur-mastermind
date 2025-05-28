@@ -8,6 +8,7 @@ from model_utils.models import TimeStampedModel
 from waldur_core.core.models import DescribableMixin, NameMixin
 from waldur_core.logging.models import UuidMixin
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import ResourceStates
 
 
 class DiscountType(django_models.CharField):
@@ -120,9 +121,7 @@ class Campaign(UuidMixin, DescribableMixin, NameMixin):
 
     def check_resource_on_conditions_of_campaign(self, resource):
         other_offerings = (
-            marketplace_models.Resource.objects.exclude(
-                state=marketplace_models.Resource.States.TERMINATED
-            )
+            marketplace_models.Resource.objects.exclude(state=ResourceStates.TERMINATED)
             .filter(project__customer=resource.customer)
             .values_list("offering_id", flat=True)
         )
@@ -146,6 +145,6 @@ class DiscountedResource(TimeStampedModel):
     # after checking coupon, stock, state, start/end dates and offerings.
 
     campaign = django_models.ForeignKey(Campaign, on_delete=django_models.CASCADE)
-    resource = django_models.ForeignKey(
+    resource = django_models.ForeignKey[marketplace_models.Resource](
         "marketplace.Resource", on_delete=django_models.CASCADE
     )

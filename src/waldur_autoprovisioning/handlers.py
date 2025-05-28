@@ -7,6 +7,7 @@ from waldur_autoprovisioning.models import Rule
 from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure.models import Project
 from waldur_mastermind.marketplace import utils as marketplace_utils
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.models import Order, Resource
 from waldur_mastermind.marketplace.tasks import (
     process_order_on_commit,
@@ -59,10 +60,10 @@ def get_or_create_order(
             project=project,
             created_by=user,
             state__in=(
-                Order.States.DONE,
-                Order.States.PENDING_CONSUMER,
-                Order.States.PENDING_PROVIDER,
-                Order.States.EXECUTING,
+                OrderStates.DONE,
+                OrderStates.PENDING_CONSUMER,
+                OrderStates.PENDING_PROVIDER,
+                OrderStates.EXECUTING,
             ),
             id__in=order_ids,
         )
@@ -71,13 +72,13 @@ def get_or_create_order(
     )
     if order:
         if order.state in [
-            Order.States.PENDING_CONSUMER,
-            Order.States.PENDING_PROVIDER,
-            Order.States.EXECUTING,
+            OrderStates.PENDING_CONSUMER,
+            OrderStates.PENDING_PROVIDER,
+            OrderStates.EXECUTING,
         ]:
             return order, False
-        if order.state == Order.States.DONE:
-            if order.resource.state != Resource.States.ERRED:
+        if order.state == OrderStates.DONE:
+            if order.resource.state != ResourceStates.ERRED:
                 return order, False
 
     name = marketplace_utils.generate_resource_name(project, offering)
@@ -91,7 +92,7 @@ def get_or_create_order(
             limits=limits,
             attributes=attributes,
             name=name,
-            state=Resource.States.CREATING,
+            state=ResourceStates.CREATING,
         )
         resource.init_cost()
         resource.save()
@@ -104,7 +105,7 @@ def get_or_create_order(
             plan=plan,
             limits=limits,
             attributes=attributes,
-            state=Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
 
         order.init_cost()

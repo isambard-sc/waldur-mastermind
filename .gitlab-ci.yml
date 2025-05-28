@@ -111,6 +111,19 @@ Run management command test:
   script:
     - gitlab-ci-test/waldur-test MANAGEMENT
 
+Run type checkings:
+  extends: .Unit test runner
+  script:
+    - pip3 install poetry==2.1.2
+    - pip3 install --upgrade setuptools==78.1.0
+    - poetry install -vvv
+    - pyright src/waldur_mastermind/marketplace_remote/processors.py
+    - pyright src/waldur_mastermind/marketplace_rancher/
+    - pyright src/waldur_rancher/utils.py
+    - pyright src/waldur_rancher/tasks.py
+    - pyright src/waldur_rancher/backend.py
+    - pyright src/waldur_rancher/serializers.py
+
 Try building docker image:
   image:
     name: "gcr.io/kaniko-project/executor:debug"
@@ -203,7 +216,7 @@ Test Multi-arch docker image build:
   interruptible: true
   image: registry.hpc.ut.ee/mirror/docker:latest
   services:
-    - name: "docker:dind"
+    - name: "registry.hpc.ut.ee/mirror/docker:dind"
       command: ["--mtu=1400"]
   rules:
     # Skip tests if said so
@@ -408,8 +421,9 @@ Generate Python SDK:
   needs:
     - Generate OpenAPI schema
   script: |
-    pip install openapi-python-client
-    openapi-python-client generate --path waldur-openapi-schema.yaml --output-path py-client --overwrite
+    pip install openapi-python-client==0.23.1
+    openapi-python-client generate --path waldur-openapi-schema.yaml --output-path py-client --overwrite --meta poetry
+    sed -i 's/prefix: str = "Bearer"/prefix: str = "Token"/' py-client/waldur_api_client/client.py
   artifacts:
     paths:
       - py-client/
@@ -506,7 +520,8 @@ Generate OpenAPI schema diff:
     - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
   before_script:
     - apk update
-    - apk add --no-cache git
+    - apk add --no-cache git nodejs npm
+    - npm install -g markdownlint-cli
   script:
     - ls -la
     - echo "Cloning docs repository"
@@ -532,6 +547,9 @@ Generate OpenAPI schema diff:
         echo "Previous schema found: $PREV_SCHEMA"
         /usr/bin/oasdiff diff -f markup $PREV_SCHEMA $CI_PROJECT_DIR/waldur-openapi-schema.yaml > $CI_PROJECT_DIR/openapi-diff.md
         ls -la $CI_PROJECT_DIR/openapi-diff.md
+        head -n 30 $CI_PROJECT_DIR/openapi-diff.md || true
+        sed -i "1i # OpenApi Schema Diff - ${CI_COMMIT_TAG}\n\n## For version ${CI_COMMIT_TAG}" $CI_PROJECT_DIR/openapi-diff.md
+        markdownlint  --disable MD041 MD035 --fix $CI_PROJECT_DIR/openapi-diff.md || true
         head -n 30 $CI_PROJECT_DIR/openapi-diff.md || true
       fi
   artifacts:
@@ -561,16 +579,16 @@ Upload OpenAPI schema and schema diff to docs:
     - cp $CI_PROJECT_DIR/waldur-openapi-schema.yaml docs/API/waldur-openapi-schema-${CI_COMMIT_TAG}.yaml
     - ls -la docs/API
     # Upload OpenAPI schema diff
-    - mkdir -p docs/about/api-changes
+    - mkdir -p docs/integrator-guide/APIs/api-changes
     - |
       if [ -s "$CI_PROJECT_DIR/openapi-diff.md" ]; then
-        cp $CI_PROJECT_DIR/openapi-diff.md docs/about/api-changes/waldur-openapi-schema-${CI_COMMIT_TAG}-diff.md
+        cp $CI_PROJECT_DIR/openapi-diff.md docs/integrator-guide/APIs/api-changes/waldur-openapi-schema-${CI_COMMIT_TAG}-diff.md
       else
         echo "No API changes detected, skipping diff file upload"
       fi
-    - ls -la docs/about/api-changes
+    - ls -la docs/integrator-guide/APIs/api-changes
     # Commit and push changes
-    - git add docs/API docs/about/api-changes
+    - git add docs/API docs/integrator-guide/APIs/api-changes
     - git commit -m "Add Waldur OpenAPI schema and diff for ${CI_COMMIT_TAG}" || exit 0
     - git branch new-api-schema-${CI_COMMIT_TAG}
     - git push --set-upstream origin new-api-schema-${CI_COMMIT_TAG}:master

@@ -58,7 +58,7 @@ class IdentityProviderSerializer(serializers.ModelSerializer):
         fields = super().get_fields()
 
         try:
-            request = self.context["view"].request
+            request = self.context["request"]
             user = request.user
         except (KeyError, AttributeError):
             return fields
@@ -79,15 +79,14 @@ class IdentityProviderSerializer(serializers.ModelSerializer):
 
         try:
             endpoints = response.json()
-        except (ValueError, TypeError):
+            return {
+                "userinfo_url": endpoints["userinfo_endpoint"],
+                "token_url": endpoints["token_endpoint"],
+                "auth_url": endpoints["authorization_endpoint"],
+                "logout_url": endpoints.get("end_session_endpoint") or "",
+            }
+        except (requests.JSONDecodeError, KeyError, TypeError):
             raise ValidationError("Unable to parse JSON in discovery response.")
-
-        return {
-            "userinfo_url": endpoints["userinfo_endpoint"],
-            "token_url": endpoints["token_endpoint"],
-            "auth_url": endpoints["authorization_endpoint"],
-            "logout_url": endpoints.get("end_session_endpoint") or "",
-        }
 
     def update(self, instance, validated_data):
         verify_ssl = validated_data.get("verify_ssl", True)

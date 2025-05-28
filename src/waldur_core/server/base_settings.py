@@ -22,13 +22,19 @@ from waldur_mastermind.marketplace.enums import (
     OrderStates,
     RequestTypes,
     ResourceStates,
+    RobotAccountStates,
 )
 from waldur_mastermind.proposal.enums import (
     CallStates,
     ProposalStates,
     RequestedOfferingStates,
 )
-from waldur_rancher.enums import RANCHER_TEMPLATE_QUESTION_TYPE
+from waldur_rancher.enums import (
+    RANCHER_TEMPLATE_QUESTION_TYPE,
+    CatalogScopeTypeChoices,
+    RoleScopeType,
+    KeycloakUserGroupMembershipState,
+)
 
 encoding = locale.getpreferredencoding()
 if encoding.lower() != "utf-8":
@@ -236,7 +242,7 @@ CELERY_TASK_QUEUES = {
     "background": {"exchange": "background"},
 }
 CELERY_TASK_DEFAULT_QUEUE = "tasks"
-CELERY_TASK_ROUTES = ("waldur_core.server.celery.PriorityRouter",)
+CELERY_TASK_ROUTES = ("waldur_core.server.celeryconf.PriorityRouter",)
 CELERY_TRACK_STARTED = True
 CELERY_SEND_EVENTS = True
 
@@ -352,6 +358,10 @@ CONSTANCE_CONFIG = {
         "https://example.com/",
         "It is used for rendering callback URL in HomePort",
     ),
+    "RANCHER_USERNAME_INPUT_LABEL": (
+        "Username",
+        "Label for the username field in Rancher external user resource access management.",
+    ),
     "SITE_ADDRESS": ("", "It is used in marketplace order header."),
     "SITE_EMAIL": ("", "It is used in marketplace order header and UI footer."),
     "SITE_PHONE": ("", "It is used in marketplace order header and UI footer."),
@@ -388,7 +398,6 @@ CONSTANCE_CONFIG = {
         False,
         "Enable reminders to owners about resources of shared offerings that have not generated any cost for the last 3 months.",
     ),
-    "ENABLE_RESOURCE_END_DATE": (True, "Allow to view and update resource end date."),
     "TELEMETRY_URL": (
         "https://telemetry.waldur.com/",
         "URL for sending telemetry data.",
@@ -760,6 +769,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "FULL_PAGE_TITLE",
         "SITE_DESCRIPTION",
         "HOMEPORT_URL",
+        "RANCHER_USERNAME_INPUT_LABEL",
     ),
     "Marketplace Branding": (
         "SITE_ADDRESS",
@@ -777,7 +787,6 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "NOTIFY_ABOUT_RESOURCE_CHANGE",
         "DISABLE_SENDING_NOTIFICATIONS_ABOUT_RESOURCE_UPDATE",
         "ENABLE_STALE_RESOURCE_NOTIFICATIONS",
-        "ENABLE_RESOURCE_END_DATE",
     ),
     "Telemetry": (
         "TELEMETRY_URL",
@@ -915,7 +924,6 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "SITE_PHONE",
     "CURRENCY_NAME",
     "ANONYMOUS_USER_CAN_VIEW_OFFERINGS",
-    "ENABLE_RESOURCE_END_DATE",
     "DOCS_URL",
     "SHORT_PAGE_TITLE",
     "FULL_PAGE_TITLE",
@@ -952,6 +960,7 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "DEFAULT_IDP",
     "HOMEPORT_URL",
     "KEYCLOAK_ICON",
+    "RANCHER_USERNAME_INPUT_LABEL",
 )
 
 for ext in WaldurExtension.get_extensions():
@@ -1038,5 +1047,9 @@ SPECTACULAR_SETTINGS = {
         "RequestedOfferingStates": RequestedOfferingStates.CHOICES,
         "RequestTypes": RequestTypes.VALUES,
         "RancherTemplateQuestionType": RANCHER_TEMPLATE_QUESTION_TYPE,
+        "RancherRoleScopeType": RoleScopeType.CHOICES,
+        "KeycloakUserGroupMembershipState": KeycloakUserGroupMembershipState.CHOICES,
+        "RancherCatalogScopeType": CatalogScopeTypeChoices,
+        "RobotAccountStates": RobotAccountStates.CHOICES,
     },
 }

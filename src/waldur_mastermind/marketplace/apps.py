@@ -52,9 +52,9 @@ class MarketplaceConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.set_order_completion_timestamp,
+            handlers.notify_user_about_rejected_order,
             sender=models.Order,
-            dispatch_uid="waldur_mastermind.marketplace.set_order_completion_timestamp",
+            dispatch_uid="waldur_mastermind.marketplace.notify_user_about_rejected_order",
         )
 
         signals.post_save.connect(
@@ -253,10 +253,22 @@ class MarketplaceConfig(AppConfig):
             dispatch_uid="waldur_core.marketplace.handlers.log_resource_robot_account_created_or_updated",
         )
 
+        signals.post_save.connect(
+            handlers.log_service_account_created_or_updated,
+            sender=models.ScopedServiceAccount,
+            dispatch_uid="waldur_core.marketplace.handlers.log_service_account_created_or_updated",
+        )
+
         signals.post_delete.connect(
             handlers.log_resource_robot_account_deleted,
             sender=models.RobotAccount,
             dispatch_uid="waldur_core.marketplace.handlers.log_resource_robot_account_deleted",
+        )
+
+        signals.post_delete.connect(
+            handlers.log_service_account_deleted,
+            sender=models.ScopedServiceAccount,
+            dispatch_uid="waldur_core.marketplace.handlers.log_service_account_deleted",
         )
 
         permission_signals.role_granted.connect(

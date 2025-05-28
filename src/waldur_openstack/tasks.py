@@ -5,12 +5,16 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from waldur_core.core import models as core_models
 from waldur_core.core import tasks as core_tasks
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure import tasks as structure_tasks
 from waldur_core.structure.registry import get_resource_type
+from waldur_mastermind.marketplace_openstack.utils import (
+    create_offerings_for_volume_and_instance,
+)
 from waldur_openstack.backend import OpenStackBackend
+from waldur_openstack.exceptions import OpenStackTenantNotFound
 
 from . import models, signals
 
@@ -24,11 +28,11 @@ class TenantCreateErrorTask(core_tasks.ErrorStateTransitionTask):
         # mark as erred if they were created
         network = tenant.networks.first()
         subnet = network.subnets.first()
-        if subnet.state == models.SubNet.States.CREATION_SCHEDULED:
+        if subnet.state == CoreStates.CREATION_SCHEDULED:
             subnet.delete()
         else:
             super().execute(subnet)
-        if network.state == models.Network.States.CREATION_SCHEDULED:
+        if network.state == CoreStates.CREATION_SCHEDULED:
             network.delete()
         else:
             super().execute(network)
@@ -51,7 +55,7 @@ class TenantPullQuotas(core_tasks.BackgroundTask):
     def run(self):
         from . import executors
 
-        for tenant in models.Tenant.objects.filter(state=models.Tenant.States.OK):
+        for tenant in models.Tenant.objects.filter(state=CoreStates.OK):
             executors.TenantPullQuotasExecutor.execute(tenant)
 
 
@@ -68,9 +72,9 @@ class SendSignalTenantPullSucceeded(core_tasks.Task):
 def mark_as_erred_old_tenants_in_deleting_state():
     models.Tenant.objects.filter(
         modified__lte=timezone.now() - timezone.timedelta(days=1),
-        state=models.Tenant.States.DELETING,
+        state=CoreStates.DELETING,
     ).update(
-        state=models.Tenant.States.ERRED,
+        state=CoreStates.ERRED,
         error_message="Deletion error. Deleting took more than a day.",
     )
 
@@ -81,7 +85,7 @@ def check_existence_of_tenant(serialized_tenant):
     backend = tenant.get_backend()
 
     if backend.does_tenant_exist_in_backend(tenant) is False:
-        raise Exception(f"Tenant {tenant} does not exist in backend.")
+        raise OpenStackTenantNotFound(f"Tenant {tenant} does not exist in backend.")
 
 
 @shared_task
@@ -104,7 +108,7 @@ class SetInstanceOKTask(core_tasks.StateTransitionTask):
 
     def execute(self, instance, *args, **kwargs):
         super().execute(instance)
-        instance.floating_ips.update(state=models.FloatingIP.States.OK)
+        instance.floating_ips.update(state=CoreStates.OK)
 
 
 class SetInstanceErredTask(core_tasks.ErrorStateTransitionTask):
@@ -117,9 +121,9 @@ class SetInstanceErredTask(core_tasks.ErrorStateTransitionTask):
         # mark as erred if creation was started, but not ended,
         # leave as is, if they are OK.
         for volume in instance.volumes.all():
-            if volume.state == models.Volume.States.CREATION_SCHEDULED:
+            if volume.state == CoreStates.CREATION_SCHEDULED:
                 volume.delete()
-            elif volume.state == models.Volume.States.OK:
+            elif volume.state == CoreStates.OK:
                 pass
             else:
                 volume.set_erred()
@@ -127,7 +131,7 @@ class SetInstanceErredTask(core_tasks.ErrorStateTransitionTask):
 
         # set instance floating IPs as free, delete not created ones.
         instance.floating_ips.filter(backend_id="").delete()
-        instance.floating_ips.update(state=models.FloatingIP.States.OK)
+        instance.floating_ips.update(state=CoreStates.OK)
 
 
 class SetBackupErredTask(core_tasks.ErrorStateTransitionTask):
@@ -137,7 +141,7 @@ class SetBackupErredTask(core_tasks.ErrorStateTransitionTask):
         super().execute(backup)
         for snapshot in backup.snapshots.all():
             # If snapshot creation was not started - delete it from waldur DB.
-            if snapshot.state == models.Snapshot.States.CREATION_SCHEDULED:
+            if snapshot.state == CoreStates.CREATION_SCHEDULED:
                 snapshot.decrease_backend_quotas_usage()
                 snapshot.delete()
             else:
@@ -184,7 +188,7 @@ class BaseDeleteExpiredResourcesTask(core_tasks.BackgroundTask):
     def run(self):
         executor = self._get_delete_executor()
         resources = self.model.objects.filter(
-            kept_until__lt=timezone.now(), state=core_models.StateMixin.States.OK
+            kept_until__lt=timezone.now(), state=CoreStates.OK
         )
         for resource in resources:
             executor.execute(resource)
@@ -259,8 +263,9 @@ class TenantSubresourcesPullTask(structure_tasks.BackgroundPullTask):
         backend.pull_tenant_floating_ips(tenant)
         backend.pull_tenant_networks(tenant)
         backend.pull_tenant_subnets(tenant)
-        backend.pull_tenant_routers(tenant)
         backend.pull_tenant_ports(tenant)
+        backend.pull_tenant_routers(tenant)
+        backend.pull_tenant_network_rbac_policies(tenant)
 
 
 class TenantSubresourcesListPullTask(structure_tasks.BackgroundListPullTask):
@@ -283,3 +288,9 @@ class TenantPropertiesListPullTask(structure_tasks.BackgroundListPullTask):
     name = "openstack.tenant_properties_list_pull_task"
     pull_task = TenantPropertiesPullTask
     model = models.Tenant
+
+
+@shared_task
+def create_offerings_task(serialized_tenant):
+    tenant = core_utils.deserialize_instance(serialized_tenant)
+    create_offerings_for_volume_and_instance(tenant)

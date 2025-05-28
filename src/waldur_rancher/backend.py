@@ -1,55 +1,342 @@
-import io
 import logging
 import time
+from typing import cast
 from urllib.parse import parse_qs, urlparse
 
 import requests
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import Q
+from django.core.files.base import ContentFile
+from django.db.models import QuerySet
 from django.utils.functional import cached_property
 
-from waldur_core.core import models as core_models
+import hvac
+from hvac import exceptions as vault_exceptions
+from keycloak import KeycloakAdmin
+from keycloak import exceptions as keycloak_exceptions
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import CoreStates
 from waldur_core.media.utils import guess_image_extension
 from waldur_core.structure.backend import ServiceBackend
 from waldur_core.structure.models import ServiceSettings
 from waldur_core.structure.registry import get_resource_type
 from waldur_core.structure.utils import update_pulled_fields
 from waldur_mastermind.common.utils import parse_datetime
+from waldur_openstack.models import Instance
 from waldur_rancher.enums import (
-    LONGHORN_NAME,
-    LONGHORN_NAMESPACE,
-    ClusterRoles,
-    GlobalRoles,
+    SERVER_ROLE,
 )
-from waldur_rancher.exceptions import NotFound, RancherException
+from waldur_rancher.exceptions import NotFound, RancherException, VaultException
 
-from . import client, models, signals, utils
+from . import client, models, utils
 
 logger = logging.getLogger(__name__)
+
+CLOUD_INIT_TEMPLATE = """\
+#cloud-config
+
+package_update: true
+package_upgrade: true
+
+cloud_init_modules:
+ - migrator
+ - seed_random
+ - bootcmd
+ - write_files
+ - growpart
+ #- resizefs  # commented out to disable
+ - disk_setup
+ - set_hostname
+ - update_hostname
+ - update_etc_hosts
+ - ca_certs
+ - rsyslog
+ - users_groups
+ - ssh
+ - mounts
+
+disk_setup:
+  /dev/sdb:
+    table_type: gpt
+    layout: true
+    overwrite: false
+
+fs_setup:
+  - label: longhorn_data
+    filesystem: btrfs
+    device: /dev/sdb1
+    overwrite: false
+
+mounts:
+- [/dev/sdb1, /opt/rke2_storage, auto, "defaults", "0", "2"]
+
+users:
+- name: root
+    # Add public SSH key here
+    ssh_authorized_keys: []
+
+write_files:
+  - path: /etc/vault/role-id
+    content: |
+      {vault_role_id}
+
+  - path: /etc/vault/secret-id
+    content: |
+      {vault_role_secret_id}
+
+
+  - path: /etc/sysctl.d/90-kubernetes.conf
+    content: |
+      # Kubernetes recommended settings
+      net.ipv4.conf.all.forwarding=1
+      net.ipv6.conf.all.forwarding=1
+      net.ipv4.ip_forward=1
+
+      # OOM settings
+      vm.panic_on_oom=0
+      vm.overcommit_memory=1
+
+      # Kernel panic settings
+      kernel.panic=10
+      kernel.panic_on_oops=1
+      kernel.keys.root_maxbytes=25000000
+
+      # For large scale environments
+      fs.inotify.max_user_watches=524288
+      fs.inotify.max_user_instances=512
+
+      # Improve network performance
+      net.core.somaxconn=32768
+      net.ipv4.tcp_tw_reuse=1
+      net.ipv4.tcp_fin_timeout=15
+      net.core.netdev_max_backlog=16384
+
+      # Prevent ip spoofing
+      net.ipv4.conf.all.rp_filter=1
+      net.ipv4.conf.default.rp_filter=1
+
+      # Ensure source routing is disabled
+      net.ipv4.conf.all.accept_source_route=0
+      net.ipv4.conf.default.accept_source_route=0
+
+      # Bridge netfilter
+      net.bridge.bridge-nf-call-iptables=1
+      net.bridge.bridge-nf-call-ip6tables=1
+
+  # Custom transactional update service
+  - path: /etc/systemd/system/custom-transactional-update.service
+    content: |
+      [Unit]
+      Description=Custom Transactional Update
+      Requires=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/var/opt/scripts/custom-update.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # Custom update timer (daily at 2am)
+  - path: /etc/systemd/system/custom-transactional-update.timer
+    content: |
+      [Unit]
+      Description=Custom Timer for Transactional Update
+
+      [Timer]
+      OnCalendar=*-*-* 02:00:00
+      RandomizedDelaySec=1800
+
+      [Install]
+      WantedBy=timers.target
+
+  - path: /var/opt/scripts/custom-update.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # Run transactional update without rebooting
+      /usr/sbin/transactional-update cleanup dup --non-interactive
+
+      # Check if reboot is needed and notify kured
+      if [ -f /var/run/reboot-needed ]; then
+        touch /run/reboot-required
+      fi
+
+  - path: /etc/modules-load.d/k8s.conf
+    permissions: '0644'
+    content: |
+      overlay
+      br_netfilter
+
+  - path: /etc/systemd/system/rke2-setup.service
+    content: |
+      [Unit]
+      Description=RKE2 Installation and Setup
+      Wants=network-online.target
+      After=network-online.target
+      # Run only once after first boot
+      ConditionPathExists=!/var/lib/rke2-setup.done
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/bash /var/opt/scripts/rke-install.sh
+      ExecStartPost=/bin/touch /var/lib/rke2-setup.done
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /tmp/first-boot-packages.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      zypper refresh
+      zypper install -y qemu-guest-agent nano htop container-selinux open-iscsi nfs-client unzip curl ca-certificates jq
+
+  - path: /etc/profile.d/kube.sh
+    append: true
+    content: |
+      export PATH=$PATH:/var/opt/bin:/opt/rke2/bin:/var/lib/rancher/rke2/bin/
+      export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+
+  - path: /var/lib/rancher/rke2/server/manifests/rke2-ingress-nginx-config.yaml
+    permissions: '0640'
+    content: |
+      apiVersion: helm.cattle.io/v1
+      kind: HelmChartConfig
+      metadata:
+        name: rke2-ingress-nginx
+        namespace: kube-system
+      spec:
+        valuesContent: |-
+          controller:
+            config:
+              allow-snippet-annotations: "true"
+              proxy-buffering: "off"
+              proxy-buffers: 100 "2M"
+              proxy-buffer-size: "2M"
+              use-forwarded-headers: "true"
+
+  - path: /var/opt/scripts/rke-install.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # --- Install Vault CLI ---
+      VAULT_VERSION="1.19.0"
+      mkdir -p /var/opt/bin
+      curl -s -L -o /tmp/vault.zip "https://releases.hashicorp.com/vault/${{VAULT_VERSION}}/vault_${{VAULT_VERSION}}_linux_amd64.zip"
+      unzip -o /tmp/vault.zip -d /var/opt/bin/ vault
+      rm -f /tmp/vault.zip
+      chmod 755 /var/opt/bin/vault
+      /var/opt/bin/vault --version || {{ echo "Vault CLI installation failed"; exit 1; }}
+
+      # --- Fetch variables from metadata server ---
+      RKE_ROLE="{rke_role}"
+      VAULT_ADDR="{vault_addr}"
+
+      VAULT_ROLE_ID="{vault_role_id}"
+      VAULT_SECRET_ID="{vault_role_secret_id}"
+
+      export VAULT_ADDR
+
+      # Ensure PATH includes our custom bin directory
+      export PATH=$PATH:/var/opt/bin
+
+      # --- Get token from Vault ---
+
+      echo "[DEBUG] Using Vault Address: ${{VAULT_ADDR}}"
+      echo "[DEBUG] Using Vault Role ID: ${{VAULT_ROLE_ID}}"
+      export VAULT_TOKEN=$(/var/opt/bin/vault write -tls-skip-verify --field=token auth/approle/login role_id=${{VAULT_ROLE_ID}} secret_id=${{VAULT_SECRET_ID}})
+
+      if [ -z "$VAULT_TOKEN" ]; then
+        echo "[ERROR] Failed to obtain Vault token. Exiting."
+        exit 1
+      else
+        echo "[INFO] Successfully obtained Vault token."
+      fi
+
+      RKE_TOKEN=$(/var/opt/bin/vault kv get -tls-skip-verify -field=token {vault_secret_path})
+      export RKE_TOKEN
+
+      if [ -z "$RKE_TOKEN" ]; then
+        echo "[ERROR] Failed to obtain RKE token from Vault. Exiting."
+        exit 1
+      else
+        echo "[INFO] Successfully obtained RKE token."
+      fi
+
+      # --- Install RKE2 ---
+
+      if [ "$RKE_ROLE" == "server" ]; then
+        CATTLE_AGENT_VAR_DIR="/opt/rke2_storage/agent" curl -fL https://rancher-aio.cloud.ut.ee/system-agent-install.sh | sudo CATTLE_AGENT_VAR_DIR="/opt/rke2_storage/agent" sh -s - --server https://rancher-aio.cloud.ut.ee --label 'cattle.io/os=linux' --token $RKE_TOKEN --etcd --controlplane
+      else
+        CATTLE_AGENT_VAR_DIR="/opt/rke2_storage/agent" curl -fL https://rancher-aio.cloud.ut.ee/system-agent-install.sh | sudo CATTLE_AGENT_VAR_DIR="/opt/rke2_storage/agent" sh -s - --server https://rancher-aio.cloud.ut.ee --label 'cattle.io/os=linux' --token $RKE_TOKEN --worker
+      fi
+
+
+  - path: /tmp/system-config.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+
+      # --- Setup GRUB config for faster reboot ---
+      sed -i "s/GRUB_TIMEOUT=10/GRUB_TIMEOUT=1/g" /etc/default/grub
+      grub2-mkconfig > /boot/grub2/grub.cfg
+
+      # --- Setup Kured reboot method ---
+      echo "REBOOT_METHOD=kured" > /etc/transactional-update.conf
+
+
+runcmd:
+  # Create necessary directories
+  - mkdir -p /var/opt/bin /var/opt/scripts
+  - chmod 755 /var/opt/bin /var/opt/scripts
+
+  # Disable default update mechanisms
+  - systemctl disable rebootmgr.service || echo "Failed to disable rebootmgr"
+  - systemctl disable transactional-update.timer || echo "Failed to disable transactional-update.timer"
+  - systemctl mask rebootmgr transactional-update.timer || echo "Failed to mask default update timers"
+
+  # Enable our custom update service and timer
+  - systemctl enable custom-transactional-update.timer
+
+  # Install basic packages first (they go into the base snapshot)
+  # NB! DO NOT TRY TO REMOVE THE `sh -c $(cat <file>)` workaround!
+  ## The `transactional-update` shell does not see files from `/tmp`, making this fail without cat redirection.
+  - transactional-update run sh -c "$(cat /tmp/first-boot-packages.sh)"
+  - transactional-update --continue run sh -c "$(cat /tmp/system-config.sh)"
+
+  # Enable and disable services
+  - systemctl enable iscsid
+  - systemctl disable podman || echo "podman not found or already disabled"
+  - systemctl mask podman || echo "podman not found or already masked"
+  - systemctl enable rke2-setup.service
+  - reboot -h now
+"""
 
 
 class RancherBackend(ServiceBackend):
     DEFAULTS = {
-        "cloud_init_template": "#cloud-config\n"
-        "packages: \n"
-        "  - curl\n"
-        "runcmd:\n"
-        "  - curl -fsSL https://get.docker.com -o get-docker.sh; sh get-docker.sh\n"
-        "  - sudo systemctl start docker\n"
-        "  - sudo systemctl enable docker\n"
-        '  - [ sh, -c, "{command}" ]\n',
-        "default_mtu": 1400,
+        "cloud_init_template": CLOUD_INIT_TEMPLATE,
+        "node_disk_driver": "sd",
+        "k8s_version": "v1.31.7+rke2r1",
         "private_registry_url": None,
         "private_registry_user": None,
         "private_registry_password": None,
         "management_tenant_access_port": 443,
+        "vault_host": None,
+        "vault_port": "8200",
+        "vault_token": "root",
+        "vault_verify": True,
+        "keycloak_url": "http://localhost:8080/auth/",
+        "keycloak_realm": "Waldur",
+        "keycloak_user_realm": "master",
+        "keycloak_username": "admin",
+        "keycloak_password": "admin",
+        "keycloak_sync_frequency": 15,
     }
 
-    def __init__(self, settings):
-        """
-        :type settings: :class:`waldur_core.structure.models.ServiceSettings`
-        """
+    def __init__(self, settings: ServiceSettings):
         self.settings = settings
 
     @cached_property
@@ -63,7 +350,8 @@ class RancherBackend(ServiceBackend):
 
     @cached_property
     def host(self):
-        return self.settings.backend_url.strip("/")
+        if self.settings.backend_url:
+            return self.settings.backend_url.strip("/")
 
     def pull_service_properties(self):
         self.pull_clusters()
@@ -96,21 +384,19 @@ class RancherBackend(ServiceBackend):
         stale_clusters = models.Cluster.objects.filter(
             settings=self.settings, backend_id__in=stale_ids
         ).exclude(backend_id="")
-        stale_clusters.update(
-            state=models.Cluster.States.ERRED, error_message="Resource is gone."
-        )
+        stale_clusters.update(state=CoreStates.ERRED, error_message="Resource is gone.")
 
-    def get_kubeconfig_file(self, cluster):
+    def get_kubeconfig_file(self, cluster: models.Cluster):
         return self.client.get_kubeconfig_file(cluster.backend_id)
 
-    def create_cluster(self, cluster):
-        mtu = self.settings.get_option("default_mtu")
+    def create_cluster(self, cluster: models.Cluster):
         private_registry = None
         private_registry_url = self.settings.get_option("private_registry_url")
         private_registry_user = self.settings.get_option("private_registry_user")
         private_registry_password = self.settings.get_option(
             "private_registry_password"
         )
+        k8s_version = self.settings.get_option("k8s_version")
         if private_registry_url and private_registry_user and private_registry_password:
             private_registry = {
                 "url": private_registry_url,
@@ -118,17 +404,27 @@ class RancherBackend(ServiceBackend):
                 "password": private_registry_password,
             }
 
+        # TODO: come up with a better solution for version suffix
+        self.client._base_url = self.client._base_url.replace("/v3", "/v1")
         backend_cluster = self.client.create_cluster(
-            cluster.name, mtu=mtu, private_registry=private_registry
+            cluster.name, k8s_version, private_registry=private_registry
         )
+        backend_cluster_id = backend_cluster["id"]
+        # as rancher API is not transactional, give it 2s to write cluster state to etcd
+        time.sleep(2)
+        cluster_id = self.client.get_v3_cluster_id(backend_cluster_id)
+        self.client._base_url = self.client._base_url.replace("/v1", "/v3")
+
         self._backend_cluster_to_cluster(backend_cluster, cluster)
+        # Use v3 backend ID as RancherClient supports only v3 API
+        cluster.backend_id = cluster_id
         # as rancher API is not transactional, give it 2s to write cluster state to etcd
         time.sleep(2)
         self.client.create_cluster_registration_token(cluster.backend_id)
-        cluster.node_command = self.client.get_node_command(cluster.backend_id)
+        cluster.kubernetes_version = k8s_version
         cluster.save()
 
-    def delete_cluster(self, cluster):
+    def delete_cluster(self, cluster: models.Cluster):
         if cluster.backend_id:
             try:
                 self.client.delete_cluster(cluster.backend_id)
@@ -139,7 +435,7 @@ class RancherBackend(ServiceBackend):
 
         cluster.delete()
 
-    def delete_node(self, node):
+    def delete_node(self, node: models.Node):
         if node.backend_id:
             try:
                 self.client.delete_node(node.backend_id)
@@ -147,29 +443,37 @@ class RancherBackend(ServiceBackend):
                 logger.debug("Node %s is not present in the backend " % node.backend_id)
         node.delete()
 
-    def update_cluster(self, cluster):
+    def update_cluster(self, cluster: models.Cluster):
         backend_cluster = self._cluster_to_backend_cluster(cluster)
         self.client.update_cluster(cluster.backend_id, backend_cluster)
 
-    def _backend_cluster_to_cluster(self, backend_cluster, cluster):
+    def _backend_cluster_to_cluster(self, backend_cluster, cluster: models.Cluster):
+        cluster_type = backend_cluster.get("type", "")
         cluster.backend_id = backend_cluster["id"]
-        cluster.name = backend_cluster["name"]
-        cluster.runtime_state = backend_cluster["state"]
+        if cluster_type == "provisioning.cattle.io.cluster":
+            cluster.name = backend_cluster["metadata"]["name"]
+            cluster.runtime_state = backend_cluster["metadata"]["state"]["name"]
+            cluster.kubernetes_version = backend_cluster["spec"].get(
+                "kubernetesVersion", ""
+            )
+        else:
+            cluster.name = backend_cluster["name"]
+            cluster.runtime_state = backend_cluster["state"]
+            cluster.kubernetes_version = backend_cluster["version"]["gitVersion"]
+            cluster.capacity = backend_cluster["capacity"]
+            cluster.requested = backend_cluster["requested"]
 
-    def _cluster_to_backend_cluster(self, cluster):
+    def _cluster_to_backend_cluster(self, cluster: models.Cluster):
         return {"name": cluster.name}
 
-    def _backend_node_to_node(self, backend_node):
+    def _backend_node_to_node(self, backend_node: dict):
         return {
             "backend_id": backend_node["id"],
             "name": backend_node["requestedHostname"],
-            "controlplane_role": backend_node.get("controlPlane", False),
-            "etcd_role": backend_node.get("etcd", False),
-            "worker_role": backend_node.get("worker", False),
             "runtime_state": backend_node.get("state", ""),
         }
 
-    def get_nodes_count(self, remote_cluster):
+    def get_nodes_count(self, remote_cluster: dict):
         spec = remote_cluster.get("appliedSpec", {})
         config = spec.get("rancherKubernetesEngineConfig", {})
         backend_nodes = config.get("nodes", [])
@@ -202,7 +506,8 @@ class RancherBackend(ServiceBackend):
             backend_id=backend_id,
             service_settings=self.settings,
             project=project,
-            state=models.Cluster.States.OK,
+            vm_project=project,
+            state=CoreStates.OK,
             runtime_state=backend_cluster["state"],
             settings=self.settings,
         )
@@ -225,7 +530,7 @@ class RancherBackend(ServiceBackend):
         self.pull_cluster_apps(cluster)
         self.pull_cluster_ingresses(cluster)
 
-    def pull_cluster_details(self, cluster, backend_cluster=None):
+    def pull_cluster_details(self, cluster: models.Cluster, backend_cluster=None):
         backend_cluster = backend_cluster or self.client.get_cluster(cluster.backend_id)
         self._backend_cluster_to_cluster(backend_cluster, cluster)
         cluster.save()
@@ -240,19 +545,13 @@ class RancherBackend(ServiceBackend):
                 cluster=cluster,
                 defaults=dict(
                     backend_id=backend_node["backend_id"],
-                    controlplane_role=backend_node["controlplane_role"],
-                    etcd_role=backend_node["etcd_role"],
-                    worker_role=backend_node["worker_role"],
                 ),
             )
 
             if not node.backend_id:
                 # If the node has been requested from Waldur, but it has not been synchronized
                 node.backend_id = backend_node["backend_id"]
-                node.controlplane_role = backend_node["controlplane_role"]
-                node.etcd_role = backend_node["etcd_role"]
-                node.worker_role = backend_node["worker_role"]
-                node.save()
+                node.save(update_fields=["backend_id"])
 
             # Update details in all cases.
             self.pull_node(node)
@@ -260,35 +559,28 @@ class RancherBackend(ServiceBackend):
         # Update nodes states.
         utils.update_cluster_nodes_states(cluster.id)
 
-    def check_cluster_nodes(self, cluster):
+    def check_cluster_nodes(self, cluster: models.Cluster):
         self.pull_cluster_details(cluster)
 
         if cluster.runtime_state == models.Cluster.RuntimeStates.ACTIVE:
             # We don't need change cluster state here, because it will make in an executor.
             return
 
-        for node in cluster.node_set.filter(
-            Q(controlplane_role=True) | Q(etcd_role=True)
-        ):
-            controlplane_role = etcd_role = False
-            if node.instance.state not in [
-                core_models.StateMixin.States.ERRED,
-                core_models.StateMixin.States.DELETING,
-                core_models.StateMixin.States.DELETION_SCHEDULED,
+        for node in cluster.node_set.filter(role=SERVER_ROLE):
+            vm = cast(Instance, node.instance)
+            if vm.state not in [
+                CoreStates.ERRED,
+                CoreStates.DELETING,
+                CoreStates.DELETION_SCHEDULED,
             ]:
-                if node.controlplane_role:
-                    controlplane_role = True
-                if node.etcd_role:
-                    etcd_role = True
-                if controlplane_role and etcd_role:
-                    # We make a return if one or more VMs with 'controlplane' and 'etcd' roles exist
-                    # and they haven't a state 'error' or 'delete'.
-                    # Here 'return' means that cluster state checking must be retry later.
-                    return
+                # Return if one or more VMs with 'server' role exist
+                # and they haven't a state 'error' or 'delete'.
+                # Here 'return' means that cluster state checking must be retry later.
+                return
 
         cluster.error_message = (
             "The cluster is not connected with any "
-            "non-failed VM's with 'controlplane' or 'etcd' roles."
+            "non-failed VM's with 'server' role."
         )
         cluster.runtime_state = "error"
         cluster.save()
@@ -301,7 +593,7 @@ class RancherBackend(ServiceBackend):
         backend_node = self.client.get_node(backend_id)
         return backend_node["state"] == models.Node.RuntimeStates.ACTIVE
 
-    def pull_node(self, node):
+    def pull_node(self, node: models.Node):
         if not node.backend_id:
             return
 
@@ -357,84 +649,66 @@ class RancherBackend(ServiceBackend):
 
         return node.save()
 
-    def create_user(self, user):
-        if user.backend_id:
-            return
-
-        password = core_utils.make_random_password
-        response = self.client.create_user(
-            name=user.user.username, username=user.user.username, password=password
-        )
-        user_id = response["id"]
-        user.backend_id = user_id
-        user.save()
-        self.client.create_global_role(user.backend_id, GlobalRoles.user_base)
-        signals.rancher_user_created.send(
-            sender=models.RancherUser,
-            instance=user,
-            password=password,
-        )
-
-    def delete_user(self, user):
-        if user.backend_id:
-            self.client.delete_user(user_id=user.backend_id)
-
-        user.delete()
-
-    def block_user(self, user):
-        if user.is_active:
-            self.client.disable_user(user.backend_id)
-            user.is_active = False
-            user.save()
-
-    def activate_user(self, user):
-        if not user.is_active:
-            self.client.enable_user(user.backend_id)
-            user.is_active = True
-            user.save()
-
     def get_or_create_cluster_group_role(self, group_id, cluster_id, role):
         if not self.client.get_cluster_group_role(group_id, cluster_id, role):
+            logger.info(
+                "Creating group role binding %s in cluster %s and role %s",
+                group_id,
+                cluster_id,
+                role,
+            )
             self.client.create_cluster_group_role(group_id, cluster_id, role)
             return True
         return False
 
-    def create_cluster_user_role(self, link):
-        role = None
-
-        if link.role == models.ClusterRole.CLUSTER_OWNER:
-            role = ClusterRoles.cluster_owner
-
-        if link.role == models.ClusterRole.CLUSTER_MEMBER:
-            role = ClusterRoles.cluster_member
-
-        response = self.client.create_cluster_user_role(
-            link.user.backend_id, link.cluster.backend_id, role
+    def delete_cluster_group_role(self, group_id, cluster_id, role):
+        existing_bindings = self.client.get_cluster_group_role(
+            group_id, cluster_id, role
         )
-        link_id = response["id"]
-        link.backend_id = link_id
-        link.save()
+        if existing_bindings:
+            binding_name = existing_bindings[0]["name"]
+            logger.info("Deleting cluster group role binding %s", binding_name)
+            self.client.delete_cluster_group_role(cluster_id, binding_name)
+            return True
+        return False
 
-    def delete_cluster_role(self, link):
-        if link.backend_id:
-            try:
-                self.client.delete_cluster_role(cluster_role_id=link.backend_id)
-            except NotFound:
-                logger.debug(
-                    "Cluster role %s is not present in the backend " % link.backend_id
-                )
+    def delete_project_group_role(self, group_id: str, project_id: str, role):
+        existing_bindings = self.client.get_project_group_role(
+            group_id, project_id, role
+        )
+        # Expects project_id to be in the format of 'cluster_id:project_id'
+        project_id = project_id.split(":")[-1]
+        if existing_bindings:
+            binding_name = existing_bindings[0]["name"]
+            logger.info("Deleting project group role binding %s", binding_name)
+            self.client.delete_project_group_role(project_id, binding_name)
+            return True
+        return False
 
-        link.delete()
+    def get_or_create_project_group_role(self, group_id, project_id, role):
+        if not self.client.get_project_group_role(group_id, project_id, role):
+            logger.info(
+                "Creating group role binding %s in project %s and role %s",
+                group_id,
+                project_id,
+                role,
+            )
+            self.client.create_project_group_role(group_id, project_id, role)
+            return True
+        return False
+
+    def list_roles(self) -> list[dict]:
+        return self.client.list_role_templates()
 
     def pull_catalogs_for_cluster(self, cluster: models.Cluster):
         self.pull_cluster_catalogs_for_cluster(cluster)
         self.pull_project_catalogs_for_cluster(cluster)
 
-    def pull_cluster_catalogs_for_cluster(self, cluster):
+    def pull_cluster_catalogs_for_cluster(self, cluster: models.Cluster):
         remote_catalogs = self.client.list_cluster_catalogs(cluster.backend_id)
         self.pull_catalogs_for_scope(remote_catalogs, cluster)
 
-    def pull_project_catalogs_for_cluster(self, cluster):
+    def pull_project_catalogs_for_cluster(self, cluster: models.Cluster):
         for project in models.Project.objects.filter(cluster=cluster):
             self.pull_project_catalogs_for_project(project)
 
@@ -519,7 +793,7 @@ class RancherBackend(ServiceBackend):
             settings=self.settings,
         )
 
-    def refresh_catalog(self, catalog):
+    def refresh_catalog(self, catalog: models.Catalog):
         if isinstance(catalog.scope, ServiceSettings):
             return self.client.refresh_global_catalog(catalog.backend_id)
         elif isinstance(catalog.scope, models.Cluster):
@@ -527,7 +801,7 @@ class RancherBackend(ServiceBackend):
         else:
             return self.client.refresh_project_catalog(catalog.backend_id)
 
-    def delete_catalog(self, catalog):
+    def delete_catalog(self, catalog: models.Catalog):
         try:
             if isinstance(catalog.scope, ServiceSettings):
                 return self.client.delete_global_catalog(catalog.backend_id)
@@ -540,7 +814,7 @@ class RancherBackend(ServiceBackend):
                 "Catalog %s is not present in the backend ", catalog.backend_id
             )
 
-    def get_catalog_spec(self, catalog):
+    def get_catalog_spec(self, catalog: models.Catalog):
         spec = {
             "name": catalog.name,
             "description": catalog.description,
@@ -553,7 +827,7 @@ class RancherBackend(ServiceBackend):
             spec["password"] = catalog.password
         return spec
 
-    def create_catalog(self, catalog):
+    def create_catalog(self, catalog: models.Catalog):
         spec = self.get_catalog_spec(catalog)
 
         if isinstance(catalog.scope, ServiceSettings):
@@ -562,14 +836,15 @@ class RancherBackend(ServiceBackend):
             spec["clusterId"] = catalog.scope.backend_id
             remote_catalog = self.client.create_cluster_catalog(spec)
         else:
-            spec["projectId"] = catalog.scope.backend_id
+            project = cast(models.Project, catalog.scope)
+            spec["projectId"] = project.backend_id
             remote_catalog = self.client.create_project_catalog(spec)
 
         catalog.backend_id = remote_catalog["id"]
         catalog.runtime_state = remote_catalog["state"]
         catalog.save()
 
-    def update_catalog(self, catalog):
+    def update_catalog(self, catalog: models.Catalog):
         spec = self.get_catalog_spec(catalog)
         if isinstance(catalog.scope, ServiceSettings):
             return self.client.update_global_catalog(catalog.backend_id, spec)
@@ -645,7 +920,7 @@ class RancherBackend(ServiceBackend):
     def pull_namespaces(self):
         local_clusters = models.Cluster.objects.filter(settings=self.settings)
         for cluster in local_clusters:
-            if cluster.state == models.Cluster.States.OK:
+            if cluster.state == CoreStates.OK:
                 self.pull_namespaces_for_cluster(cluster)
             else:
                 logger.debug(
@@ -724,7 +999,7 @@ class RancherBackend(ServiceBackend):
         remote_templates = self.client.list_templates()
         local_templates = models.Template.objects.filter(settings=self.settings)
         local_catalogs = models.Catalog.objects.filter(settings=self.settings)
-        local_clusters = models.Cluster.objects.filter(settings=self.settings)
+        local_clusters = list(models.Cluster.objects.filter(settings=self.settings))
         local_projects = models.Project.objects.filter(settings=self.settings)
         self._pull_templates(
             local_templates,
@@ -736,11 +1011,11 @@ class RancherBackend(ServiceBackend):
 
     def _pull_templates(
         self,
-        local_templates,
-        local_catalogs,
-        local_clusters,
-        local_projects,
-        remote_templates,
+        local_templates: QuerySet[models.Template],
+        local_catalogs: QuerySet[models.Catalog],
+        local_clusters: list[models.Cluster],
+        local_projects: QuerySet[models.Project],
+        remote_templates: list[dict],
     ):
         local_catalog_map = {catalog.backend_id: catalog for catalog in local_catalogs}
         local_cluster_map = {cluster.backend_id: cluster for cluster in local_clusters}
@@ -805,7 +1080,7 @@ class RancherBackend(ServiceBackend):
             settings=self.settings,
         )
 
-    def _get_external_template_icon(self, icon_url):
+    def _get_external_template_icon(self, icon_url) -> bytes | None:
         try:
             response = requests.get(icon_url, timeout=3)
         except requests.RequestException as e:
@@ -833,7 +1108,7 @@ class RancherBackend(ServiceBackend):
                 content = self._get_external_template_icon(template.icon_url)
             if not content:
                 # Clear icon field so that default icon would be rendered
-                template.icon = None
+                template.icon.delete()
                 template.save()
                 continue
             extension = guess_image_extension(content)
@@ -842,19 +1117,19 @@ class RancherBackend(ServiceBackend):
             # Overwrite existing file
             if template.icon:
                 template.icon.delete()
-            template.icon.save(f"{template.uuid}.{extension}", io.BytesIO(content))
+            template.icon.save(f"{template.uuid}.{extension}", ContentFile(content))
 
-    def list_project_secrets(self, project):
+    def list_project_secrets(self, project: models.Project):
         return self.client.list_project_secrets(project.backend_id)
 
-    def pull_cluster_workloads(self, cluster):
+    def pull_cluster_workloads(self, cluster: models.Cluster):
         for project in models.Project.objects.filter(cluster=cluster):
             self.pull_project_workloads(project)
 
     def pull_workloads(self):
         local_clusters = models.Cluster.objects.filter(settings=self.settings)
         for cluster in local_clusters:
-            if cluster.state == models.Cluster.States.OK:
+            if cluster.state == CoreStates.OK:
                 self.pull_cluster_workloads(cluster)
             else:
                 logger.debug(
@@ -863,7 +1138,7 @@ class RancherBackend(ServiceBackend):
                     cluster.backend_id,
                 )
 
-    def pull_project_workloads(self, project):
+    def pull_project_workloads(self, project: models.Project):
         remote_workloads = self.client.list_workloads(project.backend_id)
         local_workloads = models.Workload.objects.filter(project=project)
         local_namespaces = models.Namespace.objects.filter(project=project)
@@ -904,7 +1179,9 @@ class RancherBackend(ServiceBackend):
         models.Workload.objects.bulk_create(new_workloads)
         local_workloads.filter(backend_id__in=stale_workloads).delete()
 
-    def remote_workload_to_local(self, remote_workload, project, local_namespaces_map):
+    def remote_workload_to_local(
+        self, remote_workload, project: models.Project, local_namespaces_map
+    ):
         return models.Workload(
             backend_id=remote_workload["id"],
             name=remote_workload["name"],
@@ -918,29 +1195,45 @@ class RancherBackend(ServiceBackend):
         )
 
     def redeploy_workload(self, workload: models.Workload):
+        if not workload.project:
+            raise RancherException(
+                f"Workload {workload.backend_id} does not have a project."
+            )
         self.client.redeploy_workload(workload.project.backend_id, workload.backend_id)
 
     def delete_workload(self, workload: models.Workload):
+        if not workload.project:
+            raise RancherException(
+                f"Workload {workload.backend_id} does not have a project."
+            )
         self.client.delete_workload(workload.project.backend_id, workload.backend_id)
 
     def get_workload_yaml(self, workload: models.Workload):
+        if not workload.project:
+            raise RancherException(
+                f"Workload {workload.backend_id} does not have a project."
+            )
         return self.client.get_workload_yaml(
             workload.project.backend_id, workload.backend_id
         )
 
     def put_workload_yaml(self, workload: models.Workload, yaml: str):
+        if not workload.project:
+            raise RancherException(
+                f"Workload {workload.backend_id} does not have a project."
+            )
         return self.client.put_workload_yaml(
             workload.project.backend_id, workload.backend_id, yaml
         )
 
-    def pull_cluster_hpas(self, cluster):
+    def pull_cluster_hpas(self, cluster: models.Cluster):
         for project in models.Project.objects.filter(cluster=cluster):
             self.pull_project_hpas(project)
 
     def pull_hpas(self):
         local_clusters = models.Cluster.objects.filter(settings=self.settings)
         for cluster in local_clusters:
-            if cluster.state == models.Cluster.States.OK:
+            if cluster.state == CoreStates.OK:
                 self.pull_cluster_hpas(cluster)
             else:
                 logger.debug(
@@ -949,7 +1242,7 @@ class RancherBackend(ServiceBackend):
                     cluster.backend_id,
                 )
 
-    def pull_project_hpas(self, project):
+    def pull_project_hpas(self, project: models.Project):
         local_workloads = models.Workload.objects.filter(project=project)
         local_workloads_map = {
             workload.backend_id: workload for workload in local_workloads
@@ -1005,10 +1298,19 @@ class RancherBackend(ServiceBackend):
             min_replicas=remote_hpa["minReplicas"],
             max_replicas=remote_hpa["maxReplicas"],
             metrics=remote_hpa["metrics"],
-            state=models.HPA.States.OK,
+            state=CoreStates.OK,
         )
 
-    def create_hpa(self, hpa):
+    def create_hpa(self, hpa: models.HPA):
+        if not hpa.project:
+            raise RancherException(f"HPA {hpa.backend_id} does not have a project.")
+
+        if not hpa.workload:
+            raise RancherException(f"HPA {hpa.backend_id} does not have a workload.")
+
+        if not hpa.namespace:
+            raise RancherException(f"HPA {hpa.backend_id} does not have a workload.")
+
         remote_hpa = self.client.create_hpa(
             hpa.project.backend_id,
             hpa.namespace.backend_id,
@@ -1023,7 +1325,16 @@ class RancherBackend(ServiceBackend):
         hpa.runtime_state = remote_hpa["state"]
         hpa.save(update_fields=["backend_id", "runtime_state"])
 
-    def update_hpa(self, hpa):
+    def update_hpa(self, hpa: models.HPA):
+        if not hpa.project:
+            raise RancherException(f"HPA {hpa.backend_id} does not have a project.")
+
+        if not hpa.workload:
+            raise RancherException(f"HPA {hpa.backend_id} does not have a workload.")
+
+        if not hpa.namespace:
+            raise RancherException(f"HPA {hpa.backend_id} does not have a workload.")
+
         self.client.update_hpa(
             hpa.project.backend_id,
             hpa.backend_id,
@@ -1043,15 +1354,19 @@ class RancherBackend(ServiceBackend):
             logger.debug("HPA %s is not present in the backend." % hpa.backend_id)
 
     def get_hpa_yaml(self, hpa: models.HPA):
+        if not hpa.project:
+            raise RancherException(f"HPA {hpa.backend_id} does not have a project.")
         return self.client.get_hpa_yaml(hpa.project.backend_id, hpa.backend_id)
 
     def put_hpa_yaml(self, hpa: models.HPA, yaml: str):
+        if not hpa.project:
+            raise RancherException(f"HPA {hpa.backend_id} does not have a project.")
         return self.client.put_hpa_yaml(hpa.project.backend_id, hpa.backend_id, yaml)
 
     def pull_apps(self):
         local_clusters = models.Cluster.objects.filter(settings=self.settings)
         for cluster in local_clusters:
-            if cluster.state == models.Cluster.States.OK:
+            if cluster.state == CoreStates.OK:
                 self.pull_cluster_apps(cluster)
             else:
                 logger.debug(
@@ -1100,7 +1415,13 @@ class RancherBackend(ServiceBackend):
         models.Application.objects.bulk_create(new_apps)
         local_apps.filter(backend_id__in=stale_apps).delete()
 
-    def remote_app_to_local(self, remote_app, rancher_project, local_namespaces_map):
+    def remote_app_to_local(
+        self, remote_app, rancher_project: models.Project, local_namespaces_map
+    ):
+        if not rancher_project.cluster:
+            raise RancherException(
+                f"Application {remote_app['id']} does not have a cluster."
+            )
         parts = urlparse(remote_app["externalId"])
         params = parse_qs(parts.query)
 
@@ -1127,6 +1448,14 @@ class RancherBackend(ServiceBackend):
         )
 
     def create_app(self, app: models.Application):
+        if not app.rancher_project.cluster:
+            raise RancherException(
+                f"Application {app.backend_id} does not have a cluster."
+            )
+        if not app.template.catalog:
+            raise RancherException(
+                f"Application {app.backend_id} does not have a catalog."
+            )
         if not app.namespace.backend_id:
             remote_response = self.client.create_namespace(
                 app.rancher_project.cluster.backend_id,
@@ -1149,14 +1478,14 @@ class RancherBackend(ServiceBackend):
         app.runtime_state = remote_app["state"]
         app.save()
 
-    def check_application_state(self, app):
+    def check_application_state(self, app: models.Application):
         remote_app = self.client.get_application(
             app.rancher_project.backend_id, app.backend_id
         )
         app.runtime_state = remote_app["state"]
         app.save()
 
-    def delete_app(self, app):
+    def delete_app(self, app: models.Application):
         try:
             self.client.destroy_application(
                 app.rancher_project.backend_id, app.backend_id
@@ -1164,111 +1493,10 @@ class RancherBackend(ServiceBackend):
         except NotFound:
             logger.debug("App %s is not present in the backend." % app.backend_id)
 
-    def install_longhorn_to_cluster(self, cluster):
-        catalog_name = "library"
-
-        system_project = models.Project.objects.filter(
-            cluster=cluster, name="System"
-        ).first()
-        if not system_project:
-            raise RancherException(
-                "There is no system project in cluster %s" % cluster.backend_id
-            )
-
-        available_templates = models.Template.objects.filter(
-            name=LONGHORN_NAME, catalog__name=catalog_name
-        )
-        available_templates_count = len(available_templates)
-        if available_templates_count != 1:
-            if available_templates_count == 0:
-                message = f"There are no templates with name={LONGHORN_NAME}, catalog.name={catalog_name}"
-            else:
-                message = f"There are more than one template for name={LONGHORN_NAME}, catalog.name={catalog_name}"
-            logger.info(message)
-            raise RancherException(message)
-
-        logger.info(
-            "Starting longhorn installation for cluster %s (name=%s, backend_id=%s)",
-            cluster,
-            cluster.name,
-            cluster.backend_id,
-        )
-        template = available_templates.first()
-
-        try:
-            namespace = models.Namespace.objects.get(
-                name=LONGHORN_NAMESPACE, project=system_project
-            )
-        except models.Namespace.DoesNotExist:
-            logger.info(
-                "Creating namespace %s for cluster %s (name=%s, backend_id=%s)",
-                LONGHORN_NAMESPACE,
-                cluster,
-                cluster.name,
-                cluster.backend_id,
-            )
-            namespace_response = self.client.create_namespace(
-                cluster.backend_id, system_project.backend_id, LONGHORN_NAMESPACE
-            )
-            namespace = models.Namespace.objects.create(
-                name=LONGHORN_NAMESPACE,
-                backend_id=namespace_response["id"],
-                settings=system_project.settings,
-                project=system_project,
-            )
-
-        logger.info(
-            "Creating application %s for cluster %s (name=%s, backend_id=%s) in namespace %s (backend_id=%s)",
-            LONGHORN_NAMESPACE,
-            cluster,
-            cluster.name,
-            cluster.backend_id,
-            namespace.name,
-            namespace.backend_id,
-        )
-        worker_node_count = cluster.node_set.filter(worker_role=True).count()
-        replica_count = min(3, worker_node_count)
-        application = self.client.create_application(
-            catalog_id=template.catalog.backend_id,
-            template_id=template.name,
-            version=template.default_version,
-            project_id=system_project.backend_id,
-            namespace_id=namespace.backend_id,
-            name=LONGHORN_NAME,
-            answers={"persistence.defaultClassReplicaCount": replica_count},
-            wait=True,
-            timeout=1200,
-        )
-
-        models.Application.objects.create(
-            settings=self.settings,
-            service_settings=cluster.service_settings,
-            project=cluster.project,
-            rancher_project=system_project,
-            cluster=cluster,
-            namespace=namespace,
-            template=template,
-            name=LONGHORN_NAME,
-            state=models.Application.States.CREATING,
-            runtime_state=application["state"],
-            created=application["created"],
-            backend_id=application["id"],
-            answers=application.get("answers"),
-            version=template.default_version,
-        )
-
-        logger.info(
-            "Application %s for cluster %s (name=%s, backend_id=%s) was created",
-            application,
-            cluster,
-            cluster.name,
-            cluster.backend_id,
-        )
-
     def pull_ingresses(self):
         local_clusters = models.Cluster.objects.filter(settings=self.settings)
         for cluster in local_clusters:
-            if cluster.state == models.Cluster.States.OK:
+            if cluster.state == CoreStates.OK:
                 self.pull_cluster_ingresses(cluster)
             else:
                 logger.debug(
@@ -1281,7 +1509,7 @@ class RancherBackend(ServiceBackend):
         for project in models.Project.objects.filter(cluster=cluster):
             self.pull_project_ingresses(project)
 
-    def pull_project_ingresses(self, project):
+    def pull_project_ingresses(self, project: models.Project):
         remote_ingresses = self.client.list_ingresses(project.backend_id)
         local_ingresses = models.Ingress.objects.filter(rancher_project=project)
         local_namespaces = models.Namespace.objects.filter(project=project)
@@ -1290,10 +1518,13 @@ class RancherBackend(ServiceBackend):
             namespace.backend_id: namespace for namespace in local_namespaces
         }
         remote_ingress_map = {
-            ingress["id"]: self.remote_ingress_to_local(
-                ingress, project, local_namespaces_map
-            )
+            ingress["id"]: self.remote_ingress_to_local(ingress, local_namespaces_map)
             for ingress in remote_ingresses
+        }
+        remote_ingress_map = {
+            ingress_id: ingress
+            for ingress_id, ingress in remote_ingress_map.items()
+            if ingress is not None
         }
         local_ingress_map = {ingress.backend_id: ingress for ingress in local_ingresses}
         remote_ingress_ids = set(remote_ingress_map.keys())
@@ -1320,8 +1551,30 @@ class RancherBackend(ServiceBackend):
         models.Ingress.objects.bulk_create(new_ingresses)
         local_ingresses.filter(backend_id__in=stale_ingresses).delete()
 
-    def remote_ingress_to_local(self, remote_ingress, project, local_namespaces_map):
+    def remote_ingress_to_local(
+        self, remote_ingress, local_namespaces_map: dict[str, models.Namespace]
+    ):
         namespace = local_namespaces_map.get(remote_ingress["namespaceId"])
+        if not namespace:
+            logger.debug(
+                "Namespace %s is not present in the local database. "
+                "Skipping ingress %s",
+                remote_ingress["namespaceId"],
+                remote_ingress["id"],
+            )
+            return None
+        if not namespace.project:
+            logger.debug(
+                "Project is not present in the local database. Skipping ingress %s",
+                remote_ingress["id"],
+            )
+            return None
+        if not namespace.project.cluster:
+            logger.debug(
+                "Cluster is not present in the local database. Skipping ingress %s",
+                remote_ingress["id"],
+            )
+            return None
         return models.Ingress(
             backend_id=remote_ingress["id"],
             name=remote_ingress["name"],
@@ -1334,7 +1587,7 @@ class RancherBackend(ServiceBackend):
             cluster=namespace.project.cluster,
             rancher_project=namespace.project,
             rules=remote_ingress["rules"],
-            state=models.Ingress.States.OK,
+            state=CoreStates.OK,
         )
 
     def get_ingress_yaml(self, ingress: models.Ingress):
@@ -1355,7 +1608,7 @@ class RancherBackend(ServiceBackend):
     def pull_services(self):
         local_clusters = models.Cluster.objects.filter(settings=self.settings)
         for cluster in local_clusters:
-            if cluster.state == models.Cluster.States.OK:
+            if cluster.state == CoreStates.OK:
                 self.pull_cluster_services(cluster)
             else:
                 logger.debug(
@@ -1368,7 +1621,7 @@ class RancherBackend(ServiceBackend):
         for project in models.Project.objects.filter(cluster=cluster):
             self.pull_project_services(project)
 
-    def pull_project_services(self, project):
+    def pull_project_services(self, project: models.Project):
         remote_services = self.client.list_services(project.backend_id)
         local_services = models.Service.objects.filter(namespace__project=project)
         local_namespaces = models.Namespace.objects.filter(project=project)
@@ -1441,6 +1694,27 @@ class RancherBackend(ServiceBackend):
 
         for remote_service in new_services:
             namespace = local_namespaces_map.get(remote_service["namespaceId"])
+            if not namespace:
+                logger.debug(
+                    "Namespace %s is not present in the local database. "
+                    "Skipping service %s",
+                    remote_service["namespaceId"],
+                    remote_service["id"],
+                )
+                return None
+            if not namespace.project:
+                logger.debug(
+                    "Project is not present in the local database. Skipping service %s",
+                    remote_service["id"],
+                )
+                return None
+            if not namespace.project.cluster:
+                logger.debug(
+                    "Cluster is not present in the local database. Skipping service %s",
+                    remote_service["id"],
+                )
+                return None
+
             local_service = models.Service(
                 backend_id=remote_service["id"],
                 name=remote_service["name"],
@@ -1452,7 +1726,7 @@ class RancherBackend(ServiceBackend):
                 namespace=namespace,
                 cluster_ip=remote_service["clusterIp"],
                 selector=remote_service.get("selector"),
-                state=models.Service.States.OK,
+                state=CoreStates.OK,
             )
             local_service.save()
             workloads = [
@@ -1464,16 +1738,28 @@ class RancherBackend(ServiceBackend):
         local_services.filter(backend_id__in=stale_services).delete()
 
     def get_service_yaml(self, service: models.Service):
+        if not service.namespace.project:
+            raise RancherException(
+                f"Service {service.uuid} does not have a project backend ID"
+            )
         return self.client.get_service_yaml(
             service.namespace.project.backend_id, service.backend_id
         )
 
     def put_service_yaml(self, service: models.Service, yaml: str):
+        if not service.namespace.project:
+            raise RancherException(
+                f"Service {service.uuid} does not have a project backend ID"
+            )
         return self.client.put_service_yaml(
             service.namespace.project.backend_id, service.backend_id, yaml
         )
 
     def delete_service(self, service: models.Service):
+        if not service.namespace.project:
+            raise RancherException(
+                f"Service {service.uuid} does not have a project backend ID"
+            )
         return self.client.delete_service(
             service.namespace.project.backend_id, service.backend_id
         )
@@ -1482,8 +1768,8 @@ class RancherBackend(ServiceBackend):
         self,
         cluster: models.Cluster,
         yaml: str,
-        default_namespace: models.Namespace = None,
-        namespace: models.Namespace = None,
+        default_namespace: models.Namespace | None = None,
+        namespace: models.Namespace | None = None,
     ):
         return self.client.import_yaml(
             cluster.backend_id,
@@ -1494,3 +1780,234 @@ class RancherBackend(ServiceBackend):
 
     def ping(self, *args, **kwargs):
         return
+
+
+class VaultBackend:
+    def __init__(
+        self,
+        vault_host: str,
+        vault_port: int,
+        vault_token: str,
+        vault_tls_verify: bool = True,
+    ):
+        self.client = hvac.Client(
+            url=f"https://{vault_host}:{vault_port}",
+            token=vault_token,
+            verify=vault_tls_verify,
+        )
+
+    def create_or_update_policy(self, name: str, policy: dict):
+        try:
+            logger.info("Creating (updating) %s policy in Vault", name)
+            response = self.client.sys.create_or_update_policy(name=name, policy=policy)
+        except vault_exceptions.VaultError as e:
+            logger.error("Unable to create a vault policy %s, reason: %s", name, e)
+            raise
+        if response.status_code != 204:
+            raise VaultException(
+                f"Vault server responded with {response.status_code} code: {response.content}"
+            )
+
+    def create_or_update_role(self, role_name: str, policy_name: str, params=None):
+        try:
+            if params is None:
+                params = {}
+            logger.info(
+                "Creating (updating) role %s for with %s in Vault",
+                role_name,
+                policy_name,
+            )
+            # Requires: vault auth enable approle
+            response = self.client.auth.approle.create_or_update_approle(
+                role_name=role_name, token_policies=[policy_name], **params
+            )
+        except vault_exceptions.VaultError as e:
+            logger.error("Unable to create a Vault role %s, reason: %s", role_name, e)
+            raise
+        if response.status_code != 204:
+            raise VaultException(
+                f"Vault server responded with {response.status_code} code: {response.text}"
+            )
+
+    def get_role_id(self, role_name):
+        try:
+            logger.info("Reading role ID for %s role", role_name)
+            role_id_data = self.client.auth.approle.read_role_id(role_name=role_name)
+            return role_id_data["data"]["role_id"]
+        except vault_exceptions.VaultError as e:
+            logger.error(
+                "Unable to read an ID of the Vault role %s, reason: %s", role_name, e
+            )
+            raise
+
+    def generate_role_secret_id(self, role_name: str):
+        try:
+            logger.info("Generating secret ID for role %s", role_name)
+            secret_id_data = self.client.auth.approle.generate_secret_id(
+                role_name=role_name
+            )
+            return secret_id_data["data"]["secret_id"]
+        except vault_exceptions.VaultError as e:
+            logger.error(
+                "Unable to get client ID for the Vault role %s, reason: %s",
+                role_name,
+                e,
+            )
+            raise
+
+    def create_or_update_secret(self, path: str, secret: dict[str, str]):
+        try:
+            logger.info("Creating (updating) secret %s in Vault", path)
+            secret_data = self.client.secrets.kv.v2.create_or_update_secret(
+                path=path,
+                secret=secret,
+            )
+            return secret_data
+        except vault_exceptions.VaultError as e:
+            logger.error("Unable to create a Vault secret %s, reason: %s", path, e)
+            raise
+
+
+class KeycloakBackend:
+    def __init__(self, settings):
+        # Initialize Keycloak client using settings from Rancher settings
+        keycloak_url = settings.get_option("keycloak_url")
+        keycloak_realm = settings.get_option("keycloak_realm")
+        keycloak_user_realm = settings.get_option("keycloak_user_realm") or "master"
+        keycloak_username = settings.get_option("keycloak_username")
+        keycloak_password = settings.get_option("keycloak_password")
+        keycloak_verify = settings.get_option("keycloak_ssl_verify")
+        keycloak_verify = keycloak_verify if keycloak_verify is not None else True
+
+        # Set up Keycloak client
+        self.keycloak = KeycloakAdmin(
+            server_url=keycloak_url,
+            user_realm_name=keycloak_user_realm,
+            realm_name=keycloak_realm,
+            username=keycloak_username,
+            password=keycloak_password,
+            verify=keycloak_verify,
+        )
+
+    def find_user_by_username(self, username):
+        """Find a user by their username in Keycloak"""
+        users = self.keycloak.get_users({"username": username})
+        return users[0] if users else None
+
+    def get_group(self, group_id):
+        """
+        Fetching group data from Keycloak
+        """
+        try:
+            return self.keycloak.get_group(group_id)
+        except keycloak_exceptions.KeycloakError as e:
+            logger.error("Failed to fetch the group %s in Keycloak: %s", group_id, e)
+            raise
+
+    def create_group(self, group_name: str, parent_id: str | None = None):
+        """
+        Creating group in Keycloak
+        """
+        try:
+            # Try to find group
+            groups = self.keycloak.get_groups({"search": group_name})
+            group = next(
+                (
+                    g
+                    for g in groups
+                    if g["name"] == group_name
+                    or (
+                        group_name
+                        in {sub_group["name"] for sub_group in g["subGroups"]}
+                    )
+                ),
+                None,
+            )
+
+            if group:
+                logger.info(
+                    "The group %s already exists, skipping creation", group_name
+                )
+            else:
+                logger.info("Creating a group %s, parent %s", group_name, parent_id)
+                payload = {"name": group_name}
+                if parent_id is None:
+                    group_id = self.keycloak.create_group(payload)
+                else:
+                    group_id = self.keycloak.create_group(payload, parent=parent_id)
+                group = {"id": group_id}
+            return group
+
+        except keycloak_exceptions.KeycloakError as e:
+            logger.error("Failed to create the group %s in Keycloak: %s", group_name, e)
+            raise
+
+    def delete_group(self, group_id):
+        """
+        Delete group from Keycloak
+        """
+        try:
+            # Try to find group
+            group = self.get_group(group_id)
+            if group:
+                logger.info(
+                    "Deleting group %s (%s) in Keycloak", group["name"], group_id
+                )
+                self.keycloak.delete_group(group_id)
+            else:
+                logger.info("The group %s is already deleted in Keycloak", group_id)
+        except keycloak_exceptions.KeycloakError as e:
+            logger.error("Failed to delete the group %s in Keycloak: %s", group_id, e)
+            raise
+
+    def list_groups(self):
+        """
+        List groups in Keycloak
+        """
+        try:
+            return self.keycloak.get_groups()
+        except keycloak_exceptions.KeycloakError as e:
+            logger.error("Failed to list groups in Keycloak: %s", e)
+            raise
+
+    def list_group_members(self, group_id: str):
+        """
+        Get members of the group in Keycloak
+        """
+        try:
+            return self.keycloak.get_group_members(group_id)
+        except keycloak_exceptions.KeycloakError as e:
+            logger.error("Failed to get group members in Keycloak: %s", e)
+            raise
+
+    def add_user_to_group(self, user_id, group_id):
+        """
+        Add user to the Keycloak group
+        """
+        try:
+            logger.info("Adding user %s to group %s", user_id, group_id)
+            self.keycloak.group_user_add(user_id, group_id)
+        except keycloak_exceptions.KeycloakError as e:
+            logger.error(
+                "Failed to add user %s to group %s in Keycloak: %s",
+                user_id,
+                group_id,
+                e,
+            )
+            raise
+
+    def remove_user_from_group(self, user_id, group_id):
+        """
+        Remove user from the Keycloak group
+        """
+        try:
+            logger.info("Removing user %s from group %s", user_id, group_id)
+            self.keycloak.group_user_remove(user_id, group_id)
+        except keycloak_exceptions.KeycloakError as e:
+            logger.error(
+                "Failed to revoke user %s role in Keycloak group %s: %s",
+                user_id,
+                group_id,
+                e,
+            )
+            raise

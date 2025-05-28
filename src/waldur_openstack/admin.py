@@ -10,6 +10,7 @@ from waldur_core.core.admin import (
     PasswordWidget,
     format_json_field,
 )
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure import admin as structure_admin
 
 from . import executors, models
@@ -45,7 +46,7 @@ class TenantAdmin(structure_admin.ResourceAdmin):
         """Execute action with tenant that is in state OK"""
 
         def validate(self, tenant):
-            if tenant.state != models.Tenant.States.OK:
+            if tenant.state != CoreStates.OK:
                 raise ValidationError(
                     _("Tenant has to be in state OK to pull security groups.")
                 )
@@ -101,8 +102,8 @@ class TenantAdmin(structure_admin.ResourceAdmin):
 
         def validate(self, tenant):
             if tenant.state not in (
-                models.Tenant.States.OK,
-                models.Tenant.States.ERRED,
+                CoreStates.OK,
+                CoreStates.ERRED,
             ):
                 raise ValidationError(_("Tenant has to be OK or erred."))
             if not tenant.backend_id:
@@ -240,8 +241,8 @@ class VolumeAdmin(
 
         def validate(self, instance):
             if instance.state not in (
-                models.Volume.States.OK,
-                models.Volume.States.ERRED,
+                CoreStates.OK,
+                CoreStates.ERRED,
             ):
                 raise ValidationError(_("Volume has to be in OK or ERRED state."))
 
@@ -255,8 +256,8 @@ class SnapshotAdmin(structure_admin.ResourceAdmin):
 
         def validate(self, instance):
             if instance.state not in (
-                models.Snapshot.States.OK,
-                models.Snapshot.States.ERRED,
+                CoreStates.OK,
+                CoreStates.ERRED,
             ):
                 raise ValidationError(_("Snapshot has to be in OK or ERRED state."))
 
@@ -294,10 +295,7 @@ class InstanceAdmin(ActionDetailsMixin, structure_admin.VirtualMachineAdmin):
         short_description = _("Pull")
 
         def validate(self, instance):
-            if instance.state not in (
-                models.Instance.States.OK,
-                models.Instance.States.ERRED,
-            ):
+            if instance.state not in (CoreStates.OK, CoreStates.ERRED):
                 raise ValidationError(_("Instance has to be in OK or ERRED state."))
 
     pull = Pull()
@@ -313,6 +311,10 @@ class BackupAdmin(MetadataMixin, admin.ModelAdmin):
         return obj.instance.project
 
     project.short_description = _("Project")
+
+
+class NetworkRBACPolicyAdmin(admin.ModelAdmin):
+    list_display = ("uuid", "network", "target_tenant")
 
 
 admin.site.register(models.Network, NetworkAdmin)
@@ -335,5 +337,6 @@ admin.site.register(
 )
 admin.site.register(models.Instance, InstanceAdmin)
 admin.site.register(models.Backup, BackupAdmin)
+admin.site.register(models.NetworkRBACPolicy, NetworkRBACPolicyAdmin)
 
 structure_admin.CustomerAdmin.inlines += [CustomerOpenStackInline]

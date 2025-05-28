@@ -1,3 +1,5 @@
+import logging
+from collections.abc import Callable
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
@@ -36,6 +38,7 @@ from waldur_mastermind.marketplace.enums import (
     OrderStates,
     RequestTypes,
     ResourceStates,
+    RobotAccountStates,
 )
 from waldur_mastermind.marketplace.exceptions import PolicyException
 from waldur_pid import mixins as pid_mixins
@@ -43,6 +46,8 @@ from waldur_pid import mixins as pid_mixins
 from ..common import mixins as common_mixins
 from . import managers, plugins
 from .attribute_types import ATTRIBUTE_TYPES
+
+logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
@@ -97,7 +102,7 @@ class ServiceProvider(
     def has_active_offerings(self) -> bool:
         return (
             Offering.objects.filter(customer=self.customer)
-            .exclude(state=Offering.States.ARCHIVED)
+            .exclude(state=OfferingStates.ARCHIVED)
             .exists()
         )
 
@@ -105,7 +110,7 @@ class ServiceProvider(
     def offering_count(self) -> int:
         return Offering.objects.filter(
             customer=self.customer,
-            state__in=[Offering.States.ACTIVE, Offering.States.PAUSED],
+            state__in=[OfferingStates.ACTIVE, OfferingStates.PAUSED],
         ).count()
 
     def generate_api_secret_code(self):
@@ -149,6 +154,13 @@ class Category(
     quotas_models.QuotaModelMixin,
     TimeStampedModel,
 ):
+    id: int
+    columns: models.Manager["CategoryColumn"]
+    sections: models.Manager["Section"]
+    components: models.Manager["CategoryComponent"]
+    offerings: models.Manager["Offering"]
+    articles: models.Manager["CategoryHelpArticle"]
+
     title = models.CharField(blank=False, max_length=255)
     icon = models.FileField(
         upload_to="marketplace_category_icons",
@@ -264,6 +276,8 @@ class CategoryColumn(
 
 
 class Section(TimeStampedModel):
+    attributes: models.Manager["Attribute"]
+
     key = models.CharField(primary_key=True, max_length=255)
     title = models.CharField(blank=False, max_length=255)
     category = models.ForeignKey(
@@ -281,6 +295,8 @@ InternalNameValidator = RegexValidator(r"^[a-zA-Z0-9_\-\/:]+$")
 
 
 class Attribute(TimeStampedModel):
+    options: models.Manager["AttributeOption"]
+
     key = models.CharField(
         primary_key=True, max_length=255, validators=[InternalNameValidator]
     )
@@ -382,6 +398,14 @@ class Offering(
     waldur_core.media.mixins.ImageModelMixin,
     common_mixins.BackendMetadataMixin,
 ):
+    children: models.Manager["Offering"]
+    components: models.Manager["OfferingComponent"]
+    plans: models.Manager["Plan"]
+    screenshots: models.Manager["Screenshot"]
+    files: models.Manager["OfferingFile"]
+    endpoints: models.Manager["OfferingAccessEndpoint"]
+    roles: models.Manager["OfferingUserRole"]
+
     class States(OfferingStates):
         pass
 
@@ -391,6 +415,7 @@ class Offering(
         null=True,
         validators=[ImageValidator],
     )
+    remote_image_uuid = models.UUIDField(null=True, blank=True, default=None)
     full_description = models.TextField(blank=True)
     vendor_details = models.TextField(blank=True)
     getting_started = models.TextField(blank=True)
@@ -398,7 +423,7 @@ class Offering(
     category = models.ForeignKey(
         on_delete=models.CASCADE, to=Category, related_name="offerings"
     )
-    customer: structure_models.Customer = models.ForeignKey(
+    customer = models.ForeignKey(
         on_delete=models.CASCADE,
         to=structure_models.Customer,
         related_name="+",
@@ -412,7 +437,7 @@ class Offering(
         blank=True,
     )
     # Volume offering is linked with VPC offering via parent field
-    parent = models.ForeignKey(
+    parent = models.ForeignKey["Offering"](
         on_delete=models.CASCADE,
         to="Offering",
         null=True,
@@ -595,6 +620,8 @@ class OfferingComponent(
     core_mixins.ScopeMixin,
     core_models.BackendMixin,
 ):
+    components: models.Manager["PlanComponent"]
+
     class Meta:
         unique_together = ("type", "offering")
         ordering = ("name",)
@@ -718,6 +745,9 @@ class Plan(
     It is assumed that plan price is updated manually when plan component is managed via Django ORM.
     """
 
+    id: int
+    components: models.Manager["PlanComponent"]
+
     offering = models.ForeignKey(
         on_delete=models.CASCADE, to=Offering, related_name="plans"
     )
@@ -798,7 +828,7 @@ class Plan(
             return True
         usage = (
             Resource.objects.filter(plan=self)
-            .exclude(state=Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .count()
         )
         return self.max_amount > usage
@@ -867,6 +897,7 @@ class Screenshot(
     core_models.DescribableMixin,
     TimeStampedModel,
     core_models.NameMixin,
+    core_models.BackendMixin,
 ):
     image = models.ImageField(upload_to=get_upload_path)
     thumbnail = models.ImageField(upload_to=get_upload_path, editable=False, null=True)
@@ -977,7 +1008,7 @@ class ResourceDetailsMixin(
             "The date is inclusive. Once reached, a resource will be scheduled for termination."
         ),
     )
-    end_date_requested_by = models.ForeignKey(
+    end_date_requested_by = models.ForeignKey[core_models.User](
         on_delete=models.SET_NULL,
         to=core_models.User,
         blank=True,
@@ -1010,6 +1041,12 @@ class Resource(
     Eventually it is expected that core resource model is going to be superseded by
     marketplace resource model as a primary mean.
     """
+
+    children: models.Manager["Resource"]
+    quotas: models.Manager["ComponentQuota"]
+    usages: models.Manager["ComponentUsage"]
+    endpoints: models.Manager["ResourceAccessEndpoint"]
+    users: models.Manager["ResourceUser"]
 
     class States(ResourceStates):
         pass
@@ -1156,9 +1193,9 @@ class Resource(
         order_in_progress = Order.objects.filter(
             resource=self,
             state__in=[
-                Order.States.PENDING_CONSUMER,
-                Order.States.PENDING_PROVIDER,
-                Order.States.EXECUTING,
+                OrderStates.PENDING_CONSUMER,
+                OrderStates.PENDING_PROVIDER,
+                OrderStates.EXECUTING,
             ],
         ).first()
         return order_in_progress
@@ -1168,6 +1205,8 @@ class ResourcePlanPeriod(TimeStampedModel, TimeFramedModel, core_models.UuidMixi
     """
     This model allows to track billing plan for timeframes during resource lifecycle.
     """
+
+    components: models.Manager["ComponentUsage"]
 
     resource = models.ForeignKey(
         on_delete=models.CASCADE, to=Resource, related_name="+"
@@ -1192,16 +1231,14 @@ class Order(
     SafeAttributesMixin,
     TimeStampedModel,
 ):
-    class States(OrderStates):
-        pass
-
     old_plan = models.ForeignKey(
         on_delete=models.CASCADE, to=Plan, related_name="+", null=True, blank=True
     )
     project = models.ForeignKey(on_delete=models.CASCADE, to=structure_models.Project)
     resource = models.ForeignKey(on_delete=models.CASCADE, to=Resource)
-    state = FSMIntegerField(default=States.PENDING_CONSUMER, choices=States.CHOICES)
-    activated = models.DateTimeField(_("activation date"), null=True, blank=True)
+    state = FSMIntegerField(
+        default=OrderStates.PENDING_CONSUMER, choices=OrderStates.CHOICES
+    )
     output = models.TextField(blank=True)
     tracker = FieldTracker()
 
@@ -1255,39 +1292,46 @@ class Order(
         self.provider_reviewed_at = timezone.now()
         self.save()
 
-    @transition(field=state, source=States.EXECUTING, target=States.DONE)
-    def complete(self):
-        self.activated = timezone.now()
+    def _set_completed_at_timestamp(self):
+        logger.debug("Setting order %s completion time", self)
+        self.completed_at = timezone.now()
         self.save()
 
-    @transition(field=state, source="*", target=States.CANCELED)
+    @transition(field=state, source=OrderStates.EXECUTING, target=OrderStates.DONE)
+    def complete(self):
+        self._set_completed_at_timestamp()
+
+    @transition(field=state, source="*", target=OrderStates.CANCELED)
     def cancel(self, termination_comment=None):
         if termination_comment:
             self.termination_comment = termination_comment
-            self.save()
-        pass
+        self._set_completed_at_timestamp()
 
     @transition(
         field=state,
-        source=(States.PENDING_CONSUMER, States.PENDING_PROVIDER),
-        target=States.REJECTED,
+        source=(OrderStates.PENDING_CONSUMER, OrderStates.PENDING_PROVIDER),
+        target=OrderStates.REJECTED,
     )
     def reject(self):
-        pass
+        self._set_completed_at_timestamp()
 
-    @transition(field=state, source="*", target=States.ERRED)
+    @transition(field=state, source="*", target=OrderStates.ERRED)
     def fail(self):
-        pass
+        self._set_completed_at_timestamp()
 
     @transition(
         field=state,
-        source=[States.PENDING_CONSUMER, States.PENDING_PROVIDER, States.ERRED],
-        target=States.EXECUTING,
+        source=[
+            OrderStates.PENDING_CONSUMER,
+            OrderStates.PENDING_PROVIDER,
+            OrderStates.ERRED,
+        ],
+        target=OrderStates.EXECUTING,
     )
     def set_state_executing(self):
         pass
 
-    @transition(field=state, source="*", target=States.ERRED)
+    @transition(field=state, source="*", target=OrderStates.ERRED)
     def set_state_erred(self):
         pass
 
@@ -1350,7 +1394,7 @@ class ComponentUsage(
     )
     usage = models.DecimalField(default=0, decimal_places=2, max_digits=20)
     date = models.DateTimeField()
-    plan_period = models.ForeignKey(
+    plan_period = models.ForeignKey["ResourcePlanPeriod"](
         on_delete=models.CASCADE,
         to="ResourcePlanPeriod",
         related_name="components",
@@ -1360,7 +1404,7 @@ class ComponentUsage(
     recurring = models.BooleanField(
         default=False, help_text="Reported value is reused every month until changed."
     )
-    modified_by = models.ForeignKey(
+    modified_by = models.ForeignKey[User](
         to=User, related_name="+", blank=True, null=True, on_delete=models.SET_NULL
     )
 
@@ -1397,7 +1441,7 @@ class ComponentUserUsage(
     This model represents an amount of a component consumed by a user.
     """
 
-    user = models.ForeignKey(
+    user = models.ForeignKey["OfferingUser"](
         to="OfferingUser", on_delete=models.CASCADE, blank=True, null=True
     )
     username = models.CharField(max_length=100)
@@ -1418,7 +1462,9 @@ class ComponentUserUsageLimit(
         on_delete=models.CASCADE,
         to=OfferingComponent,
     )
-    user = models.ForeignKey(to="OfferingUser", on_delete=models.CASCADE, null=False)
+    user = models.ForeignKey["OfferingUser"](
+        to="OfferingUser", on_delete=models.CASCADE, null=False
+    )
     limit = models.DecimalField(default=0, decimal_places=2, max_digits=20)
 
     class Meta:
@@ -1493,37 +1539,71 @@ class CategoryHelpArticle(models.Model):
         return self.title
 
 
-class RobotAccount(
+class BaseServiceAccount(
     TimeStampedModel,
     core_models.UuidMixin,
     LoggableMixin,
-    common_mixins.BackendMetadataMixin,
-    core_models.BackendMixin,
     core_models.ErrorMessageMixin,
 ):
-    class States:
-        REQUESTED = 1
-        CREATING = 2
-        OK = 3
-        REQUESTED_DELETION = 4
-        DELETED = 5
-        ERROR = 6
-
-        CHOICES = (
-            (REQUESTED, "Requested"),
-            (CREATING, "Creating"),
-            (OK, "OK"),
-            (REQUESTED_DELETION, "Requested deletion"),
-            (DELETED, "Deleted"),
-            (ERROR, "Error"),
-        )
-
-    resource = models.ForeignKey(Resource, on_delete=models.CASCADE)
-    type = models.CharField(max_length=5)
-    # empty string should be allowed because name is set by
-    # service provider after the account is created
     username = models.CharField(max_length=32, blank=True)
-    users = models.ManyToManyField(User, blank=True)
+    description = models.TextField(blank=True)
+
+    class Meta:
+        abstract = True
+        ordering = ["created"]
+
+    def get_log_fields(self):
+        return ("username",)
+
+
+class ScopedServiceAccount(BaseServiceAccount):
+    class Meta:
+        abstract = True
+
+    email = models.EmailField(max_length=320, default="")
+
+    def __str__(self):
+        return f"Service account {self.username} for {self.scope}"
+
+    tracker = FieldTracker(fields=["username", "email", "description"])
+
+
+class ProjectServiceAccount(ScopedServiceAccount):
+    project = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=structure_models.Project,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        verbose_name = _("Project service account")
+
+    def __str__(self):
+        return f"Project service account {self.username} for {self.project}"
+
+
+class CustomerServiceAccount(ScopedServiceAccount):
+    customer = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=structure_models.Customer,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        verbose_name = _("Customer service account")
+
+    def __str__(self):
+        return f"Customer service account {self.username} for {self.customer}"
+
+
+class RobotAccount(
+    BaseServiceAccount, common_mixins.BackendMetadataMixin, core_models.BackendMixin
+):
+    resource = models.ForeignKey(Resource, on_delete=models.CASCADE)
+    keys = models.JSONField(blank=True, default=list)
+    get_state_display: Callable[[], str]
     responsible_user = models.ForeignKey(
         on_delete=models.SET_NULL,
         to=User,
@@ -1531,30 +1611,53 @@ class RobotAccount(
         blank=True,
         related_name="+",
     )
-    keys = models.JSONField(blank=True, default=list)
-    state = FSMIntegerField(default=States.REQUESTED, choices=States.CHOICES)
 
-    tracker = FieldTracker(
-        fields=["resource", "type", "username", "users", "state", "keys"]
+    # Get base fields from BaseServiceAccount's tracker and add new ones
+    tracker = FieldTracker(fields=["username", "state", "resource", "type", "keys"])
+
+    users = models.ManyToManyField(
+        User, blank=True, help_text=_("Users who have access to this robot account.")
     )
 
-    @transition(field=state, source=States.REQUESTED, target=States.CREATING)
+    type = models.CharField(max_length=5, help_text=_("Type of the robot account."))
+
+    state = FSMIntegerField(
+        default=RobotAccountStates.REQUESTED, choices=RobotAccountStates.CHOICES
+    )
+
+    @transition(
+        field=state,
+        source=RobotAccountStates.REQUESTED,
+        target=RobotAccountStates.CREATING,
+    )
     def begin_creating(self):
         pass
 
-    @transition(field=state, source=[States.CREATING, States.ERROR], target=States.OK)
+    @transition(
+        field=state,
+        source=[RobotAccountStates.CREATING, RobotAccountStates.ERROR],
+        target=RobotAccountStates.OK,
+    )
     def set_ok(self):
         pass
 
-    @transition(field=state, source=States.OK, target=States.REQUESTED_DELETION)
+    @transition(
+        field=state,
+        source=RobotAccountStates.OK,
+        target=RobotAccountStates.REQUESTED_DELETION,
+    )
     def request_deletion(self):
         pass
 
-    @transition(field=state, source=States.REQUESTED_DELETION, target=States.DELETED)
+    @transition(
+        field=state,
+        source=RobotAccountStates.REQUESTED_DELETION,
+        target=RobotAccountStates.DELETED,
+    )
     def set_deleted(self):
         pass
 
-    @transition(field=state, source="*", target=States.ERROR)
+    @transition(field=state, source="*", target=RobotAccountStates.ERROR)
     def set_error(self):
         pass
 
@@ -1563,11 +1666,7 @@ class RobotAccount(
         ordering = ["created"]
 
     def get_log_fields(self):
-        return (
-            "type",
-            "username",
-            "state",
-        )
+        return super().get_log_fields() + ("type",)
 
     def __str__(self):
         return f"Robot account {self.username} for {self.resource}"

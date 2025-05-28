@@ -13,6 +13,7 @@ from rest_framework.filters import BaseFilterBackend
 
 from waldur_core.core import filters as core_filters
 from waldur_core.core import models as core_models
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.filters import ExternalFilterBackend
 from waldur_core.core.utils import get_ordering, is_uuid_like, order_with_nulls
 from waldur_core.permissions.enums import RoleEnum
@@ -76,6 +77,11 @@ class CustomerFilter(NameFilterSet):
         field_name="organization_groups__name",
         lookup_expr="icontains",
     )
+    owned_by_current_user = django_filters.BooleanFilter(
+        widget=BooleanWidget,
+        method="filter_owned_by_current_user",
+        label="Return a list of customers where current user is owner.",
+    )
 
     class Meta:
         model = models.Customer
@@ -103,19 +109,9 @@ class CustomerFilter(NameFilterSet):
             ).distinct()
         return queryset
 
-
-class OwnedByCurrentUserFilterBackend(BaseFilterBackend):
-    def filter_queryset(self, request, queryset, view):
-        value = request.query_params.get("owned_by_current_user")
-        boolean_field = forms.NullBooleanField()
-
-        try:
-            value = boolean_field.to_python(value)
-        except exceptions.ValidationError:
-            value = None
-
+    def filter_owned_by_current_user(self, queryset, name, value):
         if value:
-            ids = get_connected_customers(request.user, RoleEnum.CUSTOMER_OWNER)
+            ids = get_connected_customers(self.request.user, RoleEnum.CUSTOMER_OWNER)
             return queryset.filter(id__in=ids)
         return queryset
 
@@ -286,16 +282,6 @@ def filter_visible_users(queryset, user, extra=None):
     return (
         queryset.filter(is_staff=False)
         .filter(Q(id__in=get_visible_users(user)) | Q(id=user.id) | (extra or Q()))
-        .distinct()
-    )
-
-
-def filter_visible_user_permissions(queryset, user):
-    if user.is_staff or user.is_support:
-        return queryset
-    return (
-        queryset.filter(user__is_staff=False)
-        .filter(Q(user__id__in=get_visible_users(user)) | Q(user__id=user.id))
         .distinct()
     )
 
@@ -508,9 +494,7 @@ class ServiceTypeFilter(django_filters.Filter):
 
 class ServiceSettingsFilter(NameFilterSet):
     type = ServiceTypeFilter()
-    state = core_filters.MappedMultipleChoiceFilter(
-        core_models.StateMixin.States.CHOICES
-    )
+    state = core_filters.MappedMultipleChoiceFilter(CoreStates.CHOICES)
     customer = django_filters.UUIDFilter(field_name="customer__uuid")
     customer_uuid = django_filters.UUIDFilter(field_name="customer__uuid")
     scope_uuid = django_filters.UUIDFilter(
@@ -569,12 +553,32 @@ class BaseResourceFilter(NameFilterSet):
     )
     # resource
     description = django_filters.CharFilter(lookup_expr="icontains")
-    state = core_filters.MappedMultipleChoiceFilter(
-        core_models.StateMixin.States.CHOICES
-    )
+    state = core_filters.MappedMultipleChoiceFilter(CoreStates.CHOICES)
     uuid = django_filters.UUIDFilter(lookup_expr="exact")
     backend_id = django_filters.CharFilter(field_name="backend_id", lookup_expr="exact")
     external_ip = core_filters.EmptyFilter()
+    can_manage = django_filters.BooleanFilter(
+        label="Can manage", method="filter_can_manage"
+    )
+
+    def filter_can_manage(self, queryset, name, value):
+        user = self.request.user
+
+        if user.is_staff:
+            return queryset
+
+        # Get projects where user is admin or manager
+        managed_projects = get_connected_projects(
+            user, [RoleEnum.PROJECT_ADMIN, RoleEnum.PROJECT_MANAGER]
+        )
+
+        # Get customers where user is owner
+        owned_customers = get_connected_customers(user, RoleEnum.CUSTOMER_OWNER)
+
+        # Filter resources by project or customer
+        return queryset.filter(
+            Q(project__in=managed_projects) | Q(project__customer__in=owned_customers)
+        ).distinct()
 
     ORDERING_FIELDS = (
         ("name", "name"),

@@ -1,8 +1,10 @@
+import uuid
 from unittest import mock
 
 from django.test import override_settings
 from rest_framework import test
 
+import respx
 from waldur_core.core.utils import serialize_instance
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
@@ -12,7 +14,7 @@ from waldur_core.permissions.fixtures import (
 )
 from waldur_core.structure.tests.fixtures import ProjectFixture
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace.models import Order, Resource
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
 from waldur_mastermind.marketplace.tests.factories import (
@@ -32,7 +34,7 @@ class OrderReviewByProviderTest(test.APITransactionTestCase):
         self.offering.type = PLUGIN_NAME
         self.offering.save()
         self.order = self.fixture.order
-        self.order.state = marketplace_models.Order.States.PENDING_PROVIDER
+        self.order.state = OrderStates.PENDING_PROVIDER
         self.order.save()
 
         self.fixture.offering_owner
@@ -99,7 +101,7 @@ class LimitsUpdateTest(test.APITransactionTestCase):
         # Assert
         self.assertEqual(response.status_code, 200, response.data)
         order = marketplace_models.Order.objects.get(uuid=response.data["order_uuid"])
-        self.assertEqual(order.state, marketplace_models.Order.States.EXECUTING)
+        self.assertEqual(order.state, OrderStates.EXECUTING)
         self.assertEqual(order.created_by, user)
         process_order.assert_called_once()
 
@@ -114,7 +116,7 @@ class LimitsUpdateTest(test.APITransactionTestCase):
         # Assert
         self.assertEqual(response.status_code, 200, response.data)
         order = marketplace_models.Order.objects.get(uuid=response.data["order_uuid"])
-        self.assertEqual(order.state, marketplace_models.Order.States.EXECUTING)
+        self.assertEqual(order.state, OrderStates.EXECUTING)
         self.assertEqual(order.created_by, user)
         process_order.assert_called_once()
 
@@ -130,78 +132,82 @@ class LimitsUpdateTest(test.APITransactionTestCase):
         # Assert
         self.assertEqual(response.status_code, 200, response.data)
         order = marketplace_models.Order.objects.get(uuid=response.data["order_uuid"])
-        self.assertEqual(order.state, marketplace_models.Order.States.PENDING_PROVIDER)
+        self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
         process_order.assert_not_called()
 
 
 class OrderPullTest(test.APITransactionTestCase):
     def setUp(self) -> None:
         super().setUp()
-        patcher = mock.patch("waldur_mastermind.marketplace_remote.utils.WaldurClient")
-        self.client_mock = patcher.start()
+        respx.start()
         fixture = ProjectFixture()
+        self.api_url = "https://remote-waldur.com"
         offering = OfferingFactory(
             type=PLUGIN_NAME,
             secret_options={
-                "api_url": "https://remote-waldur.com/",
+                "api_url": self.api_url,
                 "token": "valid_token",
             },
         )
         self.resource = ResourceFactory(project=fixture.project, offering=offering)
+        self.backend_id = uuid.uuid4().hex
         self.order = OrderFactory(
             project=fixture.project,
             offering=offering,
             resource=self.resource,
-            state=Order.States.EXECUTING,
-            backend_id="BACKEND_ID",
+            state=OrderStates.EXECUTING,
+            backend_id=self.backend_id,
         )
 
     def tearDown(self):
         super().tearDown()
+        respx.stop()
         mock.patch.stopall()
+
+    def mock_order_response(
+        self, state, error_message="", marketplace_resource_uuid=None
+    ):
+        response_json = {"state": state, "error_message": error_message}
+        if marketplace_resource_uuid:
+            response_json["marketplace_resource_uuid"] = marketplace_resource_uuid
+        respx.get(f"{self.api_url}/api/marketplace-orders/{self.backend_id}/").respond(
+            200, json=response_json
+        )
 
     def test_when_order_succeeds_resource_is_updated(self):
         # Arrange
-        self.client_mock().get_order.return_value = {
-            "state": "done",
-            "error_message": "",
-        }
+        self.mock_order_response(state="done")
 
         # Act
         OrderPullTask().run(serialize_instance(self.order))
 
         # Assert
         self.order.refresh_from_db()
-        self.assertEqual(self.order.state, Order.States.DONE)
+        self.assertEqual(self.order.state, OrderStates.DONE)
 
         self.resource.refresh_from_db()
-        self.assertEqual(self.resource.state, Resource.States.OK)
+        self.assertEqual(self.resource.state, ResourceStates.OK)
 
     def test_when_order_fails_resource_is_updated(self):
         # Arrange
-        self.client_mock().get_order.return_value = {
-            "state": "erred",
-            "error_message": "Invalid credentials",
-        }
+        self.mock_order_response(state="erred", error_message="Invalid credentials")
 
         # Act
         OrderPullTask().run(serialize_instance(self.order))
 
         # Assert
         self.order.refresh_from_db()
-        self.assertEqual(self.order.state, Order.States.ERRED)
+        self.assertEqual(self.order.state, OrderStates.ERRED)
         self.assertEqual(self.order.error_message, "Invalid credentials")
 
         self.resource.refresh_from_db()
-        self.assertEqual(self.resource.state, Resource.States.ERRED)
+        self.assertEqual(self.resource.state, ResourceStates.ERRED)
 
     def test_when_creation_order_succeeds_resource_is_created(self):
         # Arrange
-        self.client_mock().get_order.return_value = {
-            "state": "done",
-            "marketplace_resource_uuid": "marketplace_resource_uuid",
-            "error_message": "",
-        }
+        self.mock_order_response(
+            state="done", marketplace_resource_uuid=uuid.uuid4().hex
+        )
 
         # Act
         OrderPullTask().run(serialize_instance(self.order))
@@ -209,4 +215,4 @@ class OrderPullTest(test.APITransactionTestCase):
         # Assert
         self.order.refresh_from_db()
         self.assertIsNotNone(self.order.resource)
-        self.assertEqual(Resource.States.OK, self.order.resource.state)
+        self.assertEqual(ResourceStates.OK, self.order.resource.state)

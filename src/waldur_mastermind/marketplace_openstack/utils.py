@@ -36,10 +36,6 @@ logger = logging.getLogger(__name__)
 TenantQuotas = openstack_models.Tenant.Quotas
 
 
-def get_offering_category_for_tenant():
-    return marketplace_models.Category.objects.get(default_tenant_category=True)
-
-
 def get_offering_name_for_instance(tenant):
     return "Virtual machine in %s" % tenant.name
 
@@ -360,8 +356,8 @@ def create_offerings_for_volume_and_instance(tenant: openstack_models.Tenant):
         resource = marketplace_models.Resource.objects.get(scope=tenant)
     except ObjectDoesNotExist:
         logger.debug(
-            "Skipping offering creation for tenant because order "
-            "item does not exist. OpenStack tenant ID: %s",
+            "Skipping offering creation for tenant because its marketplace resource "
+            "does not exist. OpenStack tenant ID: %s",
             tenant.id,
         )
         return
@@ -385,7 +381,6 @@ def create_offerings_for_volume_and_instance(tenant: openstack_models.Tenant):
             scope=tenant,
             shared=False,
             category=category,
-            # OpenStack instance and volume offerings are charged as a part of its tenant
             billable=False,
             parent=parent_offering,
             customer=actual_customer,
@@ -405,7 +400,13 @@ def create_offerings_for_volume_and_instance(tenant: openstack_models.Tenant):
         for field in fields:
             payload[field] = getattr(parent_offering, field)
 
-        marketplace_models.Offering.objects.create(**payload)
+        if not marketplace_models.Offering.objects.filter(
+            type=offering_type,
+            scope=tenant,
+            customer=actual_customer,
+            project=tenant.project,
+        ).exists():
+            marketplace_models.Offering.objects.create(**payload)
 
 
 def create_marketplace_resource_for_imported_resources(
@@ -464,8 +465,12 @@ def create_marketplace_resource_for_imported_resources(
             return
 
         resource.offering = offering
-
         resource.init_cost()
+        backend = instance.get_backend()
+
+        storage_mode = offering.plugin_options.get("storage_mode")
+        limits = backend.get_tenant_limits(instance, storage_mode == STORAGE_MODE_FIXED)
+        resource.limits = limits
         resource.save()
         import_resource_metadata(resource)
         create_offerings_for_volume_and_instance(instance)
@@ -551,3 +556,14 @@ def update_external_addresses_of_offering_floating_ips(parent_offering):
 
     for resource in resources:
         update_external_addresses_of_resource(resource)
+
+
+def set_ports_status_for_order(order, status):
+    for port_attribute in order.attributes.get("ports", []):
+        port_url = port_attribute.get("port")
+        if port_url:
+            port_uuid = port_url.rstrip("/").split("/")[-1]
+            port = openstack_models.Port.objects.filter(uuid=port_uuid).first()
+            if port:
+                port.status = status
+                port.save()

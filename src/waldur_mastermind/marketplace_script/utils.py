@@ -35,16 +35,13 @@ def check_docker_socket_access(docker_config):
 
         # Check if socket exists
         if not os.path.exists(socket_path):
-            raise Exception(f"Docker socket {socket_path} does not exist")
+            raise FileNotFoundError(f"Docker socket {socket_path} does not exist")
 
         # Check read and write permissions for current user
-        try:
-            if not os.access(socket_path, os.R_OK | os.W_OK):
-                raise PermissionError(
-                    f"Current user doesn't have read/write permissions for Docker socket at {socket_path}"
-                )
-        except Exception as e:
-            raise Exception(f"Error checking socket permissions: {str(e)}")
+        if not os.access(socket_path, os.R_OK | os.W_OK):
+            raise PermissionError(
+                f"Current user doesn't have read/write permissions for Docker socket at {socket_path}"
+            )
 
 
 def execute_script_in_docker(image, command, src, **kwargs):

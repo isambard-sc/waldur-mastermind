@@ -1,7 +1,7 @@
+import datetime
 from unittest import mock
 
 from django.db import transaction
-from django.utils import timezone
 from rest_framework.test import APITransactionTestCase
 
 from waldur_core.logging.models import Event
@@ -10,6 +10,7 @@ from waldur_core.structure.tests import models as structure_tests_models
 from waldur_mastermind.marketplace import PLUGIN_NAME, callbacks, utils
 from waldur_mastermind.marketplace import handlers as marketplace_handlers
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.tests import factories, fixtures
 
 
@@ -42,7 +43,7 @@ class ResourceHandlerTest(APITransactionTestCase):
 
         # Set initial resource state
         fixture.resource.limits = {offering_component.type: 20}
-        fixture.resource.state = marketplace_models.Resource.States.OK
+        fixture.resource.state = ResourceStates.OK
         fixture.resource.plan = fixture.plan
         fixture.resource.save()  # Save initial state
 
@@ -273,50 +274,49 @@ class UpdateOfferingUserUsernameAfterUserChangeTest(APITransactionTestCase):
 
 class SetOrderCompletionTimestampTest(APITransactionTestCase):
     def setUp(self):
-        self.order = factories.OrderFactory(
-            state=marketplace_models.Order.States.PENDING_PROVIDER
-        )
+        self.fixed_time = datetime.datetime(2025, 5, 23, 12, 0, 0)
+        self.order = factories.OrderFactory(state=OrderStates.PENDING_PROVIDER)
         self.order.save()
 
     def set_order_executing(self):
-        self.order.state = marketplace_models.Order.States.EXECUTING
+        self.order.state = OrderStates.EXECUTING
         self.order.save()
 
     def test_set_order_completion_timestamp_created(self):
         self.set_order_executing()
         self.assertIsNone(self.order.completed_at)
 
-    @mock.patch("waldur_mastermind.marketplace.handlers.now")
+    @mock.patch("django.utils.timezone.now")
     def test_set_order_completion_timestamp_completed(self, mock_now):
-        mock_now.return_value = timezone.now()
+        mock_now.return_value = self.fixed_time
         self.set_order_executing()
         self.order.complete()
         self.order.save()
         self.assertIsNotNone(self.order.completed_at)
-        self.assertEqual(mock_now.return_value, self.order.completed_at)
+        self.assertEqual(self.fixed_time, self.order.completed_at)
 
-    @mock.patch("waldur_mastermind.marketplace.handlers.now")
+    @mock.patch("django.utils.timezone.now")
     def test_set_order_completion_timestamp_failed(self, mock_now):
-        mock_now.return_value = timezone.now()
+        mock_now.return_value = self.fixed_time
         self.set_order_executing()
         self.order.fail()
         self.order.save()
         self.assertIsNotNone(self.order.completed_at)
-        self.assertEqual(mock_now.return_value, self.order.completed_at)
+        self.assertEqual(self.fixed_time, self.order.completed_at)
 
-    @mock.patch("waldur_mastermind.marketplace.handlers.now")
+    @mock.patch("django.utils.timezone.now")
     def test_set_order_completion_timestamp_cancelled(self, mock_now):
-        mock_now.return_value = timezone.now()
+        mock_now.return_value = self.fixed_time
         self.set_order_executing()
         self.order.cancel()
         self.order.save()
         self.assertIsNotNone(self.order.completed_at)
-        self.assertEqual(mock_now.return_value, self.order.completed_at)
+        self.assertEqual(self.fixed_time, self.order.completed_at)
 
-    @mock.patch("waldur_mastermind.marketplace.handlers.now")
+    @mock.patch("django.utils.timezone.now")
     def test_set_order_completion_timestamp_rejected(self, mock_now):
-        mock_now.return_value = timezone.now()
+        mock_now.return_value = self.fixed_time
         self.order.reject()
         self.order.save()
         self.assertIsNotNone(self.order.completed_at)
-        self.assertEqual(mock_now.return_value, self.order.completed_at)
+        self.assertEqual(self.fixed_time, self.order.completed_at)

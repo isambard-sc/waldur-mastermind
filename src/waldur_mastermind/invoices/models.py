@@ -43,6 +43,8 @@ class Invoice(
 ):
     """Invoice describes billing information about purchased resources for customers on a monthly basis"""
 
+    items: models.Manager["InvoiceItem"]
+
     class Permissions:
         customer_path = "customer"
 
@@ -307,7 +309,7 @@ class InvoiceItem(
     )
     project_uuid = models.CharField(max_length=32, blank=True)
     backend_uuid = models.UUIDField(null=True, blank=True)
-    credit = models.ForeignKey(
+    credit = models.ForeignKey["CustomerCredit"](
         "CustomerCredit", on_delete=models.SET_NULL, null=True, editable=False
     )
 
@@ -640,12 +642,11 @@ class CustomerCredit(BaseCredit):
         if not invoice:
             return
 
-        consumption = (
-            InvoiceItem.objects.filter(invoice=invoice, credit=self).aggregate(
-                sum=Sum("unit_price")
-            )["sum"]
-            or 0
+        items = InvoiceItem.objects.filter(
+            invoice=invoice,
+            credit=self,
         )
+        consumption = sum([i.total for i in items]) or 0
 
         return consumption * -1
 
@@ -669,14 +670,12 @@ class ProjectCredit(BaseCredit):
             return
 
         credit = CustomerCredit.objects.filter(customer=self.project.customer).get()
-        consumption = (
-            InvoiceItem.objects.filter(
-                invoice=invoice,
-                credit=credit,
-                project=self.project,
-            ).aggregate(sum=Sum("unit_price"))["sum"]
-            or 0
+        items = InvoiceItem.objects.filter(
+            invoice=invoice,
+            credit=credit,
+            project=self.project,
         )
+        consumption = sum([i.total for i in items]) or 0
         return consumption * -1
 
     tracker = FieldTracker()

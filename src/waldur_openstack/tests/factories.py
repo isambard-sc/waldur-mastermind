@@ -8,6 +8,7 @@ from django.utils import timezone
 from factory import fuzzy
 
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.tests.types import BaseMetaFactory
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_openstack import models
@@ -102,7 +103,7 @@ class SecurityGroupFactory(
     name = factory.Sequence(lambda n: "security_group%s" % n)
     service_settings = factory.SubFactory(SettingsFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
-    state = models.SecurityGroup.States.OK
+    state = CoreStates.OK
     backend_id = factory.Sequence(lambda n: "security_group-id%s" % n)
 
     @classmethod
@@ -176,7 +177,7 @@ class TenantFactory(
     name = factory.Sequence(lambda n: "tenant%s" % n)
     service_settings = factory.SubFactory(SettingsFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
-    state = models.Tenant.States.OK
+    state = CoreStates.OK
     external_network_id = factory.LazyAttribute(lambda _: uuid.uuid4())
     backend_id = factory.Sequence(lambda n: "backend_id_%s" % n)
 
@@ -209,7 +210,7 @@ class NetworkFactory(
     service_settings = factory.SubFactory(SettingsFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
     tenant = factory.SubFactory(TenantFactory)
-    state = models.Network.States.OK
+    state = CoreStates.OK
 
     @classmethod
     def get_url(cls, network=None, action=None):
@@ -304,6 +305,9 @@ class PortFactory(
     service_settings = factory.SubFactory(SettingsFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
     tenant = factory.SubFactory(TenantFactory)
+    network = factory.SubFactory(NetworkFactory)
+    admin_state_up = True
+    status = "DOWN"
 
     @classmethod
     def get_url(cls, port=None):
@@ -329,7 +333,7 @@ class ServerGroupFactory(
     name = factory.Sequence(lambda n: "server_group%s" % n)
     backend_id = factory.Sequence(lambda n: "backend_id_%s" % n)
     policy = models.ServerGroup.AFFINITY
-    state = models.ServerGroup.States.OK
+    state = CoreStates.OK
     service_settings = factory.SubFactory(SettingsFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
     tenant = factory.SubFactory(TenantFactory)
@@ -359,7 +363,7 @@ class RouterFactory(
     project = factory.SubFactory(structure_factories.ProjectFactory)
     name = factory.Sequence(lambda n: "router%s" % n)
     backend_id = factory.Sequence(lambda n: "backend_id_%s" % n)
-    state = models.Network.States.OK
+    state = CoreStates.OK
 
     @classmethod
     def get_url(cls, router=None, action=None):
@@ -484,7 +488,7 @@ class InstanceFactory(
             project=self.project,
             size=20 * 1024,
             name=f"{self.name}-data",
-            state=models.Volume.States.OK,
+            state=CoreStates.OK,
         )
 
     @factory.post_generation
@@ -507,7 +511,7 @@ class BackupFactory(
     tenant = factory.SubFactory(TenantFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
     instance = factory.SubFactory(InstanceFactory)
-    state = models.Backup.States.OK
+    state = CoreStates.OK
     kept_until = fuzzy.FuzzyDateTime(
         timezone.datetime(2017, 6, 6, tzinfo=ZoneInfo("UTC"))
     )
@@ -538,7 +542,7 @@ class SnapshotFactory(
     project = factory.SubFactory(structure_factories.ProjectFactory)
     source_volume = factory.SubFactory(VolumeFactory)
     name = factory.Sequence(lambda n: "Snapshot #%s" % n)
-    state = models.Snapshot.States.OK
+    state = CoreStates.OK
 
     @classmethod
     def get_url(cls, snapshot, action=None):
@@ -555,7 +559,10 @@ class SnapshotFactory(
         return url if action is None else url + action + "/"
 
 
-class SnapshotRestorationFactory(factory.django.DjangoModelFactory):
+class SnapshotRestorationFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.SnapshotRestoration],
+):
     class Meta:
         model = models.SnapshotRestoration
 
@@ -586,3 +593,15 @@ class VolumeAvailabilityZoneFactory(
     @classmethod
     def get_list_url(cls):
         return "http://testserver" + reverse("openstack-volume-availability-zone-list")
+
+
+class NetworkRBACPolicyFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.NetworkRBACPolicy],
+):
+    class Meta:
+        model = models.NetworkRBACPolicy
+
+    network = factory.SubFactory(NetworkFactory)
+    target_tenant = factory.SubFactory(TenantFactory)
+    policy_type = models.NetworkRBACPolicy.NetworkShareType.SHARED

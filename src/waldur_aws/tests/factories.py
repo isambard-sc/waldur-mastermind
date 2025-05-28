@@ -4,10 +4,14 @@ from factory import fuzzy
 from libcloud.compute.types import NodeState
 
 from waldur_aws import models
+from waldur_core.core.enums import CoreStates
+from waldur_core.core.tests.types import BaseMetaFactory
 from waldur_core.structure.tests import factories as structure_factories
 
 
-class RegionFactory(factory.django.DjangoModelFactory):
+class RegionFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Region]
+):
     class Meta:
         model = models.Region
 
@@ -27,7 +31,9 @@ class RegionFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("aws-region-list")
 
 
-class ImageFactory(factory.django.DjangoModelFactory):
+class ImageFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Image]
+):
     class Meta:
         model = models.Image
 
@@ -48,7 +54,9 @@ class ImageFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("aws-image-list")
 
 
-class SizeFactory(factory.django.DjangoModelFactory):
+class SizeFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Size]
+):
     class Meta:
         model = models.Size
 
@@ -73,7 +81,9 @@ class SizeFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("aws-size-list")
 
 
-class InstanceFactory(factory.django.DjangoModelFactory):
+class InstanceFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Instance]
+):
     class Meta:
         model = models.Instance
 
@@ -84,7 +94,7 @@ class InstanceFactory(factory.django.DjangoModelFactory):
     )
     region = factory.SubFactory(RegionFactory)
 
-    state = models.Instance.States.OK
+    state = CoreStates.OK
     runtime_state = NodeState.STOPPED
     cores = fuzzy.FuzzyInteger(1, 8, step=2)
     ram = fuzzy.FuzzyInteger(1024, 10240, step=1024)

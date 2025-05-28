@@ -10,6 +10,7 @@ from django.utils import timezone
 from waldur_core.core import models as core_models
 from waldur_core.core import tasks as core_tasks
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.exceptions import (
     ServiceBackendError,
@@ -72,7 +73,7 @@ class BackgroundPullTask(core_tasks.BackgroundTask):
     def on_pull_success(self, instance):
         if not isinstance(instance, core_models.StateMixin):
             return
-        if instance.state == instance.States.ERRED:
+        if instance.state == CoreStates.ERRED:
             instance.recover()
             instance.error_message = ""
             instance.save(update_fields=["state", "error_message"])
@@ -80,7 +81,7 @@ class BackgroundPullTask(core_tasks.BackgroundTask):
     def log_error_message(self, instance, error_message):
         logger_message = f"Failed to pull {instance.__class__.__name__} {instance.name} (PK: {instance.pk}). Error: {error_message}"
         if (
-            instance.state == instance.States.ERRED
+            instance.state == CoreStates.ERRED
         ):  # report error on debug level if instance already was erred.
             logger.debug(logger_message)
         else:
@@ -103,10 +104,9 @@ class BackgroundListPullTask(core_tasks.BackgroundTask):
         return self.name == other_task.get("name")
 
     def get_pulled_objects(self):
-        States = self.model.States
-        return self.model.objects.filter(state__in=[States.ERRED, States.OK]).exclude(
-            backend_id=""
-        )
+        return self.model.objects.filter(
+            state__in=[CoreStates.ERRED, CoreStates.OK]
+        ).exclude(backend_id="")
 
     def run(self):
         for instance in self.get_pulled_objects():
@@ -118,9 +118,8 @@ class ServiceListPullTask(BackgroundListPullTask):
     model = structure_models.ServiceSettings
 
     def get_pulled_objects(self):
-        States = self.model.States
         return self.model.objects.filter(
-            state__in=[States.ERRED, States.OK],
+            state__in=[CoreStates.ERRED, CoreStates.OK],
             is_active=True,
             type__in=[k[0] for k in SupportedServices.get_choices()],
         )
@@ -186,7 +185,7 @@ class BaseThrottleProvisionTask(RetryUntilAvailableTask):
         service_settings = resource.service_settings
         model_class = resource._meta.model
         return model_class.objects.filter(
-            state=core_models.StateMixin.States.CREATING,
+            state=CoreStates.CREATING,
             service_settings=service_settings,
         ).count()
 
@@ -217,8 +216,8 @@ class SetErredStuckResources(core_tasks.BackgroundTask):
     def run(self):
         cutoff = timezone.now() - timedelta(hours=3)
         states = (
-            structure_models.BaseResource.States.CREATING,
-            structure_models.BaseResource.States.CREATION_SCHEDULED,
+            CoreStates.CREATING,
+            CoreStates.CREATION_SCHEDULED,
         )
         for model in structure_models.BaseResource.get_all_models():
             for resource in model.objects.filter(modified__lt=cutoff, state__in=states):

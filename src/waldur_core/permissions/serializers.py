@@ -47,13 +47,14 @@ class RoleDetailsSerializer(RestrictedSerializerMixin, TranslatedModelSerializer
         fields = super().get_fields()
 
         try:
-            request = self.context["view"].request
+            request = self.context["request"]
             user = request.user
         except (KeyError, AttributeError):
             return fields
 
         if user.is_anonymous or not (user.is_staff or user.is_support):
-            del fields["users_count"]
+            if "users_count" in fields:
+                del fields["users_count"]
 
         return fields
 
@@ -301,3 +302,7 @@ class UserRoleUpdateSerializer(UserRoleMutateSerializer):
 class UserRoleDeleteSerializer(UserRoleMutateSerializer):
     def get_permission(self, scope):
         return get_delete_permission(scope)
+
+
+class UserRoleExpirationTimeSerializer(serializers.Serializer):
+    expiration_time = serializers.DateTimeField(allow_null=True)

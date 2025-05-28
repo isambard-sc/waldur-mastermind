@@ -3,7 +3,7 @@ from unittest import mock
 from ddt import data, ddt
 from rest_framework import status, test
 
-from waldur_openstack import models
+from waldur_core.core.enums import CoreStates
 
 from . import factories, fixtures
 
@@ -39,7 +39,7 @@ class NetworkCreateSubnetActionTest(BaseNetworkTest):
         }
 
     def test_create_subnet_is_not_allowed_when_state_is_not_OK(self):
-        self.fixture.network.state = models.Network.States.ERRED
+        self.fixture.network.state = CoreStates.ERRED
         self.fixture.network.save()
 
         response = self.client.post(self.url)
@@ -215,128 +215,6 @@ class NetworkDeleteActionTest(BaseNetworkTest):
         executor_action_mock.assert_called_once()
 
 
-class NetworkCreatePortActionTest(BaseNetworkTest):
-    def setUp(self):
-        super().setUp()
-        self.client.force_authenticate(user=self.fixture.admin)
-        self.network = self.fixture.network
-        self.url = factories.NetworkFactory.get_url(self.network, action="create_port")
-        self.request_data = {"name": "test_port_name"}
-        self.subnet = self.fixture.subnet
-        self.subnet.backend_id = f"{self.subnet.name}_backend_id"
-        self.subnet.save()
-
-    def test_create_port_if_network_has_ok_state(self):
-        response = self.client.post(self.url, self.request_data)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-
-    def test_create_port_if_network_has_erred_state(self):
-        self.network.state = models.Network.States.ERRED
-        self.network.save()
-
-        response = self.client.post(self.url, self.request_data)
-        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
-
-    @mock.patch("waldur_openstack.executors.PortCreateExecutor.execute")
-    def test_create_port_triggers_executor(self, create_port_executor_action_mock):
-        response = self.client.post(self.url, self.request_data)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        create_port_executor_action_mock.assert_called_once()
-
-    def test_create_port_with_fixed_ips(self):
-        self.request_data["fixed_ips"] = [
-            {
-                "ip_address": "192.168.1.10",
-                "subnet_id": self.subnet.backend_id,
-            },
-            {"subnet_id": self.subnet.backend_id},
-            {
-                "ip_address": "192.168.1.12",
-            },
-        ]
-        response = self.client.post(self.url, self.request_data)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        floating_ips_response = [
-            (item.get("ip_address"), item.get("subnet_id"))
-            for item in response.data["fixed_ips"]
-        ]
-        self.assertEqual(len(floating_ips_response), 3)
-        self.assertEqual(
-            floating_ips_response,
-            [
-                (
-                    "192.168.1.10",
-                    self.subnet.backend_id,
-                ),
-                (
-                    None,
-                    self.subnet.backend_id,
-                ),
-                ("192.168.1.12", None),
-            ],
-        )
-
-    def test_create_port_with_subnet_from_different_tenant(self):
-        new_fixture = fixtures.OpenStackFixture()
-        subnet = new_fixture.subnet
-        subnet.backend_id = f"{subnet.name}_backend_id"
-        subnet.save()
-        self.request_data["fixed_ips"] = [{"subnet_id": subnet.backend_id}]
-        response = self.client.post(self.url, self.request_data)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("There is no subnet with backend_id", response.data["subnet"][0])
-
-    def test_create_port_with_invalid_fixed_ips(self):
-        self.request_data["fixed_ips"] = [
-            {"subnet_id": "some_backend_id", "garbage": "value"}
-        ]
-        response = self.client.post(self.url, self.request_data)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(
-            "Only ip_address and subnet_id fields can be specified",
-            response.data["non_field_errors"][0],
-        )
-
-    def test_create_port_with_blank_ip_address(self):
-        self.request_data["fixed_ips"] = [
-            {
-                "ip_address": "",
-            },
-        ]
-        response = self.client.post(self.url, self.request_data)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(
-            "ip_address field must not be blank",
-            response.data["non_field_errors"][0],
-        )
-
-    def test_create_port_with_blank_subnet_id(self):
-        self.request_data["fixed_ips"] = [
-            {
-                "subnet_id": "",
-            },
-        ]
-        response = self.client.post(self.url, self.request_data)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(
-            "subnet_id field must not be blank",
-            response.data["non_field_errors"][0],
-        )
-
-    def test_create_port_with_invalid_ip_address(self):
-        self.request_data["fixed_ips"] = [
-            {
-                "ip_address": "abc",
-            },
-        ]
-        response = self.client.post(self.url, self.request_data)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(
-            "Enter a valid IPv4 or IPv6 address.",
-            response.data["non_field_errors"][0],
-        )
-
-
 @ddt
 class NetworkFieldsFilterTest(BaseNetworkTest):
     def setUp(self):
@@ -357,3 +235,96 @@ class NetworkFieldsFilterTest(BaseNetworkTest):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse("segmentation_id" in response.data)
+
+
+@ddt
+class NetworkRBACTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture_1 = fixtures.OpenStackFixture()
+        self.fixture_2 = fixtures.OpenStackFixture()
+        self.network_1 = self.fixture_1.network
+        self.network_2 = self.fixture_2.network
+        self.url = factories.NetworkFactory.get_list_url()
+
+    @data("admin", "owner")
+    def test_user_can_see_own_networks_and_shared_via_rbac(self, user):
+        self.client.force_authenticate(getattr(self.fixture_1, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+        factories.NetworkRBACPolicyFactory(
+            network=self.fixture_2.network, target_tenant=self.fixture_1.tenant
+        )
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 2)
+
+    @data("admin", "owner")
+    def test_user_can_filter_networks_by_tenant_uuid(self, user):
+        self.client.force_authenticate(getattr(self.fixture_1, user))
+        factories.NetworkRBACPolicyFactory(
+            network=self.fixture_2.network, target_tenant=self.fixture_1.tenant
+        )
+        response = self.client.get(
+            self.url, {"tenant_uuid": self.fixture_1.tenant.uuid.hex}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 2)
+
+    @data("admin", "owner")
+    def test_user_can_update_own_network_but_not_shared_via_rbac(self, user):
+        self.client.force_authenticate(getattr(self.fixture_1, user))
+        factories.NetworkRBACPolicyFactory(
+            network=self.fixture_2.network, target_tenant=self.fixture_1.tenant
+        )
+        url = factories.NetworkFactory.get_url(self.fixture_1.network)
+        response = self.client.patch(url, {"name": "new"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        url = factories.NetworkFactory.get_url(self.fixture_2.network)
+        response = self.client.patch(url, {"name": "new"})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @data("admin", "owner")
+    def test_user_can_set_mtu_for_own_network_but_not_shared_via_rbac(self, user):
+        self.client.force_authenticate(getattr(self.fixture_1, user))
+        factories.NetworkRBACPolicyFactory(
+            network=self.fixture_2.network, target_tenant=self.fixture_1.tenant
+        )
+        url = factories.NetworkFactory.get_url(self.fixture_1.network, "set_mtu")
+        response = self.client.post(url, {"mtu": 1234})
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+        url = factories.NetworkFactory.get_url(self.fixture_2.network, "set_mtu")
+        response = self.client.post(url, {"mtu": 1234})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @data("admin", "owner")
+    def test_user_can_filter_networks_by_connection_type(self, user):
+        self.client.force_authenticate(getattr(self.fixture_1, user))
+        factories.NetworkRBACPolicyFactory(
+            network=self.fixture_2.network, target_tenant=self.fixture_1.tenant
+        )
+
+        response = self.client.get(
+            self.url,
+            {"tenant_uuid": self.fixture_1.tenant.uuid.hex, "direct_only": "true"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], str(self.fixture_1.network.uuid))
+
+        response = self.client.get(
+            self.url,
+            {"tenant_uuid": self.fixture_1.tenant.uuid.hex, "rbac_only": "true"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], str(self.fixture_2.network.uuid))
+
+        response = self.client.get(
+            self.url, {"tenant_uuid": self.fixture_1.tenant.uuid.hex}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 2)

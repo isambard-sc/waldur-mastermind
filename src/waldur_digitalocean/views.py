@@ -4,6 +4,7 @@ from rest_framework import decorators, response, status
 
 from waldur_core.core import executors as core_executors
 from waldur_core.core import validators as core_validators
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.serializers import EmptySerializer
 from waldur_core.structure import views as structure_views
 
@@ -42,9 +43,7 @@ class DropletViewSet(structure_views.ResourceViewSet):
     update_executor = core_executors.EmptyExecutor
     delete_executor = executors.DropletDeleteExecutor
     destroy_validators = [
-        core_validators.StateValidator(
-            models.Droplet.States.OK, models.Droplet.States.ERRED
-        )
+        core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED)
     ]
 
     def perform_create(self, serializer):
@@ -53,7 +52,7 @@ class DropletViewSet(structure_views.ResourceViewSet):
         size = serializer.validated_data["size"]
         ssh_key = serializer.validated_data.get("ssh_public_key")
 
-        droplet = serializer.save(
+        droplet: models.Droplet = serializer.save(
             cores=size.cores, ram=size.ram, disk=size.disk, transfer=size.transfer
         )
 
@@ -70,42 +69,42 @@ class DropletViewSet(structure_views.ResourceViewSet):
 
     @decorators.action(detail=True, methods=["post"])
     def start(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.Droplet = self.get_object()
         executors.DropletStartExecutor().execute(instance)
         return response.Response(
             {"status": _("start was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     start_validators = [
-        core_validators.StateValidator(models.Droplet.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(models.Droplet.RuntimeStates.OFFLINE),
     ]
     start_serializer_class = EmptySerializer
 
     @decorators.action(detail=True, methods=["post"])
     def stop(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.Droplet = self.get_object()
         executors.DropletStopExecutor().execute(instance)
         return response.Response(
             {"status": _("stop was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     stop_validators = [
-        core_validators.StateValidator(models.Droplet.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(models.Droplet.RuntimeStates.ONLINE),
     ]
     stop_serializer_class = EmptySerializer
 
     @decorators.action(detail=True, methods=["post"])
     def restart(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.Droplet = self.get_object()
         executors.DropletRestartExecutor().execute(instance)
         return response.Response(
             {"status": _("restart was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     restart_validators = [
-        core_validators.StateValidator(models.Droplet.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(models.Droplet.RuntimeStates.ONLINE),
     ]
     restart_serializer_class = EmptySerializer
@@ -135,7 +134,7 @@ class DropletViewSet(structure_views.ResourceViewSet):
 
         Note that instance must be OFFLINE.
         """
-        droplet = self.get_object()
+        droplet: models.Droplet = self.get_object()
         serializer = self.get_serializer(droplet, data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -171,5 +170,5 @@ class DropletViewSet(structure_views.ResourceViewSet):
             {"detail": _("resizing was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
-    resize_validators = [core_validators.StateValidator(models.Droplet.States.OK)]
+    resize_validators = [core_validators.StateValidator(CoreStates.OK)]
     resize_serializer_class = serializers.DigitalOceanDropletResizeSerializer

@@ -3,6 +3,7 @@ from rest_framework import test
 
 from waldur_mastermind.common.utils import parse_datetime
 from waldur_mastermind.marketplace import callbacks, models
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.tests import factories
 from waldur_openstack.tests.factories import InstanceFactory
 
@@ -13,7 +14,7 @@ class CallbacksTest(test.APITransactionTestCase):
         # Arrange
         start = parse_datetime("2018-11-01")
         order = factories.OrderFactory(
-            state=models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
 
         # Act
@@ -27,7 +28,7 @@ class CallbacksTest(test.APITransactionTestCase):
         )
 
         order.refresh_from_db()
-        self.assertEqual(order.state, models.Order.States.DONE)
+        self.assertEqual(order.state, OrderStates.DONE)
 
     def test_when_plan_is_changed_old_period_is_closed_new_is_opened(self):
         # Arrange
@@ -42,7 +43,7 @@ class CallbacksTest(test.APITransactionTestCase):
             resource=resource, plan=old_plan, start=old_start, end=None
         )
         order = factories.OrderFactory(
-            state=models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
             type=models.Order.Types.UPDATE,
             resource=resource,
             plan=new_plan,
@@ -53,7 +54,7 @@ class CallbacksTest(test.APITransactionTestCase):
 
         # Assert
         order.refresh_from_db()
-        self.assertEqual(order.state, models.Order.States.DONE)
+        self.assertEqual(order.state, OrderStates.DONE)
 
         old_period.refresh_from_db()
         self.assertEqual(old_period.end, new_start)
@@ -76,7 +77,7 @@ class CallbacksTest(test.APITransactionTestCase):
             resource=resource, plan=plan, start=start, end=None
         )
         order = factories.OrderFactory(
-            state=models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
             type=models.Order.Types.TERMINATE,
             resource=resource,
             plan=plan,
@@ -87,7 +88,7 @@ class CallbacksTest(test.APITransactionTestCase):
 
         # Assert
         order.refresh_from_db()
-        self.assertEqual(order.state, models.Order.States.DONE)
+        self.assertEqual(order.state, OrderStates.DONE)
 
         period.refresh_from_db()
         self.assertEqual(period.end, end)
@@ -98,16 +99,14 @@ class CallbacksTest(test.APITransactionTestCase):
         end = parse_datetime("2018-11-01")
 
         plan = factories.PlanFactory()
-        resource = factories.ResourceFactory(
-            plan=plan, state=models.Resource.States.ERRED
-        )
+        resource = factories.ResourceFactory(plan=plan, state=ResourceStates.ERRED)
 
         period = models.ResourcePlanPeriod.objects.create(
             resource=resource, plan=plan, start=start, end=None
         )
 
         # Act
-        resource.state = models.Resource.States.TERMINATED
+        resource.state = ResourceStates.TERMINATED
         resource.save()
 
         # Assert
@@ -127,7 +126,7 @@ class CallbacksTest(test.APITransactionTestCase):
         )
 
         order = factories.OrderFactory(
-            state=models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
             type=models.Order.Types.CREATE,
             resource=resource,
         )

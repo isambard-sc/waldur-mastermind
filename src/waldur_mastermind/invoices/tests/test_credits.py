@@ -102,9 +102,7 @@ class CustomerCreditCreateTest(test.APITransactionTestCase):
         url = factories.CustomerCreditFactory.get_list_url()
         response = self.client.post(url, payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        credit: models.CustomerCredit = models.CustomerCredit.objects.get(
-            uuid=response.data["uuid"]
-        )
+        credit = models.CustomerCredit.objects.get(uuid=response.data["uuid"])
         self.assertEqual(credit.expected_consumption, payload["expected_consumption"])
         self.assertEqual(credit.end_date, datetime.date(year=2025, month=10, day=31))
 
@@ -294,6 +292,8 @@ class CustomerCreditTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
         self.invoice = self.fixture.invoice
+        self.invoice.tax_percent = 22
+        self.invoice.save()
         self.invoice_item = self.fixture.invoice_item
 
     def test_compensate_cost(self):
@@ -319,7 +319,7 @@ class CustomerCreditTest(test.APITransactionTestCase):
             self.assertEqual(credit.consumption_last_month, credit_value)
 
     def test_compensate_cost_if_credit_greater_than_item_cost(self):
-        credit_value = self.invoice.total * 2
+        credit_value = self.invoice.price * 2
         credit = factories.CustomerCreditFactory(
             customer=self.invoice.customer, value=credit_value
         )
@@ -330,7 +330,7 @@ class CustomerCreditTest(test.APITransactionTestCase):
         self.assertEqual(old_total * -1, credit_item.total)
         self.assertEqual(self.invoice.total, 0)
         credit.refresh_from_db()
-        self.assertEqual(credit.value, credit_value - old_total)
+        self.assertEqual(credit.value, credit_value + credit_item.price)
 
     def test_expected_consumption(self):
         old_total = self.invoice.total
@@ -370,75 +370,6 @@ class CustomerCreditTest(test.APITransactionTestCase):
                 event_type="set_to_zero_overdue_credit"
             ).exists()
         )
-
-    def test_calculate_linear_expected_consumption(self):
-        @dataclass
-        class TestResult:
-            date: str
-            consumption: Decimal
-            credit_left: Decimal
-
-        def create_invoice(customer, price):
-            date = timezone.now()
-            new_invoice = models.Invoice.objects.create(
-                customer=customer,
-                month=date.month,
-                year=date.year,
-            )
-            if price:
-                models.InvoiceItem.objects.create(
-                    invoice=new_invoice,
-                    unit_price=price,
-                    unit=models.InvoiceItem.Units.QUANTITY,
-                    quantity=1,
-                )
-            return new_invoice
-
-        test_data = [
-            # TestResult("2023-12-01", Decimal("0"), Decimal("1200")),
-            TestResult("2024-01-01", Decimal("0"), Decimal("0")),
-            TestResult("2024-02-01", Decimal("0"), Decimal("0")),
-            TestResult("2024-03-01", Decimal("0"), Decimal("0")),
-            TestResult("2024-04-01", Decimal("0"), Decimal("0")),
-            TestResult("2024-05-01", Decimal("0"), Decimal("0")),
-            TestResult("2024-06-01", Decimal("0"), Decimal("0")),
-            TestResult("2024-07-01", Decimal("0"), Decimal("0")),
-            TestResult("2024-08-01", Decimal("0"), Decimal("0")),
-            TestResult("2024-09-01", Decimal("0"), Decimal("0")),
-            TestResult("2024-10-01", Decimal("0"), Decimal("0")),
-            TestResult("2024-11-01", Decimal("0"), Decimal("0")),
-            TestResult("2024-12-01", Decimal("0"), Decimal("0")),
-            TestResult("2025-01-01", Decimal("0"), Decimal("0")),
-        ]
-
-        credit = factories.CustomerCreditFactory(
-            value=1200,
-            end_date=datetime.date(2025, 1, 1),
-            minimal_consumption_logic=models.BaseCredit.MinimalConsumptionLogic.LINEAR,
-            grace_coefficient=0,
-        )
-
-        for d in test_data:
-            with freeze_time(d.date):
-                invoice = create_invoice(credit.customer, d.consumption)
-                monthly_compensation = compensations.MonthlyCompensation(
-                    invoice.customer
-                )
-                monthly_compensation.apply_compensations()
-                expected_consumption = credit.expected_consumption
-                monthly_compensation.update_linear_expected_consumption()
-                invoice.set_created()
-                credit.refresh_from_db()
-                print(
-                    f"\ndate: {d.date}, \n"
-                    f"consumption: {d.consumption}, \n"
-                    f"total_compensation: {monthly_compensation.total_compensation}, \n"
-                    f"time_left_factor: {credit.time_left_factor}, \n"
-                    f"expected_consumption: {expected_consumption}, \n"
-                    f"expected_consumption_new: {credit.expected_consumption}, \n"
-                    f"minimal_consumption: {credit.minimal_consumption}, \n"
-                    f"credit.value: {credit.value},"
-                )
 
 
 @freeze_time("2024-01-01")

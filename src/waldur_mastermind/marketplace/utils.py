@@ -12,6 +12,7 @@ from enum import Enum
 from io import BytesIO
 
 from constance import config
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
@@ -27,9 +28,11 @@ from PIL import Image
 from rest_framework import exceptions as rf_exceptions
 from rest_framework import serializers, status
 
+import httpx
 from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import CoreStates
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import get_users_with_permission, has_permission
@@ -48,6 +51,11 @@ from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices import registrators
 from waldur_mastermind.invoices.utils import get_full_days
 from waldur_mastermind.marketplace import attribute_types
+from waldur_mastermind.marketplace.enums import (
+    OrderStates,
+    ResourceStates,
+    RobotAccountStates,
+)
 from waldur_mastermind.marketplace_remote import PLUGIN_NAME as REMOTE_PLUGIN_NAME
 from waldur_mastermind.marketplace_slurm_remote import (
     PLUGIN_NAME as SLURM_REMOTE_PLUGIN_NAME,
@@ -74,7 +82,7 @@ class UsernameGenerationPolicy(Enum):
     IDENTITY_CLAIM = "identity_claim"  # Using username from external IDP system
 
 
-def get_order_processor(order):
+def get_order_processor(order: models.Order):
     offering = order.resource.offering
 
     if order.type == models.RequestTypeMixin.Types.CREATE:
@@ -208,26 +216,6 @@ def get_service_provider_info(source):
         return {}
 
 
-def get_offering_details(offering):
-    if not isinstance(offering, models.Offering):
-        return {}
-
-    return {
-        "offering_type": offering.type,
-        "offering_name": offering.name,
-        "offering_uuid": offering.uuid.hex,
-        "service_provider_name": offering.customer.name,
-        "service_provider_uuid": offering.customer.uuid.hex,
-    }
-
-
-def format_list(resources):
-    """
-    Format comma-separated list of IDs from Django queryset.
-    """
-    return ", ".join(map(str, sorted(resources.values_list("id", flat=True))))
-
-
 def get_order_url(order):
     return core_utils.format_homeport_link(
         "marketplace-order-details/{order_uuid}/",
@@ -254,7 +242,7 @@ def get_info_about_missing_usage_reports():
         billing_period=billing_period
     ).values_list("resource", flat=True)
     resources_without_usages = models.Resource.objects.filter(
-        state=models.Resource.States.OK, offering_id__in=offering_ids
+        state=ResourceStates.OK, offering_id__in=offering_ids
     ).exclude(id__in=resource_with_usages)
     result = []
 
@@ -273,13 +261,6 @@ def get_info_about_missing_usage_reports():
             )
 
     return result
-
-
-def get_public_resources_url(customer):
-    return core_utils.format_homeport_link(
-        "organizations/{organization_uuid}/marketplace-public-resources/",
-        organization_uuid=customer.uuid,
-    )
 
 
 def validate_limit_amount(value, component):
@@ -495,45 +476,43 @@ def create_offering_components(offering, custom_components=None):
 
 
 def get_resource_state(state):
-    SrcStates = core_models.StateMixin.States
-    DstStates = models.Resource.States
     mapping = {
-        SrcStates.CREATION_SCHEDULED: DstStates.CREATING,
-        SrcStates.CREATING: DstStates.CREATING,
-        SrcStates.UPDATE_SCHEDULED: DstStates.UPDATING,
-        SrcStates.UPDATING: DstStates.UPDATING,
-        SrcStates.DELETION_SCHEDULED: DstStates.TERMINATING,
-        SrcStates.DELETING: DstStates.TERMINATING,
-        SrcStates.OK: DstStates.OK,
-        SrcStates.ERRED: DstStates.ERRED,
+        CoreStates.CREATION_SCHEDULED: ResourceStates.CREATING,
+        CoreStates.CREATING: ResourceStates.CREATING,
+        CoreStates.UPDATE_SCHEDULED: ResourceStates.UPDATING,
+        CoreStates.UPDATING: ResourceStates.UPDATING,
+        CoreStates.DELETION_SCHEDULED: ResourceStates.TERMINATING,
+        CoreStates.DELETING: ResourceStates.TERMINATING,
+        CoreStates.OK: ResourceStates.OK,
+        CoreStates.ERRED: ResourceStates.ERRED,
     }
-    return mapping.get(state, DstStates.ERRED)
+    return mapping.get(state, ResourceStates.ERRED)
 
 
-def get_marketplace_offering_uuid(serializer, scope) -> str:
+def get_marketplace_offering_uuid(serializer, scope) -> str | None:
     try:
-        return models.Resource.objects.get(scope=scope).offering.uuid
+        return models.Resource.objects.get(scope=scope).offering.uuid.hex
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_offering_plugin_options(serializer, scope) -> dict:
+def get_marketplace_offering_plugin_options(serializer, scope) -> dict | None:
     try:
         return models.Resource.objects.get(scope=scope).offering.plugin_options
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_offering_name(serializer, scope) -> str:
+def get_marketplace_offering_name(serializer, scope) -> str | None:
     try:
         return models.Resource.objects.get(scope=scope).offering.name
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_category_uuid(serializer, scope) -> str:
+def get_marketplace_category_uuid(serializer, scope) -> str | None:
     try:
-        return models.Resource.objects.get(scope=scope).offering.category.uuid
+        return models.Resource.objects.get(scope=scope).offering.category.uuid.hex
     except ObjectDoesNotExist:
         return
 
@@ -545,37 +524,37 @@ def get_marketplace_category_name(serializer, scope) -> str:
         return
 
 
-def get_marketplace_resource_uuid(serializer, scope) -> str:
+def get_marketplace_resource_uuid(serializer, scope) -> str | None:
     try:
-        return models.Resource.objects.get(scope=scope).uuid
+        return models.Resource.objects.get(scope=scope).uuid.hex
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_plan_uuid(serializer, scope) -> str:
+def get_marketplace_plan_uuid(serializer, scope) -> str | None:
     try:
         resource = models.Resource.objects.get(scope=scope)
         if resource.plan:
-            return resource.plan.uuid
+            return resource.plan.uuid.hex
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_resource_state(serializer, scope) -> str:
+def get_marketplace_resource_state(serializer, scope) -> str | None:
     try:
         return models.Resource.objects.get(scope=scope).get_state_display()
     except ObjectDoesNotExist:
         return
 
 
-def get_is_usage_based(serializer, scope) -> bool:
+def get_is_usage_based(serializer, scope) -> bool | None:
     try:
         return models.Resource.objects.get(scope=scope).offering.is_usage_based
     except ObjectDoesNotExist:
         return
 
 
-def get_is_limit_based(serializer, scope) -> bool:
+def get_is_limit_based(serializer, scope) -> bool | None:
     try:
         return models.Resource.objects.get(scope=scope).offering.is_limit_based
     except ObjectDoesNotExist:
@@ -639,7 +618,7 @@ def get_offering_customers(offering, active_customers):
 def get_offering_projects(offering):
     related_project_ids = (
         models.Resource.objects.filter(offering=offering)
-        .exclude(state=models.Resource.States.TERMINATED)
+        .exclude(state=ResourceStates.TERMINATED)
         .values_list("project", flat=True)
         .distinct()
         .order_by()
@@ -656,7 +635,7 @@ def is_user_related_to_offering(offering, user):
         models.Resource.objects.filter(
             offering=offering, project__in=connected_projects
         )
-        .exclude(state=models.Resource.States.TERMINATED)
+        .exclude(state=ResourceStates.TERMINATED)
         .exists()
     )
 
@@ -794,20 +773,18 @@ def terminate_resource(resource, user, termination_comment=None, scheduled=False
     for order in models.Order.objects.filter(
         resource=resource,
         state__in=(
-            [models.Order.States.PENDING_CONSUMER]
+            [OrderStates.PENDING_CONSUMER]
             if scheduled
             else [
-                models.Order.States.PENDING_CONSUMER,
-                models.Order.States.PENDING_PROVIDER,
+                OrderStates.PENDING_CONSUMER,
+                OrderStates.PENDING_PROVIDER,
             ]
         ),
     ):
         order.cancel(termination_comment)
         order.save()
 
-    if models.Order.objects.filter(
-        resource=resource, state=models.Order.States.EXECUTING
-    ):
+    if models.Order.objects.filter(resource=resource, state=OrderStates.EXECUTING):
         logger.info(
             "Terminate order has not been created because other executing orders exist."
         )
@@ -849,7 +826,7 @@ def schedule_resources_termination(resources, termination_comment=None, user=Non
 def get_service_provider_resources(service_provider):
     return models.Resource.objects.filter(
         offering__customer=service_provider.customer, offering__shared=True
-    ).exclude(state=models.Resource.States.TERMINATED)
+    ).exclude(state=ResourceStates.TERMINATED)
 
 
 def get_service_provider_customer_ids(service_provider):
@@ -990,7 +967,7 @@ def count_customers_number_change(service_provider):
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
             type=models.Order.Types.CREATE,
-            state=models.Order.States.DONE,
+            state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
         .order_by()
@@ -1003,7 +980,7 @@ def count_customers_number_change(service_provider):
                 project__customer_id=customer_id,
                 created__lt=core_utils.month_start(to_day),
             )
-            .exclude(state=models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .exists()
         ):
             new_customers.append(customer_id)
@@ -1012,7 +989,7 @@ def count_customers_number_change(service_provider):
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
             type=models.Order.Types.TERMINATE,
-            state=models.Order.States.DONE,
+            state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
         .order_by()
@@ -1024,7 +1001,7 @@ def count_customers_number_change(service_provider):
                 offering__customer=service_provider.customer,
                 project__customer=customer_id,
             )
-            .exclude(state=models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .exists()
         ):
             lost_customers.append(customer_id)
@@ -1039,7 +1016,7 @@ def count_resources_number_change(service_provider):
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
             type=models.Order.Types.CREATE,
-            state=models.Order.States.DONE,
+            state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
         .order_by()
@@ -1052,7 +1029,7 @@ def count_resources_number_change(service_provider):
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
             type=models.Order.Types.TERMINATE,
-            state=models.Order.States.DONE,
+            state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
         .order_by()
@@ -1195,8 +1172,8 @@ def generate_glauth_records_for_offering_users(offering, offering_users):
 def generate_glauth_records_for_robot_accounts(offering, robot_accounts):
     # make sure that only accounts in OK and requested_deletion are exposed e.g. in glauth
     valid_states = [
-        models.RobotAccount.States.OK,
-        models.RobotAccount.States.REQUESTED_DELETION,
+        RobotAccountStates.OK,
+        RobotAccountStates.REQUESTED_DELETION,
     ]
     robot_accounts = robot_accounts.filter(state__in=valid_states)
 
@@ -1320,7 +1297,7 @@ def generate_username(user, offering):
 
 def user_offerings_mapping(offerings):
     resources = models.Resource.objects.filter(
-        state=models.Resource.States.OK, offering__in=offerings
+        state=ResourceStates.OK, offering__in=offerings
     )
     resource_ids = resources.values_list("id", flat=True)
 
@@ -1661,3 +1638,145 @@ def notification_about_project_ending(end_date):
             context,
             [user.email],
         )
+
+
+def get_service_account_api_token():
+    token_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_URL"]
+    client_id = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_CLIENT_ID"]
+    client_secret = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_SECRET"]
+
+    token_request_headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    token_params = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    try:
+        token_response = httpx.post(
+            token_url, data=token_params, headers=token_request_headers
+        )
+        token_response.raise_for_status()
+        # Extract the token
+        token_data = token_response.json()
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise ValueError("Access token not found in token response.")
+        return access_token
+    except httpx.HTTPError as e:
+        logger.error("Error obtaining token: %s", e)
+        raise
+
+
+def rotate_service_account_api_key(service_account: models.ScopedServiceAccount):
+    service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
+    if not service_account_url:
+        raise ValueError("URL for service accounts is not configured")
+    try:
+        api_access_token = get_service_account_api_token()
+
+        response = httpx.put(
+            f"{service_account_url}{service_account.username}/rotate-api-key/",
+            headers={"Authorization": f"Bearer {api_access_token}"},
+        )
+        response.raise_for_status()
+        return response.json()
+    except (httpx.HTTPError, ValueError) as e:
+        logger.error("Error obtaining token: %s", e)
+        raise
+
+
+def post_service_account_to_url(
+    url: str, service_account: models.ScopedServiceAccount, username: str = ""
+):
+    try:
+        api_access_token = get_service_account_api_token()
+        if isinstance(service_account, models.ProjectServiceAccount):
+            customer = service_account.project.customer
+            scope_name = service_account.project.name
+            scope_slug = service_account.project.slug
+            scope_type = "project"
+        elif isinstance(service_account, models.CustomerServiceAccount):
+            customer = service_account.customer
+            scope_name = customer.name
+            scope_slug = customer.slug
+            scope_type = "customer"
+        else:
+            raise ValueError(
+                f"Unsupported service account type: {type(service_account)}"
+            )
+
+        payload = {
+            "ownerUsername": username,
+            "username": service_account.username,
+            "email": customer.email,
+            "description": service_account.description,
+            "scopeType": scope_type,
+            "scopeName": scope_name,
+            "scopeSlug": scope_slug,
+        }
+
+        headers = {"Authorization": f"Bearer {api_access_token}"}
+        response = httpx.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        logger.info("Service account has been successfully updated at %s", url)
+        return response
+    except (httpx.HTTPError, ValueError) as e:
+        logger.error("Request to %s failed: %s", url, e)
+        raise
+
+
+def create_service_account(service_account: models.ScopedServiceAccount, username: str):
+    """
+    Makes a synchronous call to the webhook URL to create a service account.
+    Raises exceptions on failure which should be handled by the viewset.
+    """
+    if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
+        return
+
+    service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
+    if not service_account_url:
+        raise ValueError("URL for service accounts is not configured")
+
+    try:
+        response = post_service_account_to_url(
+            service_account_url, service_account, username
+        )
+        return response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(exc)
+        service_account.error_message = str(exc)
+        service_account.error_traceback = traceback.format_exc()
+        service_account.save(update_fields=["error_message", "error_traceback"])
+        raise
+
+
+def delete_service_account(service_account):
+    """
+    Makes a synchronous call to the webhook URL to remove a service account.
+    Raises exceptions on failure which should be handled by the viewset.
+    """
+    if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
+        return
+
+    service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
+    if not service_account_url:
+        raise RuntimeError("URL for service accounts is not configured")
+
+    try:
+        api_access_token = get_service_account_api_token()
+        response = httpx.delete(
+            f"{service_account_url}{service_account.username}",
+            headers={"Authorization": f"Bearer {api_access_token}"},
+        )
+        response.raise_for_status()
+        if response.status_code == 200:
+            service_account.delete()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(exc)
+        service_account.error_message = str(exc)
+        service_account.error_traceback = traceback.format_exc()
+        service_account.save(update_fields=["error_message", "error_traceback"])
+        raise

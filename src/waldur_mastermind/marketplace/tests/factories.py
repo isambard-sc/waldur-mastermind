@@ -12,6 +12,7 @@ from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.marketplace import models
+from waldur_mastermind.marketplace.enums import OfferingStates, ResourceStates
 from waldur_mastermind.marketplace_support import PLUGIN_NAME
 from waldur_pid import models as pid_models
 
@@ -168,7 +169,7 @@ class OfferingFactory(
     category = factory.SubFactory(CategoryFactory)
     customer = factory.SubFactory(structure_factories.CustomerFactory)
     type = PLUGIN_NAME
-    state = models.Offering.States.ACTIVE
+    state = OfferingStates.ACTIVE
 
     @classmethod
     def get_url(cls, offering=None, action=None):
@@ -428,7 +429,8 @@ class ResourceFactory(
     project = factory.SubFactory(structure_factories.ProjectFactory)
     backend_metadata = factory.Sequence(backend_metadata_generator)
     name = factory.Sequence(lambda n: "resource-%s" % n)
-    state = models.Resource.States.CREATING
+    state = ResourceStates.CREATING
+    limits = {"storage": 123}
 
     @classmethod
     def get_url(cls, resource=None, action=None):
@@ -537,6 +539,56 @@ class RobotAccountFactory(
         return "http://testserver" + reverse("marketplace-robot-account-list")
 
 
+class ProjectServiceAccountFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.ProjectServiceAccount],
+):
+    class Meta:
+        model = models.ProjectServiceAccount
+
+    project = factory.SubFactory(structure_factories.ProjectFactory)
+    username = "waldur"
+
+    @classmethod
+    def get_url(cls, account=None):
+        if account is None:
+            account = ProjectServiceAccountFactory()
+        return "http://testserver" + reverse(
+            "marketplace-project-service-account-detail",
+            kwargs={"uuid": account.uuid.hex},
+        )
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse("marketplace-project-service-account-list")
+
+
+class CustomerServiceAccountFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.CustomerServiceAccount],
+):
+    customer = factory.SubFactory(structure_factories.CustomerFactory)
+    username = "waldur"
+
+    class Meta:
+        model = models.CustomerServiceAccount
+
+    @classmethod
+    def get_url(cls, account=None):
+        if account is None:
+            account = CustomerServiceAccountFactory()
+        return "http://testserver" + reverse(
+            "marketplace-customer-service-account-detail",
+            kwargs={"uuid": account.uuid.hex},
+        )
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse(
+            "marketplace-customer-service-account-list"
+        )
+
+
 class IntegrationStatusFactory(
     factory.django.DjangoModelFactory,
     metaclass=BaseMetaFactory[models.IntegrationStatus],
@@ -560,7 +612,9 @@ class IntegrationStatusFactory(
         return url if action is None else url + action + "/"
 
 
-class OfferingUserFactory(factory.django.DjangoModelFactory):
+class OfferingUserFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.OfferingUser]
+):
     offering = factory.SubFactory(OfferingFactory)
     user = factory.SubFactory(structure_factories.UserFactory)
     username = factory.Sequence(lambda n: "username-%s" % n)
@@ -584,7 +638,10 @@ class OfferingUserFactory(factory.django.DjangoModelFactory):
         return url if action is None else url + action + "/"
 
 
-class ComponentUserUsageLimitFactory(factory.django.DjangoModelFactory):
+class ComponentUserUsageLimitFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.ComponentUserUsageLimit],
+):
     resource = factory.SubFactory(ResourceFactory)
     component = factory.LazyAttribute(lambda o: o.resource.offering.components.first())
     user = factory.SubFactory(OfferingUserFactory)

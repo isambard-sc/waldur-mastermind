@@ -24,6 +24,8 @@ class UsageMixin(models.Model):
 
 
 class Allocation(UsageMixin, structure_models.BaseResource):
+    associations: models.Manager["Association"]
+
     is_active = models.BooleanField(default=True)
     tracker = FieldTracker()
 
@@ -77,7 +79,7 @@ class AllocationUserUsage(UsageMixin):
         validators=[MinValueValidator(1), MaxValueValidator(12)]
     )
 
-    user = models.ForeignKey(
+    user = models.ForeignKey[core_models.User](
         to=settings.AUTH_USER_MODEL, on_delete=models.CASCADE, blank=True, null=True
     )
 

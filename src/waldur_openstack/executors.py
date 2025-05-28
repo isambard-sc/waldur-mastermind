@@ -163,7 +163,6 @@ def get_tenant_create_tasks(tenant: models.Tenant, skip_connection_extnet=False)
             creation_tasks.append(
                 SecurityGroupCreateExecutor.as_signature(security_group)
             )
-
     external_network_id = utils.get_external_network_id(tenant)
     if external_network_id and not skip_connection_extnet:
         creation_tasks.append(
@@ -175,11 +174,11 @@ def get_tenant_create_tasks(tenant: models.Tenant, skip_connection_extnet=False)
         )
     creation_tasks += [
         core_tasks.BackendMethodTask().si(
-            serialized_tenant,
-            backend_method="pull_tenant_routers",
+            serialized_tenant, backend_method="pull_tenant_ports"
         ),
         core_tasks.BackendMethodTask().si(
-            serialized_tenant, backend_method="pull_tenant_ports"
+            serialized_tenant,
+            backend_method="pull_tenant_routers",
         ),
         core_tasks.BackendMethodTask().si(serialized_tenant, "pull_tenant_quotas"),
         core_tasks.BackendMethodTask().si(serialized_tenant, "pull_tenant_images"),
@@ -273,8 +272,14 @@ class TenantImportExecutor(core_executors.ActionExecutor):
 
     @classmethod
     def get_success_signature(cls, tenant, serialized_tenant, **kwargs):
-        return core_tasks.StateTransitionTask().si(
-            serialized_tenant, state_transition="set_ok"
+        return chain(
+            core_tasks.StateTransitionTask().si(
+                serialized_tenant, state_transition="set_ok"
+            ),
+            tasks.SendSignalTenantPullSucceeded().si(serialized_tenant),
+            core_tasks.BackendMethodTask().si(
+                serialized_tenant, "create_offerings_for_volume_and_instance"
+            ),
         )
 
 
@@ -519,6 +524,9 @@ class ExistingTenantPullExecutor(core_executors.ActionExecutor):
             ),
             core_tasks.BackendMethodTask().si(serialized_tenant, "pull_subnets"),
             core_tasks.BackendMethodTask().si(
+                serialized_tenant, "pull_tenant_network_rbac_policies"
+            ),
+            core_tasks.BackendMethodTask().si(
                 serialized_tenant, backend_method="pull_tenant_routers"
             ),
             core_tasks.BackendMethodTask().si(
@@ -549,6 +557,7 @@ class ExistingTenantPullExecutor(core_executors.ActionExecutor):
                 action_details={},
             ),
             tasks.SendSignalTenantPullSucceeded().si(serialized_instance),
+            tasks.create_offerings_task.si(serialized_instance),
         )
 
 
@@ -761,7 +770,16 @@ class PortCreateExecutor(core_executors.CreateExecutor):
             serialized_port,
             "create_port",
             state_transition="begin_creating",
-            serialized_network=kwargs.get("network"),
+        )
+
+
+class PortUpdateNameAndDescriptionExecutor(core_executors.UpdateExecutor):
+    @classmethod
+    def get_task_signature(cls, port, serialized_port, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_port,
+            "update_port_name_and_description",
+            state_transition="begin_updating",
         )
 
 
@@ -1111,6 +1129,7 @@ class InstanceCreateExecutor(core_executors.CreateExecutor):
         _tasks += cls.create_floating_ips(instance, serialized_instance)
         _tasks += cls.pull_server_group(serialized_instance)
         _tasks += cls.pull_instance(serialized_instance)
+        _tasks += cls.update_ports_status(serialized_instance)
         return chain(*_tasks)
 
     @classmethod
@@ -1300,6 +1319,14 @@ class InstanceCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def pull_instance(cls, serialized_instance):
         return [core_tasks.BackendMethodTask().si(serialized_instance, "pull_instance")]
+
+    @classmethod
+    def update_ports_status(cls, serialized_instance):
+        return [
+            core_tasks.BackendMethodTask().si(
+                serialized_instance, "update_instance_port_status"
+            )
+        ]
 
 
 class InstanceUpdateExecutor(core_executors.UpdateExecutor):
@@ -1851,6 +1878,16 @@ class SnapshotRestorationExecutor(core_executors.CreateExecutor):
         serialized_volume = core_utils.serialize_instance(snapshot_restoration.volume)
         return core_tasks.StateTransitionTask().si(
             serialized_volume, state_transition="set_erred"
+        )
+
+
+class RouterDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, router, serialized_router, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_router,
+            "delete_router",
+            state_transition="begin_deleting",
         )
 
 

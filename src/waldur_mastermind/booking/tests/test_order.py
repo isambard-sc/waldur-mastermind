@@ -7,6 +7,11 @@ from waldur_mastermind.booking import PLUGIN_NAME
 from waldur_mastermind.booking import models as booking_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
+from waldur_mastermind.marketplace.enums import (
+    OfferingStates,
+    OrderStates,
+    ResourceStates,
+)
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
@@ -28,32 +33,30 @@ class OrderProcessedTest(test.APITransactionTestCase):
                     }
                 ],
             },
-            state=marketplace_models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
 
         marketplace_utils.process_order(order, self.fixture.staff)
 
-        self.assertEqual(
-            order.resource.state, marketplace_models.Resource.States.CREATING
-        )
+        self.assertEqual(order.resource.state, ResourceStates.CREATING)
 
     def test_resource_is_terminated_when_order_is_processed(self):
         resource = marketplace_factories.ResourceFactory(
             offering=self.offering,
-            state=marketplace_models.Resource.States.OK,
+            state=ResourceStates.OK,
         )
 
         order = marketplace_factories.OrderFactory(
             offering=self.offering,
             type=marketplace_models.Order.Types.TERMINATE,
             resource=resource,
-            state=marketplace_models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
 
         marketplace_utils.process_order(order, self.fixture.staff)
 
         resource.refresh_from_db()
-        self.assertEqual(marketplace_models.Resource.States.TERMINATED, resource.state)
+        self.assertEqual(ResourceStates.TERMINATED, resource.state)
 
 
 @freeze_time("2018-12-01")
@@ -84,7 +87,7 @@ class OrderCreateTest(test.APITransactionTestCase):
                     },
                 ]
             },
-            state=marketplace_models.Offering.States.ACTIVE,
+            state=OfferingStates.ACTIVE,
         )
 
     def test_create_order_if_schedule_is_valid(self):
@@ -213,7 +216,7 @@ class OrderCreateTest(test.APITransactionTestCase):
     def test_do_not_create_order_if_schedules_are_not_valid(self):
         resource = marketplace_factories.ResourceFactory(
             offering=self.offering,
-            state=marketplace_models.Resource.States.OK,
+            state=ResourceStates.OK,
             attributes={
                 "schedules": [
                     {
@@ -316,7 +319,7 @@ class OrderCreateTest(test.APITransactionTestCase):
     def create_order(self, user, offering=None, add_payload=None):
         if offering is None:
             offering = marketplace_factories.OfferingFactory(
-                state=marketplace_models.Offering.States.ACTIVE
+                state=OfferingStates.ACTIVE
             )
 
         self.client.force_authenticate(user)

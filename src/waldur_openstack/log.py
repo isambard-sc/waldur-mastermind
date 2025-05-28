@@ -28,6 +28,7 @@ class RouterLogger(EventLogger):
     old_routes = list
     new_routes = list
     tenant_backend_id = str
+    changed_interface = dict
 
     class Meta:
         event_types = ("openstack_router_updated",)
@@ -175,6 +176,7 @@ class PortLogger(EventLogger):
             "openstack_port_pulled",
             "openstack_port_deleted",
             "openstack_port_cleaned",
+            "openstack_port_updated",
         )
         event_groups = {
             "resources": event_types,

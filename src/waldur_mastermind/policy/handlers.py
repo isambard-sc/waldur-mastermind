@@ -73,6 +73,12 @@ def get_estimated_cost_policy_handler_for_observable_class(klass, observable_cla
         for policy in policies:
             if policy.get_threshold_actions() and policy.is_triggered():
                 for action in policy.get_threshold_actions():
+                    if action.ignored_fields and hasattr(observable_object, "tracker"):
+                        if not set(observable_object.tracker.changed()) - set(
+                            action.ignored_fields
+                        ):
+                            continue
+
                     action.method(policy, created)
                     logger.info(
                         "%s action has been triggered for %s. Policy UUID: %s",
@@ -108,7 +114,9 @@ def customer_credit_changed_handler(sender, instance, created=False, **kwargs):
         scope__customer=customer_credit.customer
     )
     if project_policies.count() > 0:
-        logger.info("%s project policies are found, evaluating them")
+        logger.info(
+            "%s project policies are found, evaluating them", customer_credit.customer
+        )
         utils.evaluate_policies(project_policies)
     else:
         logger.info("Project policies are not found, skipping evaluation")
@@ -125,7 +133,9 @@ def project_credit_changed_handler(sender, instance, created=False, **kwargs):
         scope=project_credit.project
     )
     if project_policies.count() > 0:
-        logger.info("%s project policies are found, evaluating them")
+        logger.info(
+            "%s project policies are found, evaluating them", project_credit.project
+        )
         utils.evaluate_policies(project_policies)
     else:
         logger.info("Project policies are not found, skipping evaluation")

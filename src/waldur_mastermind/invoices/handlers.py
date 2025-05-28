@@ -7,12 +7,11 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
-from django.utils.translation import gettext_lazy as _
-from rest_framework.exceptions import ValidationError
 
 from waldur_core.core import utils as core_utils
 from waldur_mastermind.invoices import signals as cost_signals
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import ResourceStates
 
 from . import log, models, registrators
 
@@ -112,17 +111,6 @@ def emit_invoice_created_event(sender, instance, created=False, **kwargs):
     )
 
 
-def prevent_deletion_of_customer_with_invoice(sender, instance, user, **kwargs):
-    if user.is_staff:
-        return
-    PENDING = models.Invoice.States.PENDING
-    for invoice in models.Invoice.objects.filter(customer=instance):
-        if invoice.state != PENDING or invoice.price > 0:
-            raise ValidationError(
-                _("Can't delete organization with invoice %s.") % invoice
-            )
-
-
 def update_cache_when_invoice_item_is_updated(
     sender, instance, created=False, **kwargs
 ):
@@ -188,7 +176,7 @@ def create_recurring_usage_if_invoice_has_been_created(
         resource__project__customer=invoice.customer,
         recurring=True,
         billing_period__gte=prev_month_start,
-    ).exclude(resource__state=marketplace_models.Resource.States.TERMINATED)
+    ).exclude(resource__state=ResourceStates.TERMINATED)
 
     if not usages:
         return

@@ -5,9 +5,29 @@ from waldur_core.logging import utils as logging_utils
 from waldur_core.permissions import models as permission_models
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace_slurm_remote import PLUGIN_NAME, utils
 
 logger = logging.getLogger(__name__)
+
+
+def send_done_order_to_message_queue(sender, instance, created=False, **kwargs):
+    order: marketplace_models.Order = instance
+    if created:
+        return
+    offering = order.offering
+    if offering.type != PLUGIN_NAME:
+        return
+
+    if not order.tracker.has_changed("state") or order.state != OrderStates.DONE:
+        return
+
+    payload = {"order_uuid": order.uuid.hex}
+    messages = utils.prepare_messages(
+        offering, payload, logging_utils.ObservableObjectType.ORDER
+    )
+    if messages:
+        logging_tasks.publish_messages.delay(messages)
 
 
 def send_pending_order_to_message_queue(sender, instance, created=False, **kwargs):
@@ -21,13 +41,41 @@ def send_pending_order_to_message_queue(sender, instance, created=False, **kwarg
 
     if (
         not order.tracker.has_changed("state")
-        or order.state != marketplace_models.Order.States.PENDING_PROVIDER
+        or order.state != OrderStates.PENDING_PROVIDER
     ):
         return
 
     payload = {"order_uuid": order.uuid.hex}
     messages = utils.prepare_messages(
         offering, payload, logging_utils.ObservableObjectType.ORDER
+    )
+    if messages:
+        logging_tasks.publish_messages.delay(messages)
+
+
+def send_offering_user_username_message(sender, instance, created=False, **kwargs):
+    if not created:
+        return
+    offering_user: marketplace_models.OfferingUser = instance
+    offering = offering_user.offering
+    if offering.type != PLUGIN_NAME:
+        return
+
+    if not offering_user.tracker.has_changed("username"):
+        return
+
+    if not offering_user.username:
+        return
+
+    payload = {
+        "username": offering_user.username,
+        "offering_user_uuid": offering_user.uuid.hex,
+        "user_uuid": offering_user.user.uuid.hex,
+    }
+    messages = utils.prepare_messages(
+        offering_user.offering,
+        payload,
+        logging_utils.ObservableObjectType.OFFERING_USER,
     )
     if messages:
         logging_tasks.publish_messages.delay(messages)
@@ -40,7 +88,7 @@ def process_role_changed(permission: permission_models.UserRole, granted: bool):
     project = permission.scope
     offering_ids = set(
         project.resource_set.filter(
-            state=marketplace_models.Resource.States.OK,
+            state=ResourceStates.OK,
             offering__type=PLUGIN_NAME,
         ).values_list("offering", flat=True)
     )

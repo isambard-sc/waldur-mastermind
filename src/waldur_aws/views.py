@@ -3,6 +3,7 @@ from rest_framework import decorators, response, status, viewsets
 
 from waldur_core.core import exceptions as core_exceptions
 from waldur_core.core import validators as core_validators
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.serializers import EmptySerializer
 from waldur_core.structure import views as structure_views
 
@@ -38,13 +39,11 @@ class InstanceViewSet(structure_views.ResourceViewSet):
 
     delete_executor = executors.InstanceDeleteExecutor
     destroy_validators = [
-        core_validators.StateValidator(
-            models.Instance.States.OK, models.Instance.States.ERRED
-        )
+        core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED)
     ]
 
     def perform_create(self, serializer):
-        instance = serializer.save()
+        instance: models.Instance = serializer.save()
         volume = instance.volume_set.first()
 
         self.create_executor.execute(
@@ -57,49 +56,49 @@ class InstanceViewSet(structure_views.ResourceViewSet):
 
     @decorators.action(detail=True, methods=["post"])
     def start(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.Instance = self.get_object()
         executors.InstanceStartExecutor().execute(instance)
         return response.Response(
             {"status": _("start was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     start_validators = [
-        core_validators.StateValidator(models.Instance.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("stopped"),
     ]
     start_serializer_class = EmptySerializer
 
     @decorators.action(detail=True, methods=["post"])
     def stop(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.Instance = self.get_object()
         executors.InstanceStopExecutor().execute(instance)
         return response.Response(
             {"status": _("stop was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     stop_validators = [
-        core_validators.StateValidator(models.Instance.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("running"),
     ]
     stop_serializer_class = EmptySerializer
 
     @decorators.action(detail=True, methods=["post"])
     def restart(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.Instance = self.get_object()
         executors.InstanceRestartExecutor().execute(instance)
         return response.Response(
             {"status": _("restart was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     restart_validators = [
-        core_validators.StateValidator(models.Instance.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("running"),
     ]
     restart_serializer_class = EmptySerializer
 
     @decorators.action(detail=True, methods=["post"])
     def resize(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.Instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -110,7 +109,7 @@ class InstanceViewSet(structure_views.ResourceViewSet):
             {"status": _("resize was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
-    resize_validators = [core_validators.StateValidator(models.Instance.States.OK)]
+    resize_validators = [core_validators.StateValidator(CoreStates.OK)]
     resize_serializer_class = serializers.AwsInstanceResizeSerializer
 
 
@@ -131,7 +130,7 @@ class VolumeViewSet(structure_views.ResourceViewSet):
         executors.VolumeDetachExecutor.execute(self.get_object())
 
     detach_validators = [
-        core_validators.StateValidator(models.Volume.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         _has_instance,
     ]
     detach_serializer_class = EmptySerializer
@@ -144,5 +143,5 @@ class VolumeViewSet(structure_views.ResourceViewSet):
 
         executors.VolumeAttachExecutor.execute(volume)
 
-    attach_validators = [core_validators.StateValidator(models.Volume.States.OK)]
+    attach_validators = [core_validators.StateValidator(CoreStates.OK)]
     attach_serializer_class = serializers.AwsVolumeAttachSerializer

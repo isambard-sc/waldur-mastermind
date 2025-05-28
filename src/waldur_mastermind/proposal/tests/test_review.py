@@ -3,6 +3,7 @@ from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.proposal import models
+from waldur_mastermind.proposal.enums import ProposalStates
 from waldur_mastermind.proposal.tests import fixtures
 
 from . import factories
@@ -51,7 +52,7 @@ class ReviewCreateTest(test.APITransactionTestCase):
         self.fixture = fixtures.ProposalFixture()
         self.url = factories.ReviewFactory.get_list_url()
 
-    @data("staff")
+    @data("staff", "call_manager")
     def test_user_can_add(self, user):
         response = self.create(user)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -124,14 +125,13 @@ class ReviewDeleteTest(test.APITransactionTestCase):
     @data(
         "staff",
     )
-    def test_user_can_delete(self, user):
+    def test_staff_can_delete(self, user):
         response = self.run_delete(user)
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
 
     @data(
         "owner",
         "customer_support",
-        "proposal_submitted_creator",
     )
     def test_customer_user_can_not_delete(self, user):
         response = self.run_delete(user)
@@ -251,7 +251,7 @@ class ReviewerGetTest(test.APITransactionTestCase):
         "staff",
     )
     def test_reviewers_counter_should_be_visible(self, user):
-        self.fixture.proposal.state = models.Proposal.States.IN_REVIEW
+        self.fixture.proposal.state = ProposalStates.IN_REVIEW
         self.fixture.review.proposal = self.fixture.proposal
         self.fixture.review.save()
         self.fixture.proposal.save()

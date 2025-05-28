@@ -32,6 +32,8 @@ class VirtualMachineMixin(models.Model):
 class VirtualMachine(
     VirtualMachineMixin, core_models.RuntimeStateMixin, structure_models.BaseResource
 ):
+    disks: models.Manager["Disk"]
+
     class RuntimeStates:
         POWERED_OFF = "POWERED_OFF"
         POWERED_ON = "POWERED_ON"
@@ -71,10 +73,16 @@ class VirtualMachine(
             (NOT_RUNNING, "Not running"),
         )
 
-    template = models.ForeignKey("Template", null=True, on_delete=models.SET_NULL)
-    cluster = models.ForeignKey("Cluster", null=True, on_delete=models.SET_NULL)
-    datastore = models.ForeignKey("Datastore", null=True, on_delete=models.SET_NULL)
-    folder = models.ForeignKey("Folder", null=True, on_delete=models.SET_NULL)
+    template = models.ForeignKey["Template"](
+        "Template", null=True, on_delete=models.SET_NULL
+    )
+    cluster = models.ForeignKey["Cluster"](
+        "Cluster", null=True, on_delete=models.SET_NULL
+    )
+    datastore = models.ForeignKey["Datastore"](
+        "Datastore", null=True, on_delete=models.SET_NULL
+    )
+    folder = models.ForeignKey["Folder"]("Folder", null=True, on_delete=models.SET_NULL)
     networks = models.ManyToManyField("Network", blank=True)
     guest_power_enabled = models.BooleanField(
         default=False,
@@ -181,7 +189,7 @@ class Cluster(structure_models.ServiceProperty):
 
 class CustomerCluster(models.Model):
     customer = models.ForeignKey(structure_models.Customer, on_delete=models.CASCADE)
-    cluster = models.ForeignKey("Cluster", on_delete=models.CASCADE)
+    cluster = models.ForeignKey["Cluster"]("Cluster", on_delete=models.CASCADE)
 
     def __str__(self):
         return f"{self.customer} / {self.cluster}"
@@ -204,7 +212,7 @@ class Network(structure_models.ServiceProperty):
 class CustomerNetwork(models.Model):
     # This model allows to specify allowed networks for VM provision
     customer = models.ForeignKey(structure_models.Customer, on_delete=models.CASCADE)
-    network = models.ForeignKey("Network", on_delete=models.CASCADE)
+    network = models.ForeignKey["Network"]("Network", on_delete=models.CASCADE)
 
     def __str__(self):
         return f"{self.customer} / {self.network}"
@@ -216,7 +224,7 @@ class CustomerNetwork(models.Model):
 class CustomerNetworkPair(models.Model):
     # This model allows to specify allowed networks for existing VM NIC provision
     customer = models.ForeignKey(structure_models.Customer, on_delete=models.CASCADE)
-    network = models.ForeignKey("Network", on_delete=models.CASCADE)
+    network = models.ForeignKey["Network"]("Network", on_delete=models.CASCADE)
 
     def __str__(self):
         return f"{self.customer} / {self.network}"
@@ -244,7 +252,7 @@ class Datastore(structure_models.ServiceProperty):
 
 class CustomerDatastore(models.Model):
     customer = models.ForeignKey(structure_models.Customer, on_delete=models.CASCADE)
-    datastore = models.ForeignKey("Datastore", on_delete=models.CASCADE)
+    datastore = models.ForeignKey["Datastore"]("Datastore", on_delete=models.CASCADE)
 
     def __str__(self):
         return f"{self.customer} / {self.datastore}"
@@ -264,7 +272,7 @@ class Folder(structure_models.ServiceProperty):
 
 class CustomerFolder(models.Model):
     customer = models.ForeignKey(structure_models.Customer, on_delete=models.CASCADE)
-    folder = models.ForeignKey("Folder", on_delete=models.CASCADE)
+    folder = models.ForeignKey["Folder"]("Folder", on_delete=models.CASCADE)
 
     def __str__(self):
         return f"{self.customer} / {self.folder}"

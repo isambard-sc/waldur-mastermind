@@ -1,14 +1,21 @@
 import datetime
 
+from django.contrib.contenttypes.models import ContentType
 from django.utils.functional import cached_property
 
 from waldur_core.permissions import enums
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.fixtures import CallRole
+from waldur_core.permissions.models import Role
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
 from waldur_mastermind.proposal import models as proposal_models
+from waldur_mastermind.proposal.enums import (
+    CallStates,
+    ProposalStates,
+    RequestedOfferingStates,
+)
 from waldur_mastermind.proposal.tests import factories as proposal_factories
 
 
@@ -29,10 +36,13 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
             enums.PermissionEnum.LIST_PROPOSALS,
             enums.PermissionEnum.LIST_CALLS,
             enums.PermissionEnum.LIST_ROUNDS,
+            enums.PermissionEnum.MANAGE_PROPOSAL_REVIEW,
         ):
             CallRole.MANAGER.add_permission(perm)
+            self.call_organizer_role.add_permission(perm)
 
         CallRole.REVIEWER.add_permission(enums.PermissionEnum.LIST_PROPOSALS)
+        self.call_organizer_role.add_permission(enums.PermissionEnum.CREATE_CALL)
 
     @cached_property
     def manager(self):
@@ -45,9 +55,25 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
     def call(self):
         return proposal_factories.CallFactory(
             manager=self.manager,
-            state=proposal_models.Call.States.ACTIVE,
+            state=CallStates.ACTIVE,
             created_by=self.owner,
         )
+
+    @property
+    def call_organizer_role(self):
+        return Role.objects.get_system_role(
+            "CUSTOMER.CALL_ORGANIZER",
+            content_type=ContentType.objects.get_for_model(
+                proposal_models.CallManagingOrganisation
+            ),
+        )
+
+    @property
+    def call_organizer_user(self):
+        user = structure_factories.UserFactory()
+        self.manager.add_user(user, self.call_organizer_role)
+        self.customer.add_user(user, self.call_organizer_role)
+        return user
 
     @cached_property
     def new_call(self):
@@ -63,7 +89,7 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
     def requested_offering(self):
         return proposal_factories.RequestedOfferingFactory(
             call=self.call,
-            state=proposal_models.RequestedOffering.States.REQUESTED,
+            state=RequestedOfferingStates.REQUESTED,
             created_by=self.owner,
             offering=self.offering,
         )
@@ -72,7 +98,7 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
     def requested_offering_accepted(self):
         return proposal_factories.RequestedOfferingFactory(
             call=self.call,
-            state=proposal_models.RequestedOffering.States.ACCEPTED,
+            state=RequestedOfferingStates.ACCEPTED,
             created_by=self.owner,
             offering=self.offering,
         )
@@ -121,7 +147,7 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
     def proposal_submitted(self):
         return proposal_factories.ProposalFactory(
             round=self.round,
-            state=proposal_models.Proposal.States.SUBMITTED,
+            state=ProposalStates.SUBMITTED,
             project=self.proposal_project,
         )
 

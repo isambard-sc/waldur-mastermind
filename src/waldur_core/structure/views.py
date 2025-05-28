@@ -38,6 +38,7 @@ from waldur_core.core import models as core_models
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.log import event_logger
 from waldur_core.core.serializers import EmptySerializer
 from waldur_core.core.utils import is_uuid_like
@@ -53,14 +54,33 @@ from waldur_core.structure.managers import (
     filter_queryset_for_user,
     get_active_tokens,
     get_connected_customers,
+    get_connected_projects,
+    get_project_users,
 )
 from waldur_core.structure.utils import get_components_usage_data_from_resources
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
+from waldur_mastermind.marketplace.enums import ResourceStates
 
 logger = logging.getLogger(__name__)
 
 User = auth.get_user_model()
+
+
+BASE_USER_PARAMETERS = [
+    OpenApiParameter("full_name", str, OpenApiParameter.QUERY),
+    OpenApiParameter("user_keyword", str, OpenApiParameter.QUERY),
+    OpenApiParameter("native_name", str, OpenApiParameter.QUERY),
+    OpenApiParameter("organization", str, OpenApiParameter.QUERY),
+    OpenApiParameter("email", str, OpenApiParameter.QUERY),
+    OpenApiParameter("phone_number", str, OpenApiParameter.QUERY),
+    OpenApiParameter("description", str, OpenApiParameter.QUERY),
+    OpenApiParameter("job_title", str, OpenApiParameter.QUERY),
+    OpenApiParameter("username", str, OpenApiParameter.QUERY),
+    OpenApiParameter("civil_number", str, OpenApiParameter.QUERY),
+    OpenApiParameter("is_active", str, OpenApiParameter.QUERY),
+    OpenApiParameter("registration_method", str, OpenApiParameter.QUERY),
+]
 
 
 class CustomerViewSet(UserRoleMixin, core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
@@ -72,7 +92,6 @@ class CustomerViewSet(UserRoleMixin, core_mixins.EagerLoadMixin, viewsets.ModelV
         filters.GenericRoleFilter,
         DjangoFilterBackend,
         rf_filters.OrderingFilter,
-        filters.OwnedByCurrentUserFilterBackend,
         filters.AccountingStartDateFilter,
         filters.ExternalCustomerFilterBackend,
     )
@@ -151,7 +170,7 @@ class CustomerViewSet(UserRoleMixin, core_mixins.EagerLoadMixin, viewsets.ModelV
         if not self.request.user.is_staff:
             raise PermissionDenied()
 
-        customer = serializer.save()
+        customer: models.Customer = serializer.save()
 
         if django_settings.WALDUR_CORE.get(
             "CREATE_DEFAULT_PROJECT_ON_ORGANIZATION_CREATION", False
@@ -183,19 +202,8 @@ class CustomerViewSet(UserRoleMixin, core_mixins.EagerLoadMixin, viewsets.ModelV
     @extend_schema(
         description="A list of users connected to the customer.",
         responses=serializers.CustomerUserSerializer(many=True),
-        parameters=[
-            OpenApiParameter("full_name", str, OpenApiParameter.QUERY),
-            OpenApiParameter("user_keyword", str, OpenApiParameter.QUERY),
-            OpenApiParameter("native_name", str, OpenApiParameter.QUERY),
-            OpenApiParameter("organization", str, OpenApiParameter.QUERY),
-            OpenApiParameter("email", str, OpenApiParameter.QUERY),
-            OpenApiParameter("phone_number", str, OpenApiParameter.QUERY),
-            OpenApiParameter("description", str, OpenApiParameter.QUERY),
-            OpenApiParameter("job_title", str, OpenApiParameter.QUERY),
-            OpenApiParameter("username", str, OpenApiParameter.QUERY),
-            OpenApiParameter("civil_number", str, OpenApiParameter.QUERY),
-            OpenApiParameter("is_active", str, OpenApiParameter.QUERY),
-            OpenApiParameter("registration_method", str, OpenApiParameter.QUERY),
+        parameters=BASE_USER_PARAMETERS
+        + [
             OpenApiParameter("project_role", str, OpenApiParameter.QUERY),
             OpenApiParameter("organization_role", str, OpenApiParameter.QUERY),
             OpenApiParameter("o", str, OpenApiParameter.QUERY),
@@ -256,11 +264,11 @@ class CustomerViewSet(UserRoleMixin, core_mixins.EagerLoadMixin, viewsets.ModelV
     )
     @action(detail=True)
     def stats(self, request, *args, **kwargs):
-        customer = self.get_object()
+        customer: models.Customer = self.get_object()
 
         resources = marketplace_models.Resource.objects.filter(
             project__customer=customer
-        ).exclude(state=marketplace_models.Resource.States.TERMINATED)
+        ).exclude(state=ResourceStates.TERMINATED)
         resources = filter_queryset_for_user(resources, request.user)
 
         for_current_month = request.query_params.get("for_current_month", False)
@@ -287,7 +295,7 @@ class CustomerViewSet(UserRoleMixin, core_mixins.EagerLoadMixin, viewsets.ModelV
     def update_organization_groups(self, request, uuid):
         if not self.request.user.is_staff:
             raise PermissionDenied()
-        customer = self.get_object()
+        customer: models.Customer = self.get_object()
         serializer = marketplace_serializers.OrganizationGroupsSerializer(
             instance=customer, context={"request": request}, data=request.data
         )
@@ -354,12 +362,6 @@ class ProjectViewSet(
         permission_factory(PermissionEnum.UPDATE_PROJECT, ["*", "customer"])
     ]
 
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-        if self.action == "users":
-            context["project"] = self.get_object()
-        return context
-
     @extend_schema(
         request=serializers.ProjectSerializer,
         examples=[
@@ -407,8 +409,9 @@ class ProjectViewSet(
         serializer.is_valid(raise_exception=True)
 
         customer = serializer.validated_data["customer"]
+        preserve_permissions = serializer.validated_data["preserve_permissions"]
 
-        utils.move_project(project, customer, request.user)
+        utils.move_project(project, customer, request.user, preserve_permissions)
         serialized_project = serializers.ProjectSerializer(
             project, context={"request": self.request}
         )
@@ -432,7 +435,7 @@ class ProjectViewSet(
         project = self.get_object()
 
         resources = marketplace_models.Resource.objects.filter(project=project).exclude(
-            state=marketplace_models.Resource.States.TERMINATED
+            state=ResourceStates.TERMINATED
         )
         resources = filter_queryset_for_user(resources, request.user)
 
@@ -450,6 +453,37 @@ class ProjectViewSet(
             },
             status=status.HTTP_200_OK,
         )
+
+    @extend_schema(
+        description="A list of users which can be added to the "
+        "current project from other projects of the same customer.",
+        responses=serializers.BasicUserSerializer(many=True),
+        parameters=BASE_USER_PARAMETERS,
+    )
+    @action(
+        detail=True,
+        filter_backends=[filters.GenericRoleFilter],
+    )
+    def other_users(self, request, uuid=None):
+        project: models.Project = self.get_object()
+        projects = (
+            models.Project.objects.filter(customer=project.customer)
+            .filter(id__in=get_connected_projects(request.user))
+            .exclude(id=project.id)
+        ).values_list("id", flat=True)
+
+        queryset = User.objects.filter(id__in=get_project_users(projects))
+
+        queryset = filters.UserConcatenatedNameOrderingBackend().filter_queryset(
+            request, queryset, self
+        )
+        filterset = filters.BaseUserFilter(request.GET, queryset=queryset)
+        queryset = filterset.qs
+        queryset = self.paginate_queryset(queryset)
+        serializer = serializers.BasicUserSerializer(
+            queryset, many=True, context=self.get_serializer_context()
+        )
+        return self.get_paginated_response(serializer.data)
 
 
 class UserViewSet(core_views.ActionsViewSet):
@@ -800,12 +834,10 @@ class ResourceViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
     filter_backends = (filters.GenericRoleFilter, DjangoFilterBackend)
     unsafe_methods_permissions = [permissions.is_administrator]
     update_validators = partial_update_validators = [
-        core_validators.StateValidator(models.BaseResource.States.OK)
+        core_validators.StateValidator(CoreStates.OK)
     ]
     destroy_validators = [
-        core_validators.StateValidator(
-            models.BaseResource.States.OK, models.BaseResource.States.ERRED
-        )
+        core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED)
     ]
 
     pull_serializer_class = EmptySerializer
@@ -825,9 +857,7 @@ class ResourceViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
 
     pull_executor = NotImplemented
     pull_validators = [
-        core_validators.StateValidator(
-            models.BaseResource.States.OK, models.BaseResource.States.ERRED
-        ),
+        core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED),
         check_resource_backend_id,
     ]
 
@@ -925,7 +955,7 @@ class NotificationTemplateViewSet(ActionsViewSet):
     )
     @action(detail=True, methods=["post"])
     def override(self, request, uuid=None):
-        template = self.get_object()
+        template: core_models.NotificationTemplate = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         new_content = serializer.validated_data["content"]

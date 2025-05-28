@@ -11,6 +11,11 @@ from waldur_core.core import utils as core_utils
 from waldur_core.structure import models as structure_models
 from waldur_core.users import models as users_models
 from waldur_core.users.tasks import process_invitation
+from waldur_mastermind.marketplace.enums import (
+    OfferingStates,
+    OrderStates,
+    ResourceStates,
+)
 from waldur_mastermind.marketplace.permissions import (
     order_should_not_be_reviewed_by_consumer,
 )
@@ -30,6 +35,9 @@ OFFERING_USER_ALLOWED_OFFERING_TYPES = [
     SCRIPT_PLUGIN_NAME,
 ]
 
+ROBOT_ACCOUNT_TYPE = "Robot account"
+SERVICE_ACCOUNT_TYPE = "Service account"
+
 
 def create_screenshot_thumbnail(sender, instance, created=False, **kwargs):
     if not created:
@@ -44,8 +52,8 @@ def log_order_events(sender, instance, created=False, **kwargs):
     order: models.Order = instance
     if created:
         if order.state not in (
-            models.Order.States.PENDING_CONSUMER,
-            models.Order.States.PENDING_PROVIDER,
+            OrderStates.PENDING_CONSUMER,
+            OrderStates.PENDING_PROVIDER,
         ):
             # Skip logging for imported order
             return
@@ -58,22 +66,22 @@ def log_order_events(sender, instance, created=False, **kwargs):
     else:
         if not order.tracker.has_changed("state"):
             return
-        if order.state == models.Order.States.EXECUTING:
+        if order.state == OrderStates.EXECUTING:
             log.log_order_approved(order)
-        elif order.state == models.Order.States.REJECTED:
+        elif order.state == OrderStates.REJECTED:
             log.log_order_rejected(order)
-        elif order.state == models.Order.States.DONE:
+        elif order.state == OrderStates.DONE:
             log.log_order_completed(order)
-        elif order.state == models.Order.States.CANCELED:
+        elif order.state == OrderStates.CANCELED:
             log.log_order_canceled(order)
-        elif order.state == models.Order.States.ERRED:
+        elif order.state == OrderStates.ERRED:
             log.log_order_failed(order)
 
 
 def log_resource_events(sender, instance, created=False, **kwargs):
     resource = instance
     # Skip logging for imported resource
-    if created and instance.state == models.Resource.States.CREATING:
+    if created and instance.state == ResourceStates.CREATING:
         log.log_resource_creation_requested(resource)
 
 
@@ -110,13 +118,13 @@ def init_resource_parent(sender, instance, created=False, **kwargs):
 def notify_approvers_when_order_is_created(sender, instance, created=False, **kwargs):
     order: models.Order = instance
     if created and order.state in (
-        models.Order.States.PENDING_CONSUMER,
-        models.Order.States.PENDING_PROVIDER,
+        OrderStates.PENDING_CONSUMER,
+        OrderStates.PENDING_PROVIDER,
     ):
         if order_should_not_be_reviewed_by_consumer(order):
             order.review_by_consumer(order.created_by)
             if order.project.start_date and order.project.start_date > now().date():
-                order.state = models.Order.States.PENDING_PROJECT
+                order.state = OrderStates.PENDING_PROJECT
                 order.save(update_fields=["state"])
                 return
             if utils.order_should_not_be_reviewed_by_provider(order):
@@ -130,7 +138,7 @@ def notify_approvers_when_order_is_created(sender, instance, created=False, **kw
                 )
                 tasks.process_order_on_commit(order, order.created_by)
             else:
-                order.state = models.Order.States.PENDING_PROVIDER
+                order.state = OrderStates.PENDING_PROVIDER
                 order.save(update_fields=["state"])
                 transaction.on_commit(
                     lambda: tasks.notify_provider_about_pending_order.delay(order.uuid)
@@ -170,12 +178,12 @@ def process_invitations_and_orders_when_project_start_date_is_unset(
         )
 
     orders = models.Order.objects.filter(
-        state=models.Order.States.PENDING_PROJECT, project=project
+        state=OrderStates.PENDING_PROJECT, project=project
     )
     for order in orders:
         # Setting the state to PENDING_PROVIDER because direct transition
         # from PENDING_PROJECT to EXECUTING is not supported
-        order.state = models.Order.States.PENDING_PROVIDER
+        order.state = OrderStates.PENDING_PROVIDER
         order.save(update_fields=["state"])
         if utils.order_should_not_be_reviewed_by_provider(order):
             order.set_state_executing()
@@ -196,15 +204,15 @@ def update_resource_when_order_is_rejected_or_erred(
     if not order.tracker.has_changed("state"):
         return
     resource = order.resource
-    if order.state == models.Order.States.REJECTED:
+    if order.state == OrderStates.REJECTED:
         if order.type == models.Order.Types.CREATE:
             resource.set_state_terminated()
             resource.save(update_fields=["state"])
-        elif resource.state != models.Resource.States.OK:
+        elif resource.state != ResourceStates.OK:
             resource.set_state_ok()
             resource.save(update_fields=["state"])
-    elif order.state == models.Order.States.ERRED:
-        if resource.state != models.Resource.States.CREATING:
+    elif order.state == OrderStates.ERRED:
+        if resource.state != ResourceStates.CREATING:
             return
         if resource.backend_id in [None, ""]:
             logger.info("Terminating %s", resource)
@@ -220,7 +228,7 @@ def sync_resource_limit_when_order(sender, instance, created=False, **kwargs):
     order: models.Order = instance
     if order.type != models.Order.Types.CREATE:
         return
-    if order.resource.state != models.Resource.States.CREATING:
+    if order.resource.state != ResourceStates.CREATING:
         return
     update_fields = set()
     for prop in ("limits", "attributes", "plan_id"):
@@ -236,15 +244,13 @@ def update_category_quota_when_offering_is_created(
 ):
     def get_delta():
         if created:
-            if instance.state == models.Offering.States.ACTIVE:
+            if instance.state == OfferingStates.ACTIVE:
                 return 1
         else:
             if instance.tracker.has_changed("state"):
-                if instance.state == models.Offering.States.ACTIVE:
+                if instance.state == OfferingStates.ACTIVE:
                     return 1
-                elif (
-                    instance.tracker.previous("state") == models.Offering.States.ACTIVE
-                ):
+                elif instance.tracker.previous("state") == OfferingStates.ACTIVE:
                     return -1
 
     delta = get_delta()
@@ -253,14 +259,14 @@ def update_category_quota_when_offering_is_created(
 
 
 def update_category_quota_when_offering_is_deleted(sender, instance, **kwargs):
-    if instance.state == models.Offering.States.ACTIVE:
+    if instance.state == OfferingStates.ACTIVE:
         instance.category.add_quota_usage("offering_count", -1)
 
 
 def update_category_offerings_count(sender, **kwargs):
     for category in models.Category.objects.all():
         value = models.Offering.objects.filter(
-            category=category, state=models.Offering.States.ACTIVE
+            category=category, state=OfferingStates.ACTIVE
         ).count()
         category.set_quota_usage("offering_count", value)
 
@@ -287,10 +293,10 @@ def create_resource_plan_period_when_resource_is_created(
     if not instance.tracker.has_changed("state"):
         return
 
-    if instance.state != models.Resource.States.OK:
+    if instance.state != ResourceStates.OK:
         return
 
-    if instance.tracker.previous("state") != models.Resource.States.CREATING:
+    if instance.tracker.previous("state") != ResourceStates.CREATING:
         return
 
     if not instance.plan:
@@ -312,7 +318,7 @@ def close_resource_plan_period_when_resource_is_terminated(
     if not instance.tracker.has_changed("state"):
         return
 
-    if instance.state != models.Resource.States.TERMINATED:
+    if instance.state != ResourceStates.TERMINATED:
         return
 
     if not instance.plan:
@@ -469,7 +475,7 @@ def limit_update_succeeded(sender, order: models.Order, **kwargs):
     resource = order.resource
     old_limits = resource.limits
     resource.limits = order.limits
-    if resource.state != models.Resource.States.OK:
+    if resource.state != ResourceStates.OK:
         resource.set_state_ok()
     resource.save()
     order.complete()
@@ -529,7 +535,7 @@ def disable_empty_service_settings(offering):
 
     if (
         not models.Resource.objects.filter(offering=offering)
-        .exclude(state=models.Resource.States.TERMINATED)
+        .exclude(state=ResourceStates.TERMINATED)
         .exists()
     ):
         service_settings.is_active = False
@@ -546,7 +552,7 @@ def enable_nonempty_service_settings(offering):
 
     if (
         models.Resource.objects.filter(offering=offering)
-        .exclude(state=models.Resource.States.TERMINATED)
+        .exclude(state=ResourceStates.TERMINATED)
         .exists()
     ):
         service_settings.is_active = True
@@ -562,12 +568,12 @@ def disable_archived_service_settings_without_existing_resource(
     if not instance.tracker.has_changed("state"):
         return
 
-    if instance.state != models.Resource.States.TERMINATED:
+    if instance.state != ResourceStates.TERMINATED:
         return
 
     offering: models.Offering = instance.offering
 
-    if offering.state != models.Offering.States.ARCHIVED:
+    if offering.state != OfferingStates.ARCHIVED:
         return
 
     disable_empty_service_settings(offering)
@@ -582,7 +588,7 @@ def disable_service_settings_without_existing_resource_when_archived(
     if not instance.tracker.has_changed("state"):
         return
 
-    if instance.state != models.Offering.States.ARCHIVED:
+    if instance.state != OfferingStates.ARCHIVED:
         return
 
     disable_empty_service_settings(instance)
@@ -598,8 +604,8 @@ def enable_service_settings_with_existing_resource(
         return
 
     if instance.state in [
-        models.Resource.States.TERMINATED,
-        models.Resource.States.TERMINATING,
+        ResourceStates.TERMINATED,
+        ResourceStates.TERMINATING,
     ]:
         return
 
@@ -615,7 +621,7 @@ def enable_service_settings_when_not_archived(
     if not instance.tracker.has_changed("state"):
         return
 
-    if instance.state == models.Offering.States.ARCHIVED:
+    if instance.state == OfferingStates.ARCHIVED:
         return
 
     enable_nonempty_service_settings(instance)
@@ -806,8 +812,8 @@ def resource_state_has_been_changed(sender, instance, created=False, **kwargs):
         return
 
     if (
-        resource.state == models.Resource.States.OK
-        and resource.tracker.previous("state") == models.Resource.States.ERRED
+        resource.state == ResourceStates.OK
+        and resource.tracker.previous("state") == ResourceStates.ERRED
         and resource.error_traceback
     ):
         resource.error_traceback = ""
@@ -823,7 +829,7 @@ def delete_expired_project_if_every_resource_has_been_terminated(
     if not instance.tracker.has_changed("state"):
         return
 
-    if instance.state != models.Resource.States.TERMINATED:
+    if instance.state != ResourceStates.TERMINATED:
         return
 
     project = instance.project
@@ -833,8 +839,8 @@ def delete_expired_project_if_every_resource_has_been_terminated(
             models.Resource.objects.filter(project=project)
             .exclude(
                 state__in=(
-                    models.Resource.States.ERRED,
-                    models.Resource.States.TERMINATED,
+                    ResourceStates.ERRED,
+                    ResourceStates.TERMINATED,
                 )
             )
             .exists()
@@ -858,29 +864,61 @@ def log_offering_user_deleted(sender, instance, **kwargs):
     log.log_offering_user_deleted(instance)
 
 
-def generate_changes_string(changed_dict, instance):
+def generate_changes_string(changed_dict, instance, account_type):
     changes_string = ""
     if "username" in changed_dict:
-        changes_string += f"Robot account {changed_dict['username']} has been updated. "
+        changes_string += (
+            f"{account_type} {changed_dict['username']} has been updated. "
+        )
     else:
-        changes_string += f"Robot account {instance.username} has been updated. "
-
+        changes_string += f"{account_type} {instance.username} has been updated. "
     for key in changed_dict:
         if key == "state":
-            old_state = models.RobotAccount(state=changed_dict[key]).get_state_display()
+            if account_type == ROBOT_ACCOUNT_TYPE:
+                old_state = models.RobotAccount(
+                    state=changed_dict[key]
+                ).get_state_display()
             new_state = instance.get_state_display()
-            change_string = f"Robot account '{instance.username}' state changed from '{old_state}' to '{new_state}'."
+            change_string = f"{account_type} '{instance.username}' state changed from '{old_state}' to '{new_state}'."
         else:
             change_string = f"{key} had changed from {changed_dict[key]} to {getattr(instance, key)}. "
         changes_string += change_string
     return changes_string
 
 
+def log_service_account_created_or_updated(sender, instance, created=False, **kwargs):
+    if not created:
+        changed_string = generate_changes_string(
+            instance.tracker.changed(), instance, SERVICE_ACCOUNT_TYPE
+        )
+        event_logger.marketplace_service_account.info(
+            changed_string,
+            event_type="service_account_updated",
+            event_context={"service_account": instance},
+        )
+        return
+    event_logger.marketplace_service_account.info(
+        "Service account {service_account_username} has been created.",
+        event_type="service_account_created",
+        event_context={"service_account": instance},
+    )
+
+
+def log_service_account_deleted(sender, instance, **kwargs):
+    event_logger.marketplace_service_account.info(
+        "Service account {service_account_username} has been deleted.",
+        event_type="service_account_deleted",
+        event_context={"service_account": instance},
+    )
+
+
 def log_resource_robot_account_created_or_updated(
     sender, instance, created=False, **kwargs
 ):
     if not created:
-        changed_string = generate_changes_string(instance.tracker.changed(), instance)
+        changed_string = generate_changes_string(
+            instance.tracker.changed(), instance, ROBOT_ACCOUNT_TYPE
+        )
         event_logger.marketplace_robot_account.info(
             changed_string,
             event_type="resource_robot_account_updated",
@@ -908,7 +946,7 @@ def create_offering_users_when_project_role_granted(sender, instance, **kwargs):
     project = instance.scope
     user = instance.user
     resources = project.resource_set.filter(
-        state=models.Resource.States.OK,
+        state=ResourceStates.OK,
         offering__type__in=OFFERING_USER_ALLOWED_OFFERING_TYPES,
     )
     offering_ids = set(resources.values_list("offering_id", flat=True))
@@ -1056,7 +1094,7 @@ def update_offering_user_username_after_freeipa_profile_update(
         offering_user.save(update_fields=["username"])
 
 
-def set_order_completion_timestamp(sender, instance, created=False, **kwargs):
+def notify_user_about_rejected_order(sender, instance, created=False, **kwargs):
     if created:
         return
 
@@ -1067,13 +1105,9 @@ def set_order_completion_timestamp(sender, instance, created=False, **kwargs):
 
     if (
         order.tracker.has_changed("state")
-        and order.state in models.Order.States.TERMINAL_STATES
+        and order.state in OrderStates.TERMINAL_STATES
     ):
-        logger.debug("Setting order %s completion time", order)
-        order.completed_at = now()
-        order.save(update_fields=["completed_at"])
-
-        if order.state == models.Order.States.REJECTED:
+        if order.state == OrderStates.REJECTED:
             tasks.notify_user_that_order_been_rejected.delay(order.uuid.hex)
 
 

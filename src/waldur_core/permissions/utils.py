@@ -14,7 +14,6 @@ def has_permission(request, permission, scope):
         user = request
     else:
         user = request.user
-
     if user.is_staff:
         return True
 
@@ -48,12 +47,6 @@ def permission_factory(permission, sources=None):
         raise exceptions.PermissionDenied()
 
     return permission_function
-
-
-def role_has_permission(role, permission):
-    return models.RolePermission.objects.filter(
-        role__name=role, permission=permission
-    ).exists()
 
 
 def get_users(scope, role_name=None):

@@ -10,9 +10,11 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework.exceptions import ValidationError
 
 from waldur_auth_social.models import IdentityProvider, ProviderChoices
+from waldur_core.core.enums import CoreStates
 from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure.signals import project_moved
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import ResourceStates
 
 logger = logging.getLogger(__name__)
 
@@ -148,11 +150,11 @@ def handle_resource_update_success(resource):
     Recover resource if its state is ERRED and clear error message.
     """
     update_fields = []
-    if resource.state == resource.States.ERRED:
+    if resource.state == CoreStates.ERRED:
         resource.recover()
         update_fields.append("state")
 
-    if resource.state in (resource.States.UPDATING, resource.States.CREATING):
+    if resource.state in (CoreStates.UPDATING, CoreStates.CREATING):
         resource.set_ok()
         update_fields.append("state")
 
@@ -186,7 +188,7 @@ def project_is_empty(obj):
 
     if (
         Resource.objects.filter(project=obj)
-        .exclude(state=Resource.States.TERMINATED)
+        .exclude(state=ResourceStates.TERMINATED)
         .exists()
     ):
         raise ValidationError(
@@ -206,7 +208,7 @@ def check_project_end_date(obj):
 
 
 @transaction.atomic
-def move_project(project, customer, current_user=None):
+def move_project(project, customer, current_user=None, preserve_permissions=False):
     if customer.blocked:
         raise ValidationError(_("New customer must be not blocked"))
 
@@ -217,9 +219,10 @@ def move_project(project, customer, current_user=None):
     project.customer = customer
     project.save(update_fields=["customer"])
 
-    for permission in get_permissions(project):
-        permission.revoke(current_user)
-        logger.info("Permission %s has been revoked" % permission)
+    if not preserve_permissions:
+        for permission in get_permissions(project):
+            permission.revoke(current_user)
+            logger.info(f"Permission {permission} has been revoked")
 
     project_moved.send(
         sender=project.__class__,

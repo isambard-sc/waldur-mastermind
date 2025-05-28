@@ -22,6 +22,8 @@ class RoleManager(models.Manager):
 
 
 class Role(DescribableMixin, UuidMixin):
+    permissions: models.Manager["RolePermission"]
+
     name = models.CharField(unique=True, db_index=True, max_length=150)
     is_system_role = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
@@ -52,11 +54,11 @@ class UserRoleManager(GenericKeyMixin, models.Manager):
 
 
 class UserRole(TimeStampedModel, ScopeMixin, UuidMixin):
-    user: User = models.ForeignKey(
+    user = models.ForeignKey[User](
         on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL, db_index=True
     )
     role = models.ForeignKey(on_delete=models.CASCADE, to=Role, db_index=True)
-    created_by = models.ForeignKey(
+    created_by = models.ForeignKey[User](
         on_delete=models.CASCADE,
         to=settings.AUTH_USER_MODEL,
         null=True,

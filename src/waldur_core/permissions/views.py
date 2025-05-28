@@ -58,7 +58,7 @@ class RoleViewSet(ActionsViewSet):
     def create(self, request):
         serializer = serializers.RoleModifySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        role = serializer.save()
+        role: models.Role = serializer.save()
         serializer = serializers.RoleDetailsSerializer(instance=role)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -67,10 +67,10 @@ class RoleViewSet(ActionsViewSet):
         responses=serializers.RoleDetailsSerializer,
     )
     def update(self, request, **kwargs):
-        instance = self.get_object()
+        instance: models.Role = self.get_object()
         serializer = serializers.RoleModifySerializer(instance, data=request.data)
         serializer.is_valid(raise_exception=True)
-        role = serializer.save()
+        role: models.Role = serializer.save()
         serializer = serializers.RoleDetailsSerializer(instance=role)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -80,7 +80,7 @@ class RoleViewSet(ActionsViewSet):
     )
     @action(detail=True, methods=["PUT"])
     def update_descriptions(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.Role = self.get_object()
         serializer = serializers.RoleDescriptionSerializer(instance, data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -241,7 +241,7 @@ class UserRoleMixin:
 
     @extend_schema(
         request=serializers.UserRoleCreateSerializer,
-        responses=None,
+        responses={201: serializers.UserRoleExpirationTimeSerializer},
     )
     @action(detail=True, methods=["POST"])
     def add_user(self, request, uuid=None):
@@ -268,7 +268,7 @@ class UserRoleMixin:
 
     @extend_schema(
         request=serializers.UserRoleUpdateSerializer,
-        responses=None,
+        responses={200: serializers.UserRoleExpirationTimeSerializer},
     )
     @action(detail=True, methods=["POST"])
     def update_user(self, request, uuid=None):
@@ -294,7 +294,7 @@ class UserRoleMixin:
 
     @extend_schema(
         request=serializers.UserRoleDeleteSerializer,
-        responses=None,
+        responses={200: None},
     )
     @action(detail=True, methods=["POST"])
     def delete_user(self, request, uuid=None):

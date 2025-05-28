@@ -11,6 +11,7 @@ from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
 from waldur_core.core import validators as core_validators
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.serializers import EmptySerializer
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import views as structure_views
@@ -48,7 +49,7 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
     delete_executor = executors.VirtualMachineDeleteExecutor
     update_executor = executors.VirtualMachineUpdateExecutor
     update_validators = partial_update_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(
             models.VirtualMachine.RuntimeStates.POWERED_OFF
         ),
@@ -62,14 +63,14 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
 
     @action(detail=True, methods=["post"])
     def start(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.VirtualMachine = self.get_object()
         executors.VirtualMachineStartExecutor().execute(instance)
         return Response(
             {"status": _("start was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     start_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(
             models.VirtualMachine.RuntimeStates.POWERED_OFF,
             models.VirtualMachine.RuntimeStates.SUSPENDED,
@@ -79,14 +80,14 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
 
     @action(detail=True, methods=["post"])
     def stop(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.VirtualMachine = self.get_object()
         executors.VirtualMachineStopExecutor().execute(instance)
         return Response(
             {"status": _("stop was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     stop_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(
             models.VirtualMachine.RuntimeStates.POWERED_ON,
             models.VirtualMachine.RuntimeStates.SUSPENDED,
@@ -96,14 +97,14 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
 
     @action(detail=True, methods=["post"])
     def reset(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.VirtualMachine = self.get_object()
         executors.VirtualMachineResetExecutor().execute(instance)
         return Response(
             {"status": _("reset was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     reset_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(
             models.VirtualMachine.RuntimeStates.POWERED_ON,
         ),
@@ -112,14 +113,14 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
 
     @action(detail=True, methods=["post"])
     def suspend(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.VirtualMachine = self.get_object()
         executors.VirtualMachineSuspendExecutor().execute(instance)
         return Response(
             {"status": _("suspend was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     suspend_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(
             models.VirtualMachine.RuntimeStates.POWERED_ON,
         ),
@@ -132,14 +133,14 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
 
     @action(detail=True, methods=["post"])
     def shutdown_guest(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.VirtualMachine = self.get_object()
         executors.VirtualMachineShutdownGuestExecutor().execute(instance)
         return Response(
             {"status": _("shutdown was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     shutdown_guest_validators = reboot_guest_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(
             models.VirtualMachine.RuntimeStates.POWERED_ON,
         ),
@@ -149,7 +150,7 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
 
     @action(detail=True, methods=["post"])
     def reboot_guest(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.VirtualMachine = self.get_object()
         executors.VirtualMachineRebootGuestExecutor().execute(instance)
         return Response(
             {"status": _("reboot was scheduled")}, status=status.HTTP_202_ACCEPTED
@@ -174,7 +175,7 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
             )
 
     create_port_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         check_number_of_ports,
     ]
     create_port_serializer_class = serializers.VmwarePortSerializer
@@ -199,7 +200,7 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
                 raise rf_serializers.ValidationError("Storage quota has been reached.")
 
     create_disk_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         validate_total_size,
     ]
     create_disk_serializer_class = serializers.VmwareDiskSerializer
@@ -212,7 +213,7 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
     )
     @action(detail=True, methods=["get"])
     def console(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.VirtualMachine = self.get_object()
         backend = instance.get_backend()
         try:
             url = backend.get_console_url(instance)
@@ -221,9 +222,7 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
             raise rf_serializers.ValidationError("Unable to get console URL.")
         return Response({"url": url}, status=status.HTTP_200_OK)
 
-    console_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK)
-    ]
+    console_validators = [core_validators.StateValidator(CoreStates.OK)]
 
     @extend_schema(
         request=None,
@@ -233,7 +232,7 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
     )
     @action(detail=True, methods=["get"])
     def web_console(self, request, uuid=None):
-        instance = self.get_object()
+        instance: models.VirtualMachine = self.get_object()
         backend = instance.get_backend()
         try:
             url = backend.get_web_console_url(instance)
@@ -243,7 +242,7 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
         return Response({"url": url}, status=status.HTTP_200_OK)
 
     web_console_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(
             models.VirtualMachine.RuntimeStates.POWERED_ON
         ),
@@ -270,7 +269,7 @@ class DiskViewSet(structure_views.ResourceViewSet):
     @action(detail=True, methods=["post"])
     def extend(self, request, uuid=None):
         """Increase disk capacity"""
-        disk = self.get_object()
+        disk: models.Disk = self.get_object()
         serializer = self.get_serializer(disk, data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -297,7 +296,7 @@ class DiskViewSet(structure_views.ResourceViewSet):
                 raise rf_serializers.ValidationError("Storage quota has been reached.")
 
     extend_validators = [
-        core_validators.StateValidator(models.Disk.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         validate_total_size,
     ]
     extend_serializer_class = serializers.VmwareDiskExtendSerializer

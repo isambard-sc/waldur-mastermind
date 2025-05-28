@@ -72,6 +72,10 @@ class ProjectSection(FeatureSection):
 
     show_image_in_create_dialog = Feature("Show image field in project create dialog.")
 
+    show_credit_in_create_dialog = Feature(
+        "Show credit field in project create dialog."
+    )
+
 
 class UserSection(FeatureSection):
     class Meta:
@@ -89,6 +93,8 @@ class UserSection(FeatureSection):
     disable_user_termination = Feature("Disable user termination in user workspace.")
 
     show_slug = Feature("Enable display of slug field in user summary.")
+
+    show_username = Feature("Enable display of username field in user tables.")
 
 
 class MarketplaceSection(FeatureSection):
@@ -115,6 +121,10 @@ class MarketplaceSection(FeatureSection):
     catalogue_only = Feature("Allow marketplace to function as a catalogue only.")
 
     call_only = Feature("Allow marketplace to serve only as aggregator of call info.")
+
+    show_resource_end_date = Feature(
+        "Show resource end date as a non optional column in resources list."
+    )
 
 
 class SupportSection(FeatureSection):
@@ -146,6 +156,7 @@ class InvitationsSection(FeatureSection):
     civil_number_required = Feature(
         "Make civil number field mandatory in invitation creation form."
     )
+    show_service_accounts = Feature("Show service accounts of the scopes.")
 
 
 class RancherSection(FeatureSection):
@@ -156,6 +167,8 @@ class RancherSection(FeatureSection):
     volume_mount_point = Feature(
         "Allow to select mount point for data volume when Rancher cluster is provisioned."
     )
+
+    apps = Feature("Render Rancher apps as a separate tab in resource details page.")
 
 
 class SlurmSection(FeatureSection):

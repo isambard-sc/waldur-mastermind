@@ -13,16 +13,9 @@ class RancherConfig(AppConfig):
         from waldur_openstack.models import Instance
 
         from . import handlers, models
-        from . import signals as rancher_signals
         from .backend import RancherBackend
 
         SupportedServices.register_backend(RancherBackend)
-
-        rancher_signals.rancher_user_created.connect(
-            handlers.notify_create_user,
-            sender=models.RancherUser,
-            dispatch_uid="waldur_rancher.notify_create_user",
-        )
 
         signals.post_delete.connect(
             handlers.delete_node_if_related_instance_has_been_deleted,
@@ -46,6 +39,30 @@ class RancherConfig(AppConfig):
             handlers.set_error_state_for_cluster_if_related_node_deleting_is_failed,
             sender=models.Node,
             dispatch_uid="waldur_rancher.set_error_state_for_cluster_if_related_node_deleting_is_failed",
+        )
+
+        signals.post_delete.connect(
+            handlers.delete_keycloak_group_from_backend,
+            sender=models.KeycloakGroup,
+            dispatch_uid="waldur_rancher.delete_keycloak_group_from_backend",
+        )
+
+        signals.post_delete.connect(
+            handlers.delete_keycloak_user_group_membership_from_backend,
+            sender=models.KeycloakUserGroupMembership,
+            dispatch_uid="waldur_rancher.delete_keycloak_user_group_membership_from_backend",
+        )
+
+        signals.post_save.connect(
+            handlers.add_group_to_rancher_scope,
+            sender=models.KeycloakGroup,
+            dispatch_uid="waldur_rancher.add_group_to_rancher_scope",
+        )
+
+        signals.post_delete.connect(
+            handlers.remove_group_from_rancher_scope,
+            sender=models.KeycloakGroup,
+            dispatch_uid="waldur_rancher.remove_group_from_rancher_scope",
         )
 
         for klass in (models.Project, models.Cluster, structure_models.ServiceSettings):

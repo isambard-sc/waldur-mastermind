@@ -7,6 +7,7 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.reverse import reverse
 
 from waldur_core.core import serializers as core_serializers
@@ -21,6 +22,11 @@ from waldur_mastermind.marketplace.serializers import (
     BasePublicPlanSerializer,
     OfferingComponentSerializer,
     OfferingOptionsField,
+)
+from waldur_mastermind.proposal.enums import (
+    CallStates,
+    ProposalStates,
+    RequestedOfferingStates,
 )
 
 from . import models
@@ -185,6 +191,7 @@ class ProposalReviewSerializer(
     reviewer_uuid = serializers.UUIDField(read_only=True, source="reviewer.uuid")
 
     proposal_name = serializers.ReadOnlyField(source="proposal.name")
+    proposal_uuid = serializers.UUIDField(read_only=True, source="proposal.uuid")
 
     class Meta:
         model = models.Review
@@ -192,6 +199,8 @@ class ProposalReviewSerializer(
             "url",
             "uuid",
             "proposal",
+            "proposal_name",
+            "proposal_uuid",
             "reviewer",
             "reviewer_full_name",
             "reviewer_uuid",
@@ -200,7 +209,6 @@ class ProposalReviewSerializer(
             "summary_score",
             "summary_public_comment",
             "summary_private_comment",
-            "proposal_name",
             "round_uuid",
             "round_name",
             "round_cutoff_time",
@@ -255,7 +263,7 @@ class ProposalReviewSerializer(
             review: models.Review = self.instance
 
         try:
-            request = self.context["view"].request
+            request = self.context["request"]
             user = request.user
         except (KeyError, AttributeError):
             return fields
@@ -329,10 +337,11 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
 
 class CallDocumentSerializer(serializers.ModelSerializer):
     file_name = serializers.CharField(source="file.name", read_only=True)
+    file_size = serializers.IntegerField(source="file.size", read_only=True)
 
     class Meta:
         model = models.CallDocument
-        fields = ["uuid", "file", "file_name", "description", "created"]
+        fields = ["uuid", "file", "file_name", "file_size", "description", "created"]
 
 
 class PublicCallSerializer(
@@ -400,7 +409,7 @@ class PublicCallSerializer(
     @extend_schema_field(NestedRequestedOfferingSerializer(many=True))
     def get_offerings(self, obj):
         queryset = obj.requestedoffering_set.filter(
-            state=models.RequestedOffering.States.ACCEPTED
+            state=RequestedOfferingStates.ACCEPTED
         )
         serializer = NestedRequestedOfferingSerializer(
             queryset,
@@ -535,7 +544,7 @@ class RequestedResourceSerializer(
                 {"requested_offering_uuid": _("Requested offering has not been found.")}
             )
 
-        if requested_offering.state != models.RequestedOffering.States.ACCEPTED:
+        if requested_offering.state != RequestedOfferingStates.ACCEPTED:
             raise serializers.ValidationError(
                 _("Offering has not been confirmed by service provider.")
             )
@@ -550,7 +559,7 @@ class RequestedResourceSerializer(
         return attributes
 
     def validate_proposal(self, proposal):
-        if proposal.state != models.Proposal.States.DRAFT:
+        if proposal.state != ProposalStates.DRAFT:
             raise serializers.ValidationError(
                 _("Only proposals with a draft status are available for editing.")
             )
@@ -675,7 +684,16 @@ class ProtectedCallSerializer(PublicCallSerializer):
         return default_project_role
 
     def create(self, validated_data):
-        validated_data["created_by"] = self.context["request"].user
+        request = self.context["request"]
+        customer = validated_data.get("manager", None).customer
+        if not permissions_utils.has_permission(
+            request,
+            permissions_enums.PermissionEnum.CREATE_CALL,
+            customer,
+        ):
+            raise PermissionDenied()
+
+        validated_data["created_by"] = request.user
         return super().create(validated_data)
 
 
@@ -731,10 +749,11 @@ class ProtectedRoundSerializer(
 
 class ProposalDocumentationSerializer(serializers.ModelSerializer):
     file_name = serializers.CharField(source="file.name", read_only=True)
+    file_size = serializers.IntegerField(source="file.size", read_only=True)
 
     class Meta:
         model = models.ProposalDocumentation
-        fields = ["file", "file_name", "created"]
+        fields = ["file", "file_name", "file_size", "created"]
 
 
 class ProposalUpdateProjectDetailsSerializer(serializers.ModelSerializer):
@@ -768,6 +787,7 @@ class ProposalSerializer(
     )
     created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
     created_by_uuid = serializers.UUIDField(source="created_by.uuid", read_only=True)
+    project_name = serializers.ReadOnlyField(source="project.name")
 
     class Meta:
         model = models.Proposal
@@ -776,6 +796,7 @@ class ProposalSerializer(
             "url",
             "name",
             "description",
+            "project_name",
             "project_summary",
             "project_is_confidential",
             "project_has_civilian_purpose",
@@ -824,7 +845,7 @@ class ProposalSerializer(
         except models.Round.DoesNotExist:
             raise serializers.ValidationError({"round_uuid": _("Round not found.")})
 
-        if call_round.call.state != models.Call.States.ACTIVE:
+        if call_round.call.state != CallStates.ACTIVE:
             raise serializers.ValidationError(_("Call is not active."))
 
         if call_round.status not in (

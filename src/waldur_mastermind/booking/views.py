@@ -10,6 +10,7 @@ from rest_framework.response import Response
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.serializers import EmptySerializer
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.utils import permission_factory
@@ -20,6 +21,7 @@ from waldur_mastermind.marketplace.callbacks import (
     resource_creation_canceled,
     resource_creation_succeeded,
 )
+from waldur_mastermind.marketplace.enums import ResourceStates
 
 from . import PLUGIN_NAME, executors, filters, permissions, serializers
 
@@ -39,7 +41,7 @@ class ResourceViewSet(core_views.ReadOnlyActionsViewSet):
 
     @action(detail=True, methods=["post"])
     def reject(self, request, uuid=None):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
 
         with transaction.atomic():
             order = resource_creation_canceled(resource, validate=True)
@@ -48,7 +50,7 @@ class ResourceViewSet(core_views.ReadOnlyActionsViewSet):
 
     @action(detail=True, methods=["post"])
     def accept(self, request, uuid=None):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
 
         with transaction.atomic():
             order = resource_creation_succeeded(resource, validate=True)
@@ -56,7 +58,7 @@ class ResourceViewSet(core_views.ReadOnlyActionsViewSet):
         return Response({"order_uuid": order.uuid.hex}, status=status.HTTP_200_OK)
 
     reject_validators = accept_validators = [
-        core_validators.StateValidator(models.Resource.States.CREATING)
+        core_validators.StateValidator(ResourceStates.CREATING)
     ]
 
     accept_permissions = [
@@ -81,7 +83,7 @@ class OfferingViewSet(core_views.ReadOnlyActionsViewSet):
     @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def google_calendar_sync(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         self._get_or_create_google_calendar(offering)
         transaction.on_commit(
             lambda: executors.GoogleCalendarSyncExecutor.execute(
@@ -93,7 +95,7 @@ class OfferingViewSet(core_views.ReadOnlyActionsViewSet):
     @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def share_google_calendar(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         self._get_or_create_google_calendar(offering)
         transaction.on_commit(
             lambda: executors.GoogleCalendarShareExecutor.execute(
@@ -105,7 +107,7 @@ class OfferingViewSet(core_views.ReadOnlyActionsViewSet):
     @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def unshare_google_calendar(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         self._get_or_create_google_calendar(offering)
         transaction.on_commit(
             lambda: executors.GoogleCalendarUnShareExecutor.execute(
@@ -131,8 +133,8 @@ class OfferingViewSet(core_views.ReadOnlyActionsViewSet):
             )
 
             if google_calendar.state not in (
-                google_models.GoogleCalendar.States.OK,
-                google_models.GoogleCalendar.States.ERRED,
+                CoreStates.OK,
+                CoreStates.ERRED,
             ):
                 raise ValidationError(_("The calendar cannot be updated."))
         except google_models.GoogleCalendar.DoesNotExist:

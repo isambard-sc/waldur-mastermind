@@ -3,6 +3,7 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework import decorators, response, status, viewsets
 
 from waldur_core.core import validators as core_validators
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.serializers import EmptySerializer
 from waldur_core.structure import views as structure_views
 
@@ -57,42 +58,42 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
 
     @decorators.action(detail=True, methods=["post"])
     def start(self, request, uuid=None):
-        virtual_machine = self.get_object()
+        virtual_machine: models.VirtualMachine = self.get_object()
         executors.VirtualMachineStartExecutor().execute(virtual_machine)
         return response.Response(
             {"status": _("start was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     start_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("stopped"),
     ]
     start_serializer_class = EmptySerializer
 
     @decorators.action(detail=True, methods=["post"])
     def stop(self, request, uuid=None):
-        virtual_machine = self.get_object()
+        virtual_machine: models.VirtualMachine = self.get_object()
         executors.VirtualMachineStopExecutor().execute(virtual_machine)
         return response.Response(
             {"status": _("stop was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     stop_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("running"),
     ]
     stop_serializer_class = EmptySerializer
 
     @decorators.action(detail=True, methods=["post"])
     def restart(self, request, uuid=None):
-        virtual_machine = self.get_object()
+        virtual_machine: models.VirtualMachine = self.get_object()
         executors.VirtualMachineRestartExecutor().execute(virtual_machine)
         return response.Response(
             {"status": _("restart was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
     restart_validators = [
-        core_validators.StateValidator(models.VirtualMachine.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("running"),
     ]
     restart_serializer_class = EmptySerializer
@@ -121,9 +122,7 @@ class SQLServerViewSet(structure_views.ResourceViewSet):
         }
         return response.Response(payload, status=status.HTTP_202_ACCEPTED)
 
-    create_database_validators = [
-        core_validators.StateValidator(models.SQLServer.States.OK)
-    ]
+    create_database_validators = [core_validators.StateValidator(CoreStates.OK)]
     create_database_serializer_class = serializers.AzureSqlDatabaseCreateSerializer
 
 

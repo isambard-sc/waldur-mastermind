@@ -12,6 +12,7 @@ from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
 
 from waldur_core.core import models as core_models
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.validators import validate_name, validate_template_syntax
 from waldur_core.media import models as media_models
 from waldur_core.structure import models as structure_models
@@ -36,6 +37,9 @@ class Issue(
     TimeStampedModel,
     core_models.StateMixin,
 ):
+    comments: models.Manager["Comment"]
+    attachments: models.Manager["Attachment"]
+
     class Meta:
         ordering = ["-created"]
         unique_together = ("backend_name", "backend_id")
@@ -61,7 +65,7 @@ class Issue(
     resolution = models.CharField(max_length=255, blank=True)
     priority = models.CharField(max_length=255, blank=True)
 
-    caller = models.ForeignKey(
+    caller = models.ForeignKey[core_models.User](
         settings.AUTH_USER_MODEL,
         related_name="created_issues",
         blank=True,
@@ -69,7 +73,7 @@ class Issue(
         help_text=_("Waldur user who has reported the issue."),
         on_delete=models.SET_NULL,
     )
-    reporter = models.ForeignKey(
+    reporter = models.ForeignKey["SupportUser"](
         "SupportUser",
         related_name="reported_issues",
         blank=True,
@@ -79,7 +83,7 @@ class Issue(
         ),
         on_delete=models.PROTECT,
     )
-    assignee = models.ForeignKey(
+    assignee = models.ForeignKey["SupportUser"](
         "SupportUser",
         related_name="issues",
         blank=True,
@@ -112,7 +116,7 @@ class Issue(
 
     first_response_sla = models.DateTimeField(blank=True, null=True)
     resolution_date = models.DateTimeField(blank=True, null=True)
-    template = models.ForeignKey(
+    template = models.ForeignKey["Template"](
         "Template",
         related_name="issues",
         blank=True,
@@ -180,14 +184,14 @@ class Issue(
         self.status = (
             IssueStatus.objects.filter(type=IssueStatus.Types.RESOLVED).first().name
         )
-        self.state = Issue.States.OK
+        self.state = CoreStates.OK
         self.save()
 
     def set_canceled(self):
         self.status = (
             IssueStatus.objects.filter(type=IssueStatus.Types.CANCELED).first().name
         )
-        self.state = Issue.States.OK
+        self.state = CoreStates.OK
         self.save()
 
     def __str__(self):
@@ -220,11 +224,16 @@ class SupportUser(
     core_models.NameMixin,
     models.Model,
 ):
+    reported_issues: models.Manager["Issue"]
+    issues: models.Manager["Issue"]
+    comments: models.Manager["Comment"]
+    attachments: models.Manager["Attachment"]
+
     class Meta:
         ordering = ["name"]
         unique_together = ("backend_name", "backend_id", "user")
 
-    user = models.ForeignKey(
+    user = models.ForeignKey[core_models.User](
         on_delete=models.CASCADE,
         to=settings.AUTH_USER_MODEL,
         related_name="+",
@@ -382,6 +391,9 @@ class Attachment(
 
 
 class Template(core_models.UuidMixin, core_models.NameMixin, TimeStampedModel):
+    issues: models.Manager["Issue"]
+    attachments: models.Manager["TemplateAttachment"]
+
     class IssueTypes:
         INFORMATIONAL = "INFORMATIONAL"
         SERVICE_REQUEST = "SERVICE_REQUEST"

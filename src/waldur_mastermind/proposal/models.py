@@ -36,7 +36,9 @@ class CallDocument(
     core_models.UuidMixin,
     core_models.DescribableMixin,
 ):
-    call = models.ForeignKey("Call", on_delete=models.CASCADE)
+    call_documents: models.Manager["Call"]
+
+    call = models.ForeignKey["Call"]("Call", on_delete=models.CASCADE)
     file = models.FileField(
         upload_to="call_documents",
         blank=True,
@@ -46,6 +48,7 @@ class CallDocument(
 
 
 class CallManagingOrganisation(
+    PermissionMixin,
     core_models.UuidMixin,
     core_models.DescribableMixin,
     waldur_core.media.mixins.ImageModelMixin,
@@ -246,7 +249,7 @@ class ProposalDocumentation(
     TimeStampedModel,
     core_models.UuidMixin,
 ):
-    proposal = models.ForeignKey("Proposal", on_delete=models.CASCADE)
+    proposal = models.ForeignKey["Proposal"]("Proposal", on_delete=models.CASCADE)
     file = models.FileField(
         upload_to="proposal_project_supporting_documentation",
         blank=True,
@@ -397,7 +400,7 @@ class Review(
     comment_resource_requests = models.CharField(max_length=255, null=True, blank=True)
     comment_team = models.CharField(max_length=255, null=True, blank=True)
 
-    reviewer = models.ForeignKey(
+    reviewer = models.ForeignKey[core_models.User](
         to=settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+"
     )
 

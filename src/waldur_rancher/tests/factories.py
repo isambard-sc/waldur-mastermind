@@ -1,6 +1,7 @@
 import factory
 from django.urls import reverse
 
+from waldur_core.core.tests.types import BaseMetaFactory
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_rancher import enums, models
 
@@ -11,7 +12,9 @@ class RancherServiceSettingsFactory(structure_factories.ServiceSettingsFactory):
     customer = factory.SubFactory(structure_factories.CustomerFactory)
 
 
-class ClusterFactory(factory.django.DjangoModelFactory):
+class ClusterFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Cluster]
+):
     class Meta:
         model = models.Cluster
 
@@ -20,6 +23,7 @@ class ClusterFactory(factory.django.DjangoModelFactory):
     settings = factory.SubFactory(RancherServiceSettingsFactory)
     service_settings = factory.SubFactory(RancherServiceSettingsFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
+    vm_project = factory.SubFactory(structure_factories.ProjectFactory)
 
     @classmethod
     def get_url(cls, cluster=None, action=None):
@@ -35,7 +39,9 @@ class ClusterFactory(factory.django.DjangoModelFactory):
         return url if action is None else url + action + "/"
 
 
-class NodeFactory(factory.django.DjangoModelFactory):
+class NodeFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Node]
+):
     class Meta:
         model = models.Node
 
@@ -56,7 +62,21 @@ class NodeFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("rancher-node-list")
 
 
-class RancherUserFactory(factory.django.DjangoModelFactory):
+class RoleTemplateFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.RoleTemplate]
+):
+    class Meta:
+        model = models.RoleTemplate
+
+    scope_type = enums.RoleScopeType.CLUSTER
+    settings = factory.SubFactory(RancherServiceSettingsFactory)
+    name = factory.Sequence(lambda n: f"test-role-template-{n}")
+    display_name = factory.Sequence(lambda n: f"test-role-template-display-{n}")
+
+
+class RancherUserFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.RancherUser]
+):
     class Meta:
         model = models.RancherUser
 
@@ -78,17 +98,22 @@ class RancherUserFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("rancher-user-list")
 
 
-class RancherUserClusterLinkFactory(factory.django.DjangoModelFactory):
+class RancherUserClusterLinkFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.RancherUserClusterLink],
+):
     class Meta:
         model = models.RancherUserClusterLink
 
     user = factory.SubFactory(RancherUserFactory)
     cluster = factory.SubFactory(ClusterFactory)
-    role = models.ClusterRole.CLUSTER_OWNER
+    role = factory.SubFactory(RoleTemplateFactory)
     backend_id = factory.Sequence(lambda n: "rancher-user-cluster-link-%s" % n)
 
 
-class CatalogFactory(factory.django.DjangoModelFactory):
+class CatalogFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Catalog]
+):
     class Meta:
         model = models.Catalog
 
@@ -108,7 +133,9 @@ class CatalogFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("rancher-catalog-list")
 
 
-class TemplateFactory(factory.django.DjangoModelFactory):
+class TemplateFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Template]
+):
     class Meta:
         model = models.Template
 
@@ -129,7 +156,9 @@ class TemplateFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("rancher-template-list")
 
 
-class ProjectFactory(factory.django.DjangoModelFactory):
+class ProjectFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Project]
+):
     class Meta:
         model = models.Project
 
@@ -149,7 +178,9 @@ class ProjectFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("rancher-project-list")
 
 
-class NamespaceFactory(factory.django.DjangoModelFactory):
+class NamespaceFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Namespace]
+):
     class Meta:
         model = models.Namespace
 
@@ -169,11 +200,43 @@ class NamespaceFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("rancher-namespace-list")
 
 
-class RancherUserProjectLinkFactory(factory.django.DjangoModelFactory):
+class RancherUserProjectLinkFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.RancherUserProjectLink],
+):
     class Meta:
         model = models.RancherUserProjectLink
 
     user = factory.SubFactory(RancherUserFactory)
     project = factory.SubFactory(ProjectFactory)
-    role = enums.ProjectRoleId.project_owner
+    role = factory.SubFactory(
+        RoleTemplateFactory,
+        defaults={
+            "scope_type": enums.RoleScopeType.PROJECT,
+            "name": "project-owner",
+            "display_name": "Project Owner",
+        },
+    )
     backend_id = factory.Sequence(lambda n: "rancher-user-project-link-%s" % n)
+
+
+class ClusterSecurityGroupFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.ClusterSecurityGroup],
+):
+    class Meta:
+        model = models.ClusterSecurityGroup
+
+    name = factory.Sequence(lambda n: "security_group%s" % n)
+    cluster = factory.SubFactory(ClusterFactory)
+
+    @classmethod
+    def get_url(cls, security_group=None):
+        if security_group is None:
+            security_group = ClusterSecurityGroupFactory()
+        return "http://testserver" + reverse(
+            "rancher-cluster-security-groups-detail",
+            kwargs={
+                "uuid": security_group.uuid.hex,
+            },
+        )

@@ -1,33 +1,40 @@
 import logging
+import textwrap
+from typing import cast
 
 import yaml
+from constance import config
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import transaction
-from django.utils.translation import gettext_lazy as _
+from django.utils.translation import gettext as _
 from rest_framework import serializers
 
-from waldur_core.core.models import User
-from waldur_core.permissions.enums import RoleEnum
-from waldur_core.permissions.fixtures import ProjectRole
+from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import CoreStates
+from waldur_core.core.models import SshPublicKey
 from waldur_core.quotas import exceptions as quotas_exceptions
-from waldur_core.structure.models import ServiceSettings
+from waldur_core.quotas.models import QuotaModelMixin
+from waldur_core.structure.models import Project, ServiceSettings
 from waldur_openstack import models as openstack_models
-from waldur_openstack.models import Flavor, Image, SecurityGroup, Tenant
+from waldur_openstack.models import Flavor, Image, SecurityGroup, SubNet, Tenant
 from waldur_openstack.utils import (
     is_flavor_valid_for_tenant,
     is_volume_type_valid_for_tenant,
 )
 from waldur_openstack.views import InstanceViewSet
-from waldur_rancher.backend import RancherBackend
+from waldur_rancher.enums import (
+    KeycloakUserGroupMembershipState,
+    NodeRoleType,
+    RoleScopeType,
+)
 
-from . import exceptions, models
+from . import models
 
 logger = logging.getLogger(__name__)
 
 
 def get_unique_node_name(
-    name, tenant: openstack_models.Tenant, rancher_settings, existing_names=None
+    name, tenant: openstack_models.Tenant, rancher_settings, role, existing_names=None
 ):
     existing_names = existing_names or []
     # This has a potential risk of race condition when requests to create nodes come exactly at the same time.
@@ -42,46 +49,52 @@ def get_unique_node_name(
     names = list(names_instances) + list(names_nodes) + existing_names
 
     i = 1
-    new_name = f"{name}-{i}"
+    new_name = f"{name}-{role}-{i}"
 
     while new_name in names:
         i += 1
-        new_name = f"{name}-{i}"
+        new_name = f"{name}-{role}-{i}"
 
     return new_name
 
 
 def expand_added_nodes(
-    cluster_name,
-    nodes,
-    project,
-    rancher_settings,
-    tenant,
-    ssh_public_key,
+    cluster_name: str,
+    nodes: list[dict],
+    project: Project,
+    rancher_settings: ServiceSettings,
+    tenant: Tenant | None,
+    ssh_public_key: SshPublicKey | None,
     security_groups=None,
 ):
-    valid_images = Image.objects.filter(tenants=tenant)
-    try:
-        base_image_name = rancher_settings.get_option("base_image_name")
-        image = valid_images.get(name=base_image_name)
-    except ObjectDoesNotExist:
-        raise serializers.ValidationError(_("No matching image found."))
-
-    if not security_groups:
-        try:
-            default_security_group = SecurityGroup.objects.get(
-                name="default", tenant=tenant
-            )
-            security_groups = [default_security_group]
-        except ObjectDoesNotExist:
-            raise serializers.ValidationError(_("Default security group is not found."))
-
     for node in nodes:
-        memory = node.pop("memory", None)
-        cpu = node.pop("cpu", None)
-        subnet = node.pop("subnet")
-        flavor = node.pop("flavor", None)
-        roles = node.pop("roles")
+        node_tenant = node.pop("tenant", None)
+        if not tenant:
+            tenant = node_tenant
+        if not tenant:
+            raise serializers.ValidationError(
+                "Tenant is not specified for both cluster and node."
+            )
+        valid_images = Image.objects.filter(tenants=tenant)
+        try:
+            base_image_name = rancher_settings.get_option("base_image_name")
+            image = valid_images.get(name=base_image_name)
+        except ObjectDoesNotExist:
+            raise serializers.ValidationError(_("No matching image found."))
+
+        if not security_groups:
+            try:
+                default_security_group = SecurityGroup.objects.get(
+                    name="default", tenant=tenant
+                )
+                security_groups = [default_security_group]
+            except ObjectDoesNotExist:
+                raise serializers.ValidationError(
+                    _("Default security group is not found.")
+                )
+        subnet = cast(SubNet, node.pop("subnet"))
+        flavor = cast(Flavor, node.pop("flavor"))
+        role = cast(NodeRoleType, node.pop("role"))
         system_volume_size = node.pop("system_volume_size", None)
         system_volume_type = node.pop("system_volume_type", None)
         data_volumes = node.pop("data_volumes", [])
@@ -93,7 +106,7 @@ def expand_added_nodes(
             )
 
         validate_data_volumes(data_volumes, tenant)
-        flavor = validate_flavor(flavor, roles, tenant, cpu, memory)
+        flavor = validate_flavor(flavor, role, tenant)
 
         node["initial_data"] = {
             "flavor": flavor.uuid.hex,
@@ -112,29 +125,31 @@ def expand_added_nodes(
                     "size": volume["size"],
                     "volume_type": volume.get("volume_type")
                     and volume.get("volume_type").uuid.hex,
+                    "mount_point": volume.get("mount_point"),
+                    "filesystem": volume.get("filesystem"),
                 }
                 for volume in data_volumes
             ],
         }
 
-        if "controlplane" in list(roles):
-            node["controlplane_role"] = True
-        if "etcd" in list(roles):
-            node["etcd_role"] = True
-        if "worker" in list(roles):
-            node["worker_role"] = True
-
         node["name"] = get_unique_node_name(
             cluster_name + "-rancher-node",
             tenant,
             rancher_settings,
+            role,
             existing_names=[n["name"] for n in nodes if n.get("name")],
         )
+
+        node["role"] = role
 
         if ssh_public_key:
             node["initial_data"]["ssh_public_key"] = ssh_public_key.uuid.hex
 
-    validate_quotas(nodes, tenant, project)
+    if tenant:
+        validate_quotas(nodes, tenant, project)
+    else:
+        for node in nodes:
+            validate_quotas(nodes, node["tenant"], project)
 
 
 def validate_data_volumes(data_volumes, tenant):
@@ -155,42 +170,20 @@ def validate_data_volumes(data_volumes, tenant):
         )
 
 
-def validate_flavor(flavor, roles, tenant: Tenant, cpu=None, memory=None):
-    if flavor:
-        if cpu or memory:
-            raise serializers.ValidationError(
-                _("Either flavor or cpu and memory should be specified.")
-            )
-    else:
-        if not cpu or not memory:
-            raise serializers.ValidationError(
-                _("Either flavor or cpu and memory should be specified.")
-            )
-
-    if not flavor:
-        flavor = (
-            Flavor.objects.filter(tenants=tenant, cores__gte=cpu, ram__gte=memory)
-            .order_by("cores", "ram")
-            .first()
-        )
-
-    if not flavor:
-        raise serializers.ValidationError(_("No matching flavor found."))
-
+def validate_flavor(
+    flavor: Flavor,
+    role: NodeRoleType,
+    tenant: Tenant,
+):
     if not is_flavor_valid_for_tenant(flavor, tenant):
         raise serializers.ValidationError(
             _("Flavor %s is not visible in tenant %s.") % (flavor.name, tenant)
         )
 
-    requirements = list(
-        filter(
-            lambda x: x[0] in list(roles),
-            settings.WALDUR_RANCHER["ROLE_REQUIREMENT"].items(),
-        )
-    )
+    requirements = settings.WALDUR_RANCHER["ROLE_REQUIREMENT"].get(role)
     if requirements:
-        cpu_requirements = max([t[1]["CPU"] for t in requirements])
-        ram_requirements = max([t[1]["RAM"] for t in requirements])
+        cpu_requirements = requirements["CPU"]
+        ram_requirements = requirements["RAM"]
         if flavor.cores < cpu_requirements:
             raise serializers.ValidationError(
                 _("Flavor %s does not meet requirements. CPU requirement is %s")
@@ -204,8 +197,8 @@ def validate_flavor(flavor, roles, tenant: Tenant, cpu=None, memory=None):
     return flavor
 
 
-def validate_quotas(nodes, tenant, project):
-    quota_sources = [
+def validate_quotas(nodes, tenant: Tenant, project: Project):
+    quota_sources: list[QuotaModelMixin] = [
         project,
         project.customer,
         tenant,
@@ -243,334 +236,84 @@ def get_node_quota(quota_name, node):
         return conf[quota_name]
 
 
-def format_disk_id(index):
-    return "/dev/vd" + (chr(ord("a") + index))
+def format_disk_id(disk_driver, index):
+    return f"/dev/{disk_driver}{(chr(ord('a') + index))}"
 
 
-def format_node_command(node):
-    roles_command = []
-
-    if node.controlplane_role:
-        roles_command.append("--controlplane")
-
-    if node.etcd_role:
-        roles_command.append("--etcd")
-
-    if node.worker_role:
-        roles_command.append("--worker")
-
-    return node.cluster.node_command + " " + " ".join(roles_command)
-
-
-def format_node_cloud_config(node: models.Node):
-    node_command = format_node_command(node)
-    config_template = node.cluster.service_settings.get_option("cloud_init_template")
-    user_data = config_template.format(command=node_command)
+def format_node_cloud_config(
+    node: models.Node,
+    cloud_init_extra_params: dict | None = None,
+):
+    cloud_init_extra_params = cloud_init_extra_params or {}
+    config_template = cast(
+        str | None, node.cluster.service_settings.get_option("cloud_init_template")
+    )
+    disk_driver = cast(
+        str | None, node.cluster.service_settings.get_option("node_disk_driver")
+    )
+    if not config_template:
+        return ""
+    user_data = config_template.format(
+        **cloud_init_extra_params,
+    )
     data_volumes = node.initial_data.get("data_volumes")
 
     if data_volumes:
-        data_volumes = sorted(data_volumes)
         conf = yaml.safe_load(user_data)
 
         # First volume is reserved for system volume, other volumes are data volumes
+        conf["bootcmd"] = [
+            textwrap.dedent(f"""\
+            filename_to_wait_for="{format_disk_id(disk_driver, index + 1)}"
+
+            # Timeout in seconds
+            timeout=600 # 10 minutes
+
+            # Check every `interval` seconds
+            interval=5
+
+            elapsed=0
+            while [ ! -e "$filename_to_wait_for" ]; do
+                sleep "$interval"
+                elapsed=$((elapsed + interval))
+
+                if [ "$elapsed" -ge "$timeout" ]; then
+                    echo "Timeout reached. File not found: $filename_to_wait_for"
+                    exit 1
+                fi
+            done
+
+            echo "File found: $filename_to_wait_for"
+            """)
+            for index, _ in enumerate(data_volumes)
+        ]
+
+        conf["disk_setup"] = {
+            format_disk_id(disk_driver, index + 1): {
+                "table_type": "gpt",
+                "layout": "true",
+                "overwrite": "false",
+            }
+            for index, _ in enumerate(data_volumes)
+        }
 
         conf["mounts"] = [
-            [format_disk_id(index + 1), volume["mount_point"]]
+            [format_disk_id(disk_driver, index + 1), volume["mount_point"]]
             for index, volume in enumerate(data_volumes)
             if volume.get("mount_point")
         ]
 
         conf["fs_setup"] = [
-            {"device": format_disk_id(index + 1), "filesystem": "ext4"}
+            {
+                "device": format_disk_id(disk_driver, index + 1),
+                "filesystem": volume.get("filesystem", "ext4"),
+            }
             for index, volume in enumerate(data_volumes)
         ]
-        user_data = yaml.dump(conf)
+        user_data_raw = yaml.dump(conf, default_style="|")
+        user_data = f"#cloud-config\n{user_data_raw}"
 
     return user_data
-
-
-class SyncUser:
-    @staticmethod
-    def get_users():
-        result = {}
-
-        def add_to_result():
-            if user not in result.keys():
-                result[user] = {}
-
-            if service_settings not in result[user].keys():
-                result[user][service_settings] = []
-
-            result[user][service_settings].append([cluster, role])
-
-        for cluster in models.Cluster.objects.filter(state=models.Cluster.States.OK):
-            service_settings = cluster.service_settings
-            project = cluster.project
-            users = project.get_users()
-            owners = project.customer.get_users(RoleEnum.CUSTOMER_OWNER)
-
-            for user in users:
-                role = (
-                    "manager"
-                    if project.has_user(user, ProjectRole.MANAGER)
-                    else "admin"
-                    if project.has_user(user, ProjectRole.ADMIN)
-                    else None
-                )
-                add_to_result()
-
-            for user in owners:
-                role = "owner"
-                add_to_result()
-
-        return result
-
-    @staticmethod
-    def create_users(add_users):
-        count_created = 0
-        count_activated = 0
-        for user in add_users:
-            for service_settings in add_users[user].keys():
-                try:
-                    with transaction.atomic():
-                        (
-                            rancher_user,
-                            created,
-                        ) = models.RancherUser.objects.get_or_create(
-                            settings=service_settings,
-                            user=user,
-                        )
-                        backend = RancherBackend(service_settings)
-
-                        if created:
-                            backend.create_user(rancher_user)
-                            count_created += 1
-                        else:
-                            backend.activate_user(rancher_user)
-                            count_activated += 1
-                except exceptions.RancherException as e:
-                    logger.error(f"Error creating or activating user {user}. {e}")
-
-        return count_created, count_activated
-
-    @staticmethod
-    def block_users(rancher_users):
-        count = 0
-
-        for user in rancher_users:
-            try:
-                with transaction.atomic():
-                    backend = RancherBackend(user.settings)
-                    backend.block_user(user)
-                    count += 1
-            except exceptions.RancherException as e:
-                logger.error(f"Error blocking user {user}. {e}")
-        return count
-
-    @staticmethod
-    def update_users_roles(users):
-        count = 0
-
-        for user in users:
-            for service_settings in users[user]:
-                has_change = False
-                rancher_user = models.RancherUser.objects.get(
-                    user=user, settings=service_settings
-                )
-                current_links = models.RancherUserClusterLink.objects.filter(
-                    user=rancher_user
-                )
-                actual_links = users[user][service_settings]
-                current_links_set = {
-                    (link.cluster.id, link.role) for link in current_links
-                }
-
-                actual_links_set = set()
-
-                for link in actual_links:
-                    role = (
-                        models.ClusterRole.CLUSTER_OWNER
-                        if link[1] in ["owner", "manager"]
-                        else models.ClusterRole.CLUSTER_MEMBER
-                        if link[1] in ["admin"]
-                        else None
-                    )
-                    actual_links_set.add((link[0].id, role))
-
-                remove_links = current_links_set - actual_links_set
-                add_links = actual_links_set - current_links_set
-
-                backend = RancherBackend(service_settings)
-
-                for link in remove_links:
-                    cluster_id = link[0]
-                    role = link[1]
-                    rancher_user_cluster_link = (
-                        models.RancherUserClusterLink.objects.get(
-                            user=rancher_user, role=role, cluster_id=cluster_id
-                        )
-                    )
-
-                    try:
-                        with transaction.atomic():
-                            backend.delete_cluster_role(rancher_user_cluster_link)
-
-                        has_change = True
-                    except exceptions.RancherException as e:
-                        logger.error(
-                            f"Error deleting role {rancher_user_cluster_link.id}. {e}"
-                        )
-
-                for link in add_links:
-                    cluster_id = link[0]
-                    role = link[1]
-
-                    try:
-                        with transaction.atomic():
-                            rancher_user_cluster_link = (
-                                models.RancherUserClusterLink.objects.create(
-                                    user=rancher_user, role=role, cluster_id=cluster_id
-                                )
-                            )
-                            backend.create_cluster_user_role(rancher_user_cluster_link)
-
-                        has_change = True
-                    except exceptions.RancherException as e:
-                        logger.error(
-                            f"Error creating role. User ID: {rancher_user.id}, cluster ID: {cluster_id}, role: {role}. {e}"
-                        )
-
-                if has_change:
-                    count += 1
-
-        return count
-
-    @staticmethod
-    def update_users_project_roles(users):
-        count_deleted = 0
-        count_created = 0
-        roles_cache = {}
-
-        def get_roles(service_settings):
-            if service_settings not in roles_cache.keys():
-                backend = RancherBackend(service_settings)
-                roles_cache[service_settings] = backend.client.get_projects_roles()
-
-            return roles_cache[service_settings]
-
-        for user in users:
-            for service_settings in users[user]:
-                rancher_user = models.RancherUser.objects.get(
-                    user=user, settings=service_settings
-                )
-
-                if not rancher_user.backend_id:
-                    continue
-
-                roles = get_roles(service_settings)
-                roles_ids = [role["id"] for role in roles]
-                deleted, _ = (
-                    models.RancherUserProjectLink.objects.filter(user=rancher_user)
-                    .exclude(backend_id__in=roles_ids)
-                    .delete()
-                )
-                count_deleted += deleted
-                actual_roles = [
-                    {
-                        "project_id": role["projectId"],
-                        "id": role["id"],
-                        "role_template_id": role["roleTemplateId"],
-                    }
-                    for role in roles
-                    if role["userId"] == rancher_user.backend_id
-                ]
-
-                for role in actual_roles:
-                    try:
-                        project = models.Project.objects.get(
-                            backend_id=role["project_id"]
-                        )
-                        (
-                            _,
-                            created,
-                        ) = models.RancherUserProjectLink.objects.update_or_create(
-                            backend_id=role["id"],
-                            user=rancher_user,
-                            project=project,
-                            defaults={"role": role["role_template_id"]},
-                        )
-                        count_created += created
-                    except models.Project.DoesNotExist:
-                        logger.warning(
-                            "Project with backend ID %s is not found."
-                            % role["project_id"]
-                        )
-
-        return count_deleted, count_created
-
-    @classmethod
-    def run(cls):
-        if settings.WALDUR_RANCHER["DISABLE_AUTOMANAGEMENT_OF_USERS"]:
-            return {}
-        result = {}
-        actual_users = cls.get_users()
-        current_users = models.RancherUser.objects.filter(is_active=True)
-        current_users_set = {
-            (user.user.uuid.hex, user.settings.uuid.hex) for user in current_users
-        }
-        actual_users_set = set()
-
-        for user in actual_users:
-            for service_settings in actual_users[user]:
-                actual_users_set.add((user.uuid.hex, service_settings.uuid.hex))
-
-        # Delete users
-        remove_rancher_users_set = current_users_set - actual_users_set
-        remove_rancher_users = []
-
-        for user in remove_rancher_users_set:
-            user_uuid = user[0]
-            settings_uuid = user[1]
-            remove_rancher_users.append(
-                models.RancherUser.objects.get(
-                    user__uuid=user_uuid, settings__uuid=settings_uuid
-                )
-            )
-
-        result["blocked"] = cls.block_users(remove_rancher_users)
-
-        # Create users
-        add_users_set = actual_users_set - current_users_set
-        add_users = {}
-
-        for user in add_users_set:
-            user_uuid = user[0]
-            settings_uuid = user[1]
-            user = User.objects.get(uuid=user_uuid)
-            service_settings = ServiceSettings.objects.get(uuid=settings_uuid)
-
-            if user not in add_users.keys():
-                add_users[user] = {}
-
-            if service_settings not in add_users[user].keys():
-                add_users[user][service_settings] = []
-
-            add_users[user][service_settings].extend(
-                actual_users[user][service_settings]
-            )
-
-        result["created"], result["activated"] = cls.create_users(add_users)
-
-        # Update user's roles
-        result["updated"] = cls.update_users_roles(actual_users)
-
-        # Update user's project roles
-        (
-            result["project roles deleted"],
-            result["project roles created"],
-        ) = cls.update_users_project_roles(actual_users)
-
-        return result
 
 
 def update_cluster_nodes_states(cluster_id):
@@ -580,7 +323,7 @@ def update_cluster_nodes_states(cluster_id):
         old_state = node.state
 
         if node.runtime_state == models.Node.RuntimeStates.ACTIVE:
-            node.state = models.Node.States.OK
+            node.state = CoreStates.OK
         elif (
             node.runtime_state
             in [
@@ -589,9 +332,9 @@ def update_cluster_nodes_states(cluster_id):
             ]
             or not node.runtime_state
         ):
-            node.state = models.Node.States.CREATING
+            node.state = CoreStates.CREATING
         elif node.runtime_state:
-            node.state = models.Node.States.ERRED
+            node.state = CoreStates.ERRED
 
         if old_state != node.state:
             node.save(update_fields=["state"])
@@ -633,3 +376,32 @@ def get_management_tenant(cluster):
         pass
 
     return tenant
+
+
+def send_user_membership_notification_email(
+    user: models.KeycloakUserGroupMembership, scope, rancher_url, sync_frequency_minutes
+):
+    context = {
+        "rancher_url": rancher_url,
+        "support_email": config.SITE_EMAIL,
+        "scope_type": user.group.role.scope_type.capitalize(),  # 'cluster' or 'project'
+        "scope_name": scope.name,
+        "role": user.group.role,
+        "user_exists": user.state == KeycloakUserGroupMembershipState.ACTIVE,
+        "sync_frequency_minutes": sync_frequency_minutes,
+    }
+
+    core_utils.broadcast_mail(
+        "rancher", "rancher_keycloak_membership_notification", context, [user.email]
+    )
+
+
+def get_keycloak_group_scope_and_settings(group: models.KeycloakGroup):
+    scope_type = group.role.scope_type
+    scope_uuid = group.scope_uuid
+    if scope_type == RoleScopeType.CLUSTER:
+        scope = models.Cluster.objects.get(uuid=scope_uuid)
+        return scope, scope.settings
+    else:
+        scope = models.Project.objects.get(uuid=scope_uuid)
+        return scope, scope.cluster and scope.cluster.settings

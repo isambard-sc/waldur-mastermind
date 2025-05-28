@@ -1,12 +1,13 @@
-from typing import Literal
+from typing import cast
 
 from django.conf import settings
-from django.contrib.contenttypes.models import ContentType
 from django.core import validators as django_validators
 from django.core.exceptions import MultipleObjectsReturned
+from django.db import transaction
+from django.db.models import QuerySet
 from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import extend_schema_field
-from rest_framework import serializers
+from rest_framework import exceptions, serializers
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
@@ -14,11 +15,20 @@ from waldur_core.core.enums import CoreStateType
 from waldur_core.core.validators import BackendURLValidator
 from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure.managers import filter_queryset_for_user
-from waldur_core.structure.models import VirtualMachine
+from waldur_core.structure.models import Project, ServiceSettings, VirtualMachine
 from waldur_openstack import models as openstack_models
 from waldur_openstack import serializers as openstack_serializers
-from waldur_openstack.serializers import _validate_instance_security_groups
-from waldur_rancher.enums import RANCHER_TEMPLATE_QUESTION_TYPE
+from waldur_openstack.serializers import (
+    _validate_instance_security_groups,
+    validate_security_group_rule,
+)
+from waldur_rancher.enums import (
+    AGENT_ROLE,
+    RANCHER_TEMPLATE_QUESTION_TYPE,
+    ROLE_CHOICES,
+    SERVER_ROLE,
+    RoleScopeType,
+)
 
 from . import models, utils, validators
 
@@ -32,6 +42,18 @@ class RancherServiceSettingsSerializer(structure_serializers.ServiceOptionsSeria
             "private_registry_url",
             "private_registry_user",
             "private_registry_password",
+            "vault_host",
+            "vault_port",
+            "vault_token",
+            "vault_verify",
+            "keycloak_url",
+            "keycloak_realm",
+            "keycloak_user_realm",
+            "keycloak_username",
+            "keycloak_password",
+            "keycloak_sync_frequency",
+            "argocd_k8s_namespace",
+            "argocd_k8s_kubeconfig",
         )
 
     backend_url = serializers.CharField(
@@ -46,15 +68,15 @@ class RancherServiceSettingsSerializer(structure_serializers.ServiceOptionsSeria
         source="options.base_image_name", label=_("Base image name")
     )
 
-    cloud_init_template = serializers.CharField(
-        source="options.cloud_init_template",
-        label=_("Cloud init template"),
+    k8s_version = serializers.CharField(
+        source="options.k8s_version",
+        help_text=_("Kubernetes version"),
         required=False,
     )
 
-    default_mtu = serializers.IntegerField(
-        source="options.default_mtu",
-        label=_("Default MTU of a cluster"),
+    cloud_init_template = serializers.CharField(
+        source="options.cloud_init_template",
+        label=_("Cloud init template"),
         required=False,
     )
 
@@ -96,6 +118,91 @@ class RancherServiceSettingsSerializer(structure_serializers.ServiceOptionsSeria
         required=False,
     )
 
+    vault_host = serializers.CharField(
+        source="options.vault_host",
+        help_text=_("Host of the Vault server"),
+        required=False,
+    )
+
+    vault_port = serializers.IntegerField(
+        source="options.vault_port",
+        help_text=_("Port of the Vault server"),
+        required=False,
+    )
+    vault_token = serializers.CharField(
+        source="options.vault_token",
+        help_text=_("Token for the Vault server"),
+        required=False,
+    )
+    vault_tls_verify = serializers.BooleanField(
+        source="options.vault_tls_verify",
+        help_text=_("Whether to verify the Vault server certificate"),
+        required=False,
+        default=True,
+    )
+
+    keycloak_url = serializers.CharField(
+        source="options.keycloak_url",
+        help_text=_("URL of the Keycloak server"),
+        required=False,
+    )
+
+    keycloak_realm = serializers.CharField(
+        source="options.keycloak_realm",
+        help_text=_("Keycloak realm for Rancher"),
+        required=False,
+    )
+
+    keycloak_user_realm = serializers.CharField(
+        source="options.keycloak_user_realm",
+        help_text=_("Keycloak user realm for auth"),
+        default="master",
+        required=False,
+    )
+
+    keycloak_username = serializers.CharField(
+        source="options.keycloak_username",
+        help_text=_("Username of the Keycloak integration user"),
+        required=False,
+    )
+
+    keycloak_password = serializers.CharField(
+        source="options.keycloak_password",
+        help_text=_("Password of the Keycloak integration user"),
+        required=False,
+    )
+
+    keycloak_sync_frequency = serializers.IntegerField(
+        source="options.keycloak_sync_frequency",
+        help_text=_("Frequency in minutes for syncing Keycloak users"),
+        required=False,
+        default=15,
+    )
+
+    keycloak_ssl_verify = serializers.BooleanField(
+        source="options.keycloak_ssl_verify",
+        help_text=_("Indicates whether verify SSL certificates"),
+        required=False,
+        default=True,
+    )
+
+    argocd_k8s_namespace = serializers.CharField(
+        source="options.argocd_k8s_namespace",
+        help_text=_("Namespace where ArgoCD is deployed"),
+        required=False,
+    )
+    argocd_k8s_kubeconfig = serializers.CharField(
+        source="options.argocd_k8s_kubeconfig",
+        help_text=_("Kubeconfig with access to namespace where ArgoCD is deployed"),
+        required=False,
+    )
+
+    node_disk_driver = serializers.CharField(
+        source="options.node_disk_driver",
+        required=False,
+        help_text=_("OpenStack disk driver for Rancher nodes"),
+    )
+
     def validate_management_tenant_uuid(self, tenant_uuid):
         if not filter_queryset_for_user(
             openstack_models.Tenant.objects.filter(uuid=tenant_uuid),
@@ -118,32 +225,13 @@ class DataVolumeSerializer(
         allow_null=True,
         required=False,
     )
-
-    def get_fields(self):
-        fields = super().get_fields()
-        fields["mount_point"] = serializers.ChoiceField(
-            choices=settings.WALDUR_RANCHER["MOUNT_POINT_CHOICES"],
-            required=settings.WALDUR_RANCHER["MOUNT_POINT_CHOICE_IS_MANDATORY"],
-        )
-        return fields
+    filesystem = serializers.CharField(required=False)
+    mount_point = serializers.CharField(
+        required=True,
+    )
 
     def get_filtered_field_names(self):
         return ["volume_type"]
-
-    def validate(self, attrs):
-        size = attrs["size"]
-        mount_point = attrs.get("mount_point")
-
-        if mount_point:
-            min_size = settings.WALDUR_RANCHER["MOUNT_POINT_MIN_SIZE"][mount_point]
-            if size < min_size * 1024:
-                raise serializers.ValidationError(
-                    f"Volume {mount_point} capacity should be at least {min_size} GB"
-                )
-        return attrs
-
-
-ROLE_CHOICES = ("controlplane", "etcd", "worker")
 
 
 class RancherBaseNodeSerializer(
@@ -185,14 +273,19 @@ class RancherBaseNodeSerializer(
     data_volumes = DataVolumeSerializer(many=True, write_only=True, required=False)
     memory = serializers.IntegerField(write_only=True, required=False)
     cpu = serializers.IntegerField(write_only=True, required=False)
-    roles = serializers.MultipleChoiceField(choices=ROLE_CHOICES, write_only=True)
+    role = serializers.ChoiceField(choices=ROLE_CHOICES)
+    tenant = serializers.HyperlinkedRelatedField(
+        queryset=openstack_models.Tenant.objects.all(),
+        view_name="openstack-tenant-detail",
+        lookup_field="uuid",
+        required=False,
+        write_only=True,
+    )
 
     class Meta:
         model = models.Node
         read_only_fields = (
             "error_message",
-            "etcd_role",
-            "worker_role",
             "initial_data",
             "runtime_state",
             "k8s_version",
@@ -233,8 +326,6 @@ class RancherNestedNodeSerializer(RancherBaseNodeSerializer):
         }
         exclude = RancherBaseNodeSerializer.Meta.exclude + (
             "cluster",
-            "object_id",
-            "content_type",
             "name",
         )
 
@@ -250,6 +341,22 @@ class RancherNestedSecurityGroupSerializer(
         }
 
 
+class RancherNestedPublicIPSerializer(
+    core_serializers.HyperlinkedRelatedModelSerializer,
+):
+    ip_address = serializers.IPAddressField(
+        source="floating_ip.address", read_only=True
+    )
+
+    class Meta:
+        model = models.ClusterPublicIP
+        fields = (
+            "floating_ip",
+            "cluster",
+            "ip_address",
+        )
+
+
 class RancherClusterSerializer(
     structure_serializers.SshPublicKeySerializerMixin,
     structure_serializers.BaseResourceSerializer,
@@ -258,9 +365,18 @@ class RancherClusterSerializer(
         queryset=openstack_models.Tenant.objects.all(),
         view_name="openstack-tenant-detail",
         lookup_field="uuid",
+        required=False,
     )
 
     tenant_uuid = serializers.UUIDField(read_only=True, source="tenant.uuid")
+
+    vm_project = serializers.HyperlinkedRelatedField(
+        queryset=Project.objects.all(),
+        view_name="project-detail",
+        lookup_field="uuid",
+        required=False,
+        allow_null=True,
+    )
 
     name = serializers.CharField(
         max_length=150, validators=[validators.ClusterNameValidator]
@@ -285,22 +401,25 @@ class RancherClusterSerializer(
         read_only=True, view_name="openstack-sgp-detail", lookup_field="uuid"
     )
 
+    public_ips = RancherNestedPublicIPSerializer(many=True, read_only=True)
+
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.Cluster
         fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
-            "node_command",
             "nodes",
             "tenant",
             "tenant_uuid",
+            "vm_project",
             "runtime_state",
             "ssh_public_key",
             "install_longhorn",
             "security_groups",
             "management_security_group",
+            "public_ips",
         )
         read_only_fields = (
             structure_serializers.BaseResourceSerializer.Meta.read_only_fields
-            + ("node_command", "runtime_state")
+            + ("runtime_state",)
         )
         protected_fields = (
             structure_serializers.BaseResourceSerializer.Meta.protected_fields
@@ -316,11 +435,23 @@ class RancherClusterSerializer(
 
     def get_fields(self):
         fields = super().get_fields()
+
         if (
             settings.WALDUR_RANCHER["DISABLE_SSH_KEY_INJECTION"]
             and "ssh_public_key" in fields
         ):
             del fields["ssh_public_key"]
+        try:
+            request = self.context["view"].request
+            user = request.user
+        except (KeyError, AttributeError):
+            return fields
+        for field in ("vm_project", "tenant"):
+            if field in fields:
+                field = cast(serializers.RelatedField, fields[field])
+                field.queryset = filter_queryset_for_user(
+                    cast(QuerySet, field.queryset), user
+                )
         return fields
 
     def validate(self, attrs):
@@ -331,9 +462,10 @@ class RancherClusterSerializer(
         attrs = super().validate(attrs)
         nodes = attrs["node_set"]
         name = attrs["name"]
-        service_settings = attrs["service_settings"]
+        service_settings: ServiceSettings = attrs["service_settings"]
         attrs["settings"] = service_settings
-        project = attrs["project"]
+        attrs.setdefault("vm_project", attrs["project"])
+        vm_project: Project = attrs["vm_project"]
         ssh_public_key = attrs.pop("ssh_public_key", None)
 
         clusters = models.Cluster.objects.filter(settings=service_settings, name=name)
@@ -342,14 +474,26 @@ class RancherClusterSerializer(
         if clusters.exists():
             raise serializers.ValidationError(_("Name is not unique."))
 
-        tenant = attrs.get("tenant")
+        tenant: openstack_models.Tenant | None = attrs.get("tenant")
+        if not tenant:
+            for node in nodes:
+                if not node.get("tenant"):
+                    raise exceptions.ValidationError(
+                        "Either cluster or node tenant should be specified."
+                    )
+        else:
+            for node in nodes:
+                if node.get("tenant"):
+                    raise exceptions.ValidationError(
+                        "Either cluster or node tenant should be specified."
+                    )
         security_groups = attrs.pop("security_groups", [])
         if tenant and security_groups:
             _validate_instance_security_groups(security_groups, tenant)
         utils.expand_added_nodes(
             name,
             nodes,
-            project,
+            vm_project,
             service_settings,
             tenant,
             ssh_public_key,
@@ -358,21 +502,20 @@ class RancherClusterSerializer(
         return attrs
 
     def validate_nodes(self, nodes):
-        if len([node for node in nodes if "etcd" in node["roles"]]) not in [1, 3, 5]:
+        if len([node for node in nodes if node["role"] == SERVER_ROLE]) not in [
+            1,
+            3,
+            5,
+        ]:
             raise serializers.ValidationError(
-                _("Total count of etcd nodes must be 1, 3 or 5. You have got %s nodes.")
+                _(
+                    "Total count of server nodes must be 1, 3 or 5. You have got %s nodes."
+                )
                 % len(nodes)
             )
 
-        if not len([node for node in nodes if "worker" in node["roles"]]):
-            raise serializers.ValidationError(
-                _("Count of workers roles must be min 1.")
-            )
-
-        if not len([node for node in nodes if "controlplane" in node["roles"]]):
-            raise serializers.ValidationError(
-                _("Count of controlplane nodes must be min 1.")
-            )
+        if not len([node for node in nodes if node["role"] == AGENT_ROLE]):
+            raise serializers.ValidationError(_("Count of agent nodes must be min 1."))
 
         return nodes
 
@@ -420,10 +563,7 @@ class RancherNodeSerializer(serializers.HyperlinkedModelSerializer):
             "instance_name",
             "instance_uuid",
             "instance_marketplace_uuid",
-            "controlplane_role",
-            "etcd_role",
-            "worker_role",
-            "get_node_command",
+            "role",
             "k8s_version",
             "docker_version",
             "cpu_allocated",
@@ -459,11 +599,10 @@ class RancherNodeSerializer(serializers.HyperlinkedModelSerializer):
         return obj.get_state_display()
 
     def validate(self, attrs):
-        instance = attrs.get("instance")
+        instance = cast(openstack_models.Instance, attrs["instance"])
 
         if models.Node.objects.filter(
-            object_id=instance.id,
-            content_type=ContentType.objects.get_for_model(instance),
+            instance=instance,
         ).exists():
             raise serializers.ValidationError(
                 {"instance": "The selected instance is already in use."}
@@ -484,7 +623,7 @@ class RancherCreateNodeSerializer(
         model = models.Node
         fields = (
             "cluster",
-            "roles",
+            "role",
             "system_volume_size",
             "system_volume_type",
             "memory",
@@ -493,6 +632,8 @@ class RancherCreateNodeSerializer(
             "flavor",
             "data_volumes",
             "ssh_public_key",
+            "tenant",
+            "uuid",
         )
         extra_kwargs = {
             "cluster": {"lookup_field": "uuid", "view_name": "rancher-cluster-detail"}
@@ -503,10 +644,20 @@ class RancherCreateNodeSerializer(
         cluster: models.Cluster = attrs["cluster"]
         ssh_public_key = attrs.pop("ssh_public_key", None)
         node = attrs
+        node_tenant: openstack_models.Tenant | None = attrs.get("tenant")
+        if (not cluster.tenant and not node_tenant) or (node_tenant and cluster.tenant):
+            raise serializers.ValidationError(
+                _("Tenant should be specified either for node or cluster.")
+            )
+        if node_tenant:
+            if node_tenant.id not in cluster.linked_tenant_ids:
+                raise serializers.ValidationError(
+                    _("Tenant should be one of already connected ones.")
+                )
         utils.expand_added_nodes(
             cluster.name,
             [node],
-            cluster.project,
+            cluster.vm_project,
             cluster.service_settings,
             cluster.tenant,
             ssh_public_key,
@@ -856,6 +1007,10 @@ class RancherUserClusterLinkSerializer(serializers.HyperlinkedModelSerializer):
         fields = ("cluster", "role", "cluster_name", "cluster_uuid")
         extra_kwargs = {
             "cluster": {"lookup_field": "uuid", "view_name": "rancher-cluster-detail"},
+            "role": {
+                "lookup_field": "uuid",
+                "view_name": "rancher-role-template-detail",
+            },
         }
 
 
@@ -868,6 +1023,10 @@ class RancherUserProjectLinkSerializer(serializers.HyperlinkedModelSerializer):
         fields = ("project", "role", "project_name", "project_uuid")
         extra_kwargs = {
             "project": {"lookup_field": "uuid", "view_name": "rancher-project-detail"},
+            "role": {
+                "lookup_field": "uuid",
+                "view_name": "rancher-role-template-detail",
+            },
         }
 
 
@@ -930,20 +1089,8 @@ class RancherClusterTemplateNodeSerializer(serializers.HyperlinkedModelSerialize
             "min_ram",
             "system_volume_size",
             "preferred_volume_type",
-            "roles",
+            "role",
         )
-
-    roles = serializers.SerializerMethodField()
-
-    def get_roles(self, node) -> list[Literal["controlplane", "etcd", "worker"]]:
-        roles = []
-        if node.controlplane_role:
-            roles.append("controlplane")
-        if node.etcd_role:
-            roles.append("etcd")
-        if node.worker_role:
-            roles.append("worker")
-        return roles
 
 
 class RancherClusterTemplateSerializer(serializers.HyperlinkedModelSerializer):
@@ -1002,7 +1149,7 @@ class RancherIngressSerializer(structure_serializers.BaseResourceSerializer):
         return attrs
 
     def create(self, validated_data):
-        rancher_project = validated_data["rancher_project"]
+        rancher_project = cast(models.Project, validated_data["rancher_project"])
         validated_data["settings"] = rancher_project.settings
         validated_data["cluster"] = rancher_project.cluster
         return super().create(validated_data)
@@ -1114,14 +1261,13 @@ class RancherClusterReference(serializers.ModelSerializer):
 
 
 @extend_schema_field(RancherClusterReference(allow_null=True))
-def get_rancher_cluster_for_openstack_instance(serializer, scope):
+def get_rancher_cluster_for_openstack_instance(
+    serializer, scope: openstack_models.Instance
+):
     request = serializer.context["request"]
     queryset = filter_queryset_for_user(models.Cluster.objects.all(), request.user)
     try:
-        instance_type = ContentType.objects.get_for_model(scope)
-        if not models.Node.objects.filter(
-            content_type=instance_type, object_id=scope.id
-        ).exists():
+        if not models.Node.objects.filter(instance=scope).exists():
             return
 
         cluster = queryset.filter(tenant=scope.tenant).get()
@@ -1146,7 +1292,7 @@ class RancherFieldPropsSerializer(serializers.Serializer):
     description = serializers.CharField(required=False)
     variable = serializers.CharField()
     required = serializers.BooleanField(required=False)
-    validate = serializers.JSONField(required=False)
+    validate_ = serializers.JSONField(required=False)
 
 
 class RancherTemplateBaseQuestionSerializer(RancherFieldPropsSerializer):
@@ -1165,3 +1311,254 @@ class TemplateVersionSerializer(serializers.Serializer):
     readme = serializers.CharField(read_only=True)
     app_readme = serializers.CharField(read_only=True)
     questions = RancherTemplateQuestionSerializer(many=True, read_only=True)
+
+
+class RoleTemplateSerializer(serializers.HyperlinkedModelSerializer):
+    class Meta:
+        model = models.RoleTemplate
+        fields = (
+            "url",
+            "uuid",
+            "name",
+            "scope_type",
+            "display_name",
+            "settings",
+        )
+        read_only_fields = fields
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "rancher-role-template-detail",
+            },
+            "settings": {"lookup_field": "uuid"},
+        }
+
+
+class KeycloakGroupSerializer(serializers.HyperlinkedModelSerializer):
+    scope_name = serializers.SerializerMethodField()
+    scope_type = serializers.CharField(source="role.scope_type", read_only=True)
+
+    class Meta:
+        model = models.KeycloakGroup
+        fields = (
+            "uuid",
+            "url",
+            "name",
+            "backend_id",
+            "scope_type",
+            "scope_uuid",
+            "scope_name",
+            "role",
+            "created",
+            "modified",
+        )
+        read_only_fields = ("uuid", "url", "created", "modified", "backend_id", "name")
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "keycloak-group-detail",
+            },
+            "role": {
+                "lookup_field": "uuid",
+                "view_name": "rancher-role-template-detail",
+            },
+        }
+
+    def get_scope_name(self, obj: models.KeycloakGroup) -> str | None:
+        """Get the name of the cluster or project"""
+        scope_type = obj.role.scope_type
+        scope_uuid = obj.scope_uuid
+        if scope_type == RoleScopeType.CLUSTER:
+            try:
+                return models.Cluster.objects.get(uuid=scope_uuid).name
+            except models.Cluster.DoesNotExist:
+                return None
+        elif scope_type == RoleScopeType.PROJECT:
+            try:
+                return models.Project.objects.get(uuid=scope_uuid).name
+            except models.Project.DoesNotExist:
+                return None
+        return None
+
+
+class KeycloakUserGroupMembershipSerializer(serializers.HyperlinkedModelSerializer):
+    scope_uuid = serializers.UUIDField(
+        help_text=_("UUID of a cluster or a project in Rancher"),
+        write_only=True,
+    )
+    role = serializers.HyperlinkedRelatedField(
+        view_name="rancher-role-template-detail",
+        lookup_field="uuid",
+        queryset=models.RoleTemplate.objects.all(),
+        write_only=True,
+    )
+    group = serializers.HyperlinkedRelatedField(
+        view_name="keycloak-group-detail",
+        lookup_field="uuid",
+        read_only=True,
+    )
+    group_name = serializers.CharField(source="group.name", read_only=True)
+    group_role = serializers.CharField(source="group.role", read_only=True)
+    group_scope_type = serializers.CharField(
+        source="group.role.scope_type", read_only=True
+    )
+    group_scope_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.KeycloakUserGroupMembership
+        fields = (
+            "uuid",
+            "url",
+            "username",
+            "email",
+            "first_name",
+            "last_name",
+            "group",
+            "group_name",
+            "group_role",
+            "group_scope_type",
+            "group_scope_name",
+            "scope_uuid",
+            "role",
+            "state",
+            "created",
+            "modified",
+            "last_checked",
+            "error_message",
+            "error_traceback",
+        )
+        read_only_fields = (
+            "uuid",
+            "first_name",
+            "last_name",
+            "state",
+            "created",
+            "modified",
+            "last_checked",
+            "error_message",
+            "error_traceback",
+        )
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "keycloak-user-group-membership-detail",
+            },
+        }
+
+    def validate(self, attrs):
+        role = attrs.get("role")
+        scope_uuid = attrs.get("scope_uuid")
+
+        # Validate that the scope exists
+        try:
+            utils.get_keycloak_group_scope_and_settings(
+                models.KeycloakGroup(role=role, scope_uuid=scope_uuid)
+            )
+        except models.Cluster.DoesNotExist:
+            raise serializers.ValidationError(
+                _("Cluster with UUID %s does not exist.") % scope_uuid
+            )
+        except models.Project.DoesNotExist:
+            raise serializers.ValidationError(
+                _("Project with UUID %s does not exist.") % scope_uuid
+            )
+
+        # Check if membership already exists
+        if models.KeycloakUserGroupMembership.objects.filter(
+            username=attrs["username"],
+            group__role=role,
+        ).exists():
+            raise serializers.ValidationError(
+                _("This keycloak user group membership already exists.")
+            )
+
+        return attrs
+
+    def create(self, validated_data):
+        scope_uuid = validated_data.pop("scope_uuid")
+        role = validated_data.pop("role")
+        group = models.KeycloakGroup.objects.filter(
+            role=role, scope_uuid=scope_uuid
+        ).first()
+        validated_data["group"] = group
+        return super().create(validated_data)
+
+    def get_group_scope_name(
+        self, obj: models.KeycloakUserGroupMembership
+    ) -> str | None:
+        """Get the name of the cluster or project"""
+        try:
+            scope, _ = utils.get_keycloak_group_scope_and_settings(obj.group)
+            return scope.name
+        except (models.Cluster.DoesNotExist, models.Project.DoesNotExist):
+            return None
+
+
+class RancherClusterSecurityGroupRuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.ClusterSecurityGroupRule
+        fields = (
+            "uuid",
+            "ethertype",
+            "direction",
+            "protocol",
+            "from_port",
+            "to_port",
+            "cidr",
+            "description",
+        )
+
+    def validate(self, rule):
+        validate_security_group_rule(rule)
+        return rule
+
+    def to_internal_value(self, data):
+        """Create new rule if uuid is not specified, update exist rule uuid is specified"""
+        group: models.ClusterSecurityGroup = self.context["view"].get_object()
+        internal_data = super().to_internal_value(data)
+        if "uuid" not in data:
+            return models.ClusterSecurityGroupRule(group=group, **internal_data)
+        rule_uuid = data.pop("uuid")
+        try:
+            rule = models.ClusterSecurityGroupRule.objects.filter(group=group).get(
+                id=rule_uuid
+            )
+        except models.ClusterSecurityGroupRule.DoesNotExist:
+            raise serializers.ValidationError(
+                {"uuid": _("Security group does not have rule with id %s.") % rule_uuid}
+            )
+        for key, value in internal_data.items():
+            setattr(rule, key, value)
+        return rule
+
+
+class ClusterSecurityGroupSerializer(serializers.ModelSerializer):
+    rules = RancherClusterSecurityGroupRuleSerializer(many=True)
+
+    class Meta:
+        model = models.ClusterSecurityGroup
+        fields = (
+            "uuid",
+            "name",
+            "description",
+            "rules",
+        )
+        extra_kwargs = {
+            "name": {"read_only": True},
+            "description": {"read_only": True},
+        }
+
+    @transaction.atomic()
+    def save(self, **kwargs):
+        group: models.ClusterSecurityGroup = self.context["view"].get_object()
+        rules: list[models.ClusterSecurityGroupRule] = self.validated_data["rules"]
+
+        # Delete stale security group rules
+        models.ClusterSecurityGroupRule.objects.filter(group=group).exclude(
+            uuid__in=[rule.uuid for rule in rules if rule.uuid]
+        ).delete()
+
+        # Save new or updated security group rules
+        for rule in rules:
+            rule.save()
+        return group

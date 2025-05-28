@@ -9,6 +9,7 @@ from waldur_core.structure import models as structure_models
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.utils import move_project
 from waldur_mastermind.marketplace import models, tasks
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.tests import factories, fixtures
 
 
@@ -17,13 +18,13 @@ class RemovalOfExpiredProjectWithoutActiveResourcesTest(test.APITransactionTestC
         self.fixture = fixtures.MarketplaceFixture()
         self.project = self.fixture.project
         self.resource_1 = self.fixture.resource
-        self.resource_1.state = models.Resource.States.OK
+        self.resource_1.state = ResourceStates.OK
         self.resource_1.save()
         self.resource_2 = models.Resource.objects.create(
             project=self.project,
             offering=self.fixture.offering,
             plan=self.fixture.plan,
-            state=models.Resource.States.OK,
+            state=ResourceStates.OK,
         )
         self.project.end_date = datetime.datetime(year=2020, month=1, day=1).date()
         self.project.save()
@@ -31,14 +32,14 @@ class RemovalOfExpiredProjectWithoutActiveResourcesTest(test.APITransactionTestC
     def test_delete_expired_project_if_every_resource_has_been_terminated(self):
         with freeze_time("2020-01-01"):
             self.assertTrue(self.project.is_expired)
-            self.resource_1.state = models.Resource.States.TERMINATED
+            self.resource_1.state = ResourceStates.TERMINATED
             self.resource_1.save()
             self.assertTrue(
                 structure_models.Project.available_objects.filter(
                     id=self.project.id
                 ).exists()
             )
-            self.resource_2.state = models.Resource.States.TERMINATED
+            self.resource_2.state = ResourceStates.TERMINATED
             self.resource_2.save()
             self.assertFalse(
                 structure_models.Project.available_objects.filter(
@@ -52,7 +53,7 @@ class MarketplaceResourceCountTest(test.APITransactionTestCase):
         self.fixture = fixtures.MarketplaceFixture()
         self.project = self.fixture.project
         self.resource = self.fixture.resource
-        self.resource.state = models.Resource.States.OK
+        self.resource.state = ResourceStates.OK
         self.resource.save()
 
     def test_key_marketplace_resource_count_exists_in_project_response(self):
@@ -118,7 +119,7 @@ class ProjectStartDateTest(test.APITransactionTestCase):
         self.project.start_date = datetime.date.today()
         self.project.save()
         self.order = self.fixture.order
-        self.order.state = models.Order.States.PENDING_PROJECT
+        self.order.state = OrderStates.PENDING_PROJECT
         self.order.save()
 
     def test_order_process_when_project_start_date_unset(self):
@@ -126,7 +127,7 @@ class ProjectStartDateTest(test.APITransactionTestCase):
         self.project.save()
 
         self.order.refresh_from_db()
-        self.assertEqual(models.Order.States.PENDING_PROVIDER, self.order.state)
+        self.assertEqual(OrderStates.PENDING_PROVIDER, self.order.state)
 
     @override_settings(task_always_eager=True)
     def test_order_process_when_project_started(self):
@@ -138,5 +139,5 @@ class ProjectStartDateTest(test.APITransactionTestCase):
 
         self.order.refresh_from_db()
 
-        self.assertEqual(models.Order.States.DONE, self.order.state)
-        self.assertEqual(models.Resource.States.OK, self.order.resource.state)
+        self.assertEqual(OrderStates.DONE, self.order.state)
+        self.assertEqual(ResourceStates.OK, self.order.resource.state)

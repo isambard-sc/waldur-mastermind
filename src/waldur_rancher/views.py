@@ -9,13 +9,16 @@ from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
-from rest_framework import decorators, generics, response, status
+from rest_framework import decorators, generics, mixins, response, status, viewsets
 from rest_framework.exceptions import MethodNotAllowed, ValidationError
 from rest_framework.permissions import SAFE_METHODS
 
+from keycloak import exceptions as keycloak_exceptions
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure import exceptions as structure_exceptions
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import permissions as structure_permissions
@@ -27,7 +30,9 @@ from waldur_core.structure.serializers import ConsoleUrlSerializer
 from waldur_mastermind.common import utils as common_utils
 from waldur_openstack import models as openstack_models
 from waldur_openstack import views as openstack_views
+from waldur_openstack.executors import PushSecurityGroupRulesExecutor
 from waldur_rancher import (
+    backend,
     exceptions,
     executors,
     filters,
@@ -37,6 +42,7 @@ from waldur_rancher import (
     validators,
 )
 from waldur_rancher.apps import RancherConfig
+from waldur_rancher.enums import RoleScopeType
 from waldur_rancher.exceptions import RancherException
 
 logger = logging.getLogger(__name__)
@@ -60,7 +66,7 @@ class ClusterViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
     update_executor = executors.ClusterUpdateExecutor
 
     def perform_create(self, serializer):
-        cluster = serializer.save()
+        cluster: models.Cluster = serializer.save()
         user = self.request.user
         nodes = serializer.validated_data.get("node_set")
         install_longhorn = serializer.validated_data["install_longhorn"]
@@ -80,7 +86,7 @@ class ClusterViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
 
     def destroy(self, request, *args, **kwargs):
         user = self.request.user
-        instance = self.get_object()
+        instance: models.Cluster = self.get_object()
         executors.ClusterDeleteExecutor.execute(
             instance,
             user=user,
@@ -91,37 +97,16 @@ class ClusterViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
         )
 
     update_validators = partial_update_validators = [
-        core_validators.StateValidator(models.Cluster.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
     ]
     destroy_validators = structure_views.ResourceViewSet.destroy_validators + [
         validators.all_cluster_related_vms_can_be_deleted,
     ]
     pull_executor = executors.ClusterPullExecutor
 
-    @extend_schema(
-        request=None,
-        filters=False,
-        description="Returns kubeconfig file for the cluster.",
-    )
-    @decorators.action(detail=True, methods=["get"])
-    def kubeconfig_file(self, request, uuid=None):
-        cluster = self.get_object()
-        backend = cluster.get_backend()
-        try:
-            config = backend.get_kubeconfig_file(cluster)
-        except exceptions.RancherException:
-            raise ValidationError("Unable to get kubeconfig file.")
-
-        return response.Response({"config": config}, status=status.HTTP_200_OK)
-
-    kubeconfig_file_validators = [
-        core_validators.StateValidator(models.Cluster.States.OK)
-    ]
-    kubeconfig_file_permissions = [structure_permissions.is_staff]
-
     @decorators.action(detail=True, methods=["post"])
     def import_yaml(self, request, uuid=None):
-        cluster = self.get_object()
+        cluster: models.Cluster = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         yaml = serializer.validated_data["yaml"]
@@ -144,6 +129,7 @@ class ClusterViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
         return response.Response(status.HTTP_200_OK)
 
     import_yaml_serializer_class = serializers.RancherImportYamlSerializer
+    import_yaml_permissions = [structure_permissions.is_staff]
 
     @decorators.action(detail=True, methods=["post"])
     def create_management_security_group(self, request, uuid=None):
@@ -151,7 +137,7 @@ class ClusterViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
             data=request.data, many=True
         )
         serializer.is_valid(raise_exception=True)
-        cluster = self.get_object()
+        cluster: models.Cluster = self.get_object()
         user = request.user
         tenant = utils.get_management_tenant(cluster)
         port = cluster.settings.get_option("management_tenant_access_port")
@@ -197,7 +183,7 @@ class ClusterViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
 
     create_management_security_group_validators = (
         validators.creation_of_management_security_group_is_available,
-        core_validators.StateValidator(models.Cluster.States.OK),
+        core_validators.StateValidator(CoreStates.OK),
     )
 
 
@@ -216,7 +202,7 @@ class NodeViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
     pull_executor = executors.NodePullExecutor
 
     def perform_create(self, serializer):
-        node = serializer.save()
+        node: models.Node = serializer.save()
         user = self.request.user
         transaction.on_commit(
             lambda: executors.NodeCreateExecutor.execute(
@@ -227,7 +213,7 @@ class NodeViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
         )
 
     def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
+        instance: models.Node = self.get_object()
         user = self.request.user
         executors.NodeDeleteExecutor.execute(
             instance,
@@ -243,25 +229,20 @@ class NodeViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
     )
     @decorators.action(detail=True, methods=["post"])
     def link_openstack(self, request, uuid=None):
-        node = self.get_object()
+        node: models.Node = self.get_object()
 
-        if node.content_type and node.object_id:
+        if node.instance:
             raise ValidationError(_("Node is already linked to OpenStack instance."))
 
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         instance = serializer.validated_data["instance"]
-        instance_type = ContentType.objects.get_for_model(instance)
-
-        if models.Node.objects.filter(
-            content_type=instance_type, object_id=instance.id
-        ).exists():
+        if models.Node.objects.filter(instance=instance).exists():
             raise ValidationError(
                 _("OpenStack instance is already linked to another node.")
             )
 
-        node.content_type = instance_type
-        node.object_id = instance.id
+        node.instance = instance
         node.save()
         return response.Response(status=status.HTTP_200_OK)
 
@@ -275,13 +256,12 @@ class NodeViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
     )
     @decorators.action(detail=True, methods=["post"])
     def unlink_openstack(self, request, uuid=None):
-        node = self.get_object()
-        if not node.content_type or not node.object_id:
+        node: models.Node = self.get_object()
+        if not node.instance:
             raise ValidationError(
                 _("Node is not linked to any OpenStack instance yet.")
             )
-        node.content_type = None
-        node.object_id = None
+        node.instance = None
         node.save()
         return response.Response(status=status.HTTP_200_OK)
 
@@ -294,7 +274,7 @@ class NodeViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
     )
     @decorators.action(detail=True, methods=["get"])
     def console(self, request, uuid=None):
-        node = self.get_object()
+        node: models.Node = self.get_object()
 
         if not node.instance:
             return response.Response(status=status.HTTP_404_NOT_FOUND)
@@ -323,7 +303,7 @@ class NodeViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
     )
     @decorators.action(detail=True, methods=["get"])
     def console_log(self, request, uuid=None):
-        node = self.get_object()
+        node: models.Node = self.get_object()
 
         if not node.instance:
             return response.Response(status=status.HTTP_404_NOT_FOUND)
@@ -414,7 +394,7 @@ class CatalogViewSet(OptionalReadonlyViewset, core_views.ActionsViewSet):
 
     @decorators.action(detail=True, methods=["post"])
     def refresh(self, request, uuid=None):
-        catalog = self.get_object()
+        catalog: models.Catalog = self.get_object()
         backend = catalog.get_backend()
         backend.refresh_catalog(catalog)
         return response.Response(status=status.HTTP_200_OK)
@@ -434,7 +414,7 @@ class CatalogViewSet(OptionalReadonlyViewset, core_views.ActionsViewSet):
         else:
             raise ValidationError(_("Invalid scope provided."))
 
-        catalog = serializer.save(settings=service_settings)
+        catalog: models.Catalog = serializer.save(settings=service_settings)
         backend = catalog.get_backend()
         backend.create_catalog(catalog)
 
@@ -443,7 +423,7 @@ class CatalogViewSet(OptionalReadonlyViewset, core_views.ActionsViewSet):
     def perform_update(self, serializer):
         scope = serializer.instance.scope
         self.check_catalog_permissions(scope)
-        catalog = serializer.save()
+        catalog: models.Catalog = serializer.save()
         backend = catalog.get_backend()
         backend.update_catalog(catalog)
 
@@ -472,7 +452,7 @@ class ProjectViewSet(structure_views.BaseServicePropertyViewSet):
     @extend_schema(filters=False, description="Returns project's secrets.")
     @decorators.action(detail=True, methods=["get"])
     def secrets(self, request, uuid=None):
-        project = self.get_object()
+        project: models.Project = self.get_object()
         backend = project.get_backend()
         secrets = backend.list_project_secrets(project)
         data = [{"name": secret["name"], "id": secret["id"]} for secret in secrets]
@@ -480,7 +460,7 @@ class ProjectViewSet(structure_views.BaseServicePropertyViewSet):
 
 
 class NamespaceViewSet(structure_views.BaseServicePropertyViewSet):
-    queryset = models.Namespace.objects.all().order_by("name")
+    queryset = models.Namespace.objects.exclude(project__name="System").order_by("name")
     serializer_class = serializers.RancherNamespaceSerializer
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.NamespaceFilter
@@ -488,7 +468,7 @@ class NamespaceViewSet(structure_views.BaseServicePropertyViewSet):
 
 
 class TemplateViewSet(structure_views.BaseServicePropertyViewSet):
-    queryset = models.Template.objects.all()
+    queryset = models.Template.objects.exclude(project__name="System")
     serializer_class = serializers.RancherTemplateSerializer
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.TemplateFilter
@@ -519,7 +499,9 @@ class TemplateVersionView(generics.GenericAPIView):
 
 
 class ApplicationViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
-    queryset = models.Application.objects.all().order_by("name")
+    queryset = models.Application.objects.exclude(
+        rancher_project__name="System"
+    ).order_by("name")
     serializer_class = serializers.RancherApplicationSerializer
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.ApplicationFilter
@@ -575,7 +557,7 @@ class SyncDestroyMixin:
 class WorkloadViewSet(
     OptionalReadonlyViewset, YamlMixin, SyncDestroyMixin, core_views.ActionsViewSet
 ):
-    queryset = models.Workload.objects.all()
+    queryset = models.Workload.objects.exclude(project__name="System")
     serializer_class = serializers.RancherWorkloadSerializer
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.WorkloadFilter
@@ -587,14 +569,14 @@ class WorkloadViewSet(
     @extend_schema(request=None, responses=None)
     @decorators.action(detail=True, methods=["post"])
     def redeploy(self, request, *args, **kwargs):
-        workload = self.get_object()
+        workload: models.Workload = self.get_object()
         backend = workload.get_backend()
         backend.redeploy_workload(workload)
         return response.Response(status=status.HTTP_200_OK)
 
 
 class HPAViewSet(OptionalReadonlyViewset, YamlMixin, structure_views.ResourceViewSet):
-    queryset = models.HPA.objects.all()
+    queryset = models.HPA.objects.exclude(project__name="System")
     serializer_class = serializers.RancherHPASerializer
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.HPAFilter
@@ -618,7 +600,9 @@ class IngressViewSet(
     SyncDestroyMixin,
     structure_views.ResourceViewSet,
 ):
-    queryset = models.Ingress.objects.all().order_by("name")
+    queryset = models.Ingress.objects.exclude(rancher_project__name="System").order_by(
+        "name"
+    )
     serializer_class = serializers.RancherIngressSerializer
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.IngressFilter
@@ -642,3 +626,204 @@ class ServiceViewSet(
     get_yaml_method = "get_service_yaml"
     put_yaml_method = "put_service_yaml"
     delete_scope_method = "delete_service"
+
+
+class RoleTemplateViewSet(core_views.ReadOnlyActionsViewSet):
+    queryset = models.RoleTemplate.objects.all().order_by("name")
+    serializer_class = serializers.RoleTemplateSerializer
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.RoleTemplateFilter
+    lookup_field = "uuid"
+
+
+class KeycloakGroupViewSet(core_views.ReadOnlyActionsViewSet):
+    queryset = models.KeycloakGroup.objects.all().order_by("-created")
+    serializer_class = serializers.KeycloakGroupSerializer
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.KeycloakGroupFilter
+    lookup_field = "uuid"
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        # Filter by user permissions
+        user = self.request.user
+
+        if not user.is_staff:
+            # Get clusters and projects where user can manage users
+            cluster_uuids = filter_queryset_for_user(
+                models.Cluster.objects.all(), user
+            ).values_list("uuid", flat=True)
+
+            project_uuids = filter_queryset_for_user(
+                models.Project.objects.all(), user
+            ).values_list("uuid", flat=True)
+
+            # Filter assignments based on permissions
+            return queryset.filter(
+                Q(
+                    role__scope_type=RoleScopeType.CLUSTER,
+                    scope_uuid__in=cluster_uuids,
+                )
+                | Q(
+                    role__scope_type=RoleScopeType.PROJECT,
+                    scope_uuid__in=project_uuids,
+                )
+            )
+
+        return queryset
+
+
+class KeycloakUserGroupMembershipViewSet(core_views.ActionsViewSet):
+    queryset = models.KeycloakUserGroupMembership.objects.all().order_by("-created")
+    serializer_class = serializers.KeycloakUserGroupMembershipSerializer
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.KeycloakUserGroupMembershipFilter
+    lookup_field = "uuid"
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        # Filter by user permissions
+        user = self.request.user
+
+        if not user.is_staff:
+            # Get clusters and projects where user can manage users
+            cluster_uuids = filter_queryset_for_user(
+                models.Cluster.objects.all(), user
+            ).values_list("uuid", flat=True)
+
+            project_uuids = filter_queryset_for_user(
+                models.Project.objects.all(), user
+            ).values_list("uuid", flat=True)
+
+            # Filter assignments based on permissions
+            return queryset.filter(
+                Q(
+                    group__role__scope_type=RoleScopeType.CLUSTER,
+                    group__scope_uuid__in=cluster_uuids,
+                )
+                | Q(
+                    group__role__scope_type=RoleScopeType.PROJECT,
+                    group__scope_uuid__in=project_uuids,
+                )
+            )
+
+        return queryset
+
+    def perform_create(self, serializer):
+        def create_keycloak_group(
+            keycloak: backend.KeycloakBackend,
+            scope,
+            scope_type: str,
+            role: models.RoleTemplate,
+        ):
+            # Create the parent group for the cluster
+            if scope_type == RoleScopeType.CLUSTER:
+                parent_group_name = f"c_{scope.uuid.hex}"
+            else:
+                parent_group_name = f"c_{scope.cluster.uuid.hex}"
+            parent_group = keycloak.create_group(parent_group_name)
+            # Optionally create the child group
+            group = models.KeycloakGroup.objects.filter(
+                role=role,
+                scope_uuid=scope_uuid,
+            ).first()
+            if not group:
+                # Create group if does not exist
+                group_name_prefix = scope_type[0].lower()
+                group_name = f"{group_name_prefix}_{scope.uuid.hex}_{role.name}"
+                backend_group = keycloak.create_group(
+                    group_name, parent_id=parent_group["id"]
+                )
+                group = models.KeycloakGroup(
+                    name=group_name,
+                    role=role,
+                    scope_uuid=scope_uuid,
+                )
+                group.backend_id = backend_group["id"]
+                group.save()
+
+        scope_uuid = serializer.validated_data["scope_uuid"]
+        role = serializer.validated_data["role"]
+        scope_type = role.scope_type
+        scope, settings = utils.get_keycloak_group_scope_and_settings(
+            models.KeycloakGroup(
+                role=role,
+                scope_uuid=scope_uuid,
+            )
+        )
+
+        try:
+            keycloak = backend.KeycloakBackend(settings)
+            create_keycloak_group(keycloak, scope, scope_type, role)
+            # Create a user membership
+            user_membership = serializer.save()
+            backend_user = keycloak.find_user_by_username(user_membership.username)
+            if backend_user is None:
+                # The user might not exist in Keycloak yet
+                logger.info(
+                    "The user %s does not exist in Keycloak yet, skipping adding user to the group %s (%s)",
+                    user_membership.username,
+                    user_membership.group.name,
+                    user_membership.group.backend_id,
+                )
+            else:
+                keycloak.add_user_to_group(
+                    backend_user["id"], user_membership.group.backend_id
+                )
+                user_membership.first_name = backend_user.get("firstName", "")
+                user_membership.last_name = backend_user.get("lastName", "")
+                user_membership.activate()
+                user_membership.save()
+            sync_frequency = settings.get_option("keycloak_sync_frequency") or 15
+            rancher_url = settings.backend_url
+
+            # Send notification email
+            utils.send_user_membership_notification_email(
+                user_membership,
+                scope,
+                rancher_url,
+                sync_frequency,
+            )
+        except keycloak_exceptions.KeycloakError as e:
+            raise ValidationError(f"Unable to add a user to the Keycloak group: {e}")
+
+
+CLUSTER_UUID = OpenApiParameter(
+    name="cluster_uuid",
+    type=OpenApiTypes.UUID,
+    location=OpenApiParameter.PATH,
+)
+
+
+class RancherClusterSecurityGroupsViewSet(
+    OptionalReadonlyViewset,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    serializer_class = serializers.ClusterSecurityGroupSerializer
+    queryset = models.ClusterSecurityGroup.objects.all().order_by("name")
+    filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
+    filterset_class = filters.ClusterSecurityGroupFilter
+    lookup_field = "uuid"
+
+    def perform_update(self, serializer):
+        cluster_security_group: models.ClusterSecurityGroup = serializer.save()
+        tenant_ids = cluster_security_group.cluster.linked_tenant_ids
+        for tenant_id in tenant_ids:
+            # TODO: name of security group should be unique and immutable
+            try:
+                os_security_group = openstack_models.SecurityGroup.objects.get(
+                    name=cluster_security_group.name,
+                    tenant_id=tenant_id,
+                )
+            except openstack_models.SecurityGroup.DoesNotExist:
+                raise ValidationError(
+                    f"Security group {cluster_security_group.name} not found in tenant"
+                )
+            transaction.on_commit(
+                lambda: PushSecurityGroupRulesExecutor().execute(os_security_group)
+            )

@@ -22,7 +22,7 @@ from waldur_core.core import fields as core_fields
 from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core.clean_html import clean_html
-from waldur_core.core.enums import CoreStateType
+from waldur_core.core.enums import CoreStates, CoreStateType
 from waldur_core.core.fields import MappedChoiceField
 from waldur_core.permissions.enums import PermissionEnum, get_old_role_name
 from waldur_core.permissions.fixtures import CustomerRole
@@ -37,6 +37,7 @@ from waldur_core.structure.managers import (
 )
 from waldur_core.structure.models import CUSTOMER_DETAILS_FIELDS
 from waldur_core.structure.registry import get_resource_type, get_service_type
+from waldur_mastermind.marketplace.enums import ResourceStates
 
 User = auth.get_user_model()
 logger = logging.getLogger(__name__)
@@ -202,7 +203,7 @@ class PermissionProjectSerializer(BasicProjectSerializer):
             marketplace_models.Resource.objects.filter(
                 project=project,
             )
-            .exclude(state=marketplace_models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .count()
         )
 
@@ -351,10 +352,7 @@ class ProjectSerializer(
         from waldur_mastermind.marketplace import models as marketplace_models
 
         return marketplace_models.Resource.objects.filter(
-            state__in=(
-                marketplace_models.Resource.States.OK,
-                marketplace_models.Resource.States.UPDATING,
-            ),
+            state__in=(ResourceStates.OK, ResourceStates.UPDATING),
             project=project,
         ).count()
 
@@ -477,7 +475,7 @@ class CustomerSerializer(
         fields = super().get_fields()
 
         try:
-            request = self.context["view"].request
+            request = self.context["request"]
             user = request.user
         except (KeyError, AttributeError):
             return fields
@@ -918,7 +916,7 @@ class UserSerializer(
         fields = super().get_fields()
 
         try:
-            request = self.context["view"].request
+            request = self.context["request"]
             user = request.user
         except (KeyError, AttributeError):
             return fields
@@ -1082,6 +1080,7 @@ class MoveProjectSerializer(serializers.Serializer):
         view_name="customer-detail",
         lookup_field="uuid",
     )
+    preserve_permissions = serializers.BooleanField(required=True)
 
 
 class ServiceOptionsSerializer(serializers.Serializer):
@@ -1105,8 +1104,8 @@ class ServiceSettingsSerializer(
         read_only=True, source="customer.native_name"
     )
     state = MappedChoiceField(
-        choices=[(v, k) for k, v in core_models.StateMixin.States.CHOICES],
-        choice_mappings={v: k for k, v in core_models.StateMixin.States.CHOICES},
+        choices=[(v, k) for k, v in CoreStates.CHOICES],
+        choice_mappings={v: k for k, v in CoreStates.CHOICES},
         read_only=True,
     )
     scope = core_serializers.GenericRelatedField(

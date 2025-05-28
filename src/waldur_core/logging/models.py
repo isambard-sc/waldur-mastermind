@@ -56,7 +56,9 @@ class BaseHook(EventTypesMixin, UuidMixin, TimeStampedModel):
         abstract = True
         ordering = ["-created"]
 
-    user = models.ForeignKey(on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL)
+    user = models.ForeignKey[core_models.User](
+        on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL
+    )
     is_active = models.BooleanField(default=True)
 
     # This timestamp would be updated periodically when event is sent via this hook
