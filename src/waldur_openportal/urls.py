@@ -1,7 +1,7 @@
 from django.urls import re_path
 
 from . import views
-from .api import access_for_email, project_spend_info
+from .api import access_for_email, project_spend_info, customer_spend_info
 
 
 def register_in(router):
@@ -42,5 +42,10 @@ urlpatterns = [
         r"^api/openportal/project_spend_info/",
         project_spend_info,
         name="project-spend-info",
+    ),
+    re_path(
+        r"^api/openportal/customer_spend_info/",
+        customer_spend_info,
+        name="customer-spend-info",
     ),
 ]

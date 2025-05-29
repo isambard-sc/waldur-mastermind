@@ -1,4 +1,5 @@
 import logging
+import datetime
 
 from django.contrib import auth
 from django.utils.translation import gettext_lazy as _
@@ -319,6 +320,7 @@ def access_for_email(request):
     is_authorised = False
     projects = {}
     short_name_in_waldur = None
+    email_in_waldur = None
 
     # Waldur stores old accounts, so can only stop searching
     # when we find an active user - can't break early for an
@@ -514,5 +516,211 @@ def access_for_email(request):
 
     logger.info(f"access_for_email({email}, {user}) {response.content}")
 
+    response.status_code = status.OK
+    return response
+
+
+@api_view(["GET"])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def customer_spend_info(request):
+    user = request.user
+
+    if not (user.is_authenticated or user.is_active):
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    if not (user.is_staff or user.is_support):
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    customer = request.query_params.get("customer")
+
+    if not customer:
+        response = JsonResponse({"error": "A customer must be provided."})
+        response.status_code = status.BAD_REQUEST
+        return response
+
+    customer = str(customer).lstrip().rstrip()
+
+    if len(customer) == 0:
+        response = JsonResponse({"error": "A customer must be provided."})
+        response.status_code = status.BAD_REQUEST
+        return response
+
+    # get an optional "use_project_ids" query parameter
+    use_project_ids = request.query_params.get("use_project_ids", "false").lower()
+
+    if use_project_ids not in ["true", "false"]:
+        response = JsonResponse(
+            {"error": "The 'use_project_ids' parameter must be 'true' or 'false'."}
+        )
+        response.status_code = status.BAD_REQUEST
+        return response
+
+    use_project_ids = use_project_ids == "true"
+
+    # get an optional "start_date" query parameter which is the start month-year
+    start_date = request.query_params.get("start_date")
+
+    if start_date:
+        start_date = str(start_date).lstrip().rstrip()
+
+        if len(start_date) == 0:
+            start_date = None
+
+    if start_date is not None:
+        try:
+            parts = start_date.split("-")
+            start_date = datetime.date(year=int(parts[0]), month=int(parts[1]), day=1)
+
+        except Exception as e:
+            response = JsonResponse({"error": str(e)})
+            response.status_code = status.BAD_REQUEST
+            return response
+
+    # get an optional "end_date" query parameter which is the end month-year
+    end_date = request.query_params.get("end_date")
+
+    if end_date:
+        end_date = str(end_date).lstrip().rstrip()
+
+        if len(end_date) == 0:
+            end_date = None
+
+    if end_date is not None:
+        try:
+            parts = end_date.split("-")
+            end_date = datetime.date(year=int(parts[0]), month=int(parts[1]), day=1)
+            end_date = utils.get_last_day_of_month(end_date)
+
+            if start_date is not None and end_date < start_date:
+                response = JsonResponse({"error": "End date must be after start date."})
+                response.status_code = status.BAD_REQUEST
+                return response
+
+        except Exception as e:
+            response = JsonResponse({"error": str(e)})
+            response.status_code = status.BAD_REQUEST
+            return response
+
+    orgs = structure_models.Customer.objects.filter(name=customer)
+
+    if len(orgs) != 1:
+        response = JsonResponse({})
+        response.status_code = status.BAD_REQUEST
+        return response
+
+    org = orgs[0]
+
+    # get all of the projects in this organisation
+    projs = structure_models.Project.objects.filter(customer=org)
+
+    response = {}
+    response["customer"] = str(org.name)
+
+    if start_date is not None:
+        response["start_date"] = start_date.strftime("%Y-%m-%d")
+
+    if end_date is not None:
+        response["end_date"] = end_date.strftime("%Y-%m-%d")
+
+    response["use_project_ids"] = use_project_ids
+
+    projects = {}
+
+    for proj in projs:
+        try:
+            credit = invoice_models.ProjectCredit.objects.filter(project=proj)[0].value
+        except Exception:
+            credit = 0
+
+        project = {}
+        project["total_allocation"] = float(credit)
+        project["total_consumption"] = 0.0
+        project["resources"] = []
+
+        allocs = models.Allocation.objects.filter(project=proj)
+
+        project_start_date = proj.start_date
+        project_end_date = proj.end_date
+
+        if project_start_date is None:
+            project_start_date = proj.created.date()
+
+        project["start_date"] = project_start_date.strftime("%Y-%m-%d")
+
+        if project_end_date is not None:
+            project["end_date"] = project_end_date.strftime("%Y-%m-%d")
+
+        try:
+            project["num_members"] = len(proj.get_users())
+        except Exception:
+            project["num_members"] = 0
+
+        for alloc in allocs:
+            usages = models.HistoricalAllocation.objects.filter(allocation=alloc)
+
+            resources = {}
+            resources["name"] = str(alloc.name)
+
+            consumption = []
+
+            for usage in usages:
+                if usage.is_complete:
+                    project["total_allocation"] += float(usage.node_usage)
+
+                consumption_date = datetime.date(
+                    year=usage.year, month=usage.month, day=1
+                )
+
+                # change the day to the last of the month
+                consumption_date = utils.get_last_day_of_month(consumption_date)
+
+                if (
+                    project_start_date is not None
+                    and consumption_date < project_start_date
+                    and float(usage.node_usage) == 0.0
+                ):
+                    # skip this zero usage if it is before the project start date
+                    continue
+
+                if start_date is not None and consumption_date < start_date:
+                    continue
+
+                if end_date is not None and consumption_date > end_date:
+                    continue
+
+                consumption.append(
+                    {
+                        "year": usage.year,
+                        "month": usage.month,
+                        "value": float(usage.node_usage),
+                    }
+                )
+
+                project["total_consumption"] += float(usage.node_usage)
+
+            resources["consumption"] = consumption
+
+            project["resources"].append(resources)
+
+        project_short_name = str(utils.get_project_shortname(proj))
+
+        project["shortname"] = project_short_name
+
+        if use_project_ids:
+            # get the shortname for the project from OpenPortal
+            project_name = project_short_name
+        else:
+            project_name = str(proj.name).strip()
+
+        projects[project_name] = project
+
+    response["projects"] = projects
+
+    response = JsonResponse(response)
     response.status_code = status.OK
     return response
