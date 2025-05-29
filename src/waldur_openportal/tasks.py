@@ -11,6 +11,8 @@ from waldur_mastermind.invoices import models as invoice_models
 
 from . import backend, models, utils
 
+from . import op as openportal
+
 
 logger = logging.getLogger(__name__)
 
@@ -519,3 +521,68 @@ If you want to change the frequency of these updates, please ask the project PI 
 """
 
     return body
+
+
+@shared_task(name="waldur_openportal.run_job")
+def run_job(serialized_job):
+    """
+    This task is called to run a job that has been pulled from the
+    OpenPortal jobs board. It will deserialize the job and then
+    call the backend to run it.
+    """
+    logger.info(f"OpenPortal task.run_job: {serialized_job}")
+
+    if isinstance(serialized_job, models.Job):
+        job = serialized_job
+    else:
+        job = core_utils.deserialize_instance(serialized_job)
+
+    if not isinstance(job, models.Job):
+        logger.error(f"OpenPortal - {job} is not a Job instance - it is {type(job)}")
+        return
+
+    try:
+        job = job.get_job()
+    except Exception as e:
+        logger.error(f"OpenPortal - Failed to get job {job.id}: {e}")
+        return
+
+    if not job:
+        logger.error(f"OpenPortal - Job {job.id} not found")
+        return
+
+    logger.info(f"Running job {job} - status {job.status}")
+
+
+@shared_task(name="waldur_openportal.sync_board")
+def sync_board():
+    """
+    This task polls the OpenPortal jobs board to see if this portal
+    has received any jobs. If it has, then it pulls the job from the
+    board and then spawns a new task to process the job.
+    """
+    if not openportal.have_openportal():
+        return
+
+    jobs = openportal.fetch_jobs()
+
+    if len(jobs) == 0:
+        return
+
+    for job in jobs:
+        try:
+            if job.status != openportal.Status.PENDING:
+                logger.info(f"Job {job.id} is not pending - skipping")
+                continue
+
+            logger.info(f"Processing job {job} from OpenPortal board")
+            j = models.Job.objects.create(
+                id=str(job.id),
+                data=job.to_json(),
+            )
+
+            run_job.delay(core_utils.serialize_instance(j))
+
+        except Exception as e:
+            logger.error(f"Failed to process job {job.id}: {e}")
+            continue

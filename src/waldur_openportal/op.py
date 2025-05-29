@@ -1,17 +1,41 @@
-
-
 class OpenPortalError(Exception):
     pass
 
-try:
-    from openportal import Destination, Health, Job, PortalIdentifier, \
-        ProjectIdentifier, ProjectMapping, UserIdentifier, UserMapping, \
-        is_config_loaded, load_config, health, get, run, DateRange, \
-        UsageReport, Usage, ProjectUsageReport
 
-    have_openportal = True
+try:
+    from openportal import (
+        Destination,
+        Health,
+        Job,
+        PortalIdentifier,
+        ProjectIdentifier,
+        ProjectMapping,
+        UserIdentifier,
+        UserMapping,
+        is_config_loaded,
+        fetch_jobs,
+        load_config,
+        health,
+        get,
+        run,
+        send_result,
+        DateRange,
+        UsageReport,
+        Usage,
+        ProjectUsageReport,
+    )
+
+    _have_openportal = True
+
+    def have_openportal():
+        return _have_openportal
+
 except ImportError:
-    have_openportal = False
+    _have_openportal = False
+
+    def have_openportal():
+        return _have_openportal
+
     def _raise_no_openportal_error():
         raise OpenPortalError("OpenPortal is not installed.")
 

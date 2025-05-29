@@ -596,3 +596,55 @@ class ProjectNotification(models.Model):
 
     def __repr__(self) -> str:
         return self.__str__()
+
+
+class Job(models.Model):
+    """
+    This model is responsible for storing data about jobs that are
+    running in OpenPortal. This is used to track the progress of jobs
+    and to ensure that we don't run the same job multiple times.
+    """
+
+    id = models.CharField(
+        max_length=36, unique=True, verbose_name=_("ID"), db_index=True
+    )
+
+    job_data = models.TextField(
+        verbose_name=_("job data"),
+        help_text=_("JSON representation of the job"),
+        blank=True,
+        null=True,
+    )
+
+    class JobStatus(models.TextChoices):
+        PENDING = "pending", _("Pending")
+        RUNNING = "running", _("Running")
+        COMPLETED = "completed", _("Completed")
+        COMMUNICATED = "communicated", _("Communicated")
+        CANCELLED = "cancelled", _("Cancelled")
+
+    status = models.CharField(
+        max_length=20,
+        choices=JobStatus.choices,
+        default=JobStatus.PENDING,
+        verbose_name=_("status"),
+        help_text=_("The current status of the job."),
+    )
+
+    def get_job(self) -> openportal.Job:
+        """
+        Get the job object from the job data.
+        If the job data is not set, return None.
+        """
+        return openportal.Job.from_json(self.job_data)
+
+    def __str__(self) -> str:
+        try:
+            j = openportal.Job.from_json(self.job_data)
+            return str(j)
+        except Exception as e:
+            logger.error(f"Failed to parse job data for job {self.job_id}: {e}")
+            return f"Job {self.job_id}: Invalid data"
+
+    def __repr__(self) -> str:
+        return self.__str__()
