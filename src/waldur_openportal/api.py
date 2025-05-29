@@ -517,3 +517,85 @@ def access_for_email(request):
 
     response.status_code = status.OK
     return response
+
+
+@api_view(["GET"])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def customer_spend_info(request):
+    user = request.user
+
+    if not (user.is_authenticated or user.is_active):
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    if not (user.is_staff or user.is_support):
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    customer = request.query_params.get("customer")
+
+    if not customer:
+        response = JsonResponse({"error": "A customer must be provided."})
+        response.status_code = status.BAD_REQUEST
+        return response
+
+    customer = str(customer).lstrip().rstrip()
+
+    orgs = structure_models.Customer.objects.filter(name=customer)
+
+    if len(orgs) != 1:
+        response = JsonResponse({})
+        response.status_code = status.BAD_REQUEST
+        return response
+
+    org = orgs[0]
+
+    # get all of the projects in this organisation
+    projs = structure_models.Project.objects.filter(customer=org)
+
+    projects = {}
+    projects["customer"] = str(org.name)
+
+    for proj in projs:
+        try:
+            credit = invoice_models.ProjectCredit.objects.filter(project=proj)[0].value
+        except Exception:
+            credit = 0
+
+        project = {}
+        project["total_allocation"] = float(credit)
+        project["resources"] = []
+
+        allocs = models.Allocation.objects.filter(project=proj)
+
+        for alloc in allocs:
+            usages = models.HistoricalAllocation.objects.filter(allocation=alloc)
+
+            resources = {}
+            resources["name"] = str(alloc.name)
+
+            consumption = []
+
+            for usage in usages:
+                if usage.is_complete:
+                    project["total_allocation"] += float(usage.node_usage)
+                consumption.append(
+                    {
+                        "year": usage.year,
+                        "month": usage.month,
+                        "value": float(usage.node_usage),
+                    }
+                )
+
+            resources["consumption"] = consumption
+
+            project["resources"].append(resources)
+
+        projects[proj.name] = project
+
+    response = JsonResponse(projects)
+    response.status_code = status.OK
+    return response
