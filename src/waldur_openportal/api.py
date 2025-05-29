@@ -724,3 +724,20 @@ def customer_spend_info(request):
     response = JsonResponse(response)
     response.status_code = status.OK
     return response
+
+
+@api_view(["GET"])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def fetch_jobs(request):
+    """
+    End-point called by the OpenPortal bridge agent to signal to Waldur
+    that new jobs have arrived. This triggers the code that fetches
+    and spawns the processing of jobs in background celery tasks.
+
+    We use authentication just to make sure that this end-point can't
+    be abused to encourage Waldur to DOS OpenPortal with job fetch
+    requests. The agent is expected to use a valid Waldur API token
+    that has a role that allows it to access this end-point.
+    """
+    pass
