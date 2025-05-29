@@ -319,6 +319,7 @@ def access_for_email(request):
     is_authorised = False
     projects = {}
     short_name_in_waldur = None
+    email_in_waldur = None
 
     # Waldur stores old accounts, so can only stop searching
     # when we find an active user - can't break early for an
