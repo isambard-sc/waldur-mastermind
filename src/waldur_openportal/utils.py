@@ -1,4 +1,5 @@
 import re
+import logging
 
 from django.utils import timezone
 
@@ -9,6 +10,8 @@ from waldur_core.structure.managers import (
 )
 
 from . import models
+
+logger = logging.getLogger(__name__)
 
 MAPPING = {
     "node_usage": "op_node_usage",
@@ -62,3 +65,51 @@ def get_project_allocations(user):
 
     print(f"project_allocations for user {user}: {project_allocations}")
     return project_allocations
+
+
+def get_project_shortname(project):
+    """
+    Return the preferred shortname for the passed project.
+    """
+    # look up the short name from the models.ProjectInfo object
+    # associated with this project
+    project_info, created = models.ProjectInfo.objects.get_or_create(project=project)
+
+    project_info.sanitise()
+
+    if project_info.shortname is None:
+        logger.error(f"Empty shortname for project: {project}")
+
+    return project_info.shortname
+
+
+def get_user_shortname(user):
+    """
+    Return the preferred shortname for the passed user.
+    """
+    # look up the short name from the models.UserInfo object
+    # associated with this user
+    user_info, created = models.UserInfo.objects.get_or_create(user=user)
+
+    user = user_info.user
+
+    # if this is not set, then copy it in from the user.unix_username
+    # property (which may disappear in the future)
+    if user_info.shortname is None and hasattr(user, "unix_username"):
+        if user.unix_username is not None:
+            logger.debug(f"Copying shortname from the user's unix_username for {user}")
+            user_info.set_shortname(user.unix_username)
+            user_info.save()
+
+    if user_info.shortname is None:
+        logger.error(f"Empty shortname for user: {user}")
+
+    return user_info.shortname
+
+
+def get_last_day_of_month(date):
+    """
+    Return the last day of the month for the given date.
+    """
+    next_month = date.replace(day=28) + timezone.timedelta(days=4)
+    return next_month - timezone.timedelta(days=next_month.day)
