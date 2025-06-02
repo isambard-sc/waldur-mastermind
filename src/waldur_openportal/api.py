@@ -630,6 +630,8 @@ def customer_spend_info(request):
 
     projects = {}
 
+    current_year = datetime.date.today().year
+
     for proj in projs:
         try:
             credit = invoice_models.ProjectCredit.objects.filter(project=proj)[0].value
@@ -641,7 +643,13 @@ def customer_spend_info(request):
         project["total_consumption"] = 0.0
         project["resources"] = []
 
-        allocs = models.Allocation.objects.filter(project=proj)
+        # get all of the invoice items for this project - this contains
+        # all of the consumption details, and is not deleted when the
+        # project is deleted
+        try:
+            invoice_items = invoice_models.InvoiceItem.objects.filter(project=proj)
+        except Exception:
+            invoice_items = []
 
         project_start_date = proj.start_date
         project_end_date = proj.end_date
@@ -659,52 +667,109 @@ def customer_spend_info(request):
         except Exception:
             project["num_members"] = 0
 
-        for alloc in allocs:
-            usages = models.HistoricalAllocation.objects.filter(allocation=alloc)
+        resources = {}
 
-            resources = {}
-            resources["name"] = str(alloc.name)
+        for invoice_item in invoice_items:
+            usage = float(invoice_item.price)
 
-            consumption = []
+            if usage == 0:
+                continue
+            elif usage < 0:
+                # this is a credit, so add it to the total allocation
+                project["total_allocation"] += abs(usage)
+                continue
 
-            for usage in usages:
-                if usage.is_complete:
-                    project["total_allocation"] += float(usage.node_usage)
-
-                consumption_date = datetime.date(
-                    year=usage.year, month=usage.month, day=1
+            # get the name of the resource consumed
+            try:
+                resource = invoice_item.resource.offering.name.strip()
+            except Exception:
+                logger.warning(
+                    f"Invoice item {invoice_item} has no resource offering - skipping"
                 )
+                continue
 
-                # change the day to the last of the month
-                consumption_date = utils.get_last_day_of_month(consumption_date)
+            if resource is None or len(str(resource)) == 0:
+                logger.warning(
+                    f"Invoice item {invoice_item} has no resource name - skipping"
+                )
+                continue
 
-                if (
-                    project_start_date is not None
-                    and consumption_date < project_start_date
-                    and float(usage.node_usage) == 0.0
-                ):
-                    # skip this zero usage if it is before the project start date
-                    continue
+            if resource not in resources:
+                resources[resource] = {
+                    "name": resource,
+                    "consumption": [],
+                }
 
-                if start_date is not None and consumption_date < start_date:
-                    continue
+            # get the month and year of the usage
+            try:
+                month = invoice_item.invoice.month
+                year = invoice_item.invoice.year
+            except Exception:
+                logger.warning(
+                    f"Invoice item {invoice_item} has no invoice month/year - skipping"
+                )
+                continue
 
-                if end_date is not None and consumption_date > end_date:
-                    continue
+            if month is None or year is None:
+                logger.warning(
+                    f"Invoice item {invoice_item} has no invoice month/year - skipping"
+                )
+                continue
 
-                consumption.append(
+            if month < 1 or month > 12:
+                logger.warning(
+                    f"Invoice item {invoice_item} has invalid month {month} - skipping"
+                )
+                continue
+
+            if year < 2000 or year > current_year:
+                logger.warning(
+                    f"Invoice item {invoice_item} has invalid year {year} - skipping"
+                )
+                continue
+
+            consumption_date = datetime.date(year=year, month=month, day=1)
+
+            # change the day to the last of the month
+            consumption_date = utils.get_last_day_of_month(consumption_date)
+
+            if (
+                project_start_date is not None
+                and consumption_date < project_start_date
+                and usage == 0.0
+            ):
+                # skip this zero usage if it is before the project start date
+                continue
+
+            if start_date is not None and consumption_date < start_date:
+                continue
+
+            if end_date is not None and consumption_date > end_date:
+                continue
+
+            # have we seen this month/year for this resource? - if so,
+            # then we need to add the usage to the existing entry
+            found = False
+
+            for entry in resources[resource]["consumption"]:
+                if entry["year"] == year and entry["month"] == month:
+                    entry["value"] += usage
+                    found = True
+                    break
+
+            if not found:
+                resources[resource]["consumption"].append(
                     {
-                        "year": usage.year,
-                        "month": usage.month,
-                        "value": float(usage.node_usage),
+                        "year": year,
+                        "month": month,
+                        "value": usage,
                     }
                 )
 
-                project["total_consumption"] += float(usage.node_usage)
+            project["total_consumption"] += usage
 
-            resources["consumption"] = consumption
-
-            project["resources"].append(resources)
+        project["resources"] = list(resources.values())
+        project["balance"] = project["total_allocation"] - project["total_consumption"]
 
         project_short_name = str(utils.get_project_shortname(proj))
 
