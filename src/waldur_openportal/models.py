@@ -605,7 +605,7 @@ class Job(models.Model):
     and to ensure that we don't run the same job multiple times.
     """
 
-    id = models.CharField(
+    job_id = models.CharField(
         max_length=36, unique=True, verbose_name=_("ID"), db_index=True
     )
 
@@ -616,7 +616,7 @@ class Job(models.Model):
         null=True,
     )
 
-    class JobStatus(models.TextChoices):
+    class Status(models.TextChoices):
         PENDING = "pending", _("Pending")
         RUNNING = "running", _("Running")
         COMPLETED = "completed", _("Completed")
@@ -625,8 +625,8 @@ class Job(models.Model):
 
     status = models.CharField(
         max_length=20,
-        choices=JobStatus.choices,
-        default=JobStatus.PENDING,
+        choices=Status.choices,
+        default=Status.PENDING,
         verbose_name=_("status"),
         help_text=_("The current status of the job."),
     )

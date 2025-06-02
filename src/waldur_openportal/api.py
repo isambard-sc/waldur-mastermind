@@ -15,6 +15,7 @@ from rest_framework.permissions import IsAuthenticated
 
 from http import HTTPStatus as status
 
+from waldur_core.core import utils as core_utils
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import get_connected_projects
 
@@ -22,6 +23,8 @@ from waldur_mastermind.invoices import models as invoice_models
 
 from . import models
 from . import utils
+from . import op as openportal
+from . import tasks
 
 
 logger = logging.getLogger(__name__)
@@ -631,6 +634,8 @@ def customer_spend_info(request):
 
     projects = {}
 
+    current_year = datetime.date.today().year
+
     for proj in projs:
         try:
             credit = invoice_models.ProjectCredit.objects.filter(project=proj)[0].value
@@ -642,7 +647,13 @@ def customer_spend_info(request):
         project["total_consumption"] = 0.0
         project["resources"] = []
 
-        allocs = models.Allocation.objects.filter(project=proj)
+        # get all of the invoice items for this project - this contains
+        # all of the consumption details, and is not deleted when the
+        # project is deleted
+        try:
+            invoice_items = invoice_models.InvoiceItem.objects.filter(project=proj)
+        except Exception:
+            invoice_items = []
 
         project_start_date = proj.start_date
         project_end_date = proj.end_date
@@ -660,52 +671,109 @@ def customer_spend_info(request):
         except Exception:
             project["num_members"] = 0
 
-        for alloc in allocs:
-            usages = models.HistoricalAllocation.objects.filter(allocation=alloc)
+        resources = {}
 
-            resources = {}
-            resources["name"] = str(alloc.name)
+        for invoice_item in invoice_items:
+            usage = float(invoice_item.price)
 
-            consumption = []
+            if usage == 0:
+                continue
+            elif usage < 0:
+                # this is a credit, so add it to the total allocation
+                project["total_allocation"] += abs(usage)
+                continue
 
-            for usage in usages:
-                if usage.is_complete:
-                    project["total_allocation"] += float(usage.node_usage)
-
-                consumption_date = datetime.date(
-                    year=usage.year, month=usage.month, day=1
+            # get the name of the resource consumed
+            try:
+                resource = invoice_item.resource.offering.name.strip()
+            except Exception:
+                logger.warning(
+                    f"Invoice item {invoice_item} has no resource offering - skipping"
                 )
+                continue
 
-                # change the day to the last of the month
-                consumption_date = utils.get_last_day_of_month(consumption_date)
+            if resource is None or len(str(resource)) == 0:
+                logger.warning(
+                    f"Invoice item {invoice_item} has no resource name - skipping"
+                )
+                continue
 
-                if (
-                    project_start_date is not None
-                    and consumption_date < project_start_date
-                    and float(usage.node_usage) == 0.0
-                ):
-                    # skip this zero usage if it is before the project start date
-                    continue
+            if resource not in resources:
+                resources[resource] = {
+                    "name": resource,
+                    "consumption": [],
+                }
 
-                if start_date is not None and consumption_date < start_date:
-                    continue
+            # get the month and year of the usage
+            try:
+                month = invoice_item.invoice.month
+                year = invoice_item.invoice.year
+            except Exception:
+                logger.warning(
+                    f"Invoice item {invoice_item} has no invoice month/year - skipping"
+                )
+                continue
 
-                if end_date is not None and consumption_date > end_date:
-                    continue
+            if month is None or year is None:
+                logger.warning(
+                    f"Invoice item {invoice_item} has no invoice month/year - skipping"
+                )
+                continue
 
-                consumption.append(
+            if month < 1 or month > 12:
+                logger.warning(
+                    f"Invoice item {invoice_item} has invalid month {month} - skipping"
+                )
+                continue
+
+            if year < 2000 or year > current_year:
+                logger.warning(
+                    f"Invoice item {invoice_item} has invalid year {year} - skipping"
+                )
+                continue
+
+            consumption_date = datetime.date(year=year, month=month, day=1)
+
+            # change the day to the last of the month
+            consumption_date = utils.get_last_day_of_month(consumption_date)
+
+            if (
+                project_start_date is not None
+                and consumption_date < project_start_date
+                and usage == 0.0
+            ):
+                # skip this zero usage if it is before the project start date
+                continue
+
+            if start_date is not None and consumption_date < start_date:
+                continue
+
+            if end_date is not None and consumption_date > end_date:
+                continue
+
+            # have we seen this month/year for this resource? - if so,
+            # then we need to add the usage to the existing entry
+            found = False
+
+            for entry in resources[resource]["consumption"]:
+                if entry["year"] == year and entry["month"] == month:
+                    entry["value"] += usage
+                    found = True
+                    break
+
+            if not found:
+                resources[resource]["consumption"].append(
                     {
-                        "year": usage.year,
-                        "month": usage.month,
-                        "value": float(usage.node_usage),
+                        "year": year,
+                        "month": month,
+                        "value": usage,
                     }
                 )
 
-                project["total_consumption"] += float(usage.node_usage)
+            project["total_consumption"] += usage
 
-            resources["consumption"] = consumption
-
-            project["resources"].append(resources)
+        project["resources"] = list(resources.values())
+        project["balance"] = project["total_allocation"] - project["total_consumption"]
 
         project_short_name = str(utils.get_project_shortname(proj))
 
@@ -727,17 +795,102 @@ def customer_spend_info(request):
 
 
 @api_view(["GET"])
-@authentication_classes([TokenAuthentication])
-@permission_classes([IsAuthenticated])
-def fetch_jobs(request):
+def fetch_job(request):
     """
     End-point called by the OpenPortal bridge agent to signal to Waldur
-    that new jobs have arrived. This triggers the code that fetches
-    and spawns the processing of jobs in background celery tasks.
+    that new a job has arrived and it needs to be fetched.
 
-    We use authentication just to make sure that this end-point can't
-    be abused to encourage Waldur to DOS OpenPortal with job fetch
-    requests. The agent is expected to use a valid Waldur API token
-    that has a role that allows it to access this end-point.
+    This triggers the code to fetch the job and then submit it for
+    processing to one of the backend celery workers.
+
+    As argument, you need to pass in the `job_id` query parameter,
+    which must match one of the jobs in the OpenPortal bridge queue.
+
+    If a job is not found, it will return an authorisation error
+    (403 Forbidden), thereby preventing "unauthorised" access to
+    this end-point.
+
+    If the job is found, it will return a 200 OK response.
+
+    The use of the job-id acts as a bit of authorisation, as the
+    job-id is random, and is only known to the OpenPortal bridge agent.
+    It is a de-facto secret shared between the OpenPortal bridge agent
+    and Waldur, and is not known to any other user or system.
     """
-    pass
+
+    if not openportal.have_openportal():
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    job_id = request.query_params.get("job_id")
+
+    if not job_id:
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    job_id = str(job_id).lstrip().rstrip()
+
+    if len(job_id) == 0:
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    # fetch this job from the OpenPortal bridge queue
+    try:
+        job = openportal.fetch_job(job_id)
+        if job is None:
+            response = JsonResponse({})
+            response.status_code = status.UNAUTHORIZED
+            return response
+    except Exception as e:
+        logger.error(f"Error fetching job {job_id}: {e}")
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    if job.status != openportal.Job.Status.PENDING:
+        logger.error(f"Job {job_id} is not in PENDING state, but in {job.status}")
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    job_id = str(job.job_id).lstrip().rstrip()
+
+    if len(job_id) == 0:
+        logger.error(f"Job {job} has no job_id")
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    # create a Job model object for this job
+    try:
+        job_model = models.Job.objects.create(
+            job_id=job_id,
+            job_data=job.to_json(),
+            status=models.Job.Status.PENDING,
+        )
+    except Exception as e:
+        # try to get the existing job if it already exists
+        try:
+            job_model = models.Job.objects.get(job_id=job_id)
+        except models.Job.DoesNotExist:
+            logger.error(f"Error creating job model for {job_id}: {e}")
+            response = JsonResponse({})
+            response.status_code = status.UNAUTHORIZED
+            return response
+
+    if job_model.status != models.Job.Status.PENDING:
+        logger.error(f"Job {job_id} is not in PENDING state, but in {job_model.status}")
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    # submit the job for processing
+    logger.info(f"Submitting job {job_id} for processing")
+    tasks.run_job.delay(core_utils.serialize_instance(job_model))
+
+    response = JsonResponse({})
+    response.status_code = status.OK
+    return response
