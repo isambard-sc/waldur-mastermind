@@ -616,17 +616,17 @@ class Job(models.Model):
         null=True,
     )
 
-    class Status(models.TextChoices):
+    class State(models.TextChoices):
         PENDING = "pending", _("Pending")
         RUNNING = "running", _("Running")
         COMPLETED = "completed", _("Completed")
         COMMUNICATED = "communicated", _("Communicated")
         CANCELLED = "cancelled", _("Cancelled")
 
-    status = models.CharField(
+    state = models.CharField(
         max_length=20,
-        choices=Status.choices,
-        default=Status.PENDING,
+        choices=State.choices,
+        default=State.PENDING,
         verbose_name=_("status"),
         help_text=_("The current status of the job."),
     )

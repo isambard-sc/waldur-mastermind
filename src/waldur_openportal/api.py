@@ -21,11 +21,9 @@ from waldur_core.structure.managers import get_connected_projects
 
 from waldur_mastermind.invoices import models as invoice_models
 
-from . import models
-from . import utils
+from . import models, tasks, utils
+from .board import OpenPortalBoard
 from . import op as openportal
-from . import tasks
-
 
 logger = logging.getLogger(__name__)
 
@@ -795,6 +793,8 @@ def customer_spend_info(request):
 
 
 @api_view(["GET"])
+@authentication_classes([])
+@permission_classes([])
 def fetch_job(request):
     """
     End-point called by the OpenPortal bridge agent to signal to Waldur
@@ -818,10 +818,7 @@ def fetch_job(request):
     and Waldur, and is not known to any other user or system.
     """
 
-    if not openportal.have_openportal():
-        response = JsonResponse({})
-        response.status_code = status.UNAUTHORIZED
-        return response
+    board = OpenPortalBoard()
 
     job_id = request.query_params.get("job_id")
 
@@ -839,7 +836,7 @@ def fetch_job(request):
 
     # fetch this job from the OpenPortal bridge queue
     try:
-        job = openportal.fetch_job(job_id)
+        job = board.fetch_job(job_id)
         if job is None:
             response = JsonResponse({})
             response.status_code = status.UNAUTHORIZED
@@ -850,16 +847,16 @@ def fetch_job(request):
         response.status_code = status.UNAUTHORIZED
         return response
 
-    if job.status != openportal.Job.Status.PENDING:
-        logger.error(f"Job {job_id} is not in PENDING state, but in {job.status}")
+    job_id = str(job.id).lstrip().rstrip()
+
+    if len(job_id) == 0:
+        logger.error(f"Job {job} has no job_id")
         response = JsonResponse({})
         response.status_code = status.UNAUTHORIZED
         return response
 
-    job_id = str(job.job_id).lstrip().rstrip()
-
-    if len(job_id) == 0:
-        logger.error(f"Job {job} has no job_id")
+    if job.state != openportal.Status.pending():
+        logger.error(f"Job {job_id} is not in PENDING state, but in {job.state}")
         response = JsonResponse({})
         response.status_code = status.UNAUTHORIZED
         return response
@@ -869,7 +866,7 @@ def fetch_job(request):
         job_model = models.Job.objects.create(
             job_id=job_id,
             job_data=job.to_json(),
-            status=models.Job.Status.PENDING,
+            state=models.Job.State.PENDING,
         )
     except Exception as e:
         # try to get the existing job if it already exists
@@ -881,8 +878,8 @@ def fetch_job(request):
             response.status_code = status.UNAUTHORIZED
             return response
 
-    if job_model.status != models.Job.Status.PENDING:
-        logger.error(f"Job {job_id} is not in PENDING state, but in {job_model.status}")
+    if job_model.state != models.Job.State.PENDING:
+        logger.error(f"Job {job_id} is not in PENDING state, but in {job_model.state}")
         response = JsonResponse({})
         response.status_code = status.UNAUTHORIZED
         return response

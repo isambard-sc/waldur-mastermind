@@ -12,6 +12,7 @@ from waldur_mastermind.invoices import models as invoice_models
 from . import backend, models, utils
 
 from . import op as openportal
+from .board import OpenPortalBoard
 
 
 logger = logging.getLogger(__name__)
@@ -551,7 +552,59 @@ def run_job(serialized_job):
         logger.error(f"OpenPortal - Job {job.id} not found")
         return
 
-    logger.info(f"Running job {job} - status {job.status}")
+    if job.state != openportal.Status.pending():
+        logger.info(f"OpenPortal - Job {job.id} is not pending - skipping")
+        return
+
+    board = OpenPortalBoard()
+
+    logger.info(f"Running job {job} - status {job.state}")
+
+    command = job.instruction.command
+    args = job.instruction.arguments
+
+    try:
+        result = None
+
+        if command == "create_project":
+            project = openportal.ProjectIdentifier(args[0])
+            details = openportal.ProjectDetails(args[1])
+            result = board.create_project(project, details)
+        elif command == "update_project":
+            project = openportal.ProjectIdentifier(args[0])
+            details = openportal.ProjectDetails(args[1])
+            result = board.update_project(project, details)
+        elif command == "get_project":
+            project = openportal.ProjectIdentifier(args[0])
+            result = board.get_project(project)
+        elif command == "get_project_mapping":
+            project = openportal.ProjectIdentifier(args[0])
+            result = board.get_project_mapping(project)
+        elif command == "get_usage_report":
+            project = openportal.ProjectIdentifier(args[0])
+            # This is the code we want, but need to wait for next release
+            # dates = openportal.DateRange.parse(args[1])
+
+            dates = args[1].split(":")
+
+            if len(dates) != 2:
+                raise ValueError(f"Invalid date range format: {args[1]}")
+
+            start_date = datetime.datetime.strptime(dates[0], "%Y-%m-%d").date()
+            end_date = datetime.datetime.strptime(dates[1], "%Y-%m-%d").date()
+            dates = openportal.DateRange(start_date, end_date)
+
+            result = board.get_usage_report(project, dates)
+        else:
+            raise ValueError(f"Unknown command {command} for job {job.id}")
+
+        job = job.completed(result)
+        board.send_result(job)
+    except Exception as e:
+        logger.error(f"OpenPortal - Failed to run job {job.id}: {e}")
+        job = job.errored(str(e))
+        board.send_result(job)
+        return
 
 
 @shared_task(name="waldur_openportal.sync_board")
@@ -571,7 +624,7 @@ def sync_board():
 
     for job in jobs:
         try:
-            if job.status != openportal.Status.PENDING:
+            if job.state != openportal.Status.PENDING:
                 logger.info(f"Job {job.id} is not pending - skipping")
                 continue
 
