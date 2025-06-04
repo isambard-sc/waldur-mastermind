@@ -5,6 +5,7 @@ from . import op as openportal
 from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db.models import F
 from django.utils.translation import gettext_lazy as _
 from django.core import validators
 
@@ -21,6 +22,9 @@ MAX_PROJECT_SHORTNAME_LENGTH = 30
 MAX_GROUPNAME_LENGTH = 64
 MAX_USERNAME_LENGTH = 64
 MAX_USERIDENTIFIER_LENGTH = 128
+MAX_PROJECTIDENTIFIER_LENGTH = 64
+MAX_PORTALIDENTIFIER_LENGTH = 32
+MAX_PROJECTCLASS_LENGTH = 128
 MAX_ALLOWED_DESTINATIONS_LENGTH = 1024
 
 
@@ -421,6 +425,60 @@ class UserInfo(models.Model):
         super().save(*args, **kwargs)
 
 
+class ProjectShortNameGenerator(models.Model):
+    """
+    This model is responsible for generating unique shortnames for projects.
+    It keeps track of the last used shortname and increments it for the next
+    project.
+    """
+
+    shortname = models.CharField(
+        max_length=MAX_PROJECT_SHORTNAME_LENGTH,
+        verbose_name=_("shortname"),
+        unique=True,
+        help_text=_("The key / descriptor used to identify this generator."),
+    )
+
+    count = models.PositiveIntegerField(
+        default=0,
+        verbose_name=_("count"),
+        help_text=_("The number of projects created with this shortname."),
+    )
+
+    def __str__(self) -> str:
+        return f"{self.shortname}: Last shortname {self.last_shortname}"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    def increment_count(self):
+        """
+        Increment the count of projects created with this shortname.
+        """
+        self.count = F("count") + 1
+        self.save(update_fields=["count"])
+        self.refresh_from_db()
+
+    def get_shortname(self) -> str:
+        """
+        Get the shortname for the current value of count.
+        """
+
+        # turn the number into a letter, e.g. 0 -> a, 1 -> b, ..., 25 -> z,
+        # 26 -> aa, 27 -> ab, etc.
+        count = int(self.count)
+
+        if count < 0:
+            raise ValueError("Count cannot be negative.")
+
+        shortname = ""
+        while count >= 0:
+            shortname = chr((count % 26) + ord("a")) + shortname
+            count = count // 26 - 1
+
+        return self.shortname.replace("{count}", shortname)
+
+
 class ProjectInfo(models.Model):
     """
     This model is responsible for storing additional project information
@@ -486,45 +544,102 @@ class ProjectInfo(models.Model):
 
     def sanitise(self):
         """
-        Double check that our shortname matches the project short_name
-        if this field exists
+        Enforce that the shortname set here is copied back to the
+        project short_name field, if such a field exists
+        (it will be removed in the future)
         """
         if hasattr(self.project, "short_name"):
-            if (
-                self.shortname != self.project.short_name
-                and self.project.short_name is not None
-            ):
-                self.set_shortname(self.project.short_name)
+            if self.shortname is None and self.project.short_name is not None:
+                # copy if from the project (for legacy projects)
+                self.shortname = self.project.short_name
                 self.save()
+            elif self.shortname is not None:
+                # copy to the project so that it matches
+                if self.project.short_name is None:
+                    self.project.short_name = self.shortname
+                    self.project.save()
+                else:
+                    if self.shortname != self.project.short_name:
+                        logger.warning(
+                            f"Project {self.project} has a different short_name ({self.project.short_name}) than the one set in OpenPortal ({self.shortname})."
+                        )
+
+                    self.project.short_name = self.shortname
+                    self.project.save()
+
+        if self.shortname is None:
+            # Raise an error as we don't have a shortname set!
+            raise ValueError(
+                "Project shortname cannot be empty. Please set it in OpenPortal."
+            )
 
     def set_shortname(self, shortname: str):
         """
         Set the shortname, checking whether or not this has not already
-        been set, and making sure it lines up with the short_name if
-        that field is present in the project
+        been set - note that it cannot be changed after creation
+        as external systems may already depend on it.
         """
         if not shortname:
             raise ValueError("Shortname cannot be empty.")
 
-        if hasattr(self.project, "short_name"):
-            if (
-                shortname != self.project.short_name
-                and self.project.short_name is not None
-            ):
-                self.project.short_name = self.shortname
-                self.project.save()
+        shortname = shortname.strip()
 
-            self.shortname = self.project.short_name
-
-        if self.shortname and self.shortname != shortname:
-            logger.error(
-                f"Cannot change shortname of project {self.project} from {self.shortname} to {shortname}"
-            )
+        if len(shortname) == 0 or len(shortname) > MAX_PROJECT_SHORTNAME_LENGTH:
             raise ValueError(
-                f"Cannot change shortname of project {self.project} from {self.shortname} to {shortname}"
+                f"Shortname must be between 1 and {MAX_PROJECT_SHORTNAME_LENGTH} characters long."
             )
 
         self.shortname = shortname
+        self.save()
+        self.sanitise()
+
+    def generate_shortname(self, generator: ProjectShortNameGenerator) -> str:
+        """
+        Generate a shortname using the provided generator.
+        This will generate a unique shortname based on the
+        rules in the generator
+        """
+        if self.shortname is not None:
+            logger.warning(
+                f"Project {self.project} already has a shortname set ({self.shortname})."
+                " Not generating a new one."
+            )
+            return self.shortname
+
+        if not isinstance(generator, ProjectShortNameGenerator):
+            raise ValueError(
+                "Generator must be an instance of ProjectShortNameGenerator"
+            )
+
+        while True:
+            shortname = generator.get_shortname()
+
+            try:
+                self.set_shortname(shortname)
+                return shortname
+            except Exception:
+                pass
+
+            # If we fail, check that this was because the shortname
+            # was already taken, and if so, increment the generator
+            # and try again.
+            projects = ProjectInfo.objects.filter(
+                shortname=shortname,
+            )
+
+            if projects.exists():
+                logger.warning(
+                    f"Shortname {shortname} already exists. Incrementing generator."
+                )
+                generator.increment_count()
+            else:
+                logger.error(
+                    f"Failed to generate shortname {shortname} for project {self.project}. "
+                    "This should not happen, please check the generator."
+                )
+                raise ValueError(
+                    f"Failed to generate shortname {shortname} for project {self.project}."
+                )
 
     def set_allowed_destinations(self, destinations: str):
         """
@@ -631,6 +746,13 @@ class Job(models.Model):
         help_text=_("The current status of the job."),
     )
 
+    # record the date when this job was created
+    created = models.DateField(
+        auto_now_add=True,
+        verbose_name=_("created"),
+        help_text=_("The date when this job was created."),
+    )
+
     def get_job(self) -> openportal.Job:
         """
         Get the job object from the job data.
@@ -645,6 +767,155 @@ class Job(models.Model):
         except Exception as e:
             logger.error(f"Failed to parse job data for job {self.job_id}: {e}")
             return f"Job {self.job_id}: Invalid data"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class ProjectClass(models.Model):
+    """
+    This model is responsible for storing data about project classes.
+    A ProjectClass represents a category or type of project that can
+    be created via OpenPortal. It is up to Waldur to map the ProjectClass
+    combined with the calling portal to the Organisation that the project
+    should be created in. In addition, the ProjectClass controls
+    which portals can create which types of projects.
+    """
+
+    # The name of the project class, e.g. "isambard-ai"
+    name = models.CharField(
+        max_length=MAX_PROJECTCLASS_LENGTH, verbose_name=_("name"), db_index=True
+    )
+
+    # The name of the portal (PortalIdentifier) that is allowed to create
+    # this project class. The combination of name and portal must be unique.
+    portal = models.CharField(
+        max_length=MAX_PORTALIDENTIFIER_LENGTH, verbose_name=_("portal"), db_index=True
+    )
+
+    # The customer (organisation) in which to place projects which are created in
+    # this project class by the specified portal.
+    customer = models.ForeignKey(
+        to=structure_models.Customer,
+        on_delete=models.CASCADE,
+        related_name="op-projectclass-organisation+",
+        verbose_name=_("organisation"),
+        help_text=_("The organisation that this project class belongs to."),
+    )
+
+    # The shortname naming scheme for projects created in this class
+    # by the specified portal. This should have "{year}" which will replaced
+    # by the last digit of the current year, and "{count}", which will be
+    # replaced by a letter (a, b, c, ..., z, aa, ab, ..., az, ba, bb, ...),
+    # for example, "a{year}{count}" would become "a5a", "a5b", "a5c", etc.
+    shortname = models.CharField(
+        max_length=MAX_PROJECT_SHORTNAME_LENGTH,
+        verbose_name=_("shortname"),
+        null=True,
+        blank=True,
+    )
+
+    # The OpenPortal identifiers for all resources that should be
+    # created automatically for projects created in this class
+    # by the specified portal.
+    resources = models.TextField(
+        verbose_name=_("resources"),
+        help_text=_(
+            "A comma-separated list of OpenPortal resource identifiers that should be created automatically for projects created in this class by the specified portal."
+        ),
+        blank=True,
+        null=True,
+    )
+
+    # Combination of name and portal must be unique
+    class Meta:
+        unique_together = ("name", "portal")
+        verbose_name = _("Project Class")
+        verbose_name_plural = _("Project Classes")
+
+    def __str__(self) -> str:
+        return f"{self.portal} <=> {self.name}"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    def get_generator(self) -> ProjectShortNameGenerator:
+        """
+        Get the ProjectShortNameGenerator for this project class.
+        If it does not exist, create it.
+        """
+        if self.shortname is None:
+            raise ValueError(
+                "Project class shortname is not set. Please set it before generating a shortname."
+            )
+
+        shortname = self.shortname.strip()
+
+        if len(shortname) == 0:
+            raise ValueError("Project class shortname cannot be empty.")
+
+        # Now replace the {year} with the last digit of the current year,
+        # e.g. "myproject-{year}" becomes "myproject-5" for 2025.
+        if "{year}" in shortname:
+            from datetime import datetime
+
+            current_year = datetime.now().year
+            shortname = shortname.replace("{year}", str(current_year % 10))
+
+        generator, created = ProjectShortNameGenerator.objects.get_or_create(
+            shortname=self.shortname
+        )
+
+        if created:
+            logger.info(f"Created new ProjectShortNameGenerator: {generator}")
+
+        return generator
+
+
+class ManagedProject(models.Model):
+    """
+    This model is responsible for storing data about projects that are
+    managed by OpenPortal. This is used to track the progress of projects
+    and to ensure that we don't create the same project multiple times.
+    """
+
+    # This is the OpenPortal ProjectIdentifier from the portal that
+    # requested and manages this project
+    identifier = models.CharField(
+        max_length=MAX_PROJECTIDENTIFIER_LENGTH,
+        unique=True,
+        verbose_name=_("ID"),
+        db_index=True,
+    )
+
+    # This is the JSON representation of the OpenPortla ProjectDetails
+    # that is synced between this portal and the managing portal
+    details = models.TextField(
+        verbose_name=_("project data"),
+        help_text=_("JSON representation of the project"),
+        blank=True,
+        null=True,
+    )
+
+    # This is the actual project in this Waldur
+    project = models.ForeignKey(
+        to=structure_models.Project,
+        on_delete=models.CASCADE,
+        related_name="op-managedproject-project+",
+        verbose_name=_("project"),
+        blank=True,
+        null=True,
+    )
+
+    def get_details(self) -> openportal.ProjectDetails:
+        """
+        Get the ProjectDetails object from the project data.
+        If the project data is not set, return None.
+        """
+        return openportal.ProjectDetails.from_json(self.details)
+
+    def __str__(self) -> str:
+        return f"ManagedProject {self.identifier} => {self.project}"
 
     def __repr__(self) -> str:
         return self.__str__()

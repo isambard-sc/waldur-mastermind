@@ -542,6 +542,8 @@ def run_job(serialized_job):
         logger.error(f"OpenPortal - {job} is not a Job instance - it is {type(job)}")
         return
 
+    job_model = job
+
     try:
         job = job.get_job()
     except Exception as e:
@@ -604,7 +606,11 @@ def run_job(serialized_job):
         logger.error(f"OpenPortal - Failed to run job {job.id}: {e}")
         job = job.errored(str(e))
         board.send_result(job)
-        return
+
+    # save the job model back to the database
+    job_model.state = models.Job.State.COMPLETED
+    job_model.job_data = job.to_json()
+    job_model.save()
 
 
 @shared_task(name="waldur_openportal.sync_board")

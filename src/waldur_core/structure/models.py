@@ -520,19 +520,22 @@ class Project(
     short_name = models.CharField(
         verbose_name=_("short name"),
         max_length=50,
-        unique=True,
-        help_text=_("A short, unique name for the project used as an identifier. Should only contain lower-case letters, digits, underscores and hyphens"),
+        null=True,
+        blank=True,
+        help_text=_(
+            "A short, unique name for the project used as an identifier. Should only contain lower-case letters, digits, underscores and hyphens"
+        ),
         validators=[
             RegexValidator(
                 regex=r"^[a-z0-9\-_]+$",
-                ),
+            ),
             RegexValidator(
                 regex=r"(-admin)|(-root)$",
                 inverse_match=True,
-                ),
+            ),
             MinLengthValidator(3),
-            MaxLengthValidator(30)
-        ]
+            MaxLengthValidator(30),
+        ],
     )
 
     start_date = models.DateField(null=True, blank=True)
@@ -597,14 +600,9 @@ class Project(
         signals.post_delete.send(sender=self.__class__, instance=self, using=using)
 
     def save(self, *args, **kwargs):
-        # The short_name cannot be changed after creation as external systems may already depend on it.
-        prev = self.tracker.previous("short_name")
-        if self.tracker.has_changed("short_name") and prev is not None:
-            new = self.short_name
-            raise ValueError(
-                _(f"Cannot change short name of project ('{prev}' → '{new}') after creation.")
-            )
-
+        # We will let the short name change here as a first step to removing it.
+        # The unique shortname is now stored in the waldur_openportal plugin,
+        # and this cannot be changed once set.
         super().save(*args, **kwargs)
 
     def delete(self, using=None, soft=True, *args, **kwargs):
