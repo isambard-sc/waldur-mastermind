@@ -1,7 +1,10 @@
 import logging
 import os
 
+from waldur_core.structure import models as structure_models
+
 from . import op as openportal
+from . import models
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +102,92 @@ class OpenPortalBoard:
         if not isinstance(details, openportal.ProjectDetails):
             raise openportal.OpenPortalError(f"Invalid project details: {details}")
 
-        return openportal.ProjectMapping(f"{project}:u5a")
+        # get the portal that requested the project, and the project class of the project
+        portal = str(project.portal)
+
+        if details.project_class is None:
+            raise openportal.OpenPortalError(
+                f"Project class is not set for project {details}"
+            )
+
+        if not isinstance(project.project_class, openportal.ProjectClass):
+            raise openportal.OpenPortalError(
+                f"Invalid project class: {project.project_class}"
+            )
+
+        project_class = str(details.project_class).strip()
+
+        if len(project_class) == 0:
+            raise openportal.OpenPortalError(
+                f"Project class is empty for project {project}"
+            )
+
+        # See if we have an existing ProjectClass for this portal and class
+        try:
+            project_class = models.ProjectClass.objects.filter(
+                portal=portal, project_class=project_class
+            ).first()
+        except Exception:
+            logger.warning(
+                f"Failed to get project class for portal {portal} and class {project_class}. "
+                "This suggests that the portal is not allowed to create projects in this class."
+            )
+            raise openportal.OpenPortalError(
+                f"Project class '{project_class}' is not allowed for portal '{portal}'"
+            )
+
+        if not project_class:
+            logger.warning(
+                f"Project class '{project_class}' not found for portal '{portal}'. "
+                "This suggests that the portal is not allowed to create projects in this class."
+            )
+            raise openportal.OpenPortalError(
+                f"Project class '{project_class}' is not allowed for portal '{portal}'"
+            )
+
+        # get the customer (organisation) in which the project should be created
+        if project_class.customer is None:
+            raise openportal.OpenPortalError(
+                f"Customer is not set for project {details}"
+            )
+
+        customer = project_class.customer
+
+        # now get a generator for the project shortname
+        generator = project_class.get_generator()
+
+        if not generator:
+            raise openportal.OpenPortalError(
+                f"Project class '{project_class}' does not have a generator"
+            )
+
+        # at a minimum, we need to know the name of the project
+        if details.name is None:
+            raise openportal.OpenPortalError(
+                f"Project name is not set for project {details}"
+            )
+
+        project_name = str(details.name).strip()
+
+        if len(project_name) == 0:
+            raise openportal.OpenPortalError(
+                f"Project name is empty for project {project}"
+            )
+
+        # create the project in the customer
+        waldur_project = structure_models.Project.objects.create(
+            name=project_name,
+            customer=customer,
+            project_class=project_class,
+        )
+
+        project_info = models.ProjectInfo.objects.create(
+            project=waldur_project,
+        )
+
+        shortname = project_info.generate_shortname(generator)
+
+        return openportal.ProjectMapping(f"{project}:{shortname}")
 
     def update_project(
         self, project: openportal.ProjectIdentifier, details: openportal.ProjectDetails
