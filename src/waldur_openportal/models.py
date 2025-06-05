@@ -574,11 +574,14 @@ class ProjectInfo(models.Model):
                 "Project shortname cannot be empty. Please set it in OpenPortal."
             )
 
-    def set_shortname(self, shortname: str):
+    def set_shortname(self, shortname: str, force: bool = False):
         """
         Set the shortname, checking whether or not this has not already
         been set - note that it cannot be changed after creation
         as external systems may already depend on it.
+
+        Only use 'force=True' if you are sure that you want to
+        change the shortname, as this will bypass the checks
         """
         if not shortname:
             raise ValueError("Shortname cannot be empty.")
@@ -591,7 +594,7 @@ class ProjectInfo(models.Model):
             )
 
         self.shortname = shortname
-        self.save()
+        self.save(force_accept_changed_shortname=force)
         self.sanitise()
 
     def generate_shortname(self, generator: ProjectShortNameGenerator) -> str:
@@ -616,10 +619,12 @@ class ProjectInfo(models.Model):
             shortname = generator.get_shortname()
 
             try:
-                self.set_shortname(shortname)
+                self.set_shortname(shortname, force=True)
                 return shortname
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    f"Failed to set shortname {shortname} - is it already taken? {e}"
+                )
 
             # If we fail, check that this was because the shortname
             # was already taken, and if so, increment the generator
@@ -652,19 +657,20 @@ class ProjectInfo(models.Model):
         else:
             self.allowed_destinations = str(destinations)
 
-    def save(self, *args, **kwargs):
+    def save(self, *args, force_accept_changed_shortname: bool = False, **kwargs):
         if "update_fields" in kwargs and "query_field" not in kwargs["update_fields"]:
             kwargs["update_fields"] = set(kwargs["update_fields"]).add("query_field")
 
         # The shortname cannot be changed after creation as external systems may already depend on it.
-        prev = self.tracker.previous("shortname")
-        if self.tracker.has_changed("shortname") and prev:
-            new = self.shortname
-            raise ValueError(
-                _(
-                    f"Cannot change shortname of project ('{prev}' → '{new}') after creation."
+        if not force_accept_changed_shortname:
+            prev = self.tracker.previous("shortname")
+            if self.tracker.has_changed("shortname") and prev:
+                new = self.shortname
+                raise ValueError(
+                    _(
+                        f"Cannot change shortname of project ('{prev}' → '{new}') after creation."
+                    )
                 )
-            )
 
         super().save(*args, **kwargs)
 

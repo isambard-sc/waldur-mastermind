@@ -184,7 +184,7 @@ def sync_usage():
     for project_credit in invoice_models.ProjectCredit.objects.all():
         project = project_credit.project
 
-        if project.is_expired:
+        if project.is_expired or project.is_removed:
             continue
 
         credits_available = project_credit.value
@@ -364,7 +364,7 @@ def send_notifications():
 
         project = project_credit.project
 
-        if project.is_expired:
+        if project.is_expired or project.is_removed:
             continue
 
         # get the end date for this project
@@ -557,7 +557,7 @@ def create_default_resources(serialized_managed_project):
             f"OpenPortal - ManagedProject {managed_project} has no associated project"
         )
 
-    if project.is_expired:
+    if project.is_expired or project.is_removed:
         logger.info(
             f"OpenPortal - ManagedProject {managed_project} is an expired project"
         )

@@ -167,6 +167,15 @@ class OpenPortalBoard:
             )
 
         if managed_project.project is not None:
+            if managed_project.project.is_expired or managed_project.project.is_removed:
+                # we can't make any changes to this project - return an error
+                logger.error(
+                    f"ManagedProject {managed_project} is expired or removed, cannot create project."
+                )
+                raise openportal.OpenPortalError(
+                    f"ManagedProject '{managed_project}' is expired or removed, cannot create project"
+                )
+
             # we have already created this project, so we can just return the mapping - check
             # there the project details are in agreement with the existing project
             if managed_project.details is None:
@@ -199,12 +208,40 @@ class OpenPortalBoard:
                     )
 
                 if project_info.shortname is None:
-                    logger.error(
-                        f"ProjectInfo for project {managed_project.project} does not have a shortname."
+                    # generate the shortname now for this project
+                    logger.warning(
+                        f"ProjectInfo for project {managed_project.project} does not have a shortname, generating one."
                     )
-                    raise openportal.OpenPortalError(
-                        f"ProjectInfo for project '{managed_project.project}' does not have a shortname"
-                    )
+
+                    if managed_project.project_class is None:
+                        logger.error(
+                            f"Project class is not set for project {managed_project.project}"
+                        )
+                        managed_project.delete()
+
+                        raise openportal.OpenPortalError(
+                            f"Project class is not set for project {managed_project.project}"
+                        )
+
+                    generator = managed_project.project_class.get_generator()
+
+                    if not generator:
+                        logger.error(
+                            f"Project class {managed_project.project_class} does not have a generator."
+                        )
+                        raise openportal.OpenPortalError(
+                            f"Project class '{managed_project.project_class}' does not have a generator"
+                        )
+
+                    project_info.generate_shortname(generator)
+
+                    if project_info.shortname is None:
+                        logger.error(
+                            f"Failed to generate shortname for project {managed_project.project}"
+                        )
+                        raise openportal.OpenPortalError(
+                            f"Failed to generate shortname for project '{managed_project.project}'"
+                        )
 
                 local_identifier = self._to_project_identifier(project_info.shortname)
 
@@ -359,61 +396,170 @@ class OpenPortalBoard:
                 f"ManagedProject for identifier '{identifier}' does not exist"
             )
 
+        if managed_project.project is None:
+            logger.error(
+                f"ManagedProject {managed_project} does not have an associated project. Cannot update project."
+            )
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' does not have an associated project"
+            )
+
+        if managed_project.project.is_expired or managed_project.project.is_removed:
+            # we can't make any changes to this project - return an error
+            logger.error(
+                f"ManagedProject {managed_project} is expired or removed, cannot update project."
+            )
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' is expired or removed, cannot update project"
+            )
+
         return managed_project.get_mapping()
 
     def get_project(
-        self, project: openportal.ProjectIdentifier
+        self, identifier: openportal.ProjectIdentifier
     ) -> openportal.ProjectDetails:
         """
         Get a project from OpenPortal with the given identifier.
         This returns the details of the project, e.g. its name,
         description, members etc.
         """
-        logger.info(f"Getting project {project}")
+        if not isinstance(identifier, openportal.ProjectIdentifier):
+            raise openportal.OpenPortalError(
+                f"Invalid project identifier: {identifier}"
+            )
 
-        if not isinstance(project, openportal.ProjectIdentifier):
-            raise openportal.OpenPortalError(f"Invalid project identifier: {project}")
+        # Get the ManagedProject for this identifier, which must already exist
+        try:
+            managed_project = models.ManagedProject.objects.get(
+                identifier=str(identifier)
+            )
+        except models.ManagedProject.DoesNotExist:
+            logger.error(f"ManagedProject for identifier {identifier} does not exist.")
+            raise openportal.OpenPortalError(
+                f"ManagedProject for identifier '{identifier}' does not exist"
+            )
+
+        if managed_project.project is None:
+            logger.error(
+                f"ManagedProject {managed_project} does not have an associated project."
+            )
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' does not have an associated project"
+            )
+
+        project = managed_project.project
+
+        if project.is_expired or project.is_removed:
+            # we can't make any changes to this project - return an error
+            logger.error(f"ManagedProject {managed_project} is expired or removed.")
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' is expired or removed"
+            )
 
         details = openportal.ProjectDetails("{}")
 
-        details.name = "Project Something Something"
-        details.description = "This is a test project"
+        if project.name is not None:
+            details.name = str(project.name).strip()
+
+        if project.description is not None:
+            details.description = str(project.description).strip()
+
+        if managed_project.project_class is not None:
+            details.project_class = openportal.ProjectClass(
+                managed_project.project_class.name,
+            )
+
+        # Eventually add in the users in their roles etc.
 
         return details
 
     def get_project_mapping(
-        self, project: openportal.ProjectIdentifier
+        self, identifier: openportal.ProjectIdentifier
     ) -> openportal.ProjectMapping:
         """
         Get the mapping for a project in OpenPortal with the given identifier.
         This returns the mapping from the identifier in the requesting portal
         to the OpenPortal project identifier used internally.
         """
-        logger.info(f"Getting project mapping for {project}")
+        if not isinstance(identifier, openportal.ProjectIdentifier):
+            raise openportal.OpenPortalError(
+                f"Invalid project identifier: {identifier}"
+            )
 
-        if not isinstance(project, openportal.ProjectIdentifier):
-            raise openportal.OpenPortalError(f"Invalid project identifier: {project}")
+        # Get the ManagedProject for this identifier, which must already exist
+        try:
+            managed_project = models.ManagedProject.objects.get(
+                identifier=str(identifier)
+            )
+        except models.ManagedProject.DoesNotExist:
+            logger.error(f"ManagedProject for identifier {identifier} does not exist.")
+            raise openportal.OpenPortalError(
+                f"ManagedProject for identifier '{identifier}' does not exist"
+            )
 
-        return openportal.ProjectMapping(f"{project}:u5a")
+        if managed_project.project is None:
+            logger.error(
+                f"ManagedProject {managed_project} does not have an associated project."
+            )
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' does not have an associated project"
+            )
+
+        project = managed_project.project
+
+        if project.is_expired or project.is_removed:
+            # we can't make any changes to this project - return an error
+            logger.error(f"ManagedProject {managed_project} is expired or removed.")
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' is expired or removed"
+            )
+
+        return managed_project.get_mapping()
 
     def get_usage_report(
         self,
-        project: openportal.ProjectIdentifier,
+        identifier: openportal.ProjectIdentifier,
         date_range: openportal.DateRange,
     ) -> openportal.UsageReport:
         """
         Get a usage report for a project in OpenPortal for the given date range.
         This returns the usage report, which contains the usage data for the project.
         """
-        logger.info(
-            f"Getting usage report for project {project} in date range {date_range}"
-        )
-
-        if not isinstance(project, openportal.ProjectIdentifier):
-            raise openportal.OpenPortalError(f"Invalid project identifier: {project}")
+        if not isinstance(identifier, openportal.ProjectIdentifier):
+            raise openportal.OpenPortalError(
+                f"Invalid project identifier: {identifier}"
+            )
 
         if not isinstance(date_range, openportal.DateRange):
             raise openportal.OpenPortalError(f"Invalid date range: {date_range}")
+
+        # Get the ManagedProject for this identifier, which must already exist
+        try:
+            managed_project = models.ManagedProject.objects.get(
+                identifier=str(identifier)
+            )
+        except models.ManagedProject.DoesNotExist:
+            logger.error(f"ManagedProject for identifier {identifier} does not exist.")
+            raise openportal.OpenPortalError(
+                f"ManagedProject for identifier '{identifier}' does not exist"
+            )
+
+        if managed_project.project is None:
+            logger.error(
+                f"ManagedProject {managed_project} does not have an associated project."
+            )
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' does not have an associated project"
+            )
+
+        project = managed_project.project
+
+        if project.is_removed:
+            # we can't make any changes to this project - return an error
+            logger.error(f"ManagedProject {managed_project} is removed.")
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' is removed"
+            )
 
         return openportal.UsageReport(openportal.PortalIdentifier("brics"))
 

@@ -8,6 +8,7 @@ from django.db import transaction
 from waldur_core.structure.backend import ServiceBackend
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import CoreStates
 
 from waldur_openportal import signals
 from waldur_openportal.client import OpenPortalClient
@@ -46,7 +47,7 @@ class OpenPortalBackend(ServiceBackend):
     def pull_resources(self):
         logger.debug(f"Pulling OpenPortal resources for settings: {self}")
         for allocation in self.get_allocation_queryset().filter(
-            state=models.Allocation.States.OK
+            state=CoreStates.OK, is_added=True
         ):
             try:
                 logger.debug("About to pull allocation %s", allocation)
@@ -204,7 +205,7 @@ class OpenPortalBackend(ServiceBackend):
             allocation
             for allocation in existing_allocations
             if allocation.has_project_identifier()
-            and allocation.state != models.Allocation.States.ERRED
+            and allocation.state != CoreStates.ERRED
         ]
 
         if len(existing_allocations) > 0:
@@ -359,11 +360,11 @@ class OpenPortalBackend(ServiceBackend):
         # We don't want to get stuck in a loop continually trying
         # to add an allocation that has been deleted
         if allocation.state not in [
-            models.Allocation.States.CREATION_SCHEDULED,
-            models.Allocation.States.CREATING,
-            models.Allocation.States.UPDATE_SCHEDULED,
-            models.Allocation.States.UPDATING,
-            models.Allocation.States.OK,
+            CoreStates.CREATION_SCHEDULED,
+            CoreStates.CREATING,
+            CoreStates.UPDATE_SCHEDULED,
+            CoreStates.UPDATING,
+            CoreStates.OK,
         ]:
             logger.warning(
                 f"Allocation {allocation} is in state {allocation.state} - cannot add to OpenPortal"
