@@ -524,6 +524,100 @@ If you want to change the frequency of these updates, please ask the project PI 
     return body
 
 
+@shared_task(name="waldur_openportal.create_default_resources")
+def create_default_resources(serialized_managed_project):
+    """
+    This task is called to create the default resources for a managed project.
+    It will create the default resources in the OpenPortal board.
+    """
+    logger.info(
+        f"OpenPortal task.create_default_resources: {serialized_managed_project}"
+    )
+
+    if isinstance(serialized_managed_project, models.ManagedProject):
+        managed_project = serialized_managed_project
+    else:
+        managed_project = core_utils.deserialize_instance(serialized_managed_project)
+
+    if not isinstance(managed_project, models.ManagedProject):
+        logger.error(
+            f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(project)}"
+        )
+        raise ValueError(
+            f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(managed_project)}"
+        )
+
+    project = managed_project.project
+
+    if project is None:
+        logger.error(
+            f"OpenPortal - ManagedProject {managed_project} has no associated project"
+        )
+        raise ValueError(
+            f"OpenPortal - ManagedProject {managed_project} has no associated project"
+        )
+
+    if project.is_expired:
+        logger.info(
+            f"OpenPortal - ManagedProject {managed_project} is an expired project"
+        )
+        raise ValueError(
+            f"OpenPortal - ManagedProject {managed_project} is an expired project"
+        )
+
+    offerings = managed_project.get_default_offerings()
+
+    logger.info(f"OpenPortal - Creating default resources for {project} - {offerings}")
+
+
+def update_project(
+    board: OpenPortalBoard,
+    project: openportal.ProjectIdentifier,
+    details: openportal.ProjectDetails,
+    force_update: bool = False,
+) -> openportal.ProjectMapping:
+    """
+    Update the project in the OpenPortal board with the given details.
+    If the project does not exist, then there will be an error.
+    """
+    logger.info(f"Updating project {project} with details {details}")
+    return board.update_project(project, details, force_update=force_update)
+
+
+def create_project(
+    board: OpenPortalBoard,
+    identifier: openportal.ProjectIdentifier,
+    details: openportal.ProjectDetails,
+) -> openportal.ProjectMapping:
+    """
+    Create a project in the OpenPortal board with the given identifier and details.
+    """
+    logger.info(f"Creating project {identifier} with details {details}")
+
+    # first, create the project if it doesn't exist
+    mapping = board.create_project(identifier, details)
+
+    # next, update the details of the project to match the details provided
+    mapping = update_project(board, mapping.project, details, force_update=True)
+
+    # Finally, schedule the creation of default resources
+    try:
+        managed_project = models.ManagedProject.objects.filter(
+            identifier=str(mapping.project)
+        ).first()
+    except Exception as e:
+        logger.error(f"Failed to find managed project for {mapping.project}: {e}")
+        raise ValueError(f"Failed to find managed project for {mapping.project}")
+
+    if not managed_project:
+        logger.error(f"Managed project for {mapping.project} not found")
+        raise ValueError(f"Managed project for {mapping.project} not found")
+
+    create_default_resources.delay(core_utils.serialize_instance(managed_project))
+
+    return mapping
+
+
 @shared_task(name="waldur_openportal.run_job")
 def run_job(serialized_job):
     """
@@ -544,6 +638,10 @@ def run_job(serialized_job):
 
     job_model = job
 
+    if job_model.state != models.Job.State.PENDING:
+        logger.info(f"OpenPortal - Job {job.job_id} is not pending - skipping")
+        return
+
     try:
         job = job.get_job()
     except Exception as e:
@@ -558,7 +656,10 @@ def run_job(serialized_job):
         logger.info(f"OpenPortal - Job {job.id} is not pending - skipping")
         return
 
-    board = OpenPortalBoard()
+    job_model.state = models.Job.State.RUNNING
+    job_model.save()
+
+    board = OpenPortalBoard(job.destination)
 
     logger.info(f"Running job {job} - status {job.state}")
 
@@ -569,21 +670,21 @@ def run_job(serialized_job):
         result = None
 
         if command == "create_project":
-            project = openportal.ProjectIdentifier(args[0])
+            identifier = openportal.ProjectIdentifier(args[0])
             details = openportal.ProjectDetails(args[1])
-            result = board.create_project(project, details)
+            result = create_project(board, identifier, details)
         elif command == "update_project":
-            project = openportal.ProjectIdentifier(args[0])
+            identifier = openportal.ProjectIdentifier(args[0])
             details = openportal.ProjectDetails(args[1])
-            result = board.update_project(project, details)
+            result = update_project(board, identifier, details)
         elif command == "get_project":
-            project = openportal.ProjectIdentifier(args[0])
-            result = board.get_project(project)
+            identifier = openportal.ProjectIdentifier(args[0])
+            result = board.get_project(identifier)
         elif command == "get_project_mapping":
-            project = openportal.ProjectIdentifier(args[0])
-            result = board.get_project_mapping(project)
+            identifier = openportal.ProjectIdentifier(args[0])
+            result = board.get_project_mapping(identifier)
         elif command == "get_usage_report":
-            project = openportal.ProjectIdentifier(args[0])
+            identifier = openportal.ProjectIdentifier(args[0])
             # This is the code we want, but need to wait for next release
             # dates = openportal.DateRange.parse(args[1])
 
@@ -596,7 +697,7 @@ def run_job(serialized_job):
             end_date = datetime.datetime.strptime(dates[1], "%Y-%m-%d").date()
             dates = openportal.DateRange(start_date, end_date)
 
-            result = board.get_usage_report(project, dates)
+            result = board.get_usage_report(identifier, dates)
         else:
             raise ValueError(f"Unknown command {command} for job {job.id}")
 
@@ -604,8 +705,13 @@ def run_job(serialized_job):
         board.send_result(job)
     except Exception as e:
         logger.error(f"OpenPortal - Failed to run job {job.id}: {e}")
-        job = job.errored(str(e))
-        board.send_result(job)
+        try:
+            job = job.errored(str(e))
+            board.send_result(job)
+        except Exception as e:
+            logger.error(
+                f"OpenPortal - Failed to send error result for job {job.id}: {e}"
+            )
 
     # save the job model back to the database
     job_model.state = models.Job.State.COMPLETED

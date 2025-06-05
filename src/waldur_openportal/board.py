@@ -17,13 +17,55 @@ class OpenPortalBoard:
     See also: https://github.com/isambard-sc/openportal
     """
 
-    def __init__(self):
+    def __init__(self, destination: openportal.Destination = None):
         # make sure that the OpenPortal config is loaded
         if not openportal.have_openportal():
             raise openportal.OpenPortalError("OpenPortal is not available")
 
         if not openportal.is_config_loaded():
             self.load_config()
+
+        if destination is not None and isinstance(destination, openportal.Destination):
+            self._destination = destination
+
+    def _to_project_identifier(self, project) -> openportal.ProjectIdentifier:
+        """
+        Convert the passed (any) object into a ProjectIdentifier
+        """
+        if not isinstance(project, openportal.ProjectIdentifier):
+            try:
+                project = openportal.ProjectIdentifier(project)
+            except Exception:
+                project = openportal.ProjectIdentifier(f"{project}.{self.portal()}")
+
+        return project
+
+    def _to_user_identifier(self, user) -> openportal.UserIdentifier:
+        """
+        Convert the passed (any) object into a UserIdentifier
+        """
+        if not isinstance(user, openportal.UserIdentifier):
+            try:
+                user = openportal.UserIdentifier(user)
+            except Exception:
+                user = openportal.UserIdentifier(f"{user}.{self.portal()}")
+
+        return user
+
+    def portal(self) -> openportal.PortalIdentifier:
+        """
+        Return the name of the portal that represents the web portal
+        connected to by the Bridge managed by this board.
+        """
+        try:
+            return openportal.PortalIdentifier(self._destination.agents[0])
+        except Exception as e:
+            logger.error(
+                f"Failed to get portal name from destination {self._destination}: {e}"
+            )
+            raise openportal.OpenPortalError(
+                f"Failed to get portal name from destination {self._destination}: {e}"
+            )
 
     def load_config(self):
         """
@@ -87,63 +129,150 @@ class OpenPortalBoard:
         return job
 
     def create_project(
-        self, project: openportal.ProjectIdentifier, details: openportal.ProjectDetails
+        self,
+        identifier: openportal.ProjectIdentifier,
+        details: openportal.ProjectDetails,
     ) -> openportal.ProjectMapping:
         """
         Create a project in OpenPortal with the given identifier and details.
         This returns the mapping from the identifier in the requesting portal
         to the OpenPortal project identifier used internally.
         """
-        logger.info(f"Creating project {project} with details {details}")
+        logger.info(f"Creating project {identifier} with details {details}")
 
-        if not isinstance(project, openportal.ProjectIdentifier):
-            raise openportal.OpenPortalError(f"Invalid project identifier: {project}")
+        if not isinstance(identifier, openportal.ProjectIdentifier):
+            raise openportal.OpenPortalError(
+                f"Invalid project identifier: {identifier}"
+            )
 
         if not isinstance(details, openportal.ProjectDetails):
             raise openportal.OpenPortalError(f"Invalid project details: {details}")
 
-        # get the portal that requested the project, and the project class of the project
-        portal = str(project.portal)
+        # Get (or create) the ManagedProject for the given project identifier
+        try:
+            managed_project = models.ManagedProject.objects.create(
+                identifier=str(identifier)
+            )
+        except Exception:
+            managed_project = models.ManagedProject.objects.filter(
+                identifier=str(identifier)
+            ).first()
 
+        if not managed_project:
+            logger.error(
+                f"Failed to create or get ManagedProject for identifier {identifier}."
+            )
+            raise openportal.OpenPortalError(
+                f"ManagedProject for identifier '{identifier}' could not be created or found"
+            )
+
+        if managed_project.project is not None:
+            # we have already created this project, so we can just return the mapping - check
+            # there the project details are in agreement with the existing project
+            if managed_project.details is None:
+                # This is a bug
+                logger.error(
+                    f"Project details for {managed_project} are None, but the project already exists."
+                )
+                raise openportal.OpenPortalError(
+                    f"Project details for {managed_project} are None, but the project already exists."
+                )
+            elif managed_project.details != str(details):
+                logger.warning(
+                    f"Project details for {managed_project} do not match the existing project details."
+                )
+                raise openportal.OpenPortalError(
+                    f"Project details for {managed_project} do not match the existing project details."
+                )
+
+            if managed_project.local_identifier is None:
+                project_info = models.ProjectInfo.objects.filter(
+                    project=managed_project.project
+                ).first()
+
+                if project_info is None:
+                    logger.error(
+                        f"ProjectInfo for project {managed_project.project} not found."
+                    )
+                    raise openportal.OpenPortalError(
+                        f"ProjectInfo for project '{managed_project.project}' not found"
+                    )
+
+                if project_info.shortname is None:
+                    logger.error(
+                        f"ProjectInfo for project {managed_project.project} does not have a shortname."
+                    )
+                    raise openportal.OpenPortalError(
+                        f"ProjectInfo for project '{managed_project.project}' does not have a shortname"
+                    )
+
+                local_identifier = self._to_project_identifier(project_info.shortname)
+
+                managed_project.local_identifier = str(local_identifier)
+                managed_project.save()
+
+            return managed_project.get_mapping()
+
+        # The project does not exist, so we need to create it
+
+        # get the project class of the new project
         if details.project_class is None:
+            managed_project.delete()
+
             raise openportal.OpenPortalError(
                 f"Project class is not set for project {details}"
             )
 
-        if not isinstance(project.project_class, openportal.ProjectClass):
+        if not isinstance(details.project_class, openportal.ProjectClass):
+            managed_project.delete()
+
             raise openportal.OpenPortalError(
-                f"Invalid project class: {project.project_class}"
+                f"Invalid project class: {details.project_class}"
             )
 
         project_class = str(details.project_class).strip()
 
         if len(project_class) == 0:
+            managed_project.delete()
+
             raise openportal.OpenPortalError(
                 f"Project class is empty for project {project}"
             )
 
-        # See if we have an existing ProjectClass for this portal and class
+        # See if we have an existing ProjectClass for the requesting remote portal and class
+        remote_portal = str(identifier.portal)
+
         try:
             project_class = models.ProjectClass.objects.filter(
-                portal=portal, project_class=project_class
+                portal=remote_portal, name=project_class
             ).first()
         except Exception:
+            managed_project.delete()
+
             logger.warning(
-                f"Failed to get project class for portal {portal} and class {project_class}. "
+                f"Failed to get the project class for portal {remote_portal} and class {project_class}. "
                 "This suggests that the portal is not allowed to create projects in this class."
             )
             raise openportal.OpenPortalError(
-                f"Project class '{project_class}' is not allowed for portal '{portal}'"
+                f"Project class '{project_class}' is not allowed for portal '{remote_portal}'"
             )
 
         if not project_class:
+            managed_project.delete()
+
             logger.warning(
-                f"Project class '{project_class}' not found for portal '{portal}'. "
+                f"Project class '{project_class}' not found for portal '{remote_portal}'. "
                 "This suggests that the portal is not allowed to create projects in this class."
             )
             raise openportal.OpenPortalError(
-                f"Project class '{project_class}' is not allowed for portal '{portal}'"
+                f"Project class '{project_class}' is not allowed for portal '{remote_portal}'"
             )
+
+        # The remote portal is allowed to create projects in this class,
+        # so we can now safely save the ManagedProject and create the project
+        managed_project.project_class = project_class
+        managed_project.details = str(details)
+        managed_project.save()
 
         # get the customer (organisation) in which the project should be created
         if project_class.customer is None:
@@ -171,41 +300,66 @@ class OpenPortalBoard:
 
         if len(project_name) == 0:
             raise openportal.OpenPortalError(
-                f"Project name is empty for project {project}"
+                f"Project name is empty for project {identifier}"
             )
 
         # create the project in the customer
         waldur_project = structure_models.Project.objects.create(
             name=project_name,
             customer=customer,
-            project_class=project_class,
         )
 
+        managed_project.project = waldur_project
+        managed_project.save()
+
+        # Now create a unique shortname for this project using
+        # the generator from the project class
         project_info = models.ProjectInfo.objects.create(
             project=waldur_project,
         )
 
         shortname = project_info.generate_shortname(generator)
 
-        return openportal.ProjectMapping(f"{project}:{shortname}")
+        managed_project.local_identifier = str(self._to_project_identifier(shortname))
+        managed_project.save()
+
+        return managed_project.get_mapping()
 
     def update_project(
-        self, project: openportal.ProjectIdentifier, details: openportal.ProjectDetails
+        self,
+        identifier: openportal.ProjectIdentifier,
+        new_details: openportal.ProjectDetails,
+        force_update: bool = False,
     ) -> openportal.ProjectMapping:
         """
         Update a project in OpenPortal with the given identifier and details.
         This returns the mapping from the identifier in the requesting portal
         to the OpenPortal project identifier used internally.
         """
-        logger.info(f"Updating project {project} with details {details}")
+        logger.info(f"Updating project {identifier} with details {new_details}")
 
-        if not isinstance(project, openportal.ProjectIdentifier):
-            raise openportal.OpenPortalError(f"Invalid project identifier: {project}")
+        if not isinstance(identifier, openportal.ProjectIdentifier):
+            raise openportal.OpenPortalError(
+                f"Invalid project identifier: {identifier}"
+            )
 
-        if not isinstance(details, openportal.ProjectDetails):
-            raise openportal.OpenPortalError(f"Invalid project details: {details}")
+        if not isinstance(new_details, openportal.ProjectDetails):
+            raise openportal.OpenPortalError(f"Invalid project details: {new_details}")
 
-        return openportal.ProjectMapping(f"{project}:u5a")
+        # Get the ManagedProject for this identifier, which must already exist
+        try:
+            managed_project = models.ManagedProject.objects.get(
+                identifier=str(identifier)
+            )
+        except models.ManagedProject.DoesNotExist:
+            logger.error(
+                f"ManagedProject for identifier {identifier} does not exist. Cannot update project."
+            )
+            raise openportal.OpenPortalError(
+                f"ManagedProject for identifier '{identifier}' does not exist"
+            )
+
+        return managed_project.get_mapping()
 
     def get_project(
         self, project: openportal.ProjectIdentifier

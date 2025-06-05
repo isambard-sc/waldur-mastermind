@@ -13,6 +13,7 @@ from model_utils import FieldTracker
 
 from waldur_core.core import models as core_models
 from waldur_core.structure import models as structure_models
+from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_openportal import utils
 
 logger = logging.getLogger(__name__)
@@ -446,7 +447,7 @@ class ProjectShortNameGenerator(models.Model):
     )
 
     def __str__(self) -> str:
-        return f"{self.shortname}: Last shortname {self.last_shortname}"
+        return f"{self.shortname}: Count = {self.count}"
 
     def __repr__(self) -> str:
         return self.__str__()
@@ -815,16 +816,15 @@ class ProjectClass(models.Model):
         blank=True,
     )
 
-    # The OpenPortal identifiers for all resources that should be
-    # created automatically for projects created in this class
-    # by the specified portal.
-    resources = models.TextField(
-        verbose_name=_("resources"),
+    # The list of MarketPlace Offerings that should be created automatically
+    # for projects created in this class by the specified portal.
+    offerings = models.ManyToManyField(
+        marketplace_models.Offering,
+        related_name="op-projectclass-offerings+",
+        verbose_name=_("offerings"),
         help_text=_(
-            "A comma-separated list of OpenPortal resource identifiers that should be created automatically for projects created in this class by the specified portal."
+            "The list of MarketPlace Offerings that should be created automatically for projects created in this class by the specified portal."
         ),
-        blank=True,
-        null=True,
     )
 
     # Combination of name and portal must be unique
@@ -862,8 +862,10 @@ class ProjectClass(models.Model):
             current_year = datetime.now().year
             shortname = shortname.replace("{year}", str(current_year % 10))
 
+        # Get (or create if needed) a new ProjectShortNameGenerator
+        # for this year
         generator, created = ProjectShortNameGenerator.objects.get_or_create(
-            shortname=self.shortname
+            shortname=shortname
         )
 
         if created:
@@ -888,7 +890,7 @@ class ManagedProject(models.Model):
         db_index=True,
     )
 
-    # This is the JSON representation of the OpenPortla ProjectDetails
+    # This is the JSON representation of the OpenPortal ProjectDetails
     # that is synced between this portal and the managing portal
     details = models.TextField(
         verbose_name=_("project data"),
@@ -907,12 +909,68 @@ class ManagedProject(models.Model):
         null=True,
     )
 
+    # This is the ProjectClass that this project belongs to.
+    project_class = models.ForeignKey(
+        to=ProjectClass,
+        on_delete=models.CASCADE,
+        related_name="op-managedproject-projectclass+",
+        verbose_name=_("project class"),
+        blank=True,
+        null=True,
+    )
+
+    # This is the ProjectIdentifier for this project in this portal
+    local_identifier = models.CharField(
+        max_length=MAX_PROJECTIDENTIFIER_LENGTH,
+        verbose_name=_("local ID"),
+        blank=True,
+        null=True,
+        help_text=_("The local project identifier in this portal."),
+    )
+
+    def get_local_identifier(self) -> openportal.ProjectIdentifier:
+        """
+        Get the local ProjectIdentifier for this project.
+        If the local identifier is not set, raise an error.
+        """
+        if not self.local_identifier:
+            raise ValueError("Local identifier is not set for this project.")
+        return openportal.ProjectIdentifier(self.local_identifier)
+
+    def get_remote_identifier(self) -> openportal.ProjectIdentifier:
+        """
+        Get the remote ProjectIdentifier for this project.
+        If the identifier is not set, raise an error.
+        """
+        if not self.identifier:
+            raise ValueError("Remote identifier is not set for this project.")
+        return openportal.ProjectIdentifier(self.identifier)
+
+    def get_mapping(self) -> openportal.ProjectMapping:
+        """
+        Get the ProjectMapping object for this project.
+        If the project data is not set, raise an error.
+        """
+        return openportal.ProjectMapping(
+            f"{self.get_remote_identifier()}:{self.get_local_identifier()}"
+        )
+
     def get_details(self) -> openportal.ProjectDetails:
         """
         Get the ProjectDetails object from the project data.
         If the project data is not set, return None.
         """
         return openportal.ProjectDetails.from_json(self.details)
+
+    def get_default_offerings(self) -> list[marketplace_models.Offering]:
+        """
+        Get the default marketplace offerings for this project.
+        If the project class is not set, return an empty list.
+        """
+        if self.project_class and self.project_class.offerings.exists():
+            return list(self.project_class.offerings.all())
+        else:
+            return []
 
     def __str__(self) -> str:
         return f"ManagedProject {self.identifier} => {self.project}"
