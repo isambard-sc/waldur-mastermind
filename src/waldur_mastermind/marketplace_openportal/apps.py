@@ -81,9 +81,21 @@ class MarketplaceOpenPortalConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.send_order_created_to_mqtt,
+            handlers.send_done_order_to_message_queue,
             sender=marketplace_models.Order,
-            dispatch_uid="waldur_mastermind.marketplace_openportal.send_order_created_to_mqtt",
+            dispatch_uid="waldur_mastermind.marketplace_openportal.send_done_order_to_message_queue",
+        )
+
+        signals.post_save.connect(
+            handlers.send_pending_order_to_message_queue,
+            sender=marketplace_models.Order,
+            dispatch_uid="waldur_mastermind.marketplace_openportal.send_pending_order_to_message_queue",
+        )
+
+        signals.post_save.connect(
+            handlers.send_offering_user_username_message,
+            sender=marketplace_models.OfferingUser,
+            dispatch_uid="waldur_mastermind.marketplace_openportal.send_offering_user_username_message",
         )
 
         signals.post_save.connect(

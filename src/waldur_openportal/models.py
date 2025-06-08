@@ -29,6 +29,31 @@ MAX_PROJECTCLASS_LENGTH = 128
 MAX_ALLOWED_DESTINATIONS_LENGTH = 1024
 
 
+class OnceTask(models.Model):
+    """
+    This model is responsible for storing data about tasks that should
+    only be run once, e.g. to create a project class or an allocation.
+    """
+
+    task_name = models.CharField(
+        max_length=128, unique=True, verbose_name=_("task name"), db_index=True
+    )
+
+    # The date when this task was started
+    last_run = models.DateTimeField(
+        verbose_name=_("run date"),
+        help_text=_("The date when this task was started."),
+        blank=True,
+        null=True,
+    )
+
+    def __str__(self) -> str:
+        return self.task_name
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
 class UsageMixin(models.Model):
     class Meta:
         abstract = True

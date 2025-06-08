@@ -1,6 +1,7 @@
 import logging
 import datetime
 import time
+import functools
 
 from celery import shared_task
 
@@ -16,6 +17,77 @@ from .board import OpenPortalBoard
 
 
 logger = logging.getLogger(__name__)
+
+
+def run_once_task(takeover_timeout):
+    def task_exc(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            lock_id = "openportal-run-once-" + func.__name__
+
+            def acquire_lock():
+                now = datetime.datetime.now(datetime.UTC)
+
+                lock, created = models.OnceTask.objects.get_or_create(
+                    task_name=lock_id,
+                    defaults={"last_run": now},
+                )
+
+                if not created:
+                    logger.warning(
+                        f"OpenPortal lock {lock_id} already exists - checking takeover"
+                    )
+
+                    # someone else beat us to the lock - was this more than
+                    # takeover_timeout seconds ago?
+                    if (
+                        lock.last_run is None
+                        or (now - lock.last_run.replace(tzinfo=None)).seconds
+                        > takeover_timeout
+                    ):
+                        # remove the lock
+                        try:
+                            lock.delete()
+                        except Exception:
+                            pass
+
+                        # create a new lock
+                        lock, created = models.OnceTask.objects.get_or_create(
+                            task_name="sync_openportal",
+                            defaults={"last_run": now},
+                        )
+
+                        if not created:
+                            logger.info(
+                                f"OpenPortal task {lock_id} already running - skipping"
+                            )
+                            return False
+
+                return True
+
+            def release_lock():
+                """
+                Release the lock by deleting the OnceTask object with the given lock_id.
+                """
+                try:
+                    lock = models.OnceTask.objects.get(task_name=lock_id)
+                    lock.delete()
+                except models.OnceTask.DoesNotExist:
+                    logger.warning(
+                        f"Lock {lock_id} does not exist - nothing to release"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to release lock {lock_id}: {e}")
+
+            if acquire_lock():
+                try:
+                    func(*args, **kwargs)
+                finally:
+                    release_lock()
+
+        return wrapper
+
+    return task_exc
 
 
 def get_structure_allocations(structure):
@@ -156,6 +228,7 @@ def sync_allocation_users(serialized_allocation):
 
 
 @shared_task(name="waldur_openportal.sync_usage")
+@run_once_task(takeover_timeout=60 * 30)
 def sync_usage():
     """
     This task is called to synchronise the usage for all allocations
@@ -273,6 +346,7 @@ def sync_usage():
 
 
 @shared_task(name="waldur_openportal.sync")
+@run_once_task(takeover_timeout=60 * 30)
 def sync():
     """
     This is a full OpenPortal sync - this will go through all projects
@@ -281,7 +355,6 @@ def sync():
     This will add and remove users as needed.
     """
     logger.info("OpenPortal task.sync")
-
     now = datetime.datetime.now()
     fail_count = 0
 
