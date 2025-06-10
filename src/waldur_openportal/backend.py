@@ -537,7 +537,7 @@ class OpenPortalBackend(ServiceBackend):
 
         # find the association between the user and the allocation
         try:
-            association = models.Association.objects.get(
+            association = openportal_utils.get_association(
                 user=user, allocation=allocation
             )
         except Exception as e:

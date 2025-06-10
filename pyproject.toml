@@ -1,4 +1,4 @@
-[tool.poetry]
+∑[tool.poetry]
 name = "waldur-mastermind"
 version = "0.0.0"
 description = "Waldur MasterMind is a hybrid cloud orchestrator."
@@ -41,7 +41,7 @@ docker = "7.1.0"
 iptools = "0.7.0"
 jira = "2.0.0"
 lxml = "^4.6.5"
-openportal = ">=0.12.0"
+openportal = ">=0.14.0"
 pbr = "4.0.4"
 Pillow = "^11.0.0"
 psycopg2-binary = "2.9.10"

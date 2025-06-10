@@ -42,7 +42,10 @@ def run_once_task(takeover_timeout):
                     # takeover_timeout seconds ago?
                     if (
                         lock.last_run is None
-                        or (now - lock.last_run.replace(tzinfo=None)).seconds
+                        or (
+                            now.replace(tzinfo=None)
+                            - lock.last_run.replace(tzinfo=None)
+                        ).seconds
                         > takeover_timeout
                     ):
                         # remove the lock
@@ -57,11 +60,26 @@ def run_once_task(takeover_timeout):
                             defaults={"last_run": now},
                         )
 
-                        if not created:
+                        if lock is None:
+                            logger.error(
+                                f"Failed to create OpenPortal lock {lock_id} - aborting"
+                            )
+                            return False
+                        elif created:
+                            logger.warning(
+                                f"OpenPortal task {lock_id} takeover successful - running"
+                            )
+                            return True
+                        else:
                             logger.info(
                                 f"OpenPortal task {lock_id} already running - skipping"
                             )
                             return False
+                    else:
+                        logger.info(
+                            f"OpenPortal task {lock_id} already running - skipping"
+                        )
+                        return False
 
                 return True
 

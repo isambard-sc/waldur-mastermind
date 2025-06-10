@@ -4,6 +4,8 @@ import logging
 from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
+from waldur_core.core import models as core_models
+
 from waldur_core.structure.managers import (
     get_connected_customers,
     get_connected_projects,
@@ -113,3 +115,51 @@ def get_last_day_of_month(date):
     """
     next_month = date.replace(day=28) + timezone.timedelta(days=4)
     return next_month - timezone.timedelta(days=next_month.day)
+
+
+def get_association(
+    user: core_models.User, allocation: models.Allocation
+) -> models.Association:
+    """
+    Return the association between the user and the allocation.
+    """
+    if not isinstance(allocation, models.Allocation):
+        raise TypeError("allocation must be an instance of models.Allocation")
+
+    if not isinstance(user, core_models.User):
+        raise TypeError("user must be an instance of core_models.User")
+
+    try:
+        return models.Association.objects.get(user=user, allocation=allocation)
+    except models.Association.MultipleObjectsReturned:
+        logger.warning(
+            f"Multiple associations found for {user} and {allocation} - removing all but the first one"
+        )
+        associations = models.Association.objects.filter(
+            user=user, allocation=allocation
+        )
+
+        if associations.exists():
+            first_association = associations.first()
+
+            if first_association is None:
+                logger.error(f"No associations found for {user} and {allocation}?")
+                raise models.Association.DoesNotExist(
+                    f"No association found for {user} and {allocation}"
+                )
+
+            if len(associations) > 1:
+                for association in associations[1:]:
+                    logger.info(
+                        f"Deleting duplicate association {association} for {user} and {allocation}"
+                    )
+                    association.delete()
+
+            return first_association
+        else:
+            logger.error(
+                f"No associations found for {user} and {allocation} after deletion"
+            )
+            raise models.Association.DoesNotExist(
+                f"No association found for {user} and {allocation}"
+            )

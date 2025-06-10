@@ -400,7 +400,7 @@ def access_for_email(request):
 
                 # find the association between the user and the allocation
                 try:
-                    association = models.Association.objects.get(
+                    association = utils.get_association(
                         user=user, allocation=allocation
                     )
                     username = association.username
