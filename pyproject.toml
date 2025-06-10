@@ -1,4 +1,4 @@
-∑[tool.poetry]
+[tool.poetry]
 name = "waldur-mastermind"
 version = "0.0.0"
 description = "Waldur MasterMind is a hybrid cloud orchestrator."
@@ -133,6 +133,7 @@ waldur_marketplace = "waldur_mastermind.marketplace.extension:MarketplaceExtensi
 waldur_marketplace_azure = "waldur_mastermind.marketplace_azure.extension:MarketplaceAzureExtension"
 waldur_marketplace_checklist = "waldur_mastermind.marketplace_checklist.extension:MarketplaceChecklistExtension"
 waldur_marketplace_openportal = "waldur_mastermind.marketplace_openportal.extension:MarketplaceOpenPortalExtension"
+waldur_marketplace_openportal_remote = "waldur_mastermind.marketplace_openportal_remote.extension:MarketplaceOpenPortalRemoteExtension"
 waldur_marketplace_openstack = "waldur_mastermind.marketplace_openstack.extension:MarketplaceOpenStackExtension"
 waldur_marketplace_rancher = "waldur_mastermind.marketplace_rancher.extension:MarketplaceRancherExtension"
 waldur_marketplace_script = "waldur_mastermind.marketplace_script.extension:MarketplaceScriptExtension"
