@@ -55,6 +55,17 @@ class OpenPortalBackend(ServiceBackend):
             except Exception as e:
                 logger.error("Error while pulling allocation [%s]: %s", allocation, e)
 
+    def pull_remote_resources(self):
+        logger.debug(f"Pulling OpenPortal remote resources for settings: {self}")
+        for allocation in self.get_remote_allocation_queryset().filter(
+            state=CoreStates.OK, is_added=True
+        ):
+            try:
+                logger.debug("About to pull allocation %s", allocation)
+                self.pull_remote_allocation(allocation)
+            except Exception as e:
+                logger.error("Error while pulling allocation [%s]: %s", allocation, e)
+
     def ping(self, raise_exception=False):
         logger.debug("Pinging OpenPortal")
         try:
@@ -190,6 +201,74 @@ class OpenPortalBackend(ServiceBackend):
                     f"Unable to delete user with mapping {mapping} from OpenPortal: {e}"
                 )
 
+    def sync_remote_users(self, allocation: models.RemoteAllocation) -> None:
+        if not isinstance(allocation, models.RemoteAllocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        if not (
+            allocation.has_project_identifier()
+            or allocation.is_added_to_openportal()
+            or allocation.has_remote_project_identifier()
+        ):
+            logger.warning(
+                f"Allocation {allocation} is not in OpenPortal - adding now!"
+            )
+            # this already calls 'sync_users' on the created allocation
+            self.add_remote_allocated_project(allocation)
+            return
+
+        project = allocation.get_project_identifier()
+        remote_project = allocation.get_remote_project_identifier()
+        logger.debug(
+            f"Syncing users for allocation: {allocation} | {project} <=> {remote_project}"
+        )
+        users = allocation.project.get_users()
+        logger.debug(f"Users for allocation: {users}")
+
+        # go through and add the users who are not in OpenPortal
+        for user in users:
+            if not user.is_active:
+                logger.warning(
+                    f"Removing {user} as they are no longer listed as active"
+                )
+                continue
+
+            # get the association between the user and the allocation
+            try:
+                (association, _) = models.RemoteAssociation.objects.get_or_create(
+                    user=user, allocation=allocation
+                )
+            except models.RemoteAssociation.MultipleObjectsReturned:
+                association = openportal_utils.get_remote_association(
+                    user=user, allocation=allocation
+                )
+
+            try:
+                if not association.user_is_in_remote():
+                    logger.info(f"Adding user {user} to OpenPortal Remote Project")
+
+                    self.client.add_remote_user(
+                        project=project, user=user, role=association.role
+                    )
+
+                    logger.debug(
+                        f"Added user {user} to OpenPortal project {project} in role {association.role}"
+                    )
+
+                    association.set_user_is_in_remote(True)
+                    association.save()
+
+                    signals.openportal_association_created.send(
+                        models.RemoteAllocation,
+                        allocation=allocation,
+                        user=user,
+                    )
+            except Exception as e:
+                logger.error(f"Unable to add user {user} to OpenPortal: {e}")
+
+        # Note that we don't remove remote users - the membership is solely
+        # managed by the PI on the remote system - we only add people here
+
     def assert_can_create_allocation_for_project(self, project):
         """
         This checks to see if the passed project is allowed to create an allocation
@@ -269,9 +348,94 @@ class OpenPortalBackend(ServiceBackend):
             + f"Allowed destinations are: {allowed_destinations}"
         )
 
+    def assert_can_create_remote_allocation_for_project(self, project):
+        """
+        This checks to see if the passed project is allowed to create an allocation
+        on the instance managed by this backend. Projects are only allowed to create
+        a single allocation per instance, and they must have a routing path
+        that matches the destination of this instance.
+        """
+        destination = str(self.client.destination())
+
+        logger.debug(
+            f"Asserting that project {project} can create an allocation for {destination}"
+        )
+
+        existing_allocations = self.get_remote_allocation_queryset().filter(
+            project=project
+        )
+
+        # find all of these allocations that are active and that have a project identifier
+        existing_allocations = [
+            allocation
+            for allocation in existing_allocations
+            if allocation.has_project_identifier()
+            and allocation.state != CoreStates.ERRED
+            and allocation.has_remote_project_identifier()
+        ]
+
+        if len(existing_allocations) > 0:
+            logger.error(
+                f"Project {project} already has existing remote allocation(s) in OpenPortal for {destination}"
+            )
+            logger.error(f"These are {existing_allocations}")
+            raise ServiceBackendError(
+                f"Project {project} already has an allocation for {destination} in OpenPortal. "
+                + "You may only have a single active allocation per destination per project. "
+                + f"The existing allocation(s) are: {existing_allocations}"
+            )
+
+        # now look at the allowed destinations for this project, from its
+        # project-info object
+        project_info, created = models.ProjectInfo.objects.get_or_create(
+            project=project
+        )
+        project_info.sanitise()
+
+        if (
+            project_info.allowed_destinations is None
+            or len(project_info.allowed_destinations.strip()) == 0
+        ):
+            # by default, projects can connect to any destination - this can be refined
+            # down as needed by the admin
+            logger.debug(
+                f"Project {project} is allowed to create an allocation for any destination"
+            )
+            return
+
+        allowed_destinations = project_info.allowed_destinations.split(",")
+
+        for allowed_destination in allowed_destinations:
+            allowed_destination = allowed_destination.strip()
+
+            # the allowed_destination is a regular expression, so we need to match it
+            if allowed_destination == destination:
+                # we have an exact match
+                return
+            elif allowed_destination == "*":
+                # this is a wildcard, so we allow it
+                return
+            else:
+                if re.match(allowed_destination, destination):
+                    # this is a match
+                    return
+
+        logger.error(
+            f"Project {project} is not allowed to create an allocation for {destination}"
+        )
+        logger.error(f"Allowed destinations are: {allowed_destinations}")
+
+        raise ServiceBackendError(
+            f"Project {project} is not allowed to create an allocation for {destination}. "
+            + f"Allowed destinations are: {allowed_destinations}"
+        )
+
     def _add_allocated_project(
         self, allocation: models.Allocation
     ) -> models.Allocation:
+        if not isinstance(allocation, models.Allocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
         self.assert_can_create_allocation_for_project(allocation.project)
 
         if allocation.has_project_identifier():
@@ -332,6 +496,67 @@ class OpenPortalBackend(ServiceBackend):
         allocation.save()
         return allocation
 
+    def _add_allocated_remote_project(
+        self, allocation: models.RemoteAllocation
+    ) -> models.RemoteAllocation:
+        if not isinstance(allocation, models.RemoteAllocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        self.assert_can_create_remote_allocation_for_project(allocation.project)
+
+        if allocation.has_project_identifier():
+            project = allocation.get_project_identifier()
+            logger.debug(f"Allocation already exists: {allocation} | {project}")
+
+            # add it again just to be sure
+            try:
+                remote_identifier = self.client.add_remote_project(project)
+            except Exception as e:
+                logger.warning(
+                    f"Unable to re-add project {project} to OpenPortal: {e}. This will be re-added later..."
+                )
+                return allocation
+
+            logger.debug(
+                f"Re-added allocation {allocation} to OpenPortal with remote identifier {remote_identifier}"
+            )
+            allocation.is_added = True
+            allocation.set_remote_project_identifier(remote_identifier)
+        else:
+            project = allocation.project
+            project_name = self.get_project_shortname(project)
+
+            logger.debug(
+                f"Creating allocation: {allocation} for project {project_name}"
+            )
+
+            if project_name is None or not project_name.strip():
+                logger.error(
+                    f"Empty project_name for allocation: {allocation} - cannot create in OpenPortal"
+                )
+                raise ServiceBackendError(
+                    f"Empty project_name for allocation. Please set a short name for {project}"
+                )
+
+            try:
+                remote_identifier = self.client.add_remote_project(
+                    project_name, project
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Unable to create OpenPortal project {project_name}: {e}. This will be created later..."
+                )
+                return allocation
+
+            logger.debug(
+                f"Created OpenPortal project {project_name} with remote identifier {remote_identifier}"
+            )
+            allocation.set_remote_project_identifier(remote_identifier)
+            allocation.is_added = True
+
+        allocation.save()
+        return allocation
+
     def add_allocated_project(self, allocation: models.Allocation) -> models.Allocation:
         allocation = self._add_allocated_project(allocation)
 
@@ -354,9 +579,39 @@ class OpenPortalBackend(ServiceBackend):
 
         return allocation
 
+    def add_allocated_remote_project(
+        self, allocation: models.RemoteAllocation
+    ) -> models.RemoteAllocation:
+        allocation = self._add_allocated_remote_project(allocation)
+
+        logger.debug(f"Allocation node limit is {allocation.node_limit}")
+
+        if allocation.has_project_identifier():
+            if (
+                allocation.is_added_to_openportal()
+                and allocation.has_remote_project_identifier()
+            ):
+                self.sync_remote_users(allocation)
+            else:
+                logger.warning(
+                    f"Allocation {allocation} is not yet in OpenPortal - not syncing users yet"
+                )
+        else:
+            logger.error(
+                f"Unable to create OpenPortal allocation for {allocation}: This will be created later..."
+            )
+            raise ServiceBackendError(
+                f"Unable to create OpenPortal allocation for {allocation}"
+            )
+
+        return allocation
+
     def check_added_allocation(
         self, allocation: models.Allocation
     ) -> models.Allocation:
+        if not isinstance(allocation, models.Allocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
         if allocation.has_project_identifier() and allocation.is_added_to_openportal():
             # all good
             return allocation
@@ -392,10 +647,57 @@ class OpenPortalBackend(ServiceBackend):
 
         return allocation
 
-    def create_remote_allocation(self, allocation):
-        logger.info(f"Creating remote allocation: {allocation}")
+    def check_added_remote_allocation(
+        self, allocation: models.RemoteAllocation
+    ) -> models.RemoteAllocation:
+        if not isinstance(allocation, models.RemoteAllocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        if (
+            allocation.has_project_identifier()
+            and allocation.has_remote_project_identifier()
+            and allocation.is_added_to_openportal()
+        ):
+            # all good
+            return allocation
+
+        # only try to add the project if the allocation is still valid.
+        # We don't want to get stuck in a loop continually trying
+        # to add an allocation that has been deleted
+        if allocation.state not in [
+            CoreStates.CREATION_SCHEDULED,
+            CoreStates.CREATING,
+            CoreStates.UPDATE_SCHEDULED,
+            CoreStates.UPDATING,
+            CoreStates.OK,
+        ]:
+            logger.warning(
+                f"Allocation {allocation} is in state {allocation.state} - cannot add to OpenPortal"
+            )
+            raise ServiceBackendError(
+                f"Allocation {allocation} is in state {allocation.state} - cannot add to OpenPortal"
+            )
+
+        allocation = self._add_allocated_remote_project(allocation)
+
+        if not (
+            allocation.has_project_identifier()
+            and allocation.is_added_to_openportal()
+            and allocation.has_remote_project_identifier()
+        ):
+            logger.error(
+                f"Allocation {allocation} could not be added to OpenPortal. Try again later."
+            )
+            raise ServiceBackendError(
+                f"Allocation {allocation} could not be added to OpenPortal. Try again later."
+            )
+
+        return allocation
 
     def create_allocation(self, allocation):
+        if not isinstance(allocation, models.Allocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
         allocation = self._add_allocated_project(allocation)
 
         default_limits = django_settings.WALDUR_OPENPORTAL["DEFAULT_LIMITS"]
@@ -420,10 +722,41 @@ class OpenPortalBackend(ServiceBackend):
                 f"Allocation {allocation} for project {allocation.project} has no project identifier - will try again later..."
             )
 
-    def delete_remote_allocation(self, allocation):
-        logger.info(f"Deleting remote allocation: {allocation}")
+    def create_remote_allocation(self, allocation):
+        if not isinstance(allocation, models.RemoteAllocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        allocation = self._add_allocated_remote_project(allocation)
+
+        default_limits = django_settings.WALDUR_OPENPORTAL["DEFAULT_LIMITS"]
+        allocation.node_limit = decimal.Decimal(default_limits["NODE"])
+        allocation.save()
+
+        if allocation.has_project_identifier():
+            if (
+                allocation.is_added_to_openportal()
+                and allocation.has_remote_project_identifier()
+            ):
+                # schedule syncing users as a background task so that we don't block the Waldur GUI
+                # If this fails, then another sync process will fix things later
+                from . import tasks
+
+                tasks.sync_remote_allocation_users.delay(
+                    core_utils.serialize_instance(allocation)
+                )
+            else:
+                logger.warning(
+                    f"Allocation {allocation} for project {allocation.project} is not in OpenPortal - cannot sync users"
+                )
+        else:
+            logger.warning(
+                f"Allocation {allocation} for project {allocation.project} has no project identifier - will try again later..."
+            )
 
     def delete_allocation(self, allocation):
+        if not isinstance(allocation, models.Allocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
         logger.info(f"Deleting allocation: {allocation}")
 
         if not (
@@ -444,6 +777,34 @@ class OpenPortalBackend(ServiceBackend):
         project = allocation.project
         if self.get_allocation_queryset().filter(project=project).count() == 0:
             self.delete_project(project)
+
+    def delete_remote_allocation(self, allocation):
+        if not isinstance(allocation, models.RemoteAllocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        logger.info(f"Deleting allocation: {allocation}")
+
+        if not (
+            allocation.has_project_identifier()
+            or allocation.is_added_to_openportal()
+            or allocation.has_remote_project_identifier()
+        ):
+            logger.debug(f"Allocation already deleted: {allocation}")
+        else:
+            try:
+                project = allocation.get_project_identifier()
+                self.client.delete_project(project)
+                allocation.remote_project_identifier = None
+                allocation.is_added = False
+                allocation.save()
+            except Exception as e:
+                logger.error(
+                    f"Unable to delete allocation {allocation} from OpenPortal: {e}"
+                )
+
+        project = allocation.project
+        if self.get_remote_allocation_queryset().filter(project=project).count() == 0:
+            self.delete_remote_project(project)
 
     def add_user(self, allocation: models.Allocation, user) -> bool:
         """
@@ -528,6 +889,20 @@ class OpenPortalBackend(ServiceBackend):
 
         return True
 
+    def add_remote_user(self, allocation: models.RemoteAllocation, user) -> bool:
+        """
+        Create association between user and OpenPortal account if it does not exist yet.
+        The allocation contains the information of which project the user is in.
+        """
+        if not isinstance(allocation, models.RemoteAllocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        logger.warning(
+            "Remote user management is not implemented in OpenPortal backend."
+        )
+
+        return False
+
     def delete_user(self, allocation: models.Allocation, user) -> bool:
         """
         Delete association between user and OpenPortal account if it exists.
@@ -601,8 +976,18 @@ class OpenPortalBackend(ServiceBackend):
             )
             return False
 
-    def set_remote_resource_limits(self, allocation):
-        logger.info(f"Setting remote resource limits for allocation: {allocation}")
+    def delete_remote_user(self, allocation: models.RemoteAllocation, user) -> bool:
+        """
+        Delete association between user and OpenPortal account if it exists.
+        """
+        if not isinstance(allocation, models.RemoteAllocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        logger.warning(
+            "Remote user management is not implemented in OpenPortal backend."
+        )
+
+        return False
 
     def set_resource_limits(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):
@@ -628,6 +1013,33 @@ class OpenPortalBackend(ServiceBackend):
                 f"Unable to set limit for project {project} to {limit} - got {set_limit}"
             )
 
+    def set_remote_resource_limits(self, allocation: models.RemoteAllocation):
+        if not isinstance(allocation, models.RemoteAllocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        allocation = self.check_added_remote_allocation(allocation)
+
+        if not (
+            allocation.has_project_identifier()
+            and allocation.has_remote_project_identifier()
+        ):
+            logger.error(
+                f"Allocation {allocation} has no project identifier - cannot set resource limits"
+            )
+            return
+
+        project = allocation.get_project_identifier()
+
+        limit = openportal.Usage.from_hours(allocation.node_limit)
+
+        logger.debug(f"Setting resource limit for allocation {project} to {limit}")
+        set_limit = self.client.set_remote_resource_limits(project, limit)
+
+        if set_limit.seconds != limit.seconds:
+            logger.error(
+                f"Unable to set limit for project {project} to {limit} - got {set_limit}"
+            )
+
     def get_resource_limits(
         self, project: openportal.ProjectIdentifier
     ) -> openportal.Usage:
@@ -636,7 +1048,14 @@ class OpenPortalBackend(ServiceBackend):
         logger.debug(f"OpenPortal limits for project {project}: {limit}")
         return limit
 
-    @transaction.atomic()
+    def get_remote_resource_limits(
+        self, project: openportal.ProjectIdentifier
+    ) -> openportal.Usage:
+        logger.debug(f"Getting OpenPortal limits for account: {project}")
+        limit = self.client.get_remote_resource_limits(project)
+        logger.debug(f"OpenPortal limits for project {project}: {limit}")
+        return limit
+
     def _update_usage_from_report(
         self,
         allocation,
