@@ -152,6 +152,110 @@ class Allocation(UsageMixin, structure_models.BaseResource):
         return self.__str__()
 
 
+class RemoteAllocation(UsageMixin, structure_models.BaseResource):
+    is_active = models.BooleanField(default=True)
+    tracker = FieldTracker()
+
+    node_limit = models.BigIntegerField(default=0)
+
+    # The ProjectIdentifier for the project in the remote OpenPortal instance
+    remote_project_identifier = models.CharField(
+        max_length=MAX_PROJECTIDENTIFIER_LENGTH,
+        blank=True,
+        null=True,
+        verbose_name=_("remote project identifier"),
+        help_text=_("The identifier of the project in the remote OpenPortal instance."),
+    )
+
+    # Whether or not the project has been successfully added to OpenPortal
+    is_added = models.BooleanField(default=False)
+
+    @classmethod
+    def get_url_name(cls):
+        return "openportal-remote-allocation"
+
+    def is_added_to_openportal(self):
+        return self.is_added
+
+    def usage_changed(self):
+        return any(self.tracker.has_changed(field) for field in utils.FIELD_NAMES)
+
+    def has_project_identifier(self) -> bool:
+        return bool(self.backend_id)
+
+    def set_project_identifier(self, project: openportal.ProjectIdentifier):
+        if not isinstance(project, openportal.ProjectIdentifier):
+            project = openportal.ProjectIdentifier(project)
+
+        if self.has_project_identifier():
+            if project != self.get_project_identifier():
+                raise ValueError(
+                    f"Project {project} does not match allocation {self.get_project_identifier()}"
+                )
+
+            return
+
+        self.backend_id = str(project)
+
+    def get_project_identifier(self) -> openportal.ProjectIdentifier:
+        if not self.has_project_identifier():
+            raise ValueError("ProjectIdentifier is not set!")
+
+        return openportal.ProjectIdentifier(self.backend_id)
+
+    def has_mapping(self) -> bool:
+        return self.has_project_identifier() and self.has_remote_project_identifier()
+
+    def get_mapping(self) -> openportal.ProjectMapping:
+        if not self.has_mapping():
+            raise ValueError("ProjectMapping is not set!")
+
+        return openportal.ProjectMapping(
+            f"{self.get_project_identifier()}:{self.get_remote_project_identifier()}"
+        )
+
+    def has_remote_project_identifier(self) -> bool:
+        return self.remote_project_identifier is not None
+
+    def set_remote_project_identifier(
+        self, remote_project: openportal.ProjectIdentifier
+    ):
+        if not isinstance(remote_project, openportal.ProjectIdentifier):
+            remote_project = openportal.ProjectIdentifier(remote_project)
+
+        if self.has_remote_project_identifier():
+            if remote_project != self.get_remote_project_identifier():
+                raise ValueError(
+                    f"Remote project {remote_project} does not match allocation {self.get_remote_project_identifier()}"
+                )
+
+            return
+
+        self.remote_project_identifier = str(remote_project)
+
+    def set_mapping(self, mapping: openportal.ProjectMapping):
+        if not isinstance(mapping, openportal.ProjectMapping):
+            mapping = openportal.ProjectMapping(mapping)
+
+        self.set_project_identifier(mapping.project)
+        self.set_remote_project_identifier(mapping.local_group)
+
+    @classmethod
+    def get_backend_fields(cls):
+        return super().get_backend_fields() + ("node_usage",)
+
+    def __str__(self):
+        if self.has_mapping():
+            return f"{self.name}|{self.get_mapping()}"
+        elif self.has_project_identifier():
+            return f"{self.name}|{self.get_project_identifier()}"
+        else:
+            return f"{self.name} (not in OpenPortal)"
+
+    def __repr__(self):
+        return self.__str__()
+
+
 class Association(core_models.UuidMixin):
     # This is the allocation to which the user is associated.
     allocation = models.ForeignKey(
@@ -283,6 +387,30 @@ class Association(core_models.UuidMixin):
         return self.__str__()
 
 
+class RemoteAssociation(core_models.UuidMixin):
+    # This is the allocation to which the user is associated.
+    allocation = models.ForeignKey(
+        to=RemoteAllocation,
+        on_delete=models.CASCADE,
+        related_name="op-remote_associations-remote_allocation+",
+    )
+
+    # This is the Waldur user which is associated with the allocation.
+    user = models.ForeignKey(
+        to=settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="op-remote_associations-user+",
+        blank=True,
+        null=True,
+    )
+
+    def __str__(self):
+        return f"{self.allocation} <-> {self.user}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
 class AllocationUserUsage(UsageMixin):
     """
     Allocation usage per user. This model is responsible for the allocation usage definition for particular user.
@@ -319,6 +447,36 @@ class AllocationUserUsage(UsageMixin):
         return self.__str__()
 
 
+class RemoteAllocationUserUsage(UsageMixin):
+    """
+    Allocation usage per user. This model is responsible for the allocation usage definition for particular user.
+    """
+
+    allocation = models.ForeignKey(
+        to=RemoteAllocation,
+        on_delete=models.CASCADE,
+        related_name="op-remote-allocationuser-remote-allocation+",
+    )
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(12)]
+    )
+
+    user = models.ForeignKey(
+        to=settings.AUTH_USER_MODEL,
+        related_name="op-remote-allocationuser-user+",
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+    )
+
+    def __str__(self):
+        return f"{self.user}: {self.allocation.name}"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
 class HistoricalAllocation(UsageMixin):
     """
     This model holds the historical usage of an allocation.
@@ -329,6 +487,37 @@ class HistoricalAllocation(UsageMixin):
 
     allocation = models.ForeignKey(
         to=Allocation, on_delete=models.CASCADE, related_name="op-historicalallocation+"
+    )
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(12)]
+    )
+    is_complete = models.BooleanField(default=False)
+
+    def __str__(self):
+        if self.is_complete:
+            return (
+                f"{self.allocation.name} [{self.year}-{self.month}]: {self.node_usage}"
+            )
+        else:
+            return f"{self.allocation.name} [{self.year}-{self.month}]: {self.node_usage} (incomplete)"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class HistoricalRemoteAllocation(UsageMixin):
+    """
+    This model holds the historical usage of an allocation.
+    It records the total usage per month, plus whether or not that
+    month is "complete" (i.e. the report from OpenPortal is complete
+    for that month, and no more usage will be added).
+    """
+
+    allocation = models.ForeignKey(
+        to=RemoteAllocation,
+        on_delete=models.CASCADE,
+        related_name="op-remote-historicalallocation+",
     )
     year = models.PositiveSmallIntegerField()
     month = models.PositiveSmallIntegerField(

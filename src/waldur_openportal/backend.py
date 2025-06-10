@@ -114,9 +114,14 @@ class OpenPortalBackend(ServiceBackend):
                 continue
 
             # get the association between the user and the allocation
-            (association, created) = models.Association.objects.get_or_create(
-                user=user, allocation=allocation
-            )
+            try:
+                (association, _) = models.Association.objects.get_or_create(
+                    user=user, allocation=allocation
+                )
+            except models.Association.MultipleObjectsReturned:
+                association = openportal_utils.get_association(
+                    user=user, allocation=allocation
+                )
 
             mapping = None
 
@@ -472,9 +477,14 @@ class OpenPortalBackend(ServiceBackend):
 
         # get or create the association between the user and the allocation
         # This association holds the username of the user in OpenPortal on this instance
-        (association, created) = models.Association.objects.get_or_create(
-            user=user, allocation=allocation
-        )
+        try:
+            (association, _) = models.Association.objects.get_or_create(
+                user=user, allocation=allocation
+            )
+        except models.Association.MultipleObjectsReturned:
+            association = openportal_utils.get_association(
+                user=user, allocation=allocation
+            )
 
         mapping = None
 

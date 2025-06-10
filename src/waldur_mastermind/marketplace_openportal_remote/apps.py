@@ -29,13 +29,15 @@ class MarketplaceOpenPortalRemoteConfig(AppConfig):
 
         signals.post_save.connect(
             handlers.update_component_quota,
-            sender=openportal_models.Allocation,
+            sender=openportal_models.RemoteAllocation,
             dispatch_uid="waldur_mastermind.marketplace_openportal_remote.update_component_quota",
         )
 
-        marketplace_handlers.connect_resource_handlers(openportal_models.Allocation)
+        marketplace_handlers.connect_resource_handlers(
+            openportal_models.RemoteAllocation
+        )
         marketplace_handlers.connect_resource_metadata_handlers(
-            openportal_models.Allocation
+            openportal_models.RemoteAllocation
         )
 
         USAGE = marketplace_models.OfferingComponent.BillingTypes.USAGE
@@ -62,21 +64,21 @@ class MarketplaceOpenPortalRemoteConfig(AppConfig):
             service_type=OpenPortalConfig.service_name,
         )
 
-        openportal_signals.openportal_association_created.connect(
+        openportal_signals.openportal_remote_association_created.connect(
             handlers.create_offering_user_for_openportal_remote_user,
-            sender=openportal_models.Allocation,
+            sender=openportal_models.RemoteAllocation,
             dispatch_uid="waldur_mastermind.marketplace_openportal_remote.create_offering_user_for_openportal_remote_user",
         )
 
-        openportal_signals.openportal_association_deleted.connect(
+        openportal_signals.openportal_remote_association_deleted.connect(
             handlers.drop_offering_user_for_openportal_remote_user,
-            sender=openportal_models.Allocation,
+            sender=openportal_models.RemoteAllocation,
             dispatch_uid="waldur_mastermind.marketplace_openportal_remote.drop_offering_user_for_openportal_remote_user",
         )
 
         signals.post_save.connect(
             handlers.sync_component_user_usage_when_allocation_user_usage_is_submitted,
-            sender=openportal_models.AllocationUserUsage,
+            sender=openportal_models.RemoteAllocationUserUsage,
             dispatch_uid="waldur_mastermind.marketplace_openportal_remote.sync_component_user_usage_when_allocation_user_usage_is_submitted",
         )
 
