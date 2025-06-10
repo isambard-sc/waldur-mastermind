@@ -35,9 +35,44 @@ def schedule_sync(*args, **kwargs):
     that all users are correctly associated with all projects and
     instances, and will add/remove users as needed
     """
-
     logger.info("Scheduling OpenPortal synchronization.")
+
+    logger.info(f"Args: {args}, Kwargs: {kwargs}")
+
+    # We will rate-limit by synchronizing only once per transaction.
+    # This is useful for when multiple changes are made in a single transaction,
+    # such as when a user is created and then immediately added to a project.
+    if transaction.get_connection().in_atomic_block:
+        logger.info("OpenPortal synchronization already scheduled in this transaction.")
+        return
+
+    logger.info(f"Args: {args}, Kwargs: {kwargs}")
+
     transaction.on_commit(lambda: tasks.sync.delay())
+
+
+@if_plugin_enabled
+def schedule_creation_sync(*args, **kwargs):
+    """
+    Schedule a synchronization of OpenPortal data after a new project or
+    customer is created. This will double-check that all users are correctly
+    associated with the project/customer, and will add/remove users as needed.
+    """
+
+    logger.info("Scheduling OpenPortal synchronization after creation.")
+    logger.info(f"Args: {args}, Kwargs: {kwargs}")
+
+
+@if_plugin_enabled
+def schedule_deletion_sync(*args, **kwargs):
+    """
+    Schedule a synchronization of OpenPortal data after a project or
+    customer is deleted. This will double-check that all users are correctly
+    associated with the project/customer, and will remove users as needed.
+    """
+
+    logger.info("Scheduling OpenPortal synchronization after deletion.")
+    logger.info(f"Args: {args}, Kwargs: {kwargs}")
 
 
 @if_plugin_enabled

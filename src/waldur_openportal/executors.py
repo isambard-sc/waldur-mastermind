@@ -45,5 +45,50 @@ class AllocationDeleteExecutor(core_executors.DeleteExecutor):
         )
 
 
+class RemoteAllocationCreateExecutor(core_executors.CreateExecutor):
+    @classmethod
+    def get_task_signature(cls, volume, serialized_allocation, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_allocation,
+            "create_remote_allocation",
+            state_transition="begin_creating",
+        )
+
+
+class RemoteAllocationSetLimitsExecutor(core_executors.ActionExecutor):
+    @classmethod
+    def get_task_signature(cls, allocation, serialized_allocation, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_allocation,
+            "set_remote_resource_limits",
+            state_transition="begin_updating",
+        )
+
+
+class RemoteAllocationPullExecutor(core_executors.ActionExecutor):
+    action = "Pull"
+
+    @classmethod
+    def get_task_signature(cls, volume, serialized_volume, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_volume,
+            "pull_remote_allocation",
+            state_transition="begin_updating",
+        )
+
+
+class RemoteAllocationDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, volume, serialized_allocation, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_allocation,
+            "delete_remote_allocation",
+            state_transition="begin_deleting",
+        )
+
+
 class OpenPortalCleanupExecutor(structure_executors.BaseCleanupExecutor):
-    executors = ((models.Allocation, AllocationDeleteExecutor),)
+    executors = (
+        (models.Allocation, AllocationDeleteExecutor),
+        (models.RemoteAllocation, RemoteAllocationDeleteExecutor),
+    )

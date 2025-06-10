@@ -22,14 +22,14 @@ class OpenPortalConfig(AppConfig):
 
         for model in (structure_models.Customer, structure_models.Project):
             signals.post_save.connect(
-                handlers.schedule_sync,
+                handlers.schedule_creation_sync,
                 sender=model,
                 dispatch_uid="waldur_openportal.handlers.schedule_sync_on_%s_creation"
                 % model.__class__,
             )
 
             signals.pre_delete.connect(
-                handlers.schedule_sync,
+                handlers.schedule_deletion_sync,
                 sender=model,
                 dispatch_uid="waldur_openportal.handlers.schedule_sync_on_%s_deletion"
                 % model.__class__,

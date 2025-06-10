@@ -11,14 +11,29 @@ def register_in(router):
         basename="openportal-allocation",
     )
     router.register(
+        r"openportal-remote-allocations",
+        views.RemoteAllocationViewSet,
+        basename="openportal-remote-allocation",
+    )
+    router.register(
         r"openportal-allocation-user-usage",
         views.AllocationUserUsageViewSet,
         basename="openportal-allocation-user-usage",
     )
     router.register(
+        r"openportal-remote-allocation-user-usage",
+        views.RemoteAllocationUserUsageViewSet,
+        basename="openportal-remote-allocation-user-usage",
+    )
+    router.register(
         r"openportal-associations",
         views.AssociationViewSet,
         basename="openportal-association",
+    )
+    router.register(
+        r"openportal-remote-associations",
+        views.RemoteAssociationViewSet,
+        basename="openportal-remote-association",
     )
     router.register(
         r"openportal-userinfo",

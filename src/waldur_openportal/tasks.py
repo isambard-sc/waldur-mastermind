@@ -124,6 +124,24 @@ def get_structure_allocations(structure):
         return []
 
 
+def get_structure_remote_allocations(structure):
+    """
+    Return all of the allocations associated with the passed object
+    """
+    if isinstance(structure, structure_models.Project):
+        return list(
+            models.RemoteAllocation.objects.filter(is_active=True, project=structure)
+        )
+    elif isinstance(structure, structure_models.Customer):
+        return list(
+            models.RemoteAllocation.objects.filter(
+                is_active=True, project__customer=structure
+            )
+        )
+    else:
+        return []
+
+
 @shared_task(name="waldur_openportal.add_allocated_project")
 def add_allocated_project(serialized_allocation):
     """
@@ -135,6 +153,12 @@ def add_allocated_project(serialized_allocation):
         allocation = serialized_allocation
     else:
         allocation = core_utils.deserialize_instance(serialized_allocation)
+
+        if not isinstance(allocation, models.Allocation):
+            logger.info(
+                f"Skipping allocation {allocation} - not an openportal.Allocation instance"
+            )
+            return
 
     openportal_backend: backend.OpenPortalBackend = allocation.get_backend()
     openportal_backend.add_allocated_project(allocation)
@@ -153,9 +177,9 @@ def update_user(serialized_user):
     else:
         user = core_utils.deserialize_instance(serialized_user)
 
-    if not isinstance(user, User):
-        logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
-        return
+        if not isinstance(user, User):
+            logger.info(f"Skipping user {user} - not a User instance")
+            return
 
     for allocation in utils.get_project_allocations(user):
         try:
@@ -186,6 +210,10 @@ def delete_user(serialized_user):
         user = serialized_user
     else:
         user = core_utils.deserialize_instance(serialized_user)
+
+        if not isinstance(user, User):
+            logger.info(f"Skipping user {user} - not a User instance")
+            return
 
     if not isinstance(user, User):
         logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
@@ -219,10 +247,40 @@ def sync_allocation_usage(serialized_allocation):
     else:
         allocation = core_utils.deserialize_instance(serialized_allocation)
 
+        if not isinstance(allocation, models.Allocation):
+            logger.info(
+                f"Skipping allocation {allocation} - not an Allocation instance"
+            )
+            return
+
     backend = allocation.get_backend()
 
     allocation = backend.check_added_allocation(allocation)
     backend.sync_usage(allocation)
+
+
+@shared_task(name="waldur_openportal.sync_remote_allocation_usage")
+def sync_remote_allocation_usage(serialized_allocation):
+    """
+    This task is called to synchronise the usage for the passed allocation
+    """
+    logger.info(f"task.sync_remote_allocation_usage: {serialized_allocation}")
+
+    if isinstance(serialized_allocation, models.RemoteAllocation):
+        allocation = serialized_allocation
+    else:
+        allocation = core_utils.deserialize_instance(serialized_allocation)
+
+        if not isinstance(allocation, models.RemoteAllocation):
+            logger.info(
+                f"Skipping allocation {allocation} - not a RemoteAllocation instance"
+            )
+            return
+
+    backend = allocation.get_backend()
+
+    allocation = backend.check_added_remote_allocation(allocation)
+    backend.sync_remote_usage(allocation)
 
 
 @shared_task(name="waldur_openportal.sync_allocation_users")
@@ -238,11 +296,43 @@ def sync_allocation_users(serialized_allocation):
     else:
         allocation = core_utils.deserialize_instance(serialized_allocation)
 
+        if not isinstance(allocation, models.Allocation):
+            logger.info(
+                f"Skipping allocation {allocation} - not an Allocation instance"
+            )
+            return
+
     backend = allocation.get_backend()
 
     allocation = backend.check_added_allocation(allocation)
 
     backend.sync_users(allocation)
+
+
+@shared_task(name="waldur_openportal.sync_remote_allocation_users")
+def sync_remote_allocation_users(serialized_allocation):
+    """
+    This task is called to synchronise the allocations for all users
+    associated with all allocations
+    """
+    logger.info(f"task.sync_remote_allocation_users: {serialized_allocation}")
+
+    if isinstance(serialized_allocation, models.RemoteAllocation):
+        allocation = serialized_allocation
+    else:
+        allocation = core_utils.deserialize_instance(serialized_allocation)
+
+        if not isinstance(allocation, models.RemoteAllocation):
+            logger.info(
+                f"Skipping allocation {allocation} - not a RemoteAllocation instance"
+            )
+            return
+
+    backend = allocation.get_backend()
+
+    allocation = backend.check_added_remote_allocation(allocation)
+
+    backend.sync_remote_users(allocation)
 
 
 @shared_task(name="waldur_openportal.sync_usage")
@@ -258,6 +348,20 @@ def sync_usage():
     for allocation in models.Allocation.objects.filter(is_active=True):
         try:
             sync_allocation_usage(allocation)
+        except Exception as e:
+            logger.error(f"Failed to sync usage for {allocation}: {e}")
+            fail_count += 1
+
+            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                logger.error("Too many failures - aborting")
+                return
+            elif (datetime.datetime.now() - now).seconds > 120:
+                logger.error("Took too long - aborting")
+                return
+
+    for allocation in models.RemoteAllocation.objects.filter(is_active=True):
+        try:
+            sync_remote_allocation_usage(allocation)
         except Exception as e:
             logger.error(f"Failed to sync usage for {allocation}: {e}")
             fail_count += 1
@@ -388,7 +492,21 @@ def sync():
                 if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                     logger.error("Too many failures - aborting")
                     break
-                elif (datetime.datetime.now() - now).seconds > 120:
+                elif (datetime.datetime.now() - now).seconds > 300:
+                    logger.error("Took too long - aborting")
+                    break
+
+        for allocation in get_structure_remote_allocations(customer):
+            try:
+                sync_remote_allocation_users(allocation)
+            except Exception as e:
+                logger.error(f"Failed to sync remote users for {allocation}: {e}")
+                fail_count += 1
+
+                if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                    logger.error("Too many failures - aborting")
+                    break
+                elif (datetime.datetime.now() - now).seconds > 300:
                     logger.error("Took too long - aborting")
                     break
 
@@ -406,6 +524,10 @@ def sync_project(serialized_project):
         project = serialized_project
     else:
         project = core_utils.deserialize_instance(serialized_project)
+
+        if not isinstance(project, structure_models.Project):
+            logger.info(f"Skipping project {project} - not a Project instance")
+            return
 
     now = datetime.datetime.now()
     fail_count = 0

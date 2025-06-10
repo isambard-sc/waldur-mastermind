@@ -51,12 +51,49 @@ class AllocationViewSet(structure_views.ResourceViewSet):
         )
 
 
+class RemoteAllocationViewSet(structure_views.ResourceViewSet):
+    queryset = models.RemoteAllocation.objects.all().order_by("name")
+    serializer_class = serializers.RemoteAllocationSerializer
+    filterset_class = filters.RemoteAllocationFilter
+
+    create_executor = executors.RemoteAllocationCreateExecutor
+    update_executor = core_executors.EmptyExecutor
+    pull_executor = executors.RemoteAllocationPullExecutor
+
+    destroy_permissions = [structure_permissions.is_administrator]
+    delete_executor = executors.RemoteAllocationDeleteExecutor
+
+    set_limits_permissions = [structure_permissions.is_staff]
+    set_limits_serializer_class = serializers.RemoteAllocationSetLimitsSerializer
+
+    @action(detail=True, methods=["post"])
+    def set_limits(self, request, uuid=None):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        executors.RemoteAllocationSetLimitsExecutor().execute(instance)
+        return response.Response(
+            {"status": _("Setting limits was scheduled.")},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
 class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = models.AllocationUserUsage.objects.all().order_by("year", "month")
     serializer_class = serializers.AllocationUserUsageSerializer
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.AllocationUserUsageFilter
+
+
+class RemoteAllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.RemoteAllocationUserUsage.objects.all().order_by("year", "month")
+    serializer_class = serializers.RemoteAllocationUserUsageSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.RemoteAllocationUserUsageFilter
 
 
 class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
@@ -66,6 +103,15 @@ class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.AssociationFilter
+
+
+class RemoteAssociationViewSet(viewsets.ReadOnlyModelViewSet):
+    lookup_field = "uuid"
+    queryset = models.RemoteAssociation.objects.all()
+    serializer_class = serializers.RemoteAssociationSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.RemoteAssociationFilter
 
 
 class UserInfoViewSet(core_views.ActionsViewSet):
@@ -101,8 +147,9 @@ class UserInfoViewSet(core_views.ActionsViewSet):
             logger.error(f"Error retrieving user {user} : {e}")
             return Response(status=status.HTTP_404_NOT_FOUND)
 
-        serializer = serializers.UserInfoSerializer(instance=userinfo,
-                                                    context={"request": request})
+        serializer = serializers.UserInfoSerializer(
+            instance=userinfo, context={"request": request}
+        )
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -116,8 +163,9 @@ class UserInfoViewSet(core_views.ActionsViewSet):
             logger.error(f"Error retrieving user {request.user}: {e}")
             return Response(status=status.HTTP_404_NOT_FOUND)
 
-        serializer = serializers.UserInfoSerializer(instance=userinfo,
-                                                    context={"request": request})
+        serializer = serializers.UserInfoSerializer(
+            instance=userinfo, context={"request": request}
+        )
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -138,7 +186,9 @@ class UserInfoViewSet(core_views.ActionsViewSet):
         user = userinfo.user
 
         if request.user != user and not request.user.is_staff:
-            logger.error(f"User {request.user} is not allowed to set shortname for user {user}")
+            logger.error(
+                f"User {request.user} is not allowed to set shortname for user {user}"
+            )
             return Response(status=status.HTTP_403_FORBIDDEN)
 
         try:
@@ -148,8 +198,9 @@ class UserInfoViewSet(core_views.ActionsViewSet):
             logger.error(f"Error setting shortname for user {user}: {e}")
             return Response(status=status.HTTP_400_BAD_REQUEST)
 
-        serializer = serializers.UserInfoSerializer(instance=userinfo,
-                                                    context={"request": request})
+        serializer = serializers.UserInfoSerializer(
+            instance=userinfo, context={"request": request}
+        )
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -158,10 +209,7 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
     queryset = models.ProjectInfo.objects.all().order_by("shortname")
     lookup_field = "project"
     serializer_class = serializers.ProjectInfoSerializer
-    permission_classes = [
-        permissions.IsAuthenticated,
-        IsAdminOrReadOnly
-    ]
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrReadOnly]
     filterset_class = filters.ProjectInfoFilter
 
     def _get(self, project):
@@ -185,8 +233,9 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
             logger.error(f"Error retrieving project {project} : {e}")
             return Response(status=status.HTTP_404_NOT_FOUND)
 
-        serializer = serializers.ProjectInfoSerializer(instance=projectinfo,
-                                                       context={"request": request})
+        serializer = serializers.ProjectInfoSerializer(
+            instance=projectinfo, context={"request": request}
+        )
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -207,7 +256,9 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
         project = projectinfo.project
 
         if not request.user.is_staff:
-            logger.error(f"User {request.user} is not allowed to set shortname for project {project}")
+            logger.error(
+                f"User {request.user} is not allowed to set shortname for project {project}"
+            )
             return Response(status=status.HTTP_403_FORBIDDEN)
 
         try:
@@ -217,8 +268,9 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
             logger.error(f"Error setting shortname for project {project}: {e}")
             return Response(status=status.HTTP_400_BAD_REQUEST)
 
-        serializer = serializers.ProjectInfoSerializer(instance=projectinfo,
-                                                       context={"request": request})
+        serializer = serializers.ProjectInfoSerializer(
+            instance=projectinfo, context={"request": request}
+        )
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -239,17 +291,22 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
         project = projectinfo.project
 
         if not request.user.is_staff:
-            logger.error(f"User {request.user} is not allowed to set allowed_destinations for project {project}")
+            logger.error(
+                f"User {request.user} is not allowed to set allowed_destinations for project {project}"
+            )
             return Response(status=status.HTTP_403_FORBIDDEN)
 
         try:
             projectinfo.set_allowed_destinations(allowed_destinations)
             projectinfo.save()
         except Exception as e:
-            logger.error(f"Error setting allowed_destinations for project {project}: {e}")
+            logger.error(
+                f"Error setting allowed_destinations for project {project}: {e}"
+            )
             return Response(status=status.HTTP_400_BAD_REQUEST)
 
-        serializer = serializers.ProjectInfoSerializer(instance=projectinfo,
-                                                       context={"request": request})
+        serializer = serializers.ProjectInfoSerializer(
+            instance=projectinfo, context={"request": request}
+        )
 
         return Response(serializer.data, status=status.HTTP_200_OK)

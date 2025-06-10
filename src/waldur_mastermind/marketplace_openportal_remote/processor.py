@@ -3,8 +3,8 @@ from waldur_openportal import models as openportal_models
 from waldur_openportal import views as openportal_views
 
 
-class CreateAllocationProcessor(processors.BaseCreateResourceProcessor):
-    viewset = openportal_views.AllocationViewSet
+class CreateRemoteAllocationProcessor(processors.BaseCreateResourceProcessor):
+    viewset = openportal_views.RemoteAllocationViewSet
 
     fields = (
         "name",
@@ -12,13 +12,13 @@ class CreateAllocationProcessor(processors.BaseCreateResourceProcessor):
     )
 
 
-class DeleteAllocationProcessor(processors.DeleteScopedResourceProcessor):
-    viewset = openportal_views.AllocationViewSet
+class DeleteRemoteAllocationProcessor(processors.DeleteScopedResourceProcessor):
+    viewset = openportal_views.RemoteAllocationViewSet
 
 
-class UpdateAllocationLimitsProcessor(processors.BasicUpdateResourceProcessor):
+class UpdateRemoteAllocationLimitsProcessor(processors.BasicUpdateResourceProcessor):
     def update_limits_process(self, user):
-        allocation: openportal_models.Allocation = self.order.resource.scope
+        allocation: openportal_models.RemoteAllocation = self.order.resource.scope
         allocation.schedule_updating()
         allocation.save(update_fields=["state"])
 

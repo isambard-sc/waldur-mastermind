@@ -46,8 +46,9 @@ class MarketplaceOpenPortalRemoteConfig(AppConfig):
 
         manager.register(
             PLUGIN_NAME,
-            create_resource_processor=processor.CreateAllocationProcessor,
-            delete_resource_processor=processor.DeleteAllocationProcessor,
+            create_resource_processor=processor.CreateRemoteAllocationProcessor,
+            update_resource_processor=processor.UpdateRemoteAllocationLimitsProcessor,
+            delete_resource_processor=processor.DeleteRemoteAllocationProcessor,
             can_update_limits=True,
             components=(
                 Component(

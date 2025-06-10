@@ -392,6 +392,9 @@ class OpenPortalBackend(ServiceBackend):
 
         return allocation
 
+    def create_remote_allocation(self, allocation):
+        logger.info(f"Creating remote allocation: {allocation}")
+
     def create_allocation(self, allocation):
         allocation = self._add_allocated_project(allocation)
 
@@ -416,6 +419,9 @@ class OpenPortalBackend(ServiceBackend):
             logger.warning(
                 f"Allocation {allocation} for project {allocation.project} has no project identifier - will try again later..."
             )
+
+    def delete_remote_allocation(self, allocation):
+        logger.info(f"Deleting remote allocation: {allocation}")
 
     def delete_allocation(self, allocation):
         logger.info(f"Deleting allocation: {allocation}")
@@ -595,6 +601,9 @@ class OpenPortalBackend(ServiceBackend):
             )
             return False
 
+    def set_remote_resource_limits(self, allocation):
+        logger.info(f"Setting remote resource limits for allocation: {allocation}")
+
     def set_resource_limits(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):
             raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
@@ -772,6 +781,9 @@ class OpenPortalBackend(ServiceBackend):
                 not is_current_month
             ) and report.is_complete
             historical_report.save()
+
+    def pull_remote_allocation(self, allocation):
+        logger.info(f"Pulling remote allocation: {allocation}")
 
     def pull_allocation(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):
