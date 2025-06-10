@@ -19,13 +19,13 @@ class MarketplaceOpenPortalRemoteConfig(AppConfig):
             processor,
         )
         from waldur_mastermind.marketplace_openportal_remote import (
-            registrators as openportal_registrators,
+            registrators as openportal_remote_registrators,
         )
         from waldur_openportal.apps import OpenPortalConfig
         from waldur_openportal import models as openportal_models
         from waldur_openportal import signals as openportal_signals
 
-        openportal_registrators.OpenPortalRemoteRegistrator.connect()
+        openportal_remote_registrators.OpenPortalRemoteRegistrator.connect()
 
         signals.post_save.connect(
             handlers.update_component_quota,

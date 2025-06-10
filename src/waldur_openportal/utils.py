@@ -117,9 +117,7 @@ def get_last_day_of_month(date):
     return next_month - timezone.timedelta(days=next_month.day)
 
 
-def get_association(
-    user: core_models.User, allocation: models.Allocation
-) -> models.Association:
+def get_association(user, allocation):
     """
     Return the association between the user and the allocation.
     """
