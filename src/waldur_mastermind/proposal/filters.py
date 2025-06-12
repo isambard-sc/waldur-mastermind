@@ -1,5 +1,4 @@
 import django_filters
-from django.contrib.auth import get_user_model
 from django.db.models import Q
 from django.utils import timezone
 from django_filters.widgets import BooleanWidget
@@ -13,7 +12,24 @@ from waldur_mastermind.proposal.enums import (
 
 from . import models
 
-User = get_user_model()
+
+class CallResourceTemplateFilter(django_filters.FilterSet):
+    call = core_filters.URLFilter(
+        view_name="proposal-protected-call-detail",
+        field_name="call__uuid",
+        label="Call",
+    )
+    call_uuid = django_filters.UUIDFilter(field_name="call__uuid")
+    requested_offering_uuid = django_filters.UUIDFilter(
+        field_name="requested_offering__uuid"
+    )
+    name = django_filters.CharFilter(lookup_expr="icontains")
+    is_required = django_filters.BooleanFilter()
+    o = django_filters.OrderingFilter(fields=("created", "name", "is_required"))
+
+    class Meta:
+        model = models.CallResourceTemplate
+        fields = []
 
 
 class CallManagingOrganisationFilter(django_filters.FilterSet):

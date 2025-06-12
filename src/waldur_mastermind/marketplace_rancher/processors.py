@@ -175,12 +175,13 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
         offering = self.order.offering
         rancher_offering = cast(Offering, offering.scope)
         if not rancher_offering:
+            name = f"{offering.name} (private)"
             rancher_offering = Offering.objects.create(
                 type=PLUGIN_NAME,
                 shared=False,
                 billable=False,
                 customer=offering.customer,
-                name=offering.name,
+                name=name,
                 description=offering.description,
                 plugin_options=offering.plugin_options,
                 secret_options=offering.secret_options,
@@ -243,14 +244,26 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
         }
 
         # TODO: consider lower wait timeout
-        order_uuid = submit_creation_order(
-            user,
-            rancher_offering,
-            plan,
-            self.order.project,
-            attributes,
-            order_wait_timeout=60 * 60,
-        )
+        try:
+            order_uuid = submit_creation_order(
+                user,
+                rancher_offering,
+                plan,
+                self.order.project,
+                attributes,
+                order_wait_timeout=60 * 60,
+            )
+        except exceptions.RancherException as e:
+            resource = self.order.resource
+            order_uuid_raw = str(e).split()[2]
+            order_uuid = order_uuid_raw.replace('"', "")
+            order = Order.objects.filter(uuid=order_uuid).first()
+            if order:
+                cluster_resource = order.resource
+                resource.scope = cluster_resource
+                resource.save()
+            raise
+
         return cast(Resource, Order.objects.get(uuid=order_uuid).resource)
 
     def format_node(
@@ -792,8 +805,20 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
 
 
 class ManagedRancherDeleteProcessor(processors.AbstractDeleteResourceProcessor):
-    def send_request(self, user, resource: Resource) -> None:
-        cluster = cast(rancher_models.Cluster, resource.scope)
-        tenant_resource = Resource.objects.get(scope=cluster.tenant)
-        submit_termination_order(resource)
-        submit_termination_order(tenant_resource)
+    def send_request(self, user, resource: Resource) -> bool:
+        resource.set_state_terminating()
+        resource.save(update_fields=["state"])
+
+        cluster_resource = cast(Resource, resource.scope)
+        if not cluster_resource:
+            return True
+        cluster = cast(rancher_models.Cluster, cluster_resource.scope)
+        tenant_resource = (
+            Resource.objects.filter(scope=cluster.tenant).first()
+            if cluster.tenant
+            else None
+        )
+        submit_termination_order(cluster_resource)
+        if tenant_resource:
+            submit_termination_order(tenant_resource)
+        return True

@@ -6,7 +6,6 @@ from typing import Literal
 import jwt
 from dateutil.parser import parse as parse_datetime
 from django import forms
-from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import transaction
@@ -2905,6 +2904,7 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             "last_sync",
             "order_in_progress",
             "creation_order",
+            "service_settings_uuid",
         )
         read_only_fields = (
             "backend_metadata",
@@ -2935,6 +2935,9 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
         read_only=True, source="backend_uuid", allow_null=True
     )
     resource_type = serializers.ReadOnlyField(source="backend_type")
+    service_settings_uuid = serializers.UUIDField(
+        read_only=True, source="scope.service_settings.uuid"
+    )
     project = serializers.HyperlinkedRelatedField(
         lookup_field="uuid",
         view_name="project-detail",
@@ -3012,16 +3015,14 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
         if offering_user:
             return offering_user.username
 
-    def get_limit_usage(self, resource: models.Resource) -> float | None:
+    def get_limit_usage(self, resource: models.Resource) -> dict[str, float]:
         if not resource.offering.is_limit_based or not resource.plan:
-            return
+            return {}
 
-        limit_usage = {}
+        limit_usage: dict[str, float] = {}
 
-        limit_components: list[models.OfferingComponent] = (
-            resource.offering.components.filter(
-                billing_type=models.OfferingComponent.BillingTypes.LIMIT
-            )
+        limit_components = resource.offering.components.filter(
+            billing_type=models.OfferingComponent.BillingTypes.LIMIT
         )
 
         for component in limit_components:
@@ -4450,7 +4451,7 @@ class MarketplaceProviderCustomerSerializer(ProviderOfferingCustomerSerializer):
         service_provider = self.context["service_provider"]
         user = self.context["view"].request.user
         ids = get_service_provider_user_ids(user, service_provider, customer)
-        return get_user_model().objects.filter(id__in=ids)
+        return User.objects.filter(id__in=ids)
 
     @extend_schema_field(NestedPriceEstimateSerializer)
     def get_billing_price_estimate(self, customer):
@@ -4554,6 +4555,24 @@ class ProviderOfferingSerializer(
         return request and permissions.can_see_secret_options(request, self.instance)
 
 
+class MoveOfferingSerializer(serializers.Serializer):
+    customer = serializers.HyperlinkedRelatedField(
+        queryset=structure_models.Customer.objects.all(),
+        view_name="customer-detail",
+        lookup_field="uuid",
+    )
+    preserve_permissions = serializers.BooleanField(required=True)
+
+    def validate(self, attrs):
+        customer = attrs.get("customer")
+        if not models.ServiceProvider.objects.filter(customer=customer).exists():
+            raise serializers.ValidationError(
+                {"customer": _("Customer must have a service provider profile.")}
+            )
+
+        return attrs
+
+
 class FingerprintSerializer(serializers.Serializer):
     md5 = serializers.CharField(read_only=True)
     sha256 = serializers.CharField(read_only=True)
@@ -4586,14 +4605,15 @@ class BaseServiceAccountSerializer(
 
 class BaseScopedServiceAccountSerializer(BaseServiceAccountSerializer):
     token = serializers.SerializerMethodField()
-    expiresAt = serializers.SerializerMethodField()
+    expires_at = serializers.SerializerMethodField()
 
     class Meta:
         model = models.ScopedServiceAccount
         fields = BaseServiceAccountSerializer.Meta.fields + (
             "token",
             "email",
-            "expiresAt",
+            "expires_at",
+            "preferred_identifier",
         )
         extra_kwargs = {
             "url": {
@@ -4602,14 +4622,16 @@ class BaseScopedServiceAccountSerializer(BaseServiceAccountSerializer):
             },
         }
 
+        protected_fields = ("preferred_identifier",)
+
     def get_token(self, obj) -> str | None:
         if hasattr(obj, "_token"):
             return obj._token
         return None
 
-    def get_expiresAt(self, obj) -> str | None:
-        if hasattr(obj, "_expiresAt"):
-            return obj._expiresAt
+    def get_expires_at(self, obj) -> str | None:
+        if hasattr(obj, "_expires_at"):
+            return obj._expires_at
         return None
 
 

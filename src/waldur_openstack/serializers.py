@@ -31,7 +31,10 @@ from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
-from waldur_core.core.validators import BackendURLValidator, validate_x509_certificate
+from waldur_core.core.validators import (
+    BackendURLValidator,
+    validate_x509_certificate,
+)
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.quotas.models import SharedQuotaMixin
 from waldur_core.quotas.serializers import QuotaSerializer
@@ -99,6 +102,12 @@ class OpenStackServiceSerializer(structure_serializers.ServiceOptionsSerializer)
         help_text=_(
             "List of coma-separated volume types which should not be possible to select when creating VM/Volume."
         ),
+        required=False,
+    )
+
+    live_resize_of_volumes_enabled = serializers.BooleanField(
+        source="options.live_resize_of_volumes_enabled",
+        default=False,
         required=False,
     )
 
@@ -787,20 +796,12 @@ def validate_private_subnet_cidr(value):
 
 def can_create_tenant(
     user: core_models.User,
-    service_settings: structure_models.ServiceSettings,
     project: structure_models.Project,
 ):
-    """Administrator can create tenant only using not shared service settings"""
-
-    message = _(
-        "You do not have permissions to create tenant in this project using selected service."
-    )
-    if service_settings.shared and not user.is_staff:
-        raise serializers.ValidationError(message)
-    if not service_settings.shared and not structure_permissions._has_admin_access(
-        user, project
-    ):
-        raise serializers.ValidationError(message)
+    if not structure_permissions._has_admin_access(user, project):
+        raise serializers.ValidationError(
+            _("You do not have permissions to create tenant.")
+        )
 
 
 class OpenStackTenantSerializer(structure_serializers.BaseResourceSerializer):
@@ -851,14 +852,6 @@ class OpenStackTenantSerializer(structure_serializers.BaseResourceSerializer):
                     del fields[field]
 
         return fields
-
-    def _validate_service_settings(
-        self,
-        service_settings: structure_models.ServiceSettings,
-        project: structure_models.Project,
-    ):
-        user = self.context["request"].user
-        can_create_tenant(user, service_settings, project)
 
     def validate_security_groups_configuration(self):
         plugin_settings = getattr(settings, "WALDUR_OPENSTACK", {})
@@ -944,7 +937,9 @@ class OpenStackTenantSerializer(structure_serializers.BaseResourceSerializer):
         attrs = super().validate(attrs)
 
         if not self.instance:
-            self._validate_service_settings(attrs["service_settings"], attrs["project"])
+            user = self.context["request"].user
+            project = attrs["project"]
+            can_create_tenant(user, project)
 
         self.validate_security_groups_configuration()
 
@@ -1158,10 +1153,15 @@ class OpenStackFixedIpField(serializers.JSONField):
     pass
 
 
-class OpenStackPortNestedSecurityGroupSerializer(serializers.ModelSerializer):
+class OpenStackPortNestedSecurityGroupSerializer(
+    core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
+):
     class Meta:
         model = models.SecurityGroup
-        fields = ("uuid", "name")
+        fields = ("uuid", "name", "url")
+        extra_kwargs = {
+            "url": {"lookup_field": "uuid", "view_name": "openstack-sgp-detail"}
+        }
 
 
 class OpenStackPortSerializer(structure_serializers.BaseResourceActionSerializer):
@@ -1682,6 +1682,10 @@ class OpenStackNestedPortSerializer(
         write_only=True,
         required=False,
     )
+    security_groups = OpenStackSecurityGroupSerializer(
+        read_only=True,
+        many=True,
+    )
 
     class Meta:
         model = models.Port
@@ -1698,6 +1702,7 @@ class OpenStackNestedPortSerializer(
             "device_id",
             "device_owner",
             "port",
+            "security_groups",
         )
         read_only_fields = (
             "mac_address",
@@ -1937,6 +1942,7 @@ class OpenStackVolumeSerializer(structure_serializers.BaseResourceSerializer):
         lookup_field="uuid",
     )
     tenant_uuid = serializers.UUIDField(read_only=True, source="tenant.uuid")
+    extend_enabled = serializers.BooleanField(read_only=True)
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.Volume
@@ -1961,6 +1967,7 @@ class OpenStackVolumeSerializer(structure_serializers.BaseResourceSerializer):
             "instance_marketplace_uuid",
             "tenant",
             "tenant_uuid",
+            "extend_enabled",
         )
         read_only_fields = (
             structure_serializers.BaseResourceSerializer.Meta.read_only_fields

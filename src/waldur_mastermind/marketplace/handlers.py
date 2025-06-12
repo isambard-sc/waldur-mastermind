@@ -7,6 +7,7 @@ from django.db import transaction
 from django.db.models import signals
 from django.utils.timezone import now
 
+import httpx
 from waldur_core.core import utils as core_utils
 from waldur_core.structure import models as structure_models
 from waldur_core.users import models as users_models
@@ -147,6 +148,44 @@ def notify_approvers_when_order_is_created(sender, instance, created=False, **kw
             transaction.on_commit(
                 lambda: tasks.notify_consumer_about_pending_order.delay(order.uuid)
             )
+
+
+def close_service_accounts_on_project_deletion(sender, instance, **kwargs):
+    project: structure_models.Project = instance
+
+    service_accounts = models.ProjectServiceAccount.objects.filter(project=project)
+    if not service_accounts.exists():
+        return
+
+    for service_account in service_accounts:
+        try:
+            utils.delete_service_account(service_account)
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.error(
+                "Failed to request deletion of service account %s for project %s: %s",
+                service_account,
+                project,
+                exc,
+            )
+            continue
+
+
+def close_customer_service_accounts_on_customer_deletion(sender, instance, **kwargs):
+    customer: structure_models.Customer = instance
+    service_accounts = models.CustomerServiceAccount.objects.filter(customer=customer)
+    if not service_accounts.exists():
+        return
+    for service_account in service_accounts:
+        try:
+            utils.delete_service_account(service_account)
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.error(
+                "Failed to request deletion of service account %s for customer %s: %s",
+                service_account,
+                customer,
+                exc,
+            )
+            continue
 
 
 def process_invitations_and_orders_when_project_start_date_is_unset(
@@ -681,13 +720,19 @@ def offering_component_has_been_created_or_updated(
             },
         )
     else:
-        event_logger.marketplace_offering_component.info(
-            f"Offering component {instance.name} has been updated.",
-            event_type="marketplace_offering_component_updated",
-            event_context={
-                "offering_component": instance,
-            },
-        )
+        changes = [
+            f"{field}: {instance.tracker.previous(field)} -> {getattr(instance, field, None)}"
+            for field in instance.tracker.changed()
+        ]
+        if changes:
+            diff = ", ".join(changes)
+            event_logger.marketplace_offering_component.info(
+                f"Offering component {instance.name} has been updated. Details: {diff}.",
+                event_type="marketplace_offering_component_updated",
+                event_context={
+                    "offering_component": instance,
+                },
+            )
 
 
 def offering_component_has_been_deleted(sender, instance, **kwargs):
@@ -719,13 +764,21 @@ def plan_has_been_created_or_updated(sender, instance, created=False, **kwargs):
                 },
             )
         else:
-            event_logger.marketplace_plan.info(
-                f"Plan {instance.name} has been updated.",
-                event_type="marketplace_plan_updated",
-                event_context={
-                    "plan": instance,
-                },
-            )
+            excluded_fields = {"modified", "created"}
+            changes = [
+                f"{field}: {instance.tracker.previous(field)} -> {getattr(instance, field, None)}"
+                for field in instance.tracker.changed()
+                if field not in excluded_fields
+            ]
+            if changes:
+                diff = ", ".join(changes)
+                event_logger.marketplace_plan.info(
+                    f"Plan {instance.name} has been updated. Details: {diff}.",
+                    event_type="marketplace_plan_updated",
+                    event_context={
+                        "plan": instance,
+                    },
+                )
 
 
 def offering_has_been_created_or_updated(sender, instance, created=False, **kwargs):

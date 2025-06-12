@@ -20,6 +20,7 @@ from rest_framework import status, test
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.tests.helpers import load_json_resource
+from waldur_core.logging import models as event_models
 from waldur_core.media.utils import dummy_image
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
@@ -1251,6 +1252,36 @@ class OfferingComponentUpdateTest(BaseOfferingUpdateTest):
         self.assertEqual(
             models.OfferingComponent.BillingTypes.FIXED, component.billing_type
         )
+
+    def test_update_event_includes_changes(self):
+        """
+        Test that the update event for offering component includes the changes in message.
+        """
+        # Arrange
+        component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="cores",
+            name="CPU",
+        )
+
+        # Act
+        self.update_offering_component(
+            {
+                "type": "cores",
+                "name": "NewName",
+                "measured_unit": "hours",
+                "billing_type": "fixed",
+                "uuid": component.uuid.hex,
+            },
+            "owner",
+        )
+
+        # Assert
+        event = event_models.Event.objects.filter(
+            event_type="marketplace_offering_component_updated"
+        ).first()
+        self.assertIn("name: CPU -> NewName", event.message)
+        self.assertIn("measured_unit:  -> hours", event.message)
 
 
 @ddt
@@ -2781,3 +2812,43 @@ class ProviderOfferingOrdersTest(test.APITransactionTestCase):
             status.HTTP_401_UNAUTHORIZED,
             f"Response status code is {response.status_code}, expected 401 Unauthorized",
         )
+
+
+class OfferingMoveTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.offering = self.fixture.offering
+        self.url = factories.OfferingFactory.get_url(self.offering, "move_offering")
+        self.offering.customer = self.fixture.customer
+        self.offering.save()
+        self.valid_customer = structure_factories.CustomerFactory()
+        factories.ServiceProviderFactory(customer=self.valid_customer)
+        self.invalid_customer = structure_factories.CustomerFactory()
+
+    def _move_offering(self, customer):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = {
+            "customer": structure_factories.CustomerFactory.get_url(customer),
+            "preserve_permissions": True,
+        }
+        return self.client.post(self.url, payload)
+
+    def test_move_offering_positive(self):
+        response = self._move_offering(self.valid_customer)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.customer, self.valid_customer)
+
+    def test_move_offering_fails_with_blocked_customer(self):
+        self.valid_customer.blocked = True
+        self.valid_customer.save()
+
+        response = self._move_offering(self.valid_customer)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.offering.customer, self.fixture.customer)
+
+    def test_move_offering_fails_when_target_customer_does_not_have_sp_profile(self):
+        response = self._move_offering(self.invalid_customer)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.offering.customer, self.fixture.customer)

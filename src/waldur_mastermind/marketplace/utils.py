@@ -7,13 +7,13 @@ import re
 import textwrap
 import traceback
 import unicodedata
+import uuid
 from collections import defaultdict
 from enum import Enum
 from io import BytesIO
 
 from constance import config
 from django.conf import settings
-from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.files.base import ContentFile
@@ -33,9 +33,14 @@ from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
+from waldur_core.core.models import User
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.models import UserRole
-from waldur_core.permissions.utils import get_users_with_permission, has_permission
+from waldur_core.permissions.utils import (
+    get_permissions,
+    get_users_with_permission,
+    has_permission,
+)
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
@@ -64,7 +69,6 @@ from waldur_mastermind.marketplace_slurm_remote import (
 from . import PLUGIN_NAME as BASIC_PLUGIN_NAME
 from . import models, plugins
 
-User = get_user_model()
 logger = logging.getLogger(__name__)
 USERNAME_ANONYMIZED_POSTFIX_LENGTH = 5
 USERNAME_POSTFIX_LENGTH = 2
@@ -517,7 +521,7 @@ def get_marketplace_category_uuid(serializer, scope) -> str | None:
         return
 
 
-def get_marketplace_category_name(serializer, scope) -> str:
+def get_marketplace_category_name(serializer, scope) -> str | None:
     try:
         return models.Resource.objects.get(scope=scope).offering.category.title
     except ObjectDoesNotExist:
@@ -1640,10 +1644,140 @@ def notification_about_project_ending(end_date):
         )
 
 
+# Mock data generators for service accounts
+def generate_mock_service_account_response(username: str) -> dict:
+    """Generate a mock service account response that matches the GetServiceAccountResponse schema."""
+    now = datetime.datetime.now()
+    return {
+        "serviceAccount": {
+            "createdAt": now.isoformat(),
+            "updatedAt": now.isoformat(),
+            "type": "service_account",
+            "status": "active",
+            "disabledDate": None,
+            "username": username,
+            "email": "mock@example.com",
+            "description": "Mock service account for testing",
+            "unixUid": 5000 + hash(username) % 1000,  # Generate consistent UID
+            "homeDir": f"/home/{username}",
+            "shell": "/bin/bash",
+            "targetType": "project",
+            "targetIdentifier": f"mock-project-{username[:8]}",
+            "apiKeyExpiresAt": (now + datetime.timedelta(days=90)).isoformat(),
+            "apiKeyTtl": 7776000,  # 90 days in seconds
+            "owner": None,
+            "project": None,
+        }
+    }
+
+
+def generate_mock_api_key_rotation_response(username: str) -> dict:
+    """Generate a mock API key rotation response that matches GetServiceAccountWithApiKeyResponse schema."""
+    now = datetime.datetime.now()
+    expires_at = now + datetime.timedelta(days=90)
+    ttl = 7776000  # 90 days in seconds
+
+    return {
+        "serviceAccount": {
+            "createdAt": (now - datetime.timedelta(days=30)).isoformat(),
+            "updatedAt": now.isoformat(),
+            "type": "service_account",
+            "status": "active",
+            "disabledDate": None,
+            "username": username,
+            "email": "mock@example.com",
+            "description": "Mock service account for testing",
+            "unixUid": 5000 + hash(username) % 1000,
+            "homeDir": f"/home/{username}",
+            "shell": "/bin/bash",
+            "targetType": "project",
+            "targetIdentifier": f"mock-project-{username[:8]}",
+            "apiKeyExpiresAt": expires_at.isoformat(),
+            "apiKeyTtl": ttl,
+            "owner": None,
+            "project": None,
+        },
+        "apiKey": {
+            "apiKey": f"rotated-mock-api-key-{username}-{uuid.uuid4().hex[:8]}",
+            "createdAt": now.isoformat(),
+            "expiresAt": expires_at.isoformat(),
+            "ttl": ttl,
+        },
+    }
+
+
+def generate_mock_service_account_creation_response(
+    service_account: dict, username: str, scope_type: str
+) -> dict:
+    """Generate a mock service account creation response that matches GetServiceAccountWithApiKeyResponse schema."""
+    now = datetime.datetime.now()
+    expires_at = now + datetime.timedelta(days=90)
+    ttl = 7776000  # 90 days in seconds
+    mock_username = service_account.get(
+        "preferred_identifier", f"mock-{uuid.uuid4().hex[:8]}"
+    )
+
+    return {
+        "serviceAccount": {
+            "createdAt": now.isoformat(),
+            "updatedAt": now.isoformat(),
+            "type": "service_account",
+            "status": "active",
+            "disabledDate": None,
+            "username": mock_username,
+            "email": service_account.get("email", "mock@example.com"),
+            "description": service_account.get("description", "Mock service account"),
+            "unixUid": 5000 + hash(mock_username) % 1000,
+            "homeDir": f"/home/{mock_username}",
+            "shell": "/bin/bash",
+            "targetType": scope_type,
+            "targetIdentifier": service_account.get("scope_slug", "mock-scope"),
+            "apiKeyExpiresAt": expires_at.isoformat(),
+            "apiKeyTtl": ttl,
+            "owner": None,
+            "project": None,
+        },
+        "apiKey": {
+            "apiKey": f"mock-api-key-{uuid.uuid4().hex[:16]}",
+            "createdAt": now.isoformat(),
+            "expiresAt": expires_at.isoformat(),
+            "ttl": ttl,
+        },
+    }
+
+
+def generate_mock_service_account_update_response(service_account) -> dict:
+    """Generate a mock service account update response that matches GetServiceAccountResponse schema."""
+    now = datetime.datetime.now()
+    return {
+        "serviceAccount": {
+            "createdAt": (now - datetime.timedelta(days=30)).isoformat(),
+            "updatedAt": now.isoformat(),
+            "type": "service_account",
+            "status": "active",
+            "disabledDate": None,
+            "username": service_account.username,
+            "email": service_account.email,
+            "description": service_account.description,
+            "unixUid": 5000 + hash(service_account.username) % 1000,
+            "homeDir": f"/home/{service_account.username}",
+            "shell": "/bin/bash",
+            "targetType": "project",
+            "targetIdentifier": f"mock-project-{service_account.username[:8]}",
+            "apiKeyExpiresAt": (now + datetime.timedelta(days=90)).isoformat(),
+            "apiKeyTtl": 7776000,
+            "owner": None,
+            "project": None,
+        }
+    }
+
+
 def get_service_account_api_token():
     token_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_URL"]
     client_id = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_CLIENT_ID"]
     client_secret = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_SECRET"]
+
+    token_url = token_url.rstrip("/")
 
     token_request_headers = {
         "Accept": "application/json",
@@ -1656,7 +1790,10 @@ def get_service_account_api_token():
     }
     try:
         token_response = httpx.post(
-            token_url, data=token_params, headers=token_request_headers
+            token_url,
+            data=token_params,
+            headers=token_request_headers,
+            follow_redirects=True,
         )
         token_response.raise_for_status()
         # Extract the token
@@ -1671,15 +1808,25 @@ def get_service_account_api_token():
 
 
 def rotate_service_account_api_key(service_account: models.ScopedServiceAccount):
+    if config.ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for rotate_service_account_api_key: {service_account.username}"
+        )
+        return generate_mock_api_key_rotation_response(service_account.username)
+
     service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
     if not service_account_url:
         raise ValueError("URL for service accounts is not configured")
+
+    service_account_url = service_account_url.rstrip("/")
     try:
         api_access_token = get_service_account_api_token()
 
+        url = f"{service_account_url}/{service_account.username}/rotate-api-key"
         response = httpx.put(
-            f"{service_account_url}{service_account.username}/rotate-api-key/",
+            url,
             headers={"Authorization": f"Bearer {api_access_token}"},
+            follow_redirects=True,
         )
         response.raise_for_status()
         return response.json()
@@ -1689,50 +1836,67 @@ def rotate_service_account_api_key(service_account: models.ScopedServiceAccount)
 
 
 def post_service_account_to_url(
-    url: str, service_account: models.ScopedServiceAccount, username: str = ""
+    url: str, service_account: dict, username: str = "", scope_type: str = ""
 ):
     try:
         api_access_token = get_service_account_api_token()
-        if isinstance(service_account, models.ProjectServiceAccount):
-            customer = service_account.project.customer
-            scope_name = service_account.project.name
-            scope_slug = service_account.project.slug
-            scope_type = "project"
-        elif isinstance(service_account, models.CustomerServiceAccount):
-            customer = service_account.customer
+        if scope_type == "project":
+            project: structure_models.Project = service_account["project"]
+            customer = project.customer
+            scope_name = project.name
+            scope_slug = project.slug
+            scope_offering_slugs = []
+            offering_slugs = set(
+                project.resource_set.exclude(
+                    state=ResourceStates.TERMINATED
+                ).values_list("offering__slug", flat=True)
+            )
+        elif scope_type == "customer":
+            customer: structure_models.Customer = service_account["customer"]
             scope_name = customer.name
             scope_slug = customer.slug
-            scope_type = "customer"
-        else:
-            raise ValueError(
-                f"Unsupported service account type: {type(service_account)}"
+            offering_slugs = set(
+                models.Resource.objects.exclude(state=ResourceStates.TERMINATED)
+                .filter(project__customer=customer)
+                .values_list("offering__slug", flat=True)
             )
+        else:
+            raise ValueError(f"Unsupported service account type: {scope_type}")
+
+        scope_offering_slugs = list(offering_slugs)
 
         payload = {
             "ownerUsername": username,
-            "username": service_account.username,
+            "preferredIdentifier": service_account["preferred_identifier"],
             "email": customer.email,
-            "description": service_account.description,
+            "description": service_account.get("description", ""),
             "scopeType": scope_type,
             "scopeName": scope_name,
             "scopeSlug": scope_slug,
+            "scopeOfferingSlugs": scope_offering_slugs,
         }
 
         headers = {"Authorization": f"Bearer {api_access_token}"}
-        response = httpx.post(url, json=payload, headers=headers)
+        response = httpx.post(url, json=payload, headers=headers, follow_redirects=True)
         response.raise_for_status()
         logger.info("Service account has been successfully updated at %s", url)
         return response
-    except (httpx.HTTPError, ValueError) as e:
+    except (httpx.HTTPError, ValueError, KeyError) as e:
         logger.error("Request to %s failed: %s", url, e)
         raise
 
 
-def create_service_account(service_account: models.ScopedServiceAccount, username: str):
+def create_service_account(service_account: dict, username: str, scope_type: str):
     """
     Makes a synchronous call to the webhook URL to create a service account.
     Raises exceptions on failure which should be handled by the viewset.
     """
+    if config.ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND:
+        logger.info("Mock mode enabled for create_service_account")
+        return generate_mock_service_account_creation_response(
+            service_account, username, scope_type
+        )
+
     if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
         return
 
@@ -1740,36 +1904,59 @@ def create_service_account(service_account: models.ScopedServiceAccount, usernam
     if not service_account_url:
         raise ValueError("URL for service accounts is not configured")
 
+    service_account_url = service_account_url.rstrip("/")
+
     try:
         response = post_service_account_to_url(
-            service_account_url, service_account, username
+            service_account_url, service_account, username, scope_type
         )
         return response.json()
     except (httpx.HTTPError, ValueError) as exc:
         logger.error(exc)
-        service_account.error_message = str(exc)
-        service_account.error_traceback = traceback.format_exc()
-        service_account.save(update_fields=["error_message", "error_traceback"])
         raise
 
 
-def delete_service_account(service_account):
+def delete_service_account(service_account: models.ScopedServiceAccount):
     """
     Makes a synchronous call to the webhook URL to remove a service account.
     Raises exceptions on failure which should be handled by the viewset.
     """
+    if config.ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for delete_service_account: {service_account.username}"
+        )
+        # Generate a response showing the account as closed before deleting
+        response = generate_mock_service_account_response(service_account.username)
+        response["serviceAccount"]["status"] = "closed"
+        response["serviceAccount"]["disabledDate"] = datetime.datetime.now().isoformat()
+        service_account.delete()
+        return response
+
     if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
         return
 
     service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
     if not service_account_url:
-        raise RuntimeError("URL for service accounts is not configured")
+        raise ValidationError("URL for service accounts is not configured")
+
+    service_account_url = service_account_url.rstrip("/")
 
     try:
         api_access_token = get_service_account_api_token()
-        response = httpx.delete(
-            f"{service_account_url}{service_account.username}",
+        existing_service_account = get_service_account(service_account)
+        if existing_service_account is None:
+            logger.warning(
+                "Service account %s not found at backend, deleting locally",
+                service_account.username,
+            )
+            service_account.delete()
+            return
+
+        url = f"{service_account_url}/{service_account.username}/close"
+        response = httpx.put(
+            url,
             headers={"Authorization": f"Bearer {api_access_token}"},
+            follow_redirects=True,
         )
         response.raise_for_status()
         if response.status_code == 200:
@@ -1780,3 +1967,110 @@ def delete_service_account(service_account):
         service_account.error_traceback = traceback.format_exc()
         service_account.save(update_fields=["error_message", "error_traceback"])
         raise
+
+
+def get_service_account(service_account: models.ScopedServiceAccount):
+    """
+    Makes a synchronous call to the webhook URL to get a service account.
+    Raises exceptions on failure which should be handled by the viewset.
+    """
+    if config.ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for get_service_account: {service_account.username}"
+        )
+        return generate_mock_service_account_response(service_account.username)
+
+    if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
+        return
+
+    service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
+    if not service_account_url:
+        raise ValidationError("URL for service accounts is not configured")
+
+    service_account_url = service_account_url.rstrip("/")
+
+    try:
+        api_access_token = get_service_account_api_token()
+        url = f"{service_account_url}/{service_account.username}"
+        response = httpx.get(
+            url,
+            headers={"Authorization": f"Bearer {api_access_token}"},
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            logger.warning("Service account %s not found", service_account.username)
+            return None
+        raise
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(exc)
+        raise
+
+
+def update_service_account(service_account: models.ScopedServiceAccount):
+    """
+    Makes a synchronous call to the webhook URL to update a service account email or/and description fields.
+    Raises exceptions on failure which should be handled by the viewset.
+    """
+    if config.ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for update_service_account: {service_account.username}"
+        )
+        return generate_mock_service_account_update_response(service_account)
+
+    if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
+        return
+
+    service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
+    if not service_account_url:
+        raise ValidationError("URL for service accounts is not configured")
+
+    service_account_url = service_account_url.rstrip("/")
+
+    try:
+        api_access_token = get_service_account_api_token()
+        url = f"{service_account_url}/{service_account.username}"
+
+        response = httpx.put(
+            url,
+            headers={"Authorization": f"Bearer {api_access_token}"},
+            follow_redirects=True,
+            json={
+                "email": service_account.email,
+                "description": service_account.description,
+            },
+        )
+        return response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(exc)
+        raise
+
+
+@transaction.atomic
+def move_offering(
+    offering: models.Offering,
+    target_customer: structure_models.Customer,
+    current_user=None,
+    preserve_permissions=False,
+):
+    if target_customer.blocked:
+        raise rf_exceptions.ValidationError(
+            _("Target provider's customer can not be blocked.")
+        )
+
+    if offering.customer == target_customer:
+        raise rf_exceptions.ValidationError(
+            _("Offering is already assigned to the target provider.")
+        )
+
+    offering.customer = target_customer
+    offering.save(update_fields=["customer"])
+
+    if not preserve_permissions:
+        for permission in get_permissions(offering):
+            permission.revoke(current_user)
+            logger.info(f"Permission {permission} has been revoked")
+
+    logger.info("Offering %s has been moved to provider %s", offering, target_customer)

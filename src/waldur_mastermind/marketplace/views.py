@@ -7,7 +7,6 @@ import uuid
 import reversion
 from constance import config
 from dateutil.relativedelta import relativedelta
-from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection, transaction
 from django.db.models import (
@@ -53,6 +52,7 @@ from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.mixins import EagerLoadMixin
+from waldur_core.core.models import User
 from waldur_core.core.renderers import PlainTextRenderer
 from waldur_core.core.serializers import EmptySerializer
 from waldur_core.core.utils import (
@@ -85,6 +85,7 @@ from waldur_core.structure import utils as structure_utils
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_core.structure.executors import ServiceSettingsPullExecutor
 from waldur_core.structure.managers import (
+    filter_queryset_by_user_ip,
     filter_queryset_for_user,
     get_connected_customers,
     get_connected_customers_by_permission,
@@ -127,8 +128,6 @@ from waldur_pid import models as pid_models
 from . import filters, log, models, permissions, plugins, serializers, tasks, utils
 
 logger = logging.getLogger(__name__)
-
-User = get_user_model()
 
 
 class BaseMarketplaceView(core_views.ActionsViewSet):
@@ -2222,6 +2221,31 @@ class ProviderOfferingViewSet(
             data=serializer.data,
         )
 
+    @extend_schema(
+        request=serializers.MoveOfferingSerializer,
+        responses=serializers.PublicOfferingDetailsSerializer,
+    )
+    @action(detail=True, methods=["post"])
+    def move_offering(self, request, uuid=None):
+        offering = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        target_customer = serializer.validated_data["customer"]
+        preserve_permissions = serializer.validated_data["preserve_permissions"]
+
+        utils.move_offering(
+            offering, target_customer, request.user, preserve_permissions
+        )
+        serialized_offering = serializers.PublicOfferingDetailsSerializer(
+            offering, context={"view": self, "request": request}
+        )
+
+        return Response(serialized_offering.data, status=status.HTTP_200_OK)
+
+    move_offering_serializer_class = serializers.MoveOfferingSerializer
+    move_offering_permissions = [structure_permissions.is_staff]
+
 
 class PublicOfferingViewSet(rf_viewsets.ReadOnlyModelViewSet):
     queryset = models.Offering.objects.filter()
@@ -3000,10 +3024,15 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
         resource: models.Resource = self.get_object()
         if not resource.scope:
             return Response(status=status.HTTP_404_NOT_FOUND)
+        if isinstance(resource.scope, models.Resource):
+            serializer = serializers.ResourceSerializer(
+                instance=resource.scope, context=self.get_serializer_context()
+            )
+            return Response(serializer.data, status=status.HTTP_200_OK)
         resource_type = get_resource_type(resource.scope)
         serializer_class = get_resource_serializer_class(resource_type)
         if not serializer_class:
-            return Response(status.HTTP_204_NO_CONTENT)
+            return Response(status=status.HTTP_204_NO_CONTENT)
         serializer = serializer_class(
             instance=resource.scope, context=self.get_serializer_context()
         )
@@ -3317,7 +3346,8 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
 
 class ConsumerResourceViewSet(BaseResourceViewSet):
     def get_queryset(self):
-        return self.queryset.filter_for_service_consumer(self.request.user)
+        queryset = self.queryset.filter_for_service_consumer(self.request.user)
+        return filter_queryset_by_user_ip(queryset, self.request)
 
     @action(detail=False, methods=["post"])
     def suggest_name(self, request, *args, **kwargs):
@@ -3751,6 +3781,10 @@ class ComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
     filterset_class = filters.ComponentUsageFilter
     serializer_class = serializers.ComponentUsageSerializer
 
+    @extend_schema(
+        request=serializers.ComponentUsageCreateSerializer,
+        responses={status.HTTP_201_CREATED: None},
+    )
     @transaction.atomic
     @action(detail=False, methods=["post"])
     def set_usage(self, request, *args, **kwargs):
@@ -3772,6 +3806,10 @@ class ComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
 
     set_usage_serializer_class = serializers.ComponentUsageCreateSerializer
 
+    @extend_schema(
+        request=serializers.ComponentUserUsageCreateSerializer,
+        responses={status.HTTP_201_CREATED: None},
+    )
     @action(detail=True, methods=["post"])
     def set_user_usage(self, request, *args, **kwargs):
         component_usage: models.ComponentUsage = self.get_object()
@@ -4733,25 +4771,70 @@ class BaseServiceAccountViewSet(core_views.ActionsViewSet):
     lookup_field = "uuid"
 
     def perform_create(self, serializer):
-        serializer.save()
         username = self.request.user.username
         try:
-            instance = serializer.instance
-            response_data = utils.create_service_account(instance, username)
+            data = serializer.validated_data
+            scope_type = (
+                "customer"
+                if serializer.Meta.model == models.CustomerServiceAccount
+                else "project"
+            )
+            if scope_type == "project":
+                project = data.get("project")
+                if project.max_service_accounts is not None:
+                    project_service_accounts_count = (
+                        models.ProjectServiceAccount.objects.filter(
+                            project=project
+                        ).count()
+                    )
+                    if project_service_accounts_count >= project.max_service_accounts:
+                        raise ValidationError(
+                            {
+                                "detail": "Maximum number of service accounts reached for this project"
+                            }
+                        )
+            elif scope_type == "customer":
+                customer = data.get("customer")
+                if customer.max_service_accounts is not None:
+                    customer_service_accounts_count = (
+                        models.CustomerServiceAccount.objects.filter(
+                            customer=customer
+                        ).count()
+                    )
+                    if customer_service_accounts_count >= customer.max_service_accounts:
+                        raise ValidationError(
+                            {
+                                "detail": "Maximum number of service accounts reached for this customer"
+                            }
+                        )
+
+            response_data = utils.create_service_account(data, username, scope_type)
             if response_data and "apiKey" in response_data:
+                instance = serializer.save()
                 instance._token = response_data["apiKey"]["apiKey"]
-                instance._expiresAt = response_data["apiKey"]["expiresAt"]
+                instance._expires_at = response_data["apiKey"]["expiresAt"]
                 if "serviceAccount" in response_data:
                     instance.username = response_data["serviceAccount"]["username"]
                     instance.save(update_fields=["username"])
             else:
-                instance.error_message = (
-                    "Service account creation is disabled or returned no token."
+                raise ValidationError(
+                    {
+                        "detail": "Service account creation is disabled or returned no token."
+                    }
                 )
-                instance.save(update_fields=["error_message"])
-                raise ValidationError({"detail": instance.error_message})
-        except httpx.HTTPError:
-            raise ValidationError({"detail": instance.error_message})
+        except httpx.HTTPError as e:
+            raise ValidationError({"detail": str(e)})
+
+    def perform_update(self, serializer):
+        instance: models.ScopedServiceAccount = serializer.instance
+        # Set the fields in the cache object
+        instance.email = serializer.validated_data.get("email", instance.email)
+        instance.description = serializer.validated_data.get(
+            "description", instance.description
+        )
+        utils.update_service_account(instance)
+        # Update the DB object only if the API call is successful
+        super().perform_update(serializer)
 
     def perform_destroy(self, instance):
         utils.delete_service_account(instance)
@@ -4809,7 +4892,7 @@ class ProjectServiceAccountViewSet(BaseServiceAccountViewSet):
             response_data = utils.rotate_service_account_api_key(service_account)
             if response_data and "apiKey" in response_data:
                 service_account._token = response_data["apiKey"]["apiKey"]
-                service_account._expiresAt = response_data["apiKey"]["expiresAt"]
+                service_account._expires_at = response_data["apiKey"]["expiresAt"]
                 serializer = self.get_serializer(service_account)
                 return Response(serializer.data)
             else:
@@ -4874,7 +4957,7 @@ class CustomerServiceAccountViewSet(BaseServiceAccountViewSet):
             response_data = utils.rotate_service_account_api_key(service_account)
             if response_data and "apiKey" in response_data:
                 service_account._token = response_data["apiKey"]["apiKey"]
-                service_account._expiresAt = response_data["apiKey"]["expiresAt"]
+                service_account._expires_at = response_data["apiKey"]["expiresAt"]
                 serializer = self.get_serializer(service_account)
                 return Response(serializer.data)
             else:
@@ -5144,6 +5227,8 @@ class GlobalCategoriesViewSet(views.APIView):
 
         if customer_uuid:
             resources = resources.filter(project__customer__uuid=customer_uuid)
+
+        resources = filter_queryset_by_user_ip(resources, request)
 
         qs = resources.values("offering__category__uuid").annotate(count=Count("*"))
         return Response(

@@ -76,6 +76,10 @@ class ProjectSection(FeatureSection):
         "Show credit field in project create dialog."
     )
 
+    mandatory_start_date = Feature("Make the project start date mandatory.")
+
+    mandatory_end_date = Feature("Make the project end date mandatory.")
+
 
 class UserSection(FeatureSection):
     class Meta:
@@ -192,18 +196,10 @@ class OpenstackSection(FeatureSection):
     show_migrations = Feature("Show OpenStack tenant migrations action and tab")
 
 
-class TelemetrySection(FeatureSection):
+class WaldurDeploymentSection(FeatureSection):
     class Meta:
-        key = "telemetry"
-        description = "Telemetry settings"
+        key = "deployment"
+        description = "Waldur deployment settings"
 
     send_metrics = Feature("Send telemetry metrics.")
-
-
-# Temporarily commented out to fix Homeport linter
-# class InvoiceSection(FeatureSection):
-#    class Meta:
-#        key = "invoice"
-#        description = "Invoice settings"
-
-# display_credit_management = Feature("Display credit management.")
+    enable_cookie_notice = Feature("Enable cookie notice in marketplace.")

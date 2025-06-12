@@ -1038,19 +1038,19 @@ class OpenStackBackend(ServiceBackend):
                     tenant,
                 )
 
-        remote_ids = {ip["id"] for ip in backend_routers}
-        stale_routers = models.Router.objects.filter(tenant=tenant).exclude(
-            backend_id__in=remote_ids
-        )
-        stale_routers.delete()
+        if not router_backend_id:
+            remote_ids = {ip["id"] for ip in backend_routers}
+            stale_routers = models.Router.objects.filter(tenant=tenant).exclude(
+                backend_id__in=remote_ids
+            )
+            stale_routers.delete()
 
     def _tenant_mappings(self, queryset):
         rows = queryset.exclude(backend_id="").values("id", "backend_id")
         return {row["backend_id"]: row["id"] for row in rows}
 
     def update_instance_port_status(self, instance: models.Instance):
-        session = get_tenant_session(instance.tenant)
-        neutron = get_neutron_client(session)
+        neutron = get_neutron_client(self.admin_session)
 
         for port in instance.ports.all():
             status = neutron.show_port(port.backend_id)["port"]["status"]
@@ -2975,15 +2975,9 @@ class OpenStackBackend(ServiceBackend):
             port.fixed_ips = port_response["fixed_ips"]
             port.admin_state_up = port_response["admin_state_up"]
             port.port_security_enabled = port_response["port_security_enabled"]
-            port.save(
-                update_fields=[
-                    "backend_id",
-                    "mac_address",
-                    "fixed_ips",
-                    "admin_state_up",
-                    "port_security_enabled",
-                ]
-            )
+            port.device_owner = port_response["device_owner"]
+            port.status = port_response["status"]
+            port.save()
 
             event_logger.openstack_port.info(
                 f"Port [{port}] has been created in the backend for network [{network}].",
@@ -3480,7 +3474,14 @@ class OpenStackBackend(ServiceBackend):
     @log_backend_action()
     def extend_volume(self, volume: models.Volume):
         session = get_tenant_session(volume.tenant)
-        cinder = get_cinder_client(session)
+        cinder = get_cinder_client(
+            session,
+            api_version="3.51"
+            if volume.service_settings.options.get(
+                "live_resize_of_volumes_enabled", False
+            )
+            else None,
+        )
         try:
             cinder.volumes.extend(volume.backend_id, self.mb2gb(volume.size))
         except cinder_exceptions.ClientException as e:
@@ -5207,6 +5208,42 @@ class OpenStackBackend(ServiceBackend):
                 f"Failed to remove interface from router {router.backend_id}: {e}"
             )
 
+    def remove_router_interface_safely(self, router, subnet_id=None, port_id=None):
+        """Remove router interface handling case when port is already deleted."""
+        old_routes = router.routes
+        subnet = None
+        port = None
+        if subnet_id:
+            subnet = models.SubNet.objects.get(id=subnet_id)
+        if port_id:
+            port = models.Port.objects.get(id=port_id)
+
+        try:
+            self.remove_router_interface(router, subnet, port)
+        except OpenStackBackendError as e:
+            raise OpenStackBackendError(
+                f"Unable to remove a router interface: {e.args[0]}"
+            )
+
+        removed_interface = None
+        if subnet:
+            removed_interface = {"type": "subnet", "backend_id": subnet.backend_id}
+        elif port:
+            removed_interface = {"type": "port", "backend_id": port.backend_id}
+        event_logger.openstack_router.info(
+            "Interface was removed from router.",
+            event_type="openstack_router_updated",
+            event_context={
+                "router": router,
+                "old_routes": old_routes,
+                "new_routes": old_routes,  # routes are not changed, but for consistency
+                "tenant_backend_id": router.tenant.backend_id,
+                "changed_interface": removed_interface,
+            },
+        )
+        self.pull_tenant_routers(router.tenant, router.backend_id)
+        self.pull_tenant_ports(router.tenant)
+
     def delete_router(self, router):
         if not router.backend_id:
             logger.warning(
@@ -5233,3 +5270,29 @@ class OpenStackBackend(ServiceBackend):
             neutron.delete_router(router.backend_id)
         except neutron_exceptions.NeutronClientException as e:
             raise OpenStackBackendError(e)
+
+    @log_backend_action()
+    def push_port_security_groups(self, port: models.Port):
+        session = get_tenant_session(port.tenant)
+        neutron = get_neutron_client(session)
+
+        local_ids = set(
+            models.SecurityGroup.objects.filter(ports=port)
+            .exclude(backend_id="")
+            .values_list("backend_id", flat=True)
+        )
+
+        # Update security groups
+        try:
+            neutron.update_port(
+                port.backend_id, {"port": {"security_groups": list(local_ids)}}
+            )
+            logger.info(
+                "Updated security groups for port %s to %s",
+                port.backend_id,
+                list(local_ids),
+            )
+        except neutron_exceptions.NeutronClientException:
+            logger.exception(
+                "Failed to update security groups for port %s", port.backend_id
+            )

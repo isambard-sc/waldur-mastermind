@@ -3,7 +3,6 @@ import logging
 from dbtemplates.models import Template
 from dbtemplates.utils.cache import remove_cached_template
 from django.conf import settings as django_settings
-from django.contrib import auth
 from django.core import exceptions as django_exceptions
 from django.db import transaction
 from django.db.models import Count, Q
@@ -28,7 +27,7 @@ from rest_framework import permissions as rf_permissions
 from rest_framework import serializers as rf_serializers
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import action
-from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from waldur_auth_social.models import ProviderChoices
@@ -63,8 +62,6 @@ from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_mastermind.marketplace.enums import ResourceStates
 
 logger = logging.getLogger(__name__)
-
-User = auth.get_user_model()
 
 
 BASE_USER_PARAMETERS = [
@@ -472,7 +469,7 @@ class ProjectViewSet(
             .exclude(id=project.id)
         ).values_list("id", flat=True)
 
-        queryset = User.objects.filter(id__in=get_project_users(projects))
+        queryset = core_models.User.objects.filter(id__in=get_project_users(projects))
 
         queryset = filters.UserConcatenatedNameOrderingBackend().filter_queryset(
             request, queryset, self
@@ -487,7 +484,7 @@ class ProjectViewSet(
 
 
 class UserViewSet(core_views.ActionsViewSet):
-    queryset = User.all_objects.select_related("auth_token")
+    queryset = core_models.User.all_objects.select_related("auth_token")
     serializer_class = serializers.UserSerializer
     lookup_field = "uuid"
     permission_classes = (
@@ -965,9 +962,12 @@ class NotificationTemplateViewSet(ActionsViewSet):
             template_dbtemplates = Template.objects.get(name=name)
             template_dbtemplates.content = new_content
             template_dbtemplates.save()
-            remove_cached_template(template_dbtemplates)
         except Template.DoesNotExist:
-            raise NotFound("A template %s does not exist." % name)
+            template_dbtemplates = Template.objects.create(
+                name=name, content=new_content
+            )
+
+        remove_cached_template(template_dbtemplates)
         logger.info(message)
         return Response({"detail": _(message)}, status=status.HTTP_200_OK)
 

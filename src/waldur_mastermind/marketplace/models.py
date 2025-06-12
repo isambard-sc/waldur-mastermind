@@ -2,7 +2,6 @@ import logging
 from collections.abc import Callable
 from decimal import Decimal
 
-from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models
@@ -22,6 +21,7 @@ from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
+from waldur_core.core.models import User
 from waldur_core.logging.mixins import LoggableMixin
 from waldur_core.media.mixins import get_upload_path
 from waldur_core.media.validators import ImageValidator
@@ -48,8 +48,6 @@ from . import managers, plugins
 from .attribute_types import ATTRIBUTE_TYPES
 
 logger = logging.getLogger(__name__)
-
-User = get_user_model()
 
 
 class ServiceProvider(
@@ -669,6 +667,7 @@ class OfferingComponent(
             ),
         )
 
+    tracker = FieldTracker()
     offering = models.ForeignKey(
         on_delete=models.CASCADE, to=Offering, related_name="components"
     )
@@ -1174,7 +1173,9 @@ class Resource(
 
     @property
     def is_expired(self) -> bool:
-        return self.end_date and self.end_date <= timezone.datetime.today().date()
+        if not self.end_date:
+            return False
+        return self.end_date <= timezone.datetime.today().date()
 
     def __str__(self):
         if self.name:
@@ -1185,7 +1186,7 @@ class Resource(
         return f"{self.uuid} ({self.offering.name})"
 
     @property
-    def creation_order(self) -> "Order":
+    def creation_order(self) -> "Order | None":
         return Order.objects.filter(resource=self, type=Order.Types.CREATE).first()
 
     @property
@@ -1561,11 +1562,14 @@ class ScopedServiceAccount(BaseServiceAccount):
         abstract = True
 
     email = models.EmailField(max_length=320, default="")
+    preferred_identifier = models.CharField(max_length=32, blank=True)
 
     def __str__(self):
         return f"Service account {self.username} for {self.scope}"
 
-    tracker = FieldTracker(fields=["username", "email", "description"])
+    tracker = FieldTracker(
+        fields=["username", "email", "description", "preferred_identifier"]
+    )
 
 
 class ProjectServiceAccount(ScopedServiceAccount):

@@ -883,8 +883,8 @@ class VolumeExtendExecutor(core_executors.ActionExecutor):
             volume.instance.save()
 
     @classmethod
-    def get_task_signature(cls, volume, serialized_volume, **kwargs):
-        if volume.instance is None:
+    def get_task_signature(cls, volume: models.Volume, serialized_volume, **kwargs):
+        if volume.extend_enabled:
             return chain(
                 core_tasks.BackendMethodTask().si(
                     serialized_volume,
@@ -894,50 +894,51 @@ class VolumeExtendExecutor(core_executors.ActionExecutor):
                 core_tasks.PollRuntimeStateTask().si(
                     serialized_volume,
                     backend_pull_method="pull_volume_runtime_state",
-                    success_state="available",
+                    success_state="in-use" if volume.instance else "available",
                     erred_state="error",
                 ),
             )
 
-        return chain(
-            core_tasks.StateTransitionTask().si(
-                core_utils.serialize_instance(volume.instance),
-                state_transition="begin_updating",
-            ),
-            core_tasks.BackendMethodTask().si(
-                serialized_volume,
-                backend_method="detach_volume",
-                state_transition="begin_updating",
-            ),
-            core_tasks.PollRuntimeStateTask().si(
-                serialized_volume,
-                backend_pull_method="pull_volume_runtime_state",
-                success_state="available",
-                erred_state="error",
-            ),
-            core_tasks.BackendMethodTask().si(
-                serialized_volume,
-                backend_method="extend_volume",
-            ),
-            core_tasks.PollRuntimeStateTask().si(
-                serialized_volume,
-                backend_pull_method="pull_volume_runtime_state",
-                success_state="available",
-                erred_state="error",
-            ),
-            core_tasks.BackendMethodTask().si(
-                serialized_volume,
-                instance_uuid=volume.instance.uuid.hex,
-                device=volume.device,
-                backend_method="attach_volume",
-            ),
-            core_tasks.PollRuntimeStateTask().si(
-                serialized_volume,
-                backend_pull_method="pull_volume_runtime_state",
-                success_state="in-use",
-                erred_state="error",
-            ),
-        )
+        if volume.instance:
+            return chain(
+                core_tasks.StateTransitionTask().si(
+                    core_utils.serialize_instance(volume.instance),
+                    state_transition="begin_updating",
+                ),
+                core_tasks.BackendMethodTask().si(
+                    serialized_volume,
+                    backend_method="detach_volume",
+                    state_transition="begin_updating",
+                ),
+                core_tasks.PollRuntimeStateTask().si(
+                    serialized_volume,
+                    backend_pull_method="pull_volume_runtime_state",
+                    success_state="available",
+                    erred_state="error",
+                ),
+                core_tasks.BackendMethodTask().si(
+                    serialized_volume,
+                    backend_method="extend_volume",
+                ),
+                core_tasks.PollRuntimeStateTask().si(
+                    serialized_volume,
+                    backend_pull_method="pull_volume_runtime_state",
+                    success_state="available",
+                    erred_state="error",
+                ),
+                core_tasks.BackendMethodTask().si(
+                    serialized_volume,
+                    instance_uuid=volume.instance.uuid.hex,
+                    device=volume.device,
+                    backend_method="attach_volume",
+                ),
+                core_tasks.PollRuntimeStateTask().si(
+                    serialized_volume,
+                    backend_pull_method="pull_volume_runtime_state",
+                    success_state="in-use",
+                    erred_state="error",
+                ),
+            )
 
     @classmethod
     def get_success_signature(cls, volume, serialized_volume, **kwargs):
@@ -1353,6 +1354,18 @@ class InstanceUpdateSecurityGroupsExecutor(core_executors.ActionExecutor):
         return core_tasks.BackendMethodTask().si(
             serialized_instance,
             backend_method="push_instance_security_groups",
+            state_transition="begin_updating",
+        )
+
+
+class PortUpdateSecurityGroupsExecutor(core_executors.ActionExecutor):
+    action = "Update security groups"
+
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_instance,
+            backend_method="push_port_security_groups",
             state_transition="begin_updating",
         )
 
@@ -1904,3 +1917,14 @@ class OpenStackCleanupExecutor(structure_executors.BaseCleanupExecutor):
         (models.Instance, InstanceDeleteExecutor),
         (models.Volume, VolumeDeleteExecutor),
     )
+
+
+class RouterInterfaceDeleteExecutor(core_executors.ActionExecutor):
+    @classmethod
+    def get_task_signature(cls, router, serialized_router, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_router,
+            "remove_router_interface_safely",
+            state_transition="begin_updating",
+            **kwargs,
+        )

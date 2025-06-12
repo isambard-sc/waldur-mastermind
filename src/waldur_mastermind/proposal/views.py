@@ -1,7 +1,6 @@
 import logging
 from datetime import datetime, timedelta
 
-from django.contrib import auth
 from django.db.models import OuterRef, ProtectedError, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone as timezone
@@ -14,6 +13,7 @@ from rest_framework import permissions as rf_permissions
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.exceptions import IncorrectStateException
+from waldur_core.core.models import User
 from waldur_core.core.utils import SubqueryCount
 from waldur_core.core.views import (
     ActionMethodMixin,
@@ -46,7 +46,6 @@ from . import log
 from .managers import get_connected_call_organizers
 from .serializers import ReviewSubmitSerializer
 
-User = auth.get_user_model()
 logger = logging.getLogger(__name__)
 
 
@@ -431,6 +430,36 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             "Documents removed successfully",
             status=status.HTTP_200_OK,
         )
+
+    @extend_schema(
+        methods=["get"],
+        operation_id="proposal_protected_calls_resource_templates_list",
+        request=None,
+        responses=serializers.CallResourceTemplateSerializer(many=True),
+        description="List resource templates for a call.",
+        filters=False,
+    )
+    @extend_schema(
+        methods=["post"],
+        operation_id="proposal_protected_calls_resource_templates_set",
+        request=serializers.CallResourceTemplateSerializer,
+        responses=serializers.CallResourceTemplateSerializer,
+        description="Create resource template for a call.",
+    )
+    @decorators.action(detail=True, methods=["get", "post"])
+    def resource_templates(self, request, uuid=None):
+        return self.action_list_method("resource_templates")(self, request, uuid)
+
+    resource_templates_serializer_class = serializers.CallResourceTemplateSerializer
+
+    def resource_template_detail(self, request, uuid=None, obj_uuid=None):
+        return self.action_detail_method(
+            "resource_templates", delete_validators=[], update_validators=[]
+        )(self, request, uuid, obj_uuid)
+
+    resource_template_detail_serializer_class = (
+        serializers.CallResourceTemplateSerializer
+    )
 
 
 class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):

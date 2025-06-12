@@ -408,7 +408,7 @@ CONSTANCE_CONFIG = {
         'Type of jobs deployment. Valid values: "docker" for simple docker deployment, "k8s" for Kubernetes-based one',
     ),
     "DOCKER_CLIENT": (
-        {"base_url": "unix://var/run/docker.sock"},
+        {"base_url": "unix:///var/run/docker.sock"},
         "Options for docker client. See also: <https://docker-py.readthedocs.io/en/stable/client.html#docker.client.DockerClient>",
         "dict_field",
     ),
@@ -426,6 +426,10 @@ CONSTANCE_CONFIG = {
         {
             "python": {"image": "python:3.11-alpine", "command": "python"},
             "shell": {"image": "alpine:3", "command": "sh"},
+            "ansible": {
+                "image": "alpine/ansible:2.18.6",
+                "command": "ansible-playbook",
+            },
         },
         "Key is command to execute script, value is a dictionary of image name and command.",
         "dict_field",
@@ -498,6 +502,16 @@ CONSTANCE_CONFIG = {
     "HERO_IMAGE": (
         "",
         "The image rendered at hero section of HomePort landing page.",
+        "image_field",
+    ),
+    "MARKETPLACE_HERO_IMAGE": (
+        "",
+        "The image rendered at hero section of Marketplace landing page. Please, use a wide image (min. 1920×600px) with no text or logos. Keep the center area clean, and choose a darker image for dark mode or a brighter image for light mode.",
+        "image_field",
+    ),
+    "CALL_MANAGEMENT_HERO_IMAGE": (
+        "",
+        "The image rendered at hero section of Call Management landing page. Please, use a wide image (min. 1920×600px) with no text or logos. Keep the center area clean, and choose a darker image for dark mode or a brighter image for light mode.",
         "image_field",
     ),
     "SIDEBAR_LOGO": (
@@ -667,6 +681,11 @@ CONSTANCE_CONFIG = {
     "SMAX_CREATION_SOURCE_NAME": ("", "Creation source name."),
     "SMAX_REQUESTS_OFFERING": ("", "Requests offering code for all issues."),
     "SMAX_VERIFY_SSL": (True, "Toggler for SSL verification"),
+    # Service accounts
+    "ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND": (
+        False,
+        "Enable mock returns for the service account service",
+    ),
     # Proposal settings
     "PROPOSAL_REVIEW_DURATION": (7, "Review duration in days."),
     "USER_TABLE_COLUMNS": ("", "Comma-separated list of columns for users table."),
@@ -787,6 +806,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "NOTIFY_ABOUT_RESOURCE_CHANGE",
         "DISABLE_SENDING_NOTIFICATIONS_ABOUT_RESOURCE_UPDATE",
         "ENABLE_STALE_RESOURCE_NOTIFICATIONS",
+        "ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND",
     ),
     "Telemetry": (
         "TELEMETRY_URL",
@@ -826,6 +846,8 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "SIDEBAR_LOGO_DARK",
         "POWERED_BY_LOGO",
         "HERO_IMAGE",
+        "MARKETPLACE_HERO_IMAGE",
+        "CALL_MANAGEMENT_HERO_IMAGE",
         "LOGIN_LOGO",
         "FAVICON",
         "OFFERING_LOGO_PLACEHOLDER",
@@ -938,6 +960,8 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "SIDEBAR_STYLE",
     "POWERED_BY_LOGO",
     "HERO_IMAGE",
+    "MARKETPLACE_HERO_IMAGE",
+    "CALL_MANAGEMENT_HERO_IMAGE",
     "LOGIN_LOGO",
     "FAVICON",
     "OFFERING_LOGO_PLACEHOLDER",
@@ -961,6 +985,8 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "HOMEPORT_URL",
     "KEYCLOAK_ICON",
     "RANCHER_USERNAME_INPUT_LABEL",
+    # Service accounts
+    "ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND",
 )
 
 for ext in WaldurExtension.get_extensions():

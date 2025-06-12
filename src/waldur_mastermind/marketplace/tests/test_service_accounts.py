@@ -13,8 +13,8 @@ from waldur_core.permissions.fixtures import (
 from waldur_mastermind.marketplace import models
 from waldur_mastermind.marketplace.tests import factories, fixtures
 
-TOKEN_URL = "http://example.com/api/token/"
-SERVICE_ACCOUNT_URL = "http://example.com/api/service-accounts/"
+TOKEN_URL = "http://example.com/api/token"
+SERVICE_ACCOUNT_URL = "http://example.com/api/service-accounts"
 TOKEN_CLIENT_ID = "test-client-id"
 TOKEN_SECRET = "test-client-secret"
 
@@ -28,6 +28,32 @@ class BaseServiceAccountTest(test.APITransactionTestCase):
         self.token = "test-token"
 
         self.account_username = "waldur"
+
+        self.test_identifier = "test-identifier"
+
+        service_account_response = {
+            "serviceAccount": {
+                "status": "active",
+                "username": self.account_username,
+                "email": "test@example.com",
+                "description": "test description",
+                "unixUid": 1000,
+                "unixGid": 1000,
+                "scopeType": "scope",
+                "scopeName": "Test scope",
+                "scopeSlug": "test-scope",
+                "owner": {
+                    "username": "test-owner",
+                    "email": "owner@example.com",
+                },
+            },
+            "apiKey": {
+                "apiKey": self.token,
+                "createdAt": "2025-04-28T12:00:00Z",
+                "expiresAt": "2025-05-28T12:00:00Z",
+                "ttl": 2592000,
+            },
+        }
 
         # Mock token request
         respx.post(
@@ -43,40 +69,18 @@ class BaseServiceAccountTest(test.APITransactionTestCase):
         respx.post(
             SERVICE_ACCOUNT_URL,
             headers={"Authorization": f"Bearer {self.token}"},
-        ).mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "serviceAccount": {
-                        "status": "active",
-                        "username": self.account_username,
-                        "email": "test@example.com",
-                        "description": "test description",
-                        "unixUid": 1000,
-                        "unixGid": 1000,
-                        "scopeType": "scope",
-                        "scopeName": "Test scope",
-                        "scopeSlug": "test-scope",
-                        "owner": {
-                            "username": "test-owner",
-                            "email": "owner@example.com",
-                        },
-                    },
-                    "apiKey": {
-                        "apiKey": self.token,
-                        "createdAt": "2025-04-28T12:00:00Z",
-                        "expiresAt": "2025-05-28T12:00:00Z",
-                        "ttl": 2592000,
-                    },
-                },
-            )
-        )
+        ).mock(return_value=httpx.Response(200, json=service_account_response))
 
         # Mock service account deletion request
-        respx.delete(
-            f"{SERVICE_ACCOUNT_URL}{self.account_username}",
+        respx.put(
+            f"{SERVICE_ACCOUNT_URL}/{self.account_username}/close",
             headers={"Authorization": f"Bearer {self.token}"},
         ).mock(return_value=httpx.Response(200, json={}))
+
+        respx.get(
+            f"{SERVICE_ACCOUNT_URL}/{self.account_username}",
+            headers={"Authorization": f"Bearer {self.token}"},
+        ).mock(return_value=httpx.Response(200, json=service_account_response))
 
     def tearDown(self):
         respx.stop()
@@ -123,12 +127,16 @@ class ServiceAccountPermissionTest(BaseServiceAccountTest):
             url,
             {
                 "project": self.fixture.project.uuid,
-                "username": self.account_username,
                 "description": "project test",
+                "preferred_identifier": self.test_identifier,
             },
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         self.assertIn("token", response.data)
+        account = models.ProjectServiceAccount.objects.get(
+            username=self.account_username
+        )
+        self.assertEqual(account.preferred_identifier, self.test_identifier)
 
     @data("staff", "service_manager", "service_owner")
     def test_authorized_user_can_get_customer_service_account(self, user):
@@ -168,12 +176,16 @@ class ServiceAccountPermissionTest(BaseServiceAccountTest):
             url,
             {
                 "customer": self.fixture.project.customer.uuid,
-                "username": "customer-user",
                 "description": "customer test",
+                "preferred_identifier": self.test_identifier,
             },
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         self.assertIn("token", response.data)
+        account = models.CustomerServiceAccount.objects.get(
+            username=self.account_username
+        )
+        self.assertEqual(account.preferred_identifier, self.test_identifier)
 
     @data("manager", "admin")
     def test_project_level_users_cannot_create_customer_service_account(self, user):
@@ -184,8 +196,8 @@ class ServiceAccountPermissionTest(BaseServiceAccountTest):
             url,
             {
                 "customer": self.fixture.project.customer.uuid,
-                "username": "customer-user",
                 "description": "customer test",
+                "preferred_identifier": self.test_identifier,
             },
         )
         self.assertEqual(
@@ -203,8 +215,8 @@ class ServiceAccountPermissionTest(BaseServiceAccountTest):
             url,
             {
                 "project": self.fixture.project.uuid,
-                "username": "test-account",
                 "description": "Test account",
+                "preferred_identifier": self.test_identifier,
             },
         )
         self.assertEqual(
@@ -222,8 +234,8 @@ class ServiceAccountPermissionTest(BaseServiceAccountTest):
             url,
             {
                 "customer": self.fixture.project.customer.uuid,
-                "username": "test-account",
                 "description": "Test account",
+                "preferred_identifier": self.test_identifier,
             },
         )
         self.assertEqual(
@@ -254,8 +266,22 @@ class ServiceAccountPermissionTest(BaseServiceAccountTest):
         account = factories.ProjectServiceAccountFactory(
             project=self.fixture.project,
         )
+        respx.put(
+            f"{SERVICE_ACCOUNT_URL}/{self.account_username}",
+            headers={"Authorization": f"Bearer {self.token}"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "serviceAccount": {
+                        "email": "new email",
+                        "description": "new description",
+                    }
+                },
+            )
+        )
         url = factories.ProjectServiceAccountFactory.get_url(account)
-        response = self.client.patch(url, {"username": "foo"})
+        response = self.client.patch(url, {"description": "foo"})
         self.assertEqual(
             response.status_code,
             status.HTTP_200_OK,
@@ -263,7 +289,7 @@ class ServiceAccountPermissionTest(BaseServiceAccountTest):
         )
 
         account.refresh_from_db()
-        self.assertEqual(account.username, "foo")
+        self.assertEqual(account.description, "foo")
 
     @data("user", "customer_support", "member")
     def test_unauthorized_user_can_not_update_project_service_account(self, user):
@@ -291,8 +317,8 @@ class ServiceAccountPermissionTest(BaseServiceAccountTest):
             url,
             {
                 "project": self.fixture.project.uuid,
-                "username": self.account_username,
                 "description": "project test",
+                "preferred_identifier": self.test_identifier,
             },
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
@@ -395,6 +421,144 @@ class ServiceAccountPermissionTest(BaseServiceAccountTest):
             f"Expected status code 404, got: {response.status_code}. Response data: {response.data}",
         )
 
+    @data("staff", "service_manager", "service_owner", "manager", "admin")
+    def test_can_create_project_service_account_under_limit(self, user):
+        """Test that service account can be created when under project limit"""
+        self.client.force_authenticate(getattr(self.fixture, user))
+        url = factories.ProjectServiceAccountFactory.get_list_url()
+
+        response = self.client.post(
+            url,
+            {
+                "project": self.fixture.project.uuid,
+                "description": "project test 1",
+                "preferred_identifier": f"{self.test_identifier}-1",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        response = self.client.post(
+            url,
+            {
+                "project": self.fixture.project.uuid,
+                "description": "project test 2",
+                "preferred_identifier": f"{self.test_identifier}-2",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    @data("staff", "service_manager", "service_owner", "manager", "admin")
+    def test_cannot_create_project_service_account_over_limit(self, user):
+        """Test that service account cannot be created when project limit exceeded"""
+        self.client.force_authenticate(getattr(self.fixture, user))
+        url = factories.ProjectServiceAccountFactory.get_list_url()
+
+        # Create first service account
+        response = self.client.post(
+            url,
+            {
+                "project": self.fixture.project.uuid,
+                "description": "project test 1",
+                "preferred_identifier": f"{self.test_identifier}-1",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        # Create second service account
+        response = self.client.post(
+            url,
+            {
+                "project": self.fixture.project.uuid,
+                "description": "project test 2",
+                "preferred_identifier": f"{self.test_identifier}-2",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        # Try to create third service account
+        response = self.client.post(
+            url,
+            {
+                "project": self.fixture.project.uuid,
+                "description": "project test 3",
+                "preferred_identifier": f"{self.test_identifier}-3",
+            },
+        )
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+        self.assertIn("Maximum number of service accounts", response.data["detail"])
+
+    @data("staff", "service_manager", "service_owner")
+    def test_can_create_customer_service_account_under_limit(self, user):
+        """Test that service account can be created when under customer limit"""
+        self.client.force_authenticate(getattr(self.fixture, user))
+        url = factories.CustomerServiceAccountFactory.get_list_url()
+
+        # Create first service account
+        response = self.client.post(
+            url,
+            {
+                "customer": self.fixture.offering_customer.uuid,
+                "description": "customer test 1",
+                "preferred_identifier": f"{self.test_identifier}-1",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        # Create second service account
+        response = self.client.post(
+            url,
+            {
+                "customer": self.fixture.offering_customer.uuid,
+                "description": "customer test 2",
+                "preferred_identifier": f"{self.test_identifier}-2",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    @data("staff", "service_manager", "service_owner")
+    def test_cannot_create_customer_service_account_over_limit(self, user):
+        """Test that service account cannot be created when customer limit exceeded"""
+        self.client.force_authenticate(getattr(self.fixture, user))
+        url = factories.CustomerServiceAccountFactory.get_list_url()
+
+        # Create first service account
+        response = self.client.post(
+            url,
+            {
+                "customer": self.fixture.offering_customer.uuid,
+                "description": "customer test 1",
+                "preferred_identifier": f"{self.test_identifier}-1",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        # Create second service account
+        response = self.client.post(
+            url,
+            {
+                "customer": self.fixture.offering_customer.uuid,
+                "description": "customer test 2",
+                "preferred_identifier": f"{self.test_identifier}-2",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        # Try to create third service account
+        response = self.client.post(
+            url,
+            {
+                "customer": self.fixture.offering_customer.uuid,
+                "description": "customer test 3",
+                "preferred_identifier": f"{self.test_identifier}-3",
+            },
+        )
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+        self.assertIn("Maximum number of service accounts", response.data["detail"])
+
 
 @override_waldur_core_settings(
     SERVICE_ACCOUNT_USE_API=True,
@@ -412,8 +576,8 @@ class ScopedServiceAccountAPITest(BaseServiceAccountTest):
 
         self.payload = {
             "project": self.fixture.project.uuid,
-            "username": "test-account",
             "description": "Test account",
+            "preferred_identifier": self.test_identifier,
         }
         self.new_api_key = "new-rotated-key-123"
         self.new_expires_at = "2025-05-28T12:00:00Z"
@@ -428,7 +592,7 @@ class ScopedServiceAccountAPITest(BaseServiceAccountTest):
         self.assertEqual(response.data["token"], self.token)
         self.assertTrue(
             models.ProjectServiceAccount.objects.filter(
-                username=self.account_username
+                preferred_identifier=self.test_identifier
             ).exists()
         )
 
@@ -448,10 +612,12 @@ class ScopedServiceAccountAPITest(BaseServiceAccountTest):
             self.url,
             self.payload,
         )
-        expected_error = "Client error '400 Bad Request'"
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        account = models.ProjectServiceAccount.objects.get(username="test-account")
-        self.assertIn(expected_error, account.error_message)
+        self.assertFalse(
+            models.ProjectServiceAccount.objects.filter(
+                preferred_identifier=self.test_identifier
+            ).exists()
+        )
 
     def test_rotate_project_service_account_api_key(self):
         """Test that service account API key rotation succeeds"""
@@ -460,7 +626,7 @@ class ScopedServiceAccountAPITest(BaseServiceAccountTest):
 
         # Mock API key rotation response
         respx.put(
-            f"{SERVICE_ACCOUNT_URL}{account.username}/rotate-api-key/",
+            f"{SERVICE_ACCOUNT_URL}/{account.username}/rotate-api-key",
             headers={"Authorization": f"Bearer {self.token}"},
         ).mock(
             return_value=httpx.Response(
@@ -476,7 +642,7 @@ class ScopedServiceAccountAPITest(BaseServiceAccountTest):
         response = self.client.post(f"{url}rotate_api_key/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["token"], self.new_api_key)
-        self.assertEqual(response.data["expiresAt"], self.new_expires_at)
+        self.assertEqual(response.data["expires_at"], self.new_expires_at)
 
     def test_rotate_customer_service_account_api_key(self):
         """Test that service account API key rotation succeeds"""
@@ -487,7 +653,7 @@ class ScopedServiceAccountAPITest(BaseServiceAccountTest):
 
         # Mock API key rotation response
         respx.put(
-            f"{SERVICE_ACCOUNT_URL}{account.username}/rotate-api-key/",
+            f"{SERVICE_ACCOUNT_URL}/{account.username}/rotate-api-key",
             headers={"Authorization": f"Bearer {self.token}"},
         ).mock(
             return_value=httpx.Response(
@@ -503,7 +669,44 @@ class ScopedServiceAccountAPITest(BaseServiceAccountTest):
         response = self.client.post(f"{url}rotate_api_key/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["token"], self.new_api_key)
-        self.assertEqual(response.data["expiresAt"], self.new_expires_at)
+        self.assertEqual(response.data["expires_at"], self.new_expires_at)
+
+    def test_update_service_account_details(self):
+        """Test that service account API key rotation succeeds"""
+        account = factories.CustomerServiceAccountFactory(
+            customer=self.fixture.offering_customer
+        )
+        url = factories.CustomerServiceAccountFactory.get_url(account)
+        new_email = "new-user@example.com"
+        new_description = "New description"
+
+        # Mock API account details response
+        respx.put(
+            f"{SERVICE_ACCOUNT_URL}/{self.account_username}",
+            headers={"Authorization": f"Bearer {self.token}"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "serviceAccount": {
+                        "email": new_email,
+                        "description": new_description,
+                    }
+                },
+            )
+        )
+
+        response = self.client.patch(
+            f"{url}",
+            {
+                "email": new_email,
+                "description": new_description,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["email"], new_email)
+        self.assertEqual(response.data["description"], new_description)
 
 
 class ServiceAccountOfferingTest(test.APITransactionTestCase):

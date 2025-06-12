@@ -18,7 +18,6 @@ import requests
 from constance import config
 from django.apps import apps
 from django.conf import settings
-from django.contrib.auth import get_user_model
 from django.core.mail import EmailMultiAlternatives
 from django.core.management.base import BaseCommand
 from django.core.serializers.json import DjangoJSONEncoder
@@ -159,7 +158,7 @@ def get_detail_view_name(model):
 
 def get_fake_context(user=None):
     if not user:
-        user = get_user_model()()
+        ()
     request = type(
         "R", (object,), {"method": "GET", "user": user, "query_params": QueryDict()}
     )
@@ -589,3 +588,20 @@ def text2html(value: str):
 
 def remove_duplicate_hyphens(text):
     return re.sub("-+", "-", text)
+
+
+def get_valid_template_paths():
+    valid_template_paths = set()
+    for section_key, notifications in NOTIFICATIONS.items():
+        for notification in notifications:
+            for template in notification.get("templates", []):
+                valid_template_paths.add(f"{section_key}/{template.path}")
+    return valid_template_paths
+
+
+def get_valid_notification_keys():
+    valid_keys = set()
+    for section_key, notifications in NOTIFICATIONS.items():
+        for notification in notifications:
+            valid_keys.add(f"{section_key}.{notification['path']}")
+    return valid_keys

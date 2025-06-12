@@ -1,4 +1,3 @@
-import django.contrib.auth
 import factory.fuzzy
 from rest_framework.authtoken import models as authtoken_models
 from rest_framework.reverse import reverse
@@ -17,7 +16,7 @@ class UserFactory(
     factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[core_models.User]
 ):
     class Meta:
-        model = django.contrib.auth.get_user_model()
+        model = core_models.User
 
     username = factory.Sequence(lambda n: "john%s" % n)
     civil_number = factory.Sequence(lambda n: "%08d" % n)
@@ -108,6 +107,7 @@ class CustomerFactory(
     slug = factory.Sequence(lambda n: "cust-%s" % n)
     abbreviation = factory.Sequence(lambda n: "Cust%s" % n)
     contact_details = factory.Sequence(lambda n: "contacts %s" % n)
+    max_service_accounts = 2
 
     @classmethod
     def get_url(cls, customer=None, action=None):
@@ -129,6 +129,7 @@ class ProjectFactory(
     class Meta:
         model = models.Project
 
+    max_service_accounts = 2
     name = factory.Sequence(lambda n: "Proj%s" % n)
     slug = factory.Sequence(lambda n: "proj-%s" % n)
     customer = factory.SubFactory(CustomerFactory)

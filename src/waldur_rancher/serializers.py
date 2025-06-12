@@ -7,6 +7,8 @@ from django.db import transaction
 from django.db.models import QuerySet
 from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import extend_schema_field
+from iptools.ipv4 import validate_cidr as is_valid_ipv4_cidr
+from iptools.ipv6 import validate_cidr as is_valid_ipv6_cidr
 from rest_framework import exceptions, serializers
 
 from waldur_core.core import serializers as core_serializers
@@ -481,6 +483,9 @@ class RancherClusterSerializer(
                     raise exceptions.ValidationError(
                         "Either cluster or node tenant should be specified."
                     )
+            # TODO: figure out which tenant cluster should be linked to in case of multiple tenants
+            first_tenant = nodes[0]["tenant"]
+            attrs["tenant"] = first_tenant
         else:
             for node in nodes:
                 if node.get("tenant"):
@@ -879,8 +884,12 @@ class RancherApplicationSerializer(structure_serializers.BaseResourceSerializer)
         return attrs
 
     def create(self, validated_data):
-        rancher_project = validated_data["rancher_project"]
+        rancher_project = cast(models.Project, validated_data["rancher_project"])
         validated_data["settings"] = rancher_project.settings
+        if rancher_project.cluster:
+            utils.check_managed_cluster(
+                rancher_project.cluster, self.context["request"].user
+            )
         validated_data["cluster"] = rancher_project.cluster
         return super().create(validated_data)
 
@@ -922,6 +931,12 @@ class RancherWorkloadSerializer(serializers.HyperlinkedModelSerializer):
                 "view_name": "rancher-namespace-detail",
             },
         }
+
+    def create(self, validated_data):
+        workload = cast(models.Workload, validated_data["workload"])
+        if workload.cluster:
+            utils.check_managed_cluster(workload.cluster, self.context["request"].user)
+        return super().create(validated_data)
 
 
 class RancherHPASerializer(serializers.HyperlinkedModelSerializer):
@@ -986,7 +1001,10 @@ class RancherHPASerializer(serializers.HyperlinkedModelSerializer):
         }
 
     def create(self, validated_data):
-        workload = validated_data["workload"]
+        workload = cast(models.Workload, validated_data["workload"])
+        if workload.cluster:
+            utils.check_managed_cluster(workload.cluster, self.context["request"].user)
+
         validated_data["settings"] = workload.settings
         validated_data["cluster"] = workload.cluster
         validated_data["project"] = workload.project
@@ -1243,7 +1261,6 @@ class RancherImportYamlSerializer(serializers.Serializer):
 
 class RancherCreateManagementSecurityGroupSerializer(serializers.Serializer):
     cidr = serializers.CharField(
-        validators=[openstack_serializers.validate_private_subnet_cidr],
         default="192.168.42.0/24",
         initial="192.168.42.0/24",
     )
@@ -1252,6 +1269,19 @@ class RancherCreateManagementSecurityGroupSerializer(serializers.Serializer):
         initial=openstack_models.SecurityGroupRule.IPv4,
         default=openstack_models.SecurityGroupRule.IPv4,
     )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        validators = {
+            openstack_models.SecurityGroupRule.IPv4: is_valid_ipv4_cidr,
+            openstack_models.SecurityGroupRule.IPv6: is_valid_ipv6_cidr,
+        }
+        validator = validators[attrs["ethertype"]]
+        if not validator(attrs["cidr"]):
+            raise serializers.ValidationError(
+                _("Invalid CIDR format: %s") % attrs["cidr"]
+            )
+        return attrs
 
 
 class RancherClusterReference(serializers.ModelSerializer):

@@ -1,10 +1,11 @@
 import datetime
+from decimal import Decimal
 from functools import lru_cache
+from typing import cast
 
 import pyvat
 from django.apps import apps
 from django.conf import settings
-from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
@@ -65,7 +66,7 @@ def validate_service_type(service_type):
 class StructureLoggableMixin(LoggableMixin):
     @classmethod
     def get_permitted_objects(cls, user):
-        return filter_queryset_for_user(cls.objects.all(), user)
+        return filter_queryset_for_user(cls.objects.all(), user)  # type: ignore
 
 
 class VATException(Exception):
@@ -95,17 +96,17 @@ class VATMixin(models.Model):
 
     country = models.CharField(max_length=2, blank=True)
 
-    def get_country_display(self) -> str:
+    def get_country_display(self) -> str | None:
         return COUNTRIES_DICT.get(self.country)
 
-    def get_vat_rate(self) -> float:
+    def get_vat_rate(self) -> Decimal | None:
         charge = self.get_vat_charge()
         if charge.action == pyvat.VatChargeAction.charge:
             return charge.rate
 
         # Return None, if reverse_charge or no_charge action is applied
 
-    def get_vat_charge(self) -> float:
+    def get_vat_charge(self) -> pyvat.VatCharge:
         if not self.country:
             raise VATException(
                 _(
@@ -282,6 +283,20 @@ class CustomerDetailsMixin(core_models.NameMixin, VATMixin, CoordinatesMixin):
     bank_account = models.CharField(blank=True, max_length=50)
 
 
+class ServiceAccountMixin(models.Model):
+    """Mixin for models that support service accounts."""
+
+    class Meta:
+        abstract = True
+
+    max_service_accounts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=_("Maximum number of service accounts allowed"),
+        null=True,
+        blank=True,
+    )
+
+
 class Customer(
     CustomerDetailsMixin,
     core_models.UuidMixin,
@@ -291,12 +306,14 @@ class Customer(
     PermissionMixin,
     StructureLoggableMixin,
     ImageModelMixin,
+    ServiceAccountMixin,
     TimeStampedModel,
 ):
     access_subnet_set: models.Manager["AccessSubnet"]
     projects: models.Manager["Project"]
     reviews: models.Manager["CustomerPermissionReview"]
     service_settings: models.Manager["ServiceSettings"]
+    id: int
 
     class Permissions:
         customer_path = "self"
@@ -307,7 +324,7 @@ class Customer(
         _("Start date of accounting"), default=timezone.now
     )
     default_tax_percent = models.DecimalField(
-        default=0,
+        default=Decimal(0),
         max_digits=4,
         decimal_places=2,
         validators=[MinValueValidator(0), MaxValueValidator(200)],
@@ -351,11 +368,10 @@ class Customer(
         """Return all connected to customer users"""
         if role:
             users = get_customer_users(self.id, role)
-            return get_user_model().objects.filter(id__in=users)
+            return User.objects.filter(id__in=users)
 
         return (
-            get_user_model()
-            .objects.filter(id__in=get_nested_customer_users(self))
+            User.objects.filter(id__in=get_nested_customer_users(self))
             .distinct()
             .order_by("username")
         )
@@ -497,6 +513,7 @@ class Project(
     PermissionMixin,
     StructureLoggableMixin,
     ImageModelMixin,
+    ServiceAccountMixin,
     TimeStampedModel,
     SoftDeletableModel,
 ):
@@ -574,10 +591,11 @@ class Project(
     # Entities returned in manager objects include deleted objects.
     available_objects = SoftDeletableManager()
     objects = models.Manager()
+    id: int
 
     @property
     def is_expired(self):
-        return self.end_date and self.end_date <= timezone.datetime.today().date()
+        return self.end_date and self.end_date <= timezone.now().date()
 
     @property
     def full_name(self) -> str:
@@ -585,9 +603,7 @@ class Project(
 
     def get_users(self, role=None):
         project_users = get_project_users(self.id, role)
-        return (
-            get_user_model().objects.filter(id__in=project_users).order_by("username")
-        )
+        return User.objects.filter(id__in=project_users).order_by("username")
 
     @transaction.atomic()
     def _soft_delete(self, using=None):
@@ -723,7 +739,7 @@ class ServiceSettings(
         return SupportedServices.get_service_backend(self.type)(self, **kwargs)
 
     def get_option(self, name):
-        options = self.options or {}
+        options = cast(dict, self.options) or {}
         if name in options:
             return options.get(name)
         else:
@@ -909,11 +925,11 @@ class BaseResource(
         return self.project.customer
 
     @property
-    def marketplace_uuid(self) -> str:
+    def marketplace_uuid(self) -> str | None:
         from waldur_mastermind.marketplace.models import Resource
 
         try:
-            return Resource.objects.get(scope=self).uuid
+            return Resource.objects.get(scope=self).uuid.hex
         except (Resource.DoesNotExist, Resource.MultipleObjectsReturned):
             return None
 
