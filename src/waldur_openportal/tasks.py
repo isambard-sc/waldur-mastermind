@@ -108,6 +108,21 @@ def run_once_task(takeover_timeout):
     return task_exc
 
 
+def is_task_running(func):
+    """
+    Check if a task associated with the passed function is currently running.
+    """
+    try:
+        lock_id = "openportal-run-once-" + func.__name__
+
+        task = models.OnceTask.objects.get(task_name=lock_id)
+        if task.last_run is not None:
+            return True
+    except models.OnceTask.DoesNotExist:
+        return False
+    return False
+
+
 def get_structure_allocations(structure):
     """
     Return all of the allocations associated with the passed object
@@ -279,8 +294,34 @@ def sync_remote_allocation_usage(serialized_allocation):
 
     backend = allocation.get_backend()
 
-    allocation = backend.check_added_remote_allocation(allocation)
-    backend.sync_remote_usage(allocation)
+    allocation = backend.check_added_allocation(allocation)
+    backend.sync_usage(allocation)
+
+
+@shared_task(name="waldur_openportal.sync_remote_allocation_users")
+def sync_remote_allocation_users(serialized_allocation):
+    """
+    This task is called to synchronise the allocations for all users
+    associated with all allocations
+    """
+    logger.info(f"task.sync_remote_allocation_users: {serialized_allocation}")
+
+    if isinstance(serialized_allocation, models.RemoteAllocation):
+        allocation = serialized_allocation
+    else:
+        allocation = core_utils.deserialize_instance(serialized_allocation)
+
+        if not isinstance(allocation, models.RemoteAllocation):
+            logger.info(
+                f"Skipping allocation {allocation} - not a RemoteAllocation instance"
+            )
+            return
+
+    backend = allocation.get_backend()
+
+    allocation = backend.check_added_allocation(allocation)
+
+    backend.sync_users(allocation)
 
 
 @shared_task(name="waldur_openportal.sync_allocation_users")
@@ -309,34 +350,8 @@ def sync_allocation_users(serialized_allocation):
     backend.sync_users(allocation)
 
 
-@shared_task(name="waldur_openportal.sync_remote_allocation_users")
-def sync_remote_allocation_users(serialized_allocation):
-    """
-    This task is called to synchronise the allocations for all users
-    associated with all allocations
-    """
-    logger.info(f"task.sync_remote_allocation_users: {serialized_allocation}")
-
-    if isinstance(serialized_allocation, models.RemoteAllocation):
-        allocation = serialized_allocation
-    else:
-        allocation = core_utils.deserialize_instance(serialized_allocation)
-
-        if not isinstance(allocation, models.RemoteAllocation):
-            logger.info(
-                f"Skipping allocation {allocation} - not a RemoteAllocation instance"
-            )
-            return
-
-    backend = allocation.get_backend()
-
-    allocation = backend.check_added_remote_allocation(allocation)
-
-    backend.sync_remote_users(allocation)
-
-
 @shared_task(name="waldur_openportal.sync_usage")
-@run_once_task(takeover_timeout=60 * 30)
+@run_once_task(takeover_timeout=60 * 60)
 def sync_usage():
     """
     This task is called to synchronise the usage for all allocations
@@ -468,7 +483,7 @@ def sync_usage():
 
 
 @shared_task(name="waldur_openportal.sync")
-@run_once_task(takeover_timeout=60 * 30)
+@run_once_task(takeover_timeout=60 * 60)
 def sync():
     """
     This is a full OpenPortal sync - this will go through all projects

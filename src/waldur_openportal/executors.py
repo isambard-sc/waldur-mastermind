@@ -50,7 +50,7 @@ class RemoteAllocationCreateExecutor(core_executors.CreateExecutor):
     def get_task_signature(cls, volume, serialized_allocation, **kwargs):
         return core_tasks.BackendMethodTask().si(
             serialized_allocation,
-            "create_remote_allocation",
+            "create_allocation",
             state_transition="begin_creating",
         )
 
@@ -60,7 +60,7 @@ class RemoteAllocationSetLimitsExecutor(core_executors.ActionExecutor):
     def get_task_signature(cls, allocation, serialized_allocation, **kwargs):
         return core_tasks.BackendMethodTask().si(
             serialized_allocation,
-            "set_remote_resource_limits",
+            "set_resource_limits",
             state_transition="begin_updating",
         )
 
@@ -72,7 +72,7 @@ class RemoteAllocationPullExecutor(core_executors.ActionExecutor):
     def get_task_signature(cls, volume, serialized_volume, **kwargs):
         return core_tasks.BackendMethodTask().si(
             serialized_volume,
-            "pull_remote_allocation",
+            "pull_allocation",
             state_transition="begin_updating",
         )
 
@@ -82,7 +82,7 @@ class RemoteAllocationDeleteExecutor(core_executors.DeleteExecutor):
     def get_task_signature(cls, volume, serialized_allocation, **kwargs):
         return core_tasks.BackendMethodTask().si(
             serialized_allocation,
-            "delete_remote_allocation",
+            "delete_allocation",
             state_transition="begin_deleting",
         )
 

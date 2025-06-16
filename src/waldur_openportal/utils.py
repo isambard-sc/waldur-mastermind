@@ -161,3 +161,49 @@ def get_association(user, allocation):
             raise models.Association.DoesNotExist(
                 f"No association found for {user} and {allocation}"
             )
+
+
+def get_remote_association(user, allocation):
+    """
+    Return the association between the user and the allocation.
+    """
+    if not isinstance(allocation, models.RemoteAllocation):
+        raise TypeError("allocation must be an instance of models.RemoteAllocation")
+
+    if not isinstance(user, core_models.User):
+        raise TypeError("user must be an instance of core_models.User")
+
+    try:
+        return models.RemoteAssociation.objects.get(user=user, allocation=allocation)
+    except models.RemoteAssociation.MultipleObjectsReturned:
+        logger.warning(
+            f"Multiple associations found for {user} and {allocation} - removing all but the first one"
+        )
+        associations = models.RemoteAssociation.objects.filter(
+            user=user, allocation=allocation
+        )
+
+        if associations.exists():
+            first_association = associations.first()
+
+            if first_association is None:
+                logger.error(f"No associations found for {user} and {allocation}?")
+                raise models.RemoteAssociation.DoesNotExist(
+                    f"No association found for {user} and {allocation}"
+                )
+
+            if len(associations) > 1:
+                for association in associations[1:]:
+                    logger.info(
+                        f"Deleting duplicate association {association} for {user} and {allocation}"
+                    )
+                    association.delete()
+
+            return first_association
+        else:
+            logger.error(
+                f"No associations found for {user} and {allocation} after deletion"
+            )
+            raise models.RemoteAssociation.DoesNotExist(
+                f"No association found for {user} and {allocation}"
+            )
