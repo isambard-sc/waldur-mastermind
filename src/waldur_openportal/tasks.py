@@ -561,6 +561,20 @@ def sync_project(serialized_project):
                 logger.error("Took too long - aborting")
                 break
 
+    for allocation in get_structure_remote_allocations(project):
+        try:
+            sync_remote_allocation_users(allocation)
+        except Exception as e:
+            logger.error(f"Failed to sync remote users for {allocation}: {e}")
+            fail_count += 1
+
+            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                logger.error("Too many failures - aborting")
+                break
+            elif (datetime.datetime.now() - now).seconds > 300:
+                logger.error("Took too long - aborting")
+                break
+
 
 @shared_task(name="waldur_openportal.send_notifications")
 def send_notifications():
@@ -635,6 +649,8 @@ def send_notifications():
             credits_available = float(credits_available)
 
         # find any openportal allocations associated with the project
+        # (note we don't do this for RemoteAllocations, as the remote
+        #  portal should be handling this)
         allocations = models.Allocation.objects.filter(project=project, is_active=True)
 
         # Calculate the total usage so far this month across OpenPortal allocations

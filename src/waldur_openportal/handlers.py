@@ -235,8 +235,36 @@ def update_quotas_on_allocation_usage_update(sender, instance, created=False, **
     update_quotas(project.customer, models.Allocation.Permissions.customer_path)
 
 
+@if_plugin_enabled
+def update_quotas_on_remote_allocation_usage_update(
+    sender, instance, created=False, **kwargs
+):
+    if created:
+        return
+
+    allocation = instance
+    if not allocation.usage_changed():
+        return
+
+    project = allocation.project
+    update_remote_quotas(project, models.RemoteAllocation.Permissions.project_path)
+    update_remote_quotas(
+        project.customer, models.RemoteAllocation.Permissions.customer_path
+    )
+
+
 def update_quotas(scope, path):
     qs = models.Allocation.objects.filter(**{path: scope}).values(path)
+    for quota in utils.FIELD_NAMES:
+        qs = qs.annotate(**{"total_%s" % quota: Sum(quota)})
+    qs = list(qs)[0]
+
+    for quota in utils.FIELD_NAMES:
+        scope.set_quota_usage(utils.MAPPING[quota], qs["total_%s" % quota])
+
+
+def update_remote_quotas(scope, path):
+    qs = models.RemoteAllocation.objects.filter(**{path: scope}).values(path)
     for quota in utils.FIELD_NAMES:
         qs = qs.annotate(**{"total_%s" % quota: Sum(quota)})
     qs = list(qs)[0]

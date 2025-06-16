@@ -80,6 +80,14 @@ class OpenPortalConfig(AppConfig):
             ),
         )
 
+        structure_models.Project.add_quota_field(
+            name="op_remote_allocation_count",
+            quota_field=CounterQuotaField(
+                target_models=lambda: [models.RemoteAllocation],
+                path_to_scope="project",
+            ),
+        )
+
         structure_models.Customer.add_quota_field(
             name="op_allocation_count",
             quota_field=CounterQuotaField(
@@ -88,8 +96,22 @@ class OpenPortalConfig(AppConfig):
             ),
         )
 
+        structure_models.Customer.add_quota_field(
+            name="op_remote_allocation_count",
+            quota_field=CounterQuotaField(
+                target_models=lambda: [models.RemoteAllocation],
+                path_to_scope="project.customer",
+            ),
+        )
+
         signals.post_save.connect(
             handlers.update_quotas_on_allocation_usage_update,
             sender=models.Allocation,
             dispatch_uid="waldur_openportal.handlers.update_quotas_on_allocation_usage_update",
+        )
+
+        signals.post_save.connect(
+            handlers.update_quotas_on_remote_allocation_usage_update,
+            sender=models.RemoteAllocation,
+            dispatch_uid="waldur_openportal.handlers.update_quotas_on_remote_allocation_usage_update",
         )

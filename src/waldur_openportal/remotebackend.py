@@ -20,7 +20,7 @@ from . import utils as openportal_utils
 logger = logging.getLogger(__name__)
 
 
-class OpenPortalBackend(ServiceBackend):
+class RemoteOpenPortalBackend(ServiceBackend):
     def __init__(self, settings):
         self.settings = settings
         self.client = self.get_client(settings)
@@ -42,6 +42,7 @@ class OpenPortalBackend(ServiceBackend):
     def get_client(self, settings):
         return RemoteOpenPortalClient(
             instance_name=settings.options.get("instance_name", None),
+            project_class=settings.options.get("project_class", None),
         )
 
     def pull_resources(self):

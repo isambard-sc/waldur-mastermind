@@ -244,6 +244,11 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
     def get_backend_fields(cls):
         return super().get_backend_fields() + ("node_usage",)
 
+    def get_backend(self, **kwargs):
+        from .remotebackend import RemoteOpenPortalBackend
+
+        return RemoteOpenPortalBackend(self.service_settings, **kwargs)
+
     def __str__(self):
         if self.has_mapping():
             return f"{self.name}|{self.get_mapping()}"
