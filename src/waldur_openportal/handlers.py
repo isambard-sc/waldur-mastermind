@@ -37,16 +37,12 @@ def schedule_sync(*args, **kwargs):
     """
     logger.info("Scheduling OpenPortal synchronization.")
 
-    logger.info(f"Args: {args}, Kwargs: {kwargs}")
-
     # We will rate-limit by synchronizing only once per transaction.
     # This is useful for when multiple changes are made in a single transaction,
     # such as when a user is created and then immediately added to a project.
     if transaction.get_connection().in_atomic_block:
         logger.info("OpenPortal synchronization already scheduled in this transaction.")
         return
-
-    logger.info(f"Args: {args}, Kwargs: {kwargs}")
 
     transaction.on_commit(lambda: tasks.sync.delay())
 
@@ -60,7 +56,6 @@ def schedule_creation_sync(*args, **kwargs):
     """
 
     logger.info("Scheduling OpenPortal synchronization after creation.")
-    logger.info(f"Args: {args}, Kwargs: {kwargs}")
 
 
 @if_plugin_enabled
@@ -72,7 +67,6 @@ def schedule_deletion_sync(*args, **kwargs):
     """
 
     logger.info("Scheduling OpenPortal synchronization after deletion.")
-    logger.info(f"Args: {args}, Kwargs: {kwargs}")
 
 
 @if_plugin_enabled
