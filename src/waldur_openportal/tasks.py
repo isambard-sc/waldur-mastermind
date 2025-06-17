@@ -9,6 +9,9 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.models import User
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices import models as invoice_models
+from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import utils as marketplace_utils
+from waldur_core.core.utils import get_system_robot
 
 from . import backend, models, utils
 
@@ -882,6 +885,48 @@ def create_default_resources(serialized_managed_project):
 
     logger.info(f"OpenPortal - Creating default resources for {project} - {offerings}")
 
+    for offering in offerings:
+        # find any existing orders for this project and offering
+        existing_resources = marketplace_models.Resource.objects.filter(
+            project=project,
+            offering=offering,
+        )
+
+        if existing_resources.exists():
+            logger.info(
+                f"OpenPortal - Found existing resources for {offering} in {project}"
+            )
+            continue
+
+        logger.info(f"OpenPortal - Creating {offering} for {project}")
+
+        try:
+            # Create the resource for the project and offering
+            resource = marketplace_models.Resource.objects.create(
+                name=str(offering.name),
+                project=project,
+                offering=offering,
+                plan=offering.plans.first(),
+                user=get_system_robot(),
+            )
+
+            # Create the order for the project and offering
+            order = marketplace_models.Order.objects.create(
+                project=project,
+                offering=offering,
+                resource=resource,
+                created_by=get_system_robot(),
+                consumer_reviewed_by=get_system_robot(),
+                plan=offering.plans.first(),
+            )
+
+            marketplace_utils.process_order(order, get_system_robot())
+
+        except Exception as e:
+            logger.error(
+                f"OpenPortal - Failed to create order for {offering} in {project}: {e}"
+            )
+
 
 def update_project(
     board: OpenPortalBoard,
@@ -894,7 +939,24 @@ def update_project(
     If the project does not exist, then there will be an error.
     """
     logger.info(f"Updating project {project} with details {details}")
-    return board.update_project(project, details, force_update=force_update)
+    mapping = board.update_project(project, details, force_update=force_update)
+
+    # schedule creation of default resources again in case any were missed
+    try:
+        managed_project = models.ManagedProject.objects.filter(
+            identifier=str(mapping.project)
+        ).first()
+    except Exception as e:
+        logger.error(f"Failed to find managed project for {mapping.project}: {e}")
+        raise ValueError(f"Failed to find managed project for {mapping.project}")
+
+    if not managed_project:
+        logger.error(f"Managed project for {mapping.project} not found")
+        raise ValueError(f"Managed project for {mapping.project} not found")
+
+    create_default_resources.delay(core_utils.serialize_instance(managed_project))
+
+    return mapping
 
 
 def create_project(
