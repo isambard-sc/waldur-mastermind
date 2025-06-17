@@ -17,28 +17,20 @@ logger = logging.getLogger(__name__)
 
 class OpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer):
     class Meta:
-        secret_fields = "instance_name"
+        secret_fields = ("instance_name", "project_class")
 
     instance_name = rf_serializers.CharField(
         source="options.instance_name",
         label=_("Full path name for the OpenPortal Agent managing this instance"),
-    )
-
-
-class RemoteOpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer):
-    class Meta:
-        secret_fields = "instance_name"
-
-    instance_name = rf_serializers.CharField(
-        source="options.instance_name",
-        label=_(
-            "Full path name for the OpenPortal Remote Agent managing this instance"
-        ),
+        default=None,
+        required=False,
     )
 
     project_class = rf_serializers.CharField(
         source="options.project_class",
         label=_("Class for projects created on the remote OpenPortal instance"),
+        default=None,
+        required=False,
     )
 
 
