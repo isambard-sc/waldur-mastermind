@@ -93,7 +93,21 @@ class RemoteOpenPortalBackend(ServiceBackend):
         """
         Return the preferred shortname for the passed project.
         """
-        return openportal_utils.get_project_shortname(project)
+        shortname = openportal_utils.get_project_shortname(project)
+
+        if shortname is None:
+            logger.warning(
+                f"Project {project} does not have a shortname set - using default"
+            )
+            shortname = openportal_utils.set_default_project_shortname(project)
+
+        if shortname is None or len(shortname.strip()) == 0:
+            logger.error(f"Empty shortname for project: {project}")
+            raise ServiceBackendError(
+                f"Project {project} does not have a valid shortname set."
+            )
+
+        return shortname
 
     def sync_users(self, allocation: models.RemoteAllocation) -> None:
         if not isinstance(allocation, models.RemoteAllocation):
@@ -253,11 +267,14 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
         if allocation.has_project_identifier():
             project = allocation.get_project_identifier()
-            logger.debug(f"Allocation already exists: {allocation} | {project}")
+            details = allocation.get_project_details()
+            logger.debug(
+                f"Allocation already exists: {allocation} | {project} | {details}"
+            )
 
             # add it again just to be sure
             try:
-                remote_identifier = self.client.add_project(project)
+                remote_identifier = self.client.add_project(project, details)
             except Exception as e:
                 logger.warning(
                     f"Unable to re-add project {project} to OpenPortal: {e}. This will be re-added later..."
@@ -270,33 +287,33 @@ class RemoteOpenPortalBackend(ServiceBackend):
             allocation.is_added = True
             allocation.set_remote_project_identifier(remote_identifier)
         else:
-            project = allocation.project
-            project_name = self.get_project_shortname(project)
+            project_shortname = self.get_project_shortname(allocation.project)
+            details = allocation.get_project_details()
 
             logger.debug(
-                f"Creating allocation: {allocation} for project {project_name}"
+                f"Creating allocation: {allocation} for project {project_shortname} with details {details}"
             )
 
-            if project_name is None or not project_name.strip():
+            if project_shortname is None or not project_shortname.strip():
                 logger.error(
-                    f"Empty project_name for allocation: {allocation} - cannot create in OpenPortal"
+                    f"Empty project_shortname for allocation: {allocation} - cannot create in OpenPortal"
                 )
                 raise ServiceBackendError(
-                    f"Empty project_name for allocation. Please set a short name for {project}"
+                    f"Empty project_shortname for allocation. Please set a short name for {allocation.project}"
                 )
 
             try:
-                remote_identifier = self.client.add_project(project_name, project)
+                mapping = self.client.add_project(project_shortname, details)
             except Exception as e:
                 logger.warning(
-                    f"Unable to create OpenPortal project {project_name}: {e}. This will be created later..."
+                    f"Unable to create OpenPortal project {project_shortname}: {e}. This will be created later..."
                 )
                 return allocation
 
-            logger.debug(
-                f"Created OpenPortal project {project_name} with remote identifier {remote_identifier}"
+            logger.info(
+                f"Created OpenPortal project {allocation.project} with mapping {mapping}"
             )
-            allocation.set_remote_project_identifier(remote_identifier)
+            allocation.set_mapping(mapping)
             allocation.is_added = True
 
         allocation.save()

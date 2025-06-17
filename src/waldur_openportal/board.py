@@ -298,11 +298,11 @@ class OpenPortalBoard:
             managed_project.delete()
 
             logger.warning(
-                f"Project class '{project_class}' not found for portal '{remote_portal}'. "
+                f"Project class '{details.project_class}' not found for portal '{remote_portal}'. "
                 "This suggests that the portal is not allowed to create projects in this class."
             )
             raise openportal.OpenPortalError(
-                f"Project class '{project_class}' is not allowed for portal '{remote_portal}'"
+                f"Project class '{details.project_class}' is not allowed for portal '{remote_portal}'"
             )
 
         # The remote portal is allowed to create projects in this class,

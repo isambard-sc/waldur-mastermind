@@ -203,6 +203,28 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
 
         return openportal.ProjectIdentifier(self.backend_id)
 
+    def get_project_details(self) -> openportal.ProjectDetails:
+        if self.project is None:
+            raise ValueError("Project is not set!")
+
+        project = self.project
+
+        details = openportal.ProjectDetails("{}")
+
+        if project.name is not None:
+            details.name = str(project.name)
+
+        if project.description is not None:
+            details.description = str(project.description)
+
+        if project.start_date is not None:
+            details.start_date = project.start_date
+
+        if project.end_date is not None:
+            details.end_date = project.end_date
+
+        return details
+
     def has_mapping(self) -> bool:
         return self.has_project_identifier() and self.has_remote_project_identifier()
 

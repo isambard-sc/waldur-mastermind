@@ -69,6 +69,47 @@ def get_project_allocations(user):
     return project_allocations
 
 
+def set_default_project_shortname(project):
+    """
+    Set and return the default shortname for the passed project.
+    If the project already has a shortname, the original
+    shortname will be returned
+    """
+    # Use the project slug as the default shortname
+    if project.slug is None:
+        logger.error(f"Project slug is None for project: {project}")
+        raise ValueError(f"Project slug is None for project: {project}")
+
+    shortname = str(project.slug).strip()
+
+    if len(shortname) == 0:
+        logger.error(f"Project slug is empty for project: {project}")
+        raise ValueError(f"Project slug is empty for project: {project}")
+
+    if len(shortname) > models.MAX_PROJECT_SHORTNAME_LENGTH:
+        logger.warning(
+            f"Project slug '{shortname}' is longer than {models.MAX_PROJECT_SHORTNAME_LENGTH} characters for project: {project}"
+        )
+        shortname = shortname[: models.MAX_PROJECT_SHORTNAME_LENGTH]
+
+    project_info, created = models.ProjectInfo.objects.get_or_create(
+        project=project, shortname=shortname
+    )
+
+    if created:
+        project_info.sanitise()
+    else:
+        logger.warning(
+            f"ProjectInfo already exists for project {project} with shortname {project_info.shortname}"
+        )
+
+    if project_info.shortname is None:
+        logger.error(f"Empty shortname for project: {project}")
+        raise ValueError(f"Empty shortname for project: {project}")
+
+    return project_info.shortname
+
+
 def get_project_shortname(project):
     """
     Return the preferred shortname for the passed project.

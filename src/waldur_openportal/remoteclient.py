@@ -44,6 +44,17 @@ class RemoteOpenPortalClient:
 
         return project
 
+    def _to_project_details(self, details) -> openportal.ProjectDetails:
+        """
+        Convert the passed (any) object into a ProjectDetails object
+        """
+        if not isinstance(details, openportal.ProjectDetails):
+            details = openportal.ProjectDetails(str(details))
+
+        details.project_class = self._project_class
+
+        return details
+
     def _to_usage(self, usage) -> openportal.Usage:
         """
         Convert the passed (any) object into a Usage object
@@ -117,7 +128,7 @@ class RemoteOpenPortalClient:
         logger.info(f"Deleted OpenPortal user '{user}'")
 
     def add_project(
-        self, project: openportal.ProjectIdentifier
+        self, project: openportal.ProjectIdentifier, details: openportal.ProjectDetails
     ) -> openportal.ProjectMapping:
         """
         Tell OpenPortal to create a project with the specified name.
@@ -126,10 +137,17 @@ class RemoteOpenPortalClient:
         name, and will create it, and return the mapping
         """
         project = self._to_project_identifier(project)
+        details = self._to_project_details(details)
 
-        mapping = self.run(f"{self.destination()} add_project {project}")
+        logger.info(
+            f"Creating remote OpenPortal project {project} with details {details}"
+        )
 
-        logger.info(f"Created OpenPortal project {project} with mapping {mapping}")
+        mapping = self.run(f"{self.destination()} create_project {project} {details}")
+
+        logger.info(
+            f"Created remote OpenPortal project {project} with details {details} and mapping {mapping}"
+        )
 
         return mapping
 
