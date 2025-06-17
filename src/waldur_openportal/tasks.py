@@ -768,6 +768,75 @@ If you want to change the frequency of these updates, please ask the project PI 
     return body
 
 
+@shared_task(name="waldur_openportal.update_remote_project")
+def update_remote_project(serialized_project):
+    """
+    This task will look for any remote projects attached to the passed project,
+    and will send remote update commands so that the updates are also
+    reflected in the remote portal.
+    """
+    logger.info(f"OpenPortal task.update_remote_project: {serialized_project}")
+
+    if isinstance(serialized_project, structure_models.Project):
+        project = serialized_project
+    else:
+        project = core_utils.deserialize_instance(serialized_project)
+
+        if not isinstance(project, structure_models.Project):
+            logger.info(f"Skipping project {project} - not a Project instance")
+            return
+
+    # find the remote allocations for this project
+    remote_allocations = models.RemoteAllocation.objects.filter(
+        project=project, is_active=True
+    )
+
+    for remote_allocation in remote_allocations:
+        try:
+            backend = remote_allocation.get_backend()
+
+            logger.info(f"Updating remote project {remote_allocation}")
+
+            backend.update_allocated_project(remote_allocation)
+        except Exception as e:
+            logger.error(f"Failed to update remote project {remote_allocation}: {e}")
+
+
+@shared_task(name="waldur_openportal.delete_remote_project")
+def delete_remote_project(serialized_project):
+    """
+    This task will look for any remote projects attached to the passed project,
+    and will send remote delete commands so that the updates are also
+    reflected in the remote portal.
+    """
+    logger.info(f"OpenPortal task.delete_remote_project: {serialized_project}")
+
+    if isinstance(serialized_project, structure_models.Project):
+        project = serialized_project
+    else:
+        project = core_utils.deserialize_instance(serialized_project)
+
+        if not isinstance(project, structure_models.Project):
+            logger.info(f"Skipping project {project} - not a Project instance")
+            return
+
+    # find the remote allocations for this project
+    remote_allocations = models.RemoteAllocation.objects.filter(
+        project=project, is_active=True
+    )
+
+    for remote_allocation in remote_allocations:
+        try:
+            backend = remote_allocation.get_backend()
+
+            logger.info(f"Deleting remote project {remote_allocation}")
+
+            # Delete the remote project with the latest details
+            backend.delete_allocated_project(remote_allocation)
+        except Exception as e:
+            logger.error(f"Failed to delete remote project {remote_allocation}: {e}")
+
+
 @shared_task(name="waldur_openportal.create_default_resources")
 def create_default_resources(serialized_managed_project):
     """

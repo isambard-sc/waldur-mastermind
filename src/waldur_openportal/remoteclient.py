@@ -151,6 +151,30 @@ class RemoteOpenPortalClient:
 
         return mapping
 
+    def update_project(
+        self,
+        project: openportal.ProjectIdentifier,
+        details: openportal.ProjectDetails,
+    ) -> openportal.ProjectMapping:
+        """
+        Update the project with the specified name and details.
+        This will update the project details, but not the project name.
+        """
+        project = self._to_project_identifier(project)
+        details = self._to_project_details(details)
+
+        logger.info(
+            f"Updating remote OpenPortal project {project} with details {details}"
+        )
+
+        mapping = self.run(f"{self.destination()} update_project {project} {details}")
+
+        logger.info(
+            f"Updated remote OpenPortal project {project} with details {details} and mapping {mapping}"
+        )
+
+        return mapping
+
     def delete_project(self, project: openportal.ProjectIdentifier):
         """
         Delete the project with the specified name.

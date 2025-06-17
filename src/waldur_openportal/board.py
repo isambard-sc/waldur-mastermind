@@ -128,6 +128,53 @@ class OpenPortalBoard:
 
         return job
 
+    def _verify_existing_project_details(self, managed_project: models.ManagedProject):
+        """
+        Verify that the existing project details match the managed project.
+        If not, update the project to have the correct details
+        """
+        project = managed_project.project
+
+        if project is None:
+            logger.error(
+                f"ManagedProject {managed_project} does not have an associated project."
+            )
+            return
+
+        details = managed_project.get_details()
+
+        if details is None:
+            logger.error(
+                f"ManagedProject {managed_project} does not have project details."
+            )
+            return
+
+        if details.name is not None and details.name != project.name:
+            project.name = details.name
+
+        if (
+            details.description is not None
+            and details.description != project.description
+        ):
+            project.description = details.description
+
+        if details.start_date is not None and details.start_date != project.start_date:
+            project.start_date = details.start_date
+
+        if details.end_date is not None and details.end_date != project.end_date:
+            project.end_date = details.end_date
+
+        project.save()
+
+        if details.members is not None:
+            # Check that these members are already in the project...
+            # Note that we don't change roles for people who have already
+            # been added to the project, or for invitations already sent
+            logger.warning("Need to verify project members!")
+
+        if details.credit is not None:
+            logger.warning("Need to verify project credit!")
+
     def create_project(
         self,
         identifier: openportal.ProjectIdentifier,
@@ -360,6 +407,13 @@ class OpenPortalBoard:
         managed_project.local_identifier = str(self._to_project_identifier(shortname))
         managed_project.save()
 
+        # now force an update of the project details
+        self.update_project(
+            identifier=identifier,
+            new_details=details,
+            force_update=True,
+        )
+
         return managed_project.get_mapping()
 
     def update_project(
@@ -412,6 +466,66 @@ class OpenPortalBoard:
             raise openportal.OpenPortalError(
                 f"ManagedProject '{managed_project}' is expired or removed, cannot update project"
             )
+
+        # first, make sure that the current project details are properly
+        # set in the project...
+        self._verify_existing_project_details(managed_project)
+
+        # check to see any of the details have changed - if not, skip the update
+        if not force_update and managed_project.details == str(new_details):
+            logger.info(
+                f"Project {identifier} details have not changed, skipping update."
+            )
+            return managed_project.get_mapping()
+
+        # get the project being managed
+        project = managed_project.project
+        details = managed_project.get_details()
+
+        if new_details.name is not None:
+            if details.name != new_details.name:
+                project.name = str(new_details.name).strip()
+                details.name = str(new_details.name).strip()
+
+        if new_details.description is not None:
+            if details.description != new_details.description:
+                project.description = str(new_details.description).strip()
+                details.description = str(new_details.description).strip()
+
+        if new_details.start_date is not None:
+            if details.start_date != new_details.start_date:
+                project.start_date = new_details.start_date
+                details.start_date = new_details.start_date
+
+        if new_details.end_date is not None:
+            if details.end_date != new_details.end_date:
+                project.end_date = new_details.end_date
+                details.end_date = new_details.end_date
+
+        if new_details.members is not None:
+            # Update the members of the project
+            for member, role in new_details.members.items():
+                old_role = details.members.get(member, None)
+
+                if old_role is None or old_role != role:
+                    logger.info(
+                        f"Adding member {member} with role {role} to project {identifier}"
+                    )
+                    details.members[member] = role
+
+                # note that we don't remove people from a project!
+
+        if new_details.credit is not None:
+            if details.credit != new_details.credit:
+                logger.info(
+                    f"Setting credit {new_details.credit} for project {identifier}"
+                )
+                details.credit = new_details.credit
+
+        # save the updated project and details
+        project.save()
+        managed_project.set_details(details)
+        managed_project.save()
 
         return managed_project.get_mapping()
 

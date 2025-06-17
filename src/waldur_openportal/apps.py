@@ -48,6 +48,18 @@ class OpenPortalConfig(AppConfig):
         )
 
         signals.post_save.connect(
+            handlers.update_project,
+            sender=structure_models.Project,
+            dispatch_uid="waldur_openportal.handlers.update_project",
+        )
+
+        signals.pre_delete.connect(
+            handlers.delete_project,
+            sender=structure_models.Project,
+            dispatch_uid="waldur_openportal.handlers.delete_project",
+        )
+
+        signals.post_save.connect(
             handlers.schedule_sync_on_quota_change,
             sender=quota_models.QuotaLimit,
             dispatch_uid="waldur_openportal.handlers.schedule_sync_on_quota_save",

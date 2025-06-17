@@ -94,6 +94,64 @@ def schedule_sync_on_quota_change(sender, instance, created=False, **kwargs):
 
 
 @if_plugin_enabled
+def update_project(sender, instance, force_add=False, **kwargs):
+    """
+    Update the project (passed as "instance") in OpenPortal. If this
+    is a remote project, then it will send the OpenPortal remote
+    commands to update the project in the remote portal
+    """
+    project = instance
+
+    if force_add or set(project.tracker.changed()) & {
+        "name",
+        "description",
+        "start_date",
+        "end_date",
+    }:
+        # check to see if there are any remote allocations associated
+        # with this project
+        remote_allocations = models.RemoteAllocation.objects.filter(
+            project=project,
+        )
+
+        if not remote_allocations.exists():
+            # nothing to do
+            return
+
+        # Either the project's name or description has changed, or the
+        # project has just been added to the user - we need to update the
+        # project (updating is the same as adding in OpenPortal)
+        logger.info(f"OpenPortal - updating project {project}")
+
+        transaction.on_commit(
+            lambda: tasks.update_remote_project.delay(
+                core_utils.serialize_instance(project)
+            )
+        )
+
+
+@if_plugin_enabled
+def delete_project(sender, instance, **kwargs):
+    """
+    Make sure to remote the project in the remote portal if it is
+    deleted from the top portal
+    """
+    project = instance
+
+    # check to see if there are any remote allocations associated
+    remote_allocations = models.RemoteAllocation.objects.filter(
+        project=project,
+    )
+
+    if remote_allocations.exists():
+        transaction.on_commit(
+            lambda: tasks.delete_remote_project.delay(
+                core_utils.serialize_instance(project)
+            )
+        )
+
+
+@if_plugin_enabled
 def update_user(sender, instance, force_add=False, **kwargs):
     """
     Update the user (passed as "instance") in OpenPortal. This will
@@ -102,10 +160,6 @@ def update_user(sender, instance, force_add=False, **kwargs):
     """
 
     user = instance
-
-    logger.info(
-        f"OpenPortal - updating user {user} - tracker {user.tracker.changed()} - force_add {force_add}"
-    )
 
     if force_add or set(user.tracker.changed()) & {"unix_username"}:
         # Either the user's unix_username has changed, or the user has
@@ -135,7 +189,6 @@ def delete_user(sender, instance, **kwargs):
     who are incorrectly still associated with projects.
     """
     user = instance
-    logger.info(f"OpenPortal - deleting user {user}")
 
     if not isinstance(instance, User):
         logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")

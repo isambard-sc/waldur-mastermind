@@ -551,6 +551,14 @@ class RemoteAssociation(core_models.UuidMixin):
     def __repr__(self):
         return self.__str__()
 
+    def user_is_in_remote(self) -> bool:
+        """
+        Check if the user is in the remote OpenPortal instance.
+        This is done by checking if the user has a remote project identifier.
+        """
+        logger.warning("NEED TO PROPERLY TEST IF A USER IS IN THE REMOTE INSTANCE")
+        return self.allocation.has_remote_project_identifier()
+
 
 class AllocationUserUsage(UsageMixin):
     """
@@ -1316,12 +1324,22 @@ class ManagedProject(models.Model):
             f"{self.get_remote_identifier()}:{self.get_local_identifier()}"
         )
 
+    def set_details(self, details: openportal.ProjectDetails):
+        """
+        Set the ProjectDetails object for this project.
+        If the details are not an instance of ProjectDetails, convert it.
+        """
+        if not isinstance(details, openportal.ProjectDetails):
+            details = openportal.ProjectDetails(details)
+
+        self.details = str(details)
+
     def get_details(self) -> openportal.ProjectDetails:
         """
         Get the ProjectDetails object from the project data.
         If the project data is not set, return None.
         """
-        return openportal.ProjectDetails.from_json(self.details)
+        return openportal.ProjectDetails(self.details)
 
     def get_default_offerings(self) -> list[marketplace_models.Offering]:
         """
