@@ -344,6 +344,12 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
             f"{self.get_project_identifier()}:{self.get_remote_project_identifier()}"
         )
 
+    def get_remote_project_identifier(self) -> openportal.ProjectIdentifier:
+        if not self.has_remote_project_identifier():
+            raise ValueError("RemoteProjectIdentifier is not set!")
+
+        return openportal.ProjectIdentifier(self.remote_project_identifier)
+
     def has_remote_project_identifier(self) -> bool:
         return self.remote_project_identifier is not None
 

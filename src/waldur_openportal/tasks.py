@@ -946,21 +946,63 @@ def run_job(serialized_job):
             raise ValueError(f"Unknown command {command} for job {job.id}")
 
         job = job.completed(result)
-        board.send_result(job)
+
+        # save the job data back to the model so that we don't repeat this job
+        job_model.state = models.Job.State.COMPLETED
+        job_model.job_data = job.to_json()
+        job_model.save()
+
+        result_sent = False
+        num_attempts = 0
+
+        while not result_sent and num_attempts < 5:
+            try:
+                num_attempts += 1
+                board.send_result(job)
+                result_sent = True
+            except Exception as e:
+                logger.error(
+                    f"OpenPortal - Failed to send result for job {job.id}: {e} - retrying..."
+                )
+                time.sleep(1)
+
+        if not result_sent:
+            logger.error(
+                f"OpenPortal - Failed to send result for job {job.id} after {num_attempts} attempts"
+            )
+
     except Exception as e:
         logger.error(f"OpenPortal - Failed to run job {job.id}: {e}")
         try:
             job = job.errored(str(e))
-            board.send_result(job)
         except Exception as e:
             logger.error(
-                f"OpenPortal - Failed to send error result for job {job.id}: {e}"
+                f"OpenPortal - Failed to set error result for job {job.id}: {e}"
             )
 
-    # save the job model back to the database
-    job_model.state = models.Job.State.COMPLETED
-    job_model.job_data = job.to_json()
-    job_model.save()
+        # save the job model back to the database
+        job_model.state = models.Job.State.COMPLETED
+        job_model.job_data = job.to_json()
+        job_model.save()
+
+        result_sent = False
+        num_attempts = 0
+
+        while not result_sent and num_attempts < 5:
+            try:
+                num_attempts += 1
+                board.send_result(job)
+                result_sent = True
+            except Exception as e:
+                logger.error(
+                    f"OpenPortal - Failed to send result for job {job.id}: {e} - retrying..."
+                )
+                time.sleep(1)
+
+        if not result_sent:
+            logger.error(
+                f"OpenPortal - Failed to send result for job {job.id} after {num_attempts} attempts"
+            )
 
 
 @shared_task(name="waldur_openportal.sync_board")

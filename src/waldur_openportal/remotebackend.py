@@ -552,7 +552,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
             # TODO - check if we need to update anything missed during a change of month?
 
-        associations = models.Association.objects.filter(allocation=allocation)
+        associations = models.RemoteAssociation.objects.filter(allocation=allocation)
 
         for association in associations:
             user = association.user
@@ -572,7 +572,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
             # we save usage using the UserIdentifier rather than the local
             # username, so that a consistent identifier is used across
             # all resources in a project
-            models.AllocationUserUsage.objects.update_or_create(
+            models.RemoteAllocationUserUsage.objects.update_or_create(
                 allocation=allocation,
                 year=day.year,
                 month=day.month,
@@ -581,8 +581,8 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 defaults={"node_usage": usage},
             )
 
-    def sync_usage(self, allocation: models.Allocation):
-        if not isinstance(allocation, models.Allocation):
+    def sync_usage(self, allocation: models.RemoteAllocation):
+        if not isinstance(allocation, models.RemoteAllocation):
             raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
 
         if not allocation.is_added_to_openportal():
@@ -617,7 +617,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
             first_day = month.days[0]
 
             historical_report, created = (
-                models.HistoricalAllocation.objects.get_or_create(
+                models.HistoricalRemoteAllocation.objects.get_or_create(
                     allocation=allocation,
                     year=first_day.year,
                     month=first_day.month,
