@@ -14,6 +14,9 @@ from model_utils import FieldTracker
 from waldur_core.core import models as core_models
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.invoices import models as invoice_models
+from waldur_core.structure.managers import get_project_users
+from waldur_core.permissions.models import UserRole
 from waldur_openportal import utils
 
 logger = logging.getLogger(__name__)
@@ -222,6 +225,111 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
 
         if project.end_date is not None:
             details.end_date = project.end_date
+
+        # find any credit given to this project
+        try:
+            credit = None
+
+            for obj in invoice_models.ProjectCredit.objects.filter(project=project):
+                if credit is None:
+                    credit = obj.value
+                else:
+                    credit += obj.value
+        except Exception as e:
+            logger.warning(f"No credits associated with {project}: {e}.")
+            credit = None
+
+        if credit is not None:
+            try:
+                details.credit = openportal.Usage.from_hours(credit)
+            except Exception:
+                details.credit = openportal.Usage.from_hours(float(credit))
+
+        # now try to add in any members for this project
+        for user_id in get_project_users(project.id):
+            try:
+                user = core_models.User.objects.filter(id=user_id)
+
+                if not user.exists():
+                    logger.info(
+                        f"Skipping non-existing user {user_id} for project {project}"
+                    )
+                    continue
+
+                user = user.first()
+
+                if user is None:
+                    logger.info(
+                        f"Skipping non-existing user {user_id} for project {project}"
+                    )
+                    continue
+
+                if not user.is_active:
+                    logger.info(f"Skipping inactive user {user} for project {project}")
+                    continue
+
+                if user.email is None:
+                    logger.info(
+                        f"Skipping user {user} without email for project {project}"
+                    )
+                    continue
+
+                email = str(user.email).strip()
+
+                if not email:
+                    logger.info(
+                        f"Skipping user {user} with empty email for project {project}"
+                    )
+                    continue
+
+                # get the role name of this user in the project
+                roles = UserRole.objects.filter(
+                    user=user, scope=project, is_active=True
+                )
+
+                if roles.exists():
+                    logger.info(
+                        f"Adding user {user} with roles {roles} to project {project}"
+                    )
+
+                    if len(roles) > 1:
+                        logger.warning(
+                            f"User {user} has multiple roles in project {project}: {roles}. Only using the first one."
+                        )
+
+                    role = roles.first()
+
+                    if role is None:
+                        logger.warning(
+                            f"User {user} has no role in project {project}. Not adding user!"
+                        )
+                        continue
+
+                    role = role.role
+
+                    if role is None:
+                        logger.warning(
+                            f"User {user} has no role in project {project}. Not adding user!"
+                        )
+                        continue
+
+                    if role.name is None:
+                        logger.warning(
+                            f"User {user} has no role name in project {project}. Not adding user!"
+                        )
+                        continue
+
+                    role_name = str(role.name).strip()
+
+                    if len(role_name) == 0:
+                        logger.warning(
+                            f"User {user} has empty role name in project {project}. Not adding user!"
+                        )
+                        continue
+
+                    details.add_member(email, role_name)
+            except Exception as e:
+                logger.warning(f"Failed to add user {user} to project {project}: {e}")
 
         return details
 
