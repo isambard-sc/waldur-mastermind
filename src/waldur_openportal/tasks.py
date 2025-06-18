@@ -887,14 +887,37 @@ def create_default_resources(serialized_managed_project):
 
     for offering in offerings:
         # find any existing orders for this project and offering
-        existing_resources = marketplace_models.Resource.objects.filter(
+        num_erred = 0
+        have_existing = False
+
+        for existing_resource in marketplace_models.Resource.objects.filter(
             project=project,
             offering=offering,
-        )
+        ):
+            if existing_resource.state != marketplace_models.Resource.States.ERRED:
+                # There is an existing resource in a non-error state. This indicates
+                # that the resource is either running, or has been removed in the
+                # remote portal. DO NOT RECREATE IT.
+                have_existing = True
+                logger.info(
+                    f"OpenPortal - Found existing resource {existing_resource} for {offering} in {project}"
+                )
+                break
+            else:
+                num_erred += 1
 
-        if existing_resources.exists():
+                if num_erred > 5:
+                    # This indicates we've tried many times to create this resource
+                    # and have failed. We should not try to create it again.
+                    logger.error(
+                        f"OpenPortal - Too many resources in ERRED state for {offering} in {project} - skipping"
+                    )
+                    have_existing = True
+                    break
+
+        if have_existing:
             logger.info(
-                f"OpenPortal - Found existing resources for {offering} in {project}"
+                f"OpenPortal - Skipping creation of {offering} for {project} - already exists"
             )
             continue
 
@@ -906,21 +929,27 @@ def create_default_resources(serialized_managed_project):
                 name=str(offering.name),
                 project=project,
                 offering=offering,
-                plan=offering.plans.first(),
-                user=get_system_robot(),
             )
 
             # Create the order for the project and offering
-            order = marketplace_models.Order.objects.create(
+            # Simply creating the order will trigger the background
+            # tasks needed to create the resource.
+            # We don't need to do anything more
+            marketplace_models.Order.objects.create(
                 project=project,
                 offering=offering,
                 resource=resource,
                 created_by=get_system_robot(),
                 consumer_reviewed_by=get_system_robot(),
                 plan=offering.plans.first(),
+                attributes={
+                    "name": str(offering.name),
+                    "description": "Default resource created at the start of the project",
+                },
             )
 
-            marketplace_utils.process_order(order, get_system_robot())
+            # But worth waiting a second to ensure we don't overwhelm the system
+            time.sleep(1)
 
         except Exception as e:
             logger.error(
