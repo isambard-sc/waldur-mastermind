@@ -2178,6 +2178,14 @@ class OfferingIntegrationUpdateSerializer(serializers.ModelSerializer):
             "backend_id",
         )
 
+    def get_fields(self):
+        fields = super().get_fields()
+        for field in fields.values():
+            if hasattr(field, "fields"):
+                for subfield in field.fields.values():
+                    subfield.default = serializers.empty
+        return fields
+
     def _update_service_attributes(self, instance, validated_data):
         service_attributes = validated_data.pop("service_attributes", {})
         certificate = validated_data.get("secret_options", {}).get(
@@ -2855,6 +2863,9 @@ class ResourceSuggestNameSerializer(serializers.ModelSerializer):
 
 
 class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerializer):
+    project_slug = serializers.ReadOnlyField(source="project.slug")
+    customer_slug = serializers.ReadOnlyField(source="project.customer.slug")
+
     class Meta(BaseItemSerializer.Meta):
         model = models.Resource
         fields = BaseItemSerializer.Meta.fields + (
@@ -2905,6 +2916,8 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             "order_in_progress",
             "creation_order",
             "service_settings_uuid",
+            "project_slug",
+            "customer_slug",
         )
         read_only_fields = (
             "backend_metadata",
@@ -2921,6 +2934,8 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             "options",
             "restrict_member_access",
             "last_sync",
+            "project_slug",
+            "customer_slug",
         )
         view_name = "marketplace-resource-detail"
         extra_kwargs = dict(

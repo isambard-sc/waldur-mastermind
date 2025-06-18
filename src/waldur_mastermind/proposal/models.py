@@ -74,6 +74,14 @@ class CallManagingOrganisation(
         return "call-managing-organisation"
 
 
+def filter_calls(user):
+    return Q(
+        manager__customer__callmanagingorganisation__in=managers.get_connected_call_organizers(
+            user
+        )
+    )
+
+
 class Call(
     TimeStampedModel,
     core_models.UuidMixin,
@@ -82,6 +90,7 @@ class Call(
     structure_models.StructureLoggableMixin,
     core_models.BackendMixin,
     core_models.SlugMixin,
+    PermissionMixin,
 ):
     class States(CallStates):
         pass
@@ -103,6 +112,18 @@ class Call(
     # It is used for mapping PROPOSAL.MEMBER role to one of project roles
     default_project_role = models.ForeignKey(Role, on_delete=models.SET_NULL, null=True)
     external_url = models.URLField(blank=True, null=True)
+
+    reviewer_identity_visible_to_submitters = models.BooleanField(
+        default=False,
+        help_text="Whether proposal submitters can see reviewer identities. "
+        "If False, reviewers appear as 'Reviewer 1', 'Reviewer 2', etc.",
+    )
+    reviews_visible_to_submitters = models.BooleanField(
+        default=True,
+        help_text="Whether proposal submitters can see review comments and scores. "
+        "If False, submitters only see final approval/rejection status.",
+    )
+
     # Fixed duration that applies to all proposals in this call
     fixed_duration_in_days = models.PositiveIntegerField(
         null=True,
@@ -114,6 +135,7 @@ class Call(
     class Permissions:
         customer_path = "manager__customer"
         list_permission = PermissionEnum.LIST_CALLS
+        build_query = filter_calls
 
     def __str__(self):
         return f"{self.name} | {self.manager.customer}"
@@ -199,6 +221,14 @@ class CallResourceTemplate(
         return "proposal-call-resource-template"
 
 
+def filter_rounds(user):
+    return Q(
+        call__manager__customer__callmanagingorganisation__in=managers.get_connected_call_organizers(
+            user
+        )
+    )
+
+
 class Round(
     TimeStampedModel,
     core_models.UuidMixin,
@@ -273,6 +303,7 @@ class Round(
     class Permissions:
         customer_path = "call__manager__customer"
         list_permission = PermissionEnum.LIST_ROUNDS
+        build_query = filter_rounds
 
     def __str__(self):
         return f"{self.call.name} | {self.start_time} - {self.cutoff_time}"
@@ -307,7 +338,15 @@ class ProposalDocumentation(
 
 
 def filter_proposals(user):
-    return Q(created_by=user)
+    return (
+        Q(created_by=user)
+        | Q(
+            round__call__manager__customer__callmanagingorganisation__in=managers.get_connected_call_organizers(
+                user
+            )
+        )
+        | Q(round__call__in=managers.get_connected_calls(user))
+    )
 
 
 class Proposal(

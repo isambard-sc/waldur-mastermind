@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 import traceback
 from typing import cast
 
@@ -159,7 +160,25 @@ class DeleteNodeTask(core_tasks.Task):
     def execute(self, instance: models.Node, user_id: str):
         node = instance
         user = User.objects.get(pk=user_id)
-        vm = cast(openstack_models.Instance, node.instance)
+        vm = node.instance
+
+        backend = node.get_backend()
+        backend.drain_node(node)
+
+        timeout = 60  # seconds
+        start_time = time.time()
+        node_drain_status = None
+        while True:
+            node_drain_status = backend.get_node_drain_status(node)
+            if node_drain_status == "ok":
+                break
+            elif node_drain_status == "error":
+                raise exceptions.RancherException("Node drain failed.")
+
+            if time.time() - start_time > timeout:
+                raise exceptions.RancherException("Node drain timeout.")
+
+            time.sleep(5)
 
         if vm:
             view = MarketplaceInstanceViewSet.as_view({"delete": "force_destroy"})
@@ -173,7 +192,7 @@ class DeleteNodeTask(core_tasks.Task):
             if response.status_code != status.HTTP_202_ACCEPTED:
                 raise exceptions.RancherException(response.data)
         else:
-            backend = node.cluster.get_backend()
+            backend = node.get_backend()
             backend.delete_node(node)
 
 
@@ -354,7 +373,7 @@ class CreateArgoCDClusterSecretTask(core_tasks.Task):
             )
             return
 
-        k8s = KubernetesBackend(kubeconfig_str)
+        k8s = KubernetesBackend(kubeconfig_str=kubeconfig_str)
         secret_name = f"cluster-{instance.uuid.hex}"
         argocd_namespace = instance.settings.get_option("argocd_k8s_namespace")
         cluster_backend: backend.RancherBackend = instance.get_backend()
@@ -775,7 +794,7 @@ def sync_rancher_group_bindings():
             local_project_groups = list(
                 models.KeycloakGroup.objects.filter(
                     role__settings=project.settings,
-                    role__scope_type=enums.RoleScopeType.CLUSTER,
+                    role__scope_type=enums.RoleScopeType.PROJECT,
                 )
             )
             # Create missing project groups in Rancher

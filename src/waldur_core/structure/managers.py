@@ -3,12 +3,14 @@ from typing import TypeVar
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
-from django.db.models import F, Q, QuerySet
+from django.db.models import F, Model, Q, QuerySet
 from django.db.models.functions import Now
 from rest_framework.authtoken import models as authtoken_models
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.managers import GenericKeyMixin
+from waldur_core.core.models import User
+from waldur_core.permissions.mixins import PermissionMixin
 from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import get_scope_ids, get_user_ids
 from waldur_core.structure import models as structure_models
@@ -20,10 +22,10 @@ def build_filter(path, ids):
     return models.Q(**{f"{path}__in": ids})
 
 
-T = TypeVar("T")
+T = TypeVar("T", bound=Model)
 
 
-def filter_queryset_for_user(queryset: QuerySet[T], user) -> QuerySet[T]:
+def filter_queryset_for_user(queryset: QuerySet[T], user: User) -> QuerySet[T]:
     def get_customer_subquery(path):
         if list_permission:
             connected_customers = get_connected_customers_by_permission(
@@ -42,12 +44,6 @@ def filter_queryset_for_user(queryset: QuerySet[T], user) -> QuerySet[T]:
             connected_projects = get_connected_projects(user)
         return build_filter(path, connected_projects)
 
-    def get_call_organizer_subquery(path):
-        from waldur_mastermind.proposal.managers import get_connected_call_organizers
-
-        connected_call_organizers = get_connected_call_organizers(user)
-        return build_filter(path, connected_call_organizers)
-
     if user is None or not user.is_authenticated or user.is_staff or user.is_support:
         return queryset
 
@@ -65,7 +61,6 @@ def filter_queryset_for_user(queryset: QuerySet[T], user) -> QuerySet[T]:
 
     customer_path = getattr(permissions, "customer_path", None)
     project_path = getattr(permissions, "project_path", None)
-    call_organizer_path = getattr(permissions, "call_organizer_path", None)
 
     if customer_path:
         if isinstance(customer_path, list | tuple):
@@ -81,16 +76,15 @@ def filter_queryset_for_user(queryset: QuerySet[T], user) -> QuerySet[T]:
         else:
             subquery |= get_project_subquery(project_path)
 
-    if call_organizer_path:
-        if isinstance(call_organizer_path, list | tuple):
-            for p in call_organizer_path:
-                subquery |= get_call_organizer_subquery(p)
-        else:
-            subquery |= get_call_organizer_subquery(call_organizer_path)
-
     build_query = getattr(permissions, "build_query", None)
     if build_query:
         subquery |= build_query(user)
+
+    if issubclass(queryset.model, PermissionMixin) and issubclass(
+        queryset.model, Model
+    ):
+        content_type = ContentType.objects.get_for_model(queryset.model)
+        subquery |= models.Q(id__in=get_scope_ids(user, content_type))
 
     if not subquery:
         return queryset
