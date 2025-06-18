@@ -948,9 +948,6 @@ def create_default_resources(serialized_managed_project):
                 },
             )
 
-            # But worth waiting a second to ensure we don't overwhelm the system
-            time.sleep(1)
-
         except Exception as e:
             logger.error(
                 f"OpenPortal - Failed to create order for {offering} in {project}: {e}"
@@ -1124,6 +1121,7 @@ def run_job(serialized_job):
                 logger.error(
                     f"OpenPortal - Failed to send result for job {job.id}: {e} - retrying..."
                 )
+                # celery sleep
                 time.sleep(1)
 
         if not result_sent:

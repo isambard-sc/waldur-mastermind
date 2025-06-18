@@ -827,6 +827,7 @@ def fetch_job(request):
         response.status_code = status.UNAUTHORIZED
         return response
 
+    # move to serlialiser django
     job_id = str(job_id).lstrip().rstrip()
 
     if len(job_id) == 0:
