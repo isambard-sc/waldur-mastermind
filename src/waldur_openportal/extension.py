@@ -25,17 +25,17 @@ class OpenPortalExtension(WaldurExtension):
         return {
             "waldur-openportal-sync-users": {
                 "task": "waldur_openportal.sync",
-                "schedule": timedelta(minutes=1),  # 59),
+                "schedule": timedelta(minutes=59),
                 "args": (),
             },
             "waldur-openportal-sync-usage": {
                 "task": "waldur_openportal.sync_usage",
-                "schedule": timedelta(minutes=1),  # 7),
+                "schedule": timedelta(minutes=7),
                 "args": (),
             },
             "waldur-openportal-send-notifications": {
                 "task": "waldur_openportal.send_notifications",
-                "schedule": timedelta(minutes=1),  # 47),
+                "schedule": timedelta(minutes=47),
                 "args": (),
             },
         }
