@@ -388,7 +388,14 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     def attach_documents(self, request, uuid=None):
         instance: models.Call = self.get_object()
 
-        documents = request.data.getlist("documents", [])
+        try:
+            documents = request.data.getlist("documents", [])
+        except AttributeError:
+            documents = request.data.get("documents", [])
+
+            if not isinstance(documents, list):
+                documents = [documents]
+
         description = request.data.get("description", "")
 
         for file_data in documents:
@@ -419,7 +426,17 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     @decorators.action(detail=True, methods=["post"])
     def detach_documents(self, request, uuid=None):
         instance: models.Call = self.get_object()
-        documents = request.data.getlist("documents", [])
+
+        try:
+            documents = request.data.getlist("documents", [])
+        except AttributeError:
+            documents = request.data.get("documents", [])
+
+            if not isinstance(documents, list):
+                documents = [documents]
+
+        logger.info(f"Removing documents {documents} from call {instance.name}")
+
         for file_data in documents:
             models.CallDocument.objects.get(
                 call=instance,
