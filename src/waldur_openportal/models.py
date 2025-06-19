@@ -916,7 +916,32 @@ class ProjectInfo(models.Model):
             if self.shortname is None and self.project.short_name is not None:
                 # copy if from the project (for legacy projects)
                 self.shortname = self.project.short_name
-                self.save()
+
+                try:
+                    self.save()
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to save project shortname {self.shortname} for project {self.project} - using slug: {e}"
+                    )
+                    shortname = self.project.slug.strip()
+
+                    if len(shortname) == 0:
+                        raise ValueError(
+                            "Project shortname cannot be empty. Please set it in OpenPortal."
+                        )
+
+                    if len(shortname) > MAX_PROJECT_SHORTNAME_LENGTH:
+                        logger.warning(
+                            f"Project shortname {shortname} is too long, truncating to {MAX_PROJECT_SHORTNAME_LENGTH} characters."
+                        )
+                        shortname = shortname[:MAX_PROJECT_SHORTNAME_LENGTH]
+
+                    self.shortname = shortname
+                    self.save()
+
+                    self.project.short_name = shortname
+                    self.project.save()
+
             elif self.shortname is not None:
                 # copy to the project so that it matches
                 if self.project.short_name is None:
