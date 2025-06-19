@@ -3,16 +3,16 @@ import time
 from typing import cast
 from urllib.parse import parse_qs, urlparse
 
+import hvac
 import requests
 from django.contrib.contenttypes.models import ContentType
 from django.core.files.base import ContentFile
 from django.db.models import QuerySet
 from django.utils.functional import cached_property
-
-import hvac
 from hvac import exceptions as vault_exceptions
 from keycloak import KeycloakAdmin
 from keycloak import exceptions as keycloak_exceptions
+
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.media.utils import guess_image_extension
@@ -430,7 +430,7 @@ class RancherBackend(ServiceBackend):
                 self.client.delete_cluster(cluster.backend_id)
             except NotFound:
                 logger.debug(
-                    "Cluster %s is not present in the backend " % cluster.backend_id
+                    "Cluster %s is not present in the backend ", cluster.backend_id
                 )
 
         cluster.delete()
@@ -440,7 +440,7 @@ class RancherBackend(ServiceBackend):
             try:
                 self.client.delete_node(node.backend_id)
             except NotFound:
-                logger.debug("Node %s is not present in the backend " % node.backend_id)
+                logger.debug("Node %s is not present in the backend ", node.backend_id)
         node.delete()
 
     def update_cluster(self, cluster: models.Cluster):
@@ -460,7 +460,15 @@ class RancherBackend(ServiceBackend):
             cluster.name = backend_cluster["name"]
             cluster.runtime_state = backend_cluster["state"]
             cluster.kubernetes_version = backend_cluster["version"]["gitVersion"]
-            cluster.capacity = backend_cluster["capacity"]
+            capacity: dict = backend_cluster["capacity"]
+            mem_capacity_raw = capacity.pop(
+                "memory", "0Ki"
+            )  # The API returns memory data in KB
+            mem_capacity_kb = mem_capacity_raw.replace("Ki", "")
+            capacity["memory"] = (
+                f"{int(mem_capacity_kb) // 1024}Mi"  # convert to MB and save
+            )
+            cluster.capacity = capacity
             cluster.requested = backend_cluster["requested"]
 
     def _cluster_to_backend_cluster(self, cluster: models.Cluster):
@@ -579,8 +587,7 @@ class RancherBackend(ServiceBackend):
                 return
 
         cluster.error_message = (
-            "The cluster is not connected with any "
-            "non-failed VM's with 'server' role."
+            "The cluster is not connected with any non-failed VM's with 'server' role."
         )
         cluster.runtime_state = "error"
         cluster.save()
@@ -654,10 +661,17 @@ class RancherBackend(ServiceBackend):
 
     def get_node_drain_status(self, node: models.Node):
         backend_node = self.client.get_node(node.backend_id)
-        conditions = backend_node.get("status", {}).get("conditions", [])
-        condition = next(
-            condition for condition in conditions if condition["type"] == "Drained"
-        )
+        conditions = backend_node.get("conditions", [])
+        try:
+            condition = next(
+                condition for condition in conditions if condition["type"] == "Drained"
+            )
+        except StopIteration:
+            logger.warning(
+                "Node %s does not have 'Drained' condition. ",
+                node.backend_id,
+            )
+            return "unknown"
         if not condition:
             return "unknown"
         if condition["status"] == "True":
@@ -1369,7 +1383,7 @@ class RancherBackend(ServiceBackend):
         try:
             self.client.delete_hpa(hpa.project.backend_id, hpa.backend_id)
         except NotFound:
-            logger.debug("HPA %s is not present in the backend." % hpa.backend_id)
+            logger.debug("HPA %s is not present in the backend.", hpa.backend_id)
 
     def get_hpa_yaml(self, hpa: models.HPA):
         if not hpa.project:
@@ -1509,7 +1523,7 @@ class RancherBackend(ServiceBackend):
                 app.rancher_project.backend_id, app.backend_id
             )
         except NotFound:
-            logger.debug("App %s is not present in the backend." % app.backend_id)
+            logger.debug("App %s is not present in the backend.", app.backend_id)
 
     def pull_ingresses(self):
         local_clusters = models.Cluster.objects.filter(settings=self.settings)

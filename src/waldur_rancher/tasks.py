@@ -7,10 +7,10 @@ from typing import cast
 import kubernetes
 import yaml
 from celery import shared_task
+from keycloak import exceptions as keycloak_exceptions
 from rest_framework import status
 from rest_framework.reverse import reverse
 
-from keycloak import exceptions as keycloak_exceptions
 from waldur_core.core import tasks as core_tasks
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
@@ -688,6 +688,7 @@ def sync_rancher_group_bindings():
             item
             for item in remote_cluster_groups_all
             if item["groupPrincipalId"] is not None
+            and "keycloakoidc_group://" in item["groupPrincipalId"]
         ]
         remote_cluster_groups = {
             group["groupPrincipalId"]: group for group in remote_cluster_groups_filtered
@@ -749,6 +750,7 @@ def sync_rancher_group_bindings():
             item
             for item in remote_project_groups_all
             if item["groupPrincipalId"] is not None
+            and "keycloakoidc_group://" in item["groupPrincipalId"]
         ]
         remote_project_groups = {
             group["groupPrincipalId"]: group for group in remote_cluster_groups_filtered
