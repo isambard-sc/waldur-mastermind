@@ -17,6 +17,9 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_core.structure.managers import get_project_users
 from waldur_core.permissions.models import UserRole, Role
+from waldur_core.core.mixins import ReviewMixin
+from waldur_core.core.enums import ReviewStates
+from waldur_core.core.utils import get_system_robot
 from waldur_openportal import utils
 
 logger = logging.getLogger(__name__)
@@ -1423,7 +1426,7 @@ class ProjectClass(models.Model):
         return generator
 
 
-class ManagedProject(models.Model):
+class ManagedProject(ReviewMixin, models.Model):
     """
     This model is responsible for storing data about projects that are
     managed by OpenPortal. This is used to track the progress of projects
@@ -1475,15 +1478,6 @@ class ManagedProject(models.Model):
         blank=True,
         null=True,
         help_text=_("The local project identifier in this portal."),
-    )
-
-    # Whether or not a change to this project needs approval
-    needs_approval = models.BooleanField(
-        default=False,
-        verbose_name=_("needs approval"),
-        help_text=_(
-            "Whether or not a change to this project needs approval from a local admin."
-        ),
     )
 
     def has_project_class(self) -> bool:
@@ -1618,21 +1612,60 @@ class ManagedProject(models.Model):
         else:
             return []
 
-    def set_needs_approval(self, needs_approval: bool):
+    def set_needs_approval(self, needs_approval: bool = True):
         """
         Set whether or not this project needs approval from a local admin.
         This is used to control whether or not changes to this project
         need to be approved by a local admin.
         """
-        self.needs_approval = needs_approval
+        if needs_approval:
+            if self.state != ReviewStates.PENDING:
+                self.state = ReviewStates.PENDING
+                self.reviewed_by = None
+                self.reviewed_at = None
+                self.review_comment = None
+                self.save(
+                    update_fields=[
+                        "state",
+                        "reviewed_by",
+                        "reviewed_at",
+                        "review_comment",
+                    ]
+                )
+        else:
+            self.approve(get_system_robot(), comment="Approved automatically.")
 
-    def get_needs_approval(self) -> bool:
+    def is_pending(self) -> bool:
         """
-        Get whether or not this project needs approval from a local admin.
-        This is used to control whether or not changes to this project
-        need to be approved by a local admin.
+        Check if this project is pending approval.
+        This is used to determine whether or not the project
+        needs to be approved by a local admin.
         """
-        return self.needs_approval
+        return self.state == ReviewStates.PENDING
+
+    def is_canceled(self) -> bool:
+        """
+        Check if this project is canceled.
+        This is used to determine whether or not the project
+        has been canceled by a local admin.
+        """
+        return self.state == ReviewStates.CANCELED
+
+    def is_rejected(self) -> bool:
+        """
+        Check if this project is rejected.
+        This is used to determine whether or not the project
+        has been rejected by a local admin.
+        """
+        return self.state == ReviewStates.REJECTED
+
+    def is_approved(self) -> bool:
+        """
+        Check if this project is approved.
+        This is used to determine whether or not the project
+        has been approved by a local admin.
+        """
+        return self.state == ReviewStates.APPROVED
 
     def __str__(self) -> str:
         return f"ManagedProject {self.identifier} => {self.project}"

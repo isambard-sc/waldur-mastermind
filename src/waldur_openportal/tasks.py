@@ -10,7 +10,6 @@ from waldur_core.core.models import User
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_core.core.utils import get_system_robot
 
 from . import backend, models, utils
@@ -483,6 +482,46 @@ def sync_usage():
                 elif (datetime.datetime.now() - now).seconds > 120:
                     logger.error("Took too long - aborting")
                     return
+
+
+@shared_task(name="waldur_openportal.sync_remote")
+@run_once_task(takeover_timeout=60 * 60)
+def sync_remote():
+    """
+    This is a full OpenPortal remote sync - this will go through all remote projects
+    and make sure that they have been created and any updates applied
+    """
+    logger.info("OpenPortal task.sync_remote")
+    now = datetime.datetime.now()
+    fail_count = 0
+
+    # First, try to create all of the remote projects that are not
+    # already created in the remote portal
+    for remote_allocation in models.RemoteAllocation.objects.filter(is_active=True):
+        try:
+            backend = remote_allocation.get_backend()
+
+            if not remote_allocation.is_added_to_openportal():
+                logger.info(
+                    f"Remote allocation {remote_allocation} not in OpenPortal - adding"
+                )
+                backend.add_allocated_project(remote_allocation)
+            else:
+                logger.info(
+                    f"Remote allocation {remote_allocation} already in OpenPortal - checking for updates"
+                )
+                backend.update_allocated_project(remote_allocation)
+
+        except Exception as e:
+            logger.error(f"Failed to sync remote project {remote_allocation}: {e}")
+            fail_count += 1
+
+            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                logger.error("Too many failures - aborting")
+                break
+            elif (datetime.datetime.now() - now).seconds > 300:
+                logger.error("Took too long - aborting")
+                break
 
 
 @shared_task(name="waldur_openportal.sync")

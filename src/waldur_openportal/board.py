@@ -1,7 +1,11 @@
 import logging
 import os
 
+from django.utils import timezone
+
 from waldur_core.structure import models as structure_models
+from waldur_core.core.enums import ReviewStates
+from waldur_core.core.utils import get_system_robot
 
 from . import op as openportal
 from . import models
@@ -281,8 +285,18 @@ class OpenPortalBoard:
             raise openportal.OpenPortalError(f"Invalid project details: {details}")
 
         # Get (or create) the ManagedProject for the given project identifier
-        managed_project, created = models.ManagedProject.objects.update_or_create(
+        managed_project, created = models.ManagedProject.objects.get_or_create(
             identifier=str(identifier),
+            defaults={
+                "details": str(details),
+                "local_identifier": None,
+                "project_class": None,
+                "project": None,
+                "state": ReviewStates.DRAFT,
+                "reviewed_by": None,
+                "reviewed_at": None,
+                "review_comment": None,
+            },
         )
 
         if created:
@@ -294,52 +308,57 @@ class OpenPortalBoard:
                 f"Retrieved existing ManagedProject for identifier {identifier}: {managed_project}"
             )
 
-        # We can't do anything if the project is already in a "needs approval" state
-        if managed_project.get_needs_approval():
-            logger.error(
-                f"ManagedProject {managed_project} is already in a 'needs approval' state."
-            )
-            raise openportal.OpenPortalError(
-                f"ManagedProject '{managed_project}' is already in a 'needs approval' state"
-            )
+        # We can't do anything if the project is pending approval or cancelled
+        if managed_project.is_pending():
+            logger.warning(f"{identifier} is pending approval!")
+            raise openportal.OpenPortalError(f"{identifier} is pending approval!")
+        elif managed_project.is_canceled():
+            logger.warning(f"{identifier} is canceled!")
+            raise openportal.OpenPortalError(f"{identifier} is canceled!")
+        elif managed_project.is_rejected():
+            logger.warning(f"{identifier} is rejected!")
+            raise openportal.OpenPortalError(f"{identifier} is rejected!")
 
         # get the project class of this project
         project_class = self._get_project_class(managed_project, details)
 
         if project_class is None:
             # This is a bug - we should not have a ManagedProject without a project class
-            logger.error(
-                f"ManagedProject {managed_project} does not have a project class set."
-            )
+            logger.error(f"{identifier} does not have a project class set.")
             managed_project.delete()
 
             raise openportal.OpenPortalError(
-                f"ManagedProject '{managed_project}' does not have a project class set"
+                f"{identifier} does not have a project class set"
             )
 
-        if project_class.action_needs_approval():
+        if project_class.action_needs_approval() and not managed_project.is_approved():
             # We need to approve creation requests for this project class
             logger.info(
-                f"Project class {managed_project.project_class} requires approval for project creation."
+                f"Project {identifier} with class {managed_project.project_class} requires approval for project creation"
             )
-            managed_project.set_needs_approval(True)
-            managed_project.save()
+            managed_project.set_needs_approval()
 
             # Here you would typically send a notification to the admin or
             # the person responsible for approving project creation requests.
             # For now, we will just raise an error to indicate that approval is needed.
             raise openportal.OpenPortalError(
-                f"Project class '{managed_project.project_class}' requires approval for project creation"
+                f"{identifier} requires approval for project creation"
             )
+        elif not managed_project.is_approved():
+            # If the project class does not require approval, we can proceed
+            logger.info(
+                f"Project {identifier} with class {managed_project.project_class} does not require approval for project creation."
+            )
+            managed_project.set_needs_approval(False)
 
         if managed_project.project is not None:
             if managed_project.project.is_expired or managed_project.project.is_removed:
                 # we can't make any changes to this project - return an error
                 logger.error(
-                    f"ManagedProject {managed_project} is expired or removed, cannot create project."
+                    f"{identifier} is expired or removed, cannot create project."
                 )
                 raise openportal.OpenPortalError(
-                    f"ManagedProject '{managed_project}' is expired or removed, cannot create project"
+                    f"{identifier} is expired or removed, cannot create project"
                 )
 
             # we have already created this project, so we can just return the mapping - check
@@ -347,17 +366,17 @@ class OpenPortalBoard:
             if managed_project.details is None:
                 # This is a bug
                 logger.error(
-                    f"Project details for {managed_project} are None, but the project already exists."
+                    f"Details for {identifier} are None, but the project already exists."
                 )
                 raise openportal.OpenPortalError(
-                    f"Project details for {managed_project} are None, but the project already exists."
+                    f"Details for {identifier} are None, but the project already exists."
                 )
             elif managed_project.details != str(details):
                 logger.warning(
-                    f"Project details for {managed_project} do not match the existing project details."
+                    f"Details for {identifier} do not match the existing project details."
                 )
                 raise openportal.OpenPortalError(
-                    f"Project details for {managed_project} do not match the existing project details."
+                    f"Details for {identifier} do not match the existing project details."
                 )
 
             if managed_project.local_identifier is None:
