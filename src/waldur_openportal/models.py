@@ -176,9 +176,69 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
     # Whether or not the project has been successfully added to OpenPortal
     is_added = models.BooleanField(default=False)
 
+    # The current local version of the remote project
+    local_version = models.PositiveIntegerField(
+        default=0,
+        verbose_name=_("local version"),
+        help_text=_(
+            "The local version of the remote project. This is used to track changes to the project."
+        ),
+    )
+
+    # The last successful updated version of the remote project
+    remote_version = models.PositiveIntegerField(
+        default=0,
+        verbose_name=_("remote version"),
+        help_text=_(
+            "The last successful updated version of the remote project. This is used to track changes to the project."
+        ),
+    )
+
     @classmethod
     def get_url_name(cls):
         return "openportal-remote-allocation"
+
+    def increment_version(self) -> int:
+        """
+        Update the local version of the remote project.
+        This is used to track changes to the project.
+        """
+        self.local_version = F("local_version") + 1
+        self.save(update_fields=["local_version"])
+        self.refresh_from_db()
+        return int(self.local_version)
+
+    def successfully_updated(self, version: int):
+        """
+        Mark the remote project as successfully updated.
+        This is used to track changes to the project.
+        """
+        if version < self.remote_version:
+            # somebody has already beaten us to this update
+            logger.warning(
+                f"Remote project {self} has already been updated to version {self.remote_version}, not updating to {version}."
+            )
+            return
+
+        if version > self.local_version:
+            # we cannot update to a version that is higher than our local version
+            logger.error(
+                f"Cannot update remote project {self} to version {version} as it is higher than the local version {self.local_version}."
+            )
+            raise ValueError(
+                f"Cannot update remote project {self} to version {version} as it is higher than the local version {self.local_version}."
+            )
+
+        self.remote_version = version
+        self.save(update_fields=["remote_version"])
+        self.refresh_from_db()
+
+    def needs_updating(self) -> bool:
+        """
+        Check if the remote project needs updating.
+        This is done by checking if the local version is greater than the remote version.
+        """
+        return int(self.local_version) > self.remote_version
 
     def is_added_to_openportal(self):
         return self.is_added

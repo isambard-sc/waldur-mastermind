@@ -506,11 +506,11 @@ def sync_remote():
                     f"Remote allocation {remote_allocation} not in OpenPortal - adding"
                 )
                 backend.add_allocated_project(remote_allocation)
-            else:
+            elif remote_allocation.needs_updating():
                 logger.info(
-                    f"Remote allocation {remote_allocation} already in OpenPortal - checking for updates"
+                    f"Remote allocation {remote_allocation} needs updating ({remote_allocation.local_version} vs {remote_allocation.remote_version} - updating"
                 )
-                backend.update_allocated_project(remote_allocation)
+                backend.update_allocated_project(remote_allocation, force_update=False)
 
         except Exception as e:
             logger.error(f"Failed to sync remote project {remote_allocation}: {e}")

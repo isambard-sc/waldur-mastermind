@@ -356,7 +356,9 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 f"Unable to create OpenPortal allocation for {allocation}"
             )
 
-    def update_allocated_project(self, allocation: models.RemoteAllocation):
+    def update_allocated_project(
+        self, allocation: models.RemoteAllocation, force_update=True
+    ):
         if not isinstance(allocation, models.RemoteAllocation):
             raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
 
@@ -367,8 +369,18 @@ class RemoteOpenPortalBackend(ServiceBackend):
         project_identifier = allocation.get_project_identifier()
         project_details = allocation.get_project_details()
 
+        if force_update:
+            version = allocation.increment_version()
+
+        if not allocation.needs_updating():
+            logger.debug(
+                f"Allocation {allocation} does not need updating - skipping OpenPortal update"
+            )
+            return
+
         try:
             self.client.update_project(project_identifier, project_details)
+            allocation.successfully_updated(version)
         except Exception as e:
             logger.warning(
                 f"Unable to update OpenPortal project {project_identifier}: {e}."
