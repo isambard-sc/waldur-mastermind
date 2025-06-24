@@ -523,48 +523,63 @@ class OpenPortalBoard:
             )
         except models.ManagedProject.DoesNotExist:
             logger.error(
-                f"ManagedProject for identifier {identifier} does not exist. Cannot update project."
+                f"Project for identifier {identifier} does not exist. Cannot update project."
             )
             raise openportal.OpenPortalError(
-                f"ManagedProject for identifier '{identifier}' does not exist"
+                f"Project for identifier '{identifier}' does not exist"
             )
+
+        # We can't do anything if the project is pending approval or cancelled
+        if managed_project.is_pending():
+            logger.warning(f"{identifier} is pending approval!")
+            raise openportal.OpenPortalError(f"{identifier} is pending approval!")
+        elif managed_project.is_canceled():
+            logger.warning(f"{identifier} is canceled!")
+            raise openportal.OpenPortalError(f"{identifier} is canceled!")
+        elif managed_project.is_rejected():
+            logger.warning(f"{identifier} is rejected!")
+            raise openportal.OpenPortalError(f"{identifier} is rejected!")
 
         if managed_project.project_class is None:
             # This is a bug - we should not have a ManagedProject without a project class
             logger.error(
-                f"ManagedProject {managed_project} does not have a project class set. Cannot update project."
+                f"{identifier} does not have a project class set. Cannot update project."
             )
             raise openportal.OpenPortalError(
-                f"ManagedProject '{managed_project}' does not have a project class set"
+                f"{identifier} does not have a project class set"
             )
 
-        if managed_project.project_class.action_needs_approval():
+        if (
+            managed_project.project_class.action_needs_approval()
+            and not managed_project.is_approved()
+        ):
             # We need to approve update requests for this project class
             logger.info(
-                f"Project class {managed_project.project_class} requires approval for project updates."
+                f"{identifier} with class {managed_project.project_class} requires approval for project updates."
             )
+
+            managed_project.set_needs_approval()
+
             # Here you would typically send a notification to the admin or
             # the person responsible for approving project update requests.
             # For now, we will just raise an error to indicate that approval is needed.
             raise openportal.OpenPortalError(
-                f"Project class '{managed_project.project_class}' requires approval for project updates"
+                f"{identifier} with class {managed_project.project_class} requires approval for project updates"
             )
 
         if managed_project.project is None:
             logger.error(
-                f"ManagedProject {managed_project} does not have an associated project. Cannot update project."
+                f"{identifier} does not have an associated project. Cannot update project."
             )
             raise openportal.OpenPortalError(
-                f"ManagedProject '{managed_project}' does not have an associated project"
+                f"{identifier} does not have an associated project"
             )
 
         if managed_project.project.is_expired or managed_project.project.is_removed:
             # we can't make any changes to this project - return an error
-            logger.error(
-                f"ManagedProject {managed_project} is expired or removed, cannot update project."
-            )
+            logger.error(f"{identifier} is expired or removed, cannot update project.")
             raise openportal.OpenPortalError(
-                f"ManagedProject '{managed_project}' is expired or removed, cannot update project"
+                f"{identifier} is expired or removed, cannot update project"
             )
 
         # first, make sure that the current project details are properly
@@ -589,12 +604,15 @@ class OpenPortalBoard:
                     credit_limit=float(details.hours)
                 ):
                     logger.info(
-                        f"Project class {managed_project.project_class} requires approval for credit changes."
+                        f"{identifier} with class {managed_project.project_class} requires approval for credit changes."
                     )
+
+                    managed_project.set_needs_approval()
+
                     # Here you would typically send a notification to the admin or
                     # the person responsible for approving credit changes.
                     raise openportal.OpenPortalError(
-                        f"Project class '{managed_project.project_class}' requires approval for credit changes"
+                        f"{identifier} with class {managed_project.project_class} requires approval for credit changes"
                     )
 
                 logger.info(
