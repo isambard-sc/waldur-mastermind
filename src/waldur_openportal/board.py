@@ -281,21 +281,17 @@ class OpenPortalBoard:
             raise openportal.OpenPortalError(f"Invalid project details: {details}")
 
         # Get (or create) the ManagedProject for the given project identifier
-        try:
-            managed_project = models.ManagedProject.objects.create(
-                identifier=str(identifier)
-            )
-        except Exception:
-            managed_project = models.ManagedProject.objects.filter(
-                identifier=str(identifier)
-            ).first()
+        managed_project, created = models.ManagedProject.objects.update_or_create(
+            identifier=str(identifier),
+        )
 
-        if not managed_project:
-            logger.error(
-                f"Failed to create or get ManagedProject for identifier {identifier}."
+        if created:
+            logger.info(
+                f"Created new ManagedProject for identifier {identifier}: {managed_project}"
             )
-            raise openportal.OpenPortalError(
-                f"ManagedProject for identifier '{identifier}' could not be created or found"
+        else:
+            logger.info(
+                f"Retrieved existing ManagedProject for identifier {identifier}: {managed_project}"
             )
 
         # We can't do anything if the project is already in a "needs approval" state

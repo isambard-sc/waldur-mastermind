@@ -863,21 +863,16 @@ def fetch_job(request):
         return response
 
     # create a Job model object for this job
-    try:
-        job_model = models.Job.objects.create(
-            job_id=job_id,
-            job_data=job.to_json(),
-            state=models.Job.State.PENDING,
-        )
-    except Exception as e:
-        # try to get the existing job if it already exists
-        try:
-            job_model = models.Job.objects.get(job_id=job_id)
-        except models.Job.DoesNotExist:
-            logger.error(f"Error creating job model for {job_id}: {e}")
-            response = JsonResponse({})
-            response.status_code = status.UNAUTHORIZED
-            return response
+    job_model, created = models.Job.objects.get_or_create(
+        job_id=job_id,
+        defaults={
+            "job_data": job.to_json(),
+            "state": models.Job.State.PENDING,
+        },
+    )
+
+    if not created:
+        logger.warning(f"Job {job_id} already exists in the database... re-running?")
 
     if job_model.state != models.Job.State.PENDING:
         logger.error(f"Job {job_id} is not in PENDING state, but in {job_model.state}")
