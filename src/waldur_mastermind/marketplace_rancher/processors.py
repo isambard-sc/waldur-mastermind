@@ -111,13 +111,10 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                 self.order.attributes["name"],
             ]
         )
-        return cast(
-            Project,
-            Project.objects.create(
-                customer=provider_customer,
-                name=project_name,
-                description="Automatically created project for Rancher cluster",
-            ),
+        return Project.objects.create(
+            customer=provider_customer,
+            name=project_name,
+            description="Automatically created project for Rancher cluster",
         )
 
     def create_tenants(self, user, project: Project) -> list[os_models.Tenant]:
@@ -264,7 +261,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                 resource.save()
             raise
 
-        return cast(Resource, Order.objects.get(uuid=order_uuid).resource)
+        return Order.objects.get(uuid=order_uuid).resource
 
     def format_node(
         self,
@@ -819,6 +816,12 @@ class ManagedRancherDeleteProcessor(processors.AbstractDeleteResourceProcessor):
             else None
         )
         submit_termination_order(cluster_resource)
+        if not tenant_resource:
+            project = Project.objects.filter(name__icontains=resource.name).first()
+            if project:
+                tenant_resource = Resource.objects.filter(
+                    project=project, name__istartswith=f"os-tenant-{project.slug}"
+                ).first()
         if tenant_resource:
             submit_termination_order(tenant_resource)
         return True

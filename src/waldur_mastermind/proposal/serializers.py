@@ -3,6 +3,7 @@ from datetime import datetime
 
 from constance import config
 from django.db.models import Q
+from django.db.models.query import QuerySet
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import extend_schema_field
@@ -208,6 +209,7 @@ class ProposalReviewSerializer(
     call_name = serializers.ReadOnlyField(source="proposal.round.call.name")
     reviewer_full_name = serializers.ReadOnlyField(source="reviewer.full_name")
     reviewer_uuid = serializers.UUIDField(read_only=True, source="reviewer.uuid")
+    anonymous_reviewer_name = serializers.SerializerMethodField()
 
     proposal_name = serializers.ReadOnlyField(source="proposal.name")
     proposal_uuid = serializers.UUIDField(read_only=True, source="proposal.uuid")
@@ -223,6 +225,7 @@ class ProposalReviewSerializer(
             "reviewer",
             "reviewer_full_name",
             "reviewer_uuid",
+            "anonymous_reviewer_name",
             "state",
             "review_end_date",
             "summary_score",
@@ -271,6 +274,23 @@ class ProposalReviewSerializer(
 
         return attrs
 
+    def get_anonymous_reviewer_name(self, obj) -> str | None:
+        """
+        Generate an anonymous reviewer identifier like 'Reviewer 1', 'Reviewer 2'.
+        Returns None if the review is not associated with a proposal.
+        """
+        if not obj.proposal:
+            return None
+
+        # Get all reviews for the proposal in a stable order
+        reviews = obj.proposal.review_set.order_by("created", "reviewer__id")
+
+        for index, review in enumerate(reviews, start=1):
+            if review.pk == obj.pk:
+                return _("Reviewer %(index)s") % {"index": index}
+
+        return _("Reviewer")
+
     def get_fields(self):
         fields = super().get_fields()
 
@@ -278,6 +298,8 @@ class ProposalReviewSerializer(
             return fields
         elif isinstance(self.instance, list):
             review = self.instance[0]
+        elif isinstance(self.instance, QuerySet):
+            review = self.instance.last()
         else:
             review: models.Review = self.instance
 
@@ -292,14 +314,50 @@ class ProposalReviewSerializer(
             or review.reviewer == user
             or review.proposal.round.call.manager.customer.has_user(user)
         ):
+            fields.pop("anonymous_reviewer_name", None)
             return fields
 
-        del fields["summary_private_comment"]
-        del fields["reviewer"]
-        del fields["reviewer_full_name"]
-        del fields["reviewer_uuid"]
+        # For proposal submitters, apply reviewer identity visibility control
+        is_proposal_submitter = review.proposal.created_by == user
+        call = review.proposal.round.call
+
+        if is_proposal_submitter and not call.reviewer_identity_visible_to_submitters:
+            # Hide real reviewer info, show anonymous identifier
+            fields.pop("reviewer", None)
+            fields.pop("reviewer_full_name", None)
+            fields.pop("reviewer_uuid", None)
+        else:
+            # Show real reviewer info, hide anonymous identifier
+            fields.pop("anonymous_reviewer_name", None)
+
+        # Always remove private comments for non-authorized users
+        fields.pop("summary_private_comment", None)
 
         return fields
+
+    def create(self, validated_data):
+        """
+        Prevent creating a duplicate review for the same proposal and reviewer, excluding rejected reviews.
+        """
+        reviewer = validated_data["reviewer"]
+        proposal = validated_data["proposal"]
+
+        existing_review = models.Review.objects.filter(
+            proposal=proposal,
+            reviewer=reviewer,
+            state__in=[
+                models.Review.States.SUBMITTED,
+                models.Review.States.CREATED,
+                models.Review.States.IN_REVIEW,
+            ],
+        ).exists()
+
+        if existing_review:
+            raise serializers.ValidationError(
+                _("Review already exists for this proposal and reviewer.")
+            )
+
+        return super().create(validated_data)
 
 
 class ReviewSubmitSerializer(serializers.ModelSerializer):
@@ -316,7 +374,7 @@ class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
     state = serializers.ReadOnlyField()
     created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
     approved_by_name = serializers.ReadOnlyField(source="approved_by.full_name")
-    reviews = ProposalReviewSerializer(many=True, read_only=True, source="review_set")
+    reviews = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Proposal
@@ -333,6 +391,45 @@ class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
             "created_by": {"lookup_field": "uuid", "view_name": "user-detail"},
             "approved_by": {"lookup_field": "uuid", "view_name": "user-detail"},
         }
+
+    def get_reviews(self, obj) -> list:
+        """
+        Return serialized reviews based on user permissions and visibility settings.
+        - Staff, call managers, and reviewers see all reviews.
+        - Submitters see submitted reviews if visibility is enabled.
+        """
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+
+        if not user or not request:
+            return []
+
+        reviews_qs = obj.review_set.all()
+
+        if (
+            user.is_staff
+            or obj.round.call.manager.customer.has_user(user)
+            or reviews_qs.filter(reviewer=user).exists()
+        ):
+            return ProposalReviewSerializer(
+                reviews_qs, many=True, context=self.context
+            ).data
+
+        # Submitter logic
+        if (
+            obj.created_by == user
+            and obj.round.call.reviews_visible_to_submitters
+            and (
+                obj.state == models.Proposal.States.ACCEPTED
+                or obj.state == models.Proposal.States.REJECTED
+            )
+        ):
+            submitted_reviews = reviews_qs.filter(state=models.Review.States.SUBMITTED)
+            return ProposalReviewSerializer(
+                submitted_reviews, many=True, context=self.context
+            ).data
+
+        return []
 
 
 class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
@@ -481,6 +578,8 @@ class PublicCallSerializer(
             "fixed_duration_in_days",
             "backend_id",
             "external_url",
+            "reviewer_identity_visible_to_submitters",
+            "reviews_visible_to_submitters",
         )
         view_name = "proposal-public-call-detail"
         extra_kwargs = {
@@ -496,6 +595,8 @@ class PublicCallSerializer(
                 "view_name": "user-detail",
             },
             "documents": {"required": False},
+            "reviewer_identity_visible_to_submitters": {"required": False},
+            "reviews_visible_to_submitters": {"required": False},
         }
 
     def validate_description(self, value):
@@ -815,6 +916,14 @@ class ProtectedCallSerializer(PublicCallSerializer):
         source="default_project_role.description"
     )
     fixed_duration_in_days = serializers.IntegerField(required=False, allow_null=True)
+    reviewer_identity_visible_to_submitters = serializers.BooleanField(
+        help_text="Whether proposal submitters can see reviewer identities",
+        required=False,
+    )
+    reviews_visible_to_submitters = serializers.BooleanField(
+        help_text="Whether proposal submitters can see review comments and scores",
+        required=False,
+    )
 
     class Meta(PublicCallSerializer.Meta):
         fields = PublicCallSerializer.Meta.fields + (

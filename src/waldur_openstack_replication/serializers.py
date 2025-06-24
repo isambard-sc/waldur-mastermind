@@ -1,6 +1,7 @@
 from collections import defaultdict
+from typing import cast
 
-from django.db.models import QuerySet
+from django.db import transaction
 from netaddr import IPNetwork
 from rest_framework import serializers
 
@@ -225,7 +226,7 @@ class MigrationCreateSerializer(serializers.ModelSerializer):
             network.uuid.hex
             for network in validated_data.get("mappings", {}).pop("networks", [])
         ]
-        src_networks: QuerySet[Network] = Network.objects.filter(tenant=src_tenant)
+        src_networks = Network.objects.filter(tenant=src_tenant)
         if network_uuids:
             src_networks = src_networks.filter(uuid__in=network_uuids)
         subnet_mappings = {}
@@ -242,7 +243,7 @@ class MigrationCreateSerializer(serializers.ModelSerializer):
                 tenant=dst_tenant,
                 mtu=src_network.mtu,
             )
-            src_subnets: QuerySet[SubNet] = src_network.subnets.all()
+            src_subnets = src_network.subnets.all()
             for src_subnet in src_subnets:
                 subnet_cidr = subnet_mappings.get(src_subnet.cidr) or src_subnet.cidr
                 SubNet.objects.create(
@@ -298,7 +299,7 @@ class MigrationCreateSerializer(serializers.ModelSerializer):
                 "cidr", flat=True
             )
         ]
-        src_routers: QuerySet[Router] = src_tenant.routers.all()
+        src_routers = src_tenant.routers.all()
         for src_router in src_routers:
             routes = []
             for route in src_router.routes:
@@ -341,17 +342,18 @@ class MigrationCreateSerializer(serializers.ModelSerializer):
         limits = {k: v for k, v in limits.items() if v is not None}
         return limits
 
+    @transaction.atomic
     def create(self, validated_data):
         validated_data["created_by"] = self.context["request"].user
         src_resource: Resource = validated_data["src_resource"]
 
         name = validated_data.pop("name", None) or src_resource.name
         description = validated_data.get("description") or src_resource.description
-        src_tenant: Tenant = src_resource.scope
+        src_tenant = cast(Tenant, src_resource.scope)
 
         dst_offering: Offering = validated_data.pop("dst_offering")
         dst_plan: Plan = validated_data.pop("dst_plan")
-        dst_settings: ServiceSettings = dst_offering.scope
+        dst_settings = cast(ServiceSettings, dst_offering.scope)
         dst_project = src_resource.project
 
         dst_tenant = Tenant.objects.create(
@@ -393,5 +395,6 @@ class MigrationCreateSerializer(serializers.ModelSerializer):
             limits=limits,
         )
         validated_data["dst_resource"] = dst_resource
+        validated_data.setdefault("mappings", {})
         migration = super().create(validated_data)
         return migration
