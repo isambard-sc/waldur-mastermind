@@ -1344,21 +1344,23 @@ class ProjectClass(models.Model):
                 f"Local role {local_role_name} does not exist in this portal."
             )
 
-    def action_needs_approval(self, credit_limit: float | None = None) -> bool:
+    def action_needs_approval(self, credit_limit: float = 0.0) -> bool:
         """
         Check if the action needs approval based on the credit limit.
-        If the credit limit is None, then no approval is needed.
-        If the credit limit is 0, then all actions need to be approved.
+        If the approval limit is None, then no approval is needed.
+        If the approval limit is 0, then all actions need to be approved.
         """
         if self.approval_limit is None and self.max_credit_limit is None:
             return False
 
-        if credit_limit is not None:
-            return self.exceeds_approval_limit(
-                credit_limit
-            ) or self.exceeds_max_credit_limit(credit_limit)
-        else:
-            return False
+        if credit_limit is None:
+            credit_limit = 0.0
+        elif credit_limit < 0:
+            credit_limit = 0.0
+
+        return self.exceeds_approval_limit(
+            credit_limit
+        ) or self.exceeds_max_credit_limit(credit_limit)
 
     def exceeds_max_credit_limit(self, credit_limit: float) -> bool:
         """
@@ -1368,9 +1370,10 @@ class ProjectClass(models.Model):
         """
         if self.max_credit_limit is None:
             return False
-        if self.max_credit_limit == 0:
+        elif self.max_credit_limit == 0:
             return True
-        return credit_limit > float(self.max_credit_limit)
+        else:
+            return credit_limit > float(self.max_credit_limit)
 
     def exceeds_approval_limit(self, credit_limit: float) -> bool:
         """
@@ -1380,10 +1383,10 @@ class ProjectClass(models.Model):
         """
         if self.approval_limit is None:
             return False
-        if self.approval_limit == 0:
+        elif self.approval_limit == 0:
             return True
-
-        return credit_limit > float(self.approval_limit)
+        else:
+            return credit_limit > float(self.approval_limit)
 
     def get_generator(self) -> ProjectShortNameGenerator:
         """
