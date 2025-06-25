@@ -33,6 +33,20 @@ class OpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer
         required=False,
     )
 
+    allocation_unit = rf_serializers.CharField(
+        source="options.allocation_unit",
+        label=_("Unit for allocation limits"),
+        default="NHR",
+        required=False,
+    )
+
+    default_allocation = rf_serializers.FloatField(
+        source="options.default_allocation",
+        label=_("Default allocation for new projects on this resource"),
+        default=None,
+        required=False,
+    )
+
 
 class AllocationSerializer(
     structure_serializers.BaseResourceSerializer,
