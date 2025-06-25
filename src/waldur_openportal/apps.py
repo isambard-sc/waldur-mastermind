@@ -20,20 +20,11 @@ class OpenPortalConfig(AppConfig):
 
         SupportedServices.register_backend(OpenPortalBackend)
 
-        for model in (structure_models.Customer, structure_models.Project):
-            signals.post_save.connect(
-                handlers.schedule_creation_sync,
-                sender=model,
-                dispatch_uid="waldur_openportal.handlers.schedule_sync_on_%s_creation"
-                % model.__class__,
-            )
-
-            signals.pre_delete.connect(
-                handlers.schedule_deletion_sync,
-                sender=model,
-                dispatch_uid="waldur_openportal.handlers.schedule_sync_on_%s_deletion"
-                % model.__class__,
-            )
+        signals.pre_delete.connect(
+            handlers.schedule_deletion_sync,
+            sender=structure_models.Project,
+            dispatch_uid="waldur_openportal.handlers.schedule_sync_on_project_deletion",
+        )
 
         signals.post_save.connect(
             handlers.update_user,

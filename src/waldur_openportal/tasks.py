@@ -962,6 +962,8 @@ def create_default_resources(serialized_managed_project):
 
         logger.info(f"OpenPortal - Creating {offering} for {project}")
 
+        created_resource = False
+
         try:
             # Create the resource for the project and offering
             resource = marketplace_models.Resource.objects.create(
@@ -987,10 +989,37 @@ def create_default_resources(serialized_managed_project):
                 },
             )
 
+            created_resource = True
+
         except Exception as e:
             logger.error(
                 f"OpenPortal - Failed to create order for {offering} in {project}: {e}"
             )
+
+        if created_resource:
+            num_successful = 0
+
+            # make sure that we only have one copy of this resource in the project
+            for existing_resource in marketplace_models.Resource.objects.filter(
+                project=project,
+                offering=offering,
+            ):
+                if existing_resource.state == marketplace_models.Resource.States.ERRED:
+                    # remove previously failed resource creation attempts
+                    logger.info(
+                        f"OpenPortal - Removing previously failed resource {existing_resource} for {offering} in {project}"
+                    )
+                    existing_resource.delete()
+                elif existing_resource.state == marketplace_models.Resource.States.OK:
+                    num_successful += 1
+
+                    if num_successful > 1:
+                        # This indicates we've created multiple resources for the same offering
+                        # and project. We should not try to create it again.
+                        logger.error(
+                            f"OpenPortal - Too many resources created for {offering} in {project} - deleting {existing_resource}"
+                        )
+                        existing_resource.delete()
 
 
 def update_project(
@@ -1003,7 +1032,6 @@ def update_project(
     Update the project in the OpenPortal board with the given details.
     If the project does not exist, then there will be an error.
     """
-    logger.info(f"Updating project {project} with details {details}")
     mapping = board.update_project(project, details, force_update=force_update)
 
     # schedule creation of default resources again in case any were missed
@@ -1032,28 +1060,12 @@ def create_project(
     """
     Create a project in the OpenPortal board with the given identifier and details.
     """
-    logger.info(f"Creating project {identifier} with details {details}")
-
     # first, create the project if it doesn't exist
     mapping = board.create_project(identifier, details)
 
-    # next, update the details of the project to match the details provided
+    # next, update the details of the project to match the details provided.
+    # This will also create the default resources for the project
     mapping = update_project(board, mapping.project, details, force_update=True)
-
-    # Finally, schedule the creation of default resources
-    try:
-        managed_project = models.ManagedProject.objects.filter(
-            identifier=str(mapping.project)
-        ).first()
-    except Exception as e:
-        logger.error(f"Failed to find managed project for {mapping.project}: {e}")
-        raise ValueError(f"Failed to find managed project for {mapping.project}")
-
-    if not managed_project:
-        logger.error(f"Managed project for {mapping.project} not found")
-        raise ValueError(f"Managed project for {mapping.project} not found")
-
-    create_default_resources.delay(core_utils.serialize_instance(managed_project))
 
     return mapping
 

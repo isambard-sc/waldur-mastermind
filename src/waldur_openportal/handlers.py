@@ -48,25 +48,13 @@ def schedule_sync(*args, **kwargs):
 
 
 @if_plugin_enabled
-def schedule_creation_sync(*args, **kwargs):
-    """
-    Schedule a synchronization of OpenPortal data after a new project or
-    customer is created. This will double-check that all users are correctly
-    associated with the project/customer, and will add/remove users as needed.
-    """
-
-    logger.info("Scheduling OpenPortal synchronization after creation.")
-
-
-@if_plugin_enabled
 def schedule_deletion_sync(*args, **kwargs):
     """
     Schedule a synchronization of OpenPortal data after a project or
     customer is deleted. This will double-check that all users are correctly
     associated with the project/customer, and will remove users as needed.
     """
-
-    logger.info("Scheduling OpenPortal synchronization after deletion.")
+    logger.info("[TODO] Scheduling OpenPortal synchronization after deletion.")
 
 
 @if_plugin_enabled
