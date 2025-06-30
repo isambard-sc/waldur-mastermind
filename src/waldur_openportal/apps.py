@@ -20,20 +20,11 @@ class OpenPortalConfig(AppConfig):
 
         SupportedServices.register_backend(OpenPortalBackend)
 
-        for model in (structure_models.Customer, structure_models.Project):
-            signals.post_save.connect(
-                handlers.schedule_creation_sync,
-                sender=model,
-                dispatch_uid="waldur_openportal.handlers.schedule_sync_on_%s_creation"
-                % model.__class__,
-            )
-
-            signals.pre_delete.connect(
-                handlers.schedule_deletion_sync,
-                sender=model,
-                dispatch_uid="waldur_openportal.handlers.schedule_sync_on_%s_deletion"
-                % model.__class__,
-            )
+        signals.pre_delete.connect(
+            handlers.schedule_deletion_sync,
+            sender=structure_models.Project,
+            dispatch_uid="waldur_openportal.handlers.schedule_sync_on_project_deletion",
+        )
 
         signals.post_save.connect(
             handlers.update_user,
@@ -45,6 +36,18 @@ class OpenPortalConfig(AppConfig):
             handlers.delete_user,
             sender=core_models.User,
             dispatch_uid="waldur_openportal.handlers.delete_user",
+        )
+
+        signals.post_save.connect(
+            handlers.update_project,
+            sender=structure_models.Project,
+            dispatch_uid="waldur_openportal.handlers.update_project",
+        )
+
+        signals.pre_delete.connect(
+            handlers.delete_project,
+            sender=structure_models.Project,
+            dispatch_uid="waldur_openportal.handlers.delete_project",
         )
 
         signals.post_save.connect(
@@ -80,6 +83,14 @@ class OpenPortalConfig(AppConfig):
             ),
         )
 
+        structure_models.Project.add_quota_field(
+            name="op_remote_allocation_count",
+            quota_field=CounterQuotaField(
+                target_models=lambda: [models.RemoteAllocation],
+                path_to_scope="project",
+            ),
+        )
+
         structure_models.Customer.add_quota_field(
             name="op_allocation_count",
             quota_field=CounterQuotaField(
@@ -88,8 +99,22 @@ class OpenPortalConfig(AppConfig):
             ),
         )
 
+        structure_models.Customer.add_quota_field(
+            name="op_remote_allocation_count",
+            quota_field=CounterQuotaField(
+                target_models=lambda: [models.RemoteAllocation],
+                path_to_scope="project.customer",
+            ),
+        )
+
         signals.post_save.connect(
             handlers.update_quotas_on_allocation_usage_update,
             sender=models.Allocation,
             dispatch_uid="waldur_openportal.handlers.update_quotas_on_allocation_usage_update",
+        )
+
+        signals.post_save.connect(
+            handlers.update_quotas_on_remote_allocation_usage_update,
+            sender=models.RemoteAllocation,
+            dispatch_uid="waldur_openportal.handlers.update_quotas_on_remote_allocation_usage_update",
         )

@@ -14,6 +14,12 @@ from model_utils import FieldTracker
 from waldur_core.core import models as core_models
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.invoices import models as invoice_models
+from waldur_core.structure.managers import get_project_users
+from waldur_core.permissions.models import UserRole, Role
+from waldur_core.core.mixins import ReviewMixin
+from waldur_core.core.enums import ReviewStates
+from waldur_core.core.utils import get_system_robot
 from waldur_openportal import utils
 
 logger = logging.getLogger(__name__)
@@ -170,9 +176,69 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
     # Whether or not the project has been successfully added to OpenPortal
     is_added = models.BooleanField(default=False)
 
+    # The current local version of the remote project
+    local_version = models.PositiveIntegerField(
+        default=0,
+        verbose_name=_("local version"),
+        help_text=_(
+            "The local version of the remote project. This is used to track changes to the project."
+        ),
+    )
+
+    # The last successful updated version of the remote project
+    remote_version = models.PositiveIntegerField(
+        default=0,
+        verbose_name=_("remote version"),
+        help_text=_(
+            "The last successful updated version of the remote project. This is used to track changes to the project."
+        ),
+    )
+
     @classmethod
     def get_url_name(cls):
         return "openportal-remote-allocation"
+
+    def increment_version(self) -> int:
+        """
+        Update the local version of the remote project.
+        This is used to track changes to the project.
+        """
+        self.local_version = F("local_version") + 1
+        self.save(update_fields=["local_version"])
+        self.refresh_from_db()
+        return int(self.local_version)
+
+    def successfully_updated(self, version: int):
+        """
+        Mark the remote project as successfully updated.
+        This is used to track changes to the project.
+        """
+        if version < self.remote_version:
+            # somebody has already beaten us to this update
+            logger.warning(
+                f"Remote project {self} has already been updated to version {self.remote_version}, not updating to {version}."
+            )
+            return
+
+        if version > self.local_version:
+            # we cannot update to a version that is higher than our local version
+            logger.error(
+                f"Cannot update remote project {self} to version {version} as it is higher than the local version {self.local_version}."
+            )
+            raise ValueError(
+                f"Cannot update remote project {self} to version {version} as it is higher than the local version {self.local_version}."
+            )
+
+        self.remote_version = version
+        self.save(update_fields=["remote_version"])
+        self.refresh_from_db()
+
+    def needs_updating(self) -> bool:
+        """
+        Check if the remote project needs updating.
+        This is done by checking if the local version is greater than the remote version.
+        """
+        return int(self.local_version) > self.remote_version
 
     def is_added_to_openportal(self):
         return self.is_added
@@ -203,6 +269,133 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
 
         return openportal.ProjectIdentifier(self.backend_id)
 
+    def get_project_details(self) -> openportal.ProjectDetails:
+        if self.project is None:
+            raise ValueError("Project is not set!")
+
+        project = self.project
+
+        details = openportal.ProjectDetails("{}")
+
+        if project.name is not None:
+            details.name = str(project.name)
+
+        if project.description is not None:
+            details.description = str(project.description)
+
+        if project.start_date is not None:
+            details.start_date = project.start_date
+
+        if project.end_date is not None:
+            details.end_date = project.end_date
+
+        # find any credit given to this project
+        try:
+            credit = None
+
+            for obj in invoice_models.ProjectCredit.objects.filter(project=project):
+                if credit is None:
+                    credit = obj.value
+                else:
+                    credit += obj.value
+        except Exception as e:
+            logger.warning(f"No credits associated with {project}: {e}.")
+            credit = None
+
+        if credit is not None:
+            try:
+                details.credit = openportal.Usage.from_hours(credit)
+            except Exception:
+                details.credit = openportal.Usage.from_hours(float(credit))
+
+        # now try to add in any members for this project
+        for user_id in get_project_users(project.id):
+            try:
+                user = core_models.User.objects.filter(id=user_id)
+
+                if not user.exists():
+                    logger.info(
+                        f"Skipping non-existing user {user_id} for project {project}"
+                    )
+                    continue
+
+                user = user.first()
+
+                if user is None:
+                    logger.info(
+                        f"Skipping non-existing user {user_id} for project {project}"
+                    )
+                    continue
+
+                if not user.is_active:
+                    logger.info(f"Skipping inactive user {user} for project {project}")
+                    continue
+
+                if user.email is None:
+                    logger.info(
+                        f"Skipping user {user} without email for project {project}"
+                    )
+                    continue
+
+                email = str(user.email).strip()
+
+                if not email:
+                    logger.info(
+                        f"Skipping user {user} with empty email for project {project}"
+                    )
+                    continue
+
+                # get the role name of this user in the project
+                roles = UserRole.objects.filter(
+                    user=user, scope=project, is_active=True
+                )
+
+                if roles.exists():
+                    logger.info(
+                        f"Adding user {user} with roles {roles} to project {project}"
+                    )
+
+                    if len(roles) > 1:
+                        logger.warning(
+                            f"User {user} has multiple roles in project {project}: {roles}. Only using the first one."
+                        )
+
+                    role = roles.first()
+
+                    if role is None:
+                        logger.warning(
+                            f"User {user} has no role in project {project}. Not adding user!"
+                        )
+                        continue
+
+                    role = role.role
+
+                    if role is None:
+                        logger.warning(
+                            f"User {user} has no role in project {project}. Not adding user!"
+                        )
+                        continue
+
+                    if role.name is None:
+                        logger.warning(
+                            f"User {user} has no role name in project {project}. Not adding user!"
+                        )
+                        continue
+
+                    role_name = str(role.name).strip()
+
+                    if len(role_name) == 0:
+                        logger.warning(
+                            f"User {user} has empty role name in project {project}. Not adding user!"
+                        )
+                        continue
+
+                    details.add_member(email, role_name)
+            except Exception as e:
+                logger.warning(f"Failed to add user {user} to project {project}: {e}")
+
+        return details
+
     def has_mapping(self) -> bool:
         return self.has_project_identifier() and self.has_remote_project_identifier()
 
@@ -213,6 +406,12 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
         return openportal.ProjectMapping(
             f"{self.get_project_identifier()}:{self.get_remote_project_identifier()}"
         )
+
+    def get_remote_project_identifier(self) -> openportal.ProjectIdentifier:
+        if not self.has_remote_project_identifier():
+            raise ValueError("RemoteProjectIdentifier is not set!")
+
+        return openportal.ProjectIdentifier(self.remote_project_identifier)
 
     def has_remote_project_identifier(self) -> bool:
         return self.remote_project_identifier is not None
@@ -243,6 +442,11 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
     @classmethod
     def get_backend_fields(cls):
         return super().get_backend_fields() + ("node_usage",)
+
+    def get_backend(self, **kwargs):
+        from .remotebackend import RemoteOpenPortalBackend
+
+        return RemoteOpenPortalBackend(self.service_settings, **kwargs)
 
     def __str__(self):
         if self.has_mapping():
@@ -409,6 +613,14 @@ class RemoteAssociation(core_models.UuidMixin):
 
     def __repr__(self):
         return self.__str__()
+
+    def user_is_in_remote(self) -> bool:
+        """
+        Check if the user is in the remote OpenPortal instance.
+        This is done by checking if the user has a remote project identifier.
+        """
+        logger.warning("NEED TO PROPERLY TEST IF A USER IS IN THE REMOTE INSTANCE")
+        return self.allocation.has_remote_project_identifier()
 
 
 class AllocationUserUsage(UsageMixin):
@@ -766,8 +978,47 @@ class ProjectInfo(models.Model):
         if hasattr(self.project, "short_name"):
             if self.shortname is None and self.project.short_name is not None:
                 # copy if from the project (for legacy projects)
-                self.shortname = self.project.short_name
-                self.save()
+                shortname = self.project.short_name.strip()
+
+                if len(shortname) == 0:
+                    logger.warning(
+                        f"Project {self.project} has an empty short_name, using slug instead."
+                    )
+                    shortname = self.project.slug.strip()
+
+                if len(shortname) > MAX_PROJECT_SHORTNAME_LENGTH:
+                    logger.warning(
+                        f"Project shortname {shortname} is too long, truncating to {MAX_PROJECT_SHORTNAME_LENGTH} characters."
+                    )
+                    shortname = shortname[:MAX_PROJECT_SHORTNAME_LENGTH]
+
+                self.shortname = shortname
+
+                try:
+                    self.save()
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to save project shortname {self.shortname} for project {self.project} - using slug: {e}"
+                    )
+                    shortname = self.project.slug.strip()
+
+                    if len(shortname) == 0:
+                        raise ValueError(
+                            "Project shortname cannot be empty. Please set it in OpenPortal."
+                        )
+
+                    if len(shortname) > MAX_PROJECT_SHORTNAME_LENGTH:
+                        logger.warning(
+                            f"Project shortname {shortname} is too long, truncating to {MAX_PROJECT_SHORTNAME_LENGTH} characters."
+                        )
+                        shortname = shortname[:MAX_PROJECT_SHORTNAME_LENGTH]
+
+                    self.shortname = shortname
+                    self.save(force_accept_changed_shortname=True)
+
+                    self.project.short_name = shortname
+                    self.project.save()
+
             elif self.shortname is not None:
                 # copy to the project so that it matches
                 if self.project.short_name is None:
@@ -1047,6 +1298,46 @@ class ProjectClass(models.Model):
         ),
     )
 
+    # The credit limit beyond which requests need to be approved by a local admin
+    # If this is None, then no local approval is required. If this is set to 0,
+    # then all requests (including creating the project) need to be approved.
+    approval_limit = models.DecimalField(
+        decimal_places=2,
+        max_digits=20,
+        null=True,
+        blank=True,
+        verbose_name=_("approval limit"),
+        help_text=_(
+            "The credit limit beyond which requests need to be approved by a local admin. If this is None, then no local approval is required. If this is set to 0, then all requests (including creating the project) need to be approved."
+        ),
+    )
+
+    # The maximum credit limit for any projects created in this class.
+    # Any requests beyond this limit are automatically rejected.
+    # If this is None, then no maximum limit is set. If this is
+    # set to 0, then no projects can be created in this class.
+    max_credit_limit = models.DecimalField(
+        decimal_places=2,
+        max_digits=20,
+        null=True,
+        blank=True,
+        verbose_name=_("maximum credit limit"),
+        help_text=_(
+            "The maximum credit limit for any projects created in this class. Any requests beyond this limit are automatically rejected. If this is None, then no maximum limit is set. If this is set to 0, then no projects can be created in this class."
+        ),
+    )
+
+    # The mapping of role names from the remote portal to role names
+    # in this portal for users in projects created in this class.
+    # This is a dictionary mapping role names
+    role_mapping = models.JSONField(
+        verbose_name=_("role mapping"),
+        default=dict,
+        help_text=_(
+            "The mapping of role names from the remote portal to role names in this portal for users in projects created in this class."
+        ),
+    )
+
     # Combination of name and portal must be unique
     class Meta:
         unique_together = ("name", "portal")
@@ -1058,6 +1349,107 @@ class ProjectClass(models.Model):
 
     def __repr__(self) -> str:
         return self.__str__()
+
+    def get_role_mapping(self) -> dict[str, Role]:
+        """
+        Get the role mapping for this project class.
+        This returns a dictionary mapping role names from the remote portal
+        to role names in this portal for users in projects created in this class.
+        """
+        mappings = {}
+
+        for remote_role, local_role in self.role_mapping.items():
+            try:
+                mappings[remote_role] = Role.objects.get(name=local_role)
+            except Role.DoesNotExist:
+                logger.warning(
+                    f"Role {local_role} does not exist in this portal. Skipping mapping for {remote_role}."
+                )
+
+        return mappings
+
+    def add_role_mapping(self, remote_role: str, local_role: Role):
+        """
+        Add a role mapping for this project class.
+        This maps a role name from the remote portal to a role name in this portal
+        for users in projects created in this class.
+        """
+        if not isinstance(local_role, Role):
+            role = Role.objects.get(name=local_role)
+            if not role:
+                raise ValueError(
+                    f"Local role {local_role} does not exist in this portal."
+                )
+
+            local_role = role
+
+        if remote_role in self.role_mapping:
+            logger.warning(
+                f"Role mapping for {remote_role} already exists. Overwriting with {local_role.name}."
+            )
+
+        self.role_mapping[remote_role] = str(local_role.name)
+        self.save()
+
+    def get_local_role_for(self, remote_role: str) -> Role:
+        """
+        Get the local role for a given remote role in this project class.
+        If the remote role does not exist, raise an error.
+        """
+        if remote_role not in self.role_mapping:
+            raise ValueError(f"Remote role {remote_role} does not exist in this class.")
+
+        local_role_name = self.role_mapping[remote_role]
+        try:
+            return Role.objects.get(name=local_role_name)
+        except Role.DoesNotExist:
+            raise ValueError(
+                f"Local role {local_role_name} does not exist in this portal."
+            )
+
+    def action_needs_approval(self, credit_limit: float = 0.0) -> bool:
+        """
+        Check if the action needs approval based on the credit limit.
+        If the approval limit is None, then no approval is needed.
+        If the approval limit is 0, then all actions need to be approved.
+        """
+        if self.approval_limit is None and self.max_credit_limit is None:
+            return False
+
+        if credit_limit is None:
+            credit_limit = 0.0
+        elif credit_limit < 0:
+            credit_limit = 0.0
+
+        return self.exceeds_approval_limit(
+            credit_limit
+        ) or self.exceeds_max_credit_limit(credit_limit)
+
+    def exceeds_max_credit_limit(self, credit_limit: float) -> bool:
+        """
+        Check if the given credit limit exceeds the maximum credit limit for this project class.
+        If the maximum credit limit is None, then no maximum limit is set.
+        If the maximum credit limit is 0, then no projects can be created in this class.
+        """
+        if self.max_credit_limit is None:
+            return False
+        elif self.max_credit_limit == 0:
+            return True
+        else:
+            return credit_limit > float(self.max_credit_limit)
+
+    def exceeds_approval_limit(self, credit_limit: float) -> bool:
+        """
+        Check if the given credit limit exceeds the approval limit for this project class.
+        If the approval limit is None, then no local approval is required.
+        If the approval limit is 0, then all requests (including creating the project) need to be approved.
+        """
+        if self.approval_limit is None:
+            return False
+        elif self.approval_limit == 0:
+            return True
+        else:
+            return credit_limit > float(self.approval_limit)
 
     def get_generator(self) -> ProjectShortNameGenerator:
         """
@@ -1094,7 +1486,7 @@ class ProjectClass(models.Model):
         return generator
 
 
-class ManagedProject(models.Model):
+class ManagedProject(ReviewMixin, models.Model):
     """
     This model is responsible for storing data about projects that are
     managed by OpenPortal. This is used to track the progress of projects
@@ -1148,6 +1540,46 @@ class ManagedProject(models.Model):
         help_text=_("The local project identifier in this portal."),
     )
 
+    def has_project_class(self) -> bool:
+        """
+        Check if this project has a project class set.
+        This is used to determine whether or not the project
+        can be created in this portal.
+        """
+        return self.project_class is not None
+
+    def get_project_class(self) -> ProjectClass:
+        """
+        Get the ProjectClass for this project.
+        If the project class is not set, raise an error.
+        """
+        if not self.project_class:
+            raise ValueError("Project class is not set for this project.")
+        return self.project_class
+
+    def set_project_class(self, project_class: ProjectClass):
+        """
+        Set the ProjectClass for this project.
+        If the project class is not an instance of ProjectClass, raise an error.
+        """
+        if not isinstance(project_class, ProjectClass):
+            raise ValueError("Project class must be an instance of ProjectClass.")
+
+        if self.project_class and self.project_class != project_class:
+            logger.warning(
+                f"Project class for project {self.project} is being changed from {self.project_class} to {project_class}."
+            )
+
+        self.project_class = project_class
+
+    def has_local_identifier(self) -> bool:
+        """
+        Check if this project has a local identifier set.
+        This is used to determine whether or not the project
+        can be created in this portal.
+        """
+        return self.local_identifier is not None and len(self.local_identifier) > 0
+
     def get_local_identifier(self) -> openportal.ProjectIdentifier:
         """
         Get the local ProjectIdentifier for this project.
@@ -1156,6 +1588,29 @@ class ManagedProject(models.Model):
         if not self.local_identifier:
             raise ValueError("Local identifier is not set for this project.")
         return openportal.ProjectIdentifier(self.local_identifier)
+
+    def set_local_identifier(self, identifier: openportal.ProjectIdentifier):
+        """
+        Set the local ProjectIdentifier for this project.
+        If the identifier is not an instance of ProjectIdentifier, raise an error.
+        """
+        if not isinstance(identifier, openportal.ProjectIdentifier):
+            raise ValueError("Identifier must be an instance of ProjectIdentifier.")
+
+        if self.local_identifier and self.local_identifier != str(identifier):
+            logger.warning(
+                f"Local identifier for project {self.project} is being changed from {self.local_identifier} to {identifier}."
+            )
+
+        self.local_identifier = str(identifier)
+
+    def has_remote_identifier(self) -> bool:
+        """
+        Check if this project has a remote identifier set.
+        This is used to determine whether or not the project
+        can be created in this portal.
+        """
+        return self.identifier is not None and len(self.identifier) > 0
 
     def get_remote_identifier(self) -> openportal.ProjectIdentifier:
         """
@@ -1166,6 +1621,21 @@ class ManagedProject(models.Model):
             raise ValueError("Remote identifier is not set for this project.")
         return openportal.ProjectIdentifier(self.identifier)
 
+    def set_remote_identifier(self, identifier: openportal.ProjectIdentifier):
+        """
+        Set the remote ProjectIdentifier for this project.
+        If the identifier is not an instance of ProjectIdentifier, raise an error.
+        """
+        if not isinstance(identifier, openportal.ProjectIdentifier):
+            raise ValueError("Identifier must be an instance of ProjectIdentifier.")
+
+        if self.identifier and self.identifier != str(identifier):
+            logger.warning(
+                f"Remote identifier for project {self.project} is being changed from {self.identifier} to {identifier}."
+            )
+
+        self.identifier = str(identifier)
+
     def get_mapping(self) -> openportal.ProjectMapping:
         """
         Get the ProjectMapping object for this project.
@@ -1175,12 +1645,22 @@ class ManagedProject(models.Model):
             f"{self.get_remote_identifier()}:{self.get_local_identifier()}"
         )
 
+    def set_details(self, details: openportal.ProjectDetails):
+        """
+        Set the ProjectDetails object for this project.
+        If the details are not an instance of ProjectDetails, convert it.
+        """
+        if not isinstance(details, openportal.ProjectDetails):
+            details = openportal.ProjectDetails(details)
+
+        self.details = str(details)
+
     def get_details(self) -> openportal.ProjectDetails:
         """
         Get the ProjectDetails object from the project data.
         If the project data is not set, return None.
         """
-        return openportal.ProjectDetails.from_json(self.details)
+        return openportal.ProjectDetails(self.details)
 
     def get_default_offerings(self) -> list[marketplace_models.Offering]:
         """
@@ -1191,6 +1671,61 @@ class ManagedProject(models.Model):
             return list(self.project_class.offerings.all())
         else:
             return []
+
+    def set_needs_approval(self, needs_approval: bool = True):
+        """
+        Set whether or not this project needs approval from a local admin.
+        This is used to control whether or not changes to this project
+        need to be approved by a local admin.
+        """
+        if needs_approval:
+            if self.state != ReviewStates.PENDING:
+                self.state = ReviewStates.PENDING
+                self.reviewed_by = None
+                self.reviewed_at = None
+                self.review_comment = None
+                self.save(
+                    update_fields=[
+                        "state",
+                        "reviewed_by",
+                        "reviewed_at",
+                        "review_comment",
+                    ]
+                )
+        else:
+            self.approve(get_system_robot(), comment="Approved automatically.")
+
+    def is_pending(self) -> bool:
+        """
+        Check if this project is pending approval.
+        This is used to determine whether or not the project
+        needs to be approved by a local admin.
+        """
+        return self.state == ReviewStates.PENDING
+
+    def is_canceled(self) -> bool:
+        """
+        Check if this project is canceled.
+        This is used to determine whether or not the project
+        has been canceled by a local admin.
+        """
+        return self.state == ReviewStates.CANCELED
+
+    def is_rejected(self) -> bool:
+        """
+        Check if this project is rejected.
+        This is used to determine whether or not the project
+        has been rejected by a local admin.
+        """
+        return self.state == ReviewStates.REJECTED
+
+    def is_approved(self) -> bool:
+        """
+        Check if this project is approved.
+        This is used to determine whether or not the project
+        has been approved by a local admin.
+        """
+        return self.state == ReviewStates.APPROVED
 
     def __str__(self) -> str:
         return f"ManagedProject {self.identifier} => {self.project}"

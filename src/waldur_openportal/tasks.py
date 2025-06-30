@@ -9,6 +9,8 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.models import User
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices import models as invoice_models
+from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_core.core.utils import get_system_robot
 
 from . import backend, models, utils
 
@@ -106,6 +108,21 @@ def run_once_task(takeover_timeout):
         return wrapper
 
     return task_exc
+
+
+def is_task_running(func):
+    """
+    Check if a task associated with the passed function is currently running.
+    """
+    try:
+        lock_id = "openportal-run-once-" + func.__name__
+
+        task = models.OnceTask.objects.get(task_name=lock_id)
+        if task.last_run is not None:
+            return True
+    except models.OnceTask.DoesNotExist:
+        return False
+    return False
 
 
 def get_structure_allocations(structure):
@@ -279,8 +296,34 @@ def sync_remote_allocation_usage(serialized_allocation):
 
     backend = allocation.get_backend()
 
-    allocation = backend.check_added_remote_allocation(allocation)
-    backend.sync_remote_usage(allocation)
+    allocation = backend.check_added_allocation(allocation)
+    backend.sync_usage(allocation)
+
+
+@shared_task(name="waldur_openportal.sync_remote_allocation_users")
+def sync_remote_allocation_users(serialized_allocation):
+    """
+    This task is called to synchronise the allocations for all users
+    associated with all allocations
+    """
+    logger.info(f"task.sync_remote_allocation_users: {serialized_allocation}")
+
+    if isinstance(serialized_allocation, models.RemoteAllocation):
+        allocation = serialized_allocation
+    else:
+        allocation = core_utils.deserialize_instance(serialized_allocation)
+
+        if not isinstance(allocation, models.RemoteAllocation):
+            logger.info(
+                f"Skipping allocation {allocation} - not a RemoteAllocation instance"
+            )
+            return
+
+    backend = allocation.get_backend()
+
+    allocation = backend.check_added_allocation(allocation)
+
+    backend.sync_users(allocation)
 
 
 @shared_task(name="waldur_openportal.sync_allocation_users")
@@ -309,34 +352,8 @@ def sync_allocation_users(serialized_allocation):
     backend.sync_users(allocation)
 
 
-@shared_task(name="waldur_openportal.sync_remote_allocation_users")
-def sync_remote_allocation_users(serialized_allocation):
-    """
-    This task is called to synchronise the allocations for all users
-    associated with all allocations
-    """
-    logger.info(f"task.sync_remote_allocation_users: {serialized_allocation}")
-
-    if isinstance(serialized_allocation, models.RemoteAllocation):
-        allocation = serialized_allocation
-    else:
-        allocation = core_utils.deserialize_instance(serialized_allocation)
-
-        if not isinstance(allocation, models.RemoteAllocation):
-            logger.info(
-                f"Skipping allocation {allocation} - not a RemoteAllocation instance"
-            )
-            return
-
-    backend = allocation.get_backend()
-
-    allocation = backend.check_added_remote_allocation(allocation)
-
-    backend.sync_remote_users(allocation)
-
-
 @shared_task(name="waldur_openportal.sync_usage")
-@run_once_task(takeover_timeout=60 * 30)
+@run_once_task(takeover_timeout=60 * 60)
 def sync_usage():
     """
     This task is called to synchronise the usage for all allocations
@@ -467,8 +484,48 @@ def sync_usage():
                     return
 
 
+@shared_task(name="waldur_openportal.sync_remote")
+@run_once_task(takeover_timeout=60 * 60)
+def sync_remote():
+    """
+    This is a full OpenPortal remote sync - this will go through all remote projects
+    and make sure that they have been created and any updates applied
+    """
+    logger.info("OpenPortal task.sync_remote")
+    now = datetime.datetime.now()
+    fail_count = 0
+
+    # First, try to create all of the remote projects that are not
+    # already created in the remote portal
+    for remote_allocation in models.RemoteAllocation.objects.filter(is_active=True):
+        try:
+            backend = remote_allocation.get_backend()
+
+            if not remote_allocation.is_added_to_openportal():
+                logger.info(
+                    f"Remote allocation {remote_allocation} not in OpenPortal - adding"
+                )
+                backend.add_allocated_project(remote_allocation)
+            elif remote_allocation.needs_updating():
+                logger.info(
+                    f"Remote allocation {remote_allocation} needs updating ({remote_allocation.local_version} vs {remote_allocation.remote_version} - updating"
+                )
+                backend.update_allocated_project(remote_allocation, force_update=False)
+
+        except Exception as e:
+            logger.error(f"Failed to sync remote project {remote_allocation}: {e}")
+            fail_count += 1
+
+            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                logger.error("Too many failures - aborting")
+                break
+            elif (datetime.datetime.now() - now).seconds > 300:
+                logger.error("Took too long - aborting")
+                break
+
+
 @shared_task(name="waldur_openportal.sync")
-@run_once_task(takeover_timeout=60 * 30)
+@run_once_task(takeover_timeout=60 * 60)
 def sync():
     """
     This is a full OpenPortal sync - this will go through all projects
@@ -546,6 +603,20 @@ def sync_project(serialized_project):
                 logger.error("Took too long - aborting")
                 break
 
+    for allocation in get_structure_remote_allocations(project):
+        try:
+            sync_remote_allocation_users(allocation)
+        except Exception as e:
+            logger.error(f"Failed to sync remote users for {allocation}: {e}")
+            fail_count += 1
+
+            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                logger.error("Too many failures - aborting")
+                break
+            elif (datetime.datetime.now() - now).seconds > 300:
+                logger.error("Took too long - aborting")
+                break
+
 
 @shared_task(name="waldur_openportal.send_notifications")
 def send_notifications():
@@ -620,6 +691,8 @@ def send_notifications():
             credits_available = float(credits_available)
 
         # find any openportal allocations associated with the project
+        # (note we don't do this for RemoteAllocations, as the remote
+        #  portal should be handling this)
         allocations = models.Allocation.objects.filter(project=project, is_active=True)
 
         # Calculate the total usage so far this month across OpenPortal allocations
@@ -737,6 +810,75 @@ If you want to change the frequency of these updates, please ask the project PI 
     return body
 
 
+@shared_task(name="waldur_openportal.update_remote_project")
+def update_remote_project(serialized_project):
+    """
+    This task will look for any remote projects attached to the passed project,
+    and will send remote update commands so that the updates are also
+    reflected in the remote portal.
+    """
+    logger.info(f"OpenPortal task.update_remote_project: {serialized_project}")
+
+    if isinstance(serialized_project, structure_models.Project):
+        project = serialized_project
+    else:
+        project = core_utils.deserialize_instance(serialized_project)
+
+        if not isinstance(project, structure_models.Project):
+            logger.info(f"Skipping project {project} - not a Project instance")
+            return
+
+    # find the remote allocations for this project
+    remote_allocations = models.RemoteAllocation.objects.filter(
+        project=project, is_active=True
+    )
+
+    for remote_allocation in remote_allocations:
+        try:
+            backend = remote_allocation.get_backend()
+
+            logger.info(f"Updating remote project {remote_allocation}")
+
+            backend.update_allocated_project(remote_allocation)
+        except Exception as e:
+            logger.error(f"Failed to update remote project {remote_allocation}: {e}")
+
+
+@shared_task(name="waldur_openportal.delete_remote_project")
+def delete_remote_project(serialized_project):
+    """
+    This task will look for any remote projects attached to the passed project,
+    and will send remote delete commands so that the updates are also
+    reflected in the remote portal.
+    """
+    logger.info(f"OpenPortal task.delete_remote_project: {serialized_project}")
+
+    if isinstance(serialized_project, structure_models.Project):
+        project = serialized_project
+    else:
+        project = core_utils.deserialize_instance(serialized_project)
+
+        if not isinstance(project, structure_models.Project):
+            logger.info(f"Skipping project {project} - not a Project instance")
+            return
+
+    # find the remote allocations for this project
+    remote_allocations = models.RemoteAllocation.objects.filter(
+        project=project, is_active=True
+    )
+
+    for remote_allocation in remote_allocations:
+        try:
+            backend = remote_allocation.get_backend()
+
+            logger.info(f"Deleting remote project {remote_allocation}")
+
+            # Delete the remote project with the latest details
+            backend.delete_allocated_project(remote_allocation)
+        except Exception as e:
+            logger.error(f"Failed to delete remote project {remote_allocation}: {e}")
+
+
 @shared_task(name="waldur_openportal.create_default_resources")
 def create_default_resources(serialized_managed_project):
     """
@@ -782,6 +924,107 @@ def create_default_resources(serialized_managed_project):
 
     logger.info(f"OpenPortal - Creating default resources for {project} - {offerings}")
 
+    for offering in offerings:
+        # find any existing orders for this project and offering
+        num_erred = 0
+        have_existing = False
+
+        for existing_resource in marketplace_models.Resource.objects.filter(
+            project=project,
+            offering=offering,
+        ):
+            if existing_resource.state != marketplace_models.Resource.States.ERRED:
+                # There is an existing resource in a non-error state. This indicates
+                # that the resource is either running, or has been removed in the
+                # remote portal. DO NOT RECREATE IT.
+                have_existing = True
+                logger.info(
+                    f"OpenPortal - Found existing resource {existing_resource} for {offering} in {project}"
+                )
+                break
+            else:
+                num_erred += 1
+
+                if num_erred > 5:
+                    # This indicates we've tried many times to create this resource
+                    # and have failed. We should not try to create it again.
+                    logger.error(
+                        f"OpenPortal - Too many resources in ERRED state for {offering} in {project} - skipping"
+                    )
+                    have_existing = True
+                    break
+
+        if have_existing:
+            logger.info(
+                f"OpenPortal - Skipping creation of {offering} for {project} - already exists"
+            )
+            continue
+
+        logger.info(f"OpenPortal - Creating {offering} for {project}")
+
+        created_resource = False
+
+        try:
+            # Create the resource for the project and offering
+            # Look at OrderCreateSerializer.create for how this is done
+            # by the marketplace backend
+            resource = marketplace_models.Resource.objects.create(
+                name=str(offering.name),
+                project=project,
+                offering=offering,
+            )
+            resource.init_cost()
+            resource.save()
+
+            # Create the order for the project and offering
+            # Simply creating the order will trigger the background
+            # tasks needed to create the resource.
+            # We don't need to do anything more
+            marketplace_models.Order.objects.create(
+                project=project,
+                offering=offering,
+                resource=resource,
+                created_by=get_system_robot(),
+                consumer_reviewed_by=get_system_robot(),
+                plan=offering.plans.first(),
+                attributes={
+                    "name": str(offering.name),
+                    "description": "Default resource created at the start of the project",
+                },
+            )
+
+            created_resource = True
+
+        except Exception as e:
+            logger.error(
+                f"OpenPortal - Failed to create order for {offering} in {project}: {e}"
+            )
+
+        if created_resource:
+            num_successful = 0
+
+            # make sure that we only have one copy of this resource in the project
+            for existing_resource in marketplace_models.Resource.objects.filter(
+                project=project,
+                offering=offering,
+            ):
+                if existing_resource.state == marketplace_models.Resource.States.ERRED:
+                    # remove previously failed resource creation attempts
+                    logger.info(
+                        f"OpenPortal - Removing previously failed resource {existing_resource} for {offering} in {project}"
+                    )
+                    existing_resource.delete()
+                elif existing_resource.state == marketplace_models.Resource.States.OK:
+                    num_successful += 1
+
+                    if num_successful > 1:
+                        # This indicates we've created multiple resources for the same offering
+                        # and project. We should not try to create it again.
+                        logger.error(
+                            f"OpenPortal - Too many resources created for {offering} in {project} - deleting {existing_resource}"
+                        )
+                        existing_resource.delete()
+
 
 def update_project(
     board: OpenPortalBoard,
@@ -793,27 +1036,9 @@ def update_project(
     Update the project in the OpenPortal board with the given details.
     If the project does not exist, then there will be an error.
     """
-    logger.info(f"Updating project {project} with details {details}")
-    return board.update_project(project, details, force_update=force_update)
+    mapping = board.update_project(project, details, force_update=force_update)
 
-
-def create_project(
-    board: OpenPortalBoard,
-    identifier: openportal.ProjectIdentifier,
-    details: openportal.ProjectDetails,
-) -> openportal.ProjectMapping:
-    """
-    Create a project in the OpenPortal board with the given identifier and details.
-    """
-    logger.info(f"Creating project {identifier} with details {details}")
-
-    # first, create the project if it doesn't exist
-    mapping = board.create_project(identifier, details)
-
-    # next, update the details of the project to match the details provided
-    mapping = update_project(board, mapping.project, details, force_update=True)
-
-    # Finally, schedule the creation of default resources
+    # schedule creation of default resources again in case any were missed
     try:
         managed_project = models.ManagedProject.objects.filter(
             identifier=str(mapping.project)
@@ -827,6 +1052,24 @@ def create_project(
         raise ValueError(f"Managed project for {mapping.project} not found")
 
     create_default_resources.delay(core_utils.serialize_instance(managed_project))
+
+    return mapping
+
+
+def create_project(
+    board: OpenPortalBoard,
+    identifier: openportal.ProjectIdentifier,
+    details: openportal.ProjectDetails,
+) -> openportal.ProjectMapping:
+    """
+    Create a project in the OpenPortal board with the given identifier and details.
+    """
+    # first, create the project if it doesn't exist
+    mapping = board.create_project(identifier, details)
+
+    # next, update the details of the project to match the details provided.
+    # This will also create the default resources for the project
+    mapping = update_project(board, mapping.project, details, force_update=True)
 
     return mapping
 
@@ -915,21 +1158,64 @@ def run_job(serialized_job):
             raise ValueError(f"Unknown command {command} for job {job.id}")
 
         job = job.completed(result)
-        board.send_result(job)
+
+        # save the job data back to the model so that we don't repeat this job
+        job_model.state = models.Job.State.COMPLETED
+        job_model.job_data = job.to_json()
+        job_model.save()
+
+        result_sent = False
+        num_attempts = 0
+
+        while not result_sent and num_attempts < 5:
+            try:
+                num_attempts += 1
+                board.send_result(job)
+                result_sent = True
+            except Exception as e:
+                logger.error(
+                    f"OpenPortal - Failed to send result for job {job.id}: {e} - retrying..."
+                )
+                # celery sleep
+                time.sleep(1)
+
+        if not result_sent:
+            logger.error(
+                f"OpenPortal - Failed to send result for job {job.id} after {num_attempts} attempts"
+            )
+
     except Exception as e:
         logger.error(f"OpenPortal - Failed to run job {job.id}: {e}")
         try:
             job = job.errored(str(e))
-            board.send_result(job)
         except Exception as e:
             logger.error(
-                f"OpenPortal - Failed to send error result for job {job.id}: {e}"
+                f"OpenPortal - Failed to set error result for job {job.id}: {e}"
             )
 
-    # save the job model back to the database
-    job_model.state = models.Job.State.COMPLETED
-    job_model.job_data = job.to_json()
-    job_model.save()
+        # save the job model back to the database
+        job_model.state = models.Job.State.COMPLETED
+        job_model.job_data = job.to_json()
+        job_model.save()
+
+        result_sent = False
+        num_attempts = 0
+
+        while not result_sent and num_attempts < 5:
+            try:
+                num_attempts += 1
+                board.send_result(job)
+                result_sent = True
+            except Exception as e:
+                logger.error(
+                    f"OpenPortal - Failed to send result for job {job.id}: {e} - retrying..."
+                )
+                time.sleep(1)
+
+        if not result_sent:
+            logger.error(
+                f"OpenPortal - Failed to send result for job {job.id} after {num_attempts} attempts"
+            )
 
 
 @shared_task(name="waldur_openportal.sync_board")
