@@ -966,6 +966,8 @@ def create_default_resources(serialized_managed_project):
 
         try:
             # Create the resource for the project and offering
+            # Look at OrderCreateSerializer.create for how this is done
+            # by the marketplace backend
             resource = marketplace_models.Resource.objects.create(
                 name=str(offering.name),
                 project=project,
