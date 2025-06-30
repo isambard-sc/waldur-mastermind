@@ -973,6 +973,8 @@ def create_default_resources(serialized_managed_project):
                 project=project,
                 offering=offering,
             )
+            resource.init_cost()
+            resource.save()
 
             # Create the order for the project and offering
             # Simply creating the order will trigger the background
