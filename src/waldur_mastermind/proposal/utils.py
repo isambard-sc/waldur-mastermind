@@ -93,6 +93,11 @@ def allocate_proposal(proposal: proposal_models.Proposal):
 
     for requested_resource in requested_resources:
         with transaction.atomic():
+            if "name" not in requested_resource.attributes:
+                requested_resource.attributes["name"] = str(
+                    requested_resource.requested_offering.offering.name
+                )
+
             attrs = dict(
                 project=proposal.project,
                 offering=requested_resource.requested_offering.offering,
@@ -102,7 +107,7 @@ def allocate_proposal(proposal: proposal_models.Proposal):
             )
             resource = marketplace_models.Resource(
                 **attrs,
-                name=proposal.project.name,
+                name=requested_resource.attributes["name"],
             )
             resource.init_cost()
             resource.save()
