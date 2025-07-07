@@ -13,14 +13,60 @@ class RoundInline(admin.TabularInline):
     extra = 1
 
 
+class CallResourceTemplateInline(admin.TabularInline):
+    model = models.CallResourceTemplate
+    extra = 0
+    readonly_fields = ("created_by",)
+
+
 class RequestedResourceInline(admin.TabularInline):
     model = models.RequestedResource
     extra = 1
 
 
 class CallAdmin(admin.ModelAdmin):
-    inlines = [RequestedOfferingInline, RoundInline]
-    list_display = ("name",)
+    inlines = [RequestedOfferingInline, RoundInline, CallResourceTemplateInline]
+    list_display = (
+        "name",
+        "state",
+        "fixed_duration_in_days",
+        "reviewer_identity_visible_to_submitters",
+        "reviews_visible_to_submitters",
+    )
+    fieldsets = (
+        (
+            None,
+            {
+                "fields": (
+                    "name",
+                    "description",
+                    "manager",
+                    "state",
+                )
+            },
+        ),
+        (
+            "Configuration",
+            {
+                "fields": (
+                    "fixed_duration_in_days",
+                    "default_project_role",
+                    "external_url",
+                    "backend_id",
+                )
+            },
+        ),
+        (
+            "Visibility settings",
+            {
+                "fields": (
+                    "reviewer_identity_visible_to_submitters",
+                    "reviews_visible_to_submitters",
+                ),
+                "description": "Control what proposal submitters can see about reviews",
+            },
+        ),
+    )
 
 
 class RoundAdmin(admin.ModelAdmin):
@@ -38,6 +84,7 @@ class ReviewAdmin(admin.ModelAdmin):
 
 admin.site.register(models.CallManagingOrganisation)
 admin.site.register(models.Call, CallAdmin)
+admin.site.register(models.CallResourceTemplate)
 admin.site.register(models.Round, RoundAdmin)
 admin.site.register(models.Proposal, ProposalAdmin)
 admin.site.register(models.Review, ReviewAdmin)

@@ -3,6 +3,7 @@ from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.proposal import models
+from waldur_mastermind.proposal.enums import ProposalStates
 from waldur_mastermind.proposal.tests import fixtures
 
 from . import factories
@@ -14,35 +15,44 @@ class ReviewGetTest(test.APITransactionTestCase):
         self.fixture = fixtures.ProposalFixture()
         self.url = factories.ReviewFactory.get_list_url()
 
+    def _get_review_request(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        return self.client.get(self.url)
+
     @data(
         "staff",
         "owner",
         "customer_support",
     )
     def test_review_should_be_visible(self, user):
-        user = getattr(self.fixture, user)
-        self.client.force_authenticate(user)
-        response = self.client.get(self.url)
+        response = self._get_review_request(user)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(len(response.json()))
 
     @data("user", "proposal_submitted_creator", "reviewer_2")
     def test_review_should_not_be_visible(self, user):
-        user = getattr(self.fixture, user)
-        self.client.force_authenticate(user)
-        response = self.client.get(self.url)
+        response = self._get_review_request(user)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse(len(response.json()))
 
     @data("proposal_submitted_creator")
-    def test_submitted_review_should_be_visible(self, user):
+    def test_submitted_review_for_decided_proposal_should_be_visible(self, user):
+        self.fixture.review.proposal.state = ProposalStates.ACCEPTED
+        self.fixture.review.proposal.save()
         self.fixture.review.state = models.Review.States.SUBMITTED
         self.fixture.review.save()
-        user = getattr(self.fixture, user)
-        self.client.force_authenticate(user)
-        response = self.client.get(self.url)
+        response = self._get_review_request(user)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(len(response.json()))
+
+    @data("proposal_submitted_creator")
+    def test_submitted_review_for_undecided_proposal_should_not_be_visible(self, user):
+        self.fixture.review.state = models.Review.States.SUBMITTED
+        self.fixture.review.save()
+        response = self._get_review_request(user)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(len(response.json()))
 
 
 @ddt
@@ -51,7 +61,7 @@ class ReviewCreateTest(test.APITransactionTestCase):
         self.fixture = fixtures.ProposalFixture()
         self.url = factories.ReviewFactory.get_list_url()
 
-    @data("staff")
+    @data("staff", "call_manager")
     def test_user_can_add(self, user):
         response = self.create(user)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -68,6 +78,20 @@ class ReviewCreateTest(test.APITransactionTestCase):
         response = self.create(user)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    @data("staff", "call_manager")
+    def test_user_cannot_add_duplicate_reviews(self, user):
+        response = self.create(user)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            models.Review.objects.filter(uuid=response.data["uuid"]).exists()
+        )
+        # Try to create the same review again
+        response = self.create(user)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Review already exists for this proposal and reviewer", response.data[0]
+        )
+
     def create(self, user, **kwargs):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
@@ -77,7 +101,7 @@ class ReviewCreateTest(test.APITransactionTestCase):
                 self.fixture.proposal_submitted
             ),
             "reviewer": structure_factories.UserFactory.get_url(
-                self.fixture.reviewer_1
+                self.fixture.reviewer_2
             ),
         }
         payload.update(kwargs)
@@ -124,14 +148,13 @@ class ReviewDeleteTest(test.APITransactionTestCase):
     @data(
         "staff",
     )
-    def test_user_can_delete(self, user):
+    def test_staff_can_delete(self, user):
         response = self.run_delete(user)
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
 
     @data(
         "owner",
         "customer_support",
-        "proposal_submitted_creator",
     )
     def test_customer_user_can_not_delete(self, user):
         response = self.run_delete(user)
@@ -170,6 +193,42 @@ class ActionTest(test.APITransactionTestCase):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
         response = self.client.post(self.url_accept)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @data(
+        "staff",
+        "reviewer_1",
+    )
+    def test_user_can_submit(self, user):
+        url = factories.ReviewFactory.get_url(self.review, "submit")
+        self.review.state = models.Review.States.IN_REVIEW
+        self.review.save()
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.post(
+            url,
+            {
+                "summary_score": "4",
+                "summary_public_comment": "summary public",
+                "summary_private_comment": "summary private",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.review.refresh_from_db()
+        self.assertTrue(self.review.state, models.Review.States.SUBMITTED)
+        self.assertTrue(self.review.summary_score, 4)
+        self.assertTrue(self.review.summary_public_comment, "summary public")
+        self.assertTrue(self.review.summary_private_comment, "summary private")
+
+    @data(
+        "owner",
+        "customer_support",
+    )
+    def test_user_can_not_submit(self, user):
+        url = factories.ReviewFactory.get_url(self.review, "submit")
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.post(url)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
@@ -215,7 +274,7 @@ class ReviewerGetTest(test.APITransactionTestCase):
         "staff",
     )
     def test_reviewers_counter_should_be_visible(self, user):
-        self.fixture.proposal.state = models.Proposal.States.IN_REVIEW
+        self.fixture.proposal.state = ProposalStates.IN_REVIEW
         self.fixture.review.proposal = self.fixture.proposal
         self.fixture.review.save()
         self.fixture.proposal.save()

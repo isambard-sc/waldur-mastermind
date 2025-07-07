@@ -10,9 +10,11 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework.exceptions import ValidationError
 
 from waldur_auth_social.models import IdentityProvider, ProviderChoices
+from waldur_core.core.enums import CoreStates
 from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure.signals import project_moved
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import ResourceStates
 
 logger = logging.getLogger(__name__)
 
@@ -148,11 +150,11 @@ def handle_resource_update_success(resource):
     Recover resource if its state is ERRED and clear error message.
     """
     update_fields = []
-    if resource.state == resource.States.ERRED:
+    if resource.state == CoreStates.ERRED:
         resource.recover()
         update_fields.append("state")
 
-    if resource.state in (resource.States.UPDATING, resource.States.CREATING):
+    if resource.state in (CoreStates.UPDATING, CoreStates.CREATING):
         resource.set_ok()
         update_fields.append("state")
 
@@ -186,7 +188,7 @@ def project_is_empty(obj):
 
     if (
         Resource.objects.filter(project=obj)
-        .exclude(state=Resource.States.TERMINATED)
+        .exclude(state=ResourceStates.TERMINATED)
         .exists()
     ):
         raise ValidationError(
@@ -206,7 +208,7 @@ def check_project_end_date(obj):
 
 
 @transaction.atomic
-def move_project(project, customer, current_user=None):
+def move_project(project, customer, current_user=None, preserve_permissions=False):
     if customer.blocked:
         raise ValidationError(_("New customer must be not blocked"))
 
@@ -217,9 +219,10 @@ def move_project(project, customer, current_user=None):
     project.customer = customer
     project.save(update_fields=["customer"])
 
-    for permission in get_permissions(project):
-        permission.revoke(current_user)
-        logger.info("Permission %s has been revoked" % permission)
+    if not preserve_permissions:
+        for permission in get_permissions(project):
+            permission.revoke(current_user)
+            logger.info(f"Permission {permission} has been revoked")
 
     project_moved.send(
         sender=project.__class__,
@@ -231,6 +234,7 @@ def move_project(project, customer, current_user=None):
 
 def get_components_usage_data_from_resources(
     resources: QuerySet[marketplace_models.Resource],
+    for_current_month: bool = False,
 ) -> list[dict[str, Any]]:
     offerings = marketplace_models.Offering.objects.filter(
         id__in=resources.values_list("offering_id", flat=True)
@@ -244,20 +248,38 @@ def get_components_usage_data_from_resources(
     component_limit = defaultdict(float)
     component_limit_usage = defaultdict(float)
 
+    current_date = datetime.date.today()
+
     for resource in resources:
         for component_type, usage in resource.current_usages.items():
-            component_usage[component_type] += float(usage)
+            # When filtering for current month, get usage from ComponentUsage instead of current_usages
+            if not for_current_month:
+                component_usage[component_type] += float(usage)
 
         for component_type, limit in resource.limits.items():
             if limit is not None:
                 component_limit[component_type] += float(limit)
 
+        usage_components = resource.offering.components.filter(
+            billing_type=marketplace_models.OfferingComponent.BillingTypes.USAGE
+        )
         limit_components = resource.offering.components.filter(
             billing_type=marketplace_models.OfferingComponent.BillingTypes.LIMIT
         )
 
+        if for_current_month:
+            for component in usage_components:
+                usages = marketplace_models.ComponentUsage.objects.filter(
+                    resource=resource,
+                    component=component,
+                    date__year=current_date.year,
+                    date__month=current_date.month,
+                )
+                total_usage = usages.aggregate(total=Sum("usage"))["total"] or 0
+                component_usage[component.type] += float(total_usage)
+
         for component in limit_components:
-            if component.limit_period in (
+            if not for_current_month and component.limit_period in (
                 None,
                 marketplace_models.OfferingComponent.LimitPeriods.MONTH,
             ):
@@ -269,7 +291,12 @@ def get_components_usage_data_from_resources(
                     resource=resource, component=component
                 ).exclude(plan_period=None)
 
-                if (
+                if for_current_month:
+                    usages = usages.filter(
+                        date__year=current_date.year,
+                        date__month=current_date.month,
+                    )
+                elif (
                     component.limit_period
                     == marketplace_models.OfferingComponent.LimitPeriods.ANNUAL
                 ):

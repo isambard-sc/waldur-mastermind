@@ -4,8 +4,8 @@ set -e
 TEST_MODE="${1:-UNIT}"
 
 echo "[+] Install dependencies in case of absence"
-pip3 install poetry==1.8.3
-pip3 install --upgrade setuptools==72.1.0
+pip3 install poetry==2.1.2
+pip3 install --upgrade setuptools==78.1.0
 poetry install -vvv
 
 echo "[+] Setup test settings"
@@ -39,13 +39,14 @@ if [ "$TEST_MODE" = "UNIT" ]; then
       --junitxml=report.xml \
       --cov=src/ \
       --no-migrations \
+      -ra \
       --ds=waldur_mastermind.test_settings \
       src
 
   # Check default configuration
   DJANGO_SETTINGS_MODULE=waldur_mastermind.test_settings waldur print_settings > /dev/null
-elif [ "$TEST_MODE" = "MIGRATIONS" ]; then
-  echo "[+] Running migration test"
+elif [ "$TEST_MODE" = "MANAGEMENT" ]; then
+  echo "[+] Running tests for management commands"
   pytest \
       --junitxml=report.xml \
       --cov=src/ \

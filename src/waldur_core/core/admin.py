@@ -8,7 +8,6 @@ from django.contrib import admin, messages
 from django.contrib.admin import forms as admin_forms
 from django.contrib.auth import admin as auth_admin
 from django.contrib.auth import forms as auth_forms
-from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.forms.utils import flatatt
@@ -16,7 +15,6 @@ from django.shortcuts import get_object_or_404
 from django.template.response import TemplateResponse
 from django.urls import re_path, reverse
 from django.utils.functional import cached_property
-from django.utils.html import format_html_join
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 from jsoneditor.forms import JSONEditor
@@ -122,7 +120,7 @@ class OptionalChoiceField(forms.ChoiceField):
 
 class UserCreationForm(auth_forms.UserCreationForm):
     class Meta:
-        model = get_user_model()
+        model = models.User
         fields = ("username",)
 
     # overwritten to support custom User model
@@ -131,8 +129,8 @@ class UserCreationForm(auth_forms.UserCreationForm):
         # but it sets a nicer error message than the ORM. See #13147.
         username = self.cleaned_data["username"]
         try:
-            get_user_model()._default_manager.get(username=username)
-        except get_user_model().DoesNotExist:
+            models.User._default_manager.get(username=username)
+        except models.User.DoesNotExist:
             return username
         raise forms.ValidationError(
             _("Username is not unique."),
@@ -142,7 +140,7 @@ class UserCreationForm(auth_forms.UserCreationForm):
 
 class UserChangeForm(auth_forms.UserChangeForm):
     class Meta:
-        model = get_user_model()
+        model = models.User
         exclude = ("details",)
 
     def clean_civil_number(self):
@@ -255,8 +253,6 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin, VersionAdmin):
                     "is_staff",
                     "is_support",
                     "is_identity_manager",
-                    "customer_roles",
-                    "project_roles",
                     "notifications_enabled",
                 )
             },
@@ -274,8 +270,6 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin, VersionAdmin):
         "registration_method",
         "affiliations",
         "agreement_date",
-        "customer_roles",
-        "project_roles",
         "uuid",
         "last_login",
         "last_sync",
@@ -284,41 +278,6 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin, VersionAdmin):
     )
     form = UserChangeForm
     add_form = UserCreationForm
-
-    def customer_roles(self, instance):
-        from waldur_core.structure.managers import get_connected_customers
-        from waldur_core.structure.models import Customer
-
-        customer_ids = get_connected_customers(instance)
-        customers = Customer.objects.filter(id__in=customer_ids).order_by("name")
-
-        return format_html_join(
-            mark_safe("<br/>"),  # noqa: S308
-            "<a href={}>{}</a>",
-            ((get_admin_url(customer), str(customer)) for customer in customers),
-        ) or mark_safe(  # noqa: S308, S703
-            "<span class='errors'>%s</span>"
-            % _("User has no roles in any organization.")
-        )
-
-    customer_roles.short_description = _("Roles in organizations")
-
-    def project_roles(self, instance):
-        from waldur_core.structure.managers import get_connected_projects
-        from waldur_core.structure.models import Project
-
-        project_ids = get_connected_projects(instance)
-        projects = Project.objects.filter(id__in=project_ids).order_by("name")
-
-        return format_html_join(
-            mark_safe("<br/>"),  # noqa: S308
-            "<a href={}>{}</a>",
-            ((get_admin_url(project), str(project)) for project in projects),
-        ) or mark_safe(  # noqa: S308, S703
-            "<span class='errors'>%s</span>" % _("User has no roles in any project.")
-        )
-
-    project_roles.short_description = _("Roles in projects")
 
     def format_details(self, obj):
         return format_json_field(obj.details)
@@ -454,7 +413,7 @@ class ExecutorAdminAction:
             confirmation = True # if your action requires a confirmation else set False
 
             def validate(self, tenant):
-                if tenant.state != Tenant.States.OK:
+                if tenant.state != CoreStates.OK:
                     raise ValidationError('Tenant has to be in state OK to pull security groups.')
 
         pull_security_groups = PullSecurityGroups()  # this action could be registered as admin action

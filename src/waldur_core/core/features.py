@@ -72,6 +72,14 @@ class ProjectSection(FeatureSection):
 
     show_image_in_create_dialog = Feature("Show image field in project create dialog.")
 
+    show_credit_in_create_dialog = Feature(
+        "Show credit field in project create dialog."
+    )
+
+    mandatory_start_date = Feature("Make the project start date mandatory.")
+
+    mandatory_end_date = Feature("Make the project end date mandatory.")
+
 
 class UserSection(FeatureSection):
     class Meta:
@@ -89,6 +97,8 @@ class UserSection(FeatureSection):
     disable_user_termination = Feature("Disable user termination in user workspace.")
 
     show_slug = Feature("Enable display of slug field in user summary.")
+
+    show_username = Feature("Enable display of username field in user tables.")
 
 
 class MarketplaceSection(FeatureSection):
@@ -116,6 +126,10 @@ class MarketplaceSection(FeatureSection):
 
     call_only = Feature("Allow marketplace to serve only as aggregator of call info.")
 
+    show_resource_end_date = Feature(
+        "Show resource end date as a non optional column in resources list."
+    )
+
 
 class SupportSection(FeatureSection):
     class Meta:
@@ -127,10 +141,6 @@ class SupportSection(FeatureSection):
     )
 
     users = Feature("Render list of users in support workspace.")
-
-    shared_providers = Feature(
-        "Render overview of shared marketplace service providers in support workspace."
-    )
 
     vm_type_overview = Feature("Enable VM type overview in support workspace.")
 
@@ -147,20 +157,10 @@ class InvitationsSection(FeatureSection):
     conceal_civil_number = Feature(
         "Conceal civil number in invitation creation dialog."
     )
-
-    show_tax_number = Feature("Show tax number field in invitation creation form.")
-
-    tax_number_required = Feature(
-        "Make tax number field mandatory in invitation creation form."
-    )
-
     civil_number_required = Feature(
         "Make civil number field mandatory in invitation creation form."
     )
-
-    require_user_details = Feature(
-        'Render "Show user details" button in invitation creation form.'
-    )
+    show_service_accounts = Feature("Show service accounts of the scopes.")
 
 
 class RancherSection(FeatureSection):
@@ -171,6 +171,8 @@ class RancherSection(FeatureSection):
     volume_mount_point = Feature(
         "Allow to select mount point for data volume when Rancher cluster is provisioned."
     )
+
+    apps = Feature("Render Rancher apps as a separate tab in resource details page.")
 
 
 class SlurmSection(FeatureSection):
@@ -194,18 +196,10 @@ class OpenstackSection(FeatureSection):
     show_migrations = Feature("Show OpenStack tenant migrations action and tab")
 
 
-class TelemetrySection(FeatureSection):
+class WaldurDeploymentSection(FeatureSection):
     class Meta:
-        key = "telemetry"
-        description = "Telemetry settings"
+        key = "deployment"
+        description = "Waldur deployment settings"
 
     send_metrics = Feature("Send telemetry metrics.")
-
-
-# Temporarily commented out to fix Homeport linter
-# class InvoiceSection(FeatureSection):
-#    class Meta:
-#        key = "invoice"
-#        description = "Invoice settings"
-
-# display_credit_management = Feature("Display credit management.")
+    enable_cookie_notice = Feature("Enable cookie notice in marketplace.")

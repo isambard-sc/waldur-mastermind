@@ -3,6 +3,7 @@ from django.utils.translation import gettext_lazy as _
 from libcloud.compute.types import NodeState
 from rest_framework import serializers
 
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure import serializers as structure_serializers
 
 from . import models
@@ -23,23 +24,23 @@ class AwsServiceSerializer(structure_serializers.ServiceOptionsSerializer):
     )
 
 
-class RegionSerializer(structure_serializers.BasePropertySerializer):
+class AwsRegionSerializer(structure_serializers.BasePropertySerializer):
     class Meta:
         model = models.Region
         fields = ("url", "uuid", "name")
         extra_kwargs = {"url": {"lookup_field": "uuid"}}
 
 
-class ImageSerializer(structure_serializers.BasePropertySerializer):
+class AwsImageSerializer(structure_serializers.BasePropertySerializer):
     class Meta:
         model = models.Image
         fields = ("url", "uuid", "name", "region")
         extra_kwargs = {"url": {"lookup_field": "uuid"}}
 
-    region = RegionSerializer(read_only=True)
+    region = AwsRegionSerializer(read_only=True)
 
 
-class SizeSerializer(structure_serializers.BasePropertySerializer):
+class AwsSizeSerializer(structure_serializers.BasePropertySerializer):
     class Meta:
         model = models.Size
         fields = (
@@ -57,10 +58,10 @@ class SizeSerializer(structure_serializers.BasePropertySerializer):
     # AWS expose a more technical backend_id as a name. AWS's short codes are more popular
     name = serializers.ReadOnlyField(source="backend_id")
     description = serializers.ReadOnlyField(source="name")
-    regions = RegionSerializer(many=True, read_only=True)
+    regions = AwsRegionSerializer(many=True, read_only=True)
 
 
-class InstanceSerializer(structure_serializers.VirtualMachineSerializer):
+class AwsInstanceSerializer(structure_serializers.VirtualMachineSerializer):
     region = serializers.HyperlinkedRelatedField(
         view_name="aws-region-detail",
         lookup_field="uuid",
@@ -130,7 +131,7 @@ class InstanceSerializer(structure_serializers.VirtualMachineSerializer):
         instance = super().create(validated_data)
         volume = {
             "name": ("temp-%s" % instance.name)[:150],
-            "state": models.Volume.States.CREATION_SCHEDULED,
+            "state": CoreStates.CREATION_SCHEDULED,
             "instance": instance,
             "service_settings": instance.service_settings,
             "project": instance.project,
@@ -143,7 +144,7 @@ class InstanceSerializer(structure_serializers.VirtualMachineSerializer):
         return instance
 
 
-class InstanceResizeSerializer(
+class AwsInstanceResizeSerializer(
     structure_serializers.PermissionFieldFilteringMixin, serializers.Serializer
 ):
     size = serializers.HyperlinkedRelatedField(
@@ -199,7 +200,7 @@ class InstanceResizeSerializer(
         return instance
 
 
-class VolumeSerializer(structure_serializers.BaseResourceSerializer):
+class AwsVolumeSerializer(structure_serializers.BaseResourceSerializer):
     region = serializers.HyperlinkedRelatedField(
         view_name="aws-region-detail",
         lookup_field="uuid",
@@ -232,7 +233,7 @@ class VolumeSerializer(structure_serializers.BaseResourceSerializer):
         }
 
 
-class VolumeAttachSerializer(
+class AwsVolumeAttachSerializer(
     structure_serializers.PermissionFieldFilteringMixin, serializers.Serializer
 ):
     instance = serializers.HyperlinkedRelatedField(

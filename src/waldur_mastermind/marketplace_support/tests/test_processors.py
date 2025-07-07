@@ -18,6 +18,11 @@ from waldur_core.structure.tests import fixtures
 from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
+from waldur_mastermind.marketplace.enums import (
+    OfferingStates,
+    OrderStates,
+    ResourceStates,
+)
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.marketplace_support import PLUGIN_NAME
 from waldur_mastermind.marketplace_support.utils import get_order_issue
@@ -31,14 +36,12 @@ from waldur_mastermind.support.tests.base import BaseTest
 class RequestCreateTest(BaseTest):
     def test_request_is_created_when_order_is_processed(self):
         fixture = fixtures.ProjectFixture()
-        offering = marketplace_factories.OfferingFactory(
-            type=PLUGIN_NAME, options={"order": []}
-        )
+        offering = marketplace_factories.OfferingFactory(type=PLUGIN_NAME)
 
         order = marketplace_factories.OrderFactory(
             offering=offering,
             attributes={"name": "item_name", "description": "Description"},
-            state=marketplace_models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
 
         marketplace_utils.process_order(order, fixture.staff)
@@ -74,14 +77,12 @@ class RequestCreateTest(BaseTest):
 
     def submit_order(self):
         fixture = fixtures.ProjectFixture()
-        offering = marketplace_factories.OfferingFactory(
-            type=PLUGIN_NAME, options={"order": []}
-        )
+        offering = marketplace_factories.OfferingFactory(type=PLUGIN_NAME)
 
         order = marketplace_factories.OrderFactory(
             offering=offering,
             attributes={"name": "item_name", "description": "Description"},
-            state=marketplace_models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
         offering_component = marketplace_factories.OfferingComponentFactory(
             name="CORES"
@@ -141,14 +142,12 @@ class RequestCreateTest(BaseTest):
 
     def test_issue_caller_is_equal_order_created_by(self):
         fixture = fixtures.ProjectFixture()
-        offering = marketplace_factories.OfferingFactory(
-            type=PLUGIN_NAME, options={"order": []}
-        )
+        offering = marketplace_factories.OfferingFactory(type=PLUGIN_NAME)
 
         order = marketplace_factories.OrderFactory(
             offering=offering,
             attributes={"name": "item_name", "description": "Description"},
-            state=marketplace_models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
 
         marketplace_utils.process_order(order, fixture.staff)
@@ -174,7 +173,6 @@ class RequestCreateTest(BaseTest):
         fixture = fixtures.ProjectFixture()
         offering = marketplace_factories.OfferingFactory(
             type=PLUGIN_NAME,
-            options={"order": []},
             secret_options={
                 "template_confirmation_comment": "template_confirmation_comment"
             },
@@ -183,7 +181,7 @@ class RequestCreateTest(BaseTest):
         order = marketplace_factories.OrderFactory(
             offering=offering,
             attributes={"name": "item_name", "description": "Description"},
-            state=marketplace_models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
 
         marketplace_utils.process_order(order, fixture.staff)
@@ -199,13 +197,13 @@ class RequestCreateTest(BaseTest):
         self.mock_get_active_backend().create_issue = mock_create_issue
         fixture = fixtures.ProjectFixture()
         offering = marketplace_factories.OfferingFactory(
-            type=PLUGIN_NAME, options={"order": []}
+            type=PLUGIN_NAME,
         )
 
         order = marketplace_factories.OrderFactory(
             offering=offering,
             attributes={"name": "item_name", "description": "Description"},
-            state=marketplace_models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
 
         marketplace_utils.process_order(order, fixture.staff)
@@ -223,7 +221,7 @@ class RequestActionBaseTest(BaseTest):
 
         self.user = self.fixture.staff
         self.offering = marketplace_factories.OfferingFactory(
-            state=marketplace_models.Offering.States.ACTIVE, type=PLUGIN_NAME
+            state=OfferingStates.ACTIVE, type=PLUGIN_NAME
         )
 
         self.current_plan = marketplace_factories.PlanFactory(
@@ -270,20 +268,18 @@ class RequestDeleteTest(RequestActionBaseTest):
 
     def test_success_terminate_resource_if_issue_is_resolved(self):
         order = self.get_order(self.success_issue_status)
-        self.assertEqual(order.state, marketplace_models.Order.States.DONE)
+        self.assertEqual(order.state, OrderStates.DONE)
         self.assertEqual(self.mock_get_active_backend().create_issue.call_count, 1)
         self.assertEqual(
             self.mock_get_active_backend().create_issue_links.call_count, 1
         )
         self.resource.refresh_from_db()
-        self.assertEqual(
-            self.resource.state, marketplace_models.Resource.States.TERMINATED
-        )
-        self.assertEqual(order.state, marketplace_models.Order.States.DONE)
+        self.assertEqual(self.resource.state, ResourceStates.TERMINATED)
+        self.assertEqual(order.state, OrderStates.DONE)
 
     def test_fail_termination_order_if_issue_is_canceled(self):
         order = self.get_order(self.error_issue_status)
-        self.assertEqual(order.state, marketplace_models.Order.States.ERRED)
+        self.assertEqual(order.state, OrderStates.ERRED)
 
     @data("staff", "owner", "admin", "manager")
     def test_terminate_operation_is_available(self, user):
@@ -358,13 +354,13 @@ class RequestSwitchPlanTest(RequestActionBaseTest):
 
     def test_success_switch_plan_if_issue_is_resolved(self):
         order = self.get_order(self.success_issue_status)
-        self.assertEqual(order.state, marketplace_models.Order.States.DONE)
+        self.assertEqual(order.state, OrderStates.DONE)
         self.assertEqual(self.mock_get_active_backend().create_issue.call_count, 1)
         self.assertEqual(
             self.mock_get_active_backend().create_issue_links.call_count, 1
         )
         self.resource.refresh_from_db()
-        self.assertEqual(self.resource.state, marketplace_models.Resource.States.OK)
+        self.assertEqual(self.resource.state, ResourceStates.OK)
         self.assertEqual(self.resource.plan, self.plan)
 
     def test_add_links_to_previous_issues(self):
@@ -381,16 +377,16 @@ class RequestSwitchPlanTest(RequestActionBaseTest):
 
     def test_order_is_updated_when_issue_is_resolved(self):
         order = self.get_order(self.success_issue_status)
-        self.assertEqual(order.state, marketplace_models.Order.States.DONE)
+        self.assertEqual(order.state, OrderStates.DONE)
         self.resource.refresh_from_db()
-        self.assertEqual(self.resource.state, marketplace_models.Resource.States.OK)
+        self.assertEqual(self.resource.state, ResourceStates.OK)
         self.assertEqual(self.resource.plan, self.plan)
 
     def test_fail_switch_plan_if_issue_is_fail(self):
         order = self.get_order(self.error_issue_status)
-        self.assertEqual(order.state, marketplace_models.Order.States.ERRED)
+        self.assertEqual(order.state, OrderStates.ERRED)
         self.resource.refresh_from_db()
-        self.assertEqual(self.resource.state, marketplace_models.Resource.States.ERRED)
+        self.assertEqual(self.resource.state, ResourceStates.ERRED)
         self.assertEqual(self.resource.plan, self.current_plan)
 
     @freeze_time("2019-01-15")
@@ -490,7 +486,7 @@ class UpdateLimitsTest(BaseTest):
 
         self.user = self.fixture.staff
         self.offering = marketplace_factories.OfferingFactory(
-            state=marketplace_models.Offering.States.ACTIVE, type=PLUGIN_NAME
+            state=OfferingStates.ACTIVE, type=PLUGIN_NAME
         )
 
         self.offering_component = marketplace_factories.OfferingComponentFactory(
@@ -526,20 +522,20 @@ class UpdateLimitsTest(BaseTest):
 
     def test_when_issue_is_resolved_limits_are_updated(self):
         order = self.get_order(self.success_issue_status)
-        self.assertEqual(order.state, marketplace_models.Order.States.DONE)
+        self.assertEqual(order.state, OrderStates.DONE)
         self.assertEqual(self.mock_get_active_backend().create_issue.call_count, 1)
         self.assertEqual(
             self.mock_get_active_backend().create_issue_links.call_count, 1
         )
         self.resource.refresh_from_db()
-        self.assertEqual(self.resource.state, marketplace_models.Resource.States.OK)
+        self.assertEqual(self.resource.state, ResourceStates.OK)
         self.assertEqual(self.resource.limits, self.new_limits)
 
     def test_fail_case(self):
         order = self.get_order(self.error_issue_status)
-        self.assertEqual(order.state, marketplace_models.Order.States.ERRED)
+        self.assertEqual(order.state, OrderStates.ERRED)
         self.resource.refresh_from_db()
-        self.assertEqual(self.resource.state, marketplace_models.Resource.States.ERRED)
+        self.assertEqual(self.resource.state, ResourceStates.ERRED)
         self.assertEqual(self.resource.limits, self.old_limits)
 
     def test_description_formatting(self):
@@ -583,9 +579,7 @@ class UpdateLimitsTest(BaseTest):
 @override_settings(task_always_eager=True)
 class NotificationTest(BaseTest):
     def setUp(self):
-        self.offering = marketplace_factories.OfferingFactory(
-            type=PLUGIN_NAME, options={"order": []}
-        )
+        self.offering = marketplace_factories.OfferingFactory(type=PLUGIN_NAME)
         self.service_provider = marketplace_factories.ServiceProviderFactory(
             customer=self.offering.customer, lead_email="to@example.com"
         )
@@ -669,9 +663,7 @@ class ProcessingTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.url = marketplace_factories.OrderFactory.get_list_url()
-        self.offering = marketplace_factories.OfferingFactory(
-            type=PLUGIN_NAME, options={"order": []}
-        )
+        self.offering = marketplace_factories.OfferingFactory(type=PLUGIN_NAME)
         mock_patch = mock.patch("waldur_mastermind.support.backend.get_active_backend")
         self.mock_get_active_backend = mock_patch.start()
         self.mock_get_active_backend.return_value = SupportBackend()
@@ -683,12 +675,12 @@ class ProcessingTest(test.APITransactionTestCase):
         order = marketplace_factories.OrderFactory(
             offering=self.offering,
             attributes={"name": "item_name", "description": "Description"},
-            state=marketplace_models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
         marketplace_utils.process_order(order, self.fixture.staff)
         order.refresh_from_db()
         # Order state will be "Done" after issue resolving.
-        self.assertEqual(order.state, marketplace_models.Order.States.EXECUTING)
+        self.assertEqual(order.state, OrderStates.EXECUTING)
         self.assertTrue(
             marketplace_models.Resource.objects.filter(name="item_name").exists()
         )

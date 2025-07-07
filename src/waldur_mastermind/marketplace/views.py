@@ -2,11 +2,12 @@ import copy
 import datetime
 import logging
 import textwrap
+import uuid
 
+import httpx
 import reversion
 from constance import config
 from dateutil.relativedelta import relativedelta
-from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection, transaction
 from django.db.models import (
@@ -31,31 +32,43 @@ from django.views.decorators.cache import cache_page
 from django.views.decorators.csrf import csrf_exempt
 from django_filters.rest_framework import DjangoFilterBackend
 from django_fsm import TransitionNotAllowed
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import exceptions as rf_exceptions
-from rest_framework import mixins, status, views
+from rest_framework import generics, mixins, status, views
 from rest_framework import permissions as rf_permissions
 from rest_framework import viewsets as rf_viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.generics import ListAPIView
+from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.serializers import Serializer
 
 from waldur_core.core import models as core_models
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.mixins import EagerLoadMixin
+from waldur_core.core.models import User
 from waldur_core.core.renderers import PlainTextRenderer
+from waldur_core.core.serializers import EmptySerializer
 from waldur_core.core.utils import (
     SubqueryCount,
     is_uuid_like,
     month_start,
     order_with_nulls,
-    remove_duplicate_hyphens,
 )
 from waldur_core.logging.loggers import event_logger
 from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.filters import UserPermissionFilter
+from waldur_core.permissions.fixtures import (
+    CustomerRole,
+    OfferingRole,
+    ServiceProviderRole,
+)
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import (
     get_user_ids,
@@ -72,6 +85,7 @@ from waldur_core.structure import utils as structure_utils
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_core.structure.executors import ServiceSettingsPullExecutor
 from waldur_core.structure.managers import (
+    filter_queryset_by_user_ip,
     filter_queryset_for_user,
     get_connected_customers,
     get_connected_customers_by_permission,
@@ -90,6 +104,12 @@ from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices import serializers as invoice_serializers
 from waldur_mastermind.marketplace import PLUGIN_NAME as BASIC_PLUGIN_NAME
 from waldur_mastermind.marketplace import callbacks
+from waldur_mastermind.marketplace.enums import (
+    OfferingStates,
+    OrderStates,
+    ResourceStates,
+    RobotAccountStates,
+)
 from waldur_mastermind.marketplace.managers import (
     ResourceQuerySet,
     filter_offering_permissions,
@@ -108,8 +128,6 @@ from waldur_pid import models as pid_models
 from . import filters, log, models, permissions, plugins, serializers, tasks, utils
 
 logger = logging.getLogger(__name__)
-
-User = get_user_model()
 
 
 class BaseMarketplaceView(core_views.ActionsViewSet):
@@ -132,6 +150,7 @@ class PublicViewsetMixin:
 
 
 class ConnectedOfferingDetailsMixin:
+    @extend_schema(responses=serializers.PublicOfferingDetailsSerializer, filters=False)
     @action(detail=True, methods=["get"])
     def offering(self, request, *args, **kwargs):
         requested_object = self.get_object()
@@ -145,17 +164,33 @@ class ConnectedOfferingDetailsMixin:
             return Response(status.HTTP_204_NO_CONTENT)
 
 
-class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
+class ServiceProviderViewSet(UserRoleMixin, PublicViewsetMixin, BaseMarketplaceView):
     queryset = models.ServiceProvider.objects.all().order_by("customer__name")
     serializer_class = serializers.ServiceProviderSerializer
     filterset_class = filters.ServiceProviderFilter
 
+    @extend_schema(
+        operation_id="service_provider_api_secret_code_retrieve",
+        description="Return service provider API secret code.",
+        request=None,
+        responses={
+            status.HTTP_200_OK: serializers.ServiceProviderApiSecretCodeSerializer
+        },
+        filters=False,
+        methods=["GET"],
+    )
+    @extend_schema(
+        operation_id="service_provider_api_secret_code_generate",
+        description="Generate new service provider API secret code.",
+        request=None,
+        responses={
+            status.HTTP_200_OK: serializers.ServiceProviderApiSecretCodeSerializer
+        },
+        methods=["POST"],
+    )
     @action(detail=True, methods=["GET", "POST"])
     def api_secret_code(self, request, uuid=None):
-        """On GET request - return service provider api_secret_code.
-        On POST - generate new service provider api_secret_code.
-        """
-        service_provider = self.get_object()
+        service_provider: models.ServiceProvider = self.get_object()
         if request.method == "GET":
             if not has_permission(
                 request,
@@ -184,188 +219,6 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
                 status=status.HTTP_200_OK,
             )
 
-    def get_customer_project_ids(self):
-        service_provider = self.get_object()
-        return utils.get_service_provider_project_ids(service_provider)
-
-    def get_customer_user_ids(self):
-        service_provider = self.get_object()
-        return utils.get_service_provider_user_ids(self.request.user, service_provider)
-
-    customers_permissions = [
-        permission_factory(
-            PermissionEnum.LIST_SERVICE_PROVIDER_CUSTOMERS,
-            ["customer"],
-        )
-    ]
-
-    @action(detail=True, methods=["GET"])
-    def customers(self, request, uuid=None):
-        service_provider = self.get_object()
-        customer_ids = utils.get_service_provider_customer_ids(service_provider)
-        customers = structure_models.Customer.objects.filter(id__in=customer_ids)
-        page = self.paginate_queryset(customers)
-        serializer = serializers.ProviderCustomerSerializer(
-            page,
-            many=True,
-            context={
-                "service_provider": service_provider,
-                **self.get_serializer_context(),
-            },
-        )
-        return self.get_paginated_response(serializer.data)
-
-    customer_projects_permissions = [
-        permission_factory(
-            PermissionEnum.LIST_SERVICE_PROVIDER_CUSTOMER_PROJECTS,
-            ["customer"],
-        )
-    ]
-
-    @action(detail=True, methods=["GET"])
-    def customer_projects(self, request, uuid=None):
-        service_provider = self.get_object()
-        customer_uuid = request.query_params.get("project_customer_uuid")
-        if not customer_uuid or not is_uuid_like(customer_uuid):
-            return self.get_paginated_response([])
-        project_ids = (
-            utils.get_service_provider_resources(service_provider)
-            .filter(project__customer__uuid=customer_uuid)
-            .values_list("project_id", flat=True)
-        )
-        projects = structure_models.Project.available_objects.filter(id__in=project_ids)
-        page = self.paginate_queryset(projects)
-        context = self.get_serializer_context()
-        context["service_provider"] = service_provider
-        serializer = serializers.ProviderCustomerProjectSerializer(
-            page, many=True, context=context
-        )
-        return self.get_paginated_response(serializer.data)
-
-    projects_permissions = [
-        permission_factory(
-            PermissionEnum.LIST_SERVICE_PROVIDER_PROJECTS,
-            ["customer"],
-        )
-    ]
-
-    @action(detail=True, methods=["GET"])
-    def projects(self, request, uuid=None):
-        project_ids = self.get_customer_project_ids()
-        projects = structure_models.Project.available_objects.filter(id__in=project_ids)
-        page = self.paginate_queryset(projects)
-        serializer = structure_serializers.ProjectSerializer(
-            page, many=True, context=self.get_serializer_context()
-        )
-        return self.get_paginated_response(serializer.data)
-
-    project_permissions_permissions = [
-        permission_factory(
-            PermissionEnum.LIST_SERVICE_PROVIDER_PROJECT_PERMISSIONS,
-            ["customer"],
-        )
-    ]
-
-    @action(detail=True, methods=["GET"])
-    def project_permissions(self, request, uuid=None):
-        project_ids = self.get_customer_project_ids()
-        content_type = ContentType.objects.get_for_model(structure_models.Project)
-        permissions = UserRole.objects.filter(
-            content_type=content_type,
-            object_id__in=project_ids,
-            is_active=True,
-            user__is_active=True,
-        )
-        page = self.paginate_queryset(permissions)
-        serializer = structure_serializers.ProjectPermissionLogSerializer(
-            page, many=True, context=self.get_serializer_context()
-        )
-        return self.get_paginated_response(serializer.data)
-
-    keys_permissions = [
-        permission_factory(
-            PermissionEnum.LIST_SERVICE_PROVIDER_KEYS,
-            ["customer"],
-        )
-    ]
-
-    @action(detail=True, methods=["GET"])
-    def keys(self, request, uuid=None):
-        user_ids = self.get_customer_user_ids()
-        keys = core_models.SshPublicKey.objects.filter(user_id__in=user_ids)
-        page = self.paginate_queryset(keys)
-        serializer = structure_serializers.SshKeySerializer(
-            page, many=True, context=self.get_serializer_context()
-        )
-        return self.get_paginated_response(serializer.data)
-
-    users_permissions = [
-        permission_factory(
-            PermissionEnum.LIST_SERVICE_PROVIDER_USERS,
-            ["customer"],
-        )
-    ]
-
-    @action(detail=True, methods=["GET"])
-    def users(self, request, uuid=None):
-        service_provider = self.get_object()
-        user_ids = self.get_customer_user_ids()
-        users = core_models.User.objects.filter(id__in=user_ids)
-        filtered_users = structure_filters.UserFilter(request.GET, queryset=users)
-        page = self.paginate_queryset(filtered_users.qs)
-        context = self.get_serializer_context()
-        context["service_provider"] = service_provider
-        serializer = serializers.DetailedProviderUserSerializer(
-            page, many=True, context=context
-        )
-        return self.get_paginated_response(serializer.data)
-
-    user_customers_permissions = [
-        permission_factory(
-            PermissionEnum.LIST_SERVICE_PROVIDER_USER_CUSTOMERS,
-            ["customer"],
-        )
-    ]
-
-    @action(detail=True, methods=["GET"])
-    def user_customers(self, request, uuid=None):
-        service_provider = self.get_object()
-        user_uuid = request.query_params.get("user_uuid")
-        if not user_uuid or not is_uuid_like(user_uuid):
-            self.paginate_queryset(structure_models.Customer.objects.none())
-            return self.get_paginated_response([])
-
-        try:
-            user = User.objects.get(uuid=user_uuid)
-        except User.DoesNotExist:
-            self.paginate_queryset(structure_models.Customer.objects.none())
-            return self.get_paginated_response([])
-
-        resources = utils.get_service_provider_resources(service_provider)
-        resource_projects = resources.values_list("project_id", flat=True)
-        connected_projects = get_connected_projects(user)
-
-        resource_customers = resources.values_list("project__customer_id", flat=True)
-        connected_customers = get_connected_customers(user)
-
-        valid_projects = resource_projects.intersection(connected_projects)
-        valid_customers = resource_customers.intersection(connected_customers)
-
-        project_customers = structure_models.Project.objects.filter(
-            id__in=valid_projects
-        ).values_list("customer_id", flat=True)
-
-        customers = structure_models.Customer.objects.filter(
-            id__in=project_customers.union(valid_customers)
-        )
-        page = self.paginate_queryset(customers)
-        context = self.get_serializer_context()
-        context["service_provider"] = service_provider
-        serializer = serializers.ProviderCustomerSerializer(
-            page, many=True, context=context
-        )
-        return self.get_paginated_response(serializer.data)
-
     def check_related_resources(request, view, obj=None):
         if obj and obj.has_active_offerings:
             raise rf_exceptions.ValidationError(
@@ -381,6 +234,9 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
         )
     ]
 
+    @extend_schema(
+        request=serializers.SetOfferingsUsernameSerializer,
+    )
     @action(detail=True, methods=["POST"])
     def set_offerings_username(self, request, uuid=None):
         serializer = self.get_serializer(data=request.data)
@@ -396,7 +252,7 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
 
         user_projects_ids = get_connected_projects(user)
         offering_ids = (
-            models.Resource.objects.exclude(state=models.Resource.States.TERMINATED)
+            models.Resource.objects.exclude(state=ResourceStates.TERMINATED)
             .filter(
                 project_id__in=user_projects_ids,
                 offering__customer=self.get_object().customer,
@@ -418,23 +274,6 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
 
     set_offerings_username_serializer_class = serializers.SetOfferingsUsernameSerializer
 
-    @action(detail=True, methods=["GET"])
-    def offerings(self, request, uuid=None):
-        service_provider = self.get_object()
-
-        offerings = models.Offering.objects.filter(
-            customer=service_provider.customer,
-            billable=True,
-            shared=True,
-        )
-
-        filtered_offerings = filters.OfferingFilter(request.GET, queryset=offerings)
-        page = self.paginate_queryset(filtered_offerings.qs)
-        serializer = serializers.ProviderOfferingSerializer(
-            page, many=True, context=self.get_serializer_context()
-        )
-        return self.get_paginated_response(serializer.data)
-
     stat_permissions = [
         permission_factory(
             PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
@@ -442,10 +281,14 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
         )
     ]
 
+    @extend_schema(
+        responses=serializers.ServiceProviderStatisticsSerializer,
+        filters=False,
+    )
     @action(detail=True, methods=["GET"])
     def stat(self, request, uuid=None):
         to_day = timezone.datetime.today().date()
-        service_provider = self.get_object()
+        service_provider: models.ServiceProvider = self.get_object()
 
         active_campaigns = promotions_models.Campaign.objects.filter(
             service_provider=service_provider,
@@ -458,7 +301,7 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
             models.Resource.objects.filter(
                 offering__customer=service_provider.customer,
             )
-            .exclude(state=models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .order_by()
             .values_list("project__customer", flat=True)
             .distinct()
@@ -467,13 +310,13 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
 
         active_resources = models.Resource.objects.filter(
             offering__customer=service_provider.customer,
-        ).exclude(state=models.Resource.States.TERMINATED)
+        ).exclude(state=ResourceStates.TERMINATED)
 
         active_and_paused_offerings = models.Offering.objects.filter(
             customer=service_provider.customer,
             billable=True,
             shared=True,
-            state__in=(models.Offering.States.ACTIVE, models.Offering.States.PAUSED),
+            state__in=(OfferingStates.ACTIVE, OfferingStates.PAUSED),
         ).count()
 
         content_type = ContentType.objects.get_for_model(support_models.Issue)
@@ -492,30 +335,30 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
 
         pending_orders = models.Order.objects.filter(
             offering__customer=service_provider.customer,
-            state=models.Order.States.PENDING_PROVIDER,
+            state=OrderStates.PENDING_PROVIDER,
         ).count()
 
         erred_resources = models.Resource.objects.filter(
             offering__customer=service_provider.customer,
-            state=models.Resource.States.ERRED,
+            state=ResourceStates.ERRED,
         ).count()
 
         return Response(
-            {
-                "active_campaigns": active_campaigns,
-                "current_customers": current_customers,
-                "customers_number_change": utils.count_customers_number_change(
+            dict(
+                active_campaigns=active_campaigns,
+                current_customers=current_customers,
+                customers_number_change=utils.count_customers_number_change(
                     service_provider
                 ),
-                "active_resources": active_resources.count(),
-                "resources_number_change": utils.count_resources_number_change(
+                active_resources=active_resources.count(),
+                resources_number_change=utils.count_resources_number_change(
                     service_provider
                 ),
-                "active_and_paused_offerings": active_and_paused_offerings,
-                "unresolved_tickets": unresolved_tickets,
-                "pending_orders": pending_orders,
-                "erred_resources": erred_resources,
-            },
+                active_and_paused_offerings=active_and_paused_offerings,
+                unresolved_tickets=unresolved_tickets,
+                pending_orders=pending_orders,
+                erred_resources=erred_resources,
+            ),
             status=status.HTTP_200_OK,
         )
 
@@ -526,10 +369,14 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
         )
     ]
 
+    @extend_schema(
+        responses=serializers.ServiceProviderRevenues(many=True),
+        filters=False,
+    )
     @action(detail=True, methods=["GET"])
     def revenue(self, request, uuid=None):
         start = month_start(timezone.datetime.today()) - relativedelta(years=1)
-        service_provider = self.get_object()
+        service_provider: models.ServiceProvider = self.get_object()
         customer = service_provider.customer
 
         data = (
@@ -554,11 +401,25 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
         )
     ]
 
+    @extend_schema(
+        responses=serializers.NameUUIDSerializer(many=True),
+        parameters=[
+            OpenApiParameter(
+                name="customer_name", type=str, location=OpenApiParameter.QUERY
+            ),
+        ],
+        filters=False,
+    )
     @action(detail=True, methods=["GET"])
     def robot_account_customers(self, request, uuid=None):
-        service_provider = self.get_object()
+        service_provider: models.ServiceProvider = self.get_object()
+        valid_states = [
+            RobotAccountStates.OK,
+            RobotAccountStates.REQUESTED_DELETION,
+        ]
         qs = models.RobotAccount.objects.filter(
-            resource__offering__customer=service_provider.customer
+            resource__offering__customer=service_provider.customer,
+            state__in=valid_states,
         )
         customer_name = request.query_params.get("customer_name")
         if customer_name:
@@ -568,7 +429,7 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
             id__in=customer_ids
         ).order_by("name")
         page = self.paginate_queryset(customers)
-        data = [{"name": row.name, "uuid": row.uuid} for row in page]
+        data = serializers.NameUUIDSerializer(page, many=True).data
         return self.get_paginated_response(data)
 
     robot_account_projects_permissions = [
@@ -578,11 +439,25 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
         )
     ]
 
+    @extend_schema(
+        responses=serializers.NameUUIDSerializer(many=True),
+        parameters=[
+            OpenApiParameter(
+                name="project_name", type=str, location=OpenApiParameter.QUERY
+            ),
+        ],
+        filters=False,
+    )
     @action(detail=True, methods=["GET"])
     def robot_account_projects(self, request, uuid=None):
-        service_provider = self.get_object()
+        service_provider: models.ServiceProvider = self.get_object()
+        valid_states = [
+            RobotAccountStates.OK,
+            RobotAccountStates.REQUESTED_DELETION,
+        ]
         qs = models.RobotAccount.objects.filter(
-            resource__offering__customer=service_provider.customer
+            resource__offering__customer=service_provider.customer,
+            state__in=valid_states,
         )
         project_name = request.query_params.get("project_name")
         if project_name:
@@ -592,13 +467,357 @@ class ServiceProviderViewSet(PublicViewsetMixin, BaseMarketplaceView):
             "name"
         )
         page = self.paginate_queryset(projects)
-        data = [{"name": row.name, "uuid": row.uuid} for row in page]
+        data = serializers.NameUUIDSerializer(page, many=True).data
         return self.get_paginated_response(data)
+
+
+SERVICE_PROVIDER_UUID = OpenApiParameter(
+    name="service_provider_uuid",
+    type=OpenApiTypes.UUID,
+    location=OpenApiParameter.PATH,
+)
+
+
+@extend_schema_view(
+    list=extend_schema(
+        description="Return customers of service provider.",
+        parameters=[SERVICE_PROVIDER_UUID],
+    )
+)
+class ServiceProviderCustomersViewSet(
+    mixins.ListModelMixin, rf_viewsets.GenericViewSet
+):
+    serializer_class = serializers.MarketplaceProviderCustomerSerializer
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = structure_filters.CustomerFilter
+    queryset = structure_models.Customer.objects.all()
+
+    def get_service_provider(self):
+        service_provider = models.ServiceProvider.objects.get(
+            uuid=self.kwargs["service_provider_uuid"]
+        )
+        if not has_permission(
+            self.request,
+            PermissionEnum.LIST_SERVICE_PROVIDER_CUSTOMERS,
+            service_provider.customer,
+        ):
+            raise PermissionDenied()
+        return service_provider
+
+    def get_queryset(self):
+        customer_ids = utils.get_service_provider_customer_ids(
+            self.get_service_provider()
+        )
+        return self.queryset.filter(id__in=customer_ids)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        return {
+            **context,
+            "service_provider": self.get_service_provider(),
+        }
+
+
+@extend_schema_view(
+    list=extend_schema(
+        description="Return customer projects of service provider.",
+        parameters=[SERVICE_PROVIDER_UUID],
+    )
+)
+class ServiceProviderCustomerProjectsViewSet(
+    mixins.ListModelMixin, rf_viewsets.GenericViewSet
+):
+    serializer_class = serializers.MarketplaceProviderCustomerProjectSerializer
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = structure_filters.ProjectFilter
+    queryset = structure_models.Project.available_objects.all()
+
+    def get_service_provider(self):
+        service_provider = models.ServiceProvider.objects.get(
+            uuid=self.kwargs["service_provider_uuid"]
+        )
+        if not has_permission(
+            self.request,
+            PermissionEnum.LIST_SERVICE_PROVIDER_CUSTOMER_PROJECTS,
+            service_provider.customer,
+        ):
+            raise PermissionDenied()
+        return service_provider
+
+    def get_queryset(self):
+        customer_uuid = self.request.query_params.get("project_customer_uuid")
+        if not customer_uuid or not is_uuid_like(customer_uuid):
+            return self.queryset.none()
+        project_ids = (
+            utils.get_service_provider_resources(self.get_service_provider())
+            .filter(project__customer__uuid=customer_uuid)
+            .values_list("project_id", flat=True)
+        )
+        return self.queryset.filter(id__in=project_ids)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        return {
+            **context,
+            "service_provider": self.get_service_provider(),
+        }
+
+
+@extend_schema_view(
+    list=extend_schema(
+        description="Return projects of service provider.",
+        parameters=[SERVICE_PROVIDER_UUID],
+    )
+)
+class ServiceProviderProjectsViewSet(mixins.ListModelMixin, rf_viewsets.GenericViewSet):
+    serializer_class = structure_serializers.ProjectSerializer
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = structure_filters.ProjectFilter
+    queryset = structure_models.Project.available_objects.all()
+
+    def get_service_provider(self):
+        service_provider = models.ServiceProvider.objects.get(
+            uuid=self.kwargs["service_provider_uuid"]
+        )
+        if not has_permission(
+            self.request,
+            PermissionEnum.LIST_SERVICE_PROVIDER_PROJECTS,
+            service_provider.customer,
+        ):
+            raise PermissionDenied()
+        return service_provider
+
+    def get_queryset(self):
+        project_ids = utils.get_service_provider_project_ids(
+            self.get_service_provider()
+        )
+        return self.queryset.filter(id__in=project_ids)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        return {
+            **context,
+            "service_provider": self.get_service_provider(),
+        }
+
+
+@extend_schema_view(
+    list=extend_schema(
+        description="Return project permissions of service provider.",
+        parameters=[SERVICE_PROVIDER_UUID],
+    )
+)
+class ServiceProviderProjectPermissionsViewSet(
+    mixins.ListModelMixin, rf_viewsets.GenericViewSet
+):
+    serializer_class = structure_serializers.ProjectPermissionLogSerializer
+    queryset = UserRole.objects.all()
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = UserPermissionFilter
+
+    def get_service_provider(self):
+        service_provider = models.ServiceProvider.objects.get(
+            uuid=self.kwargs["service_provider_uuid"]
+        )
+        if not has_permission(
+            self.request,
+            PermissionEnum.LIST_SERVICE_PROVIDER_PROJECT_PERMISSIONS,
+            service_provider.customer,
+        ):
+            raise PermissionDenied()
+        return service_provider
+
+    def get_queryset(self):
+        project_ids = utils.get_service_provider_project_ids(
+            self.get_service_provider()
+        )
+        content_type = ContentType.objects.get_for_model(structure_models.Project)
+        return self.queryset.filter(
+            content_type=content_type,
+            object_id__in=project_ids,
+            is_active=True,
+            user__is_active=True,
+        )
+
+
+@extend_schema_view(
+    list=extend_schema(
+        description="Return SSH keys of service provider.",
+        parameters=[SERVICE_PROVIDER_UUID],
+    )
+)
+class ServiceProviderKeysViewSet(mixins.ListModelMixin, rf_viewsets.GenericViewSet):
+    serializer_class = structure_serializers.SshKeySerializer
+    queryset = core_models.SshPublicKey.objects.all()
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = structure_filters.SshKeyFilter
+
+    def get_service_provider(self):
+        service_provider = models.ServiceProvider.objects.get(
+            uuid=self.kwargs["service_provider_uuid"]
+        )
+        if not has_permission(
+            self.request,
+            PermissionEnum.LIST_SERVICE_PROVIDER_KEYS,
+            service_provider.customer,
+        ):
+            raise PermissionDenied()
+        return service_provider
+
+    def get_queryset(self):
+        user_ids = utils.get_service_provider_user_ids(
+            self.request.user, self.get_service_provider()
+        )
+        return self.queryset.filter(user_id__in=user_ids)
+
+
+@extend_schema_view(
+    list=extend_schema(
+        description="Return users of service provider.",
+        parameters=[SERVICE_PROVIDER_UUID],
+    )
+)
+class ServiceProviderUsersViewSet(mixins.ListModelMixin, rf_viewsets.GenericViewSet):
+    serializer_class = serializers.MarketplaceServiceProviderUserSerializer
+    queryset = core_models.User.objects.all()
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = structure_filters.UserFilter
+
+    def get_service_provider(self):
+        service_provider = models.ServiceProvider.objects.get(
+            uuid=self.kwargs["service_provider_uuid"]
+        )
+        if not has_permission(
+            self.request,
+            PermissionEnum.LIST_SERVICE_PROVIDER_USERS,
+            service_provider.customer,
+        ):
+            raise PermissionDenied()
+        return service_provider
+
+    def get_queryset(self):
+        service_provider = self.get_service_provider()
+        user_ids = utils.get_service_provider_user_ids(
+            self.request.user, service_provider
+        )
+        return self.queryset.filter(id__in=user_ids)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        return {
+            **context,
+            "service_provider": self.get_service_provider(),
+        }
+
+
+@extend_schema_view(
+    list=extend_schema(
+        description="Return offerings of service provider.",
+        parameters=[SERVICE_PROVIDER_UUID],
+    )
+)
+class ServiceProviderOfferingsViewSet(
+    mixins.ListModelMixin, rf_viewsets.GenericViewSet
+):
+    serializer_class = serializers.ProviderOfferingSerializer
+    queryset = models.Offering.objects.all()
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.OfferingFilter
+
+    def get_service_provider(self):
+        return models.ServiceProvider.objects.get(
+            uuid=self.kwargs["service_provider_uuid"]
+        )
+
+    def get_queryset(self):
+        return self.queryset.filter(
+            customer=self.get_service_provider().customer,
+            billable=True,
+            shared=True,
+        )
+
+
+@extend_schema_view(
+    list=extend_schema(
+        description="""Return customers that have access role for a specified user within service provider's scope.
+
+        Checks for:
+        - Customers where user has direct permissions
+        - Customers with projects where user has project roles
+        - Customers related to service provider's resources
+
+        If user UUID is invalid or missing, returns empty list.""",
+        parameters=[
+            SERVICE_PROVIDER_UUID,
+            OpenApiParameter(
+                name="user_uuid",
+                type=OpenApiTypes.UUID,
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="UUID of user to get related customers for",
+            ),
+        ],
+    )
+)
+class ServiceProviderUserCustomersViewSet(
+    mixins.ListModelMixin, rf_viewsets.GenericViewSet
+):
+    serializer_class = serializers.MarketplaceProviderCustomerSerializer
+    queryset = structure_models.Customer.objects.all()
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = structure_filters.CustomerFilter
+
+    def get_service_provider(self):
+        service_provider = models.ServiceProvider.objects.get(
+            uuid=self.kwargs["service_provider_uuid"]
+        )
+        if not has_permission(
+            self.request,
+            PermissionEnum.LIST_SERVICE_PROVIDER_USER_CUSTOMERS,
+            service_provider.customer,
+        ):
+            raise PermissionDenied()
+        return service_provider
+
+    def get_queryset(self):
+        service_provider = self.get_service_provider()
+
+        user_uuid = self.request.query_params.get("user_uuid")
+        if not user_uuid or not is_uuid_like(user_uuid):
+            return self.queryset.none()
+
+        try:
+            user = User.objects.get(uuid=user_uuid)
+        except User.DoesNotExist:
+            return self.queryset.none()
+
+        resources = utils.get_service_provider_resources(service_provider)
+        resource_projects = resources.values_list("project_id", flat=True)
+        connected_projects = get_connected_projects(user)
+
+        resource_customers = resources.values_list("project__customer_id", flat=True)
+        connected_customers = get_connected_customers(user)
+
+        valid_projects = resource_projects.intersection(connected_projects)
+        valid_customers = resource_customers.intersection(connected_customers)
+
+        project_customers = structure_models.Project.objects.filter(
+            id__in=valid_projects
+        ).values_list("customer_id", flat=True)
+
+        return self.queryset.filter(id__in=project_customers.union(valid_customers))
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        return {
+            **context,
+            "service_provider": self.get_service_provider(),
+        }
 
 
 class CategoryViewSet(PublicViewsetMixin, EagerLoadMixin, core_views.ActionsViewSet):
     queryset = models.Category.objects.all()
-    serializer_class = serializers.CategorySerializer
+    serializer_class = serializers.MarketplaceCategorySerializer
     lookup_field = "uuid"
     filter_backends = (DjangoFilterBackend,)
     filterset_class = filters.CategoryFilter
@@ -632,16 +851,21 @@ class CategoryGroupViewSet(PublicViewsetMixin, core_views.ActionsViewSet):
     ) = [structure_permissions.is_staff]
 
 
-def can_update_offering(request, view, obj=None):
+def can_update_offering(request, view, obj: models.Offering = None):
     offering = obj
 
     if not offering:
         return
 
-    if offering.state == models.Offering.States.DRAFT:
-        if has_permission(
-            request, PermissionEnum.UPDATE_OFFERING, offering
-        ) or has_permission(request, PermissionEnum.UPDATE_OFFERING, offering.customer):
+    if offering.state == OfferingStates.DRAFT:
+        if any(
+            has_permission(request, PermissionEnum.UPDATE_OFFERING, scope)
+            for scope in (
+                offering,
+                offering.customer,
+                offering.customer.serviceprovider,
+            )
+        ):
             return
         else:
             raise rf_exceptions.PermissionDenied()
@@ -650,7 +874,7 @@ def can_update_offering(request, view, obj=None):
 
 
 def validate_offering_update(offering):
-    if offering.state == models.Offering.States.ARCHIVED:
+    if offering.state == OfferingStates.ARCHIVED:
         raise rf_exceptions.ValidationError(
             _("It is not possible to update archived offering.")
         )
@@ -660,6 +884,19 @@ def validate_offering_has_plans(offering):
     if not models.offering_has_plans(offering):
         raise rf_exceptions.ValidationError(
             _("Offering does not have any billing plans.")
+        )
+
+
+def validate_offering_username_generation_policy(offering):
+    service_provider_policy = utils.UsernameGenerationPolicy.SERVICE_PROVIDER.value
+    if (
+        offering.plugin_options.get("username_generation_policy")
+        == service_provider_policy
+    ):
+        raise rf_exceptions.ValidationError(
+            _(
+                f"Invalid generation policy service_provider_policy {service_provider_policy}"
+            )
         )
 
 
@@ -717,9 +954,9 @@ class ProviderOfferingViewSet(
                 models.Resource.objects.filter(
                     offering=OuterRef("pk"),
                     state__in=(
-                        models.Resource.States.OK,
-                        models.Resource.States.UPDATING,
-                        models.Resource.States.TERMINATING,
+                        ResourceStates.OK,
+                        ResourceStates.UPDATING,
+                        ResourceStates.TERMINATING,
                     ),
                 )
                 .order_by()
@@ -793,7 +1030,7 @@ class ProviderOfferingViewSet(
     ]
 
     def destroy(self, request, *args, **kwargs):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         serializer = serializers.ProviderOfferingSerializer(
             offering, many=False, context=self.get_serializer_context()
         )
@@ -803,7 +1040,7 @@ class ProviderOfferingViewSet(
                     {"detail": _("Offering was not deleted since it has resources.")},
                     status=status.HTTP_403_FORBIDDEN,
                 )
-            elif offering.state != models.Offering.States.DRAFT:
+            elif offering.state != OfferingStates.DRAFT:
                 return Response(
                     {
                         "detail": _(
@@ -819,30 +1056,93 @@ class ProviderOfferingViewSet(
                 )
         return super().destroy(request, *args, **kwargs)
 
+    @extend_schema(
+        request=None,
+        responses=serializers.DetailStateSerializer,
+    )
     @action(detail=True, methods=["post"])
     def activate(self, request, uuid=None):
         return self._update_state("activate")
 
+    @extend_schema(
+        request=None,
+        responses=serializers.DetailStateSerializer,
+    )
     @action(detail=True, methods=["post"])
     def draft(self, request, uuid=None):
         return self._update_state("draft")
 
+    @extend_schema(
+        responses=serializers.OrderDetailsSerializer(many=True), filters=True
+    )
+    @action(detail=True, methods=["get"], filter_backends=[])
+    def orders(self, request, uuid=None):
+        offering: models.Offering = self.get_object()
+        # Only allow staff, support and offering managers
+        if not (request.user.is_staff or request.user.is_support):
+            if not (
+                offering.has_user(request.user, OfferingRole.MANAGER)
+                or offering.customer.has_user(request.user, CustomerRole.OWNER)
+            ):
+                raise PermissionDenied()
+        queryset = models.Order.objects.filter(offering=offering)
+        filterset = filters.OrderFilter(request.query_params, queryset=queryset)
+        queryset = filterset.qs
+        # Paginate queryset
+        page = self.paginate_queryset(queryset)
+        serializer = serializers.OrderDetailsSerializer(
+            page, many=True, context=self.get_serializer_context()
+        )
+        return self.get_paginated_response(serializer.data)
+
+    @extend_schema(responses=serializers.OrderDetailsSerializer)
+    def order_detail(self, request, uuid=None, order_uuid=None):
+        offering: models.Offering = self.get_object()
+        if not (request.user.is_staff or request.user.is_support):
+            if not (
+                offering.has_user(request.user, OfferingRole.MANAGER)
+                or offering.customer.has_user(request.user, CustomerRole.OWNER)
+            ):
+                raise PermissionDenied()
+        try:
+            order = models.Order.objects.get(offering=offering, uuid=order_uuid)
+        except models.Order.DoesNotExist:
+            error_message = _("The order with uuid %s does not exist!" % order_uuid)
+            logger.error(error_message)
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = serializers.OrderDetailsSerializer(
+            order, context=self.get_serializer_context()
+        )
+        return Response(serializer.data)
+
+    @extend_schema(
+        responses=serializers.DetailStateSerializer,
+        request=serializers.OfferingPauseSerializer,
+    )
     @action(detail=True, methods=["post"])
     def pause(self, request, uuid=None):
         return self._update_state("pause", request)
 
     pause_serializer_class = serializers.OfferingPauseSerializer
 
+    @extend_schema(
+        request=None,
+        responses=serializers.DetailStateSerializer,
+    )
     @action(detail=True, methods=["post"])
     def unpause(self, request, uuid=None):
-        return self._update_state("unpause", request)
+        return self._update_state("unpause")
 
+    @extend_schema(
+        request=None,
+        responses=serializers.DetailStateSerializer,
+    )
     @action(detail=True, methods=["post"])
     def archive(self, request, uuid=None):
         return self._update_state("archive")
 
     def _update_state(self, action, request=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
 
         try:
             getattr(offering, action)()
@@ -855,7 +1155,7 @@ class ProviderOfferingViewSet(
                     offering, data=request.data, partial=True
                 )
                 serializer.is_valid(raise_exception=True)
-                offering = serializer.save()
+                offering: models.Offering = serializer.save()
 
             offering.save(update_fields=["state"])
             reversion.set_user(self.request.user)
@@ -873,21 +1173,21 @@ class ProviderOfferingViewSet(
     pause_permissions = [
         permission_factory(
             PermissionEnum.PAUSE_OFFERING,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
 
     unpause_permissions = [
         permission_factory(
             PermissionEnum.UNPAUSE_OFFERING,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
 
     archive_permissions = [
         permission_factory(
             PermissionEnum.ARCHIVE_OFFERING,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
 
@@ -913,9 +1213,15 @@ class ProviderOfferingViewSet(
 
         super().perform_create(serializer)
 
+    @extend_schema(
+        filters=False,
+        description="List importable resources for offering.",
+        request=None,
+        responses=serializers.ImportableResourceSerializer(many=True),
+    )
     @action(detail=True, methods=["get"])
     def importable_resources(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         method = plugins.manager.get_importable_resources_backend_method(offering.type)
         if (
             not method
@@ -949,6 +1255,10 @@ class ProviderOfferingViewSet(
 
     import_resource_serializer_class = serializers.ImportResourceSerializer
 
+    @extend_schema(
+        request=serializers.ImportResourceSerializer,
+        responses=serializers.ResourceSerializer,
+    )
     @action(detail=True, methods=["post"])
     def import_resource(self, request, uuid=None):
         import_resource_serializer = self.get_serializer(data=request.data)
@@ -958,7 +1268,7 @@ class ProviderOfferingViewSet(
         project = import_resource_serializer.validated_data["project"]
         backend_id = import_resource_serializer.validated_data["backend_id"]
 
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         backend = offering.scope.get_backend()
         method = plugins.manager.import_resource_backend_method(offering.type)
         if not method:
@@ -1012,9 +1322,14 @@ class ProviderOfferingViewSet(
 
         return Response(data=resource_serializer.data, status=status.HTTP_201_CREATED)
 
+    @extend_schema(
+        request=dict,
+        responses=None,
+        description="Update offering attributes.",
+    )
     @action(detail=True, methods=["post"])
     def update_attributes(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         if not isinstance(request.data, dict):
             raise rf_exceptions.ValidationError("Dictionary is expected.")
         validate_attributes(request.data, offering.category)
@@ -1028,18 +1343,22 @@ class ProviderOfferingViewSet(
     update_attributes_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_ATTRIBUTES,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
     update_attributes_validators = update_validators
 
     def _update_action(self, request):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         serializer = self.get_serializer(offering, data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(status=status.HTTP_200_OK)
 
+    @extend_schema(
+        request=serializers.OfferingLocationUpdateSerializer,
+        responses={200: None},
+    )
     @action(detail=True, methods=["post"])
     def update_location(self, request, uuid=None):
         return self._update_action(request)
@@ -1047,12 +1366,16 @@ class ProviderOfferingViewSet(
     update_location_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_LOCATION,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
     update_location_validators = update_validators
     update_location_serializer_class = serializers.OfferingLocationUpdateSerializer
 
+    @extend_schema(
+        request=serializers.OfferingDescriptionUpdateSerializer,
+        responses={200: None},
+    )
     @action(detail=True, methods=["post"])
     def update_description(self, request, uuid=None):
         return self._update_action(request)
@@ -1060,7 +1383,7 @@ class ProviderOfferingViewSet(
     update_description_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_DESCRIPTION,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
     update_description_validators = update_validators
@@ -1068,6 +1391,10 @@ class ProviderOfferingViewSet(
         serializers.OfferingDescriptionUpdateSerializer
     )
 
+    @extend_schema(
+        request=serializers.OfferingOverviewUpdateSerializer,
+        responses={200: None},
+    )
     @action(detail=True, methods=["post"])
     def update_overview(self, request, uuid=None):
         return self._update_action(request)
@@ -1076,6 +1403,10 @@ class ProviderOfferingViewSet(
     update_overview_validators = update_validators
     update_overview_serializer_class = serializers.OfferingOverviewUpdateSerializer
 
+    @extend_schema(
+        request=serializers.OfferingOptionsUpdateSerializer,
+        responses={200: None},
+    )
     @action(detail=True, methods=["post"])
     def update_options(self, request, uuid=None):
         return self._update_action(request)
@@ -1083,12 +1414,16 @@ class ProviderOfferingViewSet(
     update_options_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_OPTIONS,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
     update_options_validators = update_validators
     update_options_serializer_class = serializers.OfferingOptionsUpdateSerializer
 
+    @extend_schema(
+        request=serializers.OfferingResourceOptionsUpdateSerializer,
+        responses={200: None},
+    )
     @action(detail=True, methods=["post"])
     def update_resource_options(self, request, uuid=None):
         return self._update_action(request)
@@ -1096,7 +1431,7 @@ class ProviderOfferingViewSet(
     update_resource_options_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_OPTIONS,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
     update_resource_options_validators = update_validators
@@ -1104,6 +1439,10 @@ class ProviderOfferingViewSet(
         serializers.OfferingResourceOptionsUpdateSerializer
     )
 
+    @extend_schema(
+        request=serializers.OfferingIntegrationUpdateSerializer,
+        responses={200: None},
+    )
     @action(detail=True, methods=["post"])
     def update_integration(self, request, uuid=None):
         return self._update_action(request)
@@ -1111,7 +1450,7 @@ class ProviderOfferingViewSet(
     update_integration_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_INTEGRATION,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
     update_integration_validators = update_validators
@@ -1119,30 +1458,71 @@ class ProviderOfferingViewSet(
         serializers.OfferingIntegrationUpdateSerializer
     )
 
-    @action(detail=True, methods=["post"])
-    def update_thumbnail(self, request, uuid=None):
-        offering = self.get_object()
-        serializer = serializers.OfferingThumbnailSerializer(
-            instance=offering, data=request.data
-        )
+    def _update_media(
+        self, request: Request, serializer_class: type[Serializer]
+    ) -> Response:
+        """Helper for updating offering media."""
+        offering: models.Offering = self.get_object()
+        serializer = serializer_class(instance=offering, data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(status=status.HTTP_200_OK)
 
-    update_thumbnail_permissions = [permissions.user_can_update_thumbnail]
-
-    @action(detail=True, methods=["post"])
-    def delete_thumbnail(self, request, uuid=None):
-        offering = self.get_object()
-        offering.thumbnail.delete()
+    def _delete_media(self, media_field: str) -> Response:
+        """Helper for deleting offering media."""
+        offering: models.Offering = self.get_object()
+        getattr(offering, media_field).delete()
         offering.save()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-    delete_thumbnail_permissions = update_thumbnail_permissions
+    @extend_schema(
+        request=serializers.OfferingThumbnailSerializer,
+        description="Update offering thumbnail.",
+        responses={200: None},
+    )
+    @action(detail=True, methods=["post"])
+    def update_thumbnail(self, request, uuid=None):
+        return self._update_media(request, serializers.OfferingThumbnailSerializer)
 
+    @extend_schema(
+        request=None,
+        responses={204: None},
+        description="Delete offering thumbnail.",
+    )
+    @action(detail=True, methods=["post"])
+    def delete_thumbnail(self, request, uuid=None):
+        return self._delete_media("thumbnail")
+
+    @extend_schema(
+        request=serializers.OfferingImageSerializer,
+        description="Update offering image.",
+    )
+    @action(detail=True, methods=["post"])
+    def update_image(self, request, uuid=None):
+        return self._update_media(request, serializers.OfferingImageSerializer)
+
+    @extend_schema(
+        request=None,
+        responses={200: None},
+        description="Delete offering image.",
+    )
+    @action(detail=True, methods=["post"])
+    def delete_image(self, request, uuid=None):
+        return self._delete_media("image")
+
+    media_permissions = [permissions.user_can_update_thumbnail]
+    update_thumbnail_permissions = media_permissions
+    delete_thumbnail_permissions = media_permissions
+    update_image_permissions = media_permissions
+    delete_image_permissions = media_permissions
+
+    @extend_schema(
+        responses=serializers.ProviderOfferingCustomerSerializer(many=True),
+        description="Get customers for offering.",
+    )
     @action(detail=True)
     def customers(self, request, uuid):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         active_customers = utils.get_active_customers(request, self)
         customer_queryset = utils.get_offering_customers(offering, active_customers)
         serializer_class = serializers.ProviderOfferingCustomerSerializer
@@ -1155,7 +1535,7 @@ class ProviderOfferingViewSet(
     customers_permissions = [structure_permissions.is_owner]
 
     def get_stats(self, get_queryset, serializer, serializer_context=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         active_customers = utils.get_active_customers(self.request, self)
         start, end = utils.get_start_and_end_dates_from_request(self.request)
         invoice_items = invoice_models.InvoiceItem.objects.filter(
@@ -1171,15 +1551,58 @@ class ProviderOfferingViewSet(
         page = self.paginate_queryset(serializer.data)
         return self.get_paginated_response(page)
 
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="start",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Start date in format YYYY-MM.",
+            ),
+            OpenApiParameter(
+                name="end",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="End date in format YYYY-MM.",
+            ),
+            OpenApiParameter(
+                name="accounting_is_running",
+                type=bool,
+                location=OpenApiParameter.QUERY,
+            ),
+        ],
+        responses=serializers.ProviderOfferingCostsSerializer(many=True),
+        description="Get costs for offering.",
+    )
     @action(detail=True)
     def costs(self, *args, **kwargs):
-        return self.get_stats(utils.get_offering_costs, serializers.CostsSerializer)
+        return self.get_stats(
+            utils.get_offering_costs, serializers.ProviderOfferingCostsSerializer
+        )
 
     costs_permissions = [structure_permissions.is_owner]
 
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="start",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Start date in format YYYY-MM.",
+            ),
+            OpenApiParameter(
+                name="end",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="End date in format YYYY-MM.",
+            ),
+        ],
+        responses=serializers.OfferingComponentStatSerializer(many=True),
+        description="Get statistics for offering components.",
+    )
     @action(detail=True)
     def component_stats(self, *args, **kwargs):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         offering_components_map = {
             component.type: component for component in offering.components.all()
         }
@@ -1215,15 +1638,15 @@ class ProviderOfferingViewSet(
 
     @action(detail=True)
     def stats(self, *args, **kwargs):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         resources_count = (
             models.Resource.objects.filter(offering=offering)
-            .exclude(state=models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .count()
         )
         customers_count = (
             models.Resource.objects.filter(offering=offering)
-            .exclude(state=models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .values("project__customer")
             .distinct()
             .count()
@@ -1238,9 +1661,14 @@ class ProviderOfferingViewSet(
 
     stats_permissions = [structure_permissions.is_owner]
 
+    @extend_schema(
+        request=serializers.OrganizationGroupsSerializer,
+        description="Update organization groups for offering.",
+        responses={200: None},
+    )
     @action(detail=True, methods=["post"])
     def update_organization_groups(self, request, uuid):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         serializer = serializers.OrganizationGroupsSerializer(
             instance=offering, context={"request": request}, data=request.data
         )
@@ -1251,18 +1679,28 @@ class ProviderOfferingViewSet(
     update_organization_groups_permissions = [structure_permissions.is_owner]
     update_organization_groups_validators = update_validators
 
+    @extend_schema(
+        request=None,
+        responses=None,
+        description="Delete organization groups for offering.",
+    )
     @action(detail=True, methods=["post"])
     def delete_organization_groups(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         offering.organization_groups.clear()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     delete_organization_groups_permissions = update_organization_groups_permissions
     delete_organization_groups_validators = update_validators
 
+    @extend_schema(
+        request=serializers.NestedEndpointSerializer,
+        description="Add endpoint to offering.",
+        responses={201: serializers.EndpointUUIDSerializer},
+    )
     @action(detail=True, methods=["post"])
     def add_endpoint(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         endpoint = models.OfferingAccessEndpoint.objects.create(
@@ -1279,15 +1717,20 @@ class ProviderOfferingViewSet(
     add_endpoint_permissions = [
         permission_factory(
             PermissionEnum.ADD_OFFERING_ENDPOINT,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
     add_endpoint_serializer_class = serializers.NestedEndpointSerializer
     add_endpoint_validators = update_validators
 
+    @extend_schema(
+        request=serializers.EndpointUUIDSerializer,
+        responses={204: None},
+        description="Delete endpoint from offering.",
+    )
     @action(detail=True, methods=["post"])
     def delete_endpoint(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         offering.endpoints.filter(uuid=serializer.validated_data["uuid"]).delete()
@@ -1295,20 +1738,23 @@ class ProviderOfferingViewSet(
             status=status.HTTP_204_NO_CONTENT,
         )
 
-    delete_endpoint_serializer_class = serializers.EndpointDeleteSerializer
+    delete_endpoint_serializer_class = serializers.EndpointUUIDSerializer
     delete_endpoint_permissions = [
         permission_factory(
             PermissionEnum.DELETE_OFFERING_ENDPOINT,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
     delete_endpoint_validators = update_validators
 
+    @extend_schema(
+        responses=serializers.OfferingGroupsSerializer(many=True),
+    )
     @action(detail=False, permission_classes=[], filter_backends=[DjangoFilterBackend])
     def groups(self, *args, **kwargs):
         OFFERING_LIMIT = 4
         qs = self.filter_queryset(
-            self.get_queryset().filter(shared=True, state=models.Offering.States.ACTIVE)
+            self.get_queryset().filter(shared=True, state=OfferingStates.ACTIVE)
         )
         customer_ids = self.paginate_queryset(
             qs.order_by("customer__name")
@@ -1340,7 +1786,12 @@ class ProviderOfferingViewSet(
             ]
         )
 
-    @action(detail=True, methods=["GET"], renderer_classes=[PlainTextRenderer])
+    @extend_schema(request=None, responses=str, parameters=[])
+    @action(
+        detail=True,
+        methods=["GET"],
+        renderer_classes=[PlainTextRenderer],
+    )
     def glauth_users_config(self, request, uuid=None):
         """
         This endpoint provides a config file for GLauth
@@ -1348,9 +1799,8 @@ class ProviderOfferingViewSet(
         It is assumed that the config is used by an external agent,
         which synchronizes data from Waldur to GLauth
         """
-        offering = self.get_object()
-
-        if not offering.secret_options.get(
+        offering: models.Offering = self.get_object()
+        if not offering.plugin_options.get(
             "service_provider_can_create_offering_user", False
         ):
             logger.warning(
@@ -1368,6 +1818,7 @@ class ProviderOfferingViewSet(
             agent_type=models.IntegrationStatus.AgentTypes.GLAUTH_SYNC,
         )
         integration_status.set_last_request_timestamp()
+        integration_status.service_name = request.headers.get("User-Agent", "")
         integration_status.set_backend_active()
         integration_status.save()
 
@@ -1405,9 +1856,23 @@ class ProviderOfferingViewSet(
 
         return Response(response_text)
 
+    @extend_schema(
+        description="Check if user has access to offering.",
+        request=None,
+        parameters=[
+            OpenApiParameter(
+                name="username",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Username of the user to check.",
+                required=True,
+            ),
+        ],
+        filters=False,
+    )
     @action(detail=True, methods=["GET"])
     def user_has_resource_access(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         username = request.query_params.get("username")
         if username is None:
             raise rf_exceptions.ValidationError(
@@ -1428,9 +1893,13 @@ class ProviderOfferingViewSet(
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        request=serializers.OfferingComponentSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def update_offering_component(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
 
         component_to_update_uuid = request.data.get("uuid")
 
@@ -1458,14 +1927,18 @@ class ProviderOfferingViewSet(
     update_offering_component_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_COMPONENTS,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
     update_offering_component_validators = update_validators
 
+    @extend_schema(
+        request=serializers.RemoveOfferingComponentSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def remove_offering_component(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         resources_exist = models.Resource.objects.filter(offering=offering).exists()
 
         component_to_remove_uuid = request.data.get("uuid")
@@ -1513,18 +1986,21 @@ class ProviderOfferingViewSet(
         offering_component.delete()
         return Response(status=status.HTTP_200_OK)
 
-    remove_offering_component_serializer_class = serializers.OfferingComponentSerializer
     remove_offering_component_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_COMPONENTS,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
     remove_offering_component_validators = update_validators
 
+    @extend_schema(
+        request=serializers.OfferingComponentSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def create_offering_component(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         component_data = request.data
         serializer: serializers.OfferingComponentSerializer = self.get_serializer(
             data=component_data
@@ -1537,14 +2013,18 @@ class ProviderOfferingViewSet(
     create_offering_component_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_COMPONENTS,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
     create_offering_component_validators = update_validators
 
+    @extend_schema(
+        responses=None,
+        request=None,
+    )
     @action(detail=True, methods=["post"])
     def sync(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         if not offering.scope or not isinstance(
             offering.scope, structure_models.ServiceSettings
         ):
@@ -1558,8 +2038,8 @@ class ProviderOfferingViewSet(
                 data="Plugin does not support this operation.",
             )
         if offering.scope.state not in (
-            structure_models.ServiceSettings.States.OK,
-            structure_models.ServiceSettings.States.ERRED,
+            CoreStates.OK,
+            CoreStates.ERRED,
         ):
             return Response(
                 status=status.HTTP_400_BAD_REQUEST,
@@ -1575,13 +2055,17 @@ class ProviderOfferingViewSet(
     sync_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_COMPONENTS,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
 
+    @extend_schema(
+        request=serializers.OfferingBackendMetadataSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["POST"])
     def set_backend_metadata(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         offering_data = request.data
         serializer = self.get_serializer(offering, data=offering_data, partial=True)
         serializer.is_valid(raise_exception=True)
@@ -1599,49 +2083,168 @@ class ProviderOfferingViewSet(
     set_backend_metadata_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING,
-            ["*", "customer"],
+            ["*", "customer", "customer.serviceprovider"],
         )
     ]
 
+    @extend_schema(
+        request=None,
+        responses=structure_serializers.ProjectSerializer(many=True),
+        filters=False,
+    )
     @action(detail=True, methods=["GET"])
     def list_customer_projects(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         project_ids = (
             models.Resource.objects.filter(offering=offering)
-            .exclude(state=models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .values_list("project_id", flat=True)
         )
         projects = structure_models.Project.objects.filter(id__in=project_ids)
+        page = self.paginate_queryset(projects)
         serializer = structure_serializers.ProjectSerializer(
-            instance=projects, many=True, context={"request": request}
+            instance=page,
+            many=True,
+            context={"request": request},
         )
-        return Response(
-            status=status.HTTP_200_OK,
-            data=serializer.data,
-        )
+        return self.get_paginated_response(serializer.data)
 
+    @extend_schema(
+        responses=structure_serializers.UserSerializer(many=True),
+        request=None,
+        filters=False,
+    )
     @action(detail=True, methods=["GET"])
     def list_customer_users(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         project_ids = (
             models.Resource.objects.filter(offering=offering)
-            .exclude(state=models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .values_list("project_id", flat=True)
         )
         ctype = ContentType.objects.get_for_model(structure_models.Project)
         user_ids = get_user_ids(ctype, project_ids)
         users = core_models.User.objects.filter(id__in=user_ids)
+        page = self.paginate_queryset(users)
         serializer = structure_serializers.UserSerializer(
-            instance=users, many=True, context={"request": request}
+            instance=page,
+            many=True,
+            context={"request": request},
         )
-        return Response(
-            status=status.HTTP_200_OK,
-            data=serializer.data,
-        )
+        return self.get_paginated_response(serializer.data)
 
     list_customer_projects_permissions = list_customer_users_permissions = [
         structure_permissions.is_owner
     ]
+
+    @action(detail=True, methods=["post"])
+    def refresh_offering_usernames(self, request, uuid=None):
+        offering: models.Offering = self.get_object()
+        offering_users = models.OfferingUser.objects.filter(
+            is_restricted=False,
+            offering=offering,
+        )
+
+        for offering_user in offering_users:
+            new_username = utils.generate_username(
+                offering_user.user, offering_user.offering
+            )
+            if new_username != offering_user.username:
+                logger.info("Updating %s username to %s", offering_user, new_username)
+                offering_user.username = new_username
+                offering_user.save(update_fields=["username"])
+
+        return Response(
+            status=status.HTTP_200_OK,
+            data={"status": _("Offering user usernames have been changed.")},
+        )
+
+    refresh_offering_usernames_permissions = [
+        permission_factory(
+            PermissionEnum.UPDATE_OFFERING_INTEGRATION,
+            ["*", "customer", "customer.serviceprovider"],
+        )
+    ]
+    refresh_offering_usernames_validators = [
+        core_validators.StateValidator(OfferingStates.ACTIVE),
+        validate_offering_username_generation_policy,
+    ]
+
+    @action(detail=True, methods=["get"])
+    def list_customer_service_accounts(self, request, uuid=None):
+        offering: models.Offering = self.get_object()
+        project_ids = (
+            models.Resource.objects.filter(
+                offering=offering,
+            )
+            .exclude(state=models.Resource.States.TERMINATED)
+            .values_list("project_id", flat=True)
+            .distinct()
+        )
+        customer_ids = (
+            structure_models.Project.objects.filter(
+                id__in=project_ids,
+            )
+            .values_list("customer_id", flat=True)
+            .distinct()
+        )
+        service_accounts = models.CustomerServiceAccount.objects.filter(
+            customer_id__in=customer_ids,
+        )
+        page = self.paginate_queryset(service_accounts)
+        serializer = serializers.CustomerServiceAccountSerializer(
+            instance=page,
+            many=True,
+            context={"request": request},
+        )
+        return self.get_paginated_response(serializer.data)
+
+    @action(detail=True, methods=["get"])
+    def list_project_service_accounts(self, request, uuid=None):
+        offering: models.Offering = self.get_object()
+        project_ids = (
+            models.Resource.objects.filter(
+                offering=offering,
+            )
+            .exclude(state=models.Resource.States.TERMINATED)
+            .values_list("project_id", flat=True)
+            .distinct()
+        )
+        service_accounts = models.ProjectServiceAccount.objects.filter(
+            project_id__in=project_ids,
+        )
+        page = self.paginate_queryset(service_accounts)
+        serializer = serializers.ProjectServiceAccountSerializer(
+            instance=page,
+            many=True,
+            context={"request": request},
+        )
+        return self.get_paginated_response(serializer.data)
+
+    @extend_schema(
+        request=serializers.MoveOfferingSerializer,
+        responses=serializers.PublicOfferingDetailsSerializer,
+    )
+    @action(detail=True, methods=["post"])
+    def move_offering(self, request, uuid=None):
+        offering = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        target_customer = serializer.validated_data["customer"]
+        preserve_permissions = serializer.validated_data["preserve_permissions"]
+
+        utils.move_offering(
+            offering, target_customer, request.user, preserve_permissions
+        )
+        serialized_offering = serializers.PublicOfferingDetailsSerializer(
+            offering, context={"view": self, "request": request}
+        )
+
+        return Response(serialized_offering.data, status=status.HTTP_200_OK)
+
+    move_offering_serializer_class = serializers.MoveOfferingSerializer
+    move_offering_permissions = [structure_permissions.is_staff]
 
 
 class PublicOfferingViewSet(rf_viewsets.ReadOnlyModelViewSet):
@@ -1655,9 +2258,13 @@ class PublicOfferingViewSet(rf_viewsets.ReadOnlyModelViewSet):
         user = self.request.user
         return self.queryset.filter_by_ordering_availability_for_user(user)
 
-    @action(detail=True, methods=["get"])
+    @extend_schema(
+        responses=serializers.BasePublicPlanSerializer(many=True),
+        filters=False,
+    )
+    @action(detail=True, methods=["get"], filter_backends=[], pagination_class=None)
     def plans(self, request, uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
         return Response(
             serializers.PublicOfferingDetailsSerializer(
                 context=self.get_serializer_context()
@@ -1665,8 +2272,9 @@ class PublicOfferingViewSet(rf_viewsets.ReadOnlyModelViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(responses=serializers.BasePublicPlanSerializer)
     def plan_detail(self, request, uuid=None, plan_uuid=None):
-        offering = self.get_object()
+        offering: models.Offering = self.get_object()
 
         try:
             plan = utils.get_plans_available_for_user(
@@ -1774,7 +2382,7 @@ class PlanUsageReporter:
             plans = self.apply_filters(query, plans)
 
         resources = models.Resource.objects.filter(plan_id=OuterRef("pk")).exclude(
-            state=models.Resource.States.TERMINATED
+            state=ResourceStates.TERMINATED
         )
         remaining = ExpressionWrapper(
             F("limit") - F("usage"), output_field=PositiveSmallIntegerField()
@@ -1854,6 +2462,10 @@ class ProviderPlanViewSet(core_views.UpdateReversionMixin, core_views.ActionsVie
         )
     ]
 
+    @extend_schema(
+        request=serializers.PricesUpdateSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def update_prices(self, request, uuid):
         plan: models.Plan = self.get_object()
@@ -1867,6 +2479,10 @@ class ProviderPlanViewSet(core_views.UpdateReversionMixin, core_views.ActionsVie
     update_prices_permissions = update_permissions
     update_prices_validators = [can_manage_plan]
 
+    @extend_schema(
+        request=serializers.QuotasUpdateSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def update_quotas(self, request, uuid):
         plan: models.Plan = self.get_object()
@@ -1889,9 +2505,13 @@ class ProviderPlanViewSet(core_views.UpdateReversionMixin, core_views.ActionsVie
 
     archive_validators = [validate_plan_archive]
 
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def archive(self, request, uuid=None):
-        plan = self.get_object()
+        plan: models.Plan = self.get_object()
         with reversion.create_revision():
             plan.archived = True
             plan.save(update_fields=["archived"])
@@ -1901,13 +2521,29 @@ class ProviderPlanViewSet(core_views.UpdateReversionMixin, core_views.ActionsVie
             {"detail": _("Plan has been archived.")}, status=status.HTTP_200_OK
         )
 
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="offering_uuid", type=str, location=OpenApiParameter.QUERY
+            ),
+            OpenApiParameter(
+                name="customer_provider_uuid", type=str, location=OpenApiParameter.QUERY
+            ),
+            OpenApiParameter(name="o", type=str, location=OpenApiParameter.QUERY),
+        ],
+        responses=serializers.PlanUsageResponseSerializer(many=True),
+    )
     @action(detail=False)
     def usage_stats(self, request):
         return PlanUsageReporter(self, request).get_report()
 
+    @extend_schema(
+        request=serializers.OrganizationGroupsSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def update_organization_groups(self, request, uuid):
-        plan = self.get_object()
+        plan: models.Plan = self.get_object()
         serializer = serializers.OrganizationGroupsSerializer(
             instance=plan, context={"request": request}, data=request.data
         )
@@ -1917,9 +2553,13 @@ class ProviderPlanViewSet(core_views.UpdateReversionMixin, core_views.ActionsVie
 
     update_organization_groups_permissions = update_permissions
 
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def delete_organization_groups(self, request, uuid=None):
-        plan = self.get_object()
+        plan: models.Plan = self.get_object()
         plan.organization_groups.clear()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -1930,7 +2570,7 @@ class PlanComponentViewSet(PublicViewsetMixin, rf_viewsets.ReadOnlyModelViewSet)
     queryset = models.PlanComponent.objects.filter()
     serializer_class = serializers.PlanComponentSerializer
     filterset_class = filters.PlanComponentFilter
-    lookup_field = "uuid"
+    lookup_field = "pk"
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1972,6 +2612,7 @@ class PluginViewSet(views.APIView):
     permission_classes = ()
     authentication_classes = ()
 
+    @extend_schema(responses={200: serializers.PluginOfferingTypeSerializer(many=True)})
     def get(self, request):
         offering_types = plugins.manager.get_offering_types()
         payload = []
@@ -2043,7 +2684,9 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
     approve_by_consumer_validators = [
         structure_utils.check_customer_blocked_or_archived,
         structure_utils.check_project_end_date,
-        core_validators.StateValidator(models.Order.States.PENDING_CONSUMER),
+        core_validators.StateValidator(
+            OrderStates.PENDING_CONSUMER, state_enum=OrderStates
+        ),
     ]
 
     approve_by_consumer_permissions = [
@@ -2057,14 +2700,30 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         utils.refresh_integration_agent_status(
             request, models.IntegrationStatus.AgentTypes.ORDER_PROCESSING
         )
+        utils.refresh_integration_agent_status(
+            request, models.IntegrationStatus.AgentTypes.EVENT_PROCESSING
+        )
         return super().list(request, *args, **kwargs)
 
+    def retrieve(self, request, *args, **kwargs):
+        utils.refresh_integration_agent_status(
+            request, models.IntegrationStatus.AgentTypes.ORDER_PROCESSING
+        )
+        utils.refresh_integration_agent_status(
+            request, models.IntegrationStatus.AgentTypes.EVENT_PROCESSING
+        )
+        return super().retrieve(request, *args, **kwargs)
+
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def approve_by_consumer(self, request, uuid=None):
         order: models.Order = self.get_object()
         order.review_by_consumer(request.user)
         if order.project.start_date and order.project.start_date > timezone.now():
-            order.state = models.Order.States.PENDING_PROJECT
+            order.state = OrderStates.PENDING_PROJECT
             order.save(update_fields=["state"])
             return Response(status=status.HTTP_200_OK)
         if utils.order_should_not_be_reviewed_by_provider(order):
@@ -2078,7 +2737,7 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
             )
             tasks.process_order_on_commit(order, request.user)
         else:
-            order.state = models.Order.States.PENDING_PROVIDER
+            order.state = OrderStates.PENDING_PROVIDER
             order.save(update_fields=["state"])
             transaction.on_commit(
                 lambda: tasks.notify_provider_about_pending_order.delay(order.uuid)
@@ -2087,7 +2746,9 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
 
     approve_by_provider_validators = [
         structure_utils.check_customer_blocked_or_archived,
-        core_validators.StateValidator(models.Order.States.PENDING_PROVIDER),
+        core_validators.StateValidator(
+            OrderStates.PENDING_PROVIDER, state_enum=OrderStates
+        ),
     ]
 
     approve_by_provider_permissions = [
@@ -2097,6 +2758,10 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         )
     ]
 
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def approve_by_provider(self, request, uuid=None):
         order: models.Order = self.get_object()
@@ -2114,11 +2779,17 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
 
     reject_by_consumer_validators = [
         structure_utils.check_customer_blocked_or_archived,
-        core_validators.StateValidator(models.Order.States.PENDING_CONSUMER),
+        core_validators.StateValidator(
+            OrderStates.PENDING_CONSUMER, state_enum=OrderStates
+        ),
     ]
 
     reject_by_consumer_permissions = [permissions.user_can_reject_order_as_consumer]
 
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def reject_by_consumer(self, request, uuid=None):
         order: models.Order = self.get_object()
@@ -2137,7 +2808,9 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
 
     reject_by_provider_validators = [
         structure_utils.check_customer_blocked_or_archived,
-        core_validators.StateValidator(models.Order.States.PENDING_PROVIDER),
+        core_validators.StateValidator(
+            OrderStates.PENDING_PROVIDER, state_enum=OrderStates
+        ),
     ]
 
     reject_by_provider_permissions = [
@@ -2147,6 +2820,10 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         )
     ]
 
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def reject_by_provider(self, request, uuid=None):
         order: models.Order = self.get_object()
@@ -2164,13 +2841,18 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
 
     cancel_validators = [
         core_validators.StateValidator(
-            models.Order.States.PENDING_CONSUMER,
-            models.Order.States.PENDING_PROVIDER,
-            models.Order.States.EXECUTING,
+            OrderStates.PENDING_CONSUMER,
+            OrderStates.PENDING_PROVIDER,
+            OrderStates.EXECUTING,
+            state_enum=OrderStates,
         ),
         OfferingTypeValidator(BASIC_PLUGIN_NAME, SUPPORT_PLUGIN_NAME),
     ]
 
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def cancel(self, request, uuid=None):
         order: models.Order = self.get_object()
@@ -2180,9 +2862,10 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
 
     set_state_executing_validators = [
         core_validators.StateValidator(
-            models.Order.States.PENDING_CONSUMER,
-            models.Order.States.PENDING_PROVIDER,
-            models.Order.States.ERRED,
+            OrderStates.PENDING_CONSUMER,
+            OrderStates.PENDING_PROVIDER,
+            OrderStates.ERRED,
+            state_enum=OrderStates,
         ),
         OfferingTypeValidator(SLURM_REMOTE_PLUGIN_NAME),
     ]
@@ -2194,6 +2877,10 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         )
     ]
 
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def set_state_executing(self, request, uuid=None):
         order: models.Order = self.get_object()
@@ -2203,7 +2890,8 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
 
     set_state_done_validators = [
         core_validators.StateValidator(
-            models.Order.States.EXECUTING,
+            OrderStates.EXECUTING,
+            state_enum=OrderStates,
         ),
         OfferingTypeValidator(
             SLURM_REMOTE_PLUGIN_NAME, BASIC_PLUGIN_NAME, SUPPORT_PLUGIN_NAME
@@ -2217,10 +2905,14 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         )
     ]
 
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def set_state_done(self, request, uuid=None):
         order: models.Order = self.get_object()
-        callbacks.sync_order_state(order, models.Order.States.DONE)
+        callbacks.sync_order_state(order, OrderStates.DONE)
         return Response(status=status.HTTP_200_OK)
 
     set_state_erred_validators = [
@@ -2234,6 +2926,10 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         )
     ]
 
+    @extend_schema(
+        request=serializers.OrderSetStateErredSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def set_state_erred(self, request, uuid=None):
         order: models.Order = self.get_object()
@@ -2243,7 +2939,7 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         error_message = serializer.validated_data["error_message"]
         error_traceback = serializer.validated_data["error_traceback"]
 
-        callbacks.sync_order_state(order, models.Order.States.ERRED)
+        callbacks.sync_order_state(order, OrderStates.ERRED)
         order.error_message = error_message
         order.error_traceback = error_traceback
         order.save(update_fields=["error_message", "error_traceback"])
@@ -2260,17 +2956,22 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
 
     destroy_validators = [
         core_validators.StateValidator(
-            models.Order.States.PENDING_CONSUMER,
-            models.Order.States.PENDING_PROVIDER,
+            OrderStates.PENDING_CONSUMER,
+            OrderStates.PENDING_PROVIDER,
+            state_enum=OrderStates,
         ),
         structure_utils.check_customer_blocked_or_archived,
     ]
 
+    @extend_schema(
+        request=None,
+        responses={403: None, 204: None},
+    )
     @action(detail=True, methods=["post"])
     def unlink(self, request, uuid=None):
         if not request.user.is_staff:
             raise PermissionDenied()
-        obj = self.get_object()
+        obj: models.Order = self.get_object()
         logger.info("Starting unlink for order %s", obj.uuid)
         log.log_order_unlink(obj)
         try:
@@ -2284,7 +2985,7 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
 
 
 class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
-    queryset: ResourceQuerySet = models.Resource.objects.all()
+    queryset = models.Resource.objects.all()
     filter_backends = (DjangoFilterBackend, filters.ResourceScopeFilterBackend)
     filterset_class = filters.ResourceFilter
     lookup_field = "uuid"
@@ -2298,22 +2999,49 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
         utils.refresh_integration_agent_status(
             request, models.IntegrationStatus.AgentTypes.USAGE_REPORTING
         )
+        utils.refresh_integration_agent_status(
+            request, models.IntegrationStatus.AgentTypes.RESOURCE_SYNC
+        )
+        utils.refresh_integration_agent_status(
+            request, models.IntegrationStatus.AgentTypes.EVENT_PROCESSING
+        )
         return super().list(request, *args, **kwargs)
 
+    def retrieve(self, request, *args, **kwargs):
+        utils.refresh_integration_agent_status(
+            request, models.IntegrationStatus.AgentTypes.RESOURCE_SYNC
+        )
+        utils.refresh_integration_agent_status(
+            request, models.IntegrationStatus.AgentTypes.EVENT_PROCESSING
+        )
+        return super().retrieve(request, *args, **kwargs)
+
+    @extend_schema(
+        filters=False,
+    )
     @action(detail=True, methods=["get"])
     def details(self, request, uuid=None):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
         if not resource.scope:
             return Response(status=status.HTTP_404_NOT_FOUND)
+        if isinstance(resource.scope, models.Resource):
+            serializer = serializers.ResourceSerializer(
+                instance=resource.scope, context=self.get_serializer_context()
+            )
+            return Response(serializer.data, status=status.HTTP_200_OK)
         resource_type = get_resource_type(resource.scope)
         serializer_class = get_resource_serializer_class(resource_type)
         if not serializer_class:
-            return Response(status.HTTP_204_NO_CONTENT)
+            return Response(status=status.HTTP_204_NO_CONTENT)
         serializer = serializer_class(
             instance=resource.scope, context=self.get_serializer_context()
         )
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        request=None,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def unlink(self, request, uuid=None):
         """
@@ -2321,7 +3049,7 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
         and without checking current state of the resource. It is intended to be used
         for removing resource stuck in transitioning state.
         """
-        obj = self.get_object()
+        obj: models.Resource = self.get_object()
         log.log_resource_unlink(obj)
         logger.info("Starting unlink for resource %s", obj.uuid)
         try:
@@ -2354,6 +3082,10 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
 
         return Response({"order_uuid": order.uuid.hex}, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        responses=serializers.OrderUUIDSerializer,
+        description="Create marketplace order for resource termination.",
+    )
     @action(detail=True, methods=["post"])
     def terminate(self, request, uuid=None):
         resource: models.Resource = self.get_object()
@@ -2374,22 +3106,30 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
     terminate_permissions = [permissions.user_can_terminate_resource]
 
     terminate_validators = [
-        core_validators.StateValidator(
-            models.Resource.States.OK, models.Resource.States.ERRED
-        ),
+        core_validators.StateValidator(ResourceStates.OK, ResourceStates.ERRED),
     ]
 
-    @action(detail=True, methods=["get"])
+    @extend_schema(
+        request=None,
+        responses=serializers.ResourcePlanPeriodSerializer(many=True),
+        filters=False,
+    )
+    @action(detail=True, methods=["get"], pagination_class=None)
     def plan_periods(self, request, uuid=None):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
         qs = models.ResourcePlanPeriod.objects.filter(resource=resource)
         qs = qs.filter(Q(end=None) | Q(end__gte=month_start(timezone.now())))
         serializer = serializers.ResourcePlanPeriodSerializer(qs, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        description="Move resource to another project.",
+        request=serializers.MoveResourceSerializer,
+        responses={status.HTTP_200_OK: serializers.ResourceSerializer},
+    )
     @action(detail=True, methods=["post"])
     def move_resource(self, request, uuid=None):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         project = serializer.validated_data["project"]
@@ -2408,9 +3148,14 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
     move_resource_serializer_class = serializers.MoveResourceSerializer
     move_resource_permissions = [structure_permissions.is_staff]
 
+    @extend_schema(
+        description="Set slug for resource.",
+        request=serializers.ResourceSlugSerializer,
+        responses={status.HTTP_200_OK: None},
+    )
     @action(detail=True, methods=["post"])
     def set_slug(self, request, uuid=None):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         new_slug = serializer.validated_data["slug"]
@@ -2440,7 +3185,7 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
     set_slug_serializer_class = serializers.ResourceSlugSerializer
 
     def _set_end_date(self, request, is_staff_action):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
         serializer = serializers.ResourceEndDateByProviderSerializer(
             data=request.data, instance=resource, context={"request": request}
         )
@@ -2463,19 +3208,39 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
 
         return Response(status=status.HTTP_200_OK)
 
+    @extend_schema(
+        description="Set end date of the resource by staff.",
+        request=serializers.ResourceEndDateByProviderSerializer,
+        responses={status.HTTP_200_OK: None},
+    )
     @action(detail=True, methods=["post"])
     def set_end_date_by_staff(self, request, uuid=None):
         return self._set_end_date(request, True)
 
     set_end_date_by_staff_permissions = [structure_permissions.is_staff]
 
-    @action(detail=True, methods=["get"], renderer_classes=[PlainTextRenderer])
+    @extend_schema(
+        description="""
+        This endpoint provides a config file for GLauth.
+        Example: https://github.com/glauth/glauth/blob/master/v2/sample-simple.cfg
+        It is assumed that the config is used by an external agent,
+        which synchronizes data from Waldur to GLauth.
+        """,
+        request=None,
+        responses={status.HTTP_200_OK: str},
+        parameters=[],
+    )
+    @action(
+        detail=True,
+        methods=["get"],
+        renderer_classes=[PlainTextRenderer],
+    )
     def glauth_users_config(self, request, uuid=None):
         resource: models.Resource = self.get_object()
         project = resource.project
         offering = resource.offering
 
-        if not offering.secret_options.get(
+        if not offering.plugin_options.get(
             "service_provider_can_create_offering_user", False
         ):
             logger.warning(
@@ -2493,6 +3258,7 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
             agent_type=models.IntegrationStatus.AgentTypes.GLAUTH_SYNC,
         )
         integration_status.set_last_request_timestamp()
+        integration_status.service_name = request.headers.get("User-Agent", "")
         integration_status.set_backend_active()
         integration_status.save()
 
@@ -2533,9 +3299,12 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
 
         return Response(response_text)
 
-    @action(detail=True, methods=["get"])
+    @extend_schema(
+        filters=False, responses=serializers.SubresourceOfferingSerializer(many=True)
+    )
+    @action(detail=True, methods=["get"], pagination_class=None)
     def offering_for_subresources(self, request, uuid=None):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
 
         try:
             scope = structure_models.ServiceSettings.objects.get(
@@ -2550,9 +3319,15 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
         ]
         return Response(result)
 
-    @action(detail=True, methods=["get"])
+    @extend_schema(
+        description="Return users connected to the project.",
+        request=None,
+        responses=serializers.ProjectUserSerializer(many=True),
+        filters=False,
+    )
+    @action(detail=True, methods=["get"], filter_backends=[], pagination_class=None)
     def team(self, request, uuid=None):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
         project = resource.project
 
         return Response(
@@ -2571,7 +3346,8 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
 
 class ConsumerResourceViewSet(BaseResourceViewSet):
     def get_queryset(self):
-        return self.queryset.filter_for_service_consumer(self.request.user)
+        queryset = self.queryset.filter_for_service_consumer(self.request.user)
+        return filter_queryset_by_user_ip(queryset, self.request)
 
     @action(detail=False, methods=["post"])
     def suggest_name(self, request, *args, **kwargs):
@@ -2579,20 +3355,14 @@ class ConsumerResourceViewSet(BaseResourceViewSet):
         serializer.is_valid(raise_exception=True)
         project: structure_models.Project = serializer.validated_data["project"]
         offering: models.Offering = serializer.validated_data["offering"]
-        resource_count = models.Resource.objects.filter(
-            project=project, offering=offering
-        ).count()
-        parts = [
-            project.customer.slug,
-            project.slug,
-            offering.slug,
-        ]
-        result = "-".join(parts) + "-" + str(resource_count + 1)
-        result = remove_duplicate_hyphens(result)
-        return Response({"name": result})
+        return Response({"name": utils.generate_resource_name(project, offering)})
 
     suggest_name_serializer_class = serializers.ResourceSuggestNameSerializer
 
+    @extend_schema(
+        responses=serializers.OrderUUIDSerializer,
+        description="Create marketplace order for resource plan switch.",
+    )
     @action(detail=True, methods=["post"])
     def switch_plan(self, request, uuid=None):
         resource = self.get_object()
@@ -2612,6 +3382,10 @@ class ConsumerResourceViewSet(BaseResourceViewSet):
 
     switch_plan_serializer_class = serializers.ResourceSwitchPlanSerializer
 
+    @extend_schema(
+        responses=serializers.OrderUUIDSerializer,
+        description="Create marketplace order for resource limits update.",
+    )
     @action(detail=True, methods=["post"])
     def update_limits(self, request, uuid=None):
         resource = self.get_object()
@@ -2651,7 +3425,7 @@ class ConsumerResourceViewSet(BaseResourceViewSet):
     ]
 
     switch_plan_validators = update_limits_validators = [
-        core_validators.StateValidator(models.Resource.States.OK),
+        core_validators.StateValidator(ResourceStates.OK),
     ]
 
     @action(detail=True, methods=["post"])
@@ -2678,6 +3452,7 @@ class ProviderResourceViewSet(BaseResourceViewSet):
     def get_queryset(self):
         return self.queryset.filter_for_service_provider(self.request.user)
 
+    @extend_schema(request=serializers.ResourceEndDateByProviderSerializer)
     @action(detail=True, methods=["post"])
     def set_end_date_by_provider(self, request, uuid=None):
         return self._set_end_date(request, False)
@@ -2793,18 +3568,26 @@ class ProviderResourceViewSet(BaseResourceViewSet):
 
     set_as_erred_serializer_class = serializers.ResourceSetStateErredSerializer
 
+    @extend_schema(
+        request=None,
+        responses={status.HTTP_200_OK: None},
+        description="Set the resource as OK.",
+    )
     @action(detail=True, methods=["post"])
     def set_as_ok(self, request, uuid=None):
         resource = self.get_object()
 
-        resource.set_state_ok()
-        resource.error_message = ""
-        resource.error_traceback = ""
-        resource.save()
+        if resource.state == ResourceStates.OK:
+            logger.warning("Resource %s is already in OK state", resource)
+        else:
+            resource.set_state_ok()
+            resource.error_message = ""
+            resource.error_traceback = ""
+            resource.save()
 
-        if resource.scope and hasattr(resource.scope, "set_ok"):
-            resource.scope.set_ok()
-            resource.scope.save()
+            if resource.scope and hasattr(resource.scope, "set_ok"):
+                resource.scope.set_ok()
+                resource.scope.save()
 
         return Response(status=status.HTTP_200_OK)
 
@@ -2815,11 +3598,60 @@ class ProviderResourceViewSet(BaseResourceViewSet):
         )
     ]
 
+    @extend_schema(
+        request=None,
+        responses={status.HTTP_200_OK: None},
+        description="Refresh the last sync time for a resource.",
+    )
     @action(detail=True, methods=["post"])
     def refresh_last_sync(self, request, uuid=None):
         resource = self.get_object()
         resource.last_sync = timezone.now()
         resource.save(update_fields=["last_sync"])
+        return Response(status=status.HTTP_200_OK)
+
+    refresh_last_sync_permissions = [
+        permission_factory(
+            PermissionEnum.SET_RESOURCE_STATE,
+            ["offering.customer"],
+        )
+    ]
+
+    @action(detail=True, methods=["post"])
+    def set_limits(self, request, uuid=None):
+        resource = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        new_limits = serializer.validated_data["limits"]
+
+        limit_based_components = resource.offering.components.filter(
+            billing_type=models.OfferingComponent.BillingTypes.LIMIT
+        )
+        for component in limit_based_components:
+            if (
+                component.type in resource.limits
+                and component.type in new_limits
+                and new_limits[component.type] != resource.limits[component.type]
+            ) or (
+                component.type not in resource.limits and component.type in new_limits
+            ):
+                logger.warning(
+                    "Limit of the limit based component %s has been changed for resource %s from %s to %s",
+                    component.type,
+                    resource,
+                    resource.limits[component.type],
+                    new_limits[component.type],
+                )
+
+        resource.limits = new_limits
+        resource.save(update_fields=["limits"])
+
+        return Response(
+            {"status": _("The resource limits are updated")}, status=status.HTTP_200_OK
+        )
+
+    set_limits_serializer_class = serializers.ResourceSetLimitsSerializer
 
     refresh_last_sync_permissions = [
         permission_factory(
@@ -2831,8 +3663,12 @@ class ProviderResourceViewSet(BaseResourceViewSet):
 
 class ResourceOfferingsViewSet(ListAPIView):
     serializer_class = serializers.ResourceOfferingSerializer
+    queryset = models.Offering.objects.all()  # used by OpenAPI introspector
+    filterset_class = structure_filters.NameFilterSet
 
     def get_category(self):
+        if "category_uuid" not in self.kwargs:
+            raise rf_exceptions.ValidationError("Category UUID is required.")
         category_uuid = self.kwargs["category_uuid"]
         if not is_uuid_like(category_uuid):
             return Response(
@@ -2847,17 +3683,40 @@ class ResourceOfferingsViewSet(ListAPIView):
         offerings = (
             qs.filter_for_service_consumer(user)
             .filter(offering__category=category)
-            .exclude(state=models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .values_list("offering_id", flat=True)
         )
         return models.Offering.objects.filter(pk__in=offerings)
 
 
-class RuntimeStatesViewSet(views.APIView):
-    def get(self, request, project_uuid=None):
+class RuntimeStatesViewSet(generics.GenericAPIView):
+    filter_backends = []
+    pagination_class = None
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="project_uuid",
+                type=uuid.UUID,
+                location=OpenApiParameter.QUERY,
+                description="UUID of the project to filter runtime states by.",
+            ),
+            OpenApiParameter(
+                name="category_uuid",
+                type=uuid.UUID,
+                location=OpenApiParameter.QUERY,
+                description="UUID of the category to filter runtime states by.",
+            ),
+        ],
+        request=None,
+        responses=serializers.RuntimeStatesSerializer(many=True),
+        description="Retrieve available runtime states for resources, optionally filtered by project and category.",
+    )
+    def get(self, request, **kwargs):
         projects = filter_queryset_for_user(
             structure_models.Project.objects.all(), request.user
         )
+        project_uuid = request.query_params.get("project_uuid")
         if project_uuid and is_uuid_like(project_uuid):
             project = get_object_or_404(projects, uuid=project_uuid)
             resources = models.Resource.objects.filter(project=project)
@@ -2886,8 +3745,11 @@ class RelatedCustomersViewSet(ListAPIView):
     serializer_class = structure_serializers.BasicCustomerSerializer
     filter_backends = (DjangoFilterBackend,)
     filterset_class = structure_filters.NameFilterSet
+    queryset = structure_models.Customer.objects.all()  # used by OpenAPI introspector
 
     def get_customer(self):
+        if "customer_uuid" not in self.kwargs:
+            raise rf_exceptions.ValidationError("Customer UUID is required.")
         customer_uuid = self.kwargs["customer_uuid"]
         if not is_uuid_like(customer_uuid):
             return Response(
@@ -2929,6 +3791,11 @@ class ComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
     filterset_class = filters.ComponentUsageFilter
     serializer_class = serializers.ComponentUsageSerializer
 
+    @extend_schema(
+        request=serializers.ComponentUsageCreateSerializer,
+        responses={status.HTTP_201_CREATED: None},
+    )
+    @transaction.atomic
     @action(detail=False, methods=["post"])
     def set_usage(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -2949,9 +3816,13 @@ class ComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
 
     set_usage_serializer_class = serializers.ComponentUsageCreateSerializer
 
+    @extend_schema(
+        request=serializers.ComponentUserUsageCreateSerializer,
+        responses={status.HTTP_201_CREATED: None},
+    )
     @action(detail=True, methods=["post"])
     def set_user_usage(self, request, *args, **kwargs):
-        component_usage = self.get_object()
+        component_usage: models.ComponentUsage = self.get_object()
         serializer = self.get_serializer(
             data=request.data,
         )
@@ -3042,8 +3913,7 @@ class OfferingFileViewSet(core_views.ActionsViewSet):
         offering = serializer.validated_data["offering"]
 
         if user.is_staff or (
-            offering.customer
-            and offering.customer.has_user(user, structure_models.CustomerRole.OWNER)
+            offering.customer and offering.customer.has_user(user, CustomerRole.OWNER)
         ):
             return
 
@@ -3096,7 +3966,7 @@ class OfferingUsersViewSet(
 
         queryset = queryset.filter(
             # Exclude offerings with disabled OfferingUsers feature
-            Q(offering__secret_options__service_provider_can_create_offering_user=True)
+            Q(offering__plugin_options__service_provider_can_create_offering_user=True)
             &
             # user can see own remote offering user
             (
@@ -3119,9 +3989,13 @@ class OfferingUsersViewSet(
         ).distinct()
         return queryset
 
+    @extend_schema(
+        request=serializers.OfferingUserUpdateRestrictionSerializer,
+        responses=None,
+    )
     @action(detail=True, methods=["post"])
     def update_restricted(self, request, uuid=None):
-        offering_user = self.get_object()
+        offering_user: models.OfferingUser = self.get_object()
         serializer = serializers.OfferingUserUpdateRestrictionSerializer(
             data=request.data, context={"request": request}, instance=offering_user
         )
@@ -3187,22 +4061,32 @@ class OfferingUserGroupViewSet(core_views.ActionsViewSet):
         offering_group.save(update_fields=["backend_metadata"])
 
 
-class StatsViewSet(rf_viewsets.ViewSet):
+class StatsViewSet(rf_viewsets.GenericViewSet):
+    filter_backends = []
     permission_classes = [rf_permissions.IsAuthenticated, core_permissions.IsSupport]
+    serializer_class = EmptySerializer
 
+    @extend_schema(
+        responses=serializers.MarketplaceCustomerStatsSerializer(many=True),
+        description="Return project count per organization.",
+    )
     @action(detail=False, methods=["get"])
     def organization_project_count(self, request, *args, **kwargs):
         data = structure_models.Project.available_objects.values(
             "customer__abbreviation", "customer__name", "customer__uuid"
         ).annotate(count=Count("customer__uuid"))
-        serializer = serializers.CustomerStatsSerializer(data, many=True)
+        serializer = serializers.MarketplaceCustomerStatsSerializer(data, many=True)
         return Response(status=status.HTTP_200_OK, data=serializer.data)
 
+    @extend_schema(
+        description="Retrieve statistics about the number of offerings, grouped by category and service provider.",
+        responses=serializers.OfferingStatsCounterSerializer(many=True),
+    )
     @action(detail=False, methods=["get"])
     def offerings_counter_stats(self, request):
         excluded_states = (
-            models.Offering.States.ARCHIVED,
-            models.Offering.States.DRAFT,
+            OfferingStates.ARCHIVED,
+            OfferingStates.DRAFT,
         )
         try:
             offerings_stats = (
@@ -3237,10 +4121,14 @@ class StatsViewSet(rf_viewsets.ViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+    @extend_schema(
+        description="Return resource count per organization.",
+        responses=serializers.MarketplaceCustomerStatsSerializer(many=True),
+    )
     @action(detail=False, methods=["get"])
     def organization_resource_count(self, request, *args, **kwargs):
         data = (
-            models.Resource.objects.filter(state=models.Resource.States.OK)
+            models.Resource.objects.filter(state=ResourceStates.OK)
             .values(
                 "project__customer__abbreviation",
                 "project__customer__name",
@@ -3248,13 +4136,18 @@ class StatsViewSet(rf_viewsets.ViewSet):
             )
             .annotate(count=Count("project__customer__uuid"))
         )
-        serializer = serializers.CustomerStatsSerializer(data, many=True)
+        serializer = serializers.MarketplaceCustomerStatsSerializer(data, many=True)
         return Response(status=status.HTTP_200_OK, data=serializer.data)
 
+    @extend_schema(
+        description="Return count of customer members.",
+        request=None,
+        responses=serializers.CustomerMemberCountSerializer(many=True),
+    )
     @action(detail=False, methods=["get"])
     def customer_member_count(self, request, *args, **kwargs):
         has_resources = models.Resource.objects.filter(
-            state__in=(models.Resource.States.OK, models.Resource.States.UPDATING),
+            state__in=(ResourceStates.OK, ResourceStates.UPDATING),
             project__customer_id=OuterRef("pk"),
         )
 
@@ -3271,12 +4164,13 @@ class StatsViewSet(rf_viewsets.ViewSet):
 
         return Response(customers)
 
+    @extend_schema(description="Return resources limits per offering.")
     @action(detail=False, methods=["get"])
     def resources_limits(self, request, *args, **kwargs):
         data = []
 
         for resource in (
-            models.Resource.objects.filter(state=models.Resource.States.OK)
+            models.Resource.objects.filter(state=ResourceStates.OK)
             .exclude(limits={})
             .values("offering__uuid", "limits")
         ):
@@ -3312,6 +4206,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        description="Return component usages for current month.",
+    )
     @action(detail=False, methods=["get"])
     def component_usages(self, request, *args, **kwargs):
         now = timezone.now()
@@ -3330,6 +4227,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        description="Return component usages per project.",
+    )
     @action(detail=False, methods=["get"])
     def component_usages_per_project(self, request, *args, **kwargs):
         now = timezone.now()
@@ -3351,6 +4251,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
 
     # cache for 1 hour
     @method_decorator(cache_page(60 * 60))
+    @extend_schema(
+        description="Return component usages per month.",
+    )
     @action(detail=False, methods=["get"])
     def component_usages_per_month(self, request, *args, **kwargs):
         start, end = utils.get_start_and_end_dates_from_request(self.request)
@@ -3395,6 +4298,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
 
         return data_with_organization_groups
 
+    @extend_schema(
+        description="Count users of service providers.",
+    )
     @action(detail=False, methods=["get"])
     def count_users_of_service_providers(self, request, *args, **kwargs):
         result = []
@@ -3415,6 +4321,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
 
         return Response(result, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        description="Count projects of service providers.",
+    )
     @action(detail=False, methods=["get"])
     def count_projects_of_service_providers(self, request, *args, **kwargs):
         result = []
@@ -3433,6 +4342,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
 
         return Response(result, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        description="Count projects of service providers grouped by OECD.",
+    )
     @action(detail=False, methods=["get"])
     def count_projects_of_service_providers_grouped_by_oecd(
         self, request, *args, **kwargs
@@ -3497,6 +4409,7 @@ class StatsViewSet(rf_viewsets.ViewSet):
 
         return results
 
+    @extend_schema(description="Group project usages by OECD code.")
     @action(detail=False, methods=["get"])
     def projects_usages_grouped_by_oecd(self, request, *args, **kwargs):
         return Response(
@@ -3506,6 +4419,7 @@ class StatsViewSet(rf_viewsets.ViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(description="Group project usages by industry flag.")
     @action(detail=False, methods=["get"])
     def projects_usages_grouped_by_industry_flag(self, request, *args, **kwargs):
         return Response(
@@ -3530,7 +4444,7 @@ class StatsViewSet(rf_viewsets.ViewSet):
 
             for resource in (
                 models.Resource.objects.filter(
-                    state=models.Resource.States.OK, project__id__in=ids
+                    state=ResourceStates.OK, project__id__in=ids
                 )
                 .exclude(limits={})
                 .values("offering__uuid", "limits")
@@ -3546,6 +4460,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
 
         return results
 
+    @extend_schema(
+        description="Group project limits by OECD code.",
+    )
     @action(detail=False, methods=["get"])
     def projects_limits_grouped_by_oecd(self, request, *args, **kwargs):
         return Response(
@@ -3555,6 +4472,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        description="Group project limits by industry flag.",
+    )
     @action(detail=False, methods=["get"])
     def projects_limits_grouped_by_industry_flag(self, request, *args, **kwargs):
         return Response(
@@ -3562,6 +4482,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        description="Total cost of active resources per offering.",
+    )
     @action(detail=False, methods=["get"])
     def total_cost_of_active_resources_per_offering(self, request, *args, **kwargs):
         start, end = utils.get_start_and_end_dates_from_request(self.request)
@@ -3641,6 +4564,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
 
         return results
 
+    @extend_schema(
+        description="Count unique users connected with active resources of service provider.",
+    )
     @action(detail=False, methods=["get"])
     def count_unique_users_connected_with_active_resources_of_service_provider(
         self, request, *args, **kwargs
@@ -3678,9 +4604,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
             cursor.execute(
                 raw_query,
                 [
-                    models.Resource.States.OK,
-                    models.Resource.States.UPDATING,
-                    models.Resource.States.TERMINATING,
+                    ResourceStates.OK,
+                    ResourceStates.UPDATING,
+                    ResourceStates.TERMINATING,
                     ctype.id,
                 ],
             )
@@ -3701,12 +4627,16 @@ class StatsViewSet(rf_viewsets.ViewSet):
     def get_active_resources(self):
         return models.Resource.objects.filter(
             state__in=(
-                models.Resource.States.OK,
-                models.Resource.States.UPDATING,
-                models.Resource.States.TERMINATING,
+                ResourceStates.OK,
+                ResourceStates.UPDATING,
+                ResourceStates.TERMINATING,
             )
         )
 
+    @extend_schema(
+        description="Count active resources grouped by offering.",
+        responses=serializers.OfferingStatsSerializer(many=True),
+    )
     @action(detail=False, methods=["get"])
     def count_active_resources_grouped_by_offering(self, request, *args, **kwargs):
         result = (
@@ -3721,6 +4651,10 @@ class StatsViewSet(rf_viewsets.ViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        responses=serializers.OfferingCountryStatsSerializer(many=True),
+        description="Count active resources grouped by offering country.",
+    )
     @action(detail=False, methods=["get"])
     def count_active_resources_grouped_by_offering_country(
         self, request, *args, **kwargs
@@ -3737,6 +4671,10 @@ class StatsViewSet(rf_viewsets.ViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        responses=serializers.CountStatsSerializer(many=True),
+        description="Count active resources grouped by organization group.",
+    )
     @action(detail=False, methods=["get"])
     def count_active_resources_grouped_by_organization_group(
         self, request, *args, **kwargs
@@ -3777,9 +4715,9 @@ class StatsViewSet(rf_viewsets.ViewSet):
             structure_models.Project.objects.filter(is_removed=False)
             .filter(
                 resource__state__in=(
-                    models.Resource.States.OK,
-                    models.Resource.States.UPDATING,
-                    models.Resource.States.TERMINATING,
+                    ResourceStates.OK,
+                    ResourceStates.UPDATING,
+                    ResourceStates.TERMINATING,
                 )
             )
             .values(
@@ -3792,6 +4730,10 @@ class StatsViewSet(rf_viewsets.ViewSet):
             .order_by("resource__offering__customer__name")
         )
 
+    @extend_schema(
+        responses=serializers.CustomerOecdCodeStatsSerializer(many=True),
+        description="Count projects grouped by provider and OECD code",
+    )
     @action(detail=False, methods=["get"])
     def count_projects_grouped_by_provider_and_oecd(self, request, *args, **kwargs):
         result = self._get_count_projects_with_active_resources_grouped_by_provider_and_field(
@@ -3803,6 +4745,10 @@ class StatsViewSet(rf_viewsets.ViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        responses=serializers.CustomerIndustryFlagStatsSerializer(many=True),
+        description="Count projects grouped by provider and industry flag",
+    )
     @action(detail=False, methods=["get"])
     def count_projects_grouped_by_provider_and_industry_flag(
         self, request, *args, **kwargs
@@ -3829,6 +4775,214 @@ class ProviderInvoiceItemsViewSet(core_views.ReadOnlyActionsViewSet):
 def can_mutate_robot_account(request, view, obj=None):
     if obj and obj.backend_id:
         raise PermissionDenied("Remote robot account is synchronized.")
+
+
+class BaseServiceAccountViewSet(core_views.ActionsViewSet):
+    lookup_field = "uuid"
+
+    def perform_create(self, serializer):
+        username = self.request.user.username
+        try:
+            data = serializer.validated_data
+            scope_type = (
+                "customer"
+                if serializer.Meta.model == models.CustomerServiceAccount
+                else "project"
+            )
+            if scope_type == "project":
+                project = data.get("project")
+                if project.max_service_accounts is not None:
+                    project_service_accounts_count = (
+                        models.ProjectServiceAccount.objects.filter(
+                            project=project
+                        ).count()
+                    )
+                    if project_service_accounts_count >= project.max_service_accounts:
+                        raise ValidationError(
+                            {
+                                "detail": "Maximum number of service accounts reached for this project"
+                            }
+                        )
+            elif scope_type == "customer":
+                customer = data.get("customer")
+                if customer.max_service_accounts is not None:
+                    customer_service_accounts_count = (
+                        models.CustomerServiceAccount.objects.filter(
+                            customer=customer
+                        ).count()
+                    )
+                    if customer_service_accounts_count >= customer.max_service_accounts:
+                        raise ValidationError(
+                            {
+                                "detail": "Maximum number of service accounts reached for this customer"
+                            }
+                        )
+
+            response_data = utils.create_service_account(data, username, scope_type)
+            if response_data and "apiKey" in response_data:
+                instance = serializer.save()
+                instance._token = response_data["apiKey"]["apiKey"]
+                instance._expires_at = response_data["apiKey"]["expiresAt"]
+                if "serviceAccount" in response_data:
+                    instance.username = response_data["serviceAccount"]["username"]
+                    instance.save(update_fields=["username"])
+            else:
+                raise ValidationError(
+                    {
+                        "detail": "Service account creation is disabled or returned no token."
+                    }
+                )
+        except httpx.HTTPError as e:
+            raise ValidationError({"detail": str(e)})
+
+    def perform_update(self, serializer):
+        instance: models.ScopedServiceAccount = serializer.instance
+        # Set the fields in the cache object
+        instance.email = serializer.validated_data.get("email", instance.email)
+        instance.description = serializer.validated_data.get(
+            "description", instance.description
+        )
+        utils.update_service_account(instance)
+        # Update the DB object only if the API call is successful
+        super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        utils.delete_service_account(instance)
+
+
+class ProjectServiceAccountViewSet(BaseServiceAccountViewSet):
+    queryset = models.ProjectServiceAccount.objects.all()
+    serializer_class = serializers.ProjectServiceAccountSerializer
+    filterset_class = filters.ProjectServiceAccountFilter
+    filter_backends = (DjangoFilterBackend,)
+    destroy_permissions = partial_update_permissions = update_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_SERVICE_ACCOUNT,
+            ["project", "project.customer"],
+        )
+    ]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_staff or user.is_support:
+            return qs
+
+        projects = get_connected_projects_by_permission(
+            user, PermissionEnum.MANAGE_SERVICE_ACCOUNT
+        )
+        if projects:
+            return qs.filter(project__in=projects)
+        return qs.none()
+
+    def check_create_permissions(request, view, obj=None):
+        serializer = view.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        project = serializer.validated_data.get("project")
+        if not project:
+            raise PermissionDenied()
+        if not (
+            has_permission(request, PermissionEnum.MANAGE_SERVICE_ACCOUNT, project)
+            or has_permission(
+                request, PermissionEnum.MANAGE_SERVICE_ACCOUNT, project.customer
+            )
+        ):
+            raise PermissionDenied()
+
+    create_permissions = [check_create_permissions]
+
+    @extend_schema(
+        request=None,
+        responses=serializers.ProjectServiceAccountSerializer,
+    )
+    @action(detail=True, methods=["post"])
+    def rotate_api_key(self, request, uuid=None):
+        service_account = self.get_object()
+        try:
+            response_data = utils.rotate_service_account_api_key(service_account)
+            if response_data and "apiKey" in response_data:
+                service_account._token = response_data["apiKey"]["apiKey"]
+                service_account._expires_at = response_data["apiKey"]["expiresAt"]
+                serializer = self.get_serializer(service_account)
+                return Response(serializer.data)
+            else:
+                raise ValidationError(
+                    {"detail": "API key rotation failed - no token returned"}
+                )
+        except httpx.HTTPError as e:
+            raise ValidationError({"detail": str(e)})
+
+    rotate_api_key_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_SERVICE_ACCOUNT,
+            ["project", "project.customer"],
+        )
+    ]
+
+
+class CustomerServiceAccountViewSet(BaseServiceAccountViewSet):
+    queryset = models.CustomerServiceAccount.objects.all()
+    serializer_class = serializers.CustomerServiceAccountSerializer
+    filterset_class = filters.CustomerServiceAccountFilter
+    filter_backends = (DjangoFilterBackend,)
+
+    destroy_permissions = partial_update_permissions = update_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_SERVICE_ACCOUNT,
+            ["customer"],
+        )
+    ]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_staff or user.is_support:
+            return qs
+        customers = get_connected_customers_by_permission(
+            user, PermissionEnum.MANAGE_SERVICE_ACCOUNT
+        )
+        if customers:
+            return qs.filter(customer__in=customers)
+        return qs.none()
+
+    def check_create_permissions(request, view, obj=None):
+        serializer = view.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        customer = serializer.validated_data.get("customer")
+        if not customer:
+            raise PermissionDenied()
+        if not has_permission(request, PermissionEnum.MANAGE_SERVICE_ACCOUNT, customer):
+            raise PermissionDenied()
+
+    create_permissions = [check_create_permissions]
+
+    @extend_schema(
+        request=None,
+        responses=serializers.CustomerServiceAccountSerializer,
+    )
+    @action(detail=True, methods=["post"])
+    def rotate_api_key(self, request, uuid=None):
+        service_account = self.get_object()
+        try:
+            response_data = utils.rotate_service_account_api_key(service_account)
+            if response_data and "apiKey" in response_data:
+                service_account._token = response_data["apiKey"]["apiKey"]
+                service_account._expires_at = response_data["apiKey"]["expiresAt"]
+                serializer = self.get_serializer(service_account)
+                return Response(serializer.data)
+            else:
+                raise ValidationError(
+                    {"detail": "API key rotation failed - no token returned"}
+                )
+        except httpx.HTTPError as e:
+            raise ValidationError({"detail": str(e)})
+
+    rotate_api_key_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_SERVICE_ACCOUNT,
+            ["customer"],
+        )
+    ]
 
 
 class RobotAccountViewSet(core_views.ActionsViewSet):
@@ -3866,16 +5020,163 @@ class RobotAccountViewSet(core_views.ActionsViewSet):
         return qs.filter(subquery)
 
     def perform_create(self, serializer):
-        instance = serializer.save()
+        instance: models.RobotAccount = serializer.save()
+        offering = instance.resource.offering
+        utils.setup_linux_related_data(instance, offering)
+        # Set state to CREATING and OK since setup is complete
+        instance.begin_creating()
+        instance.set_ok()
+        instance.save()
+
+    def perform_update(self, serializer):
+        instance: models.RobotAccount = serializer.save()
         offering = instance.resource.offering
         utils.setup_linux_related_data(instance, offering)
         instance.save()
 
-    def perform_update(self, serializer):
-        instance = serializer.save()
-        offering = instance.resource.offering
-        utils.setup_linux_related_data(instance, offering)
-        instance.save()
+    @extend_schema(
+        request=None,
+        responses={
+            200: serializers.RobotAccountDetailsSerializer,
+            400: serializers.StateTransitionErrorSerializer,
+        },
+    )
+    @action(detail=True, methods=["post"])
+    def set_state_creating(self, request, uuid=None):
+        robot_account: models.RobotAccount = self.get_object()
+        try:
+            robot_account.begin_creating()
+            robot_account.save()
+            serializer = self.get_serializer(robot_account)
+            return Response(serializer.data)
+        except TransitionNotAllowed:
+            error_serializer = serializers.StateTransitionErrorSerializer(
+                {"detail": "This transition is not allowed in the current state."}
+            )
+            return Response(error_serializer.data, status=status.HTTP_400_BAD_REQUEST)
+
+    @extend_schema(
+        request=None,
+        responses=serializers.RobotAccountDetailsSerializer,
+    )
+    @action(detail=True, methods=["post"])
+    def set_state_ok(self, request, uuid=None):
+        robot_account: models.RobotAccount = self.get_object()
+        try:
+            robot_account.set_ok()
+            robot_account.save()
+            serializer = self.get_serializer(robot_account)
+            return Response(serializer.data)
+        except TransitionNotAllowed:
+            error_serializer = serializers.StateTransitionErrorSerializer(
+                {
+                    "detail": f"This transition is not allowed in the current state: {robot_account.state}"
+                }
+            )
+            return Response(error_serializer.data, status=status.HTTP_400_BAD_REQUEST)
+
+    @extend_schema(
+        request=None,
+        responses=serializers.RobotAccountDetailsSerializer,
+    )
+    @action(detail=True, methods=["post"])
+    def set_state_request_deletion(self, request, uuid=None):
+        robot_account: models.RobotAccount = self.get_object()
+        try:
+            robot_account.request_deletion()
+            robot_account.save()
+            serializer = self.get_serializer(robot_account)
+            return Response(serializer.data)
+        except TransitionNotAllowed:
+            error_serializer = serializers.StateTransitionErrorSerializer(
+                {
+                    "detail": f"This transition is not allowed in the current state: {robot_account.state}"
+                }
+            )
+            return Response(error_serializer.data, status=status.HTTP_400_BAD_REQUEST)
+
+    @extend_schema(
+        request=None,
+        responses=serializers.RobotAccountDetailsSerializer,
+    )
+    @action(detail=True, methods=["post"])
+    def set_state_deleted(self, request, uuid=None):
+        robot_account: models.RobotAccount = self.get_object()
+        try:
+            robot_account.set_deleted()
+            robot_account.save()
+            serializer = self.get_serializer(robot_account)
+            return Response(serializer.data)
+        except TransitionNotAllowed:
+            error_serializer = serializers.StateTransitionErrorSerializer(
+                {
+                    "detail": f"This transition is not allowed in the current state: {robot_account.state}"
+                }
+            )
+            return Response(error_serializer.data, status=status.HTTP_400_BAD_REQUEST)
+
+    @extend_schema(
+        request=serializers.RobotAccountErrorSerializer,
+        responses=serializers.RobotAccountDetailsSerializer,
+    )
+    @action(detail=True, methods=["post"])
+    def set_state_erred(self, request, uuid=None):
+        robot_account: models.RobotAccount = self.get_object()
+        error_serializer = serializers.RobotAccountErrorSerializer(data=request.data)
+        error_serializer.is_valid(raise_exception=True)
+
+        try:
+            robot_account.set_error()
+            if error_serializer.validated_data.get("error_message"):
+                robot_account.error_message = error_serializer.validated_data.get(
+                    "error_message"
+                )
+            robot_account.save()
+            response_serializer = self.get_serializer(robot_account)
+            return Response(response_serializer.data)
+        except TransitionNotAllowed:
+            error_serializer = serializers.StateTransitionErrorSerializer(
+                {
+                    "detail": f"This transition is not allowed in the current state: {robot_account.state}"
+                }
+            )
+            return Response(error_serializer.data, status=status.HTTP_400_BAD_REQUEST)
+
+    set_state_creating_permissions = set_state_ok_permissions = (
+        set_state_request_deletion_permissions
+    ) = set_state_deleted_permissions = set_state_erred_permissions = [
+        permission_factory(
+            PermissionEnum.UPDATE_RESOURCE_ROBOT_ACCOUNT,
+            ["resource.offering.customer"],
+        )
+    ]
+
+    # Validators for state transitions
+    set_state_creating_validators = [
+        core_validators.StateValidator(
+            RobotAccountStates.REQUESTED, state_enum=RobotAccountStates
+        )
+    ]
+    set_state_ok_validators = [
+        core_validators.StateValidator(
+            RobotAccountStates.CREATING, state_enum=RobotAccountStates
+        )
+    ]
+    set_state_request_deletion_validators = [
+        core_validators.StateValidator(
+            RobotAccountStates.OK, state_enum=RobotAccountStates
+        )
+    ]
+    set_state_deleted_validators = [
+        core_validators.StateValidator(
+            RobotAccountStates.REQUESTED_DELETION, state_enum=RobotAccountStates
+        )
+    ]
+    set_state_erred_validators = [
+        core_validators.StateValidator(
+            RobotAccountStates.OK, state_enum=RobotAccountStates
+        )
+    ]
 
 
 class SectionViewSet(rf_viewsets.ModelViewSet):
@@ -3901,17 +5202,31 @@ class CategoryComponentViewSet(rf_viewsets.ModelViewSet):
 
 
 class GlobalCategoriesViewSet(views.APIView):
-    """
-    Returns count of resource categories for all resources accessible by user.
-    """
-
+    @extend_schema(
+        description="Count of resource categories for all resources accessible by user.",
+        parameters=[
+            OpenApiParameter(
+                name="project_uuid",
+                type=uuid.UUID,
+                location=OpenApiParameter.QUERY,
+                description="UUID of the project to filter resources by.",
+            ),
+            OpenApiParameter(
+                name="customer_uuid",
+                type=uuid.UUID,
+                location=OpenApiParameter.QUERY,
+                description="UUID of the customer to filter resources by.",
+            ),
+        ],
+        responses=dict[str, int],
+    )
     def get(self, request):
         # We need to reset ordering to avoid extra GROUP BY created field.
         qs: ResourceQuerySet = models.Resource.objects.all()
         resources = (
             qs.order_by()
             .filter_for_service_consumer(request.user)
-            .exclude(state=models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
         )
 
         project_uuid = request.query_params.get("project_uuid")
@@ -3922,6 +5237,8 @@ class GlobalCategoriesViewSet(views.APIView):
 
         if customer_uuid:
             resources = resources.filter(project__customer__uuid=customer_uuid)
+
+        resources = filter_queryset_by_user_ip(resources, request)
 
         qs = resources.values("offering__category__uuid").annotate(count=Count("*"))
         return Response(
@@ -3945,10 +5262,10 @@ class IntegrationStatusViewSet(core_views.ReadOnlyActionsViewSet):
         offerings = [
             offering
             for offering in models.Offering.objects.all().filter_for_user(user)
-            if offering.customer.has_user(user, structure_models.CustomerRole.OWNER)
+            if offering.customer.has_user(user, CustomerRole.OWNER)
             or offering.customer.has_user(
                 user,
-                structure_models.CustomerRole.SERVICE_MANAGER,
+                ServiceProviderRole.MANAGER,
             )
         ]
         return qs.filter(offering__in=offerings)
@@ -3958,6 +5275,7 @@ class ComponentUserUsageLimitViewSet(core_views.ActionsViewSet):
     lookup_field = "uuid"
     queryset = models.ComponentUserUsageLimit.objects.all().order_by("-created")
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.ComponentUserUsageLimitFilter
     serializer_class = serializers.ComponentUserUsageLimitSerializer
 
     destroy_permissions = update_permissions = partial_update_permissions = [

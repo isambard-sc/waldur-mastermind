@@ -7,12 +7,6 @@ class MarketplaceSlurmRemoteExtension(WaldurExtension):
         return "waldur_mastermind.marketplace_slurm_remote"
 
     @staticmethod
-    def rest_urls():
-        from .urls import register_in
-
-        return register_in
-
-    @staticmethod
     def is_assembly():
         return True
 
@@ -33,6 +27,11 @@ class MarketplaceSlurmRemoteExtension(WaldurExtension):
             },
             "sync-resources": {
                 "task": "waldur_mastermind.marketplace_slurm_remote.sync_resources",
+                "schedule": timedelta(minutes=10),
+                "args": (),
+            },
+            "send-messages-about-pending-orders": {
+                "task": "waldur_mastermind.marketplace_slurm_remote.send_messages_about_pending_orders",
                 "schedule": timedelta(hours=1),
                 "args": (),
             },

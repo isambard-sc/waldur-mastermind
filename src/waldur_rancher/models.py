@@ -1,11 +1,14 @@
 import logging
+from typing import cast
 from urllib.parse import urljoin
 
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.fields import ArrayField
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from django_fsm import FSMField, transition
 from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
 
@@ -14,6 +17,12 @@ from waldur_core.core.models import BackendMixin
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.models import BaseResource, ServiceSettings
 from waldur_openstack import models as openstack_models
+from waldur_rancher.enums import (
+    ROLE_CHOICES,
+    CatalogScopeType,
+    KeycloakUserGroupMembershipState,
+    RoleScopeType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +31,7 @@ class SettingsMixin(models.Model):
     class Meta:
         abstract = True
 
-    settings = models.ForeignKey(
+    settings = models.ForeignKey[ServiceSettings](
         to="structure.ServiceSettings",
         on_delete=models.CASCADE,
         related_name="+",
@@ -36,20 +45,7 @@ class Cluster(SettingsMixin, BaseResource):
     class RuntimeStates:
         ACTIVE = "active"
 
-    """
-    Rancher generated node installation command base. For example:
-    sudo docker run -d --privileged --restart=unless-stopped --net=host
-    -v /etc/kubernetes:/etc/kubernetes -v /var/run:/var/run rancher/rancher-agent:v2.2.8
-    --server https://192.168.33.13
-    --token df8vrttmcmz8qzfbp74t6nkl5t5pbkrjh8wgkv27zrk8ldhfj6sp4w
-    --ca-checksum e3596989da2fa5f8a7bdfbfd1079f87033217152db4dfc93532932b17aad1567
-    --etcd --controlplane --worker
-    """
-    node_command = models.CharField(
-        max_length=1024,
-        blank=True,
-        help_text="Rancher generated node installation command base.",
-    )
+    id: int
     tracker = FieldTracker()
     tenant = models.ForeignKey(
         to=openstack_models.Tenant,
@@ -64,23 +60,60 @@ class Cluster(SettingsMixin, BaseResource):
         null=True,
         blank=True,
     )
+    # For Managed Rancher plugin OpenStack VMs are isolated from Rancher nodes
+    vm_project = models.ForeignKey(
+        to=structure_models.Project,
+        on_delete=models.CASCADE,
+    )
+
+    node_set: models.Manager["Node"]
+
+    kubernetes_version = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text=_("Kubernetes version used in the cluster."),
+    )
+
+    capacity = models.JSONField(
+        blank=True,
+        default=dict,
+        help_text=_(
+            "Cluster capacity in the format {'cpu': '10', 'ram': '49125240Ki', 'pods': '330'}"
+        ),
+    )
+
+    requested = models.JSONField(
+        blank=True,
+        default=dict,
+        help_text=_(
+            "Cluster requested resources in the format {'cpu': '1450m', 'memory': '884Mi', 'pods': '13'}"
+        ),
+    )
+
+    @property
+    def linked_tenant_ids(self) -> list[int]:
+        """
+        Returns all tenants linked to this cluster.
+        """
+        return list(
+            self.node_set.values_list("instance__tenant_id", flat=True).distinct()
+        )
 
     @classmethod
     def get_url_name(cls):
         return "rancher-cluster"
 
-    def get_access_url(self):
+    def get_access_url(self) -> str | None:
         base_url = self.service_settings.backend_url
-        return urljoin(base_url, "c/" + self.backend_id)
+        if base_url:
+            return urljoin(base_url, "c/" + self.backend_id)
 
     def __str__(self):
         return self.name
 
 
 class RoleMixin(models.Model):
-    controlplane_role = models.BooleanField(default=False)
-    etcd_role = models.BooleanField(default=False)
-    worker_role = models.BooleanField(default=False)
+    role = models.CharField(choices=ROLE_CHOICES, max_length=10, db_index=True)
 
     class Meta:
         abstract = True
@@ -100,13 +133,12 @@ class Node(
         REGISTERING = "registering"
         UNAVAILABLE = "unavailable"
 
-    content_type = models.ForeignKey(
-        on_delete=models.CASCADE, to=ContentType, null=True, related_name="+"
+    instance = models.ForeignKey(
+        openstack_models.Instance,
+        on_delete=models.CASCADE,
+        null=True,
+        related_name="+",
     )
-    object_id = models.PositiveIntegerField(null=True)
-    instance = GenericForeignKey(
-        "content_type", "object_id"
-    )  # a virtual machine where will deploy k8s node.
     cluster = models.ForeignKey(Cluster, on_delete=models.CASCADE)
     initial_data = models.JSONField(
         blank=True, default=dict, help_text=_("Initial data for instance creating.")
@@ -127,22 +159,11 @@ class Node(
 
     tracker = FieldTracker()
 
-    def get_node_command(self):
-        roles_command = []
-        if self.controlplane_role:
-            roles_command.append("--controlplane")
-
-        if self.etcd_role:
-            roles_command.append("--etcd")
-
-        if self.worker_role:
-            roles_command.append("--worker")
-
-        return self.cluster.node_command + " " + " ".join(roles_command)
+    cluster_id: int
 
     class Meta:
         ordering = ("name",)
-        unique_together = (("content_type", "object_id"), ("cluster", "name"))
+        unique_together = ("cluster", "name")
 
     class Permissions:
         customer_path = "cluster__project__customer"
@@ -166,7 +187,9 @@ class RancherUser(
 ):
     user = models.ForeignKey(core_models.User, on_delete=models.CASCADE)
     clusters = models.ManyToManyField(Cluster, through="RancherUserClusterLink")
-    settings = models.ForeignKey("structure.ServiceSettings", on_delete=models.PROTECT)
+    settings = models.ForeignKey[ServiceSettings](
+        "structure.ServiceSettings", on_delete=models.PROTECT
+    )
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -184,25 +207,24 @@ class RancherUser(
         return self.user.username
 
 
-class ClusterRole(models.CharField):
-    CLUSTER_OWNER = "owner"
-    CLUSTER_MEMBER = "member"
-
-    CHOICES = (
-        (CLUSTER_OWNER, "Cluster owner"),
-        (CLUSTER_MEMBER, "Cluster member"),
+class RoleTemplate(SettingsMixin, core_models.UuidMixin):
+    scope_type = models.CharField(
+        choices=RoleScopeType.CHOICES, max_length=10, db_index=True
     )
+    name = models.CharField(max_length=50, help_text=_("Role internal name"))
+    display_name = models.CharField(max_length=50, help_text=_("Role public name"))
 
-    def __init__(self, *args, **kwargs):
-        kwargs["max_length"] = 30
-        kwargs["choices"] = self.CHOICES
-        super().__init__(*args, **kwargs)
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        unique_together = (("scope_type", "name", "settings"),)
 
 
 class RancherUserClusterLink(BackendMixin):
     user = models.ForeignKey(RancherUser, on_delete=models.CASCADE)
     cluster = models.ForeignKey(Cluster, on_delete=models.CASCADE)
-    role = ClusterRole(db_index=True)
+    role = models.ForeignKey(RoleTemplate, on_delete=models.CASCADE)
 
     class Meta:
         unique_together = (("user", "cluster", "role"),)
@@ -210,8 +232,8 @@ class RancherUserClusterLink(BackendMixin):
 
 class RancherUserProjectLink(BackendMixin):
     user = models.ForeignKey(RancherUser, on_delete=models.CASCADE)
-    project = models.ForeignKey("Project", on_delete=models.CASCADE)
-    role = models.CharField(max_length=255, blank=False)
+    project = models.ForeignKey["Project"]("Project", on_delete=models.CASCADE)
+    role = models.ForeignKey(RoleTemplate, on_delete=models.CASCADE)
 
     class Meta:
         unique_together = (("user", "project", "role"),)
@@ -239,10 +261,11 @@ class Catalog(
     password = models.CharField(max_length=255, blank=True)
 
     def get_backend(self):
-        return self.scope.get_backend()
+        scope = cast(ServiceSettings | Cluster, self.scope)
+        return scope.get_backend()
 
     @property
-    def scope_type(self):
+    def scope_type(self) -> CatalogScopeType:
         if isinstance(self.scope, ServiceSettings):
             return "global"
         elif isinstance(self.scope, Cluster):
@@ -263,6 +286,8 @@ class Project(
     SettingsMixin,
     core_models.RuntimeStateMixin,
 ):
+    namespaces: models.Manager["Namespace"]
+
     cluster = models.ForeignKey(
         Cluster, on_delete=models.CASCADE, null=True, related_name="+"
     )
@@ -422,6 +447,8 @@ class ClusterTemplate(
     core_models.DescribableMixin,
     TimeStampedModel,
 ):
+    nodes: models.Manager["ClusterTemplateNode"]
+
     class Meta:
         ordering = ("name",)
 
@@ -458,8 +485,10 @@ class Application(SettingsMixin, core_models.RuntimeStateMixin, BaseResource):
         return self.name
 
     @property
-    def external_url(self):
-        return f'{self.settings.backend_url.strip("/")}/p/{self.project.backend_id}/apps/{self.backend_id}'
+    def external_url(self) -> str | None:
+        base_url = self.settings.backend_url
+        if base_url:
+            return f"{base_url.strip('/')}/p/{self.project.backend_id}/apps/{self.backend_id}"
 
 
 class Ingress(SettingsMixin, core_models.RuntimeStateMixin, BaseResource):
@@ -488,3 +517,86 @@ class Service(SettingsMixin, core_models.RuntimeStateMixin, BaseResource):
 
     def __str__(self):
         return self.name
+
+
+class KeycloakGroup(
+    core_models.UuidMixin,
+    core_models.BackendMixin,
+    TimeStampedModel,
+):
+    name = models.CharField(_("Group name"), max_length=150, blank=True)
+    scope_uuid = models.UUIDField(help_text=_("UUID of the cluster or project"))
+    role = models.ForeignKey(RoleTemplate, on_delete=models.CASCADE)
+
+    class Meta:
+        unique_together = (("scope_uuid", "role"),)
+
+    def __str__(self):
+        return self.name
+
+
+class KeycloakUserGroupMembership(
+    core_models.UuidMixin, TimeStampedModel, core_models.ErrorMessageMixin
+):
+    username = models.CharField(max_length=255, help_text=_("Keycloak user username"))
+    email = models.EmailField(help_text=_("User's email for notifications"))
+    state = FSMField(
+        choices=KeycloakUserGroupMembershipState.CHOICES,
+        default=KeycloakUserGroupMembershipState.PENDING,
+    )
+    last_checked = models.DateTimeField(auto_now=True)
+    group = models.ForeignKey(to=KeycloakGroup, on_delete=models.CASCADE)
+    first_name = models.CharField(max_length=100, blank=True)
+    last_name = models.CharField(max_length=100, blank=True)
+
+    @transition(
+        field=state,
+        source=KeycloakUserGroupMembershipState.PENDING,
+        target=KeycloakUserGroupMembershipState.ACTIVE,
+    )
+    def activate(self):
+        pass
+
+    def refresh_last_checked(self):
+        self.last_checked = timezone.now()
+
+    def __str__(self):
+        return f"{self.username} in {self.group}"
+
+
+class ClusterSecurityGroup(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    core_models.DescribableMixin,
+):
+    class Permissions:
+        customer_path = "cluster__project__customer"
+        project_path = "cluster__project"
+
+    cluster = models.ForeignKey(Cluster, on_delete=models.CASCADE, related_name="+")
+
+
+class ClusterSecurityGroupRule(
+    core_models.UuidMixin, openstack_models.BaseSecurityGroupRule
+):
+    group = models.ForeignKey(
+        ClusterSecurityGroup, on_delete=models.CASCADE, related_name="rules"
+    )
+
+
+class ClusterPublicIP(
+    core_models.UuidMixin,
+    TimeStampedModel,
+):
+    cluster = models.ForeignKey(
+        to=Cluster, on_delete=models.CASCADE, related_name="public_ips"
+    )
+    floating_ip = models.OneToOneField(
+        to=openstack_models.FloatingIP,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        unique_together = (("cluster", "floating_ip"),)

@@ -133,6 +133,16 @@ def register_in(router):
         basename="marketplace-robot-account",
     )
     router.register(
+        r"marketplace-project-service-accounts",
+        views.ProjectServiceAccountViewSet,
+        basename="marketplace-project-service-account",
+    )
+    router.register(
+        r"marketplace-customer-service-accounts",
+        views.CustomerServiceAccountViewSet,
+        basename="marketplace-customer-service-account",
+    )
+    router.register(
         r"marketplace-sections",
         views.SectionViewSet,
         basename="marketplace-section",
@@ -166,7 +176,7 @@ urlpatterns = [
         views.ResourceOfferingsViewSet.as_view(),
     ),
     re_path(
-        r"^api/marketplace-runtime-states/(?:(?P<project_uuid>[a-f0-9]+)/)?$",
+        r"^api/marketplace-runtime-states/$",
         views.RuntimeStatesViewSet.as_view(),
         name="marketplace-runtime-states-list",
     ),
@@ -178,6 +188,11 @@ urlpatterns = [
         r"^api/marketplace-public-offerings/(?P<uuid>[a-f0-9]+)/plans/(?P<plan_uuid>[a-f0-9]+)/$",
         views.PublicOfferingViewSet.as_view({"get": "plan_detail"}),
         name="marketplace-public-offering-plan-detail",
+    ),
+    re_path(
+        r"^api/marketplace-provider-offerings/(?P<uuid>[a-f0-9]+)/orders/(?P<order_uuid>[a-f0-9]+)/$",
+        views.ProviderOfferingViewSet.as_view({"get": "order_detail"}),
+        name="marketplace-provider-offering-order-detail",
     ),
     re_path(
         r"^api/marketplace-global-categories/$",

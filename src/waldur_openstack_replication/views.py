@@ -1,9 +1,8 @@
+from django.db import transaction
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status
-from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from waldur_core.core.validators import StateValidator
 from waldur_core.core.views import ActionsViewSet
 from waldur_core.structure.filters import GenericRoleFilter
 
@@ -18,18 +17,13 @@ class MigrationViewSet(ActionsViewSet):
     filter_backends = [GenericRoleFilter, DjangoFilterBackend]
     lookup_field = "uuid"
 
-    @action(detail=True, methods=["post"])
-    def run(self, request, uuid=None):
-        migration = self.get_object()
-        executors.MigrationExecutor.execute(migration)
-        return Response(status=status.HTTP_200_OK)
-
-    run_validators = [StateValidator(models.Migration.States.CREATION_SCHEDULED)]
-
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
+        migration: models.Migration = serializer.save()
+
+        transaction.on_commit(lambda: executors.MigrationExecutor.execute(migration))
+
         return Response(
             serializers.MigrationDetailsSerializer(instance=serializer.instance).data,
             status=status.HTTP_201_CREATED,

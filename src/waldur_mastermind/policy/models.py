@@ -36,7 +36,7 @@ class Policy(
 
     has_fired = models.BooleanField(default=False)
     fired_datetime = models.DateTimeField(null=True, blank=True, editable=False)
-    created_by = models.ForeignKey(
+    created_by = models.ForeignKey[core_models.User](
         on_delete=models.CASCADE,
         to=settings.AUTH_USER_MODEL,
         related_name="+",
@@ -269,6 +269,8 @@ class OfferingEstimatedCostPolicy(EstimatedCostPolicyMixin, OfferingPolicy):
 
 
 class OfferingUsagePolicy(invoices_models.PeriodMixin, OfferingPolicy):
+    component_limits_set: models.Manager["OfferingComponentLimit"]
+
     trigger_class = marketplace_models.ComponentUsage
 
     component_limit = models.ManyToManyField(

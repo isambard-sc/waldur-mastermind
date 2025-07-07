@@ -17,10 +17,34 @@ logger = logging.getLogger(__name__)
 
 class OpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer):
     class Meta:
-        secret_fields = ("instance_name")
+        secret_fields = ("instance_name", "project_class")
 
     instance_name = rf_serializers.CharField(
-        source="options.instance_name", label=_("Full path name for the OpenPortal Agent managing this instance")
+        source="options.instance_name",
+        label=_("Full path name for the OpenPortal Agent managing this instance"),
+        default=None,
+        required=False,
+    )
+
+    project_class = rf_serializers.CharField(
+        source="options.project_class",
+        label=_("Class for projects created on the remote OpenPortal instance"),
+        default=None,
+        required=False,
+    )
+
+    allocation_unit = rf_serializers.CharField(
+        source="options.allocation_unit",
+        label=_("Unit for allocation limits"),
+        default="NHR",
+        required=False,
+    )
+
+    default_allocation = rf_serializers.FloatField(
+        source="options.default_allocation",
+        label=_("Default allocation for new projects on this resource"),
+        default=None,
+        required=False,
     )
 
 
@@ -63,12 +87,62 @@ class AllocationSerializer(
         return attrs
 
 
+class RemoteAllocationSerializer(
+    structure_serializers.BaseResourceSerializer,
+    core_serializers.AugmentedSerializerMixin,
+):
+    class Meta(structure_serializers.BaseResourceSerializer.Meta):
+        model = models.RemoteAllocation
+        fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
+            "node_limit",
+            "remote_project_identifier",
+            "node_usage",
+            "is_active",
+        )
+        read_only_fields = (
+            structure_serializers.BaseResourceSerializer.Meta.read_only_fields
+            + (
+                "node_usage",
+                "is_active",
+            )
+        )
+        extra_kwargs = dict(
+            url={
+                "lookup_field": "uuid",
+                "view_name": "openportal-remote-allocation-detail",
+            },
+            node_limit={"validators": [MinValueValidator(0)]},
+        )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        # Skip validation on update
+        if self.instance:
+            return attrs
+
+        project = attrs["project"]
+        user = self.context["request"].user
+        if not _has_admin_access(user, project):
+            raise rf_exceptions.PermissionDenied(
+                _("You do not have permissions to create allocation for given project.")
+            )
+        return attrs
+
+
 class AllocationSetLimitsSerializer(rf_serializers.ModelSerializer):
     node_limit = rf_serializers.IntegerField(min_value=-1)
 
     class Meta:
         model = models.Allocation
-        fields = ("node_limit")
+        fields = "node_limit"
+
+
+class RemoteAllocationSetLimitsSerializer(rf_serializers.ModelSerializer):
+    node_limit = rf_serializers.IntegerField(min_value=-1)
+
+    class Meta:
+        model = models.RemoteAllocation
+        fields = "node_limit"
 
 
 class AllocationUserUsageCreateSerializer(rf_serializers.HyperlinkedModelSerializer):
@@ -78,6 +152,23 @@ class AllocationUserUsageCreateSerializer(rf_serializers.HyperlinkedModelSeriali
             "node_usage",
             "user",
             "username",
+        )
+        extra_kwargs = {
+            "user": {
+                "lookup_field": "uuid",
+                "view_name": "user-detail",
+            },
+        }
+
+
+class RemoteAllocationUserUsageCreateSerializer(
+    rf_serializers.HyperlinkedModelSerializer
+):
+    class Meta:
+        model = models.RemoteAllocationUserUsage
+        fields = (
+            "node_usage",
+            "user",
         )
         extra_kwargs = {
             "user": {
@@ -113,6 +204,31 @@ class AllocationUserUsageSerializer(rf_serializers.HyperlinkedModelSerializer):
         }
 
 
+class RemoteAllocationUserUsageSerializer(rf_serializers.HyperlinkedModelSerializer):
+    full_name = rf_serializers.ReadOnlyField(source="user.full_name")
+
+    class Meta:
+        model = models.RemoteAllocationUserUsage
+        fields = (
+            "node_usage",
+            "month",
+            "year",
+            "allocation",
+            "user",
+            "full_name",
+        )
+        extra_kwargs = {
+            "allocation": {
+                "lookup_field": "uuid",
+                "view_name": "openportal-allocation-detail",
+            },
+            "user": {
+                "lookup_field": "uuid",
+                "view_name": "user-detail",
+            },
+        }
+
+
 class AssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
     allocation = rf_serializers.HyperlinkedRelatedField(
         queryset=models.Association.objects.all(),
@@ -131,16 +247,37 @@ class AssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
         )
 
 
+class RemoteAssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
+    allocation = rf_serializers.HyperlinkedRelatedField(
+        queryset=models.RemoteAssociation.objects.all(),
+        view_name="openportal-remote-allocation-detail",
+        lookup_field="uuid",
+    )
+
+    class Meta:
+        model = models.RemoteAssociation
+        fields = (
+            "uuid",
+            "allocation",
+        )
+
+
 class HistoricalAllocationSerializer(rf_serializers.HyperlinkedModelSerializer):
     class Meta:
         model = models.HistoricalAllocation
-        fields = (
-            "node_usage",
-            "month",
-            "year",
-            "allocation",
-            "is_complete"
-        )
+        fields = ("node_usage", "month", "year", "allocation", "is_complete")
+        extra_kwargs = {
+            "allocation": {
+                "lookup_field": "uuid",
+                "view_name": "openportal-allocation-detail",
+            },
+        }
+
+
+class HistoricalRemoteAllocationSerializer(rf_serializers.HyperlinkedModelSerializer):
+    class Meta:
+        model = models.HistoricalRemoteAllocation
+        fields = ("node_usage", "month", "year", "allocation", "is_complete")
         extra_kwargs = {
             "allocation": {
                 "lookup_field": "uuid",
@@ -178,4 +315,3 @@ class ProjectInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
                 "view_name": "project-detail",
             },
         }
-

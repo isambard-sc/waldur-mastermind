@@ -9,6 +9,7 @@ from django.utils import timezone
 
 from waldur_mastermind.booking import models as models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 
 from . import PLUGIN_NAME
 
@@ -70,9 +71,8 @@ def get_offering_bookings(offering):
     But it is more end-user friendly if choices that you see are
     always available (if some time slots at risk, better to conceal them).
     """
-    States = marketplace_models.Resource.States
     resources = marketplace_models.Resource.objects.filter(
-        offering=offering, state__in=(States.OK, States.CREATING)
+        offering=offering, state__in=(ResourceStates.OK, ResourceStates.CREATING)
     ).order_by("created")
     bookings = []
 
@@ -129,15 +129,14 @@ def get_offering_bookings_and_busy_slots(offering):
 
 
 def get_other_offering_booking_requests(order):
-    States = marketplace_models.Order.States
     schedules = (
         marketplace_models.Order.objects.filter(
             offering=order.offering,
             state__in=(
-                States.PENDING_CONSUMER,
-                States.PENDING_PROVIDER,
-                States.EXECUTING,
-                States.DONE,
+                OrderStates.PENDING_CONSUMER,
+                OrderStates.PENDING_PROVIDER,
+                OrderStates.EXECUTING,
+                OrderStates.DONE,
             ),
         )
         .exclude(id=order.id)
@@ -156,7 +155,7 @@ def get_info_about_upcoming_bookings():
     tomorrow = datetime.date.today() + datetime.timedelta(days=1)
     upcoming_bookings = marketplace_models.Resource.objects.filter(
         offering__type=PLUGIN_NAME,
-        state=marketplace_models.Resource.States.OK,
+        state=ResourceStates.OK,
         attributes__schedules__0__start__icontains="%s-%02d-%02dT"
         % (tomorrow.year, tomorrow.month, tomorrow.day),
     )

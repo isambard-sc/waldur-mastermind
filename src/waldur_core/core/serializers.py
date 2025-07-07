@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from collections import OrderedDict
+from collections.abc import Iterable, Mapping
 
 from constance import LazyConfig, settings
 from django import forms
@@ -18,11 +19,13 @@ from django.urls import Resolver404, reverse
 from django.utils.translation import gettext_lazy as _
 from modeltranslation.manager import get_translatable_fields_for_model
 from rest_framework import serializers
+from rest_framework import serializers as rf_serializers
 from rest_framework.fields import Field, ReadOnlyField
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.models import generate_slug
 from waldur_core.core.signals import pre_serializer_fields
+from waldur_mastermind.common.serializers import StringListSerializer
 
 from . import fields as core_fields
 
@@ -54,6 +57,27 @@ class DictField(forms.CharField):
         return value
 
 
+class ListField(forms.CharField):
+    def __init__(self, *args, **kwargs):
+        kwargs["widget"] = forms.TextInput
+        super().__init__(*args, **kwargs)
+
+    def to_python(self, value):
+        if not value:
+            return []
+        try:
+            return [item.strip() for item in value.split(",")]
+        except ValueError as e:
+            raise forms.ValidationError(f"Invalid string format: {str(e)}")
+
+    def prepare_value(self, value):
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            return ", ".join(value)
+        return str(value)
+
+
 class DictSerializerField(serializers.CharField):
     def to_internal_value(self, data):
         """Convert JSON string to Python dictionary."""
@@ -76,7 +100,7 @@ class DictSerializerField(serializers.CharField):
         return value
 
 
-class AuthTokenSerializer(serializers.Serializer):
+class ObtainAuthTokenSerializer(serializers.Serializer):
     """
     API token serializer loosely based on DRF's default AuthTokenSerializer.
     but with the logic of authorization is extracted to view.
@@ -85,6 +109,10 @@ class AuthTokenSerializer(serializers.Serializer):
     # Fields are both required, non-blank and don't allow nulls by default
     username = serializers.CharField(max_length=128)
     password = serializers.CharField(max_length=128)
+
+
+class CoreAuthTokenSerializer(serializers.Serializer):
+    token = serializers.CharField(read_only=True)
 
 
 class Base64Field(serializers.CharField):
@@ -255,7 +283,7 @@ class AugmentedSerializerMixin:
 
             class ProjectSerializer(AugmentedSerializerMixin,
                                     serializers.HyperlinkedModelSerializer):
-                customer_uuid = serializers.ReadOnlyField(source='customer.uuid')
+                customer_uuid = serializers.UUIDField(read_only=True, source='customer.uuid')
                 customer_name = serializers.ReadOnlyField(source='customer.name')
                 class Meta:
                     model = models.Project
@@ -316,7 +344,7 @@ class AugmentedSerializerMixin:
 
         return fields
 
-    def _get_related_paths(self):
+    def _get_related_paths(self) -> Mapping[str, Iterable]:
         try:
             related_paths = self.Meta.related_paths
         except AttributeError:
@@ -341,13 +369,24 @@ class AugmentedSerializerMixin:
             for attribute in attributes
         }
 
-        try:
-            return (
-                serializers.ReadOnlyField,
-                {"source": related_field_source_map[field_name]},
+        related_field_nullable_map = {
+            "{}_{}".format(path.split(".")[-1], attribute): getattr(
+                model_class._meta.get_field(path), "null", False
             )
-        except KeyError:
+            for path, attributes in related_paths.items()
+            for attribute in attributes
+        }
+
+        if field_name not in related_field_source_map:
             return super().build_unknown_field(field_name, model_class)
+
+        return (
+            serializers.ReadOnlyField,
+            {
+                "source": related_field_source_map[field_name],
+                "allow_null": related_field_nullable_map[field_name],
+            },
+        )
 
     def get_extra_kwargs(self):
         extra_kwargs = super().get_extra_kwargs()
@@ -471,7 +510,6 @@ color_hex_validator = RegexValidator(
 class ConstanceSettingsSerializer(serializers.Serializer):
     def get_fields(self):
         fields = OrderedDict()
-
         for name, options in settings.CONFIG.items():
             default = options[0]
             if len(options) == 3:
@@ -492,18 +530,22 @@ class ConstanceSettingsSerializer(serializers.Serializer):
             else:
                 config_type = type(default)
             field_class = None
-            if config_type == str:
+            if config_type is str:
                 field_class = serializers.CharField
             if config_type == "image_field":
                 field_class = serializers.ImageField
             if config_type == "email_field":
                 field_class = serializers.EmailField
-            if config_type == int:
+            if config_type is int:
                 field_class = serializers.IntegerField
-            if config_type == bool:
+            if config_type is bool:
                 field_class = serializers.BooleanField
             if config_type == "dict_field":
                 field_class = DictSerializerField
+            if config_type == "list_field":
+                field_class = StringListSerializer
+            if config_type == "country_list_field":
+                field_class = StringListSerializer
             if config_type in (
                 "color_field",
                 "html_field",
@@ -515,14 +557,18 @@ class ConstanceSettingsSerializer(serializers.Serializer):
             if not field_class:
                 continue
             kwargs = dict(required=False)
-            if config_type == str:
+            if config_type is str:
                 kwargs["allow_blank"] = True
             if config_type == "image_field":
                 kwargs["allow_null"] = True
+            if config_type == "secret_field":
+                kwargs["allow_blank"] = True
             if config_type == "color_field":
                 kwargs["validators"] = [color_hex_validator]
+                kwargs["allow_blank"] = True
             if config_type == "url_field":
                 kwargs["validators"] = [URLValidator()]
+                kwargs["allow_blank"] = True
             fields[name] = field_class(**kwargs)
         return fields
 
@@ -566,7 +612,7 @@ class SlugSerializerMixin(serializers.Serializer):
         fields = super().get_fields()
 
         try:
-            request = self.context["view"].request
+            request = self.context["request"]
             user = request.user
         except (KeyError, AttributeError):
             return fields
@@ -583,3 +629,31 @@ class SlugSerializerMixin(serializers.Serializer):
             slug_source = validated_data[klass.get_slug_source_field()]
             validated_data["slug"] = generate_slug(slug_source, klass)
         return super().create(validated_data)
+
+
+class EmptySerializer(rf_serializers.Serializer):
+    pass
+
+
+class TableSizeSerializer(serializers.Serializer):
+    table_name = serializers.CharField(read_only=True)
+    total_size = serializers.IntegerField(read_only=True)
+    data_size = serializers.IntegerField(read_only=True)
+    external_size = serializers.IntegerField(read_only=True)
+
+
+class QuerySerializer(serializers.Serializer):
+    query = serializers.CharField()
+
+
+class VersionSerializer(serializers.Serializer):
+    version = serializers.CharField(
+        help_text="Current installed version of the application"
+    )
+    latest_version = serializers.CharField(
+        help_text="Latest available version from GitHub, if available.", required=False
+    )
+
+
+class LogoutSerializer(serializers.Serializer):
+    logout_url = serializers.URLField(read_only=True)

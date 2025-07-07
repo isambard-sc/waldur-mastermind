@@ -1,10 +1,10 @@
 from constance import config
 from django.conf import settings
-from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import extend_schema
 from rest_framework import permissions as rf_permissions
 from rest_framework import status
 from rest_framework.decorators import action
@@ -13,6 +13,7 @@ from rest_framework.response import Response
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import validators as core_validators
+from waldur_core.core.enums import ReviewStates
 from waldur_core.core.views import ProtectedViewSet, ReadOnlyActionsViewSet
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import has_user
@@ -21,8 +22,6 @@ from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure.models import Customer, Project
 from waldur_core.users import filters, models, serializers, tasks
 from waldur_core.users.utils import can_manage_invitation_with, parse_invitation_token
-
-User = get_user_model()
 
 
 class InvitationViewSet(ProtectedViewSet):
@@ -66,6 +65,7 @@ class InvitationViewSet(ProtectedViewSet):
                 lambda: tasks.process_invitation.delay(invitation.uuid.hex, sender)
             )
 
+    @extend_schema(request=serializers.TokenSerializer, responses=None)
     @action(detail=False, methods=["post"], permission_classes=[])
     def approve(self, request):
         """
@@ -90,6 +90,7 @@ class InvitationViewSet(ProtectedViewSet):
             {"detail": _("Invitation has been approved.")}, status=status.HTTP_200_OK
         )
 
+    @extend_schema(request=serializers.TokenSerializer, responses=None)
     @action(detail=False, methods=["post"], permission_classes=[])
     def reject(self, request):
         """
@@ -113,6 +114,7 @@ class InvitationViewSet(ProtectedViewSet):
             {"detail": _("Invitation has been rejected.")}, status=status.HTTP_200_OK
         )
 
+    @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def send(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
@@ -143,6 +145,7 @@ class InvitationViewSet(ProtectedViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def cancel(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
@@ -163,6 +166,7 @@ class InvitationViewSet(ProtectedViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])
     def delete(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
@@ -176,6 +180,7 @@ class InvitationViewSet(ProtectedViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(request=None, responses=None)
     @action(
         detail=True, methods=["post"], filter_backends=[filters.PendingInvitationFilter]
     )
@@ -186,14 +191,13 @@ class InvitationViewSet(ProtectedViewSet):
         if has_user(invitation.scope, request.user, invitation.role):
             raise ValidationError(_("User has already the same role in this scope."))
 
-        # do a case-insensitive check for email
-        if invitation.email.lower() != request.user.email.lower():
+        if invitation.email.casefold() != request.user.email.casefold():
             if config.ENABLE_STRICT_CHECK_ACCEPTING_INVITATION:
                 raise ValidationError(
                     _("User’s email and email of the invitation are not equal.")
                 )
 
-        if settings.WALDUR_CORE["INVITATION_DISABLE_MULTIPLE_ROLES"]:
+        if config.INVITATION_DISABLE_MULTIPLE_ROLES:
             if UserRole.objects.filter(user=request.user, is_active=True).exists():
                 raise ValidationError(_("User already has role within another scope."))
 
@@ -204,6 +208,9 @@ class InvitationViewSet(ProtectedViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        request=None, responses=serializers.InvitationCheckSerializer, parameters=[]
+    )
     @action(detail=True, methods=["post"], filter_backends=[], permission_classes=[])
     def check(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
@@ -218,6 +225,10 @@ class InvitationViewSet(ProtectedViewSet):
         else:
             return Response({"email": invitation.email}, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        request=None,
+        responses=serializers.VisibleInvitationDetailsSerializer,
+    )
     @action(detail=True, filter_backends=[filters.VisibleInvitationFilter])
     def details(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
@@ -237,6 +248,14 @@ class GroupInvitationViewSet(ProtectedViewSet):
     filterset_class = filters.GroupInvitationFilter
     lookup_field = "uuid"
 
+    @extend_schema(
+        request=None,
+        responses=structure_serializers.NestedProjectSerializer(
+            many=True, read_only=True
+        ),
+        description="Return projects for group invitation",
+        filters=False,
+    )
     @action(detail=True, methods=["get"], filter_backends=[])
     def projects(self, request, uuid=None):
         invitation: models.GroupInvitation = self.get_object()
@@ -252,6 +271,12 @@ class GroupInvitationViewSet(ProtectedViewSet):
         )
         return Response(projects.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        request=None,
+        responses=None,
+        description="Cancel group invitation",
+        parameters=[],
+    )
     @action(detail=True, methods=["post"], filter_backends=[])
     def cancel(self, request, uuid=None):
         invitation: models.GroupInvitation = self.get_object()
@@ -267,8 +292,9 @@ class GroupInvitationViewSet(ProtectedViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(request=None)
     @action(detail=True, methods=["post"], filter_backends=[])
-    def request(self, request, uuid=None):
+    def submit_request(self, request, uuid=None):
         invitation: models.GroupInvitation = self.get_object()
 
         if not invitation.is_active:
@@ -278,7 +304,7 @@ class GroupInvitationViewSet(ProtectedViewSet):
             models.PermissionRequest.objects.filter(
                 invitation=invitation, created_by=request.user
             )
-            .exclude(state=models.PermissionRequest.States.REJECTED)
+            .exclude(state=ReviewStates.REJECTED)
             .exists()
         ):
             raise ValidationError(_("Request has been created already."))
@@ -340,5 +366,5 @@ class PermissionRequestViewSet(ReadOnlyActionsViewSet):
         core_serializers.ReviewCommentSerializer
     )
     approve_validators = reject_validators = [
-        core_validators.StateValidator(models.PermissionRequest.States.PENDING)
+        core_validators.StateValidator(ReviewStates.PENDING, state_enum=ReviewStates)
     ]

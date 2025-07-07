@@ -3,7 +3,7 @@ import logging
 from waldur_core.core import models as core_models
 from waldur_core.core import tasks as core_tasks
 from waldur_core.core import utils as core_utils
-from waldur_core.core.models import StateMixin
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
@@ -185,127 +185,20 @@ def log_action(sender, instance, created=False, **kwargs):
     resource = instance
     if created or not resource.tracker.has_changed("action"):
         return
-    if resource.state == StateMixin.States.UPDATE_SCHEDULED:
+    if resource.state == CoreStates.UPDATE_SCHEDULED:
         _log_scheduled_action(resource, resource.action, resource.action_details)
-    if resource.state == StateMixin.States.OK:
+    if resource.state == CoreStates.OK:
         _log_succeeded_action(
             resource,
             resource.tracker.previous("action"),
             resource.tracker.previous("action_details"),
         )
-    elif resource.state == StateMixin.States.ERRED:
+    elif resource.state == CoreStates.ERRED:
         _log_failed_action(
             resource,
             resource.tracker.previous("action"),
             resource.tracker.previous("action_details"),
         )
-
-
-def log_snapshot_schedule_creation(sender, instance, created=False, **kwargs):
-    if not created:
-        return
-
-    snapshot_schedule = instance
-    event_logger.openstack_snapshot_schedule.info(
-        'Snapshot schedule "%s" has been created' % snapshot_schedule.name,
-        event_type="resource_snapshot_schedule_created",
-        event_context={
-            "resource": snapshot_schedule.source_volume,
-            "snapshot_schedule": snapshot_schedule,
-        },
-    )
-
-
-def log_snapshot_schedule_action(sender, instance, created=False, **kwargs):
-    snapshot_schedule = instance
-    if created or not snapshot_schedule.tracker.has_changed("is_active"):
-        return
-
-    context = {
-        "resource": snapshot_schedule.source_volume,
-        "snapshot_schedule": snapshot_schedule,
-    }
-    if snapshot_schedule.is_active:
-        event_logger.openstack_snapshot_schedule.info(
-            'Snapshot schedule "%s" has been activated' % snapshot_schedule.name,
-            event_type="resource_snapshot_schedule_activated",
-            event_context=context,
-        )
-    else:
-        if snapshot_schedule.error_message:
-            message = f'Snapshot schedule "{snapshot_schedule.name}" has been deactivated because of error: {snapshot_schedule.error_message}'
-        else:
-            message = (
-                'Snapshot schedule "%s" has been deactivated' % snapshot_schedule.name
-            )
-        event_logger.openstack_snapshot_schedule.warning(
-            message,
-            event_type="resource_snapshot_schedule_deactivated",
-            event_context=context,
-        )
-
-
-def log_snapshot_schedule_deletion(sender, instance, **kwargs):
-    snapshot_schedule = instance
-    event_logger.openstack_snapshot_schedule.info(
-        'Snapshot schedule "%s" has been deleted' % snapshot_schedule.name,
-        event_type="resource_snapshot_schedule_deleted",
-        event_context={
-            "resource": snapshot_schedule.source_volume,
-            "snapshot_schedule": snapshot_schedule,
-        },
-    )
-
-
-def log_backup_schedule_creation(sender, instance, created=False, **kwargs):
-    if not created:
-        return
-
-    backup_schedule = instance
-    event_logger.openstack_backup_schedule.info(
-        'Backup schedule "%s" has been created' % backup_schedule.name,
-        event_type="resource_backup_schedule_created",
-        event_context={
-            "resource": backup_schedule.instance,
-            "backup_schedule": backup_schedule,
-        },
-    )
-
-
-def log_backup_schedule_action(sender, instance, created=False, **kwargs):
-    backup_schedule = instance
-    if created or not backup_schedule.tracker.has_changed("is_active"):
-        return
-
-    context = {"resource": backup_schedule.instance, "backup_schedule": backup_schedule}
-    if backup_schedule.is_active:
-        event_logger.openstack_backup_schedule.info(
-            'Backup schedule "%s" has been activated' % backup_schedule.name,
-            event_type="resource_backup_schedule_activated",
-            event_context=context,
-        )
-    else:
-        if backup_schedule.error_message:
-            message = f'Backup schedule "{backup_schedule.name}" has been deactivated because of error: {backup_schedule.error_message}'
-        else:
-            message = 'Backup schedule "%s" has been deactivated' % backup_schedule.name
-        event_logger.openstack_backup_schedule.warning(
-            message,
-            event_type="resource_backup_schedule_deactivated",
-            event_context=context,
-        )
-
-
-def log_backup_schedule_deletion(sender, instance, **kwargs):
-    backup_schedule = instance
-    event_logger.openstack_backup_schedule.info(
-        'Backup schedule "%s" has been deleted' % backup_schedule.name,
-        event_type="resource_backup_schedule_deleted",
-        event_context={
-            "resource": backup_schedule.instance,
-            "backup_schedule": backup_schedule,
-        },
-    )
 
 
 def delete_state_service_properties(sender, instance, **kwargs):

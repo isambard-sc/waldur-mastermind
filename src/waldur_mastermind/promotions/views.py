@@ -1,4 +1,5 @@
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -35,18 +36,28 @@ class CampaignViewSet(core_views.ActionsViewSet):
     ]
     disabled_actions = ["partial_update"]
 
+    @extend_schema(
+        request=None,
+        responses={200: None, 409: None},
+        description="Activate campaign.",
+    )
     @action(detail=True, methods=["post"])
     def activate(self, request, uuid=None):
-        campaign = self.get_object()
+        campaign: models.Campaign = self.get_object()
         campaign.activate()
         campaign.save()
         return Response("Campaign has been activated", status=status.HTTP_200_OK)
 
     activate_validators = [core_validators.StateValidator(models.Campaign.States.DRAFT)]
 
+    @extend_schema(
+        request=None,
+        responses={200: None, 409: None},
+        description="Terminate campaign.",
+    )
     @action(detail=True, methods=["post"])
     def terminate(self, request, uuid=None):
-        campaign = self.get_object()
+        campaign: models.Campaign = self.get_object()
         campaign.terminate()
         campaign.save()
         return Response("Campaign has been terminated", status=status.HTTP_200_OK)
@@ -57,9 +68,15 @@ class CampaignViewSet(core_views.ActionsViewSet):
         )
     ]
 
+    @extend_schema(
+        request=None,
+        responses=marketplace_serializers.OrderDetailsSerializer(many=True),
+        description="Return a list of orders for which the campaign is applied.",
+        filters=False,
+    )
     @action(detail=True, methods=["get"])
     def orders(self, request, uuid=None):
-        campaign = self.get_object()
+        campaign: models.Campaign = self.get_object()
         resources = models.DiscountedResource.objects.filter(
             campaign=campaign
         ).values_list("resource", flat=True)
@@ -69,9 +86,15 @@ class CampaignViewSet(core_views.ActionsViewSet):
         )
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        request=None,
+        responses=marketplace_serializers.ResourceSerializer(many=True),
+        description="Return a list of resources for which the campaign is applied.",
+        filters=False,
+    )
     @action(detail=True, methods=["get"])
     def resources(self, request, uuid=None):
-        campaign = self.get_object()
+        campaign: models.Campaign = self.get_object()
         discounted_resources = models.DiscountedResource.objects.filter(
             campaign=campaign
         ).values_list("resource", flat=True)

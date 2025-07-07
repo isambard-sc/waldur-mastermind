@@ -20,10 +20,9 @@ coverage.xml
 test_report.xml
 .cache/
 .pytest_cache/
-
-# documentation
-docs/_build/
-docs/drfapi/
+pytest.ini
 
 /static
 __pycache__/
+
+.vscode/

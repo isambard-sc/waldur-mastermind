@@ -4,6 +4,7 @@ import re
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
+from django.core import validators
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 from django_fsm import FSMIntegerField
@@ -11,6 +12,7 @@ from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
 
 from waldur_core.core import models as core_models
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.validators import validate_name, validate_template_syntax
 from waldur_core.media import models as media_models
 from waldur_core.structure import models as structure_models
@@ -35,6 +37,9 @@ class Issue(
     TimeStampedModel,
     core_models.StateMixin,
 ):
+    comments: models.Manager["Comment"]
+    attachments: models.Manager["Attachment"]
+
     class Meta:
         ordering = ["-created"]
         unique_together = ("backend_name", "backend_id")
@@ -60,7 +65,7 @@ class Issue(
     resolution = models.CharField(max_length=255, blank=True)
     priority = models.CharField(max_length=255, blank=True)
 
-    caller = models.ForeignKey(
+    caller = models.ForeignKey[core_models.User](
         settings.AUTH_USER_MODEL,
         related_name="created_issues",
         blank=True,
@@ -68,7 +73,7 @@ class Issue(
         help_text=_("Waldur user who has reported the issue."),
         on_delete=models.SET_NULL,
     )
-    reporter = models.ForeignKey(
+    reporter = models.ForeignKey["SupportUser"](
         "SupportUser",
         related_name="reported_issues",
         blank=True,
@@ -78,7 +83,7 @@ class Issue(
         ),
         on_delete=models.PROTECT,
     )
-    assignee = models.ForeignKey(
+    assignee = models.ForeignKey["SupportUser"](
         "SupportUser",
         related_name="issues",
         blank=True,
@@ -111,7 +116,7 @@ class Issue(
 
     first_response_sla = models.DateTimeField(blank=True, null=True)
     resolution_date = models.DateTimeField(blank=True, null=True)
-    template = models.ForeignKey(
+    template = models.ForeignKey["Template"](
         "Template",
         related_name="issues",
         blank=True,
@@ -172,21 +177,21 @@ class Issue(
         )
 
     @property
-    def resolved(self):
+    def resolved(self) -> bool | None:
         return IssueStatus.check_success_status(self.status)
 
     def set_resolved(self):
         self.status = (
             IssueStatus.objects.filter(type=IssueStatus.Types.RESOLVED).first().name
         )
-        self.state = Issue.States.OK
+        self.state = CoreStates.OK
         self.save()
 
     def set_canceled(self):
         self.status = (
             IssueStatus.objects.filter(type=IssueStatus.Types.CANCELED).first().name
         )
-        self.state = Issue.States.OK
+        self.state = CoreStates.OK
         self.save()
 
     def __str__(self):
@@ -219,11 +224,16 @@ class SupportUser(
     core_models.NameMixin,
     models.Model,
 ):
+    reported_issues: models.Manager["Issue"]
+    issues: models.Manager["Issue"]
+    comments: models.Manager["Comment"]
+    attachments: models.Manager["Attachment"]
+
     class Meta:
         ordering = ["name"]
         unique_together = ("backend_name", "backend_id", "user")
 
-    user = models.ForeignKey(
+    user = models.ForeignKey[core_models.User](
         on_delete=models.CASCADE,
         to=settings.AUTH_USER_MODEL,
         related_name="+",
@@ -318,7 +328,30 @@ class Comment(
         return self.description[:50]
 
 
+class FileMixin:
+    @property
+    def file_size(self) -> int:
+        if self.file:
+            return (
+                media_models.File.objects.filter(name=self.file.name)
+                .only("size")
+                .get()
+                .size
+            )
+
+    @property
+    def mime_type(self) -> str:
+        if self.file:
+            return (
+                media_models.File.objects.filter(name=self.file.name)
+                .only("mime_type")
+                .get()
+                .mime_type
+            )
+
+
 class Attachment(
+    FileMixin,
     BackendNameMixin,
     core_models.UuidMixin,
     TimeStampedModel,
@@ -356,28 +389,11 @@ class Attachment(
     def get_log_fields(self):
         return ("uuid", "issue", "author", "backend_id")
 
-    @property
-    def file_size(self):
-        if self.file:
-            return (
-                media_models.File.objects.filter(name=self.file.name)
-                .only("size")
-                .get()
-                .size
-            )
-
-    @property
-    def mime_type(self):
-        if self.file:
-            return (
-                media_models.File.objects.filter(name=self.file.name)
-                .only("mime_type")
-                .get()
-                .mime_type
-            )
-
 
 class Template(core_models.UuidMixin, core_models.NameMixin, TimeStampedModel):
+    issues: models.Manager["Issue"]
+    attachments: models.Manager["TemplateAttachment"]
+
     class IssueTypes:
         INFORMATIONAL = "INFORMATIONAL"
         SERVICE_REQUEST = "SERVICE_REQUEST"
@@ -391,9 +407,7 @@ class Template(core_models.UuidMixin, core_models.NameMixin, TimeStampedModel):
             (INCIDENT, "Incident"),
         )
 
-    native_name = models.CharField(max_length=150, blank=True)
     description = models.TextField()
-    native_description = models.TextField(blank=True)
     issue_type = models.CharField(
         max_length=30, choices=IssueTypes.CHOICES, default=IssueTypes.INFORMATIONAL
     )
@@ -407,7 +421,7 @@ class Template(core_models.UuidMixin, core_models.NameMixin, TimeStampedModel):
 
 
 class TemplateAttachment(
-    core_models.UuidMixin, core_models.NameMixin, TimeStampedModel
+    FileMixin, core_models.UuidMixin, core_models.NameMixin, TimeStampedModel
 ):
     template = models.ForeignKey(
         Template, on_delete=models.CASCADE, related_name="attachments"
@@ -531,22 +545,13 @@ class Feedback(
     TimeStampedModel,
     core_models.StateMixin,
 ):
-    class Evaluation:
-        CHOICES = (
-            (1, "1"),
-            (2, "2"),
-            (3, "3"),
-            (4, "4"),
-            (5, "5"),
-            (6, "6"),
-            (7, "7"),
-            (8, "8"),
-            (9, "9"),
-            (10, "10"),
-        )
-
     issue = models.OneToOneField(Issue, on_delete=models.CASCADE)
-    evaluation = models.SmallIntegerField(choices=Evaluation.CHOICES)
+    evaluation = models.SmallIntegerField(
+        validators=[
+            validators.MinValueValidator(1),
+            validators.MaxValueValidator(10),
+        ]
+    )
     comment = models.TextField(blank=True)
 
     def __str__(self):

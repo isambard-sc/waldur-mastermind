@@ -1,4 +1,5 @@
 import logging
+from typing import cast
 from urllib.parse import urlparse
 
 from django.core import validators
@@ -10,6 +11,7 @@ from django.utils.translation import gettext_lazy as _
 from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
 
+from waldur_core.core import exceptions as core_exceptions
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core.fields import JSONField
@@ -33,6 +35,24 @@ class Tenant(
     core_models.RuntimeStateMixin,
     structure_models.BaseResource,
 ):
+    flavors: models.Manager["Flavor"]
+    images: models.Manager["Image"]
+    volume_types: models.Manager["VolumeType"]
+    server_groups: models.Manager["ServerGroup"]
+    security_groups: models.Manager["SecurityGroup"]
+    floating_ips: models.Manager["FloatingIP"]
+    routers: models.Manager["Router"]
+    networks: models.Manager["Network"]
+    ports: models.Manager["Port"]
+    volume_availability_zones: models.Manager["VolumeAvailabilityZone"]
+    volumes: models.Manager["Volume"]
+    snapshots: models.Manager["Snapshot"]
+    instance_availability_zones: models.Manager["InstanceAvailabilityZone"]
+    instances: models.Manager["Instance"]
+    backups: models.Manager["Backup"]
+    network_rbac_policies: models.Manager["NetworkRBACPolicy"]
+    id: int
+
     class Quotas(QuotaModelMixin.Quotas):
         vcpu = QuotaField(default_limit=20, is_backend=True)
         ram = QuotaField(default_limit=51200, is_backend=True)
@@ -96,7 +116,7 @@ class Tenant(
             "runtime_state",
         )
 
-    def get_access_url(self):
+    def get_access_url(self) -> str:
         settings = self.service_settings
         access_url = settings.get_option("access_url")
         if access_url:
@@ -113,6 +133,36 @@ class Tenant(
             return _("%s GB") % int(limit / 1024)
         else:
             return limit
+
+    @property
+    def available_subnets(self):
+        # Subnets directly belonging to the tenant
+        tenant_subnets = SubNet.objects.filter(tenant=self)
+        # Subnets from networks shared with the tenant via RBAC
+        shared_network_ids = NetworkRBACPolicy.objects.filter(
+            target_tenant=self
+        ).values_list("network_id", flat=True)
+        shared_subnets = SubNet.objects.filter(network_id__in=shared_network_ids)
+        # Combine both
+        return (tenant_subnets | shared_subnets).distinct()
+
+    @property
+    def available_networks(self):
+        tenant_networks = Network.objects.filter(tenant=self)
+        shared_network_ids = NetworkRBACPolicy.objects.filter(
+            target_tenant=self
+        ).values_list("network_id", flat=True)
+        shared_networks = Network.objects.filter(id__in=shared_network_ids)
+        return (tenant_networks | shared_networks).distinct()
+
+    @property
+    def available_ports(self):
+        tenant_ports = Port.objects.filter(tenant=self)
+        shared_network_ids = NetworkRBACPolicy.objects.filter(
+            target_tenant=self
+        ).values_list("network_id", flat=True)
+        shared_ports = Port.objects.filter(network_id__in=shared_network_ids)
+        return (tenant_ports | shared_ports).distinct()
 
 
 class Flavor(structure_models.ServiceProperty):
@@ -205,6 +255,11 @@ class ServerGroup(structure_models.BaseResource):
 
 
 class SecurityGroup(structure_models.BaseResource):
+    rules: models.Manager["SecurityGroupRule"]
+    ports: models.Manager["Port"]
+    instances: models.Manager["Instance"]
+    id: int
+
     tenant = models.ForeignKey(
         on_delete=models.CASCADE, to=Tenant, related_name="security_groups"
     )
@@ -241,7 +296,10 @@ class SecurityGroup(structure_models.BaseResource):
         return super().get_backend_fields() + ("name", "description")
 
 
-class SecurityGroupRule(LoggableMixin, core_models.DescribableMixin, models.Model):
+class BaseSecurityGroupRule(core_models.DescribableMixin, models.Model):
+    class Meta:
+        abstract = True
+
     TCP = "tcp"
     UDP = "udp"
     ICMP = "icmp"
@@ -282,6 +340,11 @@ class SecurityGroupRule(LoggableMixin, core_models.DescribableMixin, models.Mode
 
     backend_id = models.CharField(max_length=36, blank=True)
 
+
+class SecurityGroupRule(BaseSecurityGroupRule, LoggableMixin):
+    remote_group_id: int | None
+    security_group_id: int
+
     def __str__(self):
         return f"{self.security_group} ({self.protocol}): {self.cidr} ({self.from_port} -> {self.to_port})"
 
@@ -317,14 +380,14 @@ class FloatingIP(core_models.RuntimeStateMixin, structure_models.BaseResource):
     address = models.GenericIPAddressField(
         null=True, blank=True, protocol="IPv4", default=None
     )
-    external_address = models.JSONField(
+    external_address = models.GenericIPAddressField(
         editable=False,
-        default=list,
+        null=True,
         help_text="An optional address that maps to floating IP's address",
     )
 
     backend_network_id = models.CharField(max_length=255, editable=False)
-    port = models.ForeignKey(
+    port = models.ForeignKey["Port"](
         on_delete=models.SET_NULL,
         to="Port",
         related_name="floating_ips",
@@ -368,11 +431,12 @@ class FloatingIP(core_models.RuntimeStateMixin, structure_models.BaseResource):
 
 
 class Router(structure_models.BaseResource):
-    tenant: Tenant = models.ForeignKey(
+    tenant = models.ForeignKey(
         on_delete=models.CASCADE, to=Tenant, related_name="routers"
     )
     routes = JSONField(default=list)
     fixed_ips = JSONField(default=list)
+    ports = models.ManyToManyField("Port", related_name="routers", blank=True)
 
     tracker = FieldTracker()
 
@@ -385,6 +449,10 @@ class Router(structure_models.BaseResource):
 
 
 class Network(core_models.RuntimeStateMixin, structure_models.BaseResource):
+    subnets: models.Manager["SubNet"]
+    ports: models.Manager["Port"]
+    rbac_policies: models.Manager["NetworkRBACPolicy"]
+
     tenant = models.ForeignKey(
         on_delete=models.CASCADE, to=Tenant, related_name="networks"
     )
@@ -429,9 +497,9 @@ class Network(core_models.RuntimeStateMixin, structure_models.BaseResource):
 
 
 class SubNet(structure_models.BaseResource):
-    tenant: Tenant = models.ForeignKey(
-        on_delete=models.CASCADE, to=Tenant, related_name="+"
-    )
+    ports: models.Manager["Port"]
+
+    tenant = models.ForeignKey(on_delete=models.CASCADE, to=Tenant, related_name="+")
     network = models.ForeignKey(
         on_delete=models.CASCADE, to=Network, related_name="subnets"
     )
@@ -442,7 +510,7 @@ class SubNet(structure_models.BaseResource):
     )
     cidr = models.CharField(max_length=32, blank=True)
     gateway_ip = models.GenericIPAddressField(protocol="IPv4", null=True)
-    allocation_pools = JSONField(default=dict)
+    allocation_pools = cast(list[dict[str, str]], JSONField(default=dict))
     ip_version = models.SmallIntegerField(default=4)
     enable_dhcp = models.BooleanField(default=True)
     dns_nameservers = JSONField(
@@ -490,7 +558,9 @@ class SubNet(structure_models.BaseResource):
 
 
 class Port(structure_models.BaseResource):
-    tenant: Tenant = models.ForeignKey(
+    floating_ips: models.Manager["FloatingIP"]
+
+    tenant = models.ForeignKey(
         on_delete=models.CASCADE, to=Tenant, related_name="ports"
     )
     network = models.ForeignKey(
@@ -502,7 +572,7 @@ class Port(structure_models.BaseResource):
     )
     port_security_enabled = models.BooleanField(default=True)
     security_groups = models.ManyToManyField(SecurityGroup, related_name="ports")
-    instance = models.ForeignKey(
+    instance = models.ForeignKey["Instance"](
         on_delete=models.CASCADE,
         to="Instance",
         related_name="ports",
@@ -544,6 +614,15 @@ class Port(structure_models.BaseResource):
         null=True,
         blank=True,
     )
+    admin_state_up = models.BooleanField(
+        blank=True,
+        null=True,
+    )
+    status = models.CharField(
+        max_length=30,
+        blank=True,
+        null=True,
+    )
 
     @classmethod
     def get_backend_fields(cls):
@@ -553,6 +632,10 @@ class Port(structure_models.BaseResource):
             "allowed_address_pairs",
             "device_id",
             "device_owner",
+            "admin_state_up",
+            "name",
+            "description",
+            "status",
         )
 
     @classmethod
@@ -560,7 +643,29 @@ class Port(structure_models.BaseResource):
         return "openstack-port"
 
     def __str__(self):
-        return self.name
+        """
+        Return a string representation of the port.
+
+        If fixed_ips exists and has IP addresses, return a comma-separated list of IP addresses.
+        Otherwise, return a generic representation with the name and ID.
+        """
+        if self.fixed_ips:
+            ips = []
+            for fixed_ip in self.fixed_ips:
+                ip_address = (
+                    fixed_ip.get("ip_address") if isinstance(fixed_ip, dict) else None
+                )
+                if ip_address:
+                    ips.append(ip_address)
+
+            if ips:
+                return ",".join(ips)
+
+        # Fallback if there are no fixed_ips, or they don't have ip_address
+        if self.name:
+            return f"Port {self.name}"
+        else:
+            return f"Port {self.uuid.hex}"
 
 
 class CustomerOpenStack(TimeStampedModel):
@@ -610,6 +715,9 @@ class VolumeAvailabilityZone(structure_models.BaseServiceProperty):
 
 
 class Volume(core_models.ActionMixin, TenantQuotaMixin, structure_models.Storage):
+    snapshots: models.Manager["Snapshot"]
+    restoration: models.Manager["SnapshotRestoration"]
+
     tenant = models.ForeignKey(
         on_delete=models.CASCADE, to=Tenant, related_name="volumes"
     )
@@ -617,7 +725,7 @@ class Volume(core_models.ActionMixin, TenantQuotaMixin, structure_models.Storage
     # it wouldn't be possible to put a unique constraint on it
     backend_id = models.CharField(max_length=255, blank=True, null=True)
 
-    instance = models.ForeignKey(
+    instance = models.ForeignKey["Instance"](
         on_delete=models.CASCADE,
         to="Instance",
         related_name="volumes",
@@ -640,13 +748,13 @@ class Volume(core_models.ActionMixin, TenantQuotaMixin, structure_models.Storage
     image = models.ForeignKey(Image, blank=True, null=True, on_delete=models.SET_NULL)
     image_name = models.CharField(max_length=150, blank=True)
     image_metadata = JSONField(blank=True)
-    type: VolumeType = models.ForeignKey(
+    type = models.ForeignKey(
         VolumeType, blank=True, null=True, on_delete=models.SET_NULL
     )
     availability_zone = models.ForeignKey(
         VolumeAvailabilityZone, blank=True, null=True, on_delete=models.SET_NULL
     )
-    source_snapshot: "Snapshot" = models.ForeignKey(
+    source_snapshot = models.ForeignKey(
         "Snapshot",
         related_name="volumes",
         blank=True,
@@ -692,8 +800,22 @@ class Volume(core_models.ActionMixin, TenantQuotaMixin, structure_models.Storage
             "image_name",
         )
 
+    @property
+    def extend_enabled(self):
+        from waldur_openstack import utils
+
+        try:
+            utils.check_volume_resize_enabled(self)
+            return True
+        except core_exceptions.IncorrectStateException:
+            return False
+
 
 class Snapshot(core_models.ActionMixin, TenantQuotaMixin, structure_models.Storage):
+    volumes: models.Manager["Volume"]
+    restorations: models.Manager["SnapshotRestoration"]
+    backups: models.Manager["Backup"]
+
     tenant = models.ForeignKey(
         on_delete=models.CASCADE, to=Tenant, related_name="snapshots"
     )
@@ -701,17 +823,10 @@ class Snapshot(core_models.ActionMixin, TenantQuotaMixin, structure_models.Stora
     # it wouldn't be possible to put a unique constraint on it
     backend_id = models.CharField(max_length=255, blank=True, null=True)
 
-    source_volume: Volume = models.ForeignKey(
+    source_volume = models.ForeignKey(
         Volume, related_name="snapshots", null=True, on_delete=models.CASCADE
     )
     metadata = JSONField(blank=True)
-    snapshot_schedule = models.ForeignKey(
-        "SnapshotSchedule",
-        blank=True,
-        null=True,
-        on_delete=models.SET_NULL,
-        related_name="snapshots",
-    )
 
     tracker = FieldTracker()
 
@@ -783,6 +898,11 @@ class InstanceAvailabilityZone(structure_models.BaseServiceProperty):
 class Instance(
     core_models.ActionMixin, TenantQuotaMixin, structure_models.VirtualMachine
 ):
+    id: int
+    ports: models.Manager["Port"]
+    volumes: models.Manager["Volume"]
+    backups: models.Manager["Backup"]
+
     class RuntimeStates:
         # All possible OpenStack Instance states on backend.
         # See https://docs.openstack.org/developer/nova/vmstates.html
@@ -839,33 +959,32 @@ class Instance(
         ordering = ["name", "created"]
 
     @property
-    def external_ips(self):
+    def external_ips(self) -> list[str]:
         floating_ips = set(self.floating_ips.values_list("address", flat=True))
         if self.directly_connected_ips:
             floating_ips = floating_ips.union(
                 set(self.directly_connected_ips.split(","))
             )
-        return list(floating_ips - set(self.internal_ips))
+        return (
+            list(floating_ips - set(self.internal_ips))
+            if self.internal_ips
+            else list(floating_ips)
+        )
 
     @property
-    def external_address(self):
-        external_address = set()
-
-        for a in self.floating_ips.values_list("external_address", flat=True):
-            external_address.update(set(a))
-
-        return list(external_address)
+    def external_address(self) -> set[str]:
+        return set(self.floating_ips.values_list("external_address", flat=True))
 
     @property
     def internal_ips(self):
-        return [
-            val["ip_address"]
-            for ip_list in self.ports.values_list("fixed_ips", flat=True)
-            for val in ip_list
-        ]
+        internal_ips = set()
+        for ip_list in self.ports.values_list("fixed_ips", flat=True):
+            if ip_list:
+                internal_ips.update({val["ip_address"] for val in ip_list})
+        return list(internal_ips)
 
     @property
-    def size(self):
+    def size(self) -> int:
         return self.volumes.aggregate(models.Sum("size"))["size__sum"]
 
     @classmethod
@@ -891,7 +1010,7 @@ class Instance(
         }
 
     @property
-    def floating_ips(self):
+    def floating_ips(self) -> models.QuerySet[FloatingIP]:
         return FloatingIP.objects.filter(port__instance=self)
 
     @classmethod
@@ -918,18 +1037,13 @@ class Instance(
 
 
 class Backup(structure_models.BaseResource):
+    restorations: models.Manager["BackupRestoration"]
+
     tenant = models.ForeignKey(
         on_delete=models.CASCADE, to=Tenant, related_name="backups"
     )
     instance = models.ForeignKey(
         Instance, related_name="backups", on_delete=models.CASCADE
-    )
-    backup_schedule = models.ForeignKey(
-        "BackupSchedule",
-        blank=True,
-        null=True,
-        on_delete=models.SET_NULL,
-        related_name="backups",
     )
     kept_until = models.DateTimeField(
         null=True,
@@ -967,50 +1081,45 @@ class BackupRestoration(core_models.UuidMixin, TimeStampedModel):
         project_path = "backup__project"
 
 
-class BaseSchedule(structure_models.BaseResource, core_models.ScheduleMixin):
-    retention_time = models.PositiveIntegerField(
-        help_text=_("Retention time in days, if 0 - resource will be kept forever")
+class NetworkRBACPolicy(
+    core_models.UuidMixin, core_models.BackendMixin, core_models.TimeStampedModel
+):
+    class Permissions:
+        customer_path = "network__tenant__project__customer"
+        project_path = "network__tenant__project"
+
+    class NetworkShareType:
+        SHARED = "access_as_shared"
+        EXTERNAL = "access_as_external"
+
+        CHOICES = (
+            (SHARED, "Shared"),
+            (EXTERNAL, "External"),
+        )
+
+    network = models.ForeignKey(
+        Network,
+        on_delete=models.CASCADE,
+        related_name="rbac_policies",
     )
-    maximal_number_of_resources = models.PositiveSmallIntegerField()
-    call_count = models.PositiveSmallIntegerField(
-        default=0, help_text=_("How many times a resource schedule was called.")
+
+    target_tenant = models.ForeignKey["Tenant"](
+        "openstack.Tenant",
+        on_delete=models.CASCADE,
+        related_name="network_rbac_policies",
+    )
+
+    policy_type = models.CharField(
+        max_length=255,
+        default=NetworkShareType.SHARED,
+        choices=NetworkShareType.CHOICES,
     )
 
     class Meta:
-        abstract = True
-
-
-class BackupSchedule(BaseSchedule):
-    tenant = models.ForeignKey(
-        on_delete=models.CASCADE, to=Tenant, related_name="backup_schedules"
-    )
-    instance = models.ForeignKey(
-        on_delete=models.CASCADE, to=Instance, related_name="backup_schedules"
-    )
-
-    tracker = FieldTracker()
+        verbose_name = "Network RBAC Policy"
+        verbose_name_plural = "Network RBAC Policies"
+        unique_together = ("network", "target_tenant", "policy_type")
+        ordering = ["-created"]
 
     def __str__(self):
-        return f"BackupSchedule of {self.instance}. Active: {self.is_active}"
-
-    @classmethod
-    def get_url_name(cls):
-        return "openstack-backup-schedule"
-
-
-class SnapshotSchedule(BaseSchedule):
-    tenant = models.ForeignKey(
-        on_delete=models.CASCADE, to=Tenant, related_name="snapshot_schedules"
-    )
-    source_volume = models.ForeignKey(
-        on_delete=models.CASCADE, to=Volume, related_name="snapshot_schedules"
-    )
-
-    tracker = FieldTracker()
-
-    def __str__(self):
-        return f"SnapshotSchedule of {self.source_volume}. Active: {self.is_active}"
-
-    @classmethod
-    def get_url_name(cls):
-        return "openstack-snapshot-schedule"
+        return f"RBAC policy for {self.network} to {self.target_tenant}"

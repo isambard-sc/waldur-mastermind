@@ -6,6 +6,7 @@ from django.conf import settings
 from freezegun import freeze_time
 from rest_framework import status, test
 
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.utils import is_uuid_like, make_random_password
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import ProjectRole
@@ -88,19 +89,6 @@ class TenantCreateTest(BaseTenantActionsTest):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         self.assertTrue(
-            models.Tenant.objects.filter(name=self.valid_data["name"]).exists()
-        )
-
-    @data("admin", "manager", "owner")
-    def test_cannot_create_tenant_with_shared_service_settings(self, user):
-        self.fixture.settings.shared = True
-        self.fixture.settings.save()
-        self.client.force_authenticate(getattr(self.fixture, user))
-
-        response = self.client.post(self.url, data=self.valid_data)
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertFalse(
             models.Tenant.objects.filter(name=self.valid_data["name"]).exists()
         )
 
@@ -360,6 +348,21 @@ class TenantCreateTest(BaseTenantActionsTest):
         self.assertTrue(
             is_uuid_like(models.Tenant.objects.get(uuid=response.data["uuid"]).task_id)
         )
+
+    def test_tenant_creation_with_subnet_cidr_creates_correct_allocation_pools(self):
+        self.client.force_authenticate(self.fixture.staff)
+        valid_data = self.valid_data
+        valid_data["subnet_cidr"] = "192.168.42.0/29"
+
+        response = self.client.post(self.url, data=self.valid_data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(
+            models.Tenant.objects.filter(name=self.valid_data["name"]).exists()
+        )
+        tenant = models.Tenant.objects.get(name=self.valid_data["name"])
+        subnet = models.SubNet.objects.get(tenant=tenant)
+        self.assertFalse(subnet.allocation_pools)
 
 
 @ddt
@@ -665,7 +668,7 @@ class TenantChangePasswordTest(BaseTenantActionsTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_user_cannot_change_password_if_tenant_is_not_in_OK_state(self):
-        self.tenant.state = self.tenant.States.ERRED
+        self.tenant.state = CoreStates.ERRED
         self.tenant.save()
 
         self.client.force_authenticate(self.fixture.owner)
@@ -734,13 +737,13 @@ class TenantTasksTest(test.APITransactionTestCase):
 
     def test_mark_as_erred_old_tenants_in_deleting_state(self):
         with freeze_time("2022-01-01"):
-            self.tenant.state = models.Tenant.States.DELETING
+            self.tenant.state = CoreStates.DELETING
             self.tenant.save()
             tasks.mark_as_erred_old_tenants_in_deleting_state()
             self.tenant.refresh_from_db()
-            self.assertEqual(self.tenant.state, models.Tenant.States.DELETING)
+            self.assertEqual(self.tenant.state, CoreStates.DELETING)
 
         with freeze_time("2022-01-02"):
             tasks.mark_as_erred_old_tenants_in_deleting_state()
             self.tenant.refresh_from_db()
-            self.assertEqual(self.tenant.state, models.Tenant.States.ERRED)
+            self.assertEqual(self.tenant.state, CoreStates.ERRED)

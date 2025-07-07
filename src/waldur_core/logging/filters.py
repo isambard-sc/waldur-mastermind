@@ -141,10 +141,27 @@ class EventFilterBackend(filters.BaseFilterBackend):
 
 
 class EventSubscriptionFilter(django_filters.FilterSet):
-    o = django_filters.OrderingFilter(fields=("created"))
+    o = django_filters.OrderingFilter(fields=["created"])
     user_uuid = django_filters.CharFilter(field_name="user__uuid")
     user_username = django_filters.CharFilter(field_name="user__username")
 
     class Meta:
         model = models.EventSubscription
         fields = []
+
+
+class EmailLogFilter(django_filters.FilterSet):
+    subject = django_filters.CharFilter(lookup_expr="icontains")
+    body = django_filters.CharFilter(lookup_expr="icontains")
+    emails = django_filters.CharFilter(lookup_expr="icontains")
+    sent_at = django_filters.DateFilter(field_name="sent_at", lookup_expr="date")
+    o = django_filters.OrderingFilter(fields=["sent_at", "subject"])
+
+    class Meta:
+        model = models.EmailLog
+        fields = [
+            "sent_at",
+            "subject",
+            "body",
+            "emails",
+        ]

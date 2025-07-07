@@ -5,16 +5,17 @@ from django.db import transaction
 
 from waldur_auth_social.models import ProviderChoices
 from waldur_core.core import middleware
+from waldur_core.core.enums import ReviewStates
 from waldur_core.core.utils import serialize_instance
 from waldur_core.permissions import signals as permission_signals
 from waldur_core.permissions.enums import RoleEnum
+from waldur_core.permissions.fixtures import ServiceProviderRole
 from waldur_core.permissions.models import UserRole
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace_remote import PLUGIN_NAME, log, models, tasks, utils
 from waldur_mastermind.marketplace_remote.utils import INVALID_RESOURCE_STATES
-
-from . import PLUGIN_NAME, log, models, tasks, utils
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +77,10 @@ def create_request_when_project_is_updated(sender, instance, created=False, **kw
         return
 
     qs = models.ProjectUpdateRequest.objects.filter(
-        project=instance, state=models.ProjectUpdateRequest.States.PENDING
+        project=instance, state=ReviewStates.PENDING
     )
     if qs.exists():
-        qs.update(state=models.ProjectUpdateRequest.States.CANCELED)
+        qs.update(state=ReviewStates.CANCELED)
     payload = {}
     for key in structure_models.PROJECT_DETAILS_FIELDS:
         payload[f"old_{key}"] = instance.tracker.previous(key)
@@ -98,7 +99,7 @@ def create_request_when_project_is_updated(sender, instance, created=False, **kw
         project_request = models.ProjectUpdateRequest.objects.create(
             project=instance,
             offering=offering,
-            state=models.ProjectUpdateRequest.States.PENDING,
+            state=ReviewStates.PENDING,
             **payload,
         )
         logger.info(
@@ -107,12 +108,9 @@ def create_request_when_project_is_updated(sender, instance, created=False, **kw
             user,
         )
         # Auto-approve if possible
-        # Code from waldur_mastermind.marketplace.permissions.user_is_service_provider_owner_or_service_provider_manager
         if structure_permissions._has_owner_access(
             user, offering.customer
-        ) or offering.customer.has_user(
-            user, role=structure_models.CustomerRole.SERVICE_MANAGER
-        ):
+        ) or offering.customer.has_user(user, role=ServiceProviderRole.MANAGER):
             logger.info(
                 "The user %s can automatically approve the request %s.",
                 user,
@@ -138,7 +136,7 @@ def sync_remote_project_when_request_is_approved(
 
     if (
         not instance.tracker.has_changed("state")
-        or instance.state != models.ProjectUpdateRequest.States.APPROVED
+        or instance.state != ReviewStates.APPROVED
     ):
         return
 
@@ -167,13 +165,13 @@ def log_request_events(sender, instance, created=False, **kwargs):
         return
     if not instance.tracker.has_changed("state"):
         return
-    if instance.state == models.ProjectUpdateRequest.States.APPROVED:
+    if instance.state == ReviewStates.APPROVED:
         log.event_logger.project_update_request.info(
             "Project update request has been approved.",
             event_type="project_update_request_approved",
             event_context=event_context,
         )
-    elif instance.state == models.ProjectUpdateRequest.States.REJECTED:
+    elif instance.state == ReviewStates.REJECTED:
         log.event_logger.project_update_request.info(
             "Project update request has been rejected.",
             event_type="project_update_request_rejected",
@@ -199,7 +197,7 @@ def notify_about_project_details_update(sender, instance, created=False, **kwarg
 
     if (
         not instance.tracker.has_changed("state")
-        or instance.state != models.ProjectUpdateRequest.States.APPROVED
+        or instance.state != ReviewStates.APPROVED
     ):
         return
 

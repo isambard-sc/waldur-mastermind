@@ -3,13 +3,14 @@ from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.utils import timezone
 from model_utils import FieldTracker
-from model_utils.fields import AutoCreatedField
+from model_utils.models import TimeStampedModel
 
 from waldur_core.core.managers import GenericKeyMixin
 from waldur_core.core.mixins import ScopeMixin
 from waldur_core.core.models import DescribableMixin, User, UuidMixin
 
 from . import signals
+from .enums import TYPE_MAP
 
 
 class RoleManager(models.Manager):
@@ -21,6 +22,8 @@ class RoleManager(models.Manager):
 
 
 class Role(DescribableMixin, UuidMixin):
+    permissions: models.Manager["RolePermission"]
+
     name = models.CharField(unique=True, db_index=True, max_length=150)
     is_system_role = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
@@ -50,19 +53,18 @@ class UserRoleManager(GenericKeyMixin, models.Manager):
     pass
 
 
-class UserRole(ScopeMixin, UuidMixin):
-    user: User = models.ForeignKey(
+class UserRole(TimeStampedModel, ScopeMixin, UuidMixin):
+    user = models.ForeignKey[User](
         on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL, db_index=True
     )
     role = models.ForeignKey(on_delete=models.CASCADE, to=Role, db_index=True)
-    created_by = models.ForeignKey(
+    created_by = models.ForeignKey[User](
         on_delete=models.CASCADE,
         to=settings.AUTH_USER_MODEL,
         null=True,
         blank=True,
         related_name="+",
     )
-    created = AutoCreatedField()
     expiration_time = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(null=True, default=True, db_index=True)
     tracker = FieldTracker(fields=["expiration_time", "is_active"])
@@ -89,6 +91,29 @@ class UserRole(ScopeMixin, UuidMixin):
             instance=self,
             current_user=current_user,
         )
+
+    @classmethod
+    def get_scope_model_references(cls):
+        """Return the app.model references for supported scope types."""
+        return [f"{app}.{model}" for _, (app, model) in TYPE_MAP.items()]
+
+    @classmethod
+    def get_scope_content_types(cls):
+        """Get ContentType objects for all supported scopes."""
+        from django.apps import apps
+
+        model_refs = cls.get_scope_model_references()
+        models = []
+
+        for ref in model_refs:
+            try:
+                models.append(apps.get_model(ref))
+            except LookupError:
+                pass
+
+        if models:
+            return ContentType.objects.get_for_models(*models)
+        return {}
 
     class Meta:
         ordering = ["created"]

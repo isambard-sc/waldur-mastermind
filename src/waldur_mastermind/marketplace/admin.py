@@ -24,6 +24,7 @@ from waldur_core.structure.models import (
     SharedServiceSettings,
 )
 from waldur_mastermind.google.models import GoogleCalendar, GoogleCredentials
+from waldur_mastermind.marketplace.enums import OfferingStates, ResourceStates
 from waldur_mastermind.marketplace_openstack import (
     executors as marketplace_openstack_executors,
 )
@@ -336,6 +337,7 @@ class OfferingAdmin(VersionAdmin, admin.ModelAdmin):
         "shared",
         "billable",
         "type",
+        ("customer", RelatedOnlyDropdownFilter),
         ("category", RelatedOnlyDropdownFilter),
     )
     date_hierarchy = "created"
@@ -346,15 +348,12 @@ class OfferingAdmin(VersionAdmin, admin.ModelAdmin):
         "customer",
         "category",
         "name",
-        "native_name",
         "description",
-        "native_description",
         "full_description",
         "country",
         "terms_of_service",
         "terms_of_service_link",
         "privacy_policy_link",
-        "rating",
         "thumbnail",
         "attributes",
         "options",
@@ -375,7 +374,6 @@ class OfferingAdmin(VersionAdmin, admin.ModelAdmin):
         "image",
     )
     readonly_fields = (
-        "rating",
         "scope_link",
         "citation_count",
         "uuid",
@@ -397,9 +395,9 @@ class OfferingAdmin(VersionAdmin, admin.ModelAdmin):
 
     def activate(self, request, queryset):
         valid_states = [
-            models.Offering.States.DRAFT,
-            models.Offering.States.PAUSED,
-            models.Offering.States.ARCHIVED,
+            OfferingStates.DRAFT,
+            OfferingStates.PAUSED,
+            OfferingStates.ARCHIVED,
         ]
         valid_offerings = queryset.filter(state__in=valid_states)
         count = valid_offerings.count()
@@ -500,7 +498,6 @@ class OfferingUserAdmin(admin.ModelAdmin):
         "offering",
         "user",
         "username",
-        "propagation_date",
     )
 
 
@@ -677,10 +674,7 @@ class ResourceAdmin(core_admin.ExtraActionsMixin, admin.ModelAdmin):
         confirmation = True
 
         def validate(self, resource):
-            if resource.state not in (
-                models.Resource.States.OK,
-                models.Resource.States.ERRED,
-            ):
+            if resource.state not in (ResourceStates.OK, ResourceStates.ERRED):
                 raise ValidationError(_("Resource has to be in OK or ERRED state."))
 
         def get_execute_params(self, request, instance):
@@ -695,7 +689,7 @@ class ResourceAdmin(core_admin.ExtraActionsMixin, admin.ModelAdmin):
         confirmation = True
 
         def validate(self, resource):
-            if resource.state != models.Resource.States.OK:
+            if resource.state != ResourceStates.OK:
                 raise ValidationError(_("Resource has to be in OK state."))
 
     restore_limits = RestoreLimits()

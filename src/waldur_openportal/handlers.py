@@ -35,9 +35,26 @@ def schedule_sync(*args, **kwargs):
     that all users are correctly associated with all projects and
     instances, and will add/remove users as needed
     """
-
     logger.info("Scheduling OpenPortal synchronization.")
+
+    # We will rate-limit by synchronizing only once per transaction.
+    # This is useful for when multiple changes are made in a single transaction,
+    # such as when a user is created and then immediately added to a project.
+    if transaction.get_connection().in_atomic_block:
+        logger.info("OpenPortal synchronization already scheduled in this transaction.")
+        return
+
     transaction.on_commit(lambda: tasks.sync.delay())
+
+
+@if_plugin_enabled
+def schedule_deletion_sync(*args, **kwargs):
+    """
+    Schedule a synchronization of OpenPortal data after a project or
+    customer is deleted. This will double-check that all users are correctly
+    associated with the project/customer, and will remove users as needed.
+    """
+    logger.info("[TODO] Scheduling OpenPortal synchronization after deletion.")
 
 
 @if_plugin_enabled
@@ -65,6 +82,64 @@ def schedule_sync_on_quota_change(sender, instance, created=False, **kwargs):
 
 
 @if_plugin_enabled
+def update_project(sender, instance, force_add=False, **kwargs):
+    """
+    Update the project (passed as "instance") in OpenPortal. If this
+    is a remote project, then it will send the OpenPortal remote
+    commands to update the project in the remote portal
+    """
+    project = instance
+
+    if force_add or set(project.tracker.changed()) & {
+        "name",
+        "description",
+        "start_date",
+        "end_date",
+    }:
+        # check to see if there are any remote allocations associated
+        # with this project
+        remote_allocations = models.RemoteAllocation.objects.filter(
+            project=project,
+        )
+
+        if not remote_allocations.exists():
+            # nothing to do
+            return
+
+        # Either the project's name or description has changed, or the
+        # project has just been added to the user - we need to update the
+        # project (updating is the same as adding in OpenPortal)
+        logger.info(f"OpenPortal - updating project {project}")
+
+        transaction.on_commit(
+            lambda: tasks.update_remote_project.delay(
+                core_utils.serialize_instance(project)
+            )
+        )
+
+
+@if_plugin_enabled
+def delete_project(sender, instance, **kwargs):
+    """
+    Make sure to remote the project in the remote portal if it is
+    deleted from the top portal
+    """
+    project = instance
+
+    # check to see if there are any remote allocations associated
+    remote_allocations = models.RemoteAllocation.objects.filter(
+        project=project,
+    )
+
+    if remote_allocations.exists():
+        transaction.on_commit(
+            lambda: tasks.delete_remote_project.delay(
+                core_utils.serialize_instance(project)
+            )
+        )
+
+
+@if_plugin_enabled
 def update_user(sender, instance, force_add=False, **kwargs):
     """
     Update the user (passed as "instance") in OpenPortal. This will
@@ -73,10 +148,6 @@ def update_user(sender, instance, force_add=False, **kwargs):
     """
 
     user = instance
-
-    logger.info(
-        f"OpenPortal - updating user {user} - tracker {user.tracker.changed()} - force_add {force_add}"
-    )
 
     if force_add or set(user.tracker.changed()) & {"unix_username"}:
         # Either the user's unix_username has changed, or the user has
@@ -106,7 +177,6 @@ def delete_user(sender, instance, **kwargs):
     who are incorrectly still associated with projects.
     """
     user = instance
-    logger.info(f"OpenPortal - deleting user {user}")
 
     if not isinstance(instance, User):
         logger.error(f"OpenPortal - {user} is not a User instance - it is {type(user)}")
@@ -200,8 +270,36 @@ def update_quotas_on_allocation_usage_update(sender, instance, created=False, **
     update_quotas(project.customer, models.Allocation.Permissions.customer_path)
 
 
+@if_plugin_enabled
+def update_quotas_on_remote_allocation_usage_update(
+    sender, instance, created=False, **kwargs
+):
+    if created:
+        return
+
+    allocation = instance
+    if not allocation.usage_changed():
+        return
+
+    project = allocation.project
+    update_remote_quotas(project, models.RemoteAllocation.Permissions.project_path)
+    update_remote_quotas(
+        project.customer, models.RemoteAllocation.Permissions.customer_path
+    )
+
+
 def update_quotas(scope, path):
     qs = models.Allocation.objects.filter(**{path: scope}).values(path)
+    for quota in utils.FIELD_NAMES:
+        qs = qs.annotate(**{"total_%s" % quota: Sum(quota)})
+    qs = list(qs)[0]
+
+    for quota in utils.FIELD_NAMES:
+        scope.set_quota_usage(utils.MAPPING[quota], qs["total_%s" % quota])
+
+
+def update_remote_quotas(scope, path):
+    qs = models.RemoteAllocation.objects.filter(**{path: scope}).values(path)
     for quota in utils.FIELD_NAMES:
         qs = qs.annotate(**{"total_%s" % quota: Sum(quota)})
     qs = list(qs)[0]

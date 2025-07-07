@@ -3,8 +3,9 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db.models.aggregates import Sum
+from django.db.models import F, Sum
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import exceptions, serializers
 
 from waldur_core.core import serializers as core_serializers
@@ -22,22 +23,55 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from . import log, models, utils
 
 
+class ResourceLimitPeriod(serializers.Serializer):
+    start = serializers.CharField()
+    end = serializers.CharField()
+    quantity = serializers.IntegerField()
+    billing_periods = serializers.IntegerField()
+    total = serializers.CharField()
+
+
+class InvoiceItemDetailsSerializer(serializers.Serializer):
+    resource_name = serializers.CharField()
+    resource_uuid = serializers.UUIDField()
+    plan_name = serializers.CharField()
+    plan_uuid = serializers.UUIDField()
+    offering_type = serializers.CharField()
+    offering_name = serializers.CharField()
+    offering_uuid = serializers.UUIDField()
+    service_provider_name = serializers.CharField()
+    service_provider_uuid = serializers.UUIDField()
+    plan_component_id = serializers.IntegerField()
+    offering_component_type = serializers.CharField()
+    offering_component_name = serializers.CharField()
+    resource_limit_periods = ResourceLimitPeriod(many=True)
+
+
+@extend_schema_field(InvoiceItemDetailsSerializer)
+class InvoiceItemDetailsField(serializers.JSONField):
+    pass
+
+
 class InvoiceItemSerializer(serializers.HyperlinkedModelSerializer):
     tax = serializers.DecimalField(max_digits=PRICE_DECIMAL_PLACES, decimal_places=2)
     total = serializers.DecimalField(max_digits=PRICE_MAX_DIGITS, decimal_places=2)
-    factor = serializers.ReadOnlyField(source="get_factor")
-    measured_unit = serializers.ReadOnlyField(source="get_measured_unit")
-    resource_uuid = serializers.ReadOnlyField(source="resource.uuid")
-    resource_name = serializers.ReadOnlyField(source="resource.name")
-    project_uuid = serializers.ReadOnlyField(source="get_project_uuid")
-    project_name = serializers.ReadOnlyField(source="get_project_name")
-    details = serializers.JSONField()
+    factor = serializers.IntegerField(read_only=True, source="get_factor")
+    measured_unit = serializers.CharField(read_only=True, source="get_measured_unit")
+    resource_uuid = serializers.UUIDField(read_only=True, source="resource.uuid")
+    resource_name = serializers.CharField(read_only=True, source="resource.name")
+    project_uuid = serializers.UUIDField(read_only=True, source="get_project_uuid")
+    project_name = serializers.CharField(read_only=True, source="get_project_name")
+    details = InvoiceItemDetailsField()
     billing_type = serializers.SerializerMethodField()
+    credit = serializers.SerializerMethodField()
 
-    def get_billing_type(self, item):
+    def get_billing_type(self, item: models.InvoiceItem) -> str:
         plan_component = item.get_plan_component()
         if plan_component:
             return plan_component.component.billing_type
+
+    def get_credit(self, item: models.InvoiceItem) -> bool:
+        return item.credit is not None
 
     class Meta:
         model = models.InvoiceItem
@@ -64,6 +98,7 @@ class InvoiceItemSerializer(serializers.HyperlinkedModelSerializer):
             "resource_name",
             "billing_type",
             "backend_uuid",
+            "credit",
         )
         extra_kwargs = {
             "url": {"lookup_field": "uuid", "view_name": "invoice-item-detail"},
@@ -108,10 +143,16 @@ class InvoiceItemDetailSerializer(serializers.HyperlinkedModelSerializer):
         return super().create(validated_data)
 
 
+class InvoiceItemTotalPriceSerializer(serializers.Serializer):
+    total_price = serializers.DecimalField(
+        max_digits=PRICE_MAX_DIGITS, decimal_places=PRICE_DECIMAL_PLACES
+    )
+
+
 class InvoiceItemUpdateSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = models.InvoiceItem
-        fields = ("article_code", "quantity", "start", "end")
+        fields = ("article_code", "quantity", "unit_price", "start", "end")
         extra_kwargs = {"quantity": {"required": False}}
 
     def get_fields(self):
@@ -188,6 +229,25 @@ class InvoiceItemMigrateToSerializer(serializers.HyperlinkedModelSerializer):
         fields = ("invoice",)
 
 
+class CustomerDetailsSerializer(serializers.ModelSerializer):
+    country_name = serializers.ReadOnlyField(source="get_country_display")
+
+    class Meta:
+        model = structure_models.Customer
+        fields = (
+            "name",
+            "address",
+            "country",
+            "country_name",
+            "email",
+            "postal",
+            "phone_number",
+            "bank_name",
+            "bank_account",
+            "vat_code",
+        )
+
+
 class InvoiceSerializer(
     core_serializers.RestrictedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
@@ -202,8 +262,10 @@ class InvoiceSerializer(
     )
     items = serializers.SerializerMethodField()
     issuer_details = serializers.SerializerMethodField()
-    customer_details = serializers.SerializerMethodField()
+    customer_details = CustomerDetailsSerializer(source="customer")
     due_date = serializers.DateField()
+    compensations = serializers.SerializerMethodField()
+    incurred_costs = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Invoice
@@ -227,33 +289,40 @@ class InvoiceSerializer(
             "backend_id",
             "payment_url",
             "reference_number",
+            "compensations",
+            "incurred_costs",
         )
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
             "customer": {"lookup_field": "uuid"},
         }
 
+    @extend_schema_field(CustomerDetailsSerializer)
     def get_issuer_details(self, invoice):
         return settings.WALDUR_INVOICES["ISSUER_DETAILS"]
 
-    def get_customer_details(self, invoice):
-        return {
-            "name": invoice.customer.name,
-            "address": invoice.customer.address,
-            "country": invoice.customer.country,
-            "country_name": invoice.customer.get_country_display(),
-            "email": invoice.customer.email,
-            "postal": invoice.customer.postal,
-            "phone_number": invoice.customer.phone_number,
-            "bank_name": invoice.customer.bank_name,
-            "bank_account": invoice.customer.bank_account,
-        }
-
-    def get_items(self, invoice):
+    @extend_schema_field(InvoiceItemSerializer(many=True))
+    def get_items(self, invoice: models.Invoice):
         qs = invoice.items.all().order_by("project_name", "name")
         items = utils.filter_invoice_items(qs)
         serializer = InvoiceItemSerializer(items, many=True, context=self.context)
         return serializer.data
+
+    @extend_schema_field(Decimal)
+    def get_compensations(self, invoice: models.Invoice):
+        items = invoice.items.filter(credit__isnull=False)
+        compensations = items.aggregate(
+            compensations=Sum(F("quantity") * F("unit_price"), default=0)
+        ).get("compensations", 0)
+        return Decimal(compensations)
+
+    @extend_schema_field(Decimal)
+    def get_incurred_costs(self, invoice: models.Invoice):
+        items = invoice.items.filter(credit__isnull=True)
+        incurred_costs = items.aggregate(
+            incurred=Sum(F("quantity") * F("unit_price"), default=0)
+        ).get("incurred", 0)
+        return Decimal(incurred_costs)
 
 
 class InvoiceItemCostsForPeriodSerializer(serializers.Serializer):
@@ -298,12 +367,14 @@ class InvoiceItemCustomerCostsForPeriodSerializer(InvoiceItemCostsForPeriodSeria
 
 class InvoiceItemReportSerializer(serializers.ModelSerializer):
     invoice_number = serializers.ReadOnlyField(source="invoice.number")
-    invoice_uuid = serializers.ReadOnlyField(source="invoice.uuid")
+    invoice_uuid = serializers.UUIDField(read_only=True, source="invoice.uuid")
     invoice_year = serializers.ReadOnlyField(source="invoice.year")
     invoice_month = serializers.ReadOnlyField(source="invoice.month")
     invoice_date = serializers.ReadOnlyField(source="invoice.invoice_date")
     due_date = serializers.ReadOnlyField(source="invoice.due_date")
-    customer_uuid = serializers.ReadOnlyField(source="invoice.customer.uuid")
+    customer_uuid = serializers.UUIDField(
+        read_only=True, source="invoice.customer.uuid"
+    )
     customer_name = serializers.ReadOnlyField(source="invoice.customer.name")
 
     class Meta:
@@ -526,12 +597,12 @@ class SAPReportSerializer(serializers.Serializer):
         if invoice_item.resource and invoice_item.resource.offering.plans.count() == 1:
             if "offering_component_name" in invoice_item.details:
                 return (
-                    f'{invoice_item.resource.name} ({invoice_item.resource.offering.name}) / '
-                    f'{invoice_item.details["offering_component_name"]}'
+                    f"{invoice_item.resource.name} ({invoice_item.resource.offering.name}) / "
+                    f"{invoice_item.details['offering_component_name']}"
                 )
             return invoice_item.name
         if "plan_name" in invoice_item.details.keys():
-            return f'{invoice_item.name} / {invoice_item.details["plan_name"]}'
+            return f"{invoice_item.name} / {invoice_item.details['plan_name']}"
         else:
             return invoice_item.name
 
@@ -613,71 +684,85 @@ class SAFReportSerializer(serializers.Serializer):
             return date.strftime("%d.%m.%Y")
         return ""
 
-    def get_partner(self, invoice_item):
+    def get_partner(self, invoice_item: models.InvoiceItem):
         customer = invoice_item.invoice.customer
         if customer.sponsor_number:
             return customer.sponsor_number
         else:
             return customer.agreement_number
 
-    def get_first_day(self, invoice_item):
+    def get_first_day(self, invoice_item: models.InvoiceItem):
         year = invoice_item.invoice.year
         month = invoice_item.invoice.month
         return datetime.date(year=year, month=month, day=1)
 
-    def get_last_day_of_month(self, invoice_item):
+    def get_last_day_of_month(self, invoice_item: models.InvoiceItem) -> str:
         first_day = self.get_first_day(invoice_item)
         last_day = core_utils.month_end(first_day)
         return self.format_date(last_day)
 
-    def get_invoice_date(self, invoice_item):
+    def get_invoice_date(self, invoice_item: models.InvoiceItem) -> str:
         date = invoice_item.invoice.invoice_date
         return self.format_date(date)
 
-    def get_due_date(self, invoice_item):
+    def get_due_date(self, invoice_item: models.InvoiceItem) -> str:
         date = invoice_item.invoice.due_date
         return self.format_date(date)
 
-    def get_total(self, invoice_item):
+    def get_total(self, invoice_item: models.InvoiceItem) -> Decimal:
         return quantize_price(invoice_item.price)
 
-    def get_tax(self, invoice_item):
+    def get_tax(self, invoice_item: models.InvoiceItem) -> Decimal:
         # SAF expects a specific handling of rounding for VAT
         return invoice_item.tax.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-    def get_project(self, invoice_item):
+    def get_project(self, invoice_item: models.InvoiceItem) -> str:
         return settings.WALDUR_INVOICES["INVOICE_REPORTING"]["SAF_PARAMS"]["ARTPROJEKT"]
 
-    def get_vat(self, invoice_item):
+    def get_vat(self, invoice_item: models.InvoiceItem) -> float:
         return settings.WALDUR_INVOICES["INVOICE_REPORTING"]["SAF_PARAMS"]["RMAKSULIPP"]
 
-    def get_vali_field(self, invoice_item):
+    def get_vali_field(self, invoice_item: models.InvoiceItem) -> str:
         if invoice_item.invoice.customer.contact_details:
             return f"Record no {invoice_item.invoice.number}. {invoice_item.invoice.customer.contact_details}"
         else:
             return f"Record no {invoice_item.invoice.number}"
 
-    def get_empty_field(self, invoice_item):
+    def get_empty_field(self, invoice_item: models.InvoiceItem):
         return ""
 
-    def get_artnimi_field(self, invoice_item):
+    def get_artnimi_field(self, invoice_item: models.InvoiceItem) -> str:
         # If a single plan for an offering exists, skip it from display
         if invoice_item.resource and invoice_item.resource.offering.plans.count() == 1:
             return invoice_item.name
         if "plan_name" in invoice_item.details.keys():
-            return f'{invoice_item.name} / {invoice_item.details["plan_name"]}'
+            return f"{invoice_item.name} / {invoice_item.details['plan_name']}"
         else:
             return invoice_item.name
 
-    def get_covered_period(self, invoice_item):
+    def get_covered_period(self, invoice_item: models.InvoiceItem) -> str:
         first_day = self.get_first_day(invoice_item)
         last_day = core_utils.month_end(first_day)
         return f"{self.format_date(first_day)}-{self.format_date(last_day)}"
 
 
+class PaymentProfileAttributesSerializer(serializers.Serializer):
+    end_date = serializers.CharField(required=False)
+    agreement_number = serializers.CharField(required=False)
+    contract_sum = serializers.IntegerField(required=False)
+
+
+@extend_schema_field(PaymentProfileAttributesSerializer)
+class PaymentProfileAttributesField(serializers.JSONField):
+    pass
+
+
 class PaymentProfileSerializer(serializers.HyperlinkedModelSerializer):
-    organization_uuid = serializers.ReadOnlyField(source="organization.uuid")
+    organization_uuid = serializers.UUIDField(
+        read_only=True, source="organization.uuid"
+    )
     payment_type_display = serializers.ReadOnlyField(source="get_payment_type_display")
+    attributes = PaymentProfileAttributesField(required=False)
 
     class Meta:
         model = models.PaymentProfile
@@ -717,11 +802,13 @@ class PaymentSerializer(
         lookup_field="uuid",
         read_only=True,
     )
-    invoice_uuid = serializers.ReadOnlyField(source="invoice.uuid")
+    invoice_uuid = serializers.UUIDField(read_only=True, source="invoice.uuid")
     invoice_period = serializers.SerializerMethodField(method_name="get_invoice_period")
-    customer_uuid = serializers.ReadOnlyField(source="profile.organization.uuid")
+    customer_uuid = serializers.UUIDField(
+        read_only=True, source="profile.organization.uuid"
+    )
 
-    def get_invoice_period(self, payment):
+    def get_invoice_period(self, payment: models.Payment) -> str | None:
         if payment.invoice:
             return "%02d-%s" % (payment.invoice.month, payment.invoice.year)
 
@@ -775,7 +862,8 @@ class ReferenceNumberSerializer(serializers.ModelSerializer):
         fields = ("reference_number",)
 
 
-def get_payment_profiles(serializer, customer):
+@extend_schema_field(PaymentProfileSerializer(many=True))
+def get_payment_profiles(serializer, customer: structure_models.Customer):
     user = serializer.context["request"].user
     if user.is_staff or user.is_support:
         return PaymentProfileSerializer(
@@ -844,7 +932,7 @@ class CustomerCreditSerializer(serializers.HyperlinkedModelSerializer):
         many=True,
     )
     customer_name = serializers.ReadOnlyField(source="customer.name")
-    customer_uuid = serializers.ReadOnlyField(source="customer.uuid")
+    customer_uuid = serializers.UUIDField(read_only=True, source="customer.uuid")
     customer_slug = serializers.ReadOnlyField(source="customer.slug")
 
     class Meta:
@@ -957,10 +1045,12 @@ class CreateCustomerCreditSerializer(CustomerCreditSerializer):
 
 class ProjectCreditSerializer(serializers.HyperlinkedModelSerializer):
     project_name = serializers.ReadOnlyField(source="project.name")
-    project_uuid = serializers.ReadOnlyField(source="project.uuid")
+    project_uuid = serializers.UUIDField(read_only=True, source="project.uuid")
     project_slug = serializers.ReadOnlyField(source="project.slug")
     customer_name = serializers.ReadOnlyField(source="project.customer.name")
-    customer_uuid = serializers.ReadOnlyField(source="project.customer.uuid")
+    customer_uuid = serializers.UUIDField(
+        read_only=True, source="project.customer.uuid"
+    )
     customer_slug = serializers.ReadOnlyField(source="project.customer.slug")
     customer_credit = serializers.ReadOnlyField(
         source="project.customer.customercredit.value"
@@ -972,7 +1062,7 @@ class ProjectCreditSerializer(serializers.HyperlinkedModelSerializer):
         read_only=True, many=True, source="project.customer.customercredit.offerings"
     )
 
-    def get_allocated_customer_credit(self, project_credit):
+    def get_allocated_customer_credit(self, project_credit) -> float:
         return models.ProjectCredit.objects.filter(
             project__customer=project_credit.project.customer
         ).aggregate(sum=Sum("value"))["sum"]
@@ -1022,7 +1112,7 @@ class ProjectCreditSerializer(serializers.HyperlinkedModelSerializer):
         }
 
 
-def get_project_credit(serializer, project):
+def get_project_credit(serializer, project) -> float | None:
     try:
         return models.ProjectCredit.objects.get(project=project).value
     except models.ProjectCredit.DoesNotExist:
@@ -1040,7 +1130,7 @@ core_signals.pre_serializer_fields.connect(
 )
 
 
-def get_customer_credit(serializer, customer):
+def get_customer_credit(serializer, customer) -> float | None:
     try:
         return models.CustomerCredit.objects.get(customer=customer).value
     except models.CustomerCredit.DoesNotExist:
@@ -1052,7 +1142,81 @@ def add_customer_credit(sender, fields, **kwargs):
     setattr(sender, "get_customer_credit", get_customer_credit)
 
 
+def get_customer_unallocated_credit(serializer, customer) -> float | None:
+    try:
+        customer_credit = models.CustomerCredit.objects.get(customer=customer).value
+        project_credits_sum = (
+            models.ProjectCredit.objects.filter(project__customer=customer).aggregate(
+                sum=Sum("value")
+            )["sum"]
+            or 0
+        )
+
+        return customer_credit - project_credits_sum
+    except models.CustomerCredit.DoesNotExist:
+        return None
+
+
+def add_customer_unallocated_credit(sender, fields, **kwargs):
+    fields["customer_unallocated_credit"] = serializers.SerializerMethodField()
+    setattr(sender, "get_customer_unallocated_credit", get_customer_unallocated_credit)
+
+
 core_signals.pre_serializer_fields.connect(
     sender=structure_serializers.CustomerSerializer,
     receiver=add_customer_credit,
 )
+
+core_signals.pre_serializer_fields.connect(
+    sender=structure_serializers.CustomerSerializer,
+    receiver=add_customer_unallocated_credit,
+)
+
+
+class InvoiceStatsOfferingSerializer(serializers.Serializer):
+    offering_name = serializers.CharField(read_only=True)
+    aggregated_price = serializers.FloatField(read_only=True)
+    aggregated_tax = serializers.FloatField(read_only=True)
+    aggregated_total = serializers.FloatField(read_only=True)
+    service_category_title = serializers.CharField(read_only=True)
+    service_provider_name = serializers.CharField(read_only=True)
+    service_provider_uuid = serializers.UUIDField(read_only=True)
+
+
+class InvoiceStatsSerializer(serializers.ListSerializer):
+    child = InvoiceStatsOfferingSerializer(read_only=True)
+
+
+class InvoiceGrowthCustomerPeriodSerializer(serializers.Serializer):
+    name = serializers.CharField(read_only=True)
+    periods = serializers.ListField(read_only=True, child=serializers.FloatField())
+
+
+class InvoiceGrowthSerializer(serializers.Serializer):
+    periods = serializers.ListField(read_only=True, child=serializers.CharField())
+    total_periods = serializers.ListField(
+        read_only=True, child=serializers.FloatField()
+    )
+    other_periods = serializers.ListField(
+        read_only=True, child=serializers.FloatField()
+    )
+    customer_periods = InvoiceGrowthCustomerPeriodSerializer(many=True)
+
+
+class InvoiceCostSerializer(serializers.Serializer):
+    price = serializers.FloatField(read_only=True)
+    year = serializers.IntegerField(read_only=True)
+    month = serializers.IntegerField(read_only=True)
+
+
+class CostsForPeriodSerializer(serializers.Serializer):
+    total_price = serializers.CharField(read_only=True)
+    start_date = serializers.DateField(read_only=True)
+    end_date = serializers.DateField(read_only=True)
+
+
+class CustomerCreditConsumptionSerializer(serializers.Serializer):
+    date = serializers.DateField(read_only=True)
+    price = serializers.DecimalField(
+        read_only=True, max_digits=PRICE_MAX_DIGITS, decimal_places=2
+    )

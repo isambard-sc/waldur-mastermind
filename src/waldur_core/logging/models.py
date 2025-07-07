@@ -6,6 +6,7 @@ from django.apps import apps
 from django.conf import settings
 from django.contrib.contenttypes import fields as ct_fields
 from django.contrib.contenttypes import models as ct_models
+from django.contrib.postgres.fields import ArrayField
 from django.db import models
 from django.template.loader import render_to_string
 from django.utils import timezone
@@ -55,7 +56,9 @@ class BaseHook(EventTypesMixin, UuidMixin, TimeStampedModel):
         abstract = True
         ordering = ["-created"]
 
-    user = models.ForeignKey(on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL)
+    user = models.ForeignKey[core_models.User](
+        on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL
+    )
     is_active = models.BooleanField(default=True)
 
     # This timestamp would be updated periodically when event is sent via this hook
@@ -272,3 +275,16 @@ class EventSubscription(UuidMixin, TimeStampedModel, core_models.DescribableMixi
         default=list,
         help_text=_("List of observable objects"),
     )
+
+
+class EmailLog(UuidMixin):
+    sent_at = models.DateTimeField(auto_now_add=True)
+    subject = models.CharField(max_length=255)
+    body = models.TextField()
+    emails = ArrayField(models.EmailField())
+
+    def __str__(self):
+        return f"Email to {self.emails} at {self.sent_at}"
+
+    class Meta:
+        ordering = ["-sent_at"]

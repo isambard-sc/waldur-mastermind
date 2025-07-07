@@ -7,6 +7,7 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.utils import get_system_robot
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.exceptions import PolicyException
 from waldur_mastermind.marketplace_openstack import INSTANCE_TYPE
 from waldur_mastermind.policy import log, tasks
@@ -55,10 +56,7 @@ def terminate_resources(policy):
     project = structure_permissions._get_project(policy.scope)
 
     resources = marketplace_models.Resource.objects.exclude(
-        state__in=(
-            marketplace_models.Resource.States.TERMINATED,
-            marketplace_models.Resource.States.TERMINATING,
-        )
+        state__in=(ResourceStates.TERMINATED, ResourceStates.TERMINATING)
     )
 
     if project:
@@ -78,7 +76,7 @@ def terminate_resources(policy):
                 resource=resource,
                 offering=resource.offering,
                 type=marketplace_models.Order.Types.TERMINATE,
-                state=marketplace_models.Order.States.EXECUTING,
+                state=OrderStates.EXECUTING,
                 attributes=attributes,
                 project=project,
                 created_by=user,
@@ -140,8 +138,8 @@ def request_downscaling(policy):
         offering__plugin_options__supports_downscaling=True
     ).exclude(
         state__in=(
-            marketplace_models.Resource.States.TERMINATED,
-            marketplace_models.Resource.States.TERMINATING,
+            ResourceStates.TERMINATED,
+            ResourceStates.TERMINATING,
         )
     )
 
@@ -172,8 +170,8 @@ def reset_downscaling(policy):
         offering__plugin_options__supports_downscaling=True
     ).objects.exclude(
         state__in=(
-            marketplace_models.Resource.States.TERMINATED,
-            marketplace_models.Resource.States.TERMINATING,
+            ResourceStates.TERMINATED,
+            ResourceStates.TERMINATING,
         )
     )
 
@@ -195,8 +193,8 @@ def restrict_members(policy):
     project = structure_permissions._get_project(policy.scope)
 
     resources = marketplace_models.Resource.objects.filter(
-        offering__secret_options__service_provider_can_create_offering_user=True
-    ).exclude(state__in=(marketplace_models.Resource.States.TERMINATED,))
+        offering__plugin_options__service_provider_can_create_offering_user=True
+    ).exclude(state__in=(ResourceStates.TERMINATED,))
 
     if project:
         resources = resources.filter(project=project)
@@ -223,8 +221,8 @@ def reset_member_restriction(policy):
     project = structure_permissions._get_project(policy.scope)
 
     resources = marketplace_models.Resource.objects.filter(
-        offering__secret_options__service_provider_can_create_offering_user=True
-    ).exclude(state__in=(marketplace_models.Resource.States.TERMINATED,))
+        offering__plugin_options__service_provider_can_create_offering_user=True
+    ).exclude(state__in=(ResourceStates.TERMINATED,))
 
     if project:
         resources = resources.filter(project=project)
@@ -246,7 +244,7 @@ def request_pausing(policy):
 
     resources = marketplace_models.Resource.objects.filter(
         offering__plugin_options__supports_pausing=True
-    ).exclude(state__in=(marketplace_models.Resource.States.TERMINATED,))
+    ).exclude(state__in=(ResourceStates.TERMINATED,))
 
     if project:
         resources = resources.filter(project=project)
@@ -273,7 +271,7 @@ def reset_pausing(policy):
 
     resources = marketplace_models.Resource.objects.filter(
         offering__plugin_options__supports_pausing=True
-    ).exclude(state__in=(marketplace_models.Resource.States.TERMINATED,))
+    ).exclude(state__in=(ResourceStates.TERMINATED,))
 
     if project:
         resources = resources.filter(project=project)
@@ -345,6 +343,7 @@ POLICY_ACTIONS = {
         action_type=enums.PolicyActionTypes.THRESHOLD,
         method=block_modification_of_existing_resources,
         reset_method=None,
+        ignored_fields=["modified", "current_usages", "report"],
     ),
     "request_downscaling": structures.PolicyAction(
         action_type=enums.PolicyActionTypes.IMMEDIATE,

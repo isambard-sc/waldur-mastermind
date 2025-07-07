@@ -1,9 +1,9 @@
-import django.contrib.auth
 import factory.fuzzy
 from rest_framework.authtoken import models as authtoken_models
 from rest_framework.reverse import reverse
 
 from waldur_core.core import models as core_models
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.tests.types import BaseMetaFactory
 from waldur_core.core.utils import normalize_unicode
 from waldur_core.structure import models
@@ -16,14 +16,14 @@ class UserFactory(
     factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[core_models.User]
 ):
     class Meta:
-        model = django.contrib.auth.get_user_model()
+        model = core_models.User
 
     username = factory.Sequence(lambda n: "john%s" % n)
     civil_number = factory.Sequence(lambda n: "%08d" % n)
     email = factory.LazyAttribute(lambda o: "%s@example.org" % o.username)
-    first_name = factory.Sequence(lambda n: "John%s" % n)
-    last_name = factory.Sequence(lambda n: "Doe%s" % n)
-    native_name = factory.Sequence(lambda n: "Jöhn Dõe%s" % n)
+    first_name = factory.Sequence(lambda n: "John%03d" % n)
+    last_name = factory.Sequence(lambda n: "Doe%03d" % n)
+    native_name = factory.Sequence(lambda n: "Jöhn Dõe%03d" % n)
     organization = factory.Sequence(lambda n: "Organization %s" % n)
     phone_number = factory.Sequence(lambda n: "555-555-%s-2" % n)
     description = factory.Sequence(lambda n: "Description %s" % n)
@@ -107,6 +107,7 @@ class CustomerFactory(
     slug = factory.Sequence(lambda n: "cust-%s" % n)
     abbreviation = factory.Sequence(lambda n: "Cust%s" % n)
     contact_details = factory.Sequence(lambda n: "contacts %s" % n)
+    max_service_accounts = 2
 
     @classmethod
     def get_url(cls, customer=None, action=None):
@@ -128,6 +129,7 @@ class ProjectFactory(
     class Meta:
         model = models.Project
 
+    max_service_accounts = 2
     name = factory.Sequence(lambda n: "Proj%s" % n)
     slug = factory.Sequence(lambda n: "proj-%s" % n)
     customer = factory.SubFactory(CustomerFactory)
@@ -153,7 +155,7 @@ class ServiceSettingsFactory(
         model = models.ServiceSettings
 
     name = factory.Sequence(lambda n: "Settings %s" % n)
-    state = core_models.StateMixin.States.OK
+    state = CoreStates.OK
     shared = False
     type = TestConfig.service_name
 

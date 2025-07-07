@@ -1,21 +1,20 @@
 import logging
 import re
 
-from croniter import croniter
 from cryptography import x509
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat import backends as hazmat_backends
 from cryptography.hazmat.primitives import serialization as hazmat_serialization
 from django import template
 from django.core.exceptions import ValidationError
-from django.core.validators import BaseValidator, URLValidator
-from django.utils import timezone
+from django.core.validators import URLValidator
 from django.utils.deconstruct import deconstructible
 from django.utils.translation import gettext_lazy as _
 from iptools.ipv4 import validate_cidr as is_valid_ipv4_cidr
 from iptools.ipv6 import validate_cidr as is_valid_ipv6_cidr
 
 from waldur_core.core import exceptions
+from waldur_core.core.enums import CoreStates
 
 logger = logging.getLogger(__name__)
 
@@ -28,39 +27,6 @@ def validate_phone_number(value):
         raise ValidationError("Invalid phone number format.")
 
 
-def validate_cron_schedule(value):
-    try:
-        base_time = timezone.now()
-        croniter(value, base_time)
-    except (KeyError, ValueError) as e:
-        raise ValidationError(str(e))
-
-
-@deconstructible
-class MinCronValueValidator(BaseValidator):
-    """
-    Validate that the period of cron schedule is greater than or equal to provided limit_value in hours,
-    otherwise raise ValidationError.
-    """
-
-    message = _(
-        "Ensure schedule period is greater than or equal to %(limit_value)s hour(s)."
-    )
-    code = "min_cron_value"
-
-    def compare(self, cleaned, limit_value):
-        validate_cron_schedule(cleaned)
-
-        now = timezone.now()
-        schedule = croniter(cleaned, now)
-        closest_schedule = schedule.get_next(timezone.datetime)
-        next_schedule = schedule.get_next(timezone.datetime)
-        schedule_interval_in_hours = (
-            next_schedule - closest_schedule
-        ).total_seconds() / 3600
-        return schedule_interval_in_hours < limit_value
-
-
 def validate_name(value):
     if len(value.strip()) == 0:
         raise ValidationError(
@@ -69,12 +35,19 @@ def validate_name(value):
 
 
 class StateValidator:
-    def __init__(self, *valid_states):
+    # Use state_enum to validate states of a model that has custom state field (e.g. RobotAccounts use RobotAccountStates)
+    def __init__(self, *valid_states, state_enum=None):
+        self.state_enum = state_enum
         self.valid_states = valid_states
 
     def __call__(self, resource):
         if resource.state not in self.valid_states:
-            states_names = dict(resource.States.CHOICES)
+            if self.state_enum:
+                states_names = dict(self.state_enum.CHOICES)
+            elif hasattr(resource, "States"):
+                states_names = dict(resource.States.CHOICES)
+            else:
+                states_names = dict(CoreStates.CHOICES)
             valid_states_names = [
                 str(states_names[state]) for state in self.valid_states
             ]

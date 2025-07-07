@@ -1,15 +1,17 @@
 import json
 import logging
+import os
 import tempfile
 from enum import Enum
-from time import sleep
 
-import docker
 import kubernetes as k8s
 from constance import config
-from docker.errors import ContainerError, DockerException
 from kubernetes.client.rest import ApiException
 from rest_framework import serializers as rf_serializers
+
+import docker
+from docker.errors import ContainerError, DockerException
+from waldur_kubernetes import backend as kubernetes_backend
 
 from . import serializers
 from .exceptions import JobFailedException
@@ -24,8 +26,29 @@ class DeploymentOptions(Enum):
     KUBERNETES = "k8s"
 
 
+def check_docker_socket_access(docker_config):
+    base_url = docker_config.get("base_url")
+
+    # Check if base_url is using Unix socket
+    if base_url and base_url.startswith("unix://"):
+        # Extract socket path from the URL
+        socket_path = base_url.replace("unix://", "")
+
+        # Check if socket exists
+        if not os.path.exists(socket_path):
+            raise FileNotFoundError(f"Docker socket {socket_path} does not exist")
+
+        # Check read and write permissions for current user
+        if not os.access(socket_path, os.R_OK | os.W_OK):
+            raise PermissionError(
+                f"Current user doesn't have read/write permissions for Docker socket at {socket_path}"
+            )
+
+
 def execute_script_in_docker(image, command, src, **kwargs):
     remove_container = config.DOCKER_REMOVE_CONTAINER
+    check_docker_socket_access(config.DOCKER_CLIENT)
+
     with tempfile.NamedTemporaryFile(
         prefix="docker",
         dir=config.DOCKER_SCRIPT_DIR,
@@ -35,16 +58,18 @@ def execute_script_in_docker(image, command, src, **kwargs):
         docker_script.flush()
         logger.info(f"Wrote script to {docker_script.name}")
         client = docker.DockerClient(**config.DOCKER_CLIENT)
+        docker_volume_name = config.DOCKER_VOLUME_NAME
+        script_file_path = os.path.basename(docker_script.name)
         return str(
             client.containers.run(
                 image=image,
-                command=[command, "script"],
+                command=[command, script_file_path],
                 remove=remove_container,
                 stderr=True,
                 working_dir="/work",
                 volumes={
-                    docker_script.name: {
-                        "bind": "/work/script",
+                    docker_volume_name: {
+                        "bind": "/work",
                         "mode": "ro",
                     },
                 },
@@ -55,16 +80,7 @@ def execute_script_in_docker(image, command, src, **kwargs):
         )
 
 
-def construct_k8s_config_map(name, src):
-    return k8s.client.V1ConfigMap(
-        api_version="v1",
-        kind="ConfigMap",
-        metadata=k8s.client.V1ObjectMeta(name=name),
-        data={"script": src},
-    )
-
-
-def construct_k8s_job(name, image, command, volume_name, config_map_name, environment):
+def construct_k8s_job_spec(image, command, volume_name, config_map_name, environment):
     script_volume = k8s.client.V1Volume(
         name=volume_name,
         config_map=k8s.client.V1ConfigMapVolumeSource(
@@ -100,81 +116,7 @@ def construct_k8s_job(name, image, command, volume_name, config_map_name, enviro
         backoff_limit=0,  # Do not retry the job in case of failure
         active_deadline_seconds=config.K8S_JOB_TIMEOUT,
     )
-    return k8s.client.V1Job(
-        api_version="batch/v1",
-        kind="Job",
-        metadata=k8s.client.V1ObjectMeta(name=name),
-        spec=spec,
-    )
-
-
-def create_job_in_k8s(batch_api: k8s.client.BatchV1Api, job_object):
-    batch_api.create_namespaced_job(body=job_object, namespace=NAMESPACE)
-    logger.info(
-        "Job %s has been created in namespace %s",
-        job_object.metadata.name,
-        NAMESPACE,
-    )
-
-
-def create_config_map_in_k8s(api: k8s.client.CoreV1Api, config_map_object):
-    api.create_namespaced_config_map(
-        body=config_map_object,
-        namespace=NAMESPACE,
-    )
-    logger.info(
-        "ConfigMap %s has been created in namespace %s",
-        config_map_object.metadata.name,
-        NAMESPACE,
-    )
-
-
-def delete_job_from_k8s(batch_api: k8s.client.BatchV1Api, job_name):
-    batch_api.delete_namespaced_job(
-        name=job_name, namespace=NAMESPACE, propagation_policy="Background"
-    )
-    logger.info("Job %s has been deleted from namespace %s", job_name, NAMESPACE)
-
-
-def delete_config_map_from_k8s(api: k8s.client.CoreV1Api, config_map_name):
-    api.delete_namespaced_config_map(config_map_name, NAMESPACE)
-    logger.info(
-        "ConfigMap %s has been deleted from namespace %s",
-        config_map_name,
-        NAMESPACE,
-    )
-
-
-def wait_for_k8s_job_completion(batch_api: k8s.client.BatchV1Api, job_name):
-    job_succeeded = None
-    while True:
-        api_response = batch_api.read_namespaced_job_status(
-            name=job_name,
-            namespace=NAMESPACE,
-        )
-        if api_response.status.succeeded is not None:
-            job_succeeded = True
-            break
-        if api_response.status.failed is not None:
-            job_succeeded = False
-            break
-        sleep(10)
-    logger.info(
-        "Job %s in namespace %s completed with status %s",
-        job_name,
-        NAMESPACE,
-        "succeeded" if job_succeeded else "failed",
-    )
-    return job_succeeded
-
-
-def get_k8s_job_result(api: k8s.client.CoreV1Api, job_name):
-    pods = api.list_namespaced_pod(NAMESPACE, label_selector="job-name=%s" % job_name)
-    pod_name = pods.items[
-        0
-    ].metadata.name  # The number of containers is 1, because backoff limit is 0
-    log = api.read_namespaced_pod_log(pod_name, NAMESPACE)
-    return log
+    return spec
 
 
 def execute_script_in_k8s(image, command, src, dry_run=False, **kwargs):
@@ -183,28 +125,27 @@ def execute_script_in_k8s(image, command, src, dry_run=False, **kwargs):
     from constance config 'K8S_CONFIG_PATH' value
     """
     env = kwargs["environment"]
-    job_name = "job-%s" % env["ORDER_UUID"]
-    config_map_name = "script-%s" % env["ORDER_UUID"]
-    volume_name = "volume-%s" % env["ORDER_UUID"]
+    job_name = f"job-{env['ORDER_UUID']}"
+    config_map_name = f"script-{env['ORDER_UUID']}"
+    volume_name = f"volume-{env['ORDER_UUID']}"
 
-    k8s.config.load_kube_config(config_file=config.K8S_CONFIG_PATH)
-    batch_v1_api = k8s.client.BatchV1Api()
-    api_v1 = k8s.client.CoreV1Api()
-
-    config_map_object = construct_k8s_config_map(config_map_name, src)
-
-    job_object = construct_k8s_job(
-        job_name, image, command, volume_name, config_map_name, env
+    k8s_backend = kubernetes_backend.KubernetesBackend(
+        kubeconfig_file_path=config.K8S_CONFIG_PATH
     )
 
-    create_config_map_in_k8s(api_v1, config_map_object)
-    create_job_in_k8s(batch_v1_api, job_object)
+    config_map_data = {"script": src}
+    k8s_backend.create_k8s_config_map(config_map_name, NAMESPACE, config_map_data)
 
-    job_succeeded = wait_for_k8s_job_completion(batch_v1_api, job_name)
-    pod_log = get_k8s_job_result(api_v1, job_name)
+    job_spec = construct_k8s_job_spec(image, command, volume_name, config_map_name, env)
+    k8s_backend.create_k8s_job(job_name, NAMESPACE, job_spec)
 
-    delete_job_from_k8s(batch_v1_api, job_name)
-    delete_config_map_from_k8s(api_v1, config_map_name)
+    job_succeeded = k8s_backend.wait_for_k8s_job_completion(
+        job_name, NAMESPACE, timeout=600
+    )
+    pod_log = k8s_backend.get_k8s_job_result(job_name, NAMESPACE)
+
+    k8s_backend.delete_job_from_k8s(job_name, NAMESPACE)
+    k8s_backend.delete_config_map_from_k8s(config_map_name, NAMESPACE)
 
     if not job_succeeded and not dry_run:
         raise JobFailedException(pod_log)

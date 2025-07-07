@@ -32,7 +32,7 @@ class ProjectUpdateRequest(core_models.UuidMixin, ReviewMixin):
     new_oecd_fos_2007_code = models.CharField(null=True, blank=True, max_length=5)
     old_is_industry = models.BooleanField(null=True, blank=True)
     new_is_industry = models.BooleanField(null=True, blank=True)
-    created_by = models.ForeignKey(
+    created_by = models.ForeignKey[core_models.User](
         on_delete=models.CASCADE,
         to=settings.AUTH_USER_MODEL,
         related_name="+",

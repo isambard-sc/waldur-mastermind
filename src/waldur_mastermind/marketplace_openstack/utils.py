@@ -36,10 +36,6 @@ logger = logging.getLogger(__name__)
 TenantQuotas = openstack_models.Tenant.Quotas
 
 
-def get_offering_category_for_tenant():
-    return marketplace_models.Category.objects.get(default_tenant_category=True)
-
-
 def get_offering_name_for_instance(tenant):
     return "Virtual machine in %s" % tenant.name
 
@@ -233,7 +229,7 @@ def map_limits_to_quotas(limits, offering: marketplace_models.Offering, is_creat
         quotas["storage"] = ServiceBackend.gb2mb(sum(list(volume_type_quotas.values())))
 
     # Convert quota value from float to integer because OpenStack API fails otherwise
-    quotas = {k: int(v) for k, v in quotas.items()}
+    quotas = {k: isinstance(v, float) and int(v) or v for k, v in quotas.items()}
 
     return quotas
 
@@ -360,8 +356,8 @@ def create_offerings_for_volume_and_instance(tenant: openstack_models.Tenant):
         resource = marketplace_models.Resource.objects.get(scope=tenant)
     except ObjectDoesNotExist:
         logger.debug(
-            "Skipping offering creation for tenant because order "
-            "item does not exist. OpenStack tenant ID: %s",
+            "Skipping offering creation for tenant because its marketplace resource "
+            "does not exist. OpenStack tenant ID: %s",
             tenant.id,
         )
         return
@@ -385,7 +381,6 @@ def create_offerings_for_volume_and_instance(tenant: openstack_models.Tenant):
             scope=tenant,
             shared=False,
             category=category,
-            # OpenStack instance and volume offerings are charged as a part of its tenant
             billable=False,
             parent=parent_offering,
             customer=actual_customer,
@@ -405,7 +400,13 @@ def create_offerings_for_volume_and_instance(tenant: openstack_models.Tenant):
         for field in fields:
             payload[field] = getattr(parent_offering, field)
 
-        marketplace_models.Offering.objects.create(**payload)
+        if not marketplace_models.Offering.objects.filter(
+            type=offering_type,
+            scope=tenant,
+            customer=actual_customer,
+            project=tenant.project,
+        ).exists():
+            marketplace_models.Offering.objects.create(**payload)
 
 
 def create_marketplace_resource_for_imported_resources(
@@ -443,6 +444,7 @@ def create_marketplace_resource_for_imported_resources(
         resource.init_cost()
         resource.save()
         import_instance_metadata(resource)
+        update_external_addresses_of_resource(resource)
 
     if isinstance(instance, openstack_models.Volume):
         offering = offering or get_offering(VOLUME_TYPE, instance.tenant)
@@ -463,35 +465,35 @@ def create_marketplace_resource_for_imported_resources(
             return
 
         resource.offering = offering
-
         resource.init_cost()
+        backend = instance.get_backend()
+
+        storage_mode = offering.plugin_options.get("storage_mode")
+        limits = backend.get_tenant_limits(instance, storage_mode == STORAGE_MODE_FIXED)
+        resource.limits = limits
         resource.save()
         import_resource_metadata(resource)
         create_offerings_for_volume_and_instance(instance)
 
 
-def get_external_ips(offering, ips):
-    external_ips = []
+def get_external_ip(offering, floating_ip_address):
     ipv4_external_ip_mapping = offering.secret_options.get(
         "ipv4_external_ip_mapping", []
     )
-    if not (ipv4_external_ip_mapping or ips or offering):
-        return external_ips
+    if not ipv4_external_ip_mapping:
+        return
 
-    for ip in ips:
-        ip_address = ipaddress.ip_address(ip)
+    ip_address = ipaddress.ip_address(floating_ip_address)
 
-        for offering_external_ip in ipv4_external_ip_mapping:
-            ip_network = ipaddress.ip_network(offering_external_ip["floating_ip"])
+    for offering_external_ip in ipv4_external_ip_mapping:
+        ip_network = ipaddress.ip_network(offering_external_ip["floating_ip"])
 
-            if ip_address in ip_network:
-                external_ips.append(
-                    ".".join(offering_external_ip["external_ip"].split(".")[:-1])
-                    + "."
-                    + ip.split(".")[-1]
-                )
-
-    return external_ips
+        if ip_address in ip_network:
+            return (
+                ".".join(offering_external_ip["external_ip"].split(".")[:-1])
+                + "."
+                + floating_ip_address.split(".")[-1]
+            )
 
 
 def update_external_addresses_of_resource(resource):
@@ -509,13 +511,13 @@ def update_external_addresses_of_resource(resource):
         if not resource.offering.parent:
             continue
 
-        external_ips = get_external_ips(
+        external_ip = get_external_ip(
             resource.offering.parent,
-            [floating_ip.address],
+            floating_ip.address,
         )
 
-        floating_ip.external_address = external_ips
-        resource.backend_metadata["external_address"].extend(external_ips)
+        floating_ip.external_address = external_ip
+        resource.backend_metadata["external_address"].append(external_ip)
 
         floating_ip.save()
         resource.save()
@@ -554,3 +556,14 @@ def update_external_addresses_of_offering_floating_ips(parent_offering):
 
     for resource in resources:
         update_external_addresses_of_resource(resource)
+
+
+def set_ports_status_for_order(order, status):
+    for port_attribute in order.attributes.get("ports", []):
+        port_url = port_attribute.get("port")
+        if port_url:
+            port_uuid = port_url.rstrip("/").split("/")[-1]
+            port = openstack_models.Port.objects.filter(uuid=port_uuid).first()
+            if port:
+                port.status = status
+                port.save()

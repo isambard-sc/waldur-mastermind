@@ -1,9 +1,9 @@
 import unittest
 
 from ddt import data, ddt
-from django.conf import settings
 from rest_framework import status, test
 
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure.tests.factories import ProjectFactory, ServiceSettingsFactory
 from waldur_mastermind.common import utils as common_utils
 from waldur_openstack import models, views
@@ -24,20 +24,20 @@ class VolumeDeleteTest(test.APITransactionTestCase):
         return common_utils.delete_request(view, user, uuid=self.volume.uuid.hex)
 
     def test_erred_volume_can_be_destroyed(self):
-        self.volume.state = models.Volume.States.ERRED
+        self.volume.state = CoreStates.ERRED
         self.volume.save()
         response = self.destroy_volume()
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
     def test_attached_volume_can_not_be_destroyed(self):
-        self.volume.state = models.Volume.States.OK
+        self.volume.state = CoreStates.OK
         self.volume.runtime_state = "in-use"
         self.volume.save()
         response = self.destroy_volume()
         self.assertEqual(response.status_code, 409)
 
     def test_pending_volume_can_not_be_destroyed(self):
-        self.volume.state = models.Volume.States.CREATING
+        self.volume.state = CoreStates.CREATING
         self.volume.save()
         response = self.destroy_volume()
         self.assertEqual(response.status_code, 409)
@@ -90,7 +90,7 @@ class VolumeExtendTestCase(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_user_can_not_extend_volume_if_volume_operation_is_performed(self):
-        self.volume.state = models.Volume.States.UPDATING
+        self.volume.state = CoreStates.UPDATING
         self.volume.save()
 
         new_size = self.volume.size + 1024
@@ -98,7 +98,7 @@ class VolumeExtendTestCase(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
 
     def test_user_can_not_extend_volume_if_volume_is_in_erred_state(self):
-        self.volume.state = models.Instance.States.ERRED
+        self.volume.state = CoreStates.ERRED
         self.volume.save()
 
         new_size = self.volume.size + 1024
@@ -133,11 +133,11 @@ class VolumeAttachTestCase(test.APITransactionTestCase):
         return self.client.post(self.url, payload)
 
     def test_user_can_attach_volume_to_instance(self):
-        self.volume.state = models.Volume.States.OK
+        self.volume.state = CoreStates.OK
         self.volume.runtime_state = "available"
         self.volume.save()
 
-        self.instance.state = models.Instance.States.OK
+        self.instance.state = CoreStates.OK
         self.instance.runtime_state = models.Instance.RuntimeStates.SHUTOFF
         self.instance.save()
 
@@ -145,14 +145,14 @@ class VolumeAttachTestCase(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
 
     def test_user_can_not_attach_erred_volume_to_instance(self):
-        self.volume.state = models.Volume.States.ERRED
+        self.volume.state = CoreStates.ERRED
         self.volume.save()
 
         response = self.get_response()
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
 
     def test_user_can_not_attach_used_volume_to_instance(self):
-        self.volume.state = models.Volume.States.OK
+        self.volume.state = CoreStates.OK
         self.volume.runtime_state = "in-use"
         self.volume.save()
 
@@ -160,7 +160,7 @@ class VolumeAttachTestCase(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
 
     def test_user_can_not_attach_volume_to_instance_in_other_tenant(self):
-        self.volume.state = models.Volume.States.OK
+        self.volume.state = CoreStates.OK
         self.volume.runtime_state = "available"
         self.volume.save()
         self.instance = factories.InstanceFactory()
@@ -169,11 +169,11 @@ class VolumeAttachTestCase(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_user_can_attach_volume_to_instance_in_active_state(self):
-        self.volume.state = models.Volume.States.OK
+        self.volume.state = CoreStates.OK
         self.volume.runtime_state = "available"
         self.volume.save()
 
-        self.instance.state = models.Instance.States.OK
+        self.instance.state = CoreStates.OK
         self.instance.runtime_state = models.Instance.RuntimeStates.ACTIVE
         self.instance.save()
 
@@ -183,13 +183,13 @@ class VolumeAttachTestCase(test.APITransactionTestCase):
     def test_volume_AZ_should_match_instance_AZ(self):
         volume_az = self.fixture.volume_availability_zone
         self.volume.availability_zone = volume_az
-        self.volume.state = models.Volume.States.OK
+        self.volume.state = CoreStates.OK
         self.volume.runtime_state = "available"
         self.volume.save()
 
         instance_az = self.fixture.instance_availability_zone
         self.instance.availability_zone = instance_az
-        self.instance.state = models.Instance.States.OK
+        self.instance.state = CoreStates.OK
         self.instance.runtime_state = models.Instance.RuntimeStates.ACTIVE
         self.instance.save()
 
@@ -215,7 +215,7 @@ class VolumeDetachTestCase(test.APITransactionTestCase):
         return self.client.post(self.url)
 
     def test_user_can_detach_volume(self):
-        self.volume.state = models.Volume.States.OK
+        self.volume.state = CoreStates.OK
         self.volume.runtime_state = "in-use"
         self.volume.bootable = False
         self.volume.instance = self.instance
@@ -225,7 +225,7 @@ class VolumeDetachTestCase(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
 
     def test_user_cannot_detach_bootable_volume(self):
-        self.volume.state = models.Volume.States.OK
+        self.volume.state = CoreStates.OK
         self.volume.runtime_state = "in-use"
         self.volume.bootable = True
         self.volume.instance = self.instance
@@ -235,7 +235,7 @@ class VolumeDetachTestCase(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT, response.data)
 
     def test_user_cannot_detach_unattached_volume(self):
-        self.volume.state = models.Volume.States.OK
+        self.volume.state = CoreStates.OK
         self.volume.runtime_state = "in-use"
         self.volume.bootable = False
         self.volume.save()
@@ -249,7 +249,7 @@ class VolumeSnapshotTestCase(test.APITransactionTestCase):
         self.fixture = fixtures.OpenStackFixture()
         self.volume = self.fixture.volume
         self.url = factories.VolumeFactory.get_url(self.volume, action="snapshot")
-        self.volume.state = models.Volume.States.OK
+        self.volume.state = CoreStates.OK
         self.volume.runtime_state = "available"
         self.volume.save()
 
@@ -277,97 +277,6 @@ class VolumeSnapshotTestCase(test.APITransactionTestCase):
         new_usage = self.fixture.tenant.get_quota_usage(key)
 
         self.assertEqual(old_usage, new_usage)
-
-
-@ddt
-class VolumeCreateSnapshotScheduleTest(test.APITransactionTestCase):
-    action_name = "create_snapshot_schedule"
-
-    def setUp(self):
-        self.fixture = fixtures.OpenStackFixture()
-        self.url = factories.VolumeFactory.get_url(
-            self.fixture.volume, self.action_name
-        )
-        self.snapshot_schedule_data = {
-            "name": "test schedule",
-            "retention_time": 3,
-            "schedule": "0 * * * *",
-            "maximal_number_of_resources": 3,
-        }
-
-    @data("owner", "staff", "admin", "manager")
-    def test_user_can_create_snapshot_schedule(self, user):
-        self.client.force_authenticate(getattr(self.fixture, user))
-
-        response = self.client.post(self.url, self.snapshot_schedule_data)
-
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(
-            response.data["retention_time"],
-            self.snapshot_schedule_data["retention_time"],
-        )
-        self.assertEqual(
-            response.data["maximal_number_of_resources"],
-            self.snapshot_schedule_data["maximal_number_of_resources"],
-        )
-        self.assertEqual(
-            response.data["schedule"], self.snapshot_schedule_data["schedule"]
-        )
-
-    def test_snapshot_schedule_cannot_be_created_if_schedule_is_less_than_1_hours(self):
-        self.client.force_authenticate(self.fixture.owner)
-        payload = self.snapshot_schedule_data
-        payload["schedule"] = "*/5 * * * *"
-
-        response = self.client.post(self.url, self.snapshot_schedule_data)
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("schedule", response.data)
-
-    def test_snapshot_schedule_default_state_is_OK(self):
-        self.client.force_authenticate(self.fixture.owner)
-
-        response = self.client.post(self.url, self.snapshot_schedule_data)
-
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        snapshot_schedule = models.SnapshotSchedule.objects.first()
-        self.assertIsNotNone(snapshot_schedule)
-        self.assertEqual(snapshot_schedule.state, snapshot_schedule.States.OK)
-
-    def test_snapshot_schedule_can_not_be_created_with_wrong_schedule(self):
-        self.client.force_authenticate(self.fixture.owner)
-
-        # wrong schedule:
-        self.snapshot_schedule_data["schedule"] = "wrong schedule"
-
-        response = self.client.post(self.url, self.snapshot_schedule_data)
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"schedule", response.content)
-
-    def test_snapshot_schedule_creation_with_correct_timezone(self):
-        self.client.force_authenticate(self.fixture.owner)
-        expected_timezone = "Europe/London"
-        self.snapshot_schedule_data["timezone"] = expected_timezone
-        response = self.client.post(self.url, self.snapshot_schedule_data)
-
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data["timezone"], expected_timezone)
-
-    def test_snapshot_schedule_creation_with_incorrect_timezone(self):
-        self.client.force_authenticate(self.fixture.owner)
-        self.snapshot_schedule_data["timezone"] = "incorrect"
-        response = self.client.post(self.url, self.snapshot_schedule_data)
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("timezone", response.data)
-
-    def test_snapshot_schedule_creation_with_default_timezone(self):
-        self.client.force_authenticate(self.fixture.owner)
-        response = self.client.post(self.url, self.snapshot_schedule_data)
-
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data["timezone"], settings.TIME_ZONE)
 
 
 class BaseVolumeCreateTest(test.APITransactionTestCase):
@@ -580,14 +489,14 @@ class VolumeRetypeTestCase(test.APITransactionTestCase):
         self.assertEqual(self.volume.type, self.new_type)
 
     def test_user_can_not_retype_volume_if_volume_operation_is_performed(self):
-        self.volume.state = models.Volume.States.UPDATING
+        self.volume.state = CoreStates.UPDATING
         self.volume.save()
 
         response = self.retype_volume(self.admin, self.new_type)
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
 
     def test_user_can_not_retype_volume_if_it_is_in_erred_state(self):
-        self.volume.state = models.Instance.States.ERRED
+        self.volume.state = CoreStates.ERRED
         self.volume.save()
 
         response = self.retype_volume(self.admin, self.new_type)
@@ -635,14 +544,14 @@ class VolumeFilterTest(test.APITransactionTestCase):
         self.client.force_authenticate(user=self.fixture.owner)
 
     def test_filter_volumes_by_valid_instance_uuid(self):
-        self.volume.state = models.Volume.States.OK
+        self.volume.state = CoreStates.OK
         self.volume.runtime_state = "available"
         self.volume.save()
 
         volume1 = factories.VolumeFactory(
             tenant=self.fixture.tenant,
             project=self.fixture.project,
-            state=models.Volume.States.OK,
+            state=CoreStates.OK,
             runtime_state="available",
             type=self.fixture.volume_type,
             availability_zone=self.fixture.volume_availability_zone,

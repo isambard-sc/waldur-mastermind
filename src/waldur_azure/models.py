@@ -113,7 +113,7 @@ class NetworkInterface(BaseResourceGroupModel):
     )
     subnet = models.ForeignKey(on_delete=models.CASCADE, to=SubNet)
     config_name = models.CharField(max_length=255)
-    public_ip = models.ForeignKey(
+    public_ip = models.ForeignKey["PublicIP"](
         "PublicIP", on_delete=models.SET_NULL, null=True, blank=True
     )
     security_group = models.ForeignKey(

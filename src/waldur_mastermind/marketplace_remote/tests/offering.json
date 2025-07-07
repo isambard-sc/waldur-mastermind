@@ -37,9 +37,6 @@
     "support_email": "user@example.com"
   },
   "state": "Active",
-  "state_code": 2,
-  "native_name": "",
-  "native_description": "",
   "vendor_details": "",
   "type": "Marketplace.Rancher",
   "shared": true,
@@ -80,11 +77,12 @@
       ]
     }
   ],
-  "thumbnail": "thumbnail.gif",
+  "thumbnail": "http://test-thumbnail.example.com/thumbnail.gif",
   "terms_of_service_link": "",
   "privacy_policy_link": "",
   "getting_started": "",
   "integration_guide": "",
   "country": "EE",
-  "resource_options": {}
+  "resource_options": {},
+  "access_url": "http://test-access-url.example.com/"
 }

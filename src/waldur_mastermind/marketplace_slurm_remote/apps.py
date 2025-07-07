@@ -9,7 +9,6 @@ class MarketplaceSlurmConfig(AppConfig):
 
     def ready(self):
         from waldur_core.permissions import signals as permission_signals
-        from waldur_mastermind.marketplace import handlers as marketplace_handlers
         from waldur_mastermind.marketplace import models as marketplace_models
         from waldur_mastermind.marketplace.plugins import manager
         from waldur_mastermind.marketplace_slurm_remote import (
@@ -20,18 +19,8 @@ class MarketplaceSlurmConfig(AppConfig):
         from waldur_mastermind.marketplace_slurm_remote import (
             registrators as slurm_registrators,
         )
-        from waldur_slurm import models as slurm_models
 
         slurm_registrators.RemoteSlurmRegistrator.connect()
-
-        signals.post_save.connect(
-            handlers.update_component_quota,
-            sender=slurm_models.Allocation,
-            dispatch_uid="waldur_mastermind.marketplace_slurm.update_component_quota",
-        )
-
-        marketplace_handlers.connect_resource_handlers(slurm_models.Allocation)
-        marketplace_handlers.connect_resource_metadata_handlers(slurm_models.Allocation)
 
         manager.register(
             PLUGIN_NAME,
@@ -43,15 +32,21 @@ class MarketplaceSlurmConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.sync_component_user_usage_when_allocation_user_usage_is_submitted,
-            sender=slurm_models.AllocationUserUsage,
-            dispatch_uid="waldur_mastermind.marketplace_slurm_remote.sync_component_user_usage_when_allocation_user_usage_is_submitted",
+            handlers.send_done_order_to_message_queue,
+            sender=marketplace_models.Order,
+            dispatch_uid="waldur_mastermind.marketplace_slurm_remote.send_done_order_to_message_queue",
         )
 
         signals.post_save.connect(
-            handlers.send_order_created_to_mqtt,
+            handlers.send_pending_order_to_message_queue,
             sender=marketplace_models.Order,
-            dispatch_uid="waldur_mastermind.marketplace_slurm_remote.send_order_created_to_mqtt",
+            dispatch_uid="waldur_mastermind.marketplace_slurm_remote.send_pending_order_to_message_queue",
+        )
+
+        signals.post_save.connect(
+            handlers.send_offering_user_username_message,
+            sender=marketplace_models.OfferingUser,
+            dispatch_uid="waldur_mastermind.marketplace_slurm_remote.send_offering_user_username_message",
         )
 
         signals.post_save.connect(

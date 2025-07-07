@@ -1,12 +1,13 @@
-import json
 import os
 
 import yaml
-from constance import config
 from django.core.files.storage import default_storage
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management.base import BaseCommand
+from rest_framework.exceptions import ValidationError
 
 from waldur_core.core import logos
+from waldur_core.core.serializers import ConstanceSettingsSerializer
 
 WHITELABELING_LOGOS = logos.LOGO_MAP.keys()
 
@@ -44,25 +45,62 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         with open(options["constance_settings_file"]) as constance_settings_file:
             constance_settings = yaml.safe_load(constance_settings_file)
-
         if constance_settings is None:
-            self.stdout.write(self.style.ERROR("Constance settings file is empty."))
+            self.stdout.write(self.style.WARNING("Constance settings file is empty."))
             return
 
+        constance_settings = {
+            key.upper(): value for key, value in constance_settings.items()
+        }
+        keys_to_delete = []
         for setting_key, setting_value in constance_settings.items():
-            if setting_key.upper() in WHITELABELING_LOGOS:
-                if os.path.exists(setting_value):
-                    setting_value = make_constance_file_value(setting_value)
+            if setting_key in WHITELABELING_LOGOS:
+                if not setting_value.strip():
+                    setting_value = None
+                elif os.path.exists(setting_value):
+                    with open(setting_value, "rb") as image_file:
+                        image_content = image_file.read()
+                        setting_value = SimpleUploadedFile(setting_value, image_content)
                 else:
                     self.stdout.write(
                         self.style.ERROR(f"{setting_key.upper()} file does not exist.")
                     )
+                    keys_to_delete.append(setting_key)
                     continue
-            if isinstance(setting_value, dict):
-                setting_value = json.dumps(setting_value)
+                constance_settings[setting_key] = setting_value
 
-            setattr(config, setting_key.upper(), setting_value)
+        # Delete keys that have invalid values
+        for key in keys_to_delete:
+            del constance_settings[key]
 
+        try:
+            serializer = ConstanceSettingsSerializer(data=constance_settings)
+            serializer.is_valid(raise_exception=False)
+
+            # settings_to_delete = [key for key,_ in serializer.errors.items()]
+            settings_to_delete = dict(serializer.errors)
+
+            # Remove broken fields from the data
+            for name, _ in settings_to_delete.items():
+                del constance_settings[name]
+
+            serializer = ConstanceSettingsSerializer(data=constance_settings)
+            if serializer.is_valid():
+                serializer.save()
+
+            # Show error messages for broken fields
+            for name, error in settings_to_delete.items():
+                self.stdout.write(
+                    self.style.ERROR(
+                        f"Failed to save setting {name} due to error: {str(error[0])}"
+                    )
+                )
+        except ValidationError as e:
+            self.stdout.write(
+                self.style.ERROR(f"Unexpected validation error: {str(e)}")
+            )
+
+        for setting_key, setting_value in constance_settings.items():
             if "password" in setting_key.lower() or "token" in setting_key.lower():
                 setting_value = "<redacted>"
 

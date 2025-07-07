@@ -10,7 +10,7 @@ from waldur_mastermind.marketplace import models, tasks
 
 class MarketplacePlanComponentLogger(EventLogger):
     plan_component = models.PlanComponent
-    old_value = Number
+    old_value = (Number, str)
     new_value = Number
 
     class Meta:
@@ -19,6 +19,9 @@ class MarketplacePlanComponentLogger(EventLogger):
             "marketplace_plan_component_future_price_updated",
             "marketplace_plan_component_quota_updated",
         )
+        event_groups = {
+            "offering_accounting": event_types,
+        }
         nullable_fields = ("old_value", "new_value")
 
     @staticmethod
@@ -37,6 +40,9 @@ class MarketplaceOfferingComponentLogger(EventLogger):
             "marketplace_offering_component_updated",
             "marketplace_offering_component_deleted",
         )
+        event_groups = {
+            "offering_accounting": event_types,
+        }
 
     @staticmethod
     def get_scopes(event_context):
@@ -56,6 +62,9 @@ class MarketplacePlanLogger(EventLogger):
             "marketplace_plan_updated",
             "marketplace_plan_archived",
         )
+        event_groups = {
+            "offering_accounting": event_types,
+        }
 
     @staticmethod
     def get_scopes(event_context):
@@ -217,7 +226,6 @@ class MarketplaceResourceLogger(EventLogger):
             "marketplace_resource_downscaled",
             "marketplace_resource_paused",
             "marketplace_resource_erred_on_backend",
-            "marketplace_resource_has_been_changed",
             "marketplace_resource_unlinked",
         )
         nullable_fields = ["old_name"]
@@ -251,6 +259,7 @@ class RobotAccountEventLogger(EventLogger):
             "resource_robot_account_created",
             "resource_robot_account_updated",
             "resource_robot_account_deleted",
+            "resource_robot_account_state_changed",
         )
         event_groups = {
             "resources": event_types,
@@ -270,6 +279,7 @@ class MarketplaceServiceProviderLogger(EventLogger):
             "resource_robot_account_created",
             "resource_robot_account_updated",
             "resource_robot_account_deleted",
+            "resource_robot_account_state_changed",
             "marketplace_resource_create_succeeded",
             "marketplace_resource_update_limits_succeeded",
             "marketplace_resource_terminate_requested",
@@ -285,10 +295,27 @@ class MarketplaceServiceProviderLogger(EventLogger):
         event_groups = {"providers": event_types}
 
 
+class ScopedServiceAccountEventLogger(EventLogger):
+    service_account = models.ScopedServiceAccount
+
+    class Meta:
+        event_types = (
+            "service_account_created",
+            "service_account_updated",
+            "service_account_deleted",
+        )
+
+    @staticmethod
+    def get_scopes(event_context):
+        service_account: models.ScopedServiceAccount = event_context["service_account"]
+        return {service_account, service_account.scope}
+
+
 event_logger.register("marketplace_order", MarketplaceOrderLogger)
 event_logger.register("marketplace_resource", MarketplaceResourceLogger)
 event_logger.register("marketplace_offering_user", MarketplaceOfferingUserEventLogger)
 event_logger.register("marketplace_robot_account", RobotAccountEventLogger)
+event_logger.register("marketplace_service_account", ScopedServiceAccountEventLogger)
 event_logger.register("marketplace_service_provider", MarketplaceServiceProviderLogger)
 event_logger.register("marketplace_plan_component", MarketplacePlanComponentLogger)
 event_logger.register(
@@ -416,14 +443,6 @@ def log_resource_update_requested(resource):
     event_logger.marketplace_resource.info(
         "Resource {resource_name} update has been requested.",
         event_type="marketplace_resource_update_requested",
-        event_context={"resource": resource},
-    )
-
-
-def log_resource_update_succeeded(resource):
-    event_logger.marketplace_resource.info(
-        "Resource {resource_name} has been updated successfully.",
-        event_type="marketplace_resource_update_succeeded",
         event_context={"resource": resource},
     )
 
@@ -576,7 +595,7 @@ def log_resource_erred_on_backend(resource):
     )
 
 
-def log_marketplace_resource_has_been_changed(resource, changed):
+def log_resource_update_succeeded(resource, changed):
     if not changed:
         return
 
@@ -603,7 +622,7 @@ def log_marketplace_resource_has_been_changed(resource, changed):
         .render(Context(context))
         .replace("{", "{{")
         .replace("}", "}}"),
-        event_type="marketplace_resource_has_been_changed",
+        event_type="marketplace_resource_update_succeeded",
         event_context=event_context,
     )
 

@@ -1,11 +1,10 @@
-from django.contrib.contenttypes.models import ContentType
 from django.utils.functional import cached_property
 
-from waldur_core.core.models import StateMixin
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure.tests.fixtures import ProjectFixture
 from waldur_openstack.models import Tenant
 from waldur_openstack.tests import factories as openstack_factories
-from waldur_rancher import models
+from waldur_rancher import enums
 
 from . import factories
 
@@ -29,7 +28,7 @@ class RancherFixture(ProjectFixture):
             settings=self.settings,
             service_settings=self.settings,
             project=self.project,
-            state=models.Cluster.States.OK,
+            state=CoreStates.OK,
             tenant=self.tenant,
             name="my-cluster",
         )
@@ -40,15 +39,38 @@ class RancherFixture(ProjectFixture):
             service_settings=self.tenant.service_settings,
             tenant=self.tenant,
             project=self.project,
-            state=StateMixin.States.OK,
+            state=CoreStates.OK,
         )
 
     @cached_property
     def node(self):
-        content_type = ContentType.objects.get_for_model(self.instance)
         return factories.NodeFactory(
             cluster=self.cluster,
-            object_id=self.instance.id,
-            content_type=content_type,
-            state=models.Node.States.OK,
+            instance=self.instance,
+            state=CoreStates.OK,
+        )
+
+    @cached_property
+    def cluster_owner_role(self):
+        return factories.RoleTemplateFactory(
+            name="cluster-owner",
+            display_name="Cluster Owner",
+            settings=self.settings,
+        )
+
+    @cached_property
+    def cluster_member_role(self):
+        return factories.RoleTemplateFactory(
+            name="cluster-member",
+            display_name="Cluster Member",
+            settings=self.settings,
+        )
+
+    @cached_property
+    def project_owner_role(self):
+        return factories.RoleTemplateFactory(
+            name="project-owner",
+            display_name="Project Owner",
+            settings=self.settings,
+            scope_type=enums.RoleScopeType.PROJECT,
         )

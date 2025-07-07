@@ -3,12 +3,14 @@ from typing import TypeVar
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
-from django.db.models import F, Q, QuerySet
+from django.db.models import F, Model, Q, QuerySet
 from django.db.models.functions import Now
 from rest_framework.authtoken import models as authtoken_models
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.managers import GenericKeyMixin
+from waldur_core.core.models import User
+from waldur_core.permissions.mixins import PermissionMixin
 from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import get_scope_ids, get_user_ids
 from waldur_core.structure import models as structure_models
@@ -20,11 +22,29 @@ def build_filter(path, ids):
     return models.Q(**{f"{path}__in": ids})
 
 
-T = TypeVar("T")
+T = TypeVar("T", bound=Model)
 
 
-def filter_queryset_for_user(queryset: QuerySet[T], user) -> QuerySet[T]:
-    if user is None or user.is_staff or user.is_support:
+def filter_queryset_for_user(queryset: QuerySet[T], user: User) -> QuerySet[T]:
+    def get_customer_subquery(path):
+        if list_permission:
+            connected_customers = get_connected_customers_by_permission(
+                user, list_permission
+            )
+        else:
+            connected_customers = get_connected_customers(user)
+        return build_filter(path, connected_customers)
+
+    def get_project_subquery(path):
+        if list_permission:
+            connected_projects = get_connected_projects_by_permission(
+                user, list_permission
+            )
+        else:
+            connected_projects = get_connected_projects(user)
+        return build_filter(path, connected_projects)
+
+    if user is None or not user.is_authenticated or user.is_staff or user.is_support:
         return queryset
 
     if not user.is_active:
@@ -43,22 +63,28 @@ def filter_queryset_for_user(queryset: QuerySet[T], user) -> QuerySet[T]:
     project_path = getattr(permissions, "project_path", None)
 
     if customer_path:
-        if list_permission:
-            customers = get_connected_customers_by_permission(user, list_permission)
+        if isinstance(customer_path, list | tuple):
+            for p in customer_path:
+                subquery |= get_customer_subquery(p)
         else:
-            customers = get_connected_customers(user)
-        subquery |= build_filter(customer_path, customers)
+            subquery |= get_customer_subquery(customer_path)
 
     if project_path:
-        if list_permission:
-            projects = get_connected_projects_by_permission(user, list_permission)
+        if isinstance(project_path, list | tuple):
+            for p in project_path:
+                subquery |= get_project_subquery(p)
         else:
-            projects = get_connected_projects(user)
-        subquery |= build_filter(project_path, projects)
+            subquery |= get_project_subquery(project_path)
 
     build_query = getattr(permissions, "build_query", None)
     if build_query:
         subquery |= build_query(user)
+
+    if issubclass(queryset.model, PermissionMixin) and issubclass(
+        queryset.model, Model
+    ):
+        content_type = ContentType.objects.get_for_model(queryset.model)
+        subquery |= models.Q(id__in=get_scope_ids(user, content_type))
 
     if not subquery:
         return queryset
@@ -89,15 +115,25 @@ def filter_queryset_by_user_ip(queryset, request):
     if not customer_path:
         return queryset
 
-    if customer_path == "self":
-        path = "id__in"
-        none_path = "id"
-    else:
-        path = customer_path + "__id__in"
-        none_path = customer_path + "_id"
+    subquery = models.Q()
 
-    customers_ids = filter_customer_by_ip_address(user_ip)
-    subquery = models.Q(**{path: customers_ids}) | models.Q(**{none_path: None})
+    def get_subquery(c_path):
+        if c_path == "self":
+            path = "id__in"
+            none_path = "id"
+        else:
+            path = c_path + "__id__in"
+            none_path = c_path + "_id"
+
+        customers_ids = filter_customer_by_ip_address(user_ip)
+        return models.Q(**{path: customers_ids}) | models.Q(**{none_path: None})
+
+    if isinstance(customer_path, list | tuple):
+        for p in customer_path:
+            subquery |= get_subquery(p)
+    else:
+        subquery |= get_subquery(customer_path)
+
     return queryset.filter(subquery)
 
 

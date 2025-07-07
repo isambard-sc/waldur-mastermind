@@ -1,7 +1,7 @@
 from functools import cached_property
 
 from waldur_core.structure.tests.factories import ProjectFactory
-from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.marketplace_support import PLUGIN_NAME
 from waldur_mastermind.support import models as support_models
@@ -57,7 +57,7 @@ class SupportFixture:
     def order(self):
         return marketplace_factories.OrderFactory(
             project=self.project,
-            state=marketplace_models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
             offering=self.offering,
             resource=self.resource,
         )
@@ -73,12 +73,10 @@ class IssueStatusHandlerTest(BaseTest):
         self.fixture.issue.save()
 
         self.fixture.order.refresh_from_db()
-        self.assertEqual(self.fixture.order.state, marketplace_models.Order.States.DONE)
+        self.assertEqual(self.fixture.order.state, OrderStates.DONE)
 
         self.fixture.resource.refresh_from_db()
-        self.assertEqual(
-            self.fixture.resource.state, marketplace_models.Resource.States.OK
-        )
+        self.assertEqual(self.fixture.resource.state, ResourceStates.OK)
 
     def test_order_is_terminated_when_resource_creation_issue_is_canceled(self):
         self.fixture.issue.status = self.fixture.fail_issue_status.name
@@ -87,20 +85,18 @@ class IssueStatusHandlerTest(BaseTest):
         self.fixture.order.refresh_from_db()
         self.assertEqual(
             self.fixture.order.state,
-            marketplace_models.Order.States.CANCELED,
+            OrderStates.CANCELED,
         )
 
         self.fixture.resource.refresh_from_db()
-        self.assertEqual(
-            self.fixture.resource.state, marketplace_models.Resource.States.TERMINATED
-        )
+        self.assertEqual(self.fixture.resource.state, ResourceStates.TERMINATED)
 
     def test_use_second_resolve_state(self):
         self.fixture.issue.status = self.fixture.success_issue_status.name
         self.fixture.issue.save()
 
         self.fixture.order.refresh_from_db()
-        self.assertEqual(self.fixture.order.state, marketplace_models.Order.States.DONE)
+        self.assertEqual(self.fixture.order.state, OrderStates.DONE)
 
         self.fixture.issue.status = self.fixture.second_success_issue_status.name
         self.fixture.issue.save()

@@ -1,5 +1,6 @@
 - role: CUSTOMER.OWNER
   description: Organization owner
+  scope: customer
   permissions:
     - OFFERING.CREATE
     - OFFERING.DELETE
@@ -70,6 +71,7 @@
     - CUSTOMER.UPDATE
     - CUSTOMER.DELETE
     - CUSTOMER.LIST_PERMISSION_REVIEWS
+    - CUSTOMER.LIST_USERS
     - CALL.APPROVE_AND_REJECT_PROPOSALS
     - CALL.CLOSE_ROUNDS
     - ACCESS_SUBNET.CREATE
@@ -91,9 +93,11 @@
     - SERVICE_PROVIDER.GET_REVENUE
     - SERVICE_PROVIDER.GET_ROBOT_ACCOUNT_CUSTOMERS
     - SERVICE_PROVIDER.GET_ROBOT_ACCOUNT_PROJECTS
+    - SERVICE_ACCOUNT.MANAGE
 
 - role: CUSTOMER.MANAGER
-  is_active: false
+  is_active: true
+  scope: service_provider
   description: Service provider manager
   permissions:
     - RESOURCE.SET_END_DATE
@@ -150,9 +154,11 @@
     - SERVICE_PROVIDER.GET_REVENUE
     - SERVICE_PROVIDER.GET_ROBOT_ACCOUNT_CUSTOMERS
     - SERVICE_PROVIDER.GET_ROBOT_ACCOUNT_PROJECTS
+    - SERVICE_ACCOUNT.MANAGE
 
 - role: PROJECT.ADMIN
   description: Project administrator
+  scope: project
   permissions:
     - PROJECT.LIST
     - INVITATION.LIST
@@ -168,6 +174,7 @@
 
 - role: PROJECT.MANAGER
   description: Project manager
+  scope: project
   permissions:
     - PROJECT.LIST
     - INVITATION.LIST
@@ -187,6 +194,7 @@
 
 - role: OFFERING.MANAGER
   description: Offering manager
+  scope: offering
   permissions:
     - OFFERING.UPDATE
     - OFFERING.UPDATE_ATTRIBUTES
@@ -211,31 +219,56 @@
 
 - role: CALL.REVIEWER
   description: Call reviewer
+  scope: call
   permissions:
     - PROPOSAL.LIST
 
 - role: CUSTOMER.SUPPORT
   is_active: false
   description: Organization support
+  scope: customer
+  permissions:
+    - CUSTOMER.LIST_USERS
 
 - role: CALL.MANAGER
   description: Call manager
+  scope: call
   permissions:
     - CALL.APPROVE_AND_REJECT_PROPOSALS
     - CALL.CLOSE_ROUNDS
     - CALL.CREATE_PERMISSION
     - CALL.UPDATE_PERMISSION
     - CALL.DELETE_PERMISSION
+    - CALL.LIST
+    - ROUND.LIST
     - PROPOSAL.LIST
+    - PROPOSAL.MANAGE_REVIEW
 
 - role: PROPOSAL.MANAGER
   description: Proposal manager
+  scope: proposal
   permissions:
     - PROPOSAL.MANAGE
 
 - role: PROJECT.MEMBER
   description: Project member
+  scope: project
   is_active: false
   permissions:
     - RESOURCE.LIST
     - PROJECT.LIST
+
+- role: CUSTOMER.CALL_ORGANIZER
+  scope: call_organizer
+  description: Organization call organizer
+  permissions:
+    - CALL.APPROVE_AND_REJECT_PROPOSALS
+    - CALL.CLOSE_ROUNDS
+    - CALL.CREATE_PERMISSION
+    - CALL.UPDATE_PERMISSION
+    - CALL.DELETE_PERMISSION
+    - CALL.LIST
+    - CALL.CREATE
+    - ROUND.LIST
+    - PROPOSAL.LIST
+    - PROPOSAL.MANAGE_REVIEW

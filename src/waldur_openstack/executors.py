@@ -129,85 +129,82 @@ class PushSecurityGroupRulesExecutor(core_executors.ActionExecutor):
         )
 
 
-class TenantCreateExecutor(core_executors.CreateExecutor):
-    @classmethod
-    def get_task_signature(
-        cls, tenant, serialized_tenant, pull_security_groups=True, **kwargs
-    ):
-        """Create tenant, add user to it, create internal network, pull quotas"""
-        # we assume that tenant one network and subnet after creation
-        network = tenant.networks.first()
-        subnet = network.subnets.first()
-        serialized_network = core_utils.serialize_instance(network)
-        serialized_subnet = core_utils.serialize_instance(subnet)
-        creation_tasks = [
-            core_tasks.BackendMethodTask().si(
-                serialized_tenant,
-                "create_tenant_safe",
-                state_transition="begin_creating",
-            ),
-            core_tasks.BackendMethodTask().si(
-                serialized_tenant, "add_admin_user_to_tenant"
-            ),
-            core_tasks.BackendMethodTask().si(serialized_tenant, "create_tenant_user"),
-            core_tasks.BackendMethodTask().si(
-                serialized_network, "create_network", state_transition="begin_creating"
-            ),
-            core_tasks.BackendMethodTask().si(
-                serialized_subnet, "create_subnet", state_transition="begin_creating"
-            ),
-        ]
+def get_tenant_create_tasks(tenant: models.Tenant, skip_connection_extnet=False):
+    serialized_tenant = core_utils.serialize_instance(tenant)
+    creation_tasks = [
+        core_tasks.BackendMethodTask().si(
+            serialized_tenant,
+            "create_tenant_safe",
+            state_transition="begin_creating",
+        ),
+        core_tasks.BackendMethodTask().si(
+            serialized_tenant, "add_admin_user_to_tenant"
+        ),
+        core_tasks.BackendMethodTask().si(serialized_tenant, "create_tenant_user"),
+        core_tasks.BackendMethodTask().si(
+            serialized_tenant,
+            "push_tenant_quotas",
+            tenant.quota_limits,
+        ),
+        core_tasks.BackendMethodTask().si(
+            serialized_tenant,
+            "sync_default_security_group",
+        ),
+    ]
+    for router in tenant.routers.all():
+        creation_tasks.append(RouterCreateExecutor.as_signature(router))
+        creation_tasks.append(RouterSetRoutesExecutor.as_signature(router))
+    for network in tenant.networks.all():
+        creation_tasks.append(NetworkCreateExecutor.as_signature(network))
+        for subnet in network.subnets.all():
+            creation_tasks.append(SubNetCreateExecutor.as_signature(subnet))
+    security_groups = utils.reorder_security_groups_topologically(
+        list(tenant.security_groups.exclude(name="default"))
+    )
+    for security_group in security_groups:
+        creation_tasks.append(SecurityGroupCreateExecutor.as_signature(security_group))
+    external_network_id = utils.get_external_network_id(tenant)
+    if external_network_id and not skip_connection_extnet:
         creation_tasks.append(
             core_tasks.BackendMethodTask().si(
-                serialized_tenant, "push_tenant_quotas", tenant.quota_limits
+                serialized_tenant,
+                "connect_tenant_to_external_network",
+                external_network_id=external_network_id,
             )
         )
-        # handle security groups
-        # XXX: Create default security groups
-        for security_group in tenant.security_groups.all():
-            creation_tasks.append(
-                SecurityGroupCreateExecutor.as_signature(security_group)
-            )
+    creation_tasks += [
+        core_tasks.BackendMethodTask().si(
+            serialized_tenant, backend_method="pull_tenant_ports"
+        ),
+        core_tasks.BackendMethodTask().si(
+            serialized_tenant,
+            backend_method="pull_tenant_routers",
+        ),
+        core_tasks.BackendMethodTask().si(serialized_tenant, "pull_tenant_quotas"),
+        core_tasks.BackendMethodTask().si(serialized_tenant, "pull_tenant_images"),
+        core_tasks.BackendMethodTask().si(serialized_tenant, "pull_tenant_flavors"),
+        core_tasks.BackendMethodTask().si(
+            serialized_tenant, "pull_tenant_volume_types"
+        ),
+        core_tasks.BackendMethodTask().si(
+            serialized_tenant, "pull_tenant_instance_availability_zones"
+        ),
+        core_tasks.BackendMethodTask().si(
+            serialized_tenant, "pull_tenant_volume_availability_zones"
+        ),
+        core_tasks.StateTransitionTask().si(
+            serialized_tenant, state_transition="set_ok"
+        ),
+    ]
+    return chain(*creation_tasks)
 
-        if pull_security_groups:
-            creation_tasks.append(
-                core_tasks.BackendMethodTask().si(
-                    serialized_tenant, "pull_tenant_security_groups"
-                )
-            )
 
-        # initialize external network if it defined in service settings
-        external_network_id = utils.get_external_network_id(tenant)
-        if external_network_id and not kwargs.get("skip_connection_extnet"):
-            creation_tasks.append(
-                core_tasks.BackendMethodTask().si(
-                    serialized_tenant,
-                    "connect_tenant_to_external_network",
-                    external_network_id=external_network_id,
-                )
-            )
-            creation_tasks.append(
-                core_tasks.BackendMethodTask().si(
-                    serialized_tenant,
-                    backend_method="pull_tenant_routers",
-                )
-            )
-
-        creation_tasks += [
-            core_tasks.BackendMethodTask().si(serialized_tenant, "pull_tenant_quotas"),
-            core_tasks.BackendMethodTask().si(serialized_tenant, "pull_tenant_images"),
-            core_tasks.BackendMethodTask().si(serialized_tenant, "pull_tenant_flavors"),
-            core_tasks.BackendMethodTask().si(
-                serialized_tenant, "pull_tenant_volume_types"
-            ),
-            core_tasks.BackendMethodTask().si(
-                serialized_tenant, "pull_tenant_instance_availability_zones"
-            ),
-            core_tasks.BackendMethodTask().si(
-                serialized_tenant, "pull_tenant_volume_availability_zones"
-            ),
-        ]
-        return chain(*creation_tasks)
+class TenantCreateExecutor(core_executors.BaseExecutor):
+    @classmethod
+    def get_task_signature(cls, tenant, serialized_tenant, **kwargs):
+        return get_tenant_create_tasks(
+            tenant, skip_connection_extnet=kwargs.get("skip_connection_extnet")
+        )
 
     @classmethod
     def get_success_signature(cls, tenant, serialized_tenant, **kwargs):
@@ -275,8 +272,14 @@ class TenantImportExecutor(core_executors.ActionExecutor):
 
     @classmethod
     def get_success_signature(cls, tenant, serialized_tenant, **kwargs):
-        return core_tasks.StateTransitionTask().si(
-            serialized_tenant, state_transition="set_ok"
+        return chain(
+            core_tasks.StateTransitionTask().si(
+                serialized_tenant, state_transition="set_ok"
+            ),
+            tasks.SendSignalTenantPullSucceeded().si(serialized_tenant),
+            core_tasks.BackendMethodTask().si(
+                serialized_tenant, "create_offerings_for_volume_and_instance"
+            ),
         )
 
 
@@ -521,6 +524,9 @@ class ExistingTenantPullExecutor(core_executors.ActionExecutor):
             ),
             core_tasks.BackendMethodTask().si(serialized_tenant, "pull_subnets"),
             core_tasks.BackendMethodTask().si(
+                serialized_tenant, "pull_tenant_network_rbac_policies"
+            ),
+            core_tasks.BackendMethodTask().si(
                 serialized_tenant, backend_method="pull_tenant_routers"
             ),
             core_tasks.BackendMethodTask().si(
@@ -551,6 +557,7 @@ class ExistingTenantPullExecutor(core_executors.ActionExecutor):
                 action_details={},
             ),
             tasks.SendSignalTenantPullSucceeded().si(serialized_instance),
+            tasks.create_offerings_task.si(serialized_instance),
         )
 
 
@@ -763,7 +770,16 @@ class PortCreateExecutor(core_executors.CreateExecutor):
             serialized_port,
             "create_port",
             state_transition="begin_creating",
-            serialized_network=kwargs.get("network"),
+        )
+
+
+class PortUpdateNameAndDescriptionExecutor(core_executors.UpdateExecutor):
+    @classmethod
+    def get_task_signature(cls, port, serialized_port, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_port,
+            "update_port_name_and_description",
+            state_transition="begin_updating",
         )
 
 
@@ -867,8 +883,8 @@ class VolumeExtendExecutor(core_executors.ActionExecutor):
             volume.instance.save()
 
     @classmethod
-    def get_task_signature(cls, volume, serialized_volume, **kwargs):
-        if volume.instance is None:
+    def get_task_signature(cls, volume: models.Volume, serialized_volume, **kwargs):
+        if volume.extend_enabled:
             return chain(
                 core_tasks.BackendMethodTask().si(
                     serialized_volume,
@@ -878,50 +894,51 @@ class VolumeExtendExecutor(core_executors.ActionExecutor):
                 core_tasks.PollRuntimeStateTask().si(
                     serialized_volume,
                     backend_pull_method="pull_volume_runtime_state",
-                    success_state="available",
+                    success_state="in-use" if volume.instance else "available",
                     erred_state="error",
                 ),
             )
 
-        return chain(
-            core_tasks.StateTransitionTask().si(
-                core_utils.serialize_instance(volume.instance),
-                state_transition="begin_updating",
-            ),
-            core_tasks.BackendMethodTask().si(
-                serialized_volume,
-                backend_method="detach_volume",
-                state_transition="begin_updating",
-            ),
-            core_tasks.PollRuntimeStateTask().si(
-                serialized_volume,
-                backend_pull_method="pull_volume_runtime_state",
-                success_state="available",
-                erred_state="error",
-            ),
-            core_tasks.BackendMethodTask().si(
-                serialized_volume,
-                backend_method="extend_volume",
-            ),
-            core_tasks.PollRuntimeStateTask().si(
-                serialized_volume,
-                backend_pull_method="pull_volume_runtime_state",
-                success_state="available",
-                erred_state="error",
-            ),
-            core_tasks.BackendMethodTask().si(
-                serialized_volume,
-                instance_uuid=volume.instance.uuid.hex,
-                device=volume.device,
-                backend_method="attach_volume",
-            ),
-            core_tasks.PollRuntimeStateTask().si(
-                serialized_volume,
-                backend_pull_method="pull_volume_runtime_state",
-                success_state="in-use",
-                erred_state="error",
-            ),
-        )
+        if volume.instance:
+            return chain(
+                core_tasks.StateTransitionTask().si(
+                    core_utils.serialize_instance(volume.instance),
+                    state_transition="begin_updating",
+                ),
+                core_tasks.BackendMethodTask().si(
+                    serialized_volume,
+                    backend_method="detach_volume",
+                    state_transition="begin_updating",
+                ),
+                core_tasks.PollRuntimeStateTask().si(
+                    serialized_volume,
+                    backend_pull_method="pull_volume_runtime_state",
+                    success_state="available",
+                    erred_state="error",
+                ),
+                core_tasks.BackendMethodTask().si(
+                    serialized_volume,
+                    backend_method="extend_volume",
+                ),
+                core_tasks.PollRuntimeStateTask().si(
+                    serialized_volume,
+                    backend_pull_method="pull_volume_runtime_state",
+                    success_state="available",
+                    erred_state="error",
+                ),
+                core_tasks.BackendMethodTask().si(
+                    serialized_volume,
+                    instance_uuid=volume.instance.uuid.hex,
+                    device=volume.device,
+                    backend_method="attach_volume",
+                ),
+                core_tasks.PollRuntimeStateTask().si(
+                    serialized_volume,
+                    backend_pull_method="pull_volume_runtime_state",
+                    success_state="in-use",
+                    erred_state="error",
+                ),
+            )
 
     @classmethod
     def get_success_signature(cls, volume, serialized_volume, **kwargs):
@@ -1113,6 +1130,7 @@ class InstanceCreateExecutor(core_executors.CreateExecutor):
         _tasks += cls.create_floating_ips(instance, serialized_instance)
         _tasks += cls.pull_server_group(serialized_instance)
         _tasks += cls.pull_instance(serialized_instance)
+        _tasks += cls.update_ports_status(serialized_instance)
         return chain(*_tasks)
 
     @classmethod
@@ -1303,6 +1321,14 @@ class InstanceCreateExecutor(core_executors.CreateExecutor):
     def pull_instance(cls, serialized_instance):
         return [core_tasks.BackendMethodTask().si(serialized_instance, "pull_instance")]
 
+    @classmethod
+    def update_ports_status(cls, serialized_instance):
+        return [
+            core_tasks.BackendMethodTask().si(
+                serialized_instance, "update_instance_port_status"
+            )
+        ]
+
 
 class InstanceUpdateExecutor(core_executors.UpdateExecutor):
     @classmethod
@@ -1328,6 +1354,18 @@ class InstanceUpdateSecurityGroupsExecutor(core_executors.ActionExecutor):
         return core_tasks.BackendMethodTask().si(
             serialized_instance,
             backend_method="push_instance_security_groups",
+            state_transition="begin_updating",
+        )
+
+
+class PortUpdateSecurityGroupsExecutor(core_executors.ActionExecutor):
+    action = "Update security groups"
+
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_instance,
+            backend_method="push_port_security_groups",
             state_transition="begin_updating",
         )
 
@@ -1856,12 +1894,17 @@ class SnapshotRestorationExecutor(core_executors.CreateExecutor):
         )
 
 
-class OpenStackCleanupExecutor(structure_executors.BaseCleanupExecutor):
-    pre_models = (
-        models.SnapshotSchedule,
-        models.BackupSchedule,
-    )
+class RouterDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, router, serialized_router, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_router,
+            "delete_router",
+            state_transition="begin_deleting",
+        )
 
+
+class OpenStackCleanupExecutor(structure_executors.BaseCleanupExecutor):
     executors = (
         (models.SecurityGroup, SecurityGroupDeleteExecutor),
         (models.FloatingIP, FloatingIPDeleteExecutor),
@@ -1874,3 +1917,14 @@ class OpenStackCleanupExecutor(structure_executors.BaseCleanupExecutor):
         (models.Instance, InstanceDeleteExecutor),
         (models.Volume, VolumeDeleteExecutor),
     )
+
+
+class RouterInterfaceDeleteExecutor(core_executors.ActionExecutor):
+    @classmethod
+    def get_task_signature(cls, router, serialized_router, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_router,
+            "remove_router_interface_safely",
+            state_transition="begin_updating",
+            **kwargs,
+        )

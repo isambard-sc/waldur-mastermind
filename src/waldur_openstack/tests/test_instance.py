@@ -4,17 +4,17 @@ from unittest import mock
 from celery import Signature
 from cinderclient import exceptions as cinder_exceptions
 from ddt import data, ddt
-from django.conf import settings
 from django.test import override_settings
 from novaclient import exceptions as nova_exceptions
 from rest_framework import status, test
 
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.utils import serialize_instance
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.common import utils as common_utils
 from waldur_openstack import executors, models, views
 from waldur_openstack.exceptions import OpenStackBackendError
-from waldur_openstack.models import FloatingIP, Port
+from waldur_openstack.models import Port
 from waldur_openstack.tasks import LimitedPerTypeThrottleMixin
 from waldur_openstack.tests import factories, fixtures, helpers
 from waldur_openstack.tests.helpers import (
@@ -171,6 +171,25 @@ class InstanceCreateTest(test.APITransactionTestCase):
         response = self.create_instance(self.get_valid_data())
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
+    def test_user_can_define_fixed_ips(self):
+        post_data = self.get_valid_data()
+        fixed_ips = [{"ip_address": "192.168.0.1", "subnet_id": self.subnet.backend_id}]
+        post_data["ports"][0]["fixed_ips"] = fixed_ips
+        response = self.create_instance(post_data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(instance.ports.first().fixed_ips, fixed_ips)
+
+    def test_can_create_instance_with_existing_port_in_down_state(self):
+        post_data = self.get_valid_data()
+        self.fixture.port.status = "DOWN"
+        self.fixture.port.save()
+        post_data["ports"][0]["port"] = factories.PortFactory.get_url(self.fixture.port)
+        response = self.create_instance(post_data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(instance.ports.first(), self.fixture.port)
+
     def test_user_can_define_instance_subnets(self):
         subnet = self.fixture.subnet
         data = self.get_valid_data(
@@ -193,7 +212,7 @@ class InstanceCreateTest(test.APITransactionTestCase):
     def test_user_can_define_instance_floating_ips(self):
         subnet_url = factories.SubNetFactory.get_url(self.subnet)
         floating_ip = self.fixture.floating_ip
-        floating_ip.state = models.FloatingIP.States.OK
+        floating_ip.state = CoreStates.OK
         floating_ip.save()
         data = self.get_valid_data(
             floating_ips=[
@@ -278,7 +297,7 @@ class InstanceCreateTest(test.APITransactionTestCase):
     def test_user_can_assign_active_floating_ip(self):
         subnet_url = factories.SubNetFactory.get_url(self.subnet)
         floating_ip = factories.FloatingIPFactory(
-            tenant=self.tenant, runtime_state="ACTIVE", state=FloatingIP.States.OK
+            tenant=self.tenant, runtime_state="ACTIVE", state=CoreStates.OK
         )
         data = self.get_valid_data(
             floating_ips=[
@@ -474,7 +493,7 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
     def setUp(self):
         super().setUp()
         self.instance = factories.InstanceFactory(
-            state=models.Instance.States.OK,
+            state=CoreStates.OK,
             runtime_state=models.Instance.RuntimeStates.SHUTOFF,
             backend_id="VALID_ID",
         )
@@ -490,13 +509,13 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
     def mock_volumes(self, delete_data_volume=True):
         self.data_volume = self.instance.volumes.get(bootable=False)
         self.data_volume.backend_id = "DATA_VOLUME_ID"
-        self.data_volume.state = models.Volume.States.OK
+        self.data_volume.state = CoreStates.OK
         self.data_volume.save()
         self.data_volume.increase_backend_quotas_usage()
 
         self.system_volume = self.instance.volumes.get(bootable=True)
         self.system_volume.backend_id = "SYSTEM_VOLUME_ID"
-        self.system_volume.state = models.Volume.States.OK
+        self.system_volume.state = CoreStates.OK
         self.system_volume.save()
         self.system_volume.increase_backend_quotas_usage()
 
@@ -599,11 +618,11 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
 
     def test_instance_cannot_be_deleted_if_it_has_backups(self):
         self.instance = factories.InstanceFactory(
-            state=models.Instance.States.OK,
+            state=CoreStates.OK,
             runtime_state=models.Instance.RuntimeStates.SHUTOFF,
             backend_id="VALID_ID",
         )
-        factories.BackupFactory(instance=self.instance, state=models.Backup.States.OK)
+        factories.BackupFactory(instance=self.instance, state=CoreStates.OK)
         response = self.delete_instance(check_status_code=False)
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT, response.data)
 
@@ -671,105 +690,6 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
         url = factories.InstanceFactory.get_url(self.instance)
         response = self.client.delete(url)
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
-
-
-class InstanceCreateBackupSchedule(test.APITransactionTestCase):
-    action_name = "create_backup_schedule"
-
-    def setUp(self):
-        self.user = structure_factories.UserFactory.create(is_staff=True)
-        self.client.force_authenticate(user=self.user)
-        self.instance = factories.InstanceFactory(state=models.Instance.States.OK)
-        self.create_url = factories.InstanceFactory.get_url(
-            self.instance, action=self.action_name
-        )
-        self.backup_schedule_data = {
-            "name": "test schedule",
-            "retention_time": 3,
-            "schedule": "0 * * * *",
-            "maximal_number_of_resources": 3,
-        }
-
-    def test_staff_can_create_backup_schedule(self):
-        response = self.client.post(self.create_url, self.backup_schedule_data)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(
-            response.data["retention_time"], self.backup_schedule_data["retention_time"]
-        )
-        self.assertEqual(
-            response.data["maximal_number_of_resources"],
-            self.backup_schedule_data["maximal_number_of_resources"],
-        )
-        self.assertEqual(
-            response.data["schedule"], self.backup_schedule_data["schedule"]
-        )
-
-    def test_instance_should_have_bootable_volume(self):
-        self.instance.volumes.filter(bootable=True).delete()
-        response = self.client.post(self.create_url, self.backup_schedule_data)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_backup_schedule_default_state_is_OK(self):
-        response = self.client.post(self.create_url, self.backup_schedule_data)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        backup_schedule = models.BackupSchedule.objects.first()
-        self.assertIsNotNone(backup_schedule)
-        self.assertEqual(backup_schedule.state, backup_schedule.States.OK)
-
-    def test_backup_schedule_can_not_be_created_with_wrong_schedule(self):
-        # wrong schedule:
-        self.backup_schedule_data["schedule"] = "wrong schedule"
-        response = self.client.post(self.create_url, self.backup_schedule_data)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"schedule", response.content)
-
-    def test_backup_schedule_creation_with_correct_timezone(self):
-        backupable = factories.InstanceFactory(state=models.Instance.States.OK)
-        create_url = factories.InstanceFactory.get_url(
-            backupable, action=self.action_name
-        )
-        backup_schedule_data = {
-            "name": "test schedule",
-            "retention_time": 3,
-            "schedule": "0 * * * *",
-            "timezone": "Europe/London",
-            "maximal_number_of_resources": 3,
-        }
-        response = self.client.post(create_url, backup_schedule_data)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data["timezone"], "Europe/London")
-
-    def test_backup_schedule_creation_with_incorrect_timezone(self):
-        backupable = factories.InstanceFactory(state=models.Instance.States.OK)
-        create_url = factories.InstanceFactory.get_url(
-            backupable, action=self.action_name
-        )
-
-        backup_schedule_data = {
-            "name": "test schedule",
-            "retention_time": 3,
-            "schedule": "0 * * * *",
-            "timezone": "incorrect",
-            "maximal_number_of_resources": 3,
-        }
-        response = self.client.post(create_url, backup_schedule_data)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("timezone", response.data)
-
-    def test_backup_schedule_creation_with_default_timezone(self):
-        backupable = factories.InstanceFactory(state=models.Instance.States.OK)
-        create_url = factories.InstanceFactory.get_url(
-            backupable, action=self.action_name
-        )
-        backup_schedule_data = {
-            "name": "test schedule",
-            "retention_time": 3,
-            "schedule": "0 * * * *",
-            "maximal_number_of_resources": 3,
-        }
-        response = self.client.post(create_url, backup_schedule_data)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data["timezone"], settings.TIME_ZONE)
 
 
 class InstanceUpdatePortsTest(test.APITransactionTestCase):
@@ -857,7 +777,7 @@ class InstanceUpdateFloatingIPsTest(test.APITransactionTestCase):
         self.subnet_url = factories.SubNetFactory.get_url(self.fixture.subnet)
 
     def test_user_can_update_instance_floating_ips(self):
-        self.fixture.floating_ip.state = FloatingIP.States.OK
+        self.fixture.floating_ip.state = CoreStates.OK
         self.fixture.floating_ip.save()
         floating_ip_url = factories.FloatingIPFactory.get_url(self.fixture.floating_ip)
         data = {
@@ -873,7 +793,7 @@ class InstanceUpdateFloatingIPsTest(test.APITransactionTestCase):
         self.assertIn(self.fixture.floating_ip, self.instance.floating_ips)
 
     def test_when_floating_ip_is_attached_action_details_are_updated(self):
-        self.fixture.floating_ip.state = FloatingIP.States.OK
+        self.fixture.floating_ip.state = CoreStates.OK
         self.fixture.floating_ip.save()
         floating_ip_url = factories.FloatingIPFactory.get_url(self.fixture.floating_ip)
         data = {
@@ -1019,7 +939,7 @@ class InstanceBackupTest(test.APITransactionTestCase):
 
     def test_user_cannot_backup_unstable_instance(self):
         instance = self.fixture.instance
-        instance.state = models.Instance.States.UPDATING
+        instance.state = CoreStates.UPDATING
         instance.save()
         url = factories.InstanceFactory.get_url(instance, action="backup")
 

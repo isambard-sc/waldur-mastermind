@@ -1,4 +1,5 @@
 import datetime
+import decimal
 import logging
 
 from django.conf import settings
@@ -6,12 +7,11 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
-from django.utils.translation import gettext_lazy as _
-from rest_framework.exceptions import ValidationError
 
 from waldur_core.core import utils as core_utils
 from waldur_mastermind.invoices import signals as cost_signals
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import ResourceStates
 
 from . import log, models, registrators
 
@@ -111,17 +111,6 @@ def emit_invoice_created_event(sender, instance, created=False, **kwargs):
     )
 
 
-def prevent_deletion_of_customer_with_invoice(sender, instance, user, **kwargs):
-    if user.is_staff:
-        return
-    PENDING = models.Invoice.States.PENDING
-    for invoice in models.Invoice.objects.filter(customer=instance):
-        if invoice.state != PENDING or invoice.price > 0:
-            raise ValidationError(
-                _("Can't delete organization with invoice %s.") % invoice
-            )
-
-
 def update_cache_when_invoice_item_is_updated(
     sender, instance, created=False, **kwargs
 ):
@@ -187,7 +176,7 @@ def create_recurring_usage_if_invoice_has_been_created(
         resource__project__customer=invoice.customer,
         recurring=True,
         billing_period__gte=prev_month_start,
-    ).exclude(resource__state=marketplace_models.Resource.States.TERMINATED)
+    ).exclude(resource__state=ResourceStates.TERMINATED)
 
     if not usages:
         return
@@ -244,20 +233,54 @@ def log_invoice_item_save(
             },
         )
     else:
-        diff = ", ".join(
-            [
-                f"{field}: {instance.tracker.previous(field)} -> {getattr(instance, field, None)}"
-                for field in instance.tracker.changed()
-                if field != "details"
-            ]
-        )
-        log.event_logger.invoice_item.info(
-            f"Invoice item {instance.name} has been updated. Details: {diff}.",
-            event_type="invoice_item_updated",
-            event_context={
-                "invoice_item": instance,
-            },
-        )
+
+        def values_different(old, new):
+            # Handle None values
+            if old is None or new is None:
+                return old is not new
+
+            # Convert both to same type if one is string and other is numeric
+            try:
+                if isinstance(old, str) and isinstance(new, (float | decimal.Decimal)):
+                    old = float(old)
+                elif isinstance(new, str) and isinstance(
+                    old, (float | decimal.Decimal)
+                ):
+                    new = float(new)
+            except (ValueError, TypeError):
+                # If conversion fails, fall back to string comparison
+                return str(old).strip() != str(new).strip()
+
+            # Handle numeric comparisons with tolerance
+            if isinstance(old, (float | decimal.Decimal)) and isinstance(
+                new, (float | decimal.Decimal)
+            ):
+                return abs(float(old) - float(new)) > 1e-10
+
+            # Handle string comparisons
+            if isinstance(old, str) and isinstance(new, str):
+                return old.strip() != new.strip()
+
+            # Default comparison for other types
+            return old != new
+
+        changes = [
+            f"{field}: {instance.tracker.previous(field)} -> {getattr(instance, field, None)}"
+            for field in instance.tracker.changed()
+            if field != "details"
+            and values_different(
+                instance.tracker.previous(field), getattr(instance, field, None)
+            )
+        ]
+        if changes:
+            diff = ", ".join(changes)
+            log.event_logger.invoice_item.info(
+                f"Invoice item {instance.name} has been updated. Details: {diff}.",
+                event_type="invoice_item_updated",
+                event_context={
+                    "invoice_item": instance,
+                },
+            )
 
 
 def log_invoice_item_delete(sender, instance: models.InvoiceItem, **kwargs):

@@ -3,7 +3,8 @@ from unittest import mock
 from rest_framework import test
 
 from waldur_core.structure.tests import factories as structure_factories
-from waldur_mastermind.marketplace import PLUGIN_NAME, models, utils
+from waldur_mastermind.marketplace import PLUGIN_NAME, utils
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.plugins import manager
 from waldur_mastermind.marketplace.tests import factories
 
@@ -17,7 +18,7 @@ class ProcessorsTest(test.APITransactionTestCase):
         for offering_type in manager.get_offering_types():
             offering = factories.OfferingFactory(type=offering_type)
             order = factories.OrderFactory(
-                offering=offering, state=models.Order.States.EXECUTING
+                offering=offering, state=OrderStates.EXECUTING
             )
             utils.process_order(order, user)
             order.refresh_from_db()
@@ -33,9 +34,7 @@ class ProcessorsTest(test.APITransactionTestCase):
         user = structure_factories.UserFactory(is_staff=True)
         offering = factories.OfferingFactory(type="ABC")
 
-        order = factories.OrderFactory(
-            offering=offering, state=models.Order.States.EXECUTING
-        )
+        order = factories.OrderFactory(offering=offering, state=OrderStates.EXECUTING)
         resource = order.resource
 
         utils.process_order(order, user)
@@ -43,8 +42,8 @@ class ProcessorsTest(test.APITransactionTestCase):
         order.refresh_from_db()
         resource.refresh_from_db()
 
-        self.assertEqual(models.Order.States.ERRED, order.state)
-        self.assertEqual(models.Resource.States.ERRED, resource.state)
+        self.assertEqual(OrderStates.ERRED, order.state)
+        self.assertEqual(ResourceStates.ERRED, resource.state)
 
     @mock.patch(
         "waldur_mastermind.marketplace.processors.BasicCreateResourceProcessor.process_order"
@@ -55,9 +54,7 @@ class ProcessorsTest(test.APITransactionTestCase):
         user = structure_factories.UserFactory(is_staff=True)
         offering = factories.OfferingFactory(type=PLUGIN_NAME)
 
-        order = factories.OrderFactory(
-            offering=offering, state=models.Order.States.EXECUTING
-        )
+        order = factories.OrderFactory(offering=offering, state=OrderStates.EXECUTING)
         resource = order.resource
 
         utils.process_order(order, user)
@@ -65,8 +62,8 @@ class ProcessorsTest(test.APITransactionTestCase):
         order.refresh_from_db()
         resource.refresh_from_db()
 
-        self.assertEqual(models.Order.States.ERRED, order.state)
-        self.assertEqual(models.Resource.States.ERRED, resource.state)
+        self.assertEqual(OrderStates.ERRED, order.state)
+        self.assertEqual(ResourceStates.ERRED, resource.state)
 
     def test_set_resource_options(self):
         user = structure_factories.UserFactory()
@@ -79,7 +76,7 @@ class ProcessorsTest(test.APITransactionTestCase):
             }
             order = factories.OrderFactory(
                 offering=offering,
-                state=models.Order.States.EXECUTING,
+                state=OrderStates.EXECUTING,
                 attributes={"cpu": 1, "storage": 10},
             )
             utils.process_order(order, user)

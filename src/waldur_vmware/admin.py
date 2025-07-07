@@ -5,6 +5,7 @@ from django.forms.models import BaseInlineFormSet
 from django.utils.translation import gettext_lazy as _
 
 from waldur_core.core.admin import ExecutorAdminAction
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure import admin as structure_admin
 from waldur_vmware.utils import is_basic_mode
 
@@ -17,7 +18,7 @@ class DiskAdmin(structure_admin.ResourceAdmin):
         short_description = _("Pull")
 
         def validate(self, instance):
-            if instance.state not in (models.Disk.States.OK, models.Disk.States.ERRED):
+            if instance.state not in (CoreStates.OK, CoreStates.ERRED):
                 raise ValidationError(_("Disk has to be in OK or ERRED state."))
 
     pull = Pull()
@@ -30,8 +31,8 @@ class VirtualMachineAdmin(structure_admin.ResourceAdmin):
 
         def validate(self, instance):
             if instance.state not in (
-                models.VirtualMachine.States.OK,
-                models.VirtualMachine.States.ERRED,
+                CoreStates.OK,
+                CoreStates.ERRED,
             ):
                 raise ValidationError(
                     _("Virtual machine has to be in OK or ERRED state.")

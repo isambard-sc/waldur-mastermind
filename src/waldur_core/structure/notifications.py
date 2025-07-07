@@ -214,14 +214,9 @@ class MarketplaceSection(NotificationSection):
         "A notification of a failed resource termination",
     )
 
-
-class RancherSection(NotificationSection):
-    class Meta:
-        key = "rancher"
-
-    notification_create_user = Notification(
-        "notification_create_user",
-        "A notification for created rancher user. The recipients is the user who requested the creation.",
+    notification_to_user_that_order_been_rejected = Notification(
+        "notification_to_user_that_order_been_rejected",
+        "Notification to user whose order been rejected.",
     )
 
 

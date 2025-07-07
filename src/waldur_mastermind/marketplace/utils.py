@@ -7,11 +7,14 @@ import re
 import textwrap
 import traceback
 import unicodedata
+import uuid
+from collections import defaultdict
 from enum import Enum
 from io import BytesIO
 
+import httpx
 from constance import config
-from django.contrib.auth import get_user_model
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.files.base import ContentFile
@@ -29,9 +32,15 @@ from rest_framework import serializers, status
 from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import utils as core_utils
-from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.core.enums import CoreStates
+from waldur_core.core.models import User
+from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.models import UserRole
-from waldur_core.permissions.utils import get_users_with_permission, has_permission
+from waldur_core.permissions.utils import (
+    get_permissions,
+    get_users_with_permission,
+    has_permission,
+)
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
@@ -47,6 +56,11 @@ from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices import registrators
 from waldur_mastermind.invoices.utils import get_full_days
 from waldur_mastermind.marketplace import attribute_types
+from waldur_mastermind.marketplace.enums import (
+    OrderStates,
+    ResourceStates,
+    RobotAccountStates,
+)
 from waldur_mastermind.marketplace_remote import PLUGIN_NAME as REMOTE_PLUGIN_NAME
 from waldur_mastermind.marketplace_slurm_remote import (
     PLUGIN_NAME as SLURM_REMOTE_PLUGIN_NAME,
@@ -55,7 +69,6 @@ from waldur_mastermind.marketplace_slurm_remote import (
 from . import PLUGIN_NAME as BASIC_PLUGIN_NAME
 from . import models, plugins
 
-User = get_user_model()
 logger = logging.getLogger(__name__)
 USERNAME_ANONYMIZED_POSTFIX_LENGTH = 5
 USERNAME_POSTFIX_LENGTH = 2
@@ -73,7 +86,7 @@ class UsernameGenerationPolicy(Enum):
     IDENTITY_CLAIM = "identity_claim"  # Using username from external IDP system
 
 
-def get_order_processor(order):
+def get_order_processor(order: models.Order):
     offering = order.resource.offering
 
     if order.type == models.RequestTypeMixin.Types.CREATE:
@@ -207,26 +220,6 @@ def get_service_provider_info(source):
         return {}
 
 
-def get_offering_details(offering):
-    if not isinstance(offering, models.Offering):
-        return {}
-
-    return {
-        "offering_type": offering.type,
-        "offering_name": offering.name,
-        "offering_uuid": offering.uuid.hex,
-        "service_provider_name": offering.customer.name,
-        "service_provider_uuid": offering.customer.uuid.hex,
-    }
-
-
-def format_list(resources):
-    """
-    Format comma-separated list of IDs from Django queryset.
-    """
-    return ", ".join(map(str, sorted(resources.values_list("id", flat=True))))
-
-
 def get_order_url(order):
     return core_utils.format_homeport_link(
         "marketplace-order-details/{order_uuid}/",
@@ -253,7 +246,7 @@ def get_info_about_missing_usage_reports():
         billing_period=billing_period
     ).values_list("resource", flat=True)
     resources_without_usages = models.Resource.objects.filter(
-        state=models.Resource.States.OK, offering_id__in=offering_ids
+        state=ResourceStates.OK, offering_id__in=offering_ids
     ).exclude(id__in=resource_with_usages)
     result = []
 
@@ -272,13 +265,6 @@ def get_info_about_missing_usage_reports():
             )
 
     return result
-
-
-def get_public_resources_url(customer):
-    return core_utils.format_homeport_link(
-        "organizations/{organization_uuid}/marketplace-public-resources/",
-        organization_uuid=customer.uuid,
-    )
 
 
 def validate_limit_amount(value, component):
@@ -494,87 +480,85 @@ def create_offering_components(offering, custom_components=None):
 
 
 def get_resource_state(state):
-    SrcStates = core_models.StateMixin.States
-    DstStates = models.Resource.States
     mapping = {
-        SrcStates.CREATION_SCHEDULED: DstStates.CREATING,
-        SrcStates.CREATING: DstStates.CREATING,
-        SrcStates.UPDATE_SCHEDULED: DstStates.UPDATING,
-        SrcStates.UPDATING: DstStates.UPDATING,
-        SrcStates.DELETION_SCHEDULED: DstStates.TERMINATING,
-        SrcStates.DELETING: DstStates.TERMINATING,
-        SrcStates.OK: DstStates.OK,
-        SrcStates.ERRED: DstStates.ERRED,
+        CoreStates.CREATION_SCHEDULED: ResourceStates.CREATING,
+        CoreStates.CREATING: ResourceStates.CREATING,
+        CoreStates.UPDATE_SCHEDULED: ResourceStates.UPDATING,
+        CoreStates.UPDATING: ResourceStates.UPDATING,
+        CoreStates.DELETION_SCHEDULED: ResourceStates.TERMINATING,
+        CoreStates.DELETING: ResourceStates.TERMINATING,
+        CoreStates.OK: ResourceStates.OK,
+        CoreStates.ERRED: ResourceStates.ERRED,
     }
-    return mapping.get(state, DstStates.ERRED)
+    return mapping.get(state, ResourceStates.ERRED)
 
 
-def get_marketplace_offering_uuid(serializer, scope):
+def get_marketplace_offering_uuid(serializer, scope) -> str | None:
     try:
-        return models.Resource.objects.get(scope=scope).offering.uuid
+        return models.Resource.objects.get(scope=scope).offering.uuid.hex
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_offering_plugin_options(serializer, scope):
+def get_marketplace_offering_plugin_options(serializer, scope) -> dict | None:
     try:
         return models.Resource.objects.get(scope=scope).offering.plugin_options
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_offering_name(serializer, scope):
+def get_marketplace_offering_name(serializer, scope) -> str | None:
     try:
         return models.Resource.objects.get(scope=scope).offering.name
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_category_uuid(serializer, scope):
+def get_marketplace_category_uuid(serializer, scope) -> str | None:
     try:
-        return models.Resource.objects.get(scope=scope).offering.category.uuid
+        return models.Resource.objects.get(scope=scope).offering.category.uuid.hex
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_category_name(serializer, scope):
+def get_marketplace_category_name(serializer, scope) -> str | None:
     try:
         return models.Resource.objects.get(scope=scope).offering.category.title
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_resource_uuid(serializer, scope):
+def get_marketplace_resource_uuid(serializer, scope) -> str | None:
     try:
-        return models.Resource.objects.get(scope=scope).uuid
+        return models.Resource.objects.get(scope=scope).uuid.hex
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_plan_uuid(serializer, scope):
+def get_marketplace_plan_uuid(serializer, scope) -> str | None:
     try:
         resource = models.Resource.objects.get(scope=scope)
         if resource.plan:
-            return resource.plan.uuid
+            return resource.plan.uuid.hex
     except ObjectDoesNotExist:
         return
 
 
-def get_marketplace_resource_state(serializer, scope):
+def get_marketplace_resource_state(serializer, scope) -> str | None:
     try:
         return models.Resource.objects.get(scope=scope).get_state_display()
     except ObjectDoesNotExist:
         return
 
 
-def get_is_usage_based(serializer, scope):
+def get_is_usage_based(serializer, scope) -> bool | None:
     try:
         return models.Resource.objects.get(scope=scope).offering.is_usage_based
     except ObjectDoesNotExist:
         return
 
 
-def get_is_limit_based(serializer, scope):
+def get_is_limit_based(serializer, scope) -> bool | None:
     try:
         return models.Resource.objects.get(scope=scope).offering.is_limit_based
     except ObjectDoesNotExist:
@@ -638,7 +622,7 @@ def get_offering_customers(offering, active_customers):
 def get_offering_projects(offering):
     related_project_ids = (
         models.Resource.objects.filter(offering=offering)
-        .exclude(state=models.Resource.States.TERMINATED)
+        .exclude(state=ResourceStates.TERMINATED)
         .values_list("project", flat=True)
         .distinct()
         .order_by()
@@ -655,7 +639,7 @@ def is_user_related_to_offering(offering, user):
         models.Resource.objects.filter(
             offering=offering, project__in=connected_projects
         )
-        .exclude(state=models.Resource.States.TERMINATED)
+        .exclude(state=ResourceStates.TERMINATED)
         .exists()
     )
 
@@ -793,20 +777,18 @@ def terminate_resource(resource, user, termination_comment=None, scheduled=False
     for order in models.Order.objects.filter(
         resource=resource,
         state__in=(
-            [models.Order.States.PENDING_CONSUMER]
+            [OrderStates.PENDING_CONSUMER]
             if scheduled
             else [
-                models.Order.States.PENDING_CONSUMER,
-                models.Order.States.PENDING_PROVIDER,
+                OrderStates.PENDING_CONSUMER,
+                OrderStates.PENDING_PROVIDER,
             ]
         ),
     ):
         order.cancel(termination_comment)
         order.save()
 
-    if models.Order.objects.filter(
-        resource=resource, state=models.Order.States.EXECUTING
-    ):
+    if models.Order.objects.filter(resource=resource, state=OrderStates.EXECUTING):
         logger.info(
             "Terminate order has not been created because other executing orders exist."
         )
@@ -848,7 +830,7 @@ def schedule_resources_termination(resources, termination_comment=None, user=Non
 def get_service_provider_resources(service_provider):
     return models.Resource.objects.filter(
         offering__customer=service_provider.customer, offering__shared=True
-    ).exclude(state=models.Resource.States.TERMINATED)
+    ).exclude(state=ResourceStates.TERMINATED)
 
 
 def get_service_provider_customer_ids(service_provider):
@@ -876,7 +858,7 @@ def get_service_provider_user_ids(user, service_provider, customer=None):
     qs = UserRole.objects.filter(
         content_type=content_type, object_id__in=project_ids, is_active=True
     )
-    if not user.is_staff and not user.is_support:
+    if user.is_authenticated and not user.is_staff and not user.is_support:
         qs = qs.filter(user__is_active=True)
     return qs.values_list("user_id", flat=True).distinct()
 
@@ -989,7 +971,7 @@ def count_customers_number_change(service_provider):
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
             type=models.Order.Types.CREATE,
-            state=models.Order.States.DONE,
+            state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
         .order_by()
@@ -1002,7 +984,7 @@ def count_customers_number_change(service_provider):
                 project__customer_id=customer_id,
                 created__lt=core_utils.month_start(to_day),
             )
-            .exclude(state=models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .exists()
         ):
             new_customers.append(customer_id)
@@ -1011,7 +993,7 @@ def count_customers_number_change(service_provider):
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
             type=models.Order.Types.TERMINATE,
-            state=models.Order.States.DONE,
+            state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
         .order_by()
@@ -1023,7 +1005,7 @@ def count_customers_number_change(service_provider):
                 offering__customer=service_provider.customer,
                 project__customer=customer_id,
             )
-            .exclude(state=models.Resource.States.TERMINATED)
+            .exclude(state=ResourceStates.TERMINATED)
             .exists()
         ):
             lost_customers.append(customer_id)
@@ -1038,7 +1020,7 @@ def count_resources_number_change(service_provider):
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
             type=models.Order.Types.CREATE,
-            state=models.Order.States.DONE,
+            state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
         .order_by()
@@ -1051,7 +1033,7 @@ def count_resources_number_change(service_provider):
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
             type=models.Order.Types.TERMINATE,
-            state=models.Order.States.DONE,
+            state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
         .order_by()
@@ -1063,7 +1045,7 @@ def count_resources_number_change(service_provider):
     return created - terminated
 
 
-def generate_offering_password_hash(offering):
+def generate_offering_password_hash(offering: models.Offering):
     password = offering.secret_options.get("shared_user_password")
     if password:
         password_hash = hashlib.sha256()
@@ -1153,6 +1135,12 @@ def generate_glauth_records_for_offering_users(offering, offering_users):
 
         other_groups = ", ".join(group_ids)
 
+        user_disabled_status = "false"
+        # Check if user has access to non-terminated resources in offering
+        has_access = is_user_related_to_offering(offering, user)
+        if not has_access:
+            user_disabled_status = "true"
+
         record = textwrap.dedent(
             f"""
         [[users]]
@@ -1167,6 +1155,7 @@ def generate_glauth_records_for_offering_users(offering, offering_users):
           loginShell = "{login_shell}"
           homeDir = "{home_dir}"
           passsha256 = "{password_sha256}"
+          disabled = {user_disabled_status}
             [[users.customattributes]]
             preferredUsername = ["{username}"]
         """
@@ -1185,6 +1174,13 @@ def generate_glauth_records_for_offering_users(offering, offering_users):
 
 
 def generate_glauth_records_for_robot_accounts(offering, robot_accounts):
+    # make sure that only accounts in OK and requested_deletion are exposed e.g. in glauth
+    valid_states = [
+        RobotAccountStates.OK,
+        RobotAccountStates.REQUESTED_DELETION,
+    ]
+    robot_accounts = robot_accounts.filter(state__in=valid_states)
+
     robot_account_records = []
     for robot_account in robot_accounts:
         ssh_keys = robot_account.keys
@@ -1305,7 +1301,7 @@ def generate_username(user, offering):
 
 def user_offerings_mapping(offerings):
     resources = models.Resource.objects.filter(
-        state=models.Resource.States.OK, offering__in=offerings
+        state=ResourceStates.OK, offering__in=offerings
     )
     resource_ids = resources.values_list("id", flat=True)
 
@@ -1333,7 +1329,6 @@ def user_offerings_mapping(offerings):
             offering_user = models.OfferingUser.objects.create(
                 user=user, offering=offering, username=username
             )
-            offering_user.set_propagation_date()
             offering_user.save()
             logger.info("Offering user %s has been created.")
 
@@ -1354,11 +1349,15 @@ def order_should_not_be_reviewed_by_provider(order: models.Order):
             "auto_approve_remote_orders", False
         )
         # A service provider owner or a service manager is not required to approve an order manually
-        user_is_service_provider_owner = structure_permissions._has_owner_access(
-            user, offering.customer
+        user_is_service_provider_owner = (
+            offering.customer
+            and structure_permissions._has_owner_access(user, offering.customer)
         )
         user_is_service_provider_offering_manager = (
-            structure_permissions._has_service_manager_access(user, offering.customer)
+            offering.customer
+            and structure_permissions._has_service_manager_access(
+                user, offering.customer
+            )
             and offering.has_user(user)
         )
         # If any condition is not met, the order is requested for manual approval
@@ -1443,6 +1442,7 @@ def refresh_integration_agent_status(request, agent_type):
     )
     integration_status.set_last_request_timestamp()
     integration_status.set_backend_active()
+    integration_status.service_name = request.headers.get("User-Agent", "")
     integration_status.save()
 
 
@@ -1570,3 +1570,511 @@ def sync_component_user_usage(allocation_user_usage, plugin_name):
             logger.info("%s has been created", component_user_usage)
         else:
             logger.info("%s has been updated, new usage: %s", component_usage, usage)
+
+
+def generate_resource_name(
+    project: structure_models.Project, offering: models.Offering
+):
+    resource_count = models.Resource.objects.filter(
+        project=project, offering=offering
+    ).count()
+    parts = [
+        project.customer.slug,
+        project.slug,
+        offering.slug,
+    ]
+    result = "-".join(parts)
+
+    if resource_count:
+        result += "-" + str(resource_count + 1)
+
+    return core_utils.remove_duplicate_hyphens(result)
+
+
+def notification_about_project_ending(end_date):
+    projects_by_recipient = defaultdict(list)
+    expired_projects = structure_models.Project.available_objects.exclude(
+        end_date__isnull=True
+    ).filter(end_date=end_date)
+
+    # If there are no expired projects, we don't need to send notifications
+    if not expired_projects.exists():
+        logger.info("No projects found with end_date=%s", end_date)
+        return
+
+    for project in expired_projects:
+        logger.info(
+            "Project %s (uuid=%s) has end_date=%s",
+            project.name,
+            project.uuid,
+            project.end_date,
+        )
+        project_users = (
+            project.get_users().exclude(email="").exclude(notifications_enabled=False)
+        )
+        owners = (
+            project.customer.get_users(RoleEnum.CUSTOMER_OWNER)
+            .exclude(email="")
+            .exclude(notifications_enabled=False)
+        )
+        users = set(project_users) | set(owners)
+
+        for user in users:
+            projects_by_recipient[user].append(project)
+
+    for user, projects in projects_by_recipient.items():
+        for project in projects:
+            project.url = core_utils.format_homeport_link(
+                "projects/{project_uuid}/", project_uuid=project.uuid.hex
+            )
+
+        context = {
+            "projects": projects,
+            "user": user,
+            "end_date": end_date,
+            "count_projects": len(projects),
+            "delta": (end_date - timezone.datetime.today().date()).days,
+        }
+        logger.info(
+            "Sending notification to user %s about %d projects",
+            user.email,
+            len(projects),
+        )
+        core_utils.broadcast_mail(
+            "marketplace",
+            "notification_about_project_ending",
+            context,
+            [user.email],
+        )
+
+
+# Mock data generators for service accounts
+def generate_mock_service_account_response(username: str) -> dict:
+    """Generate a mock service account response that matches the GetServiceAccountResponse schema."""
+    now = datetime.datetime.now()
+    return {
+        "serviceAccount": {
+            "createdAt": now.isoformat(),
+            "updatedAt": now.isoformat(),
+            "type": "service_account",
+            "status": "active",
+            "disabledDate": None,
+            "username": username,
+            "email": "mock@example.com",
+            "description": "Mock service account for testing",
+            "unixUid": 5000 + hash(username) % 1000,  # Generate consistent UID
+            "homeDir": f"/home/{username}",
+            "shell": "/bin/bash",
+            "targetType": "project",
+            "targetIdentifier": f"mock-project-{username[:8]}",
+            "apiKeyExpiresAt": (now + datetime.timedelta(days=90)).isoformat(),
+            "apiKeyTtl": 7776000,  # 90 days in seconds
+            "owner": None,
+            "project": None,
+        }
+    }
+
+
+def generate_mock_api_key_rotation_response(username: str) -> dict:
+    """Generate a mock API key rotation response that matches GetServiceAccountWithApiKeyResponse schema."""
+    now = datetime.datetime.now()
+    expires_at = now + datetime.timedelta(days=90)
+    ttl = 7776000  # 90 days in seconds
+
+    return {
+        "serviceAccount": {
+            "createdAt": (now - datetime.timedelta(days=30)).isoformat(),
+            "updatedAt": now.isoformat(),
+            "type": "service_account",
+            "status": "active",
+            "disabledDate": None,
+            "username": username,
+            "email": "mock@example.com",
+            "description": "Mock service account for testing",
+            "unixUid": 5000 + hash(username) % 1000,
+            "homeDir": f"/home/{username}",
+            "shell": "/bin/bash",
+            "targetType": "project",
+            "targetIdentifier": f"mock-project-{username[:8]}",
+            "apiKeyExpiresAt": expires_at.isoformat(),
+            "apiKeyTtl": ttl,
+            "owner": None,
+            "project": None,
+        },
+        "apiKey": {
+            "apiKey": f"rotated-mock-api-key-{username}-{uuid.uuid4().hex[:8]}",
+            "createdAt": now.isoformat(),
+            "expiresAt": expires_at.isoformat(),
+            "ttl": ttl,
+        },
+    }
+
+
+def generate_mock_service_account_creation_response(
+    service_account: dict, username: str, scope_type: str
+) -> dict:
+    """Generate a mock service account creation response that matches GetServiceAccountWithApiKeyResponse schema."""
+    now = datetime.datetime.now()
+    expires_at = now + datetime.timedelta(days=90)
+    ttl = 7776000  # 90 days in seconds
+    mock_username = service_account.get(
+        "preferred_identifier", f"mock-{uuid.uuid4().hex[:8]}"
+    )
+
+    return {
+        "serviceAccount": {
+            "createdAt": now.isoformat(),
+            "updatedAt": now.isoformat(),
+            "type": "service_account",
+            "status": "active",
+            "disabledDate": None,
+            "username": mock_username,
+            "email": service_account.get("email", "mock@example.com"),
+            "description": service_account.get("description", "Mock service account"),
+            "unixUid": 5000 + hash(mock_username) % 1000,
+            "homeDir": f"/home/{mock_username}",
+            "shell": "/bin/bash",
+            "targetType": scope_type,
+            "targetIdentifier": service_account.get("scope_slug", "mock-scope"),
+            "apiKeyExpiresAt": expires_at.isoformat(),
+            "apiKeyTtl": ttl,
+            "owner": None,
+            "project": None,
+        },
+        "apiKey": {
+            "apiKey": f"mock-api-key-{uuid.uuid4().hex[:16]}",
+            "createdAt": now.isoformat(),
+            "expiresAt": expires_at.isoformat(),
+            "ttl": ttl,
+        },
+    }
+
+
+def generate_mock_service_account_update_response(service_account) -> dict:
+    """Generate a mock service account update response that matches GetServiceAccountResponse schema."""
+    now = datetime.datetime.now()
+    return {
+        "serviceAccount": {
+            "createdAt": (now - datetime.timedelta(days=30)).isoformat(),
+            "updatedAt": now.isoformat(),
+            "type": "service_account",
+            "status": "active",
+            "disabledDate": None,
+            "username": service_account.username,
+            "email": service_account.email,
+            "description": service_account.description,
+            "unixUid": 5000 + hash(service_account.username) % 1000,
+            "homeDir": f"/home/{service_account.username}",
+            "shell": "/bin/bash",
+            "targetType": "project",
+            "targetIdentifier": f"mock-project-{service_account.username[:8]}",
+            "apiKeyExpiresAt": (now + datetime.timedelta(days=90)).isoformat(),
+            "apiKeyTtl": 7776000,
+            "owner": None,
+            "project": None,
+        }
+    }
+
+
+def get_service_account_api_token():
+    token_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_URL"]
+    client_id = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_CLIENT_ID"]
+    client_secret = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_SECRET"]
+
+    token_url = token_url.rstrip("/")
+
+    token_request_headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    token_params = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    try:
+        token_response = httpx.post(
+            token_url,
+            data=token_params,
+            headers=token_request_headers,
+            follow_redirects=True,
+        )
+        token_response.raise_for_status()
+        # Extract the token
+        token_data = token_response.json()
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise ValueError("Access token not found in token response.")
+        return access_token
+    except httpx.HTTPError as e:
+        logger.error("Error obtaining token: %s", e)
+        raise
+
+
+def rotate_service_account_api_key(service_account: models.ScopedServiceAccount):
+    if config.ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for rotate_service_account_api_key: {service_account.username}"
+        )
+        return generate_mock_api_key_rotation_response(service_account.username)
+
+    service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
+    if not service_account_url:
+        raise ValueError("URL for service accounts is not configured")
+
+    service_account_url = service_account_url.rstrip("/")
+    try:
+        api_access_token = get_service_account_api_token()
+
+        url = f"{service_account_url}/{service_account.username}/rotate-api-key"
+        response = httpx.put(
+            url,
+            headers={"Authorization": f"Bearer {api_access_token}"},
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        return response.json()
+    except (httpx.HTTPError, ValueError) as e:
+        logger.error("Error obtaining token: %s", e)
+        raise
+
+
+def post_service_account_to_url(
+    url: str, service_account: dict, username: str = "", scope_type: str = ""
+):
+    try:
+        api_access_token = get_service_account_api_token()
+        if scope_type == "project":
+            project: structure_models.Project = service_account["project"]
+            customer = project.customer
+            scope_name = project.name
+            scope_slug = project.slug
+            scope_offering_slugs = []
+            offering_slugs = set(
+                project.resource_set.exclude(
+                    state=ResourceStates.TERMINATED
+                ).values_list("offering__slug", flat=True)
+            )
+        elif scope_type == "customer":
+            customer: structure_models.Customer = service_account["customer"]
+            scope_name = customer.name
+            scope_slug = customer.slug
+            offering_slugs = set(
+                models.Resource.objects.exclude(state=ResourceStates.TERMINATED)
+                .filter(project__customer=customer)
+                .values_list("offering__slug", flat=True)
+            )
+        else:
+            raise ValueError(f"Unsupported service account type: {scope_type}")
+
+        scope_offering_slugs = list(offering_slugs)
+
+        payload = {
+            "ownerUsername": username,
+            "preferredIdentifier": service_account["preferred_identifier"],
+            "email": customer.email,
+            "description": service_account.get("description", ""),
+            "scopeType": scope_type,
+            "scopeName": scope_name,
+            "scopeSlug": scope_slug,
+            "scopeOfferingSlugs": scope_offering_slugs,
+        }
+
+        headers = {"Authorization": f"Bearer {api_access_token}"}
+        response = httpx.post(url, json=payload, headers=headers, follow_redirects=True)
+        response.raise_for_status()
+        logger.info("Service account has been successfully updated at %s", url)
+        return response
+    except (httpx.HTTPError, ValueError, KeyError) as e:
+        logger.error("Request to %s failed: %s", url, e)
+        raise
+
+
+def create_service_account(service_account: dict, username: str, scope_type: str):
+    """
+    Makes a synchronous call to the webhook URL to create a service account.
+    Raises exceptions on failure which should be handled by the viewset.
+    """
+    if config.ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND:
+        logger.info("Mock mode enabled for create_service_account")
+        return generate_mock_service_account_creation_response(
+            service_account, username, scope_type
+        )
+
+    if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
+        return
+
+    service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
+    if not service_account_url:
+        raise ValueError("URL for service accounts is not configured")
+
+    service_account_url = service_account_url.rstrip("/")
+
+    try:
+        response = post_service_account_to_url(
+            service_account_url, service_account, username, scope_type
+        )
+        return response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(exc)
+        raise
+
+
+def delete_service_account(service_account: models.ScopedServiceAccount):
+    """
+    Makes a synchronous call to the webhook URL to remove a service account.
+    Raises exceptions on failure which should be handled by the viewset.
+    """
+    if config.ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for delete_service_account: {service_account.username}"
+        )
+        # Generate a response showing the account as closed before deleting
+        response = generate_mock_service_account_response(service_account.username)
+        response["serviceAccount"]["status"] = "closed"
+        response["serviceAccount"]["disabledDate"] = datetime.datetime.now().isoformat()
+        service_account.delete()
+        return response
+
+    if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
+        return
+
+    service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
+    if not service_account_url:
+        raise ValidationError("URL for service accounts is not configured")
+
+    service_account_url = service_account_url.rstrip("/")
+
+    try:
+        api_access_token = get_service_account_api_token()
+        existing_service_account = get_service_account(service_account)
+        if existing_service_account is None:
+            logger.warning(
+                "Service account %s not found at backend, deleting locally",
+                service_account.username,
+            )
+            service_account.delete()
+            return
+
+        url = f"{service_account_url}/{service_account.username}/close"
+        response = httpx.put(
+            url,
+            headers={"Authorization": f"Bearer {api_access_token}"},
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        if response.status_code == 200:
+            service_account.delete()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(exc)
+        service_account.error_message = str(exc)
+        service_account.error_traceback = traceback.format_exc()
+        service_account.save(update_fields=["error_message", "error_traceback"])
+        raise
+
+
+def get_service_account(service_account: models.ScopedServiceAccount):
+    """
+    Makes a synchronous call to the webhook URL to get a service account.
+    Raises exceptions on failure which should be handled by the viewset.
+    """
+    if config.ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for get_service_account: {service_account.username}"
+        )
+        return generate_mock_service_account_response(service_account.username)
+
+    if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
+        return
+
+    service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
+    if not service_account_url:
+        raise ValidationError("URL for service accounts is not configured")
+
+    service_account_url = service_account_url.rstrip("/")
+
+    try:
+        api_access_token = get_service_account_api_token()
+        url = f"{service_account_url}/{service_account.username}"
+        response = httpx.get(
+            url,
+            headers={"Authorization": f"Bearer {api_access_token}"},
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            logger.warning("Service account %s not found", service_account.username)
+            return None
+        raise
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(exc)
+        raise
+
+
+def update_service_account(service_account: models.ScopedServiceAccount):
+    """
+    Makes a synchronous call to the webhook URL to update a service account email or/and description fields.
+    Raises exceptions on failure which should be handled by the viewset.
+    """
+    if config.ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for update_service_account: {service_account.username}"
+        )
+        return generate_mock_service_account_update_response(service_account)
+
+    if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
+        return
+
+    service_account_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_URL"]
+    if not service_account_url:
+        raise ValidationError("URL for service accounts is not configured")
+
+    service_account_url = service_account_url.rstrip("/")
+
+    try:
+        api_access_token = get_service_account_api_token()
+        url = f"{service_account_url}/{service_account.username}"
+
+        response = httpx.put(
+            url,
+            headers={"Authorization": f"Bearer {api_access_token}"},
+            follow_redirects=True,
+            json={
+                "email": service_account.email,
+                "description": service_account.description,
+            },
+        )
+        return response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(exc)
+        raise
+
+
+@transaction.atomic
+def move_offering(
+    offering: models.Offering,
+    target_customer: structure_models.Customer,
+    current_user=None,
+    preserve_permissions=False,
+):
+    if target_customer.blocked:
+        raise rf_exceptions.ValidationError(
+            _("Target provider's customer can not be blocked.")
+        )
+
+    if offering.customer == target_customer:
+        raise rf_exceptions.ValidationError(
+            _("Offering is already assigned to the target provider.")
+        )
+
+    offering.customer = target_customer
+    offering.save(update_fields=["customer"])
+
+    if not preserve_permissions:
+        for permission in get_permissions(offering):
+            permission.revoke(current_user)
+            logger.info(f"Permission {permission} has been revoked")
+
+    logger.info("Offering %s has been moved to provider %s", offering, target_customer)
