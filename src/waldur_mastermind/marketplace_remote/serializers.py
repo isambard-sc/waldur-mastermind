@@ -5,36 +5,46 @@ from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
+from waldur_mastermind.marketplace_remote import PLUGIN_NAME, constants, models
 
-from . import PLUGIN_NAME, constants, models
 
-
-class CredentialsSerializer(serializers.Serializer):
+class RemoteCredentialsSerializer(serializers.Serializer):
     api_url = serializers.URLField()
     token = serializers.CharField()
 
 
-class OfferingCreateSerializer(CredentialsSerializer):
-    remote_offering_uuid = serializers.CharField()
-    local_category_uuid = serializers.CharField()
-    local_customer_uuid = serializers.CharField()
-    remote_customer_uuid = serializers.CharField()
+class RemoteOfferingCreateSerializer(RemoteCredentialsSerializer):
+    remote_offering_uuid = serializers.UUIDField()
+    local_category_uuid = serializers.UUIDField()
+    local_customer_uuid = serializers.UUIDField()
+    remote_customer_uuid = serializers.UUIDField()
 
 
-class ProjectUpdateRequestSerializer(serializers.ModelSerializer):
+class RemoteOfferingCreateResponseSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField(read_only=True)
+
+
+class RemoteProjectUpdateRequestSerializer(serializers.ModelSerializer):
     state = serializers.ReadOnlyField(source="get_state_display")
-    customer_name = serializers.ReadOnlyField(source="project.customer.name")
-    offering_name = serializers.ReadOnlyField(source="offering.name")
-    offering_uuid = serializers.ReadOnlyField(source="offering.uuid")
-
-    reviewed_by_full_name = serializers.ReadOnlyField(source="reviewed_by.full_name")
-    reviewed_by_uuid = serializers.ReadOnlyField(source="reviewed_by.uuid")
-
-    old_oecd_fos_2007_label = serializers.ReadOnlyField(
-        source="get_old_oecd_fos_2007_code_display"
+    customer_name = serializers.CharField(
+        read_only=True, source="project.customer.name"
     )
-    new_oecd_fos_2007_label = serializers.ReadOnlyField(
-        source="get_new_oecd_fos_2007_code_display"
+    customer_uuid = serializers.CharField(
+        read_only=True, source="project.customer.uuid"
+    )
+    offering_name = serializers.CharField(read_only=True, source="offering.name")
+    offering_uuid = serializers.UUIDField(read_only=True, source="offering.uuid")
+
+    reviewed_by_full_name = serializers.CharField(
+        read_only=True, source="reviewed_by.full_name"
+    )
+    reviewed_by_uuid = serializers.UUIDField(read_only=True, source="reviewed_by.uuid")
+
+    old_oecd_fos_2007_label = serializers.CharField(
+        read_only=True, source="get_old_oecd_fos_2007_code_display"
+    )
+    new_oecd_fos_2007_label = serializers.CharField(
+        read_only=True, source="get_new_oecd_fos_2007_code_display"
     )
 
     class Meta:
@@ -44,6 +54,7 @@ class ProjectUpdateRequestSerializer(serializers.ModelSerializer):
             "uuid",
             "state",
             "customer_name",
+            "customer_uuid",
             "offering_name",
             "offering_uuid",
             "created",
@@ -68,8 +79,12 @@ class ProjectUpdateRequestSerializer(serializers.ModelSerializer):
 
 
 class NestedRemoteLocalCategorySerializer(serializers.HyperlinkedModelSerializer):
-    local_category_name = serializers.ReadOnlyField(source="local_category.title")
-    local_category_uuid = serializers.ReadOnlyField(source="local_category.uuid")
+    local_category_name = serializers.CharField(
+        read_only=True, source="local_category.title"
+    )
+    local_category_uuid = serializers.UUIDField(
+        read_only=True, source="local_category.uuid"
+    )
 
     class Meta:
         fields = (
@@ -139,17 +154,12 @@ class RemoteSynchronisationSerializer(
             )
         return attrs
 
-    def _create_or_update_category_mapping(self, remote_synchronisation, categories):
+    def _create_or_update_category_mapping(
+        self, remote_synchronisation: models.RemoteSynchronisation, categories
+    ):
         if not categories:
             raise serializers.ValidationError(
                 _("At least one category must be specified.")
-            )
-
-        # Check for duplicate local categories
-        local_categories = [c["local_category"] for c in categories]
-        if len(local_categories) != len(set(local_categories)):
-            raise serializers.ValidationError(
-                _("Duplicate local categories are not allowed.")
             )
 
         # Check for duplicate remote categories
@@ -159,12 +169,50 @@ class RemoteSynchronisationSerializer(
                 _("Duplicate remote categories are not allowed.")
             )
 
-        remote_synchronisation.remotelocalcategory_set.all().delete()
+        # Create a lookup dictionary for new categories, use "Unknown" as default name
+        new_categories_dict = {
+            (c["local_category"].id, str(c["remote_category"])): c.get(
+                "remote_category_name", "Unknown"
+            )
+            for c in categories
+        }
 
-        for c in categories:
+        # Get existing categories
+        existing_categories = remote_synchronisation.remotelocalcategory_set.all()
+
+        # Update or delete existing categories
+        for existing_category in existing_categories:
+            key = (
+                existing_category.local_category_id,
+                str(existing_category.remote_category),
+            )
+            if key in new_categories_dict:
+                # Update name if different
+                new_name = new_categories_dict[key]
+                if existing_category.remote_category_name != new_name:
+                    existing_category.remote_category_name = new_name
+                    existing_category.save()
+                # Remove from dict to track what needs to be created
+                del new_categories_dict[key]
+            else:
+                # Remove if not in new categories
+                existing_category.delete()
+
+        # Create new categories
+        for (
+            local_category_id,
+            remote_category,
+        ), remote_category_name in new_categories_dict.items():
+            category_data = next(
+                c
+                for c in categories
+                if c["local_category"].id == local_category_id
+                and str(c["remote_category"]) == remote_category
+            )
             models.RemoteLocalCategory.objects.create(
-                local_category=c["local_category"],
-                remote_category=c["remote_category"],
+                local_category=category_data["local_category"],
+                remote_category=category_data["remote_category"],
+                remote_category_name=remote_category_name,  # This will be "Unknown" if not provided
                 remote_synchronisation=remote_synchronisation,
             )
 
@@ -198,3 +246,19 @@ core_signals.pre_serializer_fields.connect(
     mark_synced_fields_as_read_only,
     sender=marketplace_serializers.OfferingOverviewUpdateSerializer,
 )
+
+
+class RemoteCustomerSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField(read_only=True)
+    name = serializers.CharField(read_only=True)
+    abbreviation = serializers.CharField(read_only=True)
+    phone_number = serializers.CharField(read_only=True)
+    email = serializers.CharField(read_only=True)
+
+
+class RemoteOfferingSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField(read_only=True)
+    name = serializers.CharField(read_only=True)
+    type = serializers.CharField(read_only=True)
+    state = serializers.CharField(read_only=True)
+    category_title = serializers.CharField(read_only=True)

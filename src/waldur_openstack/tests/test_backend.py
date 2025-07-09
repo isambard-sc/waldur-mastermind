@@ -453,6 +453,9 @@ class PullInstancePortsTest(BaseBackendTest):
                     "mac_address": "DC-D6-5E-9B-49-70",
                     "device_id": device_id,
                     "device_owner": "compute:nova",
+                    "admin_state_up": True,
+                    "name": "port_1",
+                    "description": "",
                     "fixed_ips": [
                         {
                             "ip_address": "10.0.0.2",
@@ -583,6 +586,8 @@ class PullPortsTest(BaseBackendTest):
                     "device_id": device_id,
                     "network_id": "network_id",
                     "device_owner": "compute:nova",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
                     "fixed_ips": [
                         {
                             "ip_address": "10.0.0.2",
@@ -652,6 +657,69 @@ class PullPortsTest(BaseBackendTest):
         self.assertEqual(port.mac_address, "DC-D6-5E-9B-49-70")
         self.assertEqual(port.fixed_ips[0]["ip_address"], "10.0.0.2")
 
+    def test_port_subnet_is_none_if_fixed_ips_is_empty(self):
+        # Arrange
+        instance = self.fixture.instance
+        port = self.fixture.port
+        self.mocked_neutron.list_ports.return_value = {
+            "ports": [
+                {
+                    "id": port.backend_id,
+                    "name": "",
+                    "description": "",
+                    "mac_address": "DC-D6-5E-9B-49-70",
+                    "device_id": instance.backend_id,
+                    "network_id": "network_id",
+                    "device_owner": "compute:nova",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
+                    "fixed_ips": [],  # Empty fixed_ips array
+                    "security_groups": [],
+                }
+            ]
+        }
+
+        # Act
+        self.backend.pull_tenant_ports(self.tenant)
+
+        # Assert
+        port.refresh_from_db()
+        self.assertIsNone(port.subnet)
+
+    def test_port_subnet_is_none_if_subnet_id_not_found(self):
+        # Arrange
+        instance = self.fixture.instance
+        port = self.fixture.port
+        self.mocked_neutron.list_ports.return_value = {
+            "ports": [
+                {
+                    "id": port.backend_id,
+                    "name": "",
+                    "description": "",
+                    "mac_address": "DC-D6-5E-9B-49-70",
+                    "device_id": instance.backend_id,
+                    "network_id": "network_id",
+                    "device_owner": "compute:nova",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
+                    "fixed_ips": [
+                        {
+                            "ip_address": "10.0.0.2",
+                            "subnet_id": "non_existing_subnet_id",  # Subnet ID that doesn't match any existing SubNet
+                        }
+                    ],
+                    "security_groups": [],
+                }
+            ]
+        }
+
+        # Act
+        self.backend.pull_tenant_ports(self.tenant)
+
+        # Assert
+        port.refresh_from_db()
+        self.assertIsNone(port.subnet)
+
     def test_instance_has_several_ports_in_the_same_network_connected_to_the_same_instance(
         self,
     ):
@@ -679,6 +747,8 @@ class PullPortsTest(BaseBackendTest):
                     ],
                     "name": "",
                     "description": "",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
                     "network_id": "network_id",
                     "security_groups": [],
                 },
@@ -695,6 +765,8 @@ class PullPortsTest(BaseBackendTest):
                     ],
                     "name": "",
                     "description": "",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
                     "network_id": "network_id",
                     "security_groups": [],
                 },
@@ -752,6 +824,8 @@ class PullPortsTest(BaseBackendTest):
                     ],
                     "name": "",
                     "description": "",
+                    "admin_state_up": True,
+                    "status": "ACTIVE",
                     "network_id": "network_id",
                     "security_groups": [],
                 }

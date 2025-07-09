@@ -1,10 +1,10 @@
 from constance import config
-from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import models as django_models
 from django.db.models import Q
 
 from waldur_core.core import managers as core_managers
+from waldur_core.core.models import User
 from waldur_core.core.utils import is_uuid_like
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.models import UserRole
@@ -17,10 +17,9 @@ from waldur_core.structure.managers import (
     get_connected_projects_by_permission,
     get_organization_groups,
 )
+from waldur_mastermind.marketplace.enums import OfferingStates
 
 from . import models
-
-User = get_user_model()
 
 
 class MixinManager(core_managers.GenericKeyMixin, django_models.Manager):
@@ -50,12 +49,7 @@ class OfferingQuerySet(django_models.QuerySet):
     def filter_by_ordering_availability_for_user(self, user):
         """Returns offerings available to the user to create an order"""
 
-        queryset = self.filter(
-            state__in=[
-                self.model.States.ACTIVE,
-                self.model.States.PAUSED,
-            ]
-        )
+        queryset = self.filter(state__in=[OfferingStates.ACTIVE, OfferingStates.PAUSED])
 
         if user.is_anonymous:
             if not config.ANONYMOUS_USER_CAN_VIEW_OFFERINGS:
@@ -164,8 +158,20 @@ class ResourceQuerySet(django_models.QuerySet["models.Resource"]):
             return self
 
         connected_customers = get_connected_customers(user)
+        connected_service_providers = get_connected_serviceproviders(user)
 
-        return self.filter(offering__customer__in=connected_customers).distinct()
+        return self.filter(
+            Q(offering__customer__in=connected_customers)
+            | Q(offering__customer__serviceprovider__in=connected_service_providers)
+        ).distinct()
+
+    def filter_for_user(self, user):
+        if user.is_staff or user.is_support:
+            return self
+        return self.filter(
+            project__in=get_connected_projects(user),
+            project__customer__in=get_connected_customers(user),
+        )
 
 
 class ResourceManager(MixinManager):
@@ -188,8 +194,8 @@ class PlanQuerySet(django_models.QuerySet):
     def filter_by_plan_availability_for_user(self, user):
         queryset = self.filter(
             offering__state__in=(
-                models.Offering.States.ACTIVE,
-                models.Offering.States.PAUSED,
+                OfferingStates.ACTIVE,
+                OfferingStates.PAUSED,
             ),
             archived=False,
         )
@@ -226,7 +232,15 @@ def get_connected_offerings(user, role=None):
     return get_scope_ids(user, content_type, role)
 
 
+def get_connected_serviceproviders(user, role=None):
+    content_type = ContentType.objects.get_for_model(models.ServiceProvider)
+    return get_scope_ids(user, content_type, role)
+
+
 def filter_offering_permissions(user, is_active=True):
+    if user.is_anonymous:
+        return UserRole.objects.none()
+
     queryset = UserRole.objects.filter(
         content_type=ContentType.objects.get_for_model(models.Offering),
         role__name=RoleEnum.OFFERING_MANAGER,

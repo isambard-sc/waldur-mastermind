@@ -1,10 +1,11 @@
+from typing import cast
 from unittest import mock
 
 from ddt import data, ddt
 from rest_framework import status, test
 from rest_framework.response import Response
 
-from waldur_core.core.models import StateMixin
+from waldur_core.core.enums import CoreStates
 from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure.tests.factories import (
     ProjectFactory,
@@ -31,13 +32,13 @@ class ClusterGetTest(test.APITransactionTestCase):
         self.client.force_authenticate(self.fixture.staff)
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(list(response.data)), 2)
+        self.assertEqual(len(response.data), 2)
 
     def test_user_cannot_get_strangers_clusters(self):
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(list(response.data)), 1)
+        self.assertEqual(len(response.data), 1)
 
     def test_rancher_cluster_is_exposed_for_openstack_instance(self):
         self.client.force_authenticate(self.fixture.staff)
@@ -46,7 +47,7 @@ class ClusterGetTest(test.APITransactionTestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(
-            response.data["rancher_cluster"]["uuid"].hex, self.fixture.cluster.uuid.hex
+            response.data["rancher_cluster"]["uuid"], self.fixture.cluster.uuid.hex
         )
 
     def test_rancher_cluster_is_none_if_node_is_not_existed(self):
@@ -66,7 +67,7 @@ class ClusterGetTest(test.APITransactionTestCase):
             tenant=self.fixture.tenant,
             service_settings=self.fixture.tenant.service_settings,
             project=project,
-            state=StateMixin.States.OK,
+            state=CoreStates.OK,
         )
         self.client.force_authenticate(admin)
         response = self.client.get(openstack_factories.InstanceFactory.get_url(vm))
@@ -93,6 +94,7 @@ class BaseClusterCreateTest(test.APITransactionTestCase):
             name="default", tenant=self.tenant
         )
         self.fixture.settings.options["base_image_name"] = image.name
+        self.fixture.settings.options["cloud_init_template"] = ""
         self.fixture.settings.save()
 
         self.network = openstack_factories.NetworkFactory(tenant=self.tenant)
@@ -104,66 +106,70 @@ class BaseClusterCreateTest(test.APITransactionTestCase):
         self.fixture.settings.options["base_subnet_name"] = self.subnet.name
         self.fixture.settings.save()
 
-    def _create_request_(
-        self, name, disk=1024, memory=1, cpu=2, add_payload=None, install_longhorn=False
+    def _prepate_request(
+        self,
+        name,
+        disk=1024,
+        add_payload=None,
+        install_longhorn=False,
+        agent_count=1,
+        server_count=3,
     ):
         add_payload = add_payload or {}
+        default_conf = {
+            "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
+            "system_volume_size": disk,
+            "flavor": openstack_factories.FlavorFactory.get_url(self.flavor),
+        }
         payload = {
             "name": name,
             "service_settings": ServiceSettingsFactory.get_url(self.fixture.settings),
             "project": ProjectFactory.get_url(self.fixture.project),
             "tenant": openstack_factories.TenantFactory.get_url(self.fixture.tenant),
-            "nodes": [
-                {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": disk,
-                    "memory": memory,
-                    "cpu": cpu,
-                    "roles": ["worker"],
-                },
-                {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": disk,
-                    "memory": memory,
-                    "cpu": cpu,
-                    "roles": ["controlplane", "worker"],
-                },
-                {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": disk,
-                    "memory": memory,
-                    "cpu": cpu,
-                    "roles": ["controlplane", "etcd"],
-                },
-                {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": disk,
-                    "memory": memory,
-                    "cpu": cpu,
-                    "roles": ["worker"],
-                },
-            ],
+            "nodes": utils.format_nodes(default_conf, server_count, agent_count),
             "install_longhorn": install_longhorn,
         }
         payload.update(add_payload)
+        return payload
+
+    def _create_request(
+        self,
+        name,
+        disk=1024,
+        add_payload=None,
+        install_longhorn=False,
+        agent_count=1,
+        server_count=3,
+    ):
+        payload = self._prepate_request(
+            name, disk, add_payload, install_longhorn, agent_count, server_count
+        )
         return self.client.post(self.url, payload)
 
 
 class ClusterCreateTest(BaseClusterCreateTest):
+    def setUp(self):
+        super().setUp()
+        self.default_conf = {
+            "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
+            "system_volume_size": 1024,
+            "flavor": openstack_factories.FlavorFactory.get_url(self.flavor),
+        }
+
     def tearDown(self):
         mock.patch.stopall()
 
     @mock.patch("waldur_rancher.executors.core_tasks")
     def test_create_cluster(self, mock_core_tasks):
         self.client.force_authenticate(self.fixture.owner)
-        response = self._create_request_("new-cluster")
+        response = self._create_request("new-cluster")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertTrue(models.Cluster.objects.filter(name="new-cluster").exists())
         cluster = models.Cluster.objects.get(name="new-cluster")
         mock_core_tasks.BackendMethodTask.return_value.si.assert_has_calls(
             [
                 mock.call(
-                    "waldur_rancher.cluster:%s" % cluster.id,
+                    f"waldur_rancher.cluster:{cluster.id}",
                     "create_cluster",
                     state_transition="begin_creating",
                 )
@@ -177,27 +183,21 @@ class ClusterCreateTest(BaseClusterCreateTest):
         self.tenant.service_settings.save()
         volume_type = openstack_factories.VolumeTypeFactory()
         volume_type.tenants.add(self.tenant)
-        payload = {
-            "nodes": [
+        default_conf = {
+            **self.default_conf,
+            "data_volumes": [
                 {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": 1024,
-                    "memory": 1,
-                    "cpu": 1,
-                    "roles": ["controlplane", "etcd", "worker"],
-                    "data_volumes": [
-                        {
-                            "size": 12 * 1024,
-                            "volume_type": openstack_factories.VolumeTypeFactory.get_url(
-                                volume_type
-                            ),
-                            "mount_point": "/var/lib/etcd",
-                        }
-                    ],
+                    "size": 12 * 1024,
+                    "volume_type": openstack_factories.VolumeTypeFactory.get_url(
+                        volume_type
+                    ),
+                    "mount_point": "/var/lib/etcd",
                 }
-            ]
+            ],
         }
-        response = self._create_request_("new-cluster", add_payload=payload)
+        response = self._create_request(
+            "new-cluster", add_payload={"nodes": utils.format_nodes(default_conf, 3, 1)}
+        )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         self.assertTrue(models.Cluster.objects.filter(name="new-cluster").exists())
         cluster = models.Cluster.objects.get(name="new-cluster")
@@ -205,25 +205,10 @@ class ClusterCreateTest(BaseClusterCreateTest):
 
     def test_node_name_uniqueness(self):
         self.client.force_authenticate(self.fixture.owner)
-        payload = {
-            "nodes": [
-                {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": 1024,
-                    "memory": 1,
-                    "cpu": 1,
-                    "roles": ["controlplane", "etcd", "worker"],
-                },
-                {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": 1024,
-                    "memory": 1,
-                    "cpu": 1,
-                    "roles": ["worker"],
-                },
-            ]
-        }
-        response = self._create_request_("new-cluster", add_payload=payload)
+        response = self._create_request(
+            "new-cluster",
+            add_payload={"nodes": utils.format_nodes(self.default_conf, 3, 1)},
+        )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertTrue(models.Cluster.objects.filter(name="new-cluster").exists())
         cluster = models.Cluster.objects.get(name="new-cluster")
@@ -231,102 +216,39 @@ class ClusterCreateTest(BaseClusterCreateTest):
             cluster.node_set.all()[0].name, cluster.node_set.all()[1].name
         )
 
-    def test_validate_etcd_node_count(self):
+    def test_validate_server_node_count(self):
         self.client.force_authenticate(self.fixture.owner)
-        payload = {
-            "nodes": [
-                {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": 1024,
-                    "memory": 1,
-                    "cpu": 1,
-                    "roles": ["controlplane", "etcd", "worker"],
-                },
-                {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": 1024,
-                    "memory": 1,
-                    "cpu": 1,
-                    "roles": ["controlplane", "etcd", "worker"],
-                },
-            ]
-        }
-        response = self._create_request_("new-cluster", add_payload=payload)
+        response = self._create_request(
+            "new-cluster",
+            add_payload={"nodes": utils.format_nodes(self.default_conf, 2, 1)},
+        )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue(
-            "Total count of etcd nodes must be 1, 3 or 5." in response.data["nodes"][0]
+            "Total count of server nodes must be 1, 3 or 5."
+            in response.data["nodes"][0]
         )
 
-    def test_validate_worker_node_count(self):
+    def test_validate_agent_node_count(self):
         self.client.force_authenticate(self.fixture.owner)
-        payload = {
-            "nodes": [
-                {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": 1024,
-                    "memory": 1,
-                    "cpu": 1,
-                    "roles": [
-                        "controlplane",
-                        "etcd",
-                    ],
-                },
-            ]
-        }
-        response = self._create_request_("new-cluster", add_payload=payload)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertTrue(
-            "Count of workers roles must be min 1." in response.data["nodes"][0]
+        response = self._create_request(
+            "new-cluster",
+            add_payload={"nodes": utils.format_nodes(self.default_conf, 3, 0)},
         )
-
-    def test_validate_controlplane_node_count(self):
-        self.client.force_authenticate(self.fixture.owner)
-        payload = {
-            "nodes": [
-                {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": 1024,
-                    "memory": 1,
-                    "cpu": 1,
-                    "roles": ["etcd", "worker"],
-                },
-            ]
-        }
-        response = self._create_request_("new-cluster", add_payload=payload)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue(
-            "Count of controlplane nodes must be min 1." in response.data["nodes"][0]
+            "Count of agent nodes must be min 1." in response.data["nodes"][0]
         )
 
     def test_validate_name_uniqueness(self):
         self.client.force_authenticate(self.fixture.owner)
-        self._create_request_("new-cluster")
-        response = self._create_request_("new-cluster")
+        self._create_request("new-cluster")
+        response = self._create_request("new-cluster")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_validate_name(self):
         self.client.force_authenticate(self.fixture.owner)
-        response = self._create_request_("new_cluster")
+        response = self._create_request("new_cluster")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    @mock.patch("waldur_rancher.client.RancherClient._post")
-    def test_create_cluster_with_mtu(self, mock_client_post):
-        self.mock_backend()
-
-        self.fixture.settings.options["default_mtu"] = 5000
-        self.fixture.settings.save()
-        self.fixture.cluster.backend_id = ""
-        self.fixture.cluster.save()
-        backend = self.fixture.cluster.get_backend()
-        backend.create_cluster(self.fixture.cluster)
-        actual = mock_client_post.call_args_list[1][1]["json"]
-        self.assertEqual(
-            actual,
-            {
-                "name": self.fixture.cluster.name,
-                "rancherKubernetesEngineConfig": {"network": {"mtu": 5000}},
-            },
-        )
 
     def mock_backend(self):
         mock_token_patch = mock.patch(
@@ -337,19 +259,31 @@ class ClusterCreateTest(BaseClusterCreateTest):
             "waldur_rancher.backend.RancherBackend._backend_cluster_to_cluster"
         )
         mock_backend_patch.start()
-        mock_command_patch = mock.patch(
-            "waldur_rancher.client.RancherClient.get_node_command"
+        mock_v1_to_v3_patch = mock.patch(
+            "waldur_rancher.client.RancherClient.get_v3_cluster_id"
         )
-        mock_command = mock_command_patch.start()
-        mock_command.return_value = ""
+        mock_v1_to_v3 = mock_v1_to_v3_patch.start()
+        mock_v1_to_v3.return_value = "v3_cluster_id"
 
     @mock.patch("waldur_rancher.client.RancherClient._post")
     def test_create_private_cluster(self, mock_client_post):
         self.mock_backend()
-
-        self.fixture.settings.options["private_registry_url"] = "http://example.com"
-        self.fixture.settings.options["private_registry_user"] = "user"
-        self.fixture.settings.options["private_registry_password"] = "1234"
+        private_registry_credentials_secret_name = "registryconfig-auth-abc"
+        mock_client_post.side_effect = [
+            None,
+            {"metadata": {"name": private_registry_credentials_secret_name}},
+            {"id": "test-id"},
+        ]
+        options = cast(dict, self.fixture.settings.options)
+        k8s_version = "v1.33.0+rke2r1"
+        options.update(
+            {
+                "private_registry_url": "example.com",
+                "private_registry_user": "user",
+                "private_registry_password": "1234",
+                "k8s_version": k8s_version,
+            }
+        )
         self.fixture.settings.save()
         self.fixture.cluster.backend_id = ""
         self.fixture.cluster.save()
@@ -358,16 +292,56 @@ class ClusterCreateTest(BaseClusterCreateTest):
         self.assertEqual(
             mock_client_post.call_args_list[1][1]["json"],
             {
-                "name": self.fixture.cluster.name,
-                "rancherKubernetesEngineConfig": {
-                    "network": {"mtu": 1400},
-                    "privateRegistries": [
-                        {
-                            "url": "http://example.com",
-                            "user": "user",
-                            "password": "1234",
-                        }
-                    ],
+                "type": "kubernetes.io/basic-auth",
+                "metadata": {
+                    "namespace": "fleet-default",
+                    "generateName": "registryconfig-auth-",
+                },
+                "data": {"username": "dXNlcg==", "password": "MTIzNA=="},
+            },
+        )
+        self.assertEqual(
+            mock_client_post.call_args_list[2][1]["json"],
+            {
+                "type": "provisioning.cattle.io.cluster",
+                "metadata": {
+                    "name": self.fixture.cluster.name,
+                    "namespace": "fleet-default",
+                },
+                "spec": {
+                    "rkeConfig": {
+                        "chartValues": {"rke2-cilium": {}},
+                        "dataDirectories": {
+                            "systemAgent": "/opt/rke2_storage/agent",
+                            "provisioning": "/opt/rke2_storage/provisioning",
+                            "k8sDistro": "/opt/rke2_storage/rke2",
+                        },
+                        "machineGlobalConfig": {
+                            "cni": "cilium",
+                            "disable-kube-proxy": False,
+                            "etcd-expose-metrics": False,
+                        },
+                        "machineSelectorConfig": [
+                            {
+                                "config": {
+                                    "protect-kernel-defaults": False,
+                                    "system-default-registry": "example.com",
+                                }
+                            }
+                        ],
+                        "registries": {
+                            "configs": {
+                                "example.com": {
+                                    "authConfigSecretName": private_registry_credentials_secret_name,
+                                    "caBundle": None,
+                                    "insecureSkipVerify": False,
+                                    "tlsSecretName": None,
+                                }
+                            },
+                            "mirrors": {},
+                        },
+                    },
+                    "kubernetesVersion": k8s_version,
                 },
             },
         )
@@ -405,7 +379,7 @@ class ClusterCreateTest(BaseClusterCreateTest):
     @utils.override_plugin_settings(READ_ONLY_MODE=True)
     def test_create_is_disabled_in_read_only_mode(self, mock_core_tasks):
         self.client.force_authenticate(self.fixture.owner)
-        response = self._create_request_("new-cluster")
+        response = self._create_request("new-cluster")
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
     @mock.patch("waldur_rancher.executors.core_tasks")
@@ -415,81 +389,12 @@ class ClusterCreateTest(BaseClusterCreateTest):
         payload = {
             "ssh_public_key": SshPublicKeyFactory.get_url(ssh_public_key),
         }
-        response = self._create_request_("new-cluster", add_payload=payload)
+        response = self._create_request("new-cluster", add_payload=payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         cluster = models.Cluster.objects.get(name="new-cluster")
         self.assertEqual(
             cluster.node_set.first().initial_data["ssh_public_key"],
             ssh_public_key.uuid.hex,
-        )
-
-    @mock.patch("waldur_rancher.executors.core_tasks")
-    def test_create_cluster_with_longhorn_using_rest(self, mock_core_tasks):
-        self.client.force_authenticate(self.fixture.owner)
-        response = self._create_request_("new-cluster", install_longhorn=True)
-        cluster = models.Cluster.objects.get(name="new-cluster")
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertTrue(models.Cluster.objects.filter(name="new-cluster").exists())
-        mock_core_tasks.BackendMethodTask.return_value.si.assert_has_calls(
-            [
-                mock.call(
-                    "waldur_rancher.cluster:%s" % cluster.id,
-                    "install_longhorn_to_cluster",
-                )
-            ]
-        )
-
-    @mock.patch("waldur_rancher.client.RancherClient._post")
-    def test_create_cluster_with_longhorn(self, mock_client_post):
-        self.mock_backend()
-
-        mock_namespace_create = mock.patch(
-            "waldur_rancher.client.RancherClient.create_namespace"
-        )
-        mock_namespace = mock_namespace_create.start()
-        mock_namespace.return_value = {"id": "1"}
-
-        mock_client_post.return_value = {
-            "id": 1,
-            "state": "installing",
-            "created": "2020-08-04",
-            "answers": {},
-        }
-
-        catalog = factories.CatalogFactory(name="library")
-        system_project = factories.ProjectFactory(
-            settings=self.fixture.settings, cluster=self.fixture.cluster, name="System"
-        )
-        template = factories.TemplateFactory(
-            settings=self.fixture.settings,
-            name="longhorn",
-            catalog=catalog,
-            default_version="1.1",
-            versions=["1.0", "1.1"],
-        )
-
-        self.fixture.cluster.backend_id = ""
-        self.fixture.cluster.save()
-        self.fixture.node.worker_role = True
-        self.fixture.node.save()
-        backend = self.fixture.cluster.get_backend()
-        backend.create_cluster(self.fixture.cluster)
-        backend.install_longhorn_to_cluster(self.fixture.cluster)
-        self.assertEqual(
-            mock_client_post.call_args_list[2][1]["json"],
-            {
-                "prune": False,
-                "timeout": 1200,
-                "wait": True,
-                "type": "app",
-                "name": "longhorn",
-                "targetNamespace": "1",
-                "externalId": f"catalog://?catalog={template.catalog.backend_id}&template={template.name}&version=1.1",
-                "projectId": system_project.backend_id,
-                "answers": {
-                    "persistence.defaultClassReplicaCount": 1,
-                },
-            },
         )
 
     def test_validate_security_groups_positive(self):
@@ -510,7 +415,7 @@ class ClusterCreateTest(BaseClusterCreateTest):
                 },
             ]
         }
-        response = self._create_request_("new-cluster", add_payload=payload)
+        response = self._create_request("new-cluster", add_payload=payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
     def test_validate_security_groups_negative(self):
@@ -531,16 +436,77 @@ class ClusterCreateTest(BaseClusterCreateTest):
                 },
             ]
         }
-        response = self._create_request_("new-cluster", add_payload=payload)
+        response = self._create_request("new-cluster", add_payload=payload)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_default_security_groups_is_used_if_custom_is_not_provided(self):
         self.client.force_authenticate(self.fixture.owner)
-        self._create_request_("new-cluster")
+        self._create_request("new-cluster")
         cluster = models.Cluster.objects.get(name="new-cluster")
         self.assertEqual(
             cluster.node_set.first().initial_data["security_groups"],
             [self.default_security_group.uuid.hex],
+        )
+
+    def test_vm_project_is_saved_in_vm_spec(self):
+        self.client.force_authenticate(self.fixture.owner)
+        project = ProjectFactory(customer=self.fixture.customer)
+        response = self._create_request(
+            "new-cluster", add_payload={"vm_project": ProjectFactory.get_url(project)}
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        cluster = models.Cluster.objects.get(name="new-cluster")
+        node = cluster.node_set.first()
+        self.assertEqual(cluster.vm_project, project)
+        self.assertEqual(
+            node.initial_data["project"],
+            project.uuid.hex,
+        )
+
+    def test_when_both_node_and_cluster_tenant_are_specified_error_is_raised(self):
+        self.client.force_authenticate(self.fixture.owner)
+        nodes = utils.format_nodes(self.default_conf, 3, 1)
+        for node in nodes:
+            node["tenant"] = openstack_factories.TenantFactory.get_url(
+                self.fixture.tenant
+            )
+        request = self._prepate_request(
+            "new-cluster",
+            add_payload={"nodes": nodes},
+        )
+        response = self.client.post(self.url, request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_when_both_node_and_cluster_tenant_are_not_specified_error_is_raised(self):
+        self.client.force_authenticate(self.fixture.owner)
+        nodes = utils.format_nodes(self.default_conf, 3, 1)
+        request = self._prepate_request(
+            "new-cluster",
+            add_payload={"nodes": nodes},
+        )
+        del request["tenant"]
+        response = self.client.post(self.url, request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_ok_if_only_node_tenant_is_specified(self):
+        self.client.force_authenticate(self.fixture.owner)
+        nodes = utils.format_nodes(self.default_conf, 3, 1)
+        for node in nodes:
+            node["tenant"] = openstack_factories.TenantFactory.get_url(
+                self.fixture.tenant
+            )
+        request = self._prepate_request(
+            "new-cluster",
+            add_payload={"nodes": nodes},
+        )
+        del request["tenant"]
+        response = self.client.post(self.url, request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        cluster = models.Cluster.objects.get(name="new-cluster")
+        node = cluster.node_set.first()
+        self.assertEqual(
+            node.initial_data["tenant"],
+            self.fixture.tenant.uuid.hex,
         )
 
     def test_custom_security_groups_are_propagated_to_initial_data(self):
@@ -561,7 +527,7 @@ class ClusterCreateTest(BaseClusterCreateTest):
                 },
             ]
         }
-        response = self._create_request_("new-cluster", add_payload=payload)
+        response = self._create_request("new-cluster", add_payload=payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
         cluster = models.Cluster.objects.get(name="new-cluster")
@@ -578,7 +544,7 @@ class ClusterCreateTest(BaseClusterCreateTest):
         payload = {
             "ssh_public_key": SshPublicKeyFactory.get_url(ssh_public_key),
         }
-        response = self._create_request_("new-cluster", add_payload=payload)
+        response = self._create_request("new-cluster", add_payload=payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         cluster = models.Cluster.objects.get(name="new-cluster")
         self.assertTrue("ssh_public_key" not in cluster.node_set.first().initial_data)
@@ -591,27 +557,21 @@ class ClusterCreateTest(BaseClusterCreateTest):
             settings=self.tenant.service_settings
         )
         volume_type.tenants.add(self.tenant)
-        payload = {
-            "nodes": [
+        default_conf = {
+            **self.default_conf,
+            "data_volumes": [
                 {
-                    "subnet": openstack_factories.SubNetFactory.get_url(self.subnet),
-                    "system_volume_size": 1024,
-                    "memory": 1,
-                    "cpu": 1,
-                    "roles": ["controlplane", "etcd", "worker"],
-                    "data_volumes": [
-                        {
-                            "size": 12 * 1024,
-                            "volume_type": openstack_factories.VolumeTypeFactory.get_url(
-                                volume_type
-                            ),
-                            "mount_point": "/var/lib/etcd",
-                        }
-                    ],
+                    "size": 12 * 1024,
+                    "volume_type": openstack_factories.VolumeTypeFactory.get_url(
+                        volume_type
+                    ),
+                    "mount_point": "/var/lib/etcd",
                 }
-            ]
+            ],
         }
-        response = self._create_request_("new-cluster", add_payload=payload)
+        response = self._create_request(
+            "new-cluster", add_payload={"nodes": utils.format_nodes(default_conf, 3, 1)}
+        )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertTrue(models.Cluster.objects.filter(name="new-cluster").exists())
         cluster = models.Cluster.objects.get(name="new-cluster")
@@ -695,7 +655,7 @@ class ClusterUpdateTest(test.APITransactionTestCase):
         response = self.client.patch(self.url, {"name": "new-name"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         mock_core_tasks.BackendMethodTask.return_value.si.assert_called_once_with(
-            "waldur_rancher.cluster:%s" % self.fixture.cluster.id,
+            f"waldur_rancher.cluster:{self.fixture.cluster.id}",
             "update_cluster",
             state_transition="begin_updating",
         )
@@ -708,7 +668,7 @@ class ClusterUpdateTest(test.APITransactionTestCase):
         response = self.client.patch(self.url, {"description": "description"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         mock_core_tasks.StateTransitionTask.return_value.si.assert_called_once_with(
-            "waldur_rancher.cluster:%s" % self.fixture.cluster.id,
+            f"waldur_rancher.cluster:{self.fixture.cluster.id}",
             state_transition="begin_updating",
         )
 
@@ -737,14 +697,14 @@ class ClusterDeleteTest(test.APITransactionTestCase):
         response = self.client.delete(self.url)
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_core_tasks.BackendMethodTask.return_value.si.assert_called_once_with(
-            "waldur_rancher.cluster:%s" % self.fixture.cluster.id,
+            f"waldur_rancher.cluster:{self.fixture.cluster.id}",
             "delete_cluster",
             state_transition="begin_deleting",
         )
 
     def test_not_delete_cluster_if_state_is_not_ok(self):
         self.client.force_authenticate(self.fixture.owner)
-        self.fixture.cluster.state = models.Cluster.States.CREATION_SCHEDULED
+        self.fixture.cluster.state = CoreStates.CREATION_SCHEDULED
         self.fixture.cluster.save()
         response = self.client.delete(self.url)
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
@@ -758,31 +718,37 @@ class ClusterDeleteTest(test.APITransactionTestCase):
         response = self.client.delete(self.url)
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_tasks.DeleteNodeTask.return_value.si.assert_called_once_with(
-            "waldur_rancher.node:%s" % self.fixture.node.id,
+            f"waldur_rancher.node:{self.fixture.node.id}",
             user_id=self.fixture.owner.id,
         )
 
+    @mock.patch("waldur_rancher.backend.RancherBackend.client")
     @mock.patch("waldur_rancher.tasks.common_utils.delete_request")
     def test_when_cluster_is_deleted_instance_deletion_is_requested(
-        self, mock_delete_request
+        self, mock_delete_request, mock_client
     ):
         mock_delete_request.return_value = Response(status=status.HTTP_202_ACCEPTED)
+        mock_client.get_node.return_value = {
+            "conditions": [{"type": "Drained", "status": "True"}]
+        }
         tasks.DeleteNodeTask().execute(self.fixture.node, user_id=self.fixture.owner.id)
+        vm = self.fixture.node.instance
         self.assertEqual(mock_delete_request.call_count, 1)
         self.assertEqual(mock_delete_request.call_args[0][1], self.fixture.owner)
         self.assertEqual(
             mock_delete_request.call_args[1],
             {
-                "uuid": self.fixture.node.instance.uuid.hex,
+                "uuid": vm.uuid.hex,
                 "query_params": {"delete_volumes": True},
             },
         )
+        mock_client.drain_node.assert_called_once_with(self.fixture.node.backend_id)
 
     @mock.patch("waldur_rancher.backend.RancherBackend.client")
     def test_if_instance_has_been_deleted_node_and_cluster_are_deleted(
         self, mock_client
     ):
-        self.fixture.cluster.state = models.Node.States.DELETING
+        self.fixture.cluster.state = CoreStates.DELETING
         self.fixture.cluster.save()
         self.fixture.node.backend_id = "backend_id"
         self.fixture.node.save()
@@ -794,12 +760,122 @@ class ClusterDeleteTest(test.APITransactionTestCase):
         mock_client.delete_cluster.assert_called_once_with(
             self.fixture.cluster.backend_id
         )
-        mock_client.delete_node.assert_called_once_with(self.fixture.node.backend_id)
+
+
+@ddt
+class ClusterSecurityGroupRulesTest(test.APITransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.fixture = fixtures.RancherFixture()
+        self.security_group = factories.ClusterSecurityGroupFactory(
+            cluster=self.fixture.cluster
+        )
+        self.fixture.node
+        openstack_factories.SecurityGroupFactory(
+            tenant=self.fixture.tenant, name=self.security_group.name
+        )
+        self.url = factories.ClusterSecurityGroupFactory.get_url(self.security_group)
+
+    @data("staff", "owner", "admin", "manager")
+    def test_user_can_update_security_group_rules(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        payload = {
+            "rules": [
+                {
+                    "direction": "ingress",
+                    "protocol": "tcp",
+                    "from_port": 443,
+                    "to_port": 443,
+                    "cidr": "192.168.77.0/24",
+                }
+            ]
+        }
+        response = self.client.put(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.security_group.refresh_from_db()
+        rule = models.ClusterSecurityGroupRule.objects.filter(
+            group=self.security_group
+        ).get()
+        self.assertEqual(rule.direction, "ingress")
+        self.assertEqual(rule.protocol, "tcp")
+        self.assertEqual(rule.from_port, 443)
+        self.assertEqual(rule.to_port, 443)
+        self.assertEqual(rule.cidr, "192.168.77.0/24")
+
+    def test_validation_invalid_cidr(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = {
+            "rules": [
+                {
+                    "direction": "ingress",
+                    "protocol": "tcp",
+                    "from_port": 443,
+                    "to_port": 443,
+                    "cidr": "invalid-cidr",
+                }
+            ]
+        }
+        response = self.client.put(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_validation_missing_fields(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = [{"direction": "ingress"}]
+        response = self.client.put(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rules_are_replaced(self):
+        factories.ClusterSecurityGroupFactory(cluster=self.fixture.cluster)
+        self.client.force_authenticate(self.fixture.staff)
+        payload = {
+            "rules": [
+                {
+                    "direction": "ingress",
+                    "protocol": "tcp",
+                    "from_port": 443,
+                    "to_port": 443,
+                    "cidr": "192.168.77.0/24",
+                }
+            ]
+        }
+        response = self.client.put(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(
+            models.ClusterSecurityGroupRule.objects.filter(
+                group=self.security_group
+            ).count(),
+            1,
+        )
 
     @utils.override_plugin_settings(READ_ONLY_MODE=True)
-    @mock.patch("waldur_rancher.executors.core_tasks")
-    def test_delete_is_disabled_in_read_only_mode(self, mock_core_tasks):
-        self.fixture.node.delete()
-        self.client.force_authenticate(self.fixture.owner)
-        response = self.client.delete(self.url)
+    def test_update_is_disabled_in_read_only_mode(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = {
+            "rules": [
+                {
+                    "direction": "ingress",
+                    "protocol": "tcp",
+                    "from_port": 443,
+                    "to_port": 443,
+                    "cidr": "192.168.77.0/24",
+                }
+            ]
+        }
+        response = self.client.put(self.url, payload)
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_validation_port_range(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = {
+            "rules": [
+                {
+                    "direction": "ingress",
+                    "protocol": "tcp",
+                    "from_port": 443,
+                    "to_port": 80,
+                    "cidr": "192.168.77.0/24",
+                }
+            ]
+        }
+        response = self.client.put(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

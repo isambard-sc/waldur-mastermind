@@ -2,10 +2,10 @@ from dateutil.parser import parse as parse_datetime
 from freezegun import freeze_time
 from rest_framework import status, test
 
-from waldur_core.permissions.fixtures import CustomerRole
+from waldur_core.permissions.fixtures import ServiceProviderRole
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.booking import models
-from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import ResourceStates
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 from .. import PLUGIN_NAME
@@ -38,7 +38,7 @@ class BookingsTest(test.APITransactionTestCase):
 
         self.resource_2 = marketplace_factories.ResourceFactory(
             offering=self.fixture.offering,
-            state=marketplace_models.Resource.States.OK,
+            state=ResourceStates.OK,
             attributes={"schedules": [self.schedules[1]]},
         )
         self.slot_2 = models.BookingSlot.objects.create(
@@ -74,7 +74,7 @@ class BookingsTest(test.APITransactionTestCase):
     ):
         creator = self.fixture.order.created_by
         new_fixture = structure_fixtures.CustomerFixture()
-        new_fixture.customer.add_user(creator, role=CustomerRole.MANAGER)
+        new_fixture.customer.add_user(creator, role=ServiceProviderRole.MANAGER)
         self.client.force_authenticate(new_fixture.owner)
         response = self.client.get(
             f"/api/marketplace-bookings/{self.fixture.offering.uuid.hex}/"

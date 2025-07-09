@@ -1,22 +1,17 @@
 from unittest import mock
 
+from constance.test.unittest import override_config as override_constance_config
 from ddt import data, ddt
 from python_freeipa import exceptions as freeipa_exceptions
 from rest_framework import status, test
 
 from waldur_core.core import utils as core_utils
-from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_freeipa import tasks
 from waldur_freeipa.backend import FreeIPABackend
 from waldur_freeipa.tests import factories
-from waldur_freeipa.tests.helpers import override_plugin_settings
-from waldur_slurm import models as slurm_models
-from waldur_slurm import signals as slurm_signals
-from waldur_slurm.tests import fixtures as slurm_fixtures
 
 
-@override_plugin_settings(ENABLED=True)
 class BaseProfileTest(test.APITransactionTestCase):
     def setUp(self):
         self.user = structure_factories.UserFactory(preferred_language="ET")
@@ -24,6 +19,7 @@ class BaseProfileTest(test.APITransactionTestCase):
         self.url = factories.ProfileFactory.get_list_url()
 
 
+@override_constance_config(FREEIPA_ENABLED=True)
 class ProfileValidateTest(BaseProfileTest):
     def test_username_should_not_contain_spaces(self):
         response = self.client.post(self.url, {"username": "Alice Lebowski"})
@@ -40,7 +36,7 @@ class ProfileValidateTest(BaseProfileTest):
         self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
         self.assertIn("username", response.data)
 
-    @override_plugin_settings(ENABLED=True, BLACKLISTED_USERNAMES=["root"])
+    @override_constance_config(FREEIPA_BLACKLISTED_USERNAMES=["root"])
     def test_blacklisted_username_is_not_allowed(self):
         response = self.client.post(self.url, {"username": "root"})
         self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
@@ -54,6 +50,7 @@ class ProfileValidateTest(BaseProfileTest):
 
 
 @mock.patch("python_freeipa.Client")
+@override_constance_config(FREEIPA_ENABLED=True)
 class ProfileCreateTest(BaseProfileTest):
     def setUp(self):
         super().setUp()
@@ -70,12 +67,15 @@ class ProfileCreateTest(BaseProfileTest):
         self.assertEqual(status.HTTP_201_CREATED, response.status_code)
         mock_client().user_add.assert_called_once()
 
-    def test_profile_is_not_active_initially(self, mock_client):
+    def test_profile_is_active_initially(self, mock_client):
         response = self.client.post(self.url, self.valid_data)
-        self.assertFalse(response.data["is_active"])
+        self.assertTrue(response.data["is_active"])
         self.assertIsNotNone(response.data["agreement_date"])
 
-    @override_plugin_settings(ENABLED=True, USERNAME_PREFIX="ipa_")
+    @override_constance_config(
+        FREEIPA_USERNAME_PREFIX="ipa_",
+        FREEIPA_ENABLED=True,
+    )
     def test_username_is_prefixed(self, mock_client):
         response = self.client.post(self.url, self.valid_data)
         self.assertEqual(status.HTTP_201_CREATED, response.status_code)
@@ -98,7 +98,7 @@ class ProfileCreateTest(BaseProfileTest):
             ),
             user_password=None,
             organization_unit=self.user.organization,
-            disabled=True,
+            disabled=False,
         )
 
     def test_when_profile_created_ssh_keys_are_attached(self, mock_client):
@@ -113,7 +113,7 @@ class ProfileCreateTest(BaseProfileTest):
         self.assertEqual(sorted(expected_keys), sorted(kwargs.get("ssh_key")))
 
 
-@override_plugin_settings(ENABLED=True)
+@override_constance_config(FREEIPA_ENABLED=True)
 @mock.patch("python_freeipa.Client")
 class ProfileSshKeysTest(test.APITransactionTestCase):
     def setUp(self):
@@ -180,7 +180,7 @@ class ProfileSshKeysTest(test.APITransactionTestCase):
 
 
 @ddt
-@override_plugin_settings(ENABLED=True)
+@override_constance_config(FREEIPA_ENABLED=True)
 @mock.patch("python_freeipa.Client")
 class ProfileUpdateTest(test.APITransactionTestCase):
     def setUp(self):
@@ -232,7 +232,7 @@ class ProfileUpdateTest(test.APITransactionTestCase):
         )
 
 
-@override_plugin_settings(ENABLED=True)
+@override_constance_config(FREEIPA_ENABLED=True)
 @mock.patch("waldur_freeipa.handlers.tasks")
 class UpdateUserHandlerTest(test.APITransactionTestCase):
     def setUp(self):
@@ -259,49 +259,7 @@ class UpdateUserHandlerTest(test.APITransactionTestCase):
         )
 
 
-@override_plugin_settings(ENABLED=True)
-class ProfileAllocationTest(test.APITransactionTestCase):
-    def setUp(self):
-        self.user = structure_factories.UserFactory()
-        self.profile = factories.ProfileFactory(user=self.user, is_active=False)
-        self.fixture = slurm_fixtures.SlurmFixture()
-
-    def test_when_association_is_created_profile_is_enabled(self):
-        self.fixture.allocation.project.add_user(self.user, ProjectRole.ADMIN)
-
-        slurm_signals.slurm_association_created.send(
-            slurm_models.Allocation,
-            allocation=self.fixture.allocation,
-            user=self.user,
-            username=self.user.username,
-        )
-        self.profile.refresh_from_db()
-        self.assertTrue(self.profile.is_active)
-
-    def test_active_profile_is_disabled_if_user_does_not_have_access_to_any_allocation(
-        self,
-    ):
-        self.profile.is_active = True
-        self.profile.save()
-
-        tasks.disable_accounts_without_allocations()
-
-        self.profile.refresh_from_db()
-        self.assertFalse(self.profile.is_active)
-
-    def test_active_profile_is_not_disabled_if_user_has_access_to_any_allocation(self):
-        self.profile.is_active = True
-        self.profile.save()
-
-        self.fixture.allocation.project.add_user(self.user, ProjectRole.ADMIN)
-
-        tasks.disable_accounts_without_allocations()
-
-        self.profile.refresh_from_db()
-        self.assertTrue(self.profile.is_active)
-
-
-@override_plugin_settings(ENABLED=True)
+@override_constance_config(FREEIPA_ENABLED=True)
 @mock.patch("python_freeipa.Client")
 class ProfileStatusTest(test.APITransactionTestCase):
     def setUp(self):

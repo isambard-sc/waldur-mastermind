@@ -13,8 +13,7 @@ from djangosaml2.signals import post_authenticated
 from djangosaml2.utils import get_custom_setting, get_location
 from djangosaml2.views import _get_subject_id, _set_subject_id
 from rest_framework.authtoken.models import Token
-from rest_framework.generics import ListAPIView
-from rest_framework.views import APIView
+from rest_framework.generics import GenericAPIView, ListAPIView
 from saml2 import BINDING_HTTP_POST, BINDING_HTTP_REDIRECT, md
 from saml2.client import Saml2Client
 from saml2.metadata import do_extensions, entity_descriptor
@@ -24,10 +23,11 @@ from six import text_type
 
 from waldur_core.core.authentication import (
     AuthenticationMethod,
+    refresh_token,
     set_authentication_method,
 )
+from waldur_core.core.serializers import EmptySerializer
 from waldur_core.core.views import (
-    RefreshTokenMixin,
     login_completed,
     login_failed,
     logout_completed,
@@ -65,7 +65,7 @@ def metadata(request, config_loader_path=None, valid_for=None):
     )
 
 
-class BaseSaml2View(APIView):
+class BaseSaml2View(GenericAPIView):
     throttle_classes = ()
     permission_classes = ()
     authentication_classes = ()
@@ -160,7 +160,7 @@ class Saml2LoginView(BaseSaml2View):
         return JsonResponse(data)
 
 
-class Saml2LoginCompleteView(RefreshTokenMixin, BaseSaml2View):
+class Saml2LoginCompleteView(BaseSaml2View):
     """
     SAML Authorization Response endpoint
 
@@ -200,15 +200,15 @@ class Saml2LoginCompleteView(RefreshTokenMixin, BaseSaml2View):
             response = client.parse_authn_request_response(
                 xmlstr, BINDING_HTTP_POST, outstanding_queries
             )
-        except Exception as e:
-            if isinstance(e, StatusRequestDenied):
-                return login_failed(
-                    _(
-                        "Authentication request has been denied by identity provider. "
-                        "Please check your credentials."
-                    )
+        except StatusRequestDenied:
+            return login_failed(
+                _(
+                    "Authentication request has been denied by identity provider. "
+                    "Please check your credentials."
                 )
-            logger.error("SAML response parsing failed %s" % e)
+            )
+        except Exception as e:
+            logger.error("SAML response parsing failed %s", e)
             return login_failed(_("SAML2 response has errors."))
 
         if response is None:
@@ -256,7 +256,7 @@ class Saml2LoginCompleteView(RefreshTokenMixin, BaseSaml2View):
 
         logger.debug("Sending the post_authenticated signal")
         post_authenticated.send_robust(sender=user, session_info=session_info)
-        token = self.refresh_token(user)
+        token = refresh_token(user)
 
         logger.info(
             "Authenticated with SAML token. Returning token for successful login of user %s",
@@ -277,6 +277,8 @@ class Saml2LogoutView(BaseSaml2View):
 
     This view redirects users to corresponding IdP page for the logout.
     """
+
+    serializer_class = EmptySerializer
 
     @validate_saml2
     def get(self, request):

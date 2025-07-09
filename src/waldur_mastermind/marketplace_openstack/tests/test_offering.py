@@ -5,12 +5,14 @@ from ddt import data, ddt
 from django.core.exceptions import ObjectDoesNotExist
 from rest_framework import status, test
 
+from waldur_core.core.enums import CoreStates
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import OfferingStates
 from waldur_mastermind.marketplace.management.commands.load_categories import (
     load_category,
 )
@@ -66,6 +68,7 @@ class PlanComponentsTest(test.APITransactionTestCase):
         fixture = structure_fixtures.ProjectFixture()
         url = marketplace_factories.OfferingFactory.get_list_url()
         self.client.force_authenticate(fixture.owner)
+        marketplace_factories.ServiceProviderFactory(customer=fixture.customer)
         payload = {
             "name": "offering",
             "category": marketplace_factories.CategoryFactory.get_url(self.category),
@@ -122,7 +125,7 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
         tenant = openstack_models.Tenant.objects.create(
             service_settings=fixture.settings,
             project=fixture.project,
-            state=openstack_models.Tenant.States.CREATING,
+            state=CoreStates.CREATING,
         )
 
         tenant.set_ok()
@@ -139,14 +142,14 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
         tenant = self.trigger_offering_creation()
         tenant.delete()
         offering = marketplace_models.Offering.objects.get(type=offering_type)
-        self.assertEqual(offering.state, marketplace_models.Offering.States.ARCHIVED)
+        self.assertEqual(offering.state, OfferingStates.ARCHIVED)
 
     def trigger_offering_creation(self):
         fixture = OpenStackFixture()
         tenant = openstack_models.Tenant.objects.create(
             service_settings=fixture.settings,
             project=fixture.project,
-            state=openstack_models.Tenant.States.CREATING,
+            state=CoreStates.CREATING,
         )
         resource = marketplace_factories.ResourceFactory(scope=tenant)
         marketplace_factories.OrderFactory(resource=resource)
@@ -247,6 +250,7 @@ class OfferingCreateTest(BaseBackendTestCase):
         self.customer_url = structure_factories.CustomerFactory.get_url(
             customer=self.fixture.customer
         )
+        marketplace_factories.ServiceProviderFactory(customer=self.fixture.customer)
         self.category_url = marketplace_factories.CategoryFactory.get_url()
         self.url = marketplace_factories.OfferingFactory.get_list_url()
         patcher = mock.patch(
@@ -536,23 +540,23 @@ class InstanceExternalIPTest(test.APITransactionTestCase):
             service_settings=self.fixture.settings,
             project=self.fixture.project,
             tenant=self.fixture.tenant,
-            state=openstack_models.FloatingIP.States.OK,
+            state=CoreStates.OK,
         )
         floating_ip.refresh_from_db()
-        self.assertEqual(floating_ip.external_address, ["200.200.200.1"])
+        self.assertEqual(floating_ip.external_address, "200.200.200.1")
         self.parent_offering.secret_options["ipv4_external_ip_mapping"] = [
             {
                 "floating_ip": "100.100.100.0/24",
-                "external_ip": "300.300.300.0/24",
+                "external_ip": "250.250.250.0/24",
             }
         ]
         self.parent_offering.save()
         floating_ip.refresh_from_db()
-        self.assertEqual(floating_ip.external_address, ["300.300.300.1"])
+        self.assertEqual(floating_ip.external_address, "250.250.250.1")
 
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["external_address"], ["300.300.300.1"])
+        self.assertEqual(response.data["external_address"], {"250.250.250.1"})
 
     def test_external_ips_has_not_been_added(self):
         floating_ip = openstack_factories.FloatingIPFactory(
@@ -561,10 +565,10 @@ class InstanceExternalIPTest(test.APITransactionTestCase):
             service_settings=self.fixture.settings,
             project=self.fixture.project,
             tenant=self.fixture.tenant,
-            state=openstack_models.FloatingIP.States.OK,
+            state=CoreStates.OK,
         )
         floating_ip.refresh_from_db()
-        self.assertEqual(floating_ip.external_address, [])
+        self.assertEqual(floating_ip.external_address, None)
 
     def test_filter(self):
         openstack_factories.FloatingIPFactory(
@@ -573,7 +577,7 @@ class InstanceExternalIPTest(test.APITransactionTestCase):
             service_settings=self.fixture.settings,
             project=self.fixture.project,
             tenant=self.fixture.tenant,
-            state=openstack_models.FloatingIP.States.OK,
+            state=CoreStates.OK,
         )
         openstack_factories.FloatingIPFactory(
             port=self.fixture.port,
@@ -581,7 +585,7 @@ class InstanceExternalIPTest(test.APITransactionTestCase):
             service_settings=self.fixture.settings,
             project=self.fixture.project,
             tenant=self.fixture.tenant,
-            state=openstack_models.FloatingIP.States.OK,
+            state=CoreStates.OK,
         )
         marketplace_factories.ResourceFactory()
         url = marketplace_factories.ResourceFactory.get_list_url()

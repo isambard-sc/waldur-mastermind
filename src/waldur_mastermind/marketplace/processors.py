@@ -99,7 +99,11 @@ class AbstractCreateResourceProcessor(BaseOrderProcessor):
                         name=name, url=url, resource=resource
                     )
 
-            if not scope or isinstance(scope, str):
+            if (
+                not scope
+                or isinstance(scope, str)
+                or isinstance(scope, models.Resource)  # Managed Rancher Cluster case
+            ):
                 resource_creation_succeeded(resource)
 
     def send_request(self, user):
@@ -124,7 +128,7 @@ class CreateResourceProcessor(AbstractCreateResourceProcessor):
     4) Create marketplace resource object from order and plugin resource.
     5) Store link from order to the resource.
 
-    Therefore this class implements template method design pattern.
+    Therefore, this class implements template method design pattern.
     """
 
     def validate_order(self, request):
@@ -239,7 +243,7 @@ class AbstractUpdateResourceProcessor(BaseOrderProcessor):
                     self.order.resource.plan = self.order.plan
                     self.order.resource.save(update_fields=["plan"])
 
-                self.order.state = models.Order.States.DONE
+                self.order.complete()
                 self.order.save(update_fields=["state"])
         else:
             with transaction.atomic():
@@ -330,7 +334,7 @@ class AbstractDeleteResourceProcessor(BaseOrderProcessor):
                 self.order.resource.set_state_terminated()
                 self.order.resource.save(update_fields=["state"])
 
-                self.order.state = models.Order.States.DONE
+                self.order.complete()
                 self.order.save(update_fields=["state"])
         else:
             with transaction.atomic():
@@ -430,16 +434,16 @@ class BasicCreateResourceProcessor(AbstractCreateResourceProcessor):
 
 
 class BasicDeleteResourceProcessor(AbstractDeleteResourceProcessor):
-    def send_request(self, user, resource):
+    def send_request(self, user, resource) -> bool:
         return True
 
 
 class BasicUpdateResourceProcessor(AbstractUpdateResourceProcessor):
-    def send_request(self, user):
+    def send_request(self, user) -> bool:
         return True
 
     def validate_request(self, request):
         pass
 
-    def update_limits_process(self, user):
+    def update_limits_process(self, user) -> bool:
         return True

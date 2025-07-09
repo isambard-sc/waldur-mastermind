@@ -1,12 +1,15 @@
-from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
-from waldur_core.core.serializers import TranslatedModelSerializerMixin
+from waldur_core.core.models import User
+from waldur_core.core.serializers import (
+    RestrictedSerializerMixin,
+    TranslatedModelSerializerMixin,
+)
 from waldur_core.core.utils import is_uuid_like
-from waldur_core.permissions.enums import TYPE_MAP, PermissionEnum
+from waldur_core.permissions.enums import TYPE_KEYS, TYPE_MAP, PermissionEnum
 from waldur_core.permissions.utils import (
     get_create_permission,
     get_delete_permission,
@@ -18,10 +21,8 @@ from waldur_core.structure.permissions import _get_customer
 
 from . import models
 
-User = get_user_model()
 
-
-class RoleDetailsSerializer(TranslatedModelSerializerMixin):
+class RoleDetailsSerializer(RestrictedSerializerMixin, TranslatedModelSerializerMixin):
     class Meta:
         model = models.Role
         fields = (
@@ -38,31 +39,40 @@ class RoleDetailsSerializer(TranslatedModelSerializerMixin):
 
     permissions = serializers.SerializerMethodField()
     users_count = serializers.SerializerMethodField()
-    content_type = serializers.ReadOnlyField(source="content_type.model")
+    content_type = serializers.SerializerMethodField()
 
     def get_fields(self):
         fields = super().get_fields()
 
         try:
-            request = self.context["view"].request
+            request = self.context["request"]
             user = request.user
         except (KeyError, AttributeError):
             return fields
 
         if user.is_anonymous or not (user.is_staff or user.is_support):
-            del fields["users_count"]
+            if "users_count" in fields:
+                del fields["users_count"]
 
         return fields
 
-    def get_permissions(self, role):
+    def get_permissions(self, role: models.Role) -> list[str]:
         return list(
             models.RolePermission.objects.filter(role=role).values_list(
                 "permission", flat=True
             )
         )
 
-    def get_users_count(self, role):
+    def get_users_count(self, role: models.Role) -> int:
         return models.UserRole.objects.filter(is_active=True, role=role).count()
+
+    def get_content_type(self, role: models.Role) -> TYPE_KEYS:
+        for external_ct_id, (app_label, model) in TYPE_MAP.items():
+            if (
+                role.content_type.app_label == app_label
+                and role.content_type.model == model
+            ):
+                return external_ct_id
 
 
 class RoleModifySerializer(RoleDetailsSerializer):
@@ -93,7 +103,7 @@ class RoleModifySerializer(RoleDetailsSerializer):
     def validate_permissions(self, permissions):
         invalid = set(permissions) - set(perm.value for perm in PermissionEnum)
         if invalid:
-            raise ValidationError(f'Invalid permissions {",".join(invalid)}')
+            raise ValidationError(f"Invalid permissions {','.join(invalid)}")
         return permissions
 
     def create(self, validated_data):
@@ -129,14 +139,14 @@ class RoleDescriptionSerializer(TranslatedModelSerializerMixin):
 
 class UserRoleDetailsSerializer(serializers.ModelSerializer):
     role_name = serializers.ReadOnlyField(source="role.name")
-    role_uuid = serializers.ReadOnlyField(source="role.uuid")
-    user_uuid = serializers.ReadOnlyField(source="user.uuid")
+    role_uuid = serializers.UUIDField(read_only=True, source="role.uuid")
+    user_uuid = serializers.UUIDField(read_only=True, source="user.uuid")
     user_email = serializers.ReadOnlyField(source="user.email")
     user_full_name = serializers.ReadOnlyField(source="user.full_name")
     user_username = serializers.ReadOnlyField(source="user.username")
     user_image = serializers.ImageField(source="user.image", read_only=True)
     created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
-    created_by_uuid = serializers.ReadOnlyField(source="created_by.uuid")
+    created_by_uuid = serializers.UUIDField(read_only=True, source="created_by.uuid")
 
     class Meta:
         model = models.UserRole
@@ -157,22 +167,44 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
         )
 
 
-class PermissionSerializer(serializers.Serializer):
-    user_uuid = serializers.ReadOnlyField(source="user.uuid")
-    user_name = serializers.ReadOnlyField(source="user.full_name")
-    user_slug = serializers.ReadOnlyField(source="user.slug")
-    created = serializers.ReadOnlyField()
-    expiration_time = serializers.ReadOnlyField()
-    created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
-    created_by_username = serializers.ReadOnlyField(source="created_by.username")
-    role_name = serializers.ReadOnlyField(source="role.name")
-    role_description = serializers.ReadOnlyField(source="role.description")
-    role_uuid = serializers.ReadOnlyField(source="role.uuid")
-    scope_type = serializers.ReadOnlyField(source="scope._meta.model_name")
-    scope_uuid = serializers.ReadOnlyField(source="scope.uuid")
-    scope_name = serializers.ReadOnlyField(source="scope.name")
-    customer_uuid = serializers.ReadOnlyField(source="scope.customer.uuid")
-    customer_name = serializers.ReadOnlyField(source="scope.customer.name")
+class PermissionSerializer(serializers.ModelSerializer):
+    user_uuid = serializers.UUIDField(read_only=True, source="user.uuid")
+    user_name = serializers.CharField(read_only=True, source="user.full_name")
+    user_slug = serializers.CharField(read_only=True, source="user.slug")
+    created_by_full_name = serializers.CharField(
+        read_only=True, source="created_by.full_name"
+    )
+    created_by_username = serializers.CharField(
+        read_only=True, source="created_by.username"
+    )
+    role_name = serializers.CharField(read_only=True, source="role.name")
+    role_description = serializers.CharField(read_only=True, source="role.description")
+    role_uuid = serializers.UUIDField(read_only=True, source="role.uuid")
+    scope_type = serializers.CharField(read_only=True, source="scope._meta.model_name")
+    scope_uuid = serializers.UUIDField(read_only=True, source="scope.uuid")
+    scope_name = serializers.CharField(read_only=True, source="scope.name")
+    customer_uuid = serializers.UUIDField(read_only=True, source="scope.customer.uuid")
+    customer_name = serializers.CharField(read_only=True, source="scope.customer.name")
+
+    class Meta:
+        model = models.UserRole
+        fields = (
+            "user_uuid",
+            "user_name",
+            "user_slug",
+            "created",
+            "expiration_time",
+            "created_by_full_name",
+            "created_by_username",
+            "role_name",
+            "role_description",
+            "role_uuid",
+            "scope_type",
+            "scope_uuid",
+            "scope_name",
+            "customer_uuid",
+            "customer_name",
+        )
 
 
 class UserRoleMutateSerializer(serializers.Serializer):
@@ -268,3 +300,7 @@ class UserRoleUpdateSerializer(UserRoleMutateSerializer):
 class UserRoleDeleteSerializer(UserRoleMutateSerializer):
     def get_permission(self, scope):
         return get_delete_permission(scope)
+
+
+class UserRoleExpirationTimeSerializer(serializers.Serializer):
+    expiration_time = serializers.DateTimeField(allow_null=True)

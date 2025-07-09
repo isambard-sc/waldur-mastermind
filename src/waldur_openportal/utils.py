@@ -4,6 +4,8 @@ import logging
 from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
+from waldur_core.core import models as core_models
+
 from waldur_core.structure.managers import (
     get_connected_customers,
     get_connected_projects,
@@ -67,6 +69,47 @@ def get_project_allocations(user):
     return project_allocations
 
 
+def set_default_project_shortname(project):
+    """
+    Set and return the default shortname for the passed project.
+    If the project already has a shortname, the original
+    shortname will be returned
+    """
+    # Use the project slug as the default shortname
+    if project.slug is None:
+        logger.error(f"Project slug is None for project: {project}")
+        raise ValueError(f"Project slug is None for project: {project}")
+
+    shortname = str(project.slug).strip()
+
+    if len(shortname) == 0:
+        logger.error(f"Project slug is empty for project: {project}")
+        raise ValueError(f"Project slug is empty for project: {project}")
+
+    if len(shortname) > models.MAX_PROJECT_SHORTNAME_LENGTH:
+        logger.warning(
+            f"Project slug '{shortname}' is longer than {models.MAX_PROJECT_SHORTNAME_LENGTH} characters for project: {project}"
+        )
+        shortname = shortname[: models.MAX_PROJECT_SHORTNAME_LENGTH]
+
+    project_info, created = models.ProjectInfo.objects.get_or_create(
+        project=project, shortname=shortname
+    )
+
+    if created:
+        project_info.sanitise()
+    else:
+        logger.warning(
+            f"ProjectInfo already exists for project {project} with shortname {project_info.shortname}"
+        )
+
+    if project_info.shortname is None:
+        logger.error(f"Empty shortname for project: {project}")
+        raise ValueError(f"Empty shortname for project: {project}")
+
+    return project_info.shortname
+
+
 def get_project_shortname(project):
     """
     Return the preferred shortname for the passed project.
@@ -113,3 +156,95 @@ def get_last_day_of_month(date):
     """
     next_month = date.replace(day=28) + timezone.timedelta(days=4)
     return next_month - timezone.timedelta(days=next_month.day)
+
+
+def get_association(user, allocation):
+    """
+    Return the association between the user and the allocation.
+    """
+    if not isinstance(allocation, models.Allocation):
+        raise TypeError("allocation must be an instance of models.Allocation")
+
+    if not isinstance(user, core_models.User):
+        raise TypeError("user must be an instance of core_models.User")
+
+    try:
+        return models.Association.objects.get(user=user, allocation=allocation)
+    except models.Association.MultipleObjectsReturned:
+        logger.warning(
+            f"Multiple associations found for {user} and {allocation} - removing all but the first one"
+        )
+        associations = models.Association.objects.filter(
+            user=user, allocation=allocation
+        )
+
+        if associations.exists():
+            first_association = associations.first()
+
+            if first_association is None:
+                logger.error(f"No associations found for {user} and {allocation}?")
+                raise models.Association.DoesNotExist(
+                    f"No association found for {user} and {allocation}"
+                )
+
+            if len(associations) > 1:
+                for association in associations[1:]:
+                    logger.info(
+                        f"Deleting duplicate association {association} for {user} and {allocation}"
+                    )
+                    association.delete()
+
+            return first_association
+        else:
+            logger.error(
+                f"No associations found for {user} and {allocation} after deletion"
+            )
+            raise models.Association.DoesNotExist(
+                f"No association found for {user} and {allocation}"
+            )
+
+
+def get_remote_association(user, allocation):
+    """
+    Return the association between the user and the allocation.
+    """
+    if not isinstance(allocation, models.RemoteAllocation):
+        raise TypeError("allocation must be an instance of models.RemoteAllocation")
+
+    if not isinstance(user, core_models.User):
+        raise TypeError("user must be an instance of core_models.User")
+
+    try:
+        return models.RemoteAssociation.objects.get(user=user, allocation=allocation)
+    except models.RemoteAssociation.MultipleObjectsReturned:
+        logger.warning(
+            f"Multiple associations found for {user} and {allocation} - removing all but the first one"
+        )
+        associations = models.RemoteAssociation.objects.filter(
+            user=user, allocation=allocation
+        )
+
+        if associations.exists():
+            first_association = associations.first()
+
+            if first_association is None:
+                logger.error(f"No associations found for {user} and {allocation}?")
+                raise models.RemoteAssociation.DoesNotExist(
+                    f"No association found for {user} and {allocation}"
+                )
+
+            if len(associations) > 1:
+                for association in associations[1:]:
+                    logger.info(
+                        f"Deleting duplicate association {association} for {user} and {allocation}"
+                    )
+                    association.delete()
+
+            return first_association
+        else:
+            logger.error(
+                f"No associations found for {user} and {allocation} after deletion"
+            )
+            raise models.RemoteAssociation.DoesNotExist(
+                f"No association found for {user} and {allocation}"
+            )

@@ -9,18 +9,16 @@ import time
 import unicodedata
 import uuid
 import warnings
-from collections import OrderedDict
 from itertools import chain
-from operator import itemgetter
 from secrets import choice
 from string import ascii_letters, digits
 
 import jwt
 import requests
+import textile
 from constance import config
 from django.apps import apps
 from django.conf import settings
-from django.contrib.auth import get_user_model
 from django.core.mail import EmailMultiAlternatives
 from django.core.management.base import BaseCommand
 from django.core.serializers.json import DjangoJSONEncoder
@@ -34,10 +32,10 @@ from django.urls import resolve
 from django.utils import timezone
 from django.utils.crypto import get_random_string
 from requests.packages.urllib3 import exceptions
+from rest_framework.serializers import ValidationError
 from rest_framework.settings import api_settings
-
-import textile
 from ua_parser import user_agent_parser
+
 from waldur_core.structure.notifications import NOTIFICATIONS
 
 logger = logging.getLogger(__name__)
@@ -45,17 +43,6 @@ logger = logging.getLogger(__name__)
 
 def flatten(*xs):
     return tuple(chain.from_iterable(xs))
-
-
-def sort_dict(unsorted_dict):
-    """
-    Return a OrderedDict ordered by key names from the :unsorted_dict:
-    """
-    sorted_dict = OrderedDict()
-    # sort items before inserting them into a dict
-    for key, value in sorted(unsorted_dict.items(), key=itemgetter(0)):
-        sorted_dict[key] = value
-    return sorted_dict
 
 
 def datetime_to_timestamp(datetime):
@@ -71,17 +58,6 @@ def timestamp_to_datetime(timestamp, replace_tz=True):
 
 def timeshift(**kwargs):
     return timezone.now().replace(microsecond=0) + datetime.timedelta(**kwargs)
-
-
-def hours_in_month(month=None, year=None):
-    now = datetime.datetime.now()
-    if not month:
-        month = now.month
-    if not year:
-        year = now.year
-
-    days_in_month = calendar.monthrange(year, month)[1]
-    return 24 * days_in_month
 
 
 def month_start(date):
@@ -107,7 +83,7 @@ def pwgen(pw_len=16):
     digits that look similar -- just to avoid confusion.
     """
     return get_random_string(
-        pw_len, "abcdefghjkmnpqrstuvwxyz" "ABCDEFGHJKLMNPQRSTUVWXYZ" "23456789"
+        pw_len, "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     )
 
 
@@ -180,19 +156,9 @@ def get_detail_view_name(model):
     return "%s-detail" % model.__name__.lower()
 
 
-def get_list_view_name(model):
-    if model is NotImplemented:
-        raise AttributeError("Cannot get list view name for not implemented model")
-
-    if hasattr(model, "get_url_name") and callable(model.get_url_name):
-        return "%s-list" % model.get_url_name()
-
-    return "%s-list" % model.__name__.lower()
-
-
 def get_fake_context(user=None):
     if not user:
-        user = get_user_model()()
+        ()
     request = type(
         "R", (object,), {"method": "GET", "user": user, "query_params": QueryDict()}
     )
@@ -219,7 +185,7 @@ def find_template_from_registry(app, event_type, template_suffix):
 def send_mail(
     subject,
     body,
-    to,
+    to: list | tuple,
     from_email=None,
     html_message=None,
     filename=None,
@@ -229,6 +195,8 @@ def send_mail(
     reply_to=None,
     fail_silently=False,
 ):
+    from waldur_core.logging.models import EmailLog
+
     from_email = from_email or settings.DEFAULT_FROM_EMAIL
     reply_to = reply_to or settings.DEFAULT_REPLY_TO_EMAIL
     email = EmailMultiAlternatives(
@@ -253,7 +221,14 @@ def send_mail(
 
     if filename:
         email.attach(filename, attachment, content_type)
-    return email.send(fail_silently=fail_silently)
+
+    result = email.send(fail_silently=fail_silently)
+    EmailLog.objects.create(
+        subject=subject,
+        body=email.body,
+        emails=to,
+    )
+    return result
 
 
 def broadcast_mail(
@@ -269,7 +244,7 @@ def broadcast_mail(
     """
     Shorthand to format email message from template file and sent it to all recipients.
 
-    It is assumed that there are there are 3 templates available for event type in application.
+    It is assumed that there are 3 templates available for event type in application.
     For example, if app is 'users' and event_type is 'invitation_rejected', then there should be 3 files:
 
     1) users/invitation_rejected_subject.txt is template for email subject
@@ -288,6 +263,7 @@ def broadcast_mail(
     :param filename: name of the attached file
     :param attachment: content of attachment
     :param content_type: the content type of attachment
+    :param bcc: list of emails for sending as bcc
     """
     from .models import Notification
 
@@ -343,6 +319,13 @@ def order_with_nulls(queryset, field):
         return queryset.order_by(F(col).desc(nulls_last=True))
     else:
         return queryset.order_by(F(col).asc(nulls_first=True))
+
+
+def validate_uuid(value):
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        raise ValidationError("Invalid UUID format")
 
 
 def is_uuid_like(val):
@@ -488,7 +471,7 @@ class QuietSession(requests.Session):
 
 
 def format_homeport_link(format_str="", **kwargs):
-    link = settings.WALDUR_CORE["HOMEPORT_URL"] + format_str
+    link = config.HOMEPORT_URL + format_str
     return link.format(**kwargs)
 
 
@@ -605,3 +588,20 @@ def text2html(value: str):
 
 def remove_duplicate_hyphens(text):
     return re.sub("-+", "-", text)
+
+
+def get_valid_template_paths():
+    valid_template_paths = set()
+    for section_key, notifications in NOTIFICATIONS.items():
+        for notification in notifications:
+            for template in notification.get("templates", []):
+                valid_template_paths.add(f"{section_key}/{template.path}")
+    return valid_template_paths
+
+
+def get_valid_notification_keys():
+    valid_keys = set()
+    for section_key, notifications in NOTIFICATIONS.items():
+        for notification in notifications:
+            valid_keys.add(f"{section_key}.{notification['path']}")
+    return valid_keys

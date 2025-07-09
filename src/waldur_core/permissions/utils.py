@@ -1,12 +1,11 @@
-from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
 from django.db.models.query import QuerySet
 from rest_framework import exceptions
 
-from . import enums, models, signals
+from waldur_core.core.models import User
 
-User = get_user_model()
+from . import enums, models, signals
 
 
 def has_permission(request, permission, scope):
@@ -14,7 +13,6 @@ def has_permission(request, permission, scope):
         user = request
     else:
         user = request.user
-
     if user.is_staff:
         return True
 
@@ -48,12 +46,6 @@ def permission_factory(permission, sources=None):
         raise exceptions.PermissionDenied()
 
     return permission_function
-
-
-def role_has_permission(role, permission):
-    return models.RolePermission.objects.filter(
-        role__name=role, permission=permission
-    ).exists()
 
 
 def get_users(scope, role_name=None):
@@ -213,61 +205,3 @@ def get_delete_permission(model_class):
 
 def get_update_permission(model_class):
     return enums.UPDATE_PERMISSIONS.get(model_class._meta.model_name)
-
-
-def queryset_factory(model, role, path=None, ordering=None, created_by=False):
-    ordering = ordering or []
-
-    if not path:
-        path_list = []
-        path = "id"
-    else:
-        path_list = path.split(".")
-        path = path.replace(".", "__")
-
-    def get_queryset(view):
-        user = view.request.user
-
-        if user.is_staff:
-            return model.objects.all()
-
-        related_model = model
-        try:
-            permissions = related_model.Permissions
-
-        except AttributeError:
-            permissions = None
-
-        list_permission = getattr(permissions, "list_permission", None)
-
-        for p in path_list:
-            related_model = getattr(related_model, p).field.related_model
-
-        ctype = ContentType.objects.get_for_model(related_model)
-
-        if list_permission:
-            roles = list(
-                models.Role.objects.filter(
-                    content_type=ctype,
-                    is_active=True,
-                    permissions__permission=list_permission,
-                ).values_list("name", flat=True)
-            )
-            if not roles:
-                return model.objects.none()
-            related_model_ids = get_scope_ids(user, ctype, roles)
-        else:
-            related_model_ids = get_scope_ids(user, ctype, role)
-
-        query = {path + "__in": related_model_ids}
-
-        if created_by:
-            return (
-                model.objects.filter(Q(**query) | Q(created_by=user))
-                .distinct()
-                .order_by(*ordering)
-            )
-        else:
-            return model.objects.filter(**query).distinct().order_by(*ordering)
-
-    return get_queryset

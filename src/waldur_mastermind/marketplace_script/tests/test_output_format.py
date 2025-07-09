@@ -5,6 +5,7 @@ from rest_framework import test
 
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.marketplace_script.tasks import pull_resource
 
@@ -12,6 +13,7 @@ from . import fixtures
 
 
 @mock.patch("waldur_mastermind.marketplace_script.utils.docker")
+@mock.patch("waldur_mastermind.marketplace_script.utils.check_docker_socket_access")
 class CreateOutputFormatTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.ScriptFixture()
@@ -28,15 +30,13 @@ class CreateOutputFormatTest(test.APITransactionTestCase):
                 "name": "name",
             },
             limits={"cpu": 10},
-            state=marketplace_models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
 
-    def test_output_is_blank(self, mock_docker):
+    def test_output_is_blank(self, mock_check_access, mock_docker):
         mock_docker.DockerClient().containers.run.return_value = b""
         marketplace_utils.process_order(self.order, self.fixture.staff)
-        self.assertEqual(
-            self.order.resource.state, marketplace_models.Resource.States.OK
-        )
+        self.assertEqual(self.order.resource.state, ResourceStates.OK)
         self.assertEqual(self.order.resource.backend_id, "")
         self.assertEqual(self.order.resource.backend_metadata, {})
         self.assertFalse(
@@ -45,14 +45,12 @@ class CreateOutputFormatTest(test.APITransactionTestCase):
             ).exists()
         )
 
-    def test_output_includes_only_backend_id(self, mock_docker):
+    def test_output_includes_only_backend_id(self, mock_check_access, mock_docker):
         mock_docker.DockerClient().containers.run.return_value = (
             b"Some lines\n" + b"backend_id"
         )
         marketplace_utils.process_order(self.order, self.fixture.staff)
-        self.assertEqual(
-            self.order.resource.state, marketplace_models.Resource.States.OK
-        )
+        self.assertEqual(self.order.resource.state, ResourceStates.OK)
         self.assertEqual(self.order.resource.backend_id, "backend_id")
         self.assertEqual(self.order.resource.backend_metadata, {})
         self.assertFalse(
@@ -61,7 +59,9 @@ class CreateOutputFormatTest(test.APITransactionTestCase):
             ).exists()
         )
 
-    def test_output_includes_backend_id_and_metadata(self, mock_docker):
+    def test_output_includes_backend_id_and_metadata(
+        self, mock_check_access, mock_docker
+    ):
         mock_docker.DockerClient().containers.run.return_value = (
             b"Some lines\n"
             + b"backend_id"
@@ -69,9 +69,7 @@ class CreateOutputFormatTest(test.APITransactionTestCase):
             + base64.b64encode(b'{"backend_metadata": {"cpu": 1}}')
         )
         marketplace_utils.process_order(self.order, self.fixture.staff)
-        self.assertEqual(
-            self.order.resource.state, marketplace_models.Resource.States.OK
-        )
+        self.assertEqual(self.order.resource.state, ResourceStates.OK)
         self.assertEqual(self.order.resource.backend_id, "backend_id")
         self.assertEqual(self.order.resource.backend_metadata, {"cpu": 1})
         self.assertFalse(
@@ -80,7 +78,9 @@ class CreateOutputFormatTest(test.APITransactionTestCase):
             ).exists()
         )
 
-    def test_output_includes_backend_id_metadata_and_endpoints(self, mock_docker):
+    def test_output_includes_backend_id_metadata_and_endpoints(
+        self, mock_check_access, mock_docker
+    ):
         mock_docker.DockerClient().containers.run.return_value = (
             b"Some lines\n"
             + b"backend_id"
@@ -98,9 +98,7 @@ class CreateOutputFormatTest(test.APITransactionTestCase):
             )
         )
         marketplace_utils.process_order(self.order, self.fixture.staff)
-        self.assertEqual(
-            self.order.resource.state, marketplace_models.Resource.States.OK
-        )
+        self.assertEqual(self.order.resource.state, ResourceStates.OK)
         self.assertEqual(self.order.resource.backend_id, "backend_id")
         self.assertEqual(self.order.resource.backend_metadata, {"cpu": 1})
         self.assertTrue(
@@ -111,12 +109,13 @@ class CreateOutputFormatTest(test.APITransactionTestCase):
 
 
 @mock.patch("waldur_mastermind.marketplace_script.utils.docker")
+@mock.patch("waldur_mastermind.marketplace_script.utils.check_docker_socket_access")
 class PullOutputFormatTest(test.APITransactionTestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.ScriptFixture()
         self.offering = self.fixture.offering
         self.resource = self.fixture.resource
-        self.resource.state = marketplace_models.Resource.States.OK
+        self.resource.state = ResourceStates.OK
         self.resource.save()
         self.component = self.offering.components.first()
         self.component.billing_type = (
@@ -124,14 +123,14 @@ class PullOutputFormatTest(test.APITransactionTestCase):
         )
         self.component.save()
 
-    def test_output_is_blank(self, mock_docker):
+    def test_output_is_blank(self, mock_check_access, mock_docker):
         mock_docker.DockerClient().containers.run.return_value = b""
         pull_resource(self.fixture.resource.id)
         self.fixture.resource.refresh_from_db()
-        self.assertEqual(self.resource.state, marketplace_models.Resource.States.OK)
+        self.assertEqual(self.resource.state, ResourceStates.OK)
         self.assertEqual(self.resource.error_message, "")
 
-    def test_output_includes_usages(self, mock_docker):
+    def test_output_includes_usages(self, mock_check_access, mock_docker):
         component_type = self.component.type.encode("utf-8")
         self.assertFalse(
             marketplace_models.ComponentUsage.objects.filter(
@@ -152,7 +151,7 @@ class PullOutputFormatTest(test.APITransactionTestCase):
         )
         pull_resource(self.fixture.resource.id)
         self.fixture.resource.refresh_from_db()
-        self.assertEqual(self.resource.state, marketplace_models.Resource.States.OK)
+        self.assertEqual(self.resource.state, ResourceStates.OK)
         self.assertEqual(self.resource.error_message, "")
         self.assertTrue(
             marketplace_models.ComponentUsage.objects.filter(
@@ -161,7 +160,7 @@ class PullOutputFormatTest(test.APITransactionTestCase):
             ).exists()
         )
 
-    def test_output_includes_report(self, mock_docker):
+    def test_output_includes_report(self, mock_check_access, mock_docker):
         mock_docker.DockerClient().containers.run.return_value = (
             b"Some lines\n"
             + base64.b64encode(
@@ -174,5 +173,5 @@ class PullOutputFormatTest(test.APITransactionTestCase):
         )
         pull_resource(self.fixture.resource.id)
         self.fixture.resource.refresh_from_db()
-        self.assertEqual(self.resource.state, marketplace_models.Resource.States.OK)
+        self.assertEqual(self.resource.state, ResourceStates.OK)
         self.assertEqual(self.resource.report, [{"header": "header", "body": "body"}])

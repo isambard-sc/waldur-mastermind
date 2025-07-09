@@ -17,6 +17,7 @@ from waldur_mastermind.marketplace_openstack.tests.mocks import (
     MOCK_FLAVOR,
     MOCK_IMAGE,
     MOCK_INSTANCE,
+    MOCK_LIMITS,
     MOCK_TENANT,
     MOCK_VOLUME,
 )
@@ -40,6 +41,22 @@ class ImportAsMarketplaceResourceTest(BaseOpenStackTest):
     def setUp(self):
         super().setUp()
         self.fixture = OpenStackFixture()
+
+        self.mock_limits = {
+            "vcpu": 10,
+            "ram": 20480,
+            "storage": 100,
+        }
+
+        self.get_limits_patcher = patch(
+            "waldur_openstack.backend.OpenStackBackend.get_tenant_limits"
+        )
+        self.mock_get_limits = self.get_limits_patcher.start()
+        self.mock_get_limits.return_value = self.mock_limits
+
+    def tearDown(self):
+        self.get_limits_patcher.stop()
+        super().tearDown()
 
     def test_import_volume_as_marketplace_resource(self):
         volume = self.fixture.volume
@@ -73,10 +90,17 @@ class ImportAsMarketplaceResourceTest(BaseOpenStackTest):
 
     def test_import_tenant_as_marketplace_resource(self):
         tenant = self.fixture.tenant
+
         self.import_tenant(tenant)
+
+        self.mock_get_limits.assert_called_once_with(tenant, False)
+
         self.assertTrue(
             marketplace_models.Resource.objects.filter(scope=tenant).exists()
         )
+
+        resource = marketplace_models.Resource.objects.get(scope=tenant)
+        self.assertEqual(resource.limits, self.mock_limits)
 
     def test_when_tenant_is_imported_volume_and_instance_offerings_are_created(self):
         tenant = self.fixture.tenant
@@ -160,13 +184,21 @@ class InstanceImportTest(BaseInstanceImportTest):
         }
 
     @mock.patch("waldur_openstack.executors.InstancePullExecutor.execute")
-    def test_instance_can_be_imported(self, resource_import_execute_mock):
+    @mock.patch(
+        "waldur_mastermind.marketplace_openstack.utils.update_external_addresses_of_resource"
+    )
+    def test_instance_can_be_imported(
+        self,
+        update_external_addresses_of_resource_mock,
+        resource_import_execute_mock,
+    ):
         response = self.client.post(self.url, self._get_payload())
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         resource_import_execute_mock.assert_called()
-        instance = marketplace_models.Resource.objects.get()
-        self.assertEqual(instance.backend_id, "1")
+        resource = marketplace_models.Resource.objects.get()
+        self.assertEqual(resource.backend_id, "1")
+        update_external_addresses_of_resource_mock.assert_called_once_with(resource)
 
     def test_existing_instance_cannot_be_imported(self):
         InstanceFactory(
@@ -376,4 +408,7 @@ class TenantImportTest(BaseBackendTestCase):
         }
         url = OfferingFactory.get_url(self.offering, "import_resource")
         self.mocked_keystone.projects.get.return_value = MOCK_TENANT
+        self.mocked_nova.quotas.get.return_value = MOCK_LIMITS
+        self.mocked_cinder.quotas.get.return_value = MOCK_LIMITS
+
         return self.client.post(url, payload)

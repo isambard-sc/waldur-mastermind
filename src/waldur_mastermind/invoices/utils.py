@@ -2,14 +2,13 @@ import base64
 import datetime
 import logging
 import re
-from calendar import monthrange
 from decimal import ROUND_UP, Decimal
 from uuid import UUID
 
 from constance import config
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db.models import F, Sum
+from django.db.models import F, QuerySet, Sum
 from django.db.models.expressions import Case, When
 from django.db.models.functions.comparison import Coalesce
 from django.db.models.functions.datetime import Extract
@@ -19,7 +18,6 @@ from django.utils.translation import gettext_lazy as _
 
 from waldur_core.core import utils as core_utils
 from waldur_core.structure.models import Customer
-from waldur_mastermind.common.mixins import UnitPriceMixin
 
 from . import models
 
@@ -49,12 +47,6 @@ def get_full_days(start, end):
         full_days += 1
 
     return int(full_days)
-
-
-def get_current_month_days():
-    now = timezone.now()
-    range = monthrange(now.year, now.month)
-    return range[1]
 
 
 def get_full_hours(start, end):
@@ -99,10 +91,50 @@ def get_previous_month():
     return datetime.date(year, month, 1)
 
 
-def filter_invoice_items(items):
-    return [
+def filter_invoice_items(
+    items: QuerySet,
+    query: str | None = None,
+    provider_uuid: str | UUID | None = None,
+    project_uuid: str | UUID | None = None,
+    offering_uuid: str | UUID | None = None,
+    conceal_compensation_items: bool = False,
+) -> list:
+    """
+    Filter invoice items based on various criteria.
+
+    Args:
+        items: QuerySet or list of invoice items
+        query: search filter
+        provider_uuid: Filter by provider UUID
+        project_uuid: Filter by project UUID
+        offering_uuid: Filter by offering UUID
+        conceal_compensation_items: If True, filter out credit compensation items
+
+    Returns:
+        Filtered list of invoice items
+    """
+
+    if query:
+        # Currently frontend query filter is to filter by resource name
+        items = items.filter(resource__name__icontains=query)
+
+    if provider_uuid:
+        items = items.filter(details__service_provider_uuid=provider_uuid)
+
+    if project_uuid:
+        items = items.filter(project_uuid=project_uuid)
+
+    if offering_uuid:
+        items = items.filter(details__offering_uuid=offering_uuid)
+
+    if conceal_compensation_items:
+        items = items.filter(credit__isnull=True)
+
+    result = [
         item for item in items if item.total != 0
     ]  # skip empty, but leave in credit and debit
+
+    return result
 
 
 def create_invoice_html(invoice):
@@ -122,19 +154,6 @@ def create_invoice_html(invoice):
         items=all_items,
     )
     return render_to_string("invoices/invoice.html", context)
-
-
-def get_price_per_day(price, unit):
-    if unit == UnitPriceMixin.Units.PER_DAY:
-        return price
-    elif unit == UnitPriceMixin.Units.PER_MONTH:
-        return price / Decimal(30)
-    elif unit == UnitPriceMixin.Units.PER_HALF_MONTH:
-        return price / Decimal(15)
-    elif unit == UnitPriceMixin.Units.PER_HOUR:
-        return price * 24
-    else:
-        return price
 
 
 def get_end_date_for_profile(profile):

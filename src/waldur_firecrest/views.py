@@ -6,10 +6,10 @@ from waldur_core.structure.views import ResourceViewSet
 from . import models, serializers, tasks
 
 
-class JobViewSet(ResourceViewSet):
+class FirecrestJobViewSet(ResourceViewSet):
     queryset = models.Job.objects.all()
-    serializer_class = serializers.JobSerializer
+    serializer_class = serializers.FirecrestJobSerializer
 
     def perform_create(self, serializer):
-        job = serializer.save()
+        job: models.Job = serializer.save()
         transaction.on_commit(lambda: tasks.submit_job.delay(serialize_instance(job)))

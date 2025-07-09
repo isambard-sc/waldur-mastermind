@@ -21,10 +21,10 @@ class EventSerializer(RestrictedSerializerMixin, serializers.ModelSerializer):
 
 
 class BaseHookSerializer(serializers.HyperlinkedModelSerializer):
-    author_uuid = serializers.ReadOnlyField(source="user.uuid")
-    author_fullname = serializers.ReadOnlyField(source="user.full_name")
-    author_username = serializers.ReadOnlyField(source="user.username")
-    author_email = serializers.ReadOnlyField(source="user.email")
+    author_uuid = serializers.UUIDField(read_only=True, source="user.uuid")
+    author_fullname = serializers.CharField(read_only=True, source="user.full_name")
+    author_username = serializers.CharField(read_only=True, source="user.username")
+    author_email = serializers.CharField(read_only=True, source="user.email")
     hook_type = serializers.SerializerMethodField()
 
     class Meta:
@@ -91,7 +91,7 @@ class BaseHookSerializer(serializers.HyperlinkedModelSerializer):
 
         return attrs
 
-    def get_hook_type(self, hook):
+    def get_hook_type(self, hook) -> str:
         raise NotImplementedError
 
 
@@ -116,7 +116,7 @@ class WebHookSerializer(BaseHookSerializer):
         model = models.WebHook
         fields = BaseHookSerializer.Meta.fields + ("destination_url", "content_type")
 
-    def get_hook_type(self, hook):
+    def get_hook_type(self, hook) -> str:
         return "webhook"
 
 
@@ -125,13 +125,13 @@ class EmailHookSerializer(BaseHookSerializer):
         model = models.EmailHook
         fields = BaseHookSerializer.Meta.fields + ("email",)
 
-    def get_hook_type(self, hook):
+    def get_hook_type(self, hook) -> str:
         return "email"
 
 
 class EventSubscriptionSerializer(serializers.HyperlinkedModelSerializer):
     observable_objects = serializers.JSONField(default=list)
-    user_uuid = serializers.ReadOnlyField(source="user.uuid")
+    user_uuid = serializers.UUIDField(read_only=True, source="user.uuid")
     user_username = serializers.ReadOnlyField(source="user.username")
     user_full_name = serializers.ReadOnlyField(source="user.full_name")
 
@@ -223,3 +223,65 @@ class EventSubscriptionSerializer(serializers.HyperlinkedModelSerializer):
             raise serializers.ValidationError("Failed to assign RabbitMQ permissions")
 
         return super().create(validated_data)
+
+
+class EventStatsSerializer(serializers.Serializer):
+    year = serializers.IntegerField(read_only=True)
+    month = serializers.IntegerField(read_only=True)
+    count = serializers.IntegerField(read_only=True)
+
+
+class RmqConnectionSerializer(serializers.Serializer):
+    source_ip = serializers.IPAddressField(read_only=True)
+    vhost = serializers.CharField(read_only=True)
+
+
+class RmqUserStatsItemSerializer(serializers.Serializer):
+    username = serializers.CharField(read_only=True)
+    connections = RmqConnectionSerializer(many=True, read_only=True)
+
+
+class RmqUserStatsSerializer(serializers.ListSerializer):
+    child = RmqUserStatsItemSerializer()
+
+
+class RmqWaldurUserSerializer(serializers.Serializer):
+    full_name = serializers.CharField(read_only=True)
+    username = serializers.CharField(read_only=True)
+    email = serializers.EmailField(read_only=True)
+
+
+class RmqSubscriptionSerializer(serializers.Serializer):
+    created = serializers.DateTimeField(read_only=True)
+    uuid = serializers.UUIDField(read_only=True)
+    source_ip = serializers.IPAddressField(read_only=True)
+
+
+class RmqVHostStatsItemSerializer(serializers.Serializer):
+    name = serializers.CharField(read_only=True)
+    waldur_user = RmqWaldurUserSerializer(read_only=True)
+    subscriptions = RmqSubscriptionSerializer(many=True, read_only=True)
+
+
+class RmqVHostStatsSerializer(serializers.ListSerializer):
+    child = RmqVHostStatsItemSerializer()
+
+
+class EmailLogSerializer(serializers.HyperlinkedModelSerializer):
+    class Meta:
+        model = models.EmailLog
+        fields = (
+            "uuid",
+            "url",
+            "sent_at",
+            "subject",
+            "body",
+            "emails",
+        )
+
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "email-log-detail",
+            },
+        }

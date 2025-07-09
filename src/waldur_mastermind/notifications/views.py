@@ -1,4 +1,5 @@
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import extend_schema
 from rest_framework import decorators, permissions, status
 from rest_framework.response import Response
 
@@ -23,12 +24,14 @@ class BroadcastMessageViewSet(ActionsViewSet):
     ]
     lookup_field = "uuid"
 
+    @extend_schema(request=None, responses=None)
     @decorators.action(detail=True, methods=["post"])
     def send(self, request, *args, **kwargs):
-        broadcast_message = self.get_object()
+        broadcast_message: models.BroadcastMessage = self.get_object()
         tasks.send_broadcast_message_email.delay(broadcast_message.uuid)
         return Response(status=status.HTTP_202_ACCEPTED)
 
+    @extend_schema(request=serializers.QuerySerializer)
     @decorators.action(detail=False)
     def recipients(self, request, *args, **kwargs):
         serializer = serializers.QuerySerializer(

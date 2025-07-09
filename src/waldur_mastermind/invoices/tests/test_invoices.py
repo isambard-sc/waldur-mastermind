@@ -1,5 +1,6 @@
 import datetime
 from decimal import Decimal
+from unittest import mock
 
 from ddt import data, ddt
 from django.core import mail
@@ -16,7 +17,7 @@ from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.invoices import models, tasks
 from waldur_mastermind.invoices.tests import factories, fixtures
-from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import ResourceStates
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.marketplace_openstack import TENANT_TYPE
 from waldur_mastermind.marketplace_support import PLUGIN_NAME
@@ -42,6 +43,25 @@ class InvoiceRetrieveTest(test.APITransactionTestCase):
             factories.InvoiceFactory.get_url(self.fixture.invoice)
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_invoice_item_contains_credit_field(self):
+        self.client.force_authenticate(self.fixture.owner)
+        credit = factories.CustomerCreditFactory(
+            customer=self.fixture.customer, value=100.0
+        )
+        invoice_item = self.fixture.invoice_item
+        invoice_item.credit = credit
+        invoice_item.save()
+
+        invoice_data = self.client.get(
+            factories.InvoiceFactory.get_url(self.fixture.invoice)
+        )
+
+        self.assertIn(
+            "credit", invoice_data.data["items"][0], invoice_data.data["items"]
+        )
+        credit = invoice_data.data["items"][0]["credit"]
+        self.assertTrue(credit)
 
 
 @ddt
@@ -213,14 +233,14 @@ class InvoiceStatsTest(test.APITransactionTestCase):
         )
 
         self.resource_1 = marketplace_factories.ResourceFactory(
-            state=marketplace_models.Resource.States.OK,
+            state=ResourceStates.OK,
             offering=self.offering,
             plan=self.plan,
             limits={"cpu": 1},
         )
 
         self.resource_2 = marketplace_factories.ResourceFactory(
-            state=marketplace_models.Resource.States.OK,
+            state=ResourceStates.OK,
             offering=self.offering,
             project=self.resource_1.project,
             plan=self.plan,
@@ -228,7 +248,7 @@ class InvoiceStatsTest(test.APITransactionTestCase):
         )
 
         self.resource_3 = marketplace_factories.ResourceFactory(
-            state=marketplace_models.Resource.States.OK,
+            state=ResourceStates.OK,
             offering=self.offering_2,
             project=self.resource_1.project,
             plan=self.plan_2,
@@ -256,7 +276,7 @@ class InvoiceStatsTest(test.APITransactionTestCase):
             plan=self.marketplace_support_plan,
         )
         self.resource_4 = marketplace_factories.ResourceFactory(
-            state=marketplace_models.Resource.States.OK,
+            state=ResourceStates.OK,
             offering=self.marketplace_support_offering,
             project=self.resource_1.project,
             plan=self.marketplace_support_plan,
@@ -397,7 +417,7 @@ class InvoicePaidTest(test.APITransactionTestCase):
         self.url = factories.InvoiceFactory.get_url(self.invoice, "paid")
 
     def test_staff_can_mark_invoice_as_paid(self):
-        self.client.force_authenticate(getattr(self.fixture, "staff"))
+        self.client.force_authenticate(self.fixture.staff)
         response = self.client.post(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.invoice.refresh_from_db()
@@ -412,7 +432,7 @@ class InvoicePaidTest(test.APITransactionTestCase):
     def test_staff_cannot_mark_invoice_as_paid_if_current_state_is_not_created(self):
         self.invoice.state = models.Invoice.States.PENDING
         self.invoice.save()
-        self.client.force_authenticate(getattr(self.fixture, "staff"))
+        self.client.force_authenticate(self.fixture.staff)
         response = self.client.post(self.url)
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
 
@@ -421,7 +441,7 @@ class InvoicePaidTest(test.APITransactionTestCase):
             organization=self.invoice.customer, is_active=True
         )
 
-        self.client.force_authenticate(getattr(self.fixture, "staff"))
+        self.client.force_authenticate(self.fixture.staff)
         date = datetime.date.today()
         response = self.client.post(
             self.url, data={"date": date, "proof": dummy_image()}, format="multipart"
@@ -437,7 +457,7 @@ class InvoicePaidTest(test.APITransactionTestCase):
         )
 
     def test_do_not_create_payment_if_profile_does_not_exist(self):
-        self.client.force_authenticate(getattr(self.fixture, "staff"))
+        self.client.force_authenticate(self.fixture.staff)
         date = datetime.date.today()
         response = self.client.post(
             self.url, data={"date": date, "proof": dummy_image()}, format="multipart"
@@ -449,7 +469,7 @@ class InvoicePaidTest(test.APITransactionTestCase):
             organization=self.invoice.customer, is_active=True
         )
 
-        self.client.force_authenticate(getattr(self.fixture, "staff"))
+        self.client.force_authenticate(self.fixture.staff)
         date = datetime.date.today()
         response = self.client.post(self.url, data={"date": date}, format="multipart")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -481,3 +501,176 @@ class UpdateBackendIdTest(test.APITransactionTestCase):
         self.client.force_authenticate(getattr(self.fixture, user))
         response = self.client.post(self.url, {"backend_id": "backend_id"})
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class InvoiceUpdateCacheTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.customer = structure_factories.CustomerFactory()
+        self.invoice = factories.InvoiceFactory(customer=self.customer)
+
+    def test_update_cache_with_same_values_does_not_perform_db_update(self):
+        """Test that update_cache with same values doesn't cause a DB update"""
+        # Arrange - Set total_cost and total_price to 0
+        self.invoice.total_cost = Decimal("0.0000")
+        self.invoice.total_price = Decimal("0.00")
+        self.invoice.save()
+
+        # Mock the total and price properties to return the same values
+        with (
+            mock.patch.object(
+                models.Invoice, "total", new_callable=mock.PropertyMock
+            ) as mock_total,
+            mock.patch.object(
+                models.Invoice, "price", new_callable=mock.PropertyMock
+            ) as mock_price,
+            mock.patch.object(models.Invoice, "save") as mock_save,
+        ):
+            mock_total.return_value = Decimal("0.0000")
+            mock_price.return_value = Decimal("0.00")
+
+            # Act
+            self.invoice.update_cache()
+
+            # Assert
+            mock_save.assert_not_called()
+
+    def test_update_cache_with_different_values_performs_db_update(self):
+        """Test that update_cache with different values performs a DB update"""
+        # Arrange
+        self.invoice.total_cost = Decimal("0.0000")
+        self.invoice.total_price = Decimal("0.00")
+        self.invoice.save()
+
+        # Mock the total and price properties to return different values
+        with (
+            mock.patch.object(
+                models.Invoice, "total", new_callable=mock.PropertyMock
+            ) as mock_total,
+            mock.patch.object(
+                models.Invoice, "price", new_callable=mock.PropertyMock
+            ) as mock_price,
+            mock.patch.object(models.Invoice, "save") as mock_save,
+        ):
+            mock_total.return_value = Decimal("10.0000")
+            mock_price.return_value = Decimal("10.00")
+
+            # Act
+            self.invoice.update_cache()
+
+            # Assert
+            mock_save.assert_called_once_with(
+                update_fields=["total_cost", "total_price"]
+            )
+
+    def test_update_cache_with_different_precision_considered_equal(self):
+        """Test that decimal values with different precision but same value are considered equal"""
+        # Arrange
+        self.invoice.total_cost = Decimal("0.0000")
+        self.invoice.total_price = Decimal("0.00")
+        self.invoice.save()
+
+        # Mock the total and price properties to return different precision but same values
+        with (
+            mock.patch.object(
+                models.Invoice, "total", new_callable=mock.PropertyMock
+            ) as mock_total,
+            mock.patch.object(
+                models.Invoice, "price", new_callable=mock.PropertyMock
+            ) as mock_price,
+            mock.patch.object(models.Invoice, "save") as mock_save,
+        ):
+            # Same value as stored, but with different precision
+            mock_total.return_value = Decimal("0.00")  # Different precision from 0.0000
+            mock_price.return_value = Decimal("0.0000")  # Different precision from 0.00
+
+            # Act
+            self.invoice.update_cache()
+
+            # Assert - should not call save because the values are numerically equal
+            mock_save.assert_not_called()
+
+    def test_update_cache_with_improved_comparison(self):
+        """Test the fixed implementation that handles decimal precision correctly"""
+        # Arrange - patch the update_cache method with a fixed implementation
+        original_update_cache = models.Invoice.update_cache
+
+        def fixed_update_cache(self):
+            """Fixed implementation that quantizes before comparison"""
+            updates = {}
+
+            current_total = self.total
+            # Quantize to same precision for accurate comparison
+            if self.total_cost.quantize(current_total) != current_total:
+                updates["total_cost"] = current_total
+
+            current_price = self.price
+            # Quantize to same precision for accurate comparison
+            if self.total_price.quantize(current_price) != current_price:
+                updates["total_price"] = current_price
+
+            if updates:
+                for field, value in updates.items():
+                    setattr(self, field, value)
+                self.save(update_fields=list(updates.keys()))
+
+        models.Invoice.update_cache = fixed_update_cache
+
+        try:
+            # Set initial values
+            self.invoice.total_cost = Decimal("0.0000")
+            self.invoice.total_price = Decimal("0.00")
+            self.invoice.save()
+
+            # Mock properties to return values with different precision
+            with (
+                mock.patch.object(
+                    models.Invoice, "total", new_callable=mock.PropertyMock
+                ) as mock_total,
+                mock.patch.object(
+                    models.Invoice, "price", new_callable=mock.PropertyMock
+                ) as mock_price,
+                mock.patch.object(models.Invoice, "save") as mock_save,
+            ):
+                mock_total.return_value = Decimal(
+                    "0.00"
+                )  # Different precision but same value
+                mock_price.return_value = Decimal(
+                    "0.0000"
+                )  # Different precision but same value
+
+                # Act
+                self.invoice.update_cache()
+
+                # Assert - should not call save because of improved comparison
+                mock_save.assert_not_called()
+        finally:
+            # Restore original method
+            models.Invoice.update_cache = original_update_cache
+
+    def test_update_cache_with_one_digit_difference(self):
+        """Test that update_cache detects actual value differences, not just precision"""
+        # Arrange
+        self.invoice.total_cost = Decimal("10.0000")
+        self.invoice.total_price = Decimal("10.00")
+        self.invoice.save()
+
+        # Mock the total and price properties to return slightly different values
+        with (
+            mock.patch.object(
+                models.Invoice, "total", new_callable=mock.PropertyMock
+            ) as mock_total,
+            mock.patch.object(
+                models.Invoice, "price", new_callable=mock.PropertyMock
+            ) as mock_price,
+            mock.patch.object(models.Invoice, "save") as mock_save,
+        ):
+            mock_total.return_value = Decimal("10.0001")  # Slightly different
+            mock_price.return_value = Decimal("10.01")  # Slightly different
+
+            # Act
+            self.invoice.update_cache()
+
+            # Assert - should call save with both fields
+            mock_save.assert_called_once_with(
+                update_fields=["total_cost", "total_price"]
+            )

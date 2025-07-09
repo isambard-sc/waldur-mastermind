@@ -1,13 +1,10 @@
 from urllib.parse import urlparse
 
 import requests
-from django.contrib.auth import get_user_model
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
 from . import models
-
-User = get_user_model()
 
 
 class AuthSerializer(serializers.Serializer):
@@ -58,7 +55,7 @@ class IdentityProviderSerializer(serializers.ModelSerializer):
         fields = super().get_fields()
 
         try:
-            request = self.context["view"].request
+            request = self.context["request"]
             user = request.user
         except (KeyError, AttributeError):
             return fields
@@ -74,20 +71,20 @@ class IdentityProviderSerializer(serializers.ModelSerializer):
     def discover_urls(self, discovery_url, verify_ssl=True):
         try:
             response = requests.get(discovery_url, verify=verify_ssl)
+            response.raise_for_status()
         except requests.exceptions.RequestException:
             raise ValidationError("Unable to discover endpoints.")
 
         try:
             endpoints = response.json()
-        except (ValueError, TypeError):
+            return {
+                "userinfo_url": endpoints["userinfo_endpoint"],
+                "token_url": endpoints["token_endpoint"],
+                "auth_url": endpoints["authorization_endpoint"],
+                "logout_url": endpoints.get("end_session_endpoint") or "",
+            }
+        except (requests.JSONDecodeError, KeyError, TypeError):
             raise ValidationError("Unable to parse JSON in discovery response.")
-
-        return {
-            "userinfo_url": endpoints["userinfo_endpoint"],
-            "token_url": endpoints["token_endpoint"],
-            "auth_url": endpoints["authorization_endpoint"],
-            "logout_url": endpoints.get("end_session_endpoint") or "",
-        }
 
     def update(self, instance, validated_data):
         verify_ssl = validated_data.get("verify_ssl", True)
@@ -114,3 +111,7 @@ class IdentityProviderSerializer(serializers.ModelSerializer):
             validated_data["discovery_url"], verify_ssl
         )
         return super().create(validated_data)
+
+
+class RemoteEduteamsUUIDSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField()

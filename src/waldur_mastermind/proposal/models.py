@@ -1,5 +1,6 @@
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
+from typing import Literal
 
 from django.conf import settings
 from django.core.validators import MinValueValidator
@@ -13,11 +14,17 @@ from model_utils.models import TimeStampedModel
 import waldur_core.media.mixins
 from waldur_core.core import models as core_models
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
+from waldur_core.permissions.mixins import PermissionMixin
 from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.models import SafeAttributesMixin
+from waldur_mastermind.proposal.enums import (
+    CallStates,
+    ProposalStates,
+    RequestedOfferingStates,
+)
 
 from . import managers
 
@@ -29,7 +36,9 @@ class CallDocument(
     core_models.UuidMixin,
     core_models.DescribableMixin,
 ):
-    call = models.ForeignKey("Call", on_delete=models.CASCADE)
+    call_documents: models.Manager["Call"]
+
+    call = models.ForeignKey["Call"]("Call", on_delete=models.CASCADE)
     file = models.FileField(
         upload_to="call_documents",
         blank=True,
@@ -39,6 +48,7 @@ class CallDocument(
 
 
 class CallManagingOrganisation(
+    PermissionMixin,
     core_models.UuidMixin,
     core_models.DescribableMixin,
     waldur_core.media.mixins.ImageModelMixin,
@@ -64,6 +74,14 @@ class CallManagingOrganisation(
         return "call-managing-organisation"
 
 
+def filter_calls(user):
+    return Q(
+        manager__customer__callmanagingorganisation__in=managers.get_connected_call_organizers(
+            user
+        )
+    )
+
+
 class Call(
     TimeStampedModel,
     core_models.UuidMixin,
@@ -71,17 +89,11 @@ class Call(
     core_models.DescribableMixin,
     structure_models.StructureLoggableMixin,
     core_models.BackendMixin,
+    core_models.SlugMixin,
+    PermissionMixin,
 ):
-    class States:
-        DRAFT = "draft"
-        ACTIVE = "active"
-        ARCHIVED = "archived"
-
-        CHOICES = (
-            (DRAFT, "Draft"),
-            (ACTIVE, "Active"),
-            (ARCHIVED, "Archived"),
-        )
+    class States(CallStates):
+        pass
 
     manager = models.ForeignKey(CallManagingOrganisation, on_delete=models.PROTECT)
     created_by = models.ForeignKey(
@@ -100,10 +112,30 @@ class Call(
     # It is used for mapping PROPOSAL.MEMBER role to one of project roles
     default_project_role = models.ForeignKey(Role, on_delete=models.SET_NULL, null=True)
     external_url = models.URLField(blank=True, null=True)
+
+    reviewer_identity_visible_to_submitters = models.BooleanField(
+        default=False,
+        help_text="Whether proposal submitters can see reviewer identities. "
+        "If False, reviewers appear as 'Reviewer 1', 'Reviewer 2', etc.",
+    )
+    reviews_visible_to_submitters = models.BooleanField(
+        default=True,
+        help_text="Whether proposal submitters can see review comments and scores. "
+        "If False, submitters only see final approval/rejection status.",
+    )
+
+    # Fixed duration that applies to all proposals in this call
+    fixed_duration_in_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Fixed duration in days that applies to all proposals in this call",
+    )
     objects = managers.CallManager()
 
     class Permissions:
         customer_path = "manager__customer"
+        list_permission = PermissionEnum.LIST_CALLS
+        build_query = filter_calls
 
     def __str__(self):
         return f"{self.name} | {self.manager.customer}"
@@ -119,19 +151,11 @@ class RequestedOffering(
     TimeStampedModel,
     core_models.DescribableMixin,
 ):
-    class States:
-        REQUESTED = "requested"
-        ACCEPTED = "accepted"
-        CANCELED = "canceled"
-
-        CHOICES = (
-            (REQUESTED, "Requested"),
-            (ACCEPTED, "Accepted"),
-            (CANCELED, "Canceled"),
-        )
-
     class Permissions:
         customer_path = "offering__customer"
+
+    class States(RequestedOfferingStates):
+        pass
 
     approved_by = models.ForeignKey(
         core_models.User,
@@ -150,8 +174,58 @@ class RequestedOffering(
         default=States.REQUESTED, choices=States.CHOICES, db_index=True
     )
     call = models.ForeignKey(Call, on_delete=models.CASCADE)
+    offering = models.ForeignKey(marketplace_models.Offering, on_delete=models.CASCADE)
     plan = models.ForeignKey(
         on_delete=models.CASCADE, to=marketplace_models.Plan, null=True, blank=True
+    )
+
+
+class CallResourceTemplate(
+    core_models.UuidMixin,
+    TimeStampedModel,
+    core_models.DescribableMixin,
+):
+    """Predefined resource templates that proposal creators must use"""
+
+    class Permissions:
+        customer_path = "call__manager__customer"
+
+    call = models.ForeignKey(
+        Call, on_delete=models.CASCADE, related_name="resource_templates"
+    )
+    requested_offering = models.ForeignKey(RequestedOffering, on_delete=models.CASCADE)
+    name = models.CharField(max_length=255)
+    attributes = models.JSONField(blank=True, default=dict)
+    limits = models.JSONField(blank=True, default=dict)
+    is_required = models.BooleanField(
+        default=False,
+        help_text="If True, every proposal must include this resource type",
+    )
+    created_by = models.ForeignKey(
+        core_models.User,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="+",
+    )
+
+    class Meta:
+        unique_together = ("call", "name")
+        verbose_name = _("Call resource template")
+        verbose_name_plural = _("Call resource templates")
+
+    def __str__(self):
+        return f"{self.call.name} - {self.name}"
+
+    @classmethod
+    def get_url_name(cls):
+        return "proposal-call-resource-template"
+
+
+def filter_rounds(user):
+    return Q(
+        call__manager__customer__callmanagingorganisation__in=managers.get_connected_call_organizers(
+            user
+        )
     )
 
 
@@ -193,8 +267,8 @@ class Round(
 
         CHOICES = (
             (SCHEDULED, "Round is scheduled"),
-            (OPEN, "Round is open."),
-            (ENDED, "Round is ended."),
+            (OPEN, "Round is open"),
+            (ENDED, "Round is ended"),
         )
 
     review_strategy = models.CharField(
@@ -228,16 +302,18 @@ class Round(
 
     class Permissions:
         customer_path = "call__manager__customer"
+        list_permission = PermissionEnum.LIST_ROUNDS
+        build_query = filter_rounds
 
     def __str__(self):
         return f"{self.call.name} | {self.start_time} - {self.cutoff_time}"
 
     @property
-    def name(self):
+    def name(self) -> str:
         return f"Round {self.start_time.strftime('%d.%m.%Y')}-{self.cutoff_time.strftime('%d.%m.%Y')}"
 
     @property
-    def status(self):
+    def status(self) -> Literal["scheduled", "open", "ended"]:
         now = timezone.now()
 
         if self.start_time > now:
@@ -252,7 +328,7 @@ class ProposalDocumentation(
     TimeStampedModel,
     core_models.UuidMixin,
 ):
-    proposal = models.ForeignKey("Proposal", on_delete=models.CASCADE)
+    proposal = models.ForeignKey["Proposal"]("Proposal", on_delete=models.CASCADE)
     file = models.FileField(
         upload_to="proposal_project_supporting_documentation",
         blank=True,
@@ -262,45 +338,35 @@ class ProposalDocumentation(
 
 
 def filter_proposals(user):
-    return Q(created_by=user)
+    return (
+        Q(created_by=user)
+        | Q(
+            round__call__manager__customer__callmanagingorganisation__in=managers.get_connected_call_organizers(
+                user
+            )
+        )
+        | Q(round__call__in=managers.get_connected_calls(user))
+    )
 
 
 class Proposal(
     TimeStampedModel,
-    structure_models.PermissionMixin,
+    PermissionMixin,
     core_models.UuidMixin,
     core_models.NameMixin,
     core_models.DescribableMixin,
     structure_models.StructureLoggableMixin,
     structure_models.ProjectOECDFOS2007CodeMixin,
 ):
-    class States:
-        DRAFT = "draft"
-        TEAM_VERIFICATION = "team_verification"
-        SUBMITTED = "submitted"
-        IN_REVIEW = "in_review"
-        IN_REVISION = "in_revision"
-        ACCEPTED = "accepted"
-        REJECTED = "rejected"
-        CANCELED = "canceled"
-
-        CHOICES = (
-            (DRAFT, "Draft"),
-            (TEAM_VERIFICATION, "Team verification"),
-            (SUBMITTED, "Submitted"),
-            (IN_REVIEW, "In review"),
-            (IN_REVISION, "In revision"),
-            (ACCEPTED, "Accepted"),
-            (REJECTED, "Rejected"),
-            (CANCELED, "Canceled"),
-        )
+    class States(ProposalStates):
+        pass
 
     round = models.ForeignKey(Round, on_delete=models.CASCADE)
     state = models.CharField(
         default=States.DRAFT, choices=States.CHOICES, db_index=True
     )
     project = models.ForeignKey(
-        structure_models.Project, on_delete=models.PROTECT, editable=False
+        structure_models.Project, on_delete=models.PROTECT, editable=False, null=True
     )
     duration_in_days = models.PositiveIntegerField(
         null=True,
@@ -358,6 +424,14 @@ class RequestedResource(
         RequestedOffering,
         related_name="+",
         on_delete=models.PROTECT,
+    )
+    # Optional reference to call resource template
+    call_resource_template = models.ForeignKey(
+        "CallResourceTemplate",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text="Resource template this request is based on",
     )
     attributes = models.JSONField(blank=True, default=dict)
     limits = models.JSONField(blank=True, default=dict)
@@ -421,7 +495,7 @@ class Review(
     comment_resource_requests = models.CharField(max_length=255, null=True, blank=True)
     comment_team = models.CharField(max_length=255, null=True, blank=True)
 
-    reviewer = models.ForeignKey(
+    reviewer = models.ForeignKey[core_models.User](
         to=settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+"
     )
 
@@ -432,7 +506,7 @@ class Review(
         return "proposal-review"
 
     @property
-    def review_end_date(self):
+    def review_end_date(self) -> datetime:
         if not self.proposal.round.review_duration_in_days:
             return
 

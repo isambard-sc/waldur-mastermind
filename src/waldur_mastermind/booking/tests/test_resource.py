@@ -5,8 +5,9 @@ from rest_framework import status, test
 from rest_framework.reverse import reverse
 
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
-from waldur_core.permissions.fixtures import CustomerRole
+from waldur_core.permissions.fixtures import CustomerRole, ServiceProviderRole
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 from .. import PLUGIN_NAME
@@ -28,7 +29,7 @@ class MarketplaceFixture(fixtures.BookingFixture):
     def resource(self) -> marketplace_models.Resource:
         return marketplace_factories.ResourceFactory(
             offering=self.offering,
-            state=marketplace_models.Resource.States.CREATING,
+            state=ResourceStates.CREATING,
             project=self.project,
             plan=self.plan,
         )
@@ -38,7 +39,7 @@ class MarketplaceFixture(fixtures.BookingFixture):
         return marketplace_factories.OrderFactory(
             resource=self.resource,
             offering=self.offering,
-            state=marketplace_models.Order.States.EXECUTING,
+            state=OrderStates.EXECUTING,
         )
 
 
@@ -91,7 +92,9 @@ class OrderAcceptTest(test.APITransactionTestCase):
         self.fixture.order
 
         CustomerRole.OWNER.add_permission(PermissionEnum.ACCEPT_BOOKING_REQUEST)
-        CustomerRole.MANAGER.add_permission(PermissionEnum.ACCEPT_BOOKING_REQUEST)
+        ServiceProviderRole.MANAGER.add_permission(
+            PermissionEnum.ACCEPT_BOOKING_REQUEST
+        )
 
     def accept(self, resource, user=None):
         user = user or self.fixture.owner
@@ -108,12 +111,10 @@ class OrderAcceptTest(test.APITransactionTestCase):
         self.assertEqual(status.HTTP_200_OK, response.status_code, response.data)
 
         self.fixture.resource.refresh_from_db()
-        self.assertEqual(
-            self.fixture.resource.state, marketplace_models.Resource.States.OK
-        )
+        self.assertEqual(self.fixture.resource.state, ResourceStates.OK)
 
         self.fixture.order.refresh_from_db()
-        self.assertEqual(self.fixture.order.state, marketplace_models.Order.States.DONE)
+        self.assertEqual(self.fixture.order.state, OrderStates.DONE)
 
     def test_owner_cannot_accept_other_owners_resources(self):
         response = self.accept(MarketplaceFixture().resource)
@@ -154,14 +155,12 @@ class OrderRejectTest(test.APITransactionTestCase):
         self.assertEqual(status.HTTP_200_OK, response.status_code)
 
         self.fixture.resource.refresh_from_db()
-        self.assertEqual(
-            self.fixture.resource.state, marketplace_models.Resource.States.TERMINATED
-        )
+        self.assertEqual(self.fixture.resource.state, ResourceStates.TERMINATED)
 
         self.fixture.order.refresh_from_db()
         self.assertEqual(
             self.fixture.order.state,
-            marketplace_models.Order.States.CANCELED,
+            OrderStates.CANCELED,
         )
 
     def test_owner_cannot_reject_other_owners_resources(self):
@@ -173,14 +172,12 @@ class OrderRejectTest(test.APITransactionTestCase):
         self.assertEqual(status.HTTP_200_OK, response.status_code)
 
         self.fixture.resource.refresh_from_db()
-        self.assertEqual(
-            self.fixture.resource.state, marketplace_models.Resource.States.TERMINATED
-        )
+        self.assertEqual(self.fixture.resource.state, ResourceStates.TERMINATED)
 
         self.fixture.order.refresh_from_db()
         self.assertEqual(
             self.fixture.order.state,
-            marketplace_models.Order.States.CANCELED,
+            OrderStates.CANCELED,
         )
 
 
@@ -275,7 +272,8 @@ class ResourceGetTest(test.APITransactionTestCase):
         self.assertEqual(1, len(response.data))
         self.assertEqual(self.resource_1.uuid.hex, response.data[0]["uuid"])
         self.assertEqual(
-            self.resource_1.offering.customer.uuid, response.data[0]["provider_uuid"]
+            self.resource_1.offering.customer.uuid.hex,
+            response.data[0]["provider_uuid"],
         )
 
         response = self.client.get(
@@ -285,5 +283,5 @@ class ResourceGetTest(test.APITransactionTestCase):
         self.assertEqual(1, len(response.data))
         self.assertEqual(self.resource_3.uuid.hex, response.data[0]["uuid"])
         self.assertEqual(
-            self.resource_3.project.customer.uuid, response.data[0]["customer_uuid"]
+            self.resource_3.project.customer.uuid.hex, response.data[0]["customer_uuid"]
         )

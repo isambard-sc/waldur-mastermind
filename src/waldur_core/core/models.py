@@ -1,10 +1,8 @@
 import logging
 import re
-from datetime import datetime
 from functools import lru_cache
-from zoneinfo import ZoneInfo
+from uuid import UUID
 
-from croniter.croniter import croniter
 from django.apps import apps
 from django.conf import settings
 from django.contrib.auth.models import PermissionsMixin, UserManager
@@ -15,15 +13,16 @@ from django.utils import timezone as django_timezone
 from django.utils.translation import gettext_lazy as _
 from django_fsm import ConcurrentTransitionMixin, FSMIntegerField, transition
 from model_utils import FieldTracker
+from model_utils.fields import AutoLastModifiedField
 from model_utils.models import TimeStampedModel
+from rest_framework.authtoken.models import Token
 from reversion import revisions as reversion
 
 from waldur_core.core import managers as core_managers
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.fields import JSONField, UUIDField
 from waldur_core.core.utils import normalize_unicode, send_mail
 from waldur_core.core.validators import (
-    MinCronValueValidator,
-    validate_cron_schedule,
     validate_name,
     validate_phone_number,
     validate_ssh_public_key,
@@ -129,7 +128,7 @@ class UuidMixin(models.Model):
     class Meta:
         abstract = True
 
-    uuid = UUIDField()
+    uuid: UUID = UUIDField()
 
 
 class ErrorMessageMixin(models.Model):
@@ -149,51 +148,6 @@ class LastSyncMixin(models.Model):
         abstract = True
 
     last_sync = models.DateTimeField(default=django_timezone.now, editable=False)
-
-
-class ScheduleMixin(models.Model):
-    """
-    Mixin to add a standardized "schedule" fields.
-    """
-
-    class Meta:
-        abstract = True
-
-    schedule = models.CharField(
-        max_length=15, validators=[validate_cron_schedule, MinCronValueValidator(1)]
-    )
-    next_trigger_at = models.DateTimeField(null=True)
-    timezone = models.CharField(
-        max_length=50, default=django_timezone.get_current_timezone_name
-    )
-    is_active = models.BooleanField(default=False)
-
-    def update_next_trigger_at(self):
-        tz = ZoneInfo(self.timezone)
-        dt = datetime.now(tz)
-        self.next_trigger_at = croniter(self.schedule, dt).get_next(datetime)
-
-    def save(self, *args, **kwargs):
-        """
-        Updates next_trigger_at field if:
-         - instance become active
-         - instance.schedule changed
-         - instance is new
-        """
-        try:
-            prev_instance = self.__class__.objects.get(pk=self.pk)
-        except self.DoesNotExist:
-            prev_instance = None
-
-        if prev_instance is None or (
-            not prev_instance.is_active
-            and self.is_active
-            or self.schedule != prev_instance.schedule
-            or self.timezone != prev_instance.timezone
-        ):
-            self.update_next_trigger_at()
-
-        super().save(*args, **kwargs)
 
 
 class UserDetailsMixin(models.Model):
@@ -276,7 +230,7 @@ class User(
     is_staff = models.BooleanField(
         _("staff status"),
         default=False,
-        help_text=_("Designates whether the user can log into this admin " "site."),
+        help_text=_("Designates whether the user can log into this admin site."),
     )
     is_active = models.BooleanField(
         _("active"),
@@ -304,6 +258,7 @@ class User(
         ),
     )
     date_joined = models.DateTimeField(_("date joined"), default=django_timezone.now)
+    modified = AutoLastModifiedField(_("modified"))
     registration_method = models.CharField(
         _("registration method"),
         max_length=50,
@@ -381,19 +336,20 @@ class User(
     ]
 
     @property
-    def full_name(self):
-        return (f"{self.first_name} {self.last_name}").strip()
+    def full_name(self) -> str:
+        return f"{self.first_name} {self.last_name}".strip()
 
     @full_name.setter
-    def full_name(self, value):
+    def full_name(self, value: str):
         names = value.split()
         self.first_name = " ".join(names[:1])
         self.last_name = " ".join(names[1:])
         self.query_field = normalize_unicode(value)
 
     tracker = FieldTracker()
-    objects = core_managers.UserActiveManager()
+    objects: UserManager = core_managers.UserActiveManager()
     all_objects = UserManager()
+    auth_token: Token | None
 
     USERNAME_FIELD = "username"
     REQUIRED_FIELDS = ["email"]
@@ -405,7 +361,9 @@ class User(
 
     def save(self, *args, **kwargs):
         if "update_fields" in kwargs and "query_field" not in kwargs["update_fields"]:
-            kwargs["update_fields"] = set(kwargs["update_fields"]).add("query_field")
+            update_fields = set(kwargs["update_fields"])
+            update_fields.add("query_field")
+            kwargs["update_fields"] = update_fields
         self.query_field = normalize_unicode(self.full_name)
 
         # The unix_username cannot be changed after creation as external systems may already depend on it.
@@ -535,25 +493,25 @@ def get_ssh_key_fingerprints(ssh_key):
     # sha256
     sha256_digest = hashlib.sha256(key_body).digest()
     sha256_b64 = base64.b64encode(sha256_digest).rstrip(b"=")
-    sha256_fp = f'SHA256:{sha256_b64.decode("utf-8")}'
+    sha256_fp = f"SHA256:{sha256_b64.decode('utf-8')}"
 
     # sha512
     sha512_digest = hashlib.sha512(key_body).digest()
     sha512_b64 = base64.b64encode(sha512_digest).rstrip(b"=")
-    sha512_fp = f'SHA512:{sha512_b64.decode("utf-8")}'
+    sha512_fp = f"SHA512:{sha512_b64.decode('utf-8')}"
 
     return md5_fp, sha256_fp, sha512_fp
 
 
 @reversion.register()
-class SshPublicKey(LoggableMixin, UuidMixin, models.Model):
+class SshPublicKey(TimeStampedModel, LoggableMixin, UuidMixin, models.Model):
     """
     User public key.
 
     Used for injection into VMs for remote access.
     """
 
-    user = models.ForeignKey(
+    user = models.ForeignKey[User](
         on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL, db_index=True
     )
     # Model doesn't inherit NameMixin, because name field can be blank.
@@ -573,7 +531,7 @@ class SshPublicKey(LoggableMixin, UuidMixin, models.Model):
     is_shared = models.BooleanField(default=False)
 
     @property
-    def type(self):
+    def type(self) -> str:
         key_parts = self.public_key.split(" ", 1)
         return key_parts[0]
 
@@ -641,68 +599,57 @@ class RuntimeStateMixin(models.Model):
 
 
 class StateMixin(ErrorMessageMixin, ConcurrentTransitionMixin):
-    class States:
-        CREATION_SCHEDULED = 5
-        CREATING = 6
-        UPDATE_SCHEDULED = 1
-        UPDATING = 2
-        DELETION_SCHEDULED = 7
-        DELETING = 8
-        OK = 3
-        ERRED = 4
-
-        CHOICES = (
-            (CREATION_SCHEDULED, "Creation Scheduled"),
-            (CREATING, "Creating"),
-            (UPDATE_SCHEDULED, "Update Scheduled"),
-            (UPDATING, "Updating"),
-            (DELETION_SCHEDULED, "Deletion Scheduled"),
-            (DELETING, "Deleting"),
-            (OK, "OK"),
-            (ERRED, "Erred"),
-        )
-
     class Meta:
         abstract = True
 
     state = FSMIntegerField(
-        default=States.CREATION_SCHEDULED,
-        choices=States.CHOICES,
+        default=CoreStates.CREATION_SCHEDULED,
+        choices=CoreStates.CHOICES,
     )
 
-    @transition(field=state, source=States.CREATION_SCHEDULED, target=States.CREATING)
+    @transition(
+        field=state, source=CoreStates.CREATION_SCHEDULED, target=CoreStates.CREATING
+    )
     def begin_creating(self):
         pass
 
-    @transition(field=state, source=States.UPDATE_SCHEDULED, target=States.UPDATING)
+    @transition(
+        field=state, source=CoreStates.UPDATE_SCHEDULED, target=CoreStates.UPDATING
+    )
     def begin_updating(self):
         pass
 
-    @transition(field=state, source=States.DELETION_SCHEDULED, target=States.DELETING)
+    @transition(
+        field=state, source=CoreStates.DELETION_SCHEDULED, target=CoreStates.DELETING
+    )
     def begin_deleting(self):
         pass
 
     @transition(
-        field=state, source=[States.OK, States.ERRED], target=States.UPDATE_SCHEDULED
+        field=state,
+        source=[CoreStates.OK, CoreStates.ERRED],
+        target=CoreStates.UPDATE_SCHEDULED,
     )
     def schedule_updating(self):
         pass
 
     @transition(
-        field=state, source=[States.OK, States.ERRED], target=States.DELETION_SCHEDULED
+        field=state,
+        source=[CoreStates.OK, CoreStates.ERRED],
+        target=CoreStates.DELETION_SCHEDULED,
     )
     def schedule_deleting(self):
         pass
 
-    @transition(field=state, source="*", target=States.OK)
+    @transition(field=state, source="*", target=CoreStates.OK)
     def set_ok(self):
         pass
 
-    @transition(field=state, source="*", target=States.ERRED)
+    @transition(field=state, source="*", target=CoreStates.ERRED)
     def set_erred(self):
         pass
 
-    @transition(field=state, source=States.ERRED, target=States.OK)
+    @transition(field=state, source=CoreStates.ERRED, target=CoreStates.OK)
     def recover(self):
         pass
 

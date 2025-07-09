@@ -1,11 +1,12 @@
 import datetime
 
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
-from waldur_core.structure.models import CustomerRole
+from waldur_core.permissions.fixtures import CustomerRole, ServiceProviderRole
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_mastermind.promotions import models
@@ -83,7 +84,7 @@ class CampaignSerializer(
             and not user.is_support
             and not service_provider.customer.has_user(user, CustomerRole.OWNER)
             and not service_provider.customer.has_user(
-                user, CustomerRole.SERVICE_MANAGER
+                user, ServiceProviderRole.MANAGER
             )
         ):
             raise serializers.ValidationError(
@@ -212,6 +213,19 @@ class CampaignSerializer(
         return campaign
 
 
+class NestedCampaignSerializer(CampaignSerializer):
+    def get_fields(self):
+        fields = super().get_fields()
+        fields.pop("url")
+        fields.pop("offerings")
+        fields.pop("required_offerings")
+        fields.pop("coupon")
+        fields.pop("state")
+        fields.pop("auto_apply")
+        return fields
+
+
+@extend_schema_field(NestedCampaignSerializer(many=True))
 def get_promotion_campaigns(serializer, offering):
     campaigns = []
     today = datetime.date.today()
@@ -223,20 +237,10 @@ def get_promotion_campaigns(serializer, offering):
         state=models.Campaign.States.ACTIVE,
     ):
         try:
-
-            class KlassSerializer(CampaignSerializer):
-                def get_fields(self):
-                    fields = super().get_fields()
-                    fields.pop("url")
-                    fields.pop("offerings")
-                    fields.pop("required_offerings")
-                    fields.pop("coupon")
-                    fields.pop("state")
-                    fields.pop("auto_apply")
-                    return fields
-
             campaigns.append(
-                KlassSerializer(instance=campaign, context=serializer.context).data
+                NestedCampaignSerializer(
+                    instance=campaign, context=serializer.context
+                ).data
             )
         except IndexError:
             continue

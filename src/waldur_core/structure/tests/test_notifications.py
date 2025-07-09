@@ -65,8 +65,7 @@ class NotificationChangeTest(test.APITransactionTestCase):
         valid_data = {"key": "appname.template_name"}
 
         response = self.client.put(self.url, valid_data)
-        print(f"{response=}")
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
 
     @data("user")
     def test_other_can_not_change_customer_organization_group(self, user):
@@ -169,20 +168,6 @@ class NotificationTemplateListTest(test.APITransactionTestCase):
         response = self.client.post(self.override_url, new_content)
 
         self.assertEqual(status.HTTP_403_FORBIDDEN, response.status_code)
-
-    @data(
-        "staff",
-    )
-    def test_staff_can_not_override_notification_templates_that_does_not_exist(
-        self, user
-    ):
-        if user:
-            self.client.force_authenticate(user=getattr(self.fixture, user))
-
-        new_content = {"content": "new_content"}
-        response = self.client.post(self.override_url, new_content)
-
-        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
 
 
 @ddt

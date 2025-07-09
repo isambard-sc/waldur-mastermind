@@ -14,6 +14,7 @@ class MarketplaceConfig(AppConfig):
         from waldur_core.structure import models as structure_models
         from waldur_core.structure import signals as structure_signals
         from waldur_core.structure.serializers import BaseResourceSerializer
+        from waldur_freeipa import models as freeipa_models
 
         from . import PLUGIN_NAME, handlers, models, processors, utils
         from . import registrators as marketplace_registrators
@@ -51,6 +52,12 @@ class MarketplaceConfig(AppConfig):
         )
 
         signals.post_save.connect(
+            handlers.notify_user_about_rejected_order,
+            sender=models.Order,
+            dispatch_uid="waldur_mastermind.marketplace.notify_user_about_rejected_order",
+        )
+
+        signals.post_save.connect(
             handlers.log_resource_events,
             sender=models.Resource,
             dispatch_uid="waldur_mastermind.marketplace.log_resource_events",
@@ -66,6 +73,17 @@ class MarketplaceConfig(AppConfig):
             handlers.update_category_quota_when_offering_is_created,
             sender=models.Offering,
             dispatch_uid="waldur_mastermind.marketplace.update_category_quota_when_offering_is_created",
+        )
+        signals.pre_delete.connect(
+            handlers.close_service_accounts_on_project_deletion,
+            sender=structure_models.Project,
+            dispatch_uid="waldur_mastermind.marketplace.close_service_accounts_on_project_deletion",
+        )
+
+        signals.pre_delete.connect(
+            handlers.close_customer_service_accounts_on_customer_deletion,
+            sender=structure_models.Customer,
+            dispatch_uid="waldur_mastermind.marketplace.close_customer_service_accounts_on_customer_deletion",
         )
 
         signals.post_delete.connect(
@@ -197,16 +215,6 @@ class MarketplaceConfig(AppConfig):
 
         marketplace_registrators.MarketplaceRegistrator.connect()
 
-        permission_signals.role_granted.connect(
-            handlers.add_service_manager_role_to_customer,
-            dispatch_uid="waldur_mastermind.marketplace.add_service_manager_role_to_customer",
-        )
-
-        permission_signals.role_revoked.connect(
-            handlers.drop_service_manager_role_from_customer,
-            dispatch_uid="waldur_mastermind.marketplace.drop_service_manager_role_from_customer",
-        )
-
         structure_signals.project_moved.connect(
             handlers.update_customer_of_offering_if_project_has_been_moved,
             sender=structure_models.Project,
@@ -256,10 +264,22 @@ class MarketplaceConfig(AppConfig):
             dispatch_uid="waldur_core.marketplace.handlers.log_resource_robot_account_created_or_updated",
         )
 
+        signals.post_save.connect(
+            handlers.log_service_account_created_or_updated,
+            sender=models.ScopedServiceAccount,
+            dispatch_uid="waldur_core.marketplace.handlers.log_service_account_created_or_updated",
+        )
+
         signals.post_delete.connect(
             handlers.log_resource_robot_account_deleted,
             sender=models.RobotAccount,
             dispatch_uid="waldur_core.marketplace.handlers.log_resource_robot_account_deleted",
+        )
+
+        signals.post_delete.connect(
+            handlers.log_service_account_deleted,
+            sender=models.ScopedServiceAccount,
+            dispatch_uid="waldur_core.marketplace.handlers.log_service_account_deleted",
         )
 
         permission_signals.role_granted.connect(
@@ -277,6 +297,12 @@ class MarketplaceConfig(AppConfig):
             handlers.update_offering_user_username_after_offering_settings_change,
             sender=models.Offering,
             dispatch_uid="waldur_mastermind.marketplace.update_offering_user_username_after_offering_settings_change",
+        )
+
+        signals.post_save.connect(
+            handlers.update_offering_user_username_after_freeipa_profile_update,
+            sender=freeipa_models.Profile,
+            dispatch_uid="waldur_mastermind.marketplace.update_offering_user_username_after_freeipa_profile_update",
         )
 
         signals.post_save.connect(

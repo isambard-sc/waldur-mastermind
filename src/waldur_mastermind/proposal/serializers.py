@@ -1,10 +1,14 @@
 import logging
+from datetime import datetime
 
 from constance import config
 from django.db.models import Q
+from django.db.models.query import QuerySet
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.reverse import reverse
 
 from waldur_core.core import serializers as core_serializers
@@ -18,6 +22,12 @@ from waldur_mastermind.marketplace import permissions as marketplace_permissions
 from waldur_mastermind.marketplace.serializers import (
     BasePublicPlanSerializer,
     OfferingComponentSerializer,
+    OfferingOptionsField,
+)
+from waldur_mastermind.proposal.enums import (
+    CallStates,
+    ProposalStates,
+    RequestedOfferingStates,
 )
 
 from . import models
@@ -68,19 +78,16 @@ class CallManagingOrganisationSerializer(
 class NestedRequestedOfferingSerializer(serializers.HyperlinkedModelSerializer):
     state = serializers.ReadOnlyField()
     offering_name = serializers.ReadOnlyField(source="offering.name")
-    offering_uuid = serializers.ReadOnlyField(source="offering.uuid")
-    category_uuid = serializers.ReadOnlyField(source="offering.category.uuid")
+    offering_uuid = serializers.UUIDField(read_only=True, source="offering.uuid")
+    category_uuid = serializers.UUIDField(
+        read_only=True, source="offering.category.uuid"
+    )
     category_name = serializers.ReadOnlyField(source="offering.category.title")
     provider_name = serializers.ReadOnlyField(source="offering.customer.name")
     call_managing_organisation = serializers.ReadOnlyField(
         source="call.manager.customer.name"
     )
-    options = serializers.JSONField(
-        required=False,
-        default={"options": {}, "order": []},
-        read_only=True,
-        source="offering.options",
-    )
+    options = OfferingOptionsField(read_only=True, source="offering.options")
     plan_details = BasePublicPlanSerializer(read_only=True, source="plan")
     components = OfferingComponentSerializer(
         source="offering.components", many=True, read_only=True
@@ -115,7 +122,7 @@ class NestedRequestedOfferingSerializer(serializers.HyperlinkedModelSerializer):
             },
         }
 
-    def get_url(self, requested_offering):
+    def get_url(self, requested_offering) -> str:
         return self.context["request"].build_absolute_uri(
             reverse(
                 "proposal-call-offering-detail",
@@ -132,8 +139,12 @@ class NestedRequestedResourceSerializer(serializers.HyperlinkedModelSerializer):
     requested_offering = NestedRequestedOfferingSerializer(read_only=True)
     created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
     url = serializers.SerializerMethodField()
+    call_resource_template_name = serializers.ReadOnlyField(
+        source="call_resource_template.name"
+    )
+    call_resource_template = serializers.SerializerMethodField()
 
-    def get_url(self, requested_resource):
+    def get_url(self, requested_resource) -> str:
         return self.context["request"].build_absolute_uri(
             reverse(
                 "proposal-proposal-resource-detail",
@@ -144,6 +155,19 @@ class NestedRequestedResourceSerializer(serializers.HyperlinkedModelSerializer):
             )
         )
 
+    def get_call_resource_template(self, requested_resource) -> str:
+        if requested_resource.call_resource_template:
+            return self.context["request"].build_absolute_uri(
+                reverse(
+                    "proposal-call-resource_template-detail",
+                    kwargs={
+                        "uuid": requested_resource.call_resource_template.call.uuid.hex,
+                        "obj_uuid": requested_resource.call_resource_template.uuid.hex,
+                    },
+                )
+            )
+        return None
+
     class Meta:
         model = models.RequestedResource
         fields = [
@@ -152,6 +176,8 @@ class NestedRequestedResourceSerializer(serializers.HyperlinkedModelSerializer):
             "requested_offering",
             "resource",
             "resource_name",
+            "call_resource_template",
+            "call_resource_template_name",
             "attributes",
             "limits",
             "description",
@@ -170,7 +196,7 @@ class NestedRequestedResourceSerializer(serializers.HyperlinkedModelSerializer):
         }
 
 
-class ReviewSerializer(
+class ProposalReviewSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
@@ -182,8 +208,11 @@ class ReviewSerializer(
     call_uuid = serializers.UUIDField(source="proposal.round.call.uuid", read_only=True)
     call_name = serializers.ReadOnlyField(source="proposal.round.call.name")
     reviewer_full_name = serializers.ReadOnlyField(source="reviewer.full_name")
+    reviewer_uuid = serializers.UUIDField(read_only=True, source="reviewer.uuid")
+    anonymous_reviewer_name = serializers.SerializerMethodField()
 
     proposal_name = serializers.ReadOnlyField(source="proposal.name")
+    proposal_uuid = serializers.UUIDField(read_only=True, source="proposal.uuid")
 
     class Meta:
         model = models.Review
@@ -191,14 +220,17 @@ class ReviewSerializer(
             "url",
             "uuid",
             "proposal",
+            "proposal_name",
+            "proposal_uuid",
             "reviewer",
             "reviewer_full_name",
+            "reviewer_uuid",
+            "anonymous_reviewer_name",
             "state",
             "review_end_date",
             "summary_score",
             "summary_public_comment",
             "summary_private_comment",
-            "proposal_name",
             "round_uuid",
             "round_name",
             "round_cutoff_time",
@@ -242,6 +274,23 @@ class ReviewSerializer(
 
         return attrs
 
+    def get_anonymous_reviewer_name(self, obj) -> str | None:
+        """
+        Generate an anonymous reviewer identifier like 'Reviewer 1', 'Reviewer 2'.
+        Returns None if the review is not associated with a proposal.
+        """
+        if not obj.proposal:
+            return None
+
+        # Get all reviews for the proposal in a stable order
+        reviews = obj.proposal.review_set.order_by("created", "reviewer__id")
+
+        for index, review in enumerate(reviews, start=1):
+            if review.pk == obj.pk:
+                return _("Reviewer %(index)s") % {"index": index}
+
+        return _("Reviewer")
+
     def get_fields(self):
         fields = super().get_fields()
 
@@ -249,11 +298,13 @@ class ReviewSerializer(
             return fields
         elif isinstance(self.instance, list):
             review = self.instance[0]
+        elif isinstance(self.instance, QuerySet):
+            review = self.instance.last()
         else:
             review: models.Review = self.instance
 
         try:
-            request = self.context["view"].request
+            request = self.context["request"]
             user = request.user
         except (KeyError, AttributeError):
             return fields
@@ -263,20 +314,67 @@ class ReviewSerializer(
             or review.reviewer == user
             or review.proposal.round.call.manager.customer.has_user(user)
         ):
+            fields.pop("anonymous_reviewer_name", None)
             return fields
 
-        del fields["summary_private_comment"]
-        del fields["reviewer"]
-        del fields["reviewer_full_name"]
+        # For proposal submitters, apply reviewer identity visibility control
+        is_proposal_submitter = review.proposal.created_by == user
+        call = review.proposal.round.call
+
+        if is_proposal_submitter and not call.reviewer_identity_visible_to_submitters:
+            # Hide real reviewer info, show anonymous identifier
+            fields.pop("reviewer", None)
+            fields.pop("reviewer_full_name", None)
+            fields.pop("reviewer_uuid", None)
+        else:
+            # Show real reviewer info, hide anonymous identifier
+            fields.pop("anonymous_reviewer_name", None)
+
+        # Always remove private comments for non-authorized users
+        fields.pop("summary_private_comment", None)
 
         return fields
+
+    def create(self, validated_data):
+        """
+        Prevent creating a duplicate review for the same proposal and reviewer, excluding rejected reviews.
+        """
+        reviewer = validated_data["reviewer"]
+        proposal = validated_data["proposal"]
+
+        existing_review = models.Review.objects.filter(
+            proposal=proposal,
+            reviewer=reviewer,
+            state__in=[
+                models.Review.States.SUBMITTED,
+                models.Review.States.CREATED,
+                models.Review.States.IN_REVIEW,
+            ],
+        ).exists()
+
+        if existing_review:
+            raise serializers.ValidationError(
+                _("Review already exists for this proposal and reviewer.")
+            )
+
+        return super().create(validated_data)
+
+
+class ReviewSubmitSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Review
+        fields = (
+            "summary_score",
+            "summary_public_comment",
+            "summary_private_comment",
+        )
 
 
 class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
     state = serializers.ReadOnlyField()
     created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
     approved_by_name = serializers.ReadOnlyField(source="approved_by.full_name")
-    reviews = ReviewSerializer(many=True, read_only=True, source="review_set")
+    reviews = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Proposal
@@ -293,6 +391,45 @@ class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
             "created_by": {"lookup_field": "uuid", "view_name": "user-detail"},
             "approved_by": {"lookup_field": "uuid", "view_name": "user-detail"},
         }
+
+    def get_reviews(self, obj) -> list:
+        """
+        Return serialized reviews based on user permissions and visibility settings.
+        - Staff, call managers, and reviewers see all reviews.
+        - Submitters see submitted reviews if visibility is enabled.
+        """
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+
+        if not user or not request:
+            return []
+
+        reviews_qs = obj.review_set.all()
+
+        if (
+            user.is_staff
+            or obj.round.call.manager.customer.has_user(user)
+            or reviews_qs.filter(reviewer=user).exists()
+        ):
+            return ProposalReviewSerializer(
+                reviews_qs, many=True, context=self.context
+            ).data
+
+        # Submitter logic
+        if (
+            obj.created_by == user
+            and obj.round.call.reviews_visible_to_submitters
+            and (
+                obj.state == models.Proposal.States.ACCEPTED
+                or obj.state == models.Proposal.States.REJECTED
+            )
+        ):
+            submitted_reviews = reviews_qs.filter(state=models.Review.States.SUBMITTED)
+            return ProposalReviewSerializer(
+                submitted_reviews, many=True, context=self.context
+            ).data
+
+        return []
 
 
 class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
@@ -315,25 +452,109 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
 
 
 class CallDocumentSerializer(serializers.ModelSerializer):
-    file_name = serializers.ReadOnlyField(source="file.name")
+    file_name = serializers.CharField(source="file.name", read_only=True)
+    file_size = serializers.IntegerField(source="file.size", read_only=True)
 
     class Meta:
         model = models.CallDocument
-        fields = ["uuid", "file", "file_name", "description", "created"]
+        fields = ["uuid", "file", "file_name", "file_size", "description", "created"]
+
+
+class CallResourceTemplateSerializer(
+    core_serializers.AugmentedSerializerMixin,
+    serializers.HyperlinkedModelSerializer,
+):
+    requested_offering_name = serializers.ReadOnlyField(
+        source="requested_offering.offering.name"
+    )
+    requested_offering_uuid = serializers.UUIDField(
+        source="requested_offering.uuid", read_only=True
+    )
+    created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.CallResourceTemplate
+        fields = [
+            "uuid",
+            "url",
+            "name",
+            "description",
+            "attributes",
+            "limits",
+            "is_required",
+            "requested_offering",
+            "requested_offering_name",
+            "requested_offering_uuid",
+            "created_by",
+            "created_by_name",
+            "created",
+        ]
+        read_only_fields = ("created_by",)
+        extra_kwargs = {
+            "requested_offering": {
+                "lookup_field": "uuid",
+                "view_name": "proposal-requested-offering-detail",
+            },
+            "created_by": {"lookup_field": "uuid", "view_name": "user-detail"},
+        }
+
+    def get_fields(self):
+        """Make requested_offering not required for PATCH operations."""
+        fields = super().get_fields()
+        if hasattr(self, "instance") and self.instance:
+            if "requested_offering" in fields:
+                fields["requested_offering"].required = False
+
+        return fields
+
+    def get_url(self, resource_template) -> str:
+        return self.context["request"].build_absolute_uri(
+            reverse(
+                "proposal-call-resource_template-detail",
+                kwargs={
+                    "uuid": resource_template.call.uuid.hex,
+                    "obj_uuid": resource_template.uuid.hex,
+                },
+            )
+        )
+
+    def validate_requested_offering(self, requested_offering):
+        if hasattr(self, "initial_data") and "call" in self.context:
+            call = self.context["call"]
+            if requested_offering.call != call:
+                raise serializers.ValidationError(
+                    "Requested offering must belong to the same call"
+                )
+            if requested_offering.state != RequestedOfferingStates.ACCEPTED:
+                raise serializers.ValidationError(
+                    "Requested offering must be in accepted state"
+                )
+        return requested_offering
+
+    def create(self, validated_data):
+        validated_data["created_by"] = self.context["request"].user
+        return super().create(validated_data)
 
 
 class PublicCallSerializer(
+    core_serializers.SlugSerializerMixin,
+    core_serializers.RestrictedSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
     state = serializers.ReadOnlyField()
     customer_name = serializers.ReadOnlyField(source="manager.customer.name")
-    customer_uuid = serializers.ReadOnlyField(source="manager.customer.uuid")
+    customer_uuid = serializers.UUIDField(
+        read_only=True, source="manager.customer.uuid"
+    )
     offerings = serializers.SerializerMethodField(method_name="get_offerings")
     rounds = serializers.SerializerMethodField()
     start_date = serializers.SerializerMethodField()
     end_date = serializers.SerializerMethodField()
     documents = CallDocumentSerializer(many=True, read_only=True)
+    resource_templates = serializers.SerializerMethodField()
+    fixed_duration_in_days = serializers.ReadOnlyField()
 
     class Meta:
         model = models.Call
@@ -343,6 +564,7 @@ class PublicCallSerializer(
             "created",
             "start_date",
             "end_date",
+            "slug",
             "name",
             "description",
             "state",
@@ -352,8 +574,12 @@ class PublicCallSerializer(
             "offerings",
             "rounds",
             "documents",
+            "resource_templates",
+            "fixed_duration_in_days",
             "backend_id",
             "external_url",
+            "reviewer_identity_visible_to_submitters",
+            "reviews_visible_to_submitters",
         )
         view_name = "proposal-public-call-detail"
         extra_kwargs = {
@@ -369,19 +595,25 @@ class PublicCallSerializer(
                 "view_name": "user-detail",
             },
             "documents": {"required": False},
+            "reviewer_identity_visible_to_submitters": {"required": False},
+            "reviews_visible_to_submitters": {"required": False},
         }
 
-    def get_start_date(self, obj):
+    def validate_description(self, value):
+        return clean_html(value.strip())
+
+    def get_start_date(self, obj) -> datetime:
         first_round = obj.round_set.order_by("start_time").first()
         return first_round.start_time if first_round else None
 
-    def get_end_date(self, obj):
+    def get_end_date(self, obj) -> datetime:
         last_round = obj.round_set.order_by("-cutoff_time").first()
         return last_round.cutoff_time if last_round else None
 
+    @extend_schema_field(NestedRequestedOfferingSerializer(many=True))
     def get_offerings(self, obj):
         queryset = obj.requestedoffering_set.filter(
-            state=models.RequestedOffering.States.ACCEPTED
+            state=RequestedOfferingStates.ACCEPTED
         )
         serializer = NestedRequestedOfferingSerializer(
             queryset,
@@ -391,6 +623,7 @@ class PublicCallSerializer(
         )
         return serializer.data
 
+    @extend_schema_field(NestedRoundSerializer(many=True))
     def get_rounds(self, obj):
         queryset = obj.round_set.all()
         all_open_rounds = queryset.filter(
@@ -406,6 +639,17 @@ class PublicCallSerializer(
         )
         serializer = NestedRoundSerializer(
             sorted_queryset,
+            many=True,
+            read_only=True,
+            context=self.context,
+        )
+        return serializer.data
+
+    @extend_schema_field(CallResourceTemplateSerializer(many=True))
+    def get_resource_templates(self, obj):
+        queryset = obj.resource_templates.all()
+        serializer = CallResourceTemplateSerializer(
+            queryset,
             many=True,
             read_only=True,
             context=self.context,
@@ -448,7 +692,7 @@ class RequestedOfferingSerializer(
             },
         }
 
-    def get_url(self, requested_offering):
+    def get_url(self, requested_offering) -> str:
         return self.context["request"].build_absolute_uri(
             reverse(
                 "proposal-call-offering-detail",
@@ -487,11 +731,13 @@ class RequestedOfferingSerializer(
 class RequestedResourceSerializer(
     core_serializers.AugmentedSerializerMixin, NestedRequestedResourceSerializer
 ):
-    requested_offering_uuid = serializers.UUIDField(write_only=True, required=True)
+    requested_offering_uuid = serializers.UUIDField(write_only=True, required=False)
+    call_resource_template_uuid = serializers.UUIDField(write_only=True, required=False)
 
     class Meta(NestedRequestedResourceSerializer.Meta):
         fields = NestedRequestedResourceSerializer.Meta.fields + [
-            "requested_offering_uuid"
+            "requested_offering_uuid",
+            "call_resource_template_uuid",
         ]
 
         read_only_fields = (
@@ -503,24 +749,72 @@ class RequestedResourceSerializer(
         if self.instance:
             return attrs
 
-        requested_offering_uuid = attrs.pop("requested_offering_uuid")
         proposal = attrs["proposal"]
+        call = proposal.round.call
 
-        try:
-            requested_offering = proposal.round.call.requestedoffering_set.get(
-                uuid=requested_offering_uuid
-            )
-        except models.RequestedOffering.DoesNotExist:
+        # Handle resource template based requests
+        call_resource_template_uuid = attrs.pop("call_resource_template_uuid", None)
+        requested_offering_uuid = attrs.pop("requested_offering_uuid", None)
+
+        if call_resource_template_uuid:
+            # Creating from template
+            try:
+                template = call.resource_templates.get(uuid=call_resource_template_uuid)
+            except models.CallResourceTemplate.DoesNotExist:
+                raise serializers.ValidationError(
+                    {"call_resource_template_uuid": _("Resource template not found.")}
+                )
+
+            attrs["call_resource_template"] = template
+            attrs["requested_offering"] = template.requested_offering
+
+            # Use template's attributes and limits as defaults
+            if not attrs.get("attributes"):
+                attrs["attributes"] = template.attributes
+            if not attrs.get("limits"):
+                attrs["limits"] = template.limits
+
+        elif requested_offering_uuid:
+            # Traditional direct offering request
+            try:
+                requested_offering = call.requestedoffering_set.get(
+                    uuid=requested_offering_uuid
+                )
+            except models.RequestedOffering.DoesNotExist:
+                raise serializers.ValidationError(
+                    {
+                        "requested_offering_uuid": _(
+                            "Requested offering has not been found."
+                        )
+                    }
+                )
+
+            if requested_offering.state != RequestedOfferingStates.ACCEPTED:
+                raise serializers.ValidationError(
+                    _("Offering has not been confirmed by service provider.")
+                )
+
+            # Check if call has resource templates - if so, direct requests may not be allowed
+            if call.resource_templates.exists():
+                # Check if this offering is available through a template
+                available_offering = call.resource_templates.filter(
+                    requested_offering=requested_offering
+                ).exists()
+                if not available_offering:
+                    raise serializers.ValidationError(
+                        _(
+                            "This offering is not available for direct requests. Please use a resource template."
+                        )
+                    )
+
+            attrs["requested_offering"] = requested_offering
+        else:
             raise serializers.ValidationError(
-                {"requested_offering_uuid": _("Requested offering has not been found.")}
+                _(
+                    "Either requested_offering_uuid or call_resource_template_uuid must be provided."
+                )
             )
 
-        if requested_offering.state != models.RequestedOffering.States.ACCEPTED:
-            raise serializers.ValidationError(
-                _("Offering has not been confirmed by service provider.")
-            )
-
-        attrs["requested_offering"] = requested_offering
         return attrs
 
     def validate_attributes(self, attributes):
@@ -530,7 +824,7 @@ class RequestedResourceSerializer(
         return attributes
 
     def validate_proposal(self, proposal):
-        if proposal.state != models.Proposal.States.DRAFT:
+        if proposal.state != ProposalStates.DRAFT:
             raise serializers.ValidationError(
                 _("Only proposals with a draft status are available for editing.")
             )
@@ -558,22 +852,15 @@ class ProviderRequestedResourceSerializer(NestedRequestedResourceSerializer):
                     "lookup_field": "uuid",
                     "view_name": "proposal-proposal-detail",
                 },
+                "url": {
+                    "lookup_field": "uuid",
+                    "view_name": "proposal-requested-resource-detail",
+                },
             },
         }
 
-    def get_url(self, requested_resource):
-        return self.context["request"].build_absolute_uri(
-            reverse(
-                "proposal-requested-resource-detail",
-                kwargs={
-                    "uuid": requested_resource.uuid.hex,
-                },
-            )
-        )
-
 
 class ProviderRequestedOfferingSerializer(NestedRequestedOfferingSerializer):
-    url = serializers.SerializerMethodField()
     call_name = serializers.ReadOnlyField(source="call.name")
     created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
     created_by_email = serializers.ReadOnlyField(source="created_by.email")
@@ -610,17 +897,11 @@ class ProviderRequestedOfferingSerializer(NestedRequestedOfferingSerializer):
                 "view_name": "marketplace-plan-detail",
                 "read_only": True,
             },
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "proposal-requested-offering-detail",
+            },
         }
-
-    def get_url(self, requested_offering):
-        return self.context["request"].build_absolute_uri(
-            reverse(
-                "proposal-requested-offering-detail",
-                kwargs={
-                    "uuid": requested_offering.uuid.hex,
-                },
-            )
-        )
 
 
 class ProtectedCallSerializer(PublicCallSerializer):
@@ -633,6 +914,15 @@ class ProtectedCallSerializer(PublicCallSerializer):
     )
     default_project_role_description = serializers.ReadOnlyField(
         source="default_project_role.description"
+    )
+    fixed_duration_in_days = serializers.IntegerField(required=False, allow_null=True)
+    reviewer_identity_visible_to_submitters = serializers.BooleanField(
+        help_text="Whether proposal submitters can see reviewer identities",
+        required=False,
+    )
+    reviews_visible_to_submitters = serializers.BooleanField(
+        help_text="Whether proposal submitters can see review comments and scores",
+        required=False,
     )
 
     class Meta(PublicCallSerializer.Meta):
@@ -668,7 +958,16 @@ class ProtectedCallSerializer(PublicCallSerializer):
         return default_project_role
 
     def create(self, validated_data):
-        validated_data["created_by"] = self.context["request"].user
+        request = self.context["request"]
+        customer = validated_data.get("manager", None).customer
+        if not permissions_utils.has_permission(
+            request,
+            permissions_enums.PermissionEnum.CREATE_CALL,
+            customer,
+        ):
+            raise PermissionDenied()
+
+        validated_data["created_by"] = request.user
         return super().create(validated_data)
 
 
@@ -686,7 +985,7 @@ class ProtectedRoundSerializer(
     class Meta(NestedRoundSerializer.Meta):
         fields = NestedRoundSerializer.Meta.fields + ["url", "proposals"]
 
-    def get_url(self, call_round):
+    def get_url(self, call_round) -> str:
         return self.context["request"].build_absolute_uri(
             reverse(
                 "proposal-call-round-detail",
@@ -723,11 +1022,12 @@ class ProtectedRoundSerializer(
 
 
 class ProposalDocumentationSerializer(serializers.ModelSerializer):
-    file_name = serializers.ReadOnlyField(source="file.name")
+    file_name = serializers.CharField(source="file.name", read_only=True)
+    file_size = serializers.IntegerField(source="file.size", read_only=True)
 
     class Meta:
         model = models.ProposalDocumentation
-        fields = ["file", "file_name", "created"]
+        fields = ["file", "file_name", "file_size", "created"]
 
 
 class ProposalUpdateProjectDetailsSerializer(serializers.ModelSerializer):
@@ -759,6 +1059,9 @@ class ProposalSerializer(
     oecd_fos_2007_label = serializers.ReadOnlyField(
         source="get_oecd_fos_2007_code_display"
     )
+    created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
+    created_by_uuid = serializers.UUIDField(source="created_by.uuid", read_only=True)
+    project_name = serializers.ReadOnlyField(source="project.name")
 
     class Meta:
         model = models.Proposal
@@ -767,6 +1070,7 @@ class ProposalSerializer(
             "url",
             "name",
             "description",
+            "project_name",
             "project_summary",
             "project_is_confidential",
             "project_has_civilian_purpose",
@@ -774,6 +1078,8 @@ class ProposalSerializer(
             "state",
             "approved_by",
             "created_by",
+            "created_by_name",
+            "created_by_uuid",
             "duration_in_days",
             "project",
             "round",
@@ -813,7 +1119,7 @@ class ProposalSerializer(
         except models.Round.DoesNotExist:
             raise serializers.ValidationError({"round_uuid": _("Round not found.")})
 
-        if call_round.call.state != models.Call.States.ACTIVE:
+        if call_round.call.state != CallStates.ACTIVE:
             raise serializers.ValidationError(_("Call is not active."))
 
         if call_round.status not in (
@@ -827,26 +1133,65 @@ class ProposalSerializer(
 
     def create(self, validated_data):
         validated_data["created_by"] = self.context["request"].user
-        return super().create(validated_data)
+        proposal = super().create(validated_data)
+
+        # Set fixed duration if specified by call
+        if proposal.round.call.fixed_duration_in_days:
+            proposal.duration_in_days = proposal.round.call.fixed_duration_in_days
+            proposal.save()
+
+        return proposal
+
+    def get_fields(self):
+        fields = super().get_fields()
+
+        # Make duration_in_days read-only if call has fixed duration
+        def is_fixed_duration(instance):
+            try:
+                return instance.round.call.fixed_duration_in_days
+            except AttributeError:
+                return False
+
+        # Handle both single instance and list
+        instances = (
+            self.instance
+            if isinstance(self.instance, (list | tuple))
+            else [self.instance]
+            if self.instance
+            else []
+        )
+
+        if any(is_fixed_duration(obj) for obj in instances):
+            fields["duration_in_days"].read_only = True
+        elif hasattr(self, "initial_data") and "round_uuid" in self.initial_data:
+            # For creation, check if the call has fixed duration
+            try:
+                round_uuid = self.initial_data["round_uuid"]
+                call_round = models.Round.objects.get(uuid=round_uuid)
+                if call_round.call.fixed_duration_in_days:
+                    fields["duration_in_days"].read_only = True
+            except (models.Round.DoesNotExist, KeyError):
+                pass
+
+        return fields
 
 
-class ReviewerSerializer(serializers.Serializer):
+class RoundReviewerSerializer(serializers.Serializer):
     full_name = serializers.SerializerMethodField()
     email = serializers.EmailField()
     accepted_proposals = serializers.IntegerField()
     rejected_proposals = serializers.IntegerField()
     in_review_proposals = serializers.IntegerField()
 
-    def get_full_name(self, obj):
+    def get_full_name(self, obj) -> str:
         return f"{obj.first_name} {obj.last_name}"
 
 
-class ProposalAllocateSerializer(serializers.Serializer):
+class ProposalApproveSerializer(serializers.Serializer):
     allocation_comment = serializers.CharField(required=False)
 
 
-class RoundSerializer(serializers.ModelSerializer):
-    url = serializers.SerializerMethodField()
+class CallRoundSerializer(serializers.HyperlinkedModelSerializer):
     call_uuid = serializers.UUIDField(source="call.uuid", read_only=True)
     call_name = serializers.ReadOnlyField(source="call.name")
 
@@ -873,12 +1218,22 @@ class RoundSerializer(serializers.ModelSerializer):
         },
     }
 
-    def get_url(self, obj):
-        return self.context["request"].build_absolute_uri(
-            reverse(
-                "call-round-detail",
-                kwargs={
-                    "uuid": obj.uuid.hex,
-                },
-            )
-        )
+
+class CallManagingOrganisationStatSerializer(serializers.Serializer):
+    open_calls = serializers.IntegerField(read_only=True)
+    active_rounds = serializers.IntegerField(read_only=True)
+    accepted_proposals = serializers.IntegerField(read_only=True)
+    pending_proposals = serializers.IntegerField(read_only=True)
+    pending_review = serializers.IntegerField(read_only=True)
+    rounds_closing_in_one_week = serializers.IntegerField(read_only=True)
+    calls_closing_in_one_week = serializers.IntegerField(read_only=True)
+    offering_requests_pending = serializers.IntegerField(read_only=True)
+
+
+class CallAttachDocumentsSerializer(serializers.Serializer):
+    documents = serializers.ListField(child=serializers.FileField())
+    description = serializers.CharField(required=False)
+
+
+class CallDetachDocumentsSerializer(serializers.Serializer):
+    documents = serializers.ListField(child=serializers.UUIDField())

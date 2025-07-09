@@ -39,6 +39,11 @@ class MarketplaceExtension(WaldurExtension):
                 "schedule": timedelta(days=1),
                 "args": (),
             },
+            "terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_order": {
+                "task": "waldur_mastermind.marketplace.terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_order",
+                "schedule": timedelta(days=1),
+                "args": (),
+            },
             "process_pending_project_orders": {
                 "task": "waldur_mastermind.marketplace.process_pending_project_orders",
                 "schedule": timedelta(hours=2),
@@ -72,6 +77,11 @@ class MarketplaceExtension(WaldurExtension):
             "mark_resources_as_erred_after_timeout": {
                 "task": "waldur_mastermind.marketplace.mark_resources_as_erred_after_timeout",
                 "schedule": timedelta(hours=2),
+                "args": (),
+            },
+            "remove_deleted_robot_accounts": {
+                "task": "waldur_mastermind.marketplace.remove_deleted_robot_accounts",
+                "schedule": timedelta(days=1),
                 "args": (),
             },
         }

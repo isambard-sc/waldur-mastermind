@@ -7,15 +7,25 @@ from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import decorators, permissions, response, status, views, viewsets
+from drf_spectacular.utils import extend_schema
+from rest_framework import (
+    decorators,
+    generics,
+    permissions,
+    response,
+    status,
+    views,
+    viewsets,
+)
 from rest_framework import exceptions as rf_exceptions
 from rest_framework.exceptions import ValidationError
 
 from waldur_core.core import mixins as core_mixins
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core import views as core_views
+from waldur_core.core.serializers import EmptySerializer
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure import filters as structure_filters
-from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.notifications.models import BroadcastMessage
 from waldur_mastermind.support.backend.smax import SmaxServiceBackend
@@ -64,7 +74,7 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     @transaction.atomic()
     def perform_create(self, serializer):
-        issue = serializer.save()
+        issue: models.Issue = serializer.save()
         try:
             backend.get_active_backend().create_issue(issue)
             backend.get_active_backend().create_confirmation_comment(issue)
@@ -75,7 +85,7 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     @transaction.atomic()
     def perform_update(self, serializer):
-        issue = serializer.save()
+        issue: models.Issue = serializer.save()
         backend.get_active_backend().update_issue(issue)
 
     def _update_is_available_validator(issue):
@@ -97,7 +107,7 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
     destroy_permissions = [is_staff_or_support]
     destroy_validators = [_destroy_is_available_validator]
 
-    def _comment_permission(request, view, obj=None):
+    def _comment_permission(request, view, obj: models.Issue = None):
         user = request.user
         if user.is_staff or user.is_support or not obj:
             return
@@ -105,13 +115,11 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         # if it's a personal issue
         if not issue.customer and not issue.project and issue.caller == user:
             return
-        if issue.customer and issue.customer.has_user(
-            user, structure_models.CustomerRole.OWNER
-        ):
+        if issue.customer and issue.customer.has_user(user, CustomerRole.OWNER):
             return
         if issue.project and (
-            issue.project.has_user(user, structure_models.ProjectRole.ADMINISTRATOR)
-            or issue.project.has_user(user, structure_models.ProjectRole.MANAGER)
+            issue.project.has_user(user, ProjectRole.ADMIN)
+            or issue.project.has_user(user, ProjectRole.MANAGER)
         ):
             return
         raise rf_exceptions.PermissionDenied()
@@ -135,7 +143,7 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     @decorators.action(detail=True, methods=["post"])
     def sync(self, request, uuid=None):
-        issue = self.get_object()
+        issue: models.Issue = self.get_object()
         backend.get_active_backend().sync_issues(issue.id)
         return response.Response(status=status.HTTP_200_OK)
 
@@ -163,7 +171,7 @@ class CommentViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     @transaction.atomic()
     def perform_update(self, serializer):
-        comment = serializer.save()
+        comment: models.Comment = serializer.save()
         backend.get_active_backend().update_comment(comment)
 
     def _update_is_available_validator(comment):
@@ -207,7 +215,10 @@ class SupportUserViewSet(CheckExtensionMixin, viewsets.ReadOnlyModelViewSet):
     filterset_class = filters.SupportUserFilter
 
 
-class SupportStatsViewSet(CheckExtensionMixin, views.APIView):
+class SupportStatsViewSet(CheckExtensionMixin, generics.GenericAPIView):
+    serializer_class = serializers.SupportStatsSerializer
+    pagination_class = None
+
     def get(self, request, format=None):
         today = date.today()
         current_month = today.month
@@ -274,7 +285,7 @@ class AttachmentViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     @transaction.atomic()
     def perform_create(self, serializer):
-        attachment = serializer.save()
+        attachment: models.Attachment = serializer.save()
         backend.get_active_backend().create_attachment(attachment)
 
     def get_queryset(self):
@@ -282,11 +293,48 @@ class AttachmentViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         return queryset.filter_for_user(self.request.user)
 
 
-class TemplateViewSet(CheckExtensionMixin, viewsets.ReadOnlyModelViewSet):
-    permission_classes = (permissions.IsAuthenticated,)
+class TemplateViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
+    permission_classes = [core_permissions.IsAdminOrReadOnly]
     queryset = models.Template.objects.all().order_by("name")
     lookup_field = "uuid"
     serializer_class = serializers.TemplateSerializer
+
+    @extend_schema(
+        description="This view attaches documents to template.",
+        request=serializers.CreateAttachmentsSerializer,
+        responses={201: None, 400: None},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def create_attachments(self, request, uuid=None):
+        template: models.Template = self.get_object()
+        attachments = request.FILES.getlist("attachments")
+
+        if not attachments:
+            return response.Response(
+                {"detail": "No attachments provided."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        for attachment in attachments:
+            obj, created = models.TemplateAttachment.objects.get_or_create(
+                template=template,
+                name=attachment.name,
+                defaults={"file": attachment},
+            )
+            if created:
+                template.attachments.add(obj)
+        return response.Response(status=status.HTTP_201_CREATED)
+
+    @extend_schema(request=serializers.DeleteAttachmentsSerializer, responses=None)
+    @decorators.action(detail=True, methods=["post"])
+    def delete_attachments(self, request, uuid=None):
+        template: models.Template = self.get_object()
+        attachment_ids = request.data.get("attachment_ids", [])
+        attachments = models.TemplateAttachment.objects.filter(
+            uuid__in=attachment_ids, template=template
+        )
+        attachments.delete()
+        return response.Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class FeedbackViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
@@ -308,14 +356,15 @@ class FeedbackViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
     list_permissions = retrieve_permissions = [is_staff_or_support]
 
 
-class FeedbackReportViewSet(views.APIView):
+class FeedbackReportViewSet(generics.GenericAPIView):
     permission_classes = [permissions.IsAuthenticated, core_permissions.IsSupport]
+    filter_backends = []
+    serializer_class = EmptySerializer
+    pagination_class = None
 
     def get(self, request, format=None):
         result = {
-            dict(models.Feedback.Evaluation.CHOICES).get(count["evaluation"]): count[
-                "id__count"
-            ]
+            str(count["evaluation"]): count["id__count"]
             for count in models.Feedback.objects.values("evaluation").annotate(
                 Count("id")
             )
@@ -323,8 +372,11 @@ class FeedbackReportViewSet(views.APIView):
         return response.Response(result, status=status.HTTP_200_OK)
 
 
-class FeedbackAverageReportViewSet(views.APIView):
+class FeedbackAverageReportViewSet(generics.GenericAPIView):
     permission_classes = [permissions.IsAuthenticated, core_permissions.IsSupport]
+    filter_backends = []
+    serializer_class = EmptySerializer
+    pagination_class = None
 
     def get(self, request, format=None):
         avg = models.Feedback.objects.aggregate(Avg("evaluation"))["evaluation__avg"]
@@ -336,9 +388,12 @@ class FeedbackAverageReportViewSet(views.APIView):
         return response.Response(result, status=status.HTTP_200_OK)
 
 
-class ZammadWebHookReceiverView(CheckExtensionMixin, views.APIView):
+class ZammadWebHookReceiverView(CheckExtensionMixin, generics.GenericAPIView):
     authentication_classes = ()
     permission_classes = ()
+    filter_backends = []
+    serializer_class = EmptySerializer
+    pagination_class = None
 
     def post(self, request):
         ticket_id = request.data.get("ticket", {}).get("id")
@@ -355,9 +410,11 @@ class ZammadWebHookReceiverView(CheckExtensionMixin, views.APIView):
         return response.Response(status=status.HTTP_200_OK)
 
 
-class SmaxWebHookReceiverView(CheckExtensionMixin, views.APIView):
+class SmaxWebHookReceiverView(CheckExtensionMixin, generics.GenericAPIView):
     authentication_classes = ()
     permission_classes = ()
+    filter_backends = ()
+    serializer_class = serializers.SmaxWebHookReceiverSerializer
 
     def post(self, request):
         issue_id = request.data.get("id")
@@ -377,6 +434,11 @@ class SmaxWebHookReceiverView(CheckExtensionMixin, views.APIView):
         return response.Response(status=status.HTTP_200_OK)
 
 
+@extend_schema(
+    request=None,
+    responses={202: None, 403: None},
+    description="This view triggers synchronization of issues from backend.",
+)
 @decorators.api_view(["GET", "POST"])
 def sync_issues(request):
     if not request.user.is_active or not (

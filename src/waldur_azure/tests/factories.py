@@ -1,10 +1,13 @@
 from random import randint
 
 import factory
+import factory.fuzzy
 from django.urls import reverse
 from libcloud.compute.types import NodeState
 
 from waldur_azure import models
+from waldur_core.core.enums import CoreStates
+from waldur_core.core.tests.types import BaseMetaFactory
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests.factories import ProjectFactory
@@ -18,7 +21,9 @@ class AzureServiceSettingsFactory(structure_factories.ServiceSettingsFactory):
     customer = factory.SubFactory(structure_factories.CustomerFactory)
 
 
-class LocationFactory(factory.django.DjangoModelFactory):
+class LocationFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Location]
+):
     class Meta:
         model = models.Location
 
@@ -40,7 +45,9 @@ class LocationFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("azure-location-list")
 
 
-class SizeFactory(factory.django.DjangoModelFactory):
+class SizeFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Size]
+):
     class Meta:
         model = models.Size
 
@@ -68,7 +75,9 @@ class SizeFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("azure-size-list")
 
 
-class ImageFactory(factory.django.DjangoModelFactory):
+class ImageFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Image]
+):
     class Meta:
         model = models.Image
 
@@ -95,7 +104,9 @@ class ImageFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("azure-image-list")
 
 
-class ResourceGroupFactory(factory.django.DjangoModelFactory):
+class ResourceGroupFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.ResourceGroup]
+):
     class Meta:
         model = models.ResourceGroup
 
@@ -106,7 +117,9 @@ class ResourceGroupFactory(factory.django.DjangoModelFactory):
     location = factory.SubFactory(LocationFactory)
 
 
-class NetworkFactory(factory.django.DjangoModelFactory):
+class NetworkFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Network]
+):
     class Meta:
         model = models.Network
 
@@ -118,7 +131,9 @@ class NetworkFactory(factory.django.DjangoModelFactory):
     cidr = "10.0.0.0/16"
 
 
-class SubNetFactory(factory.django.DjangoModelFactory):
+class SubNetFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.SubNet]
+):
     class Meta:
         model = models.SubNet
 
@@ -131,7 +146,10 @@ class SubNetFactory(factory.django.DjangoModelFactory):
     network = factory.SubFactory(NetworkFactory)
 
 
-class NetworkInterfaceFactory(factory.django.DjangoModelFactory):
+class NetworkInterfaceFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.NetworkInterface],
+):
     class Meta:
         model = models.NetworkInterface
 
@@ -144,7 +162,9 @@ class NetworkInterfaceFactory(factory.django.DjangoModelFactory):
     config_name = factory.Sequence(lambda n: "conf-%s" % n)
 
 
-class PublicIPFactory(factory.django.DjangoModelFactory):
+class PublicIPFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.PublicIP]
+):
     class Meta:
         model = models.PublicIP
 
@@ -159,7 +179,9 @@ class PublicIPFactory(factory.django.DjangoModelFactory):
     )
 
 
-class VirtualMachineFactory(factory.django.DjangoModelFactory):
+class VirtualMachineFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.VirtualMachine]
+):
     class Meta:
         model = models.VirtualMachine
 
@@ -172,7 +194,7 @@ class VirtualMachineFactory(factory.django.DjangoModelFactory):
     image = factory.SubFactory(ImageFactory)
     network_interface = factory.SubFactory(NetworkInterfaceFactory)
 
-    state = models.VirtualMachine.States.OK
+    state = CoreStates.OK
     runtime_state = NodeState.RUNNING
     cores = factory.fuzzy.FuzzyInteger(1, 8, step=2)
     ram = factory.fuzzy.FuzzyInteger(1024, 10240, step=1024)
@@ -192,7 +214,9 @@ class VirtualMachineFactory(factory.django.DjangoModelFactory):
         return "http://testserver" + reverse("azure-virtualmachine-list")
 
 
-class SQLServerFactory(factory.django.DjangoModelFactory):
+class SQLServerFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.SQLServer]
+):
     class Meta:
         model = models.SQLServer
 
@@ -201,7 +225,7 @@ class SQLServerFactory(factory.django.DjangoModelFactory):
     service_settings = factory.SubFactory(AzureServiceSettingsFactory)
     project = factory.SubFactory(ProjectFactory)
     resource_group = factory.SubFactory(ResourceGroupFactory)
-    state = models.SQLServer.States.OK
+    state = CoreStates.OK
 
     @classmethod
     def get_url(cls, instance=None, action=None):

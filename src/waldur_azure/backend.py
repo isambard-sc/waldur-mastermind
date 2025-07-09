@@ -5,6 +5,7 @@ from azure.core.exceptions import HttpResponseError
 from django.core.exceptions import ObjectDoesNotExist
 
 from waldur_azure.client import AzureBackendError, AzureClient, AzureImage
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure.backend import ServiceBackend
 
 from . import models
@@ -113,7 +114,7 @@ class AzureBackend(ServiceBackend):
                 service_settings=service_settings,
                 project=project,
                 location=locations.get(backend_public_ip.location),
-                state=models.PublicIP.States.OK,
+                state=CoreStates.OK,
             )
 
         for cached_public_ip in stale_public_ips:
@@ -279,7 +280,7 @@ class AzureBackend(ServiceBackend):
                 service_settings=service_settings,
                 project=project,
                 location=locations.get(backend_group.location),
-                state=models.ResourceGroup.States.OK,
+                state=CoreStates.OK,
             )
 
         for cached_group in stale_groups:
@@ -441,7 +442,7 @@ class AzureBackend(ServiceBackend):
             defaults=dict(
                 name=resource_group_name,
                 location=location,
-                state=models.ResourceGroup.States.OK,
+                state=CoreStates.OK,
             ),
         )
 
@@ -469,7 +470,7 @@ class AzureBackend(ServiceBackend):
             network_interface=network_interface,
             size=size,
             image=image,
-            state=models.VirtualMachine.States.OK,
+            state=CoreStates.OK,
         )
 
     def import_network_interface(self, backend_vm, project, resource_group, location):
@@ -497,7 +498,7 @@ class AzureBackend(ServiceBackend):
                 project=project,
                 backend_id=network_name,
                 cidr=backend_network.address_space.address_prefixes[0],
-                state=models.Network.States.OK,
+                state=CoreStates.OK,
             )
 
             backend_subnet = self.client.get_subnet(
@@ -511,7 +512,7 @@ class AzureBackend(ServiceBackend):
                 backend_id=subnet_name,
                 cidr=backend_subnet.address_prefix,
                 network=network,
-                state=models.SubNet.States.OK,
+                state=CoreStates.OK,
             )
 
             public_ip_address_name = backend_interface.ip_configurations[
@@ -528,7 +529,7 @@ class AzureBackend(ServiceBackend):
                 backend_id=public_ip_address_name,
                 ip_address=backend_public_ip.ip_address,
                 location=location,
-                state=models.PublicIP.States.OK,
+                state=CoreStates.OK,
             )
 
             return models.NetworkInterface.objects.create(
@@ -539,7 +540,7 @@ class AzureBackend(ServiceBackend):
                 backend_id=network_interface_id,
                 public_ip=public_ip,
                 subnet=subnet,
-                state=models.NetworkInterface.States.OK,
+                state=CoreStates.OK,
             )
 
     def pull_virtual_machine(self, local_vm: models.VirtualMachine):

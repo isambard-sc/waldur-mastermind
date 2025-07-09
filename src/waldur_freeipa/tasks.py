@@ -1,7 +1,7 @@
 import logging
 
 from celery import shared_task
-from django.conf import settings
+from constance import config
 from django.core.exceptions import ObjectDoesNotExist
 from python_freeipa import exceptions as freeipa_exceptions
 
@@ -24,11 +24,11 @@ def schedule_sync():
         )
         return
 
-    if not settings.WALDUR_FREEIPA["ENABLED"]:
+    if not config.FREEIPA_ENABLED:
         logger.debug("Skipping FreeIPA synchronization because plugin is disabled.")
         return
 
-    if not settings.WALDUR_FREEIPA["GROUP_SYNCHRONIZATION_ENABLED"]:
+    if not config.FREEIPA_GROUP_SYNCHRONIZATION_ENABLED:
         logger.debug(
             "Skipping FreeIPA group synchronization because this feature is disabled."
         )
@@ -44,7 +44,7 @@ def sync_groups():
     This task is used by Celery beat in order to periodically
     schedule FreeIPA group synchronization.
     """
-    if not settings.WALDUR_FREEIPA["ENABLED"]:
+    if not config.FREEIPA_ENABLED:
         return
 
     schedule_sync()
@@ -65,7 +65,7 @@ def schedule_sync_names():
 
 @shared_task(name="waldur_freeipa.sync_names")
 def sync_names():
-    if not settings.WALDUR_FREEIPA["ENABLED"]:
+    if not config.FREEIPA_ENABLED:
         return
 
     FreeIPABackend().synchronize_names()
@@ -109,17 +109,11 @@ def sync_profile_ssh_keys(profile_id):
         return
 
 
-@shared_task(name="waldur_freeipa.disable_accounts_without_allocations")
-def disable_accounts_without_allocations():
-    if not settings.WALDUR_FREEIPA["ENABLED"]:
-        return
+@shared_task()
+def user_enable(profile_serialized):
+    FreeIPABackend().user_enable(core_utils.deserialize_instance(profile_serialized))
 
-    has_changed = False
-    for profile in models.Profile.objects.filter(is_active=True):
-        new_is_active = utils.is_profile_active_for_user(profile.user)
-        if new_is_active != profile.is_active:
-            profile.is_active = new_is_active
-            profile.save(update_fields=["is_active"])
-            has_changed = True
-    if has_changed:
-        schedule_sync()
+
+@shared_task()
+def user_disable(profile_serialized):
+    FreeIPABackend().user_disable(core_utils.deserialize_instance(profile_serialized))

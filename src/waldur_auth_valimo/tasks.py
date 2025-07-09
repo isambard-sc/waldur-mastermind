@@ -2,10 +2,11 @@ import logging
 from datetime import timedelta
 
 from celery import shared_task
-from django.contrib.auth import get_user_model
 from django.utils import timezone
 
-from waldur_core.core import tasks, views
+from waldur_core.core import tasks
+from waldur_core.core.authentication import refresh_token
+from waldur_core.core.models import User
 
 from . import client, models
 
@@ -25,7 +26,7 @@ class AuthTask(tasks.StateTransitionTask):
         auth_result.save(update_fields=["backend_transaction_id"])
 
 
-class PollTask(views.RefreshTokenMixin, tasks.Task):
+class PollTask(tasks.Task):
     max_retries = 25
     default_retry_delay = 12
 
@@ -49,10 +50,9 @@ class PollTask(views.RefreshTokenMixin, tasks.Task):
             )
 
     def _associate_with_user(self, auth_result, civil_number):
-        User = get_user_model()
         try:
             user = User.objects.get(civil_number=civil_number)
-            self.refresh_token(user)
+            refresh_token(user)
             auth_result.user = user
             auth_result.set_ok()
             user.last_login = timezone.now()

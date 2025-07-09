@@ -1,8 +1,10 @@
 import functools
 import logging
 import mimetypes
+from typing import Any
 from urllib.parse import urlencode
 
+import requests
 import reversion
 from constance import config
 from django.conf import settings
@@ -16,11 +18,12 @@ from django.http import FileResponse, HttpResponse, HttpResponseRedirect, JsonRe
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.views.generic import TemplateView
-from rest_framework import exceptions, serializers, status, viewsets
+from drf_spectacular.utils import OpenApiExample, extend_schema
+from packaging import version
+from rest_framework import exceptions, generics, serializers, status, viewsets
 from rest_framework import mixins as rf_mixins
 from rest_framework import permissions as rf_permissions
-from rest_framework.authtoken.models import Token
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.reverse import reverse
 from rest_framework.views import APIView
@@ -33,20 +36,25 @@ from waldur_core.core.authentication import (
     OIDC_AUTHENTICATION_METHODS,
     AuthenticationMethod,
     get_authentication_method,
+    refresh_token,
     set_authentication_method,
 )
 from waldur_core.core.exceptions import ExtensionDisabled, IncorrectStateException
 from waldur_core.core.features import FEATURES
 from waldur_core.core.logos import DEFAULT_LOGOS, LOGO_MAP
 from waldur_core.core.metadata import WaldurConfiguration
-from waldur_core.core.mixins import ReviewMixin, ensure_atomic_transaction
+from waldur_core.core.mixins import ensure_atomic_transaction
 from waldur_core.core.serializers import (
-    AuthTokenSerializer,
     ConstanceSettingsSerializer,
-    ReviewCommentSerializer,
+    CoreAuthTokenSerializer,
+    EmptySerializer,
+    LogoutSerializer,
+    ObtainAuthTokenSerializer,
+    QuerySerializer,
+    TableSizeSerializer,
+    VersionSerializer,
 )
 from waldur_core.core.utils import format_homeport_link
-from waldur_core.core.validators import StateValidator
 from waldur_core.logging.loggers import event_logger
 from waldur_core.structure.permissions import IsStaffOrSupportUser
 
@@ -72,92 +80,56 @@ def validate_authentication_method(method):
     return wrapper
 
 
-class RefreshTokenMixin:
+class ObtainAuthToken(APIView):
     """
-    This mixin is used in both password and social auth (implemented via plugin).
-    Mixin allows to create new token if it does not exist yet or if it has already expired.
-    Token is refreshed if it has not expired yet.
-    """
-
-    def refresh_token(self, user):
-        token, created = Token.objects.get_or_create(user=user)
-
-        if user.token_lifetime:
-            lifetime = timezone.timedelta(seconds=user.token_lifetime)
-
-            if token.created < timezone.now() - lifetime:
-                token.delete()
-                token = Token.objects.create(user=user)
-                created = True
-
-        if not created:
-            token.created = timezone.now()
-            token.save(update_fields=["created"])
-
-        return token
-
-
-class ObtainAuthToken(RefreshTokenMixin, APIView):
-    """
-    Api view loosely based on DRF's default ObtainAuthToken,
+    API view loosely based on DRF's default ObtainAuthToken,
     but with the responses formats and status codes aligned with BasicAuthentication behavior.
-
-    Valid request example:
-
-    .. code-block:: http
-
-        POST /api-auth/password/ HTTP/1.1
-        Accept: application/json
-        Content-Type: application/json
-        Host: example.com
-
-        {
-            "username": "alice",
-            "password": "$ecr3t"
-        }
-
-    Success response example:
-
-    .. code-block:: http
-
-        HTTP/1.0 200 OK
-        Allow: POST, OPTIONS
-        Content-Type: application/json
-        Vary: Accept, Cookie
-
-        {
-            "token": "c84d653b9ec92c6cbac41c706593e66f567a7fa4"
-        }
-
-    Field validation failure response example:
-
-    .. code-block:: http
-
-        HTTP/1.0 401 UNAUTHORIZED
-        Allow: POST, OPTIONS
-        Content-Type: application/json
-
-        {
-            "password": ["This field is required."]
-        }
-
-    Invalid credentials failure response example:
-
-    .. code-block:: http
-
-        HTTP/1.0 401 UNAUTHORIZED
-        Allow: POST, OPTIONS
-        Content-Type: application/json
-
-        {
-            "detail": "Invalid username/password"
-        }
     """
 
     throttle_classes = ()
     permission_classes = ()
-    serializer_class = AuthTokenSerializer
+    serializer_class = ObtainAuthTokenSerializer
 
+    @extend_schema(
+        request=ObtainAuthTokenSerializer,
+        responses={
+            200: CoreAuthTokenSerializer,
+            401: None,
+        },
+        examples=[
+            OpenApiExample(
+                "Valid request",
+                summary="Valid request example",
+                description="Example of a valid request to obtain an authentication token.",
+                value={"username": "alice", "password": "$ecr3t"},
+                request_only=True,
+            ),
+            OpenApiExample(
+                "Success response",
+                summary="Success response example",
+                description="Example of a successful response with the authentication token.",
+                value={"token": "c84d653b9ec92c6cbac41c706593e66f567a7fa4"},
+                response_only=True,
+                status_codes=[200],
+            ),
+            OpenApiExample(
+                "Field validation failure response",
+                summary="Field validation failure response example",
+                description="Example of a response when field validation fails.",
+                value={"password": ["This field is required."]},
+                response_only=True,
+                status_codes=[401],
+            ),
+            OpenApiExample(
+                "Invalid credentials failure response",
+                summary="Invalid credentials failure response example",
+                description="Example of a response when invalid credentials are provided.",
+                value={"detail": "Invalid username/password"},
+                response_only=True,
+                status_codes=[401],
+            ),
+        ],
+    )
     @validate_authentication_method("LOCAL_SIGNIN")
     def post(self, request):
         serializer = self.serializer_class(data=request.data)
@@ -189,9 +161,7 @@ class ObtainAuthToken(RefreshTokenMixin, APIView):
         )
 
         if not user:
-            logger.debug(
-                "Not returning auth token: " "user %s does not exist", username
-            )
+            logger.debug("Not returning auth token: user %s does not exist", username)
             cache.set(auth_failure_key, auth_failures + 1, lockout_time_in_mins * 60)
             event_logger.auth.info(
                 "User {username} failed to authenticate with username and password.",
@@ -207,13 +177,13 @@ class ObtainAuthToken(RefreshTokenMixin, APIView):
             cache.delete(auth_failure_key)
 
         if not user.is_active:
-            logger.debug("Not returning auth token: " "user %s is disabled", username)
+            logger.debug("Not returning auth token: user %s is disabled", username)
             return Response(
                 data={"detail": _("User account is disabled.")},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        token = self.refresh_token(user)
+        token = refresh_token(user)
         user.last_login = timezone.now()
         user.save(update_fields=["last_login"])
         set_authentication_method(request, AuthenticationMethod.LOCAL)
@@ -230,9 +200,18 @@ class ObtainAuthToken(RefreshTokenMixin, APIView):
         return Response({"token": token.key})
 
 
-class LogoutView(APIView):
+class LogoutView(generics.GenericAPIView):
     permission_classes = (rf_permissions.IsAuthenticated,)
+    filter_backends = []
 
+    @extend_schema(
+        description="Logout from the system. If single logout is supported, returns logout URL.",
+        request=None,
+        responses={
+            200: LogoutSerializer,
+            204: None,
+        },
+    )
     def post(self, request, format=None):
         request.user.auth_token.delete()
         event_logger.auth.info(
@@ -366,6 +345,7 @@ class ActionsViewSet(viewsets.ModelViewSet):
         if self.action == "metadata":
             return
         self.validate_object_action(self.action)
+        self.reset_filterset_class(self.action)
 
     def validate_object_action(self, action_name, obj=None):
         """Execute validation for actions that are related to particular object"""
@@ -382,6 +362,12 @@ class ActionsViewSet(viewsets.ModelViewSet):
         for validator in validators:
             validator(obj or self.get_object())
 
+    def reset_filterset_class(self, action_name):
+        action_method = getattr(self, action_name)
+
+        if getattr(action_method, "detail", False):
+            self.filterset_class = None
+
 
 class ReadOnlyActionsViewSet(ActionsViewSet):
     disabled_actions = ["create", "update", "partial_update", "destroy"]
@@ -394,7 +380,7 @@ def get_feature_values():
     return {
         section["key"]: {
             feature["key"]: feature_values.get(
-                f'{section["key"]}.{feature["key"]}', False
+                f"{section['key']}.{feature['key']}", False
             )
             for feature in section["items"]
         }
@@ -503,20 +489,34 @@ def get_public_settings(request=None):
     return public_settings
 
 
+@extend_schema(
+    description="Retrieve public settings",
+    request=None,
+    responses={status.HTTP_200_OK: dict},
+)
 @api_view(["GET"])
 @permission_classes((rf_permissions.AllowAny,))
 def configuration_detail(request):
     return Response(get_public_settings(request))
 
 
+@extend_schema(
+    methods=["GET"],
+    request=ConstanceSettingsSerializer,
+    responses={status.HTTP_200_OK: ConstanceSettingsSerializer},
+)
+@extend_schema(
+    methods=["POST"],
+    request=ConstanceSettingsSerializer,
+    responses={status.HTTP_200_OK: None},
+)
 @api_view(["POST", "GET"])
 @permission_classes((rf_permissions.IsAdminUser,))
 def override_db_settings(request):
     if request.method == "GET":
         from constance.admin import get_values
 
-        serialized_data = ConstanceSettingsSerializer(get_values())
-        return Response(serialized_data.data)
+        return Response(get_values())
     serializer = ConstanceSettingsSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     serializer.save()
@@ -524,6 +524,11 @@ def override_db_settings(request):
     return Response(status=status.HTTP_200_OK)
 
 
+@extend_schema(
+    description="Override feature values",
+    request=dict,
+    responses={status.HTTP_200_OK: str},
+)
 @api_view(["POST"])
 @permission_classes((rf_permissions.IsAdminUser,))
 def feature_values(request):
@@ -537,7 +542,7 @@ def feature_values(request):
             feature_value = request.data.get(section["key"], {}).get(feature["key"])
             if feature_value is not None:
                 models.Feature.objects.update_or_create(
-                    key=f'{section["key"]}.{feature["key"]}',
+                    key=f"{section['key']}.{feature['key']}",
                     defaults=dict(value=feature_value),
                 )
                 updated += 1
@@ -625,39 +630,13 @@ class UpdateReversionMixin:
             reversion.set_comment("Updated via REST API")
 
 
-class ReviewViewSet(ActionsViewSet):
-    disabled_actions = ["create", "destroy", "update", "partial_update"]
-    lookup_field = "uuid"
-
-    @action(detail=True, methods=["post"])
-    def approve(self, request, **kwargs):
-        review_request = self.get_object()
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        comment = serializer.validated_data.get("comment")
-        review_request.approve(request.user, comment)
-        return Response(status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=["post"])
-    def reject(self, request, **kwargs):
-        review_request = self.get_object()
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        comment = serializer.validated_data.get("comment")
-        review_request.reject(request.user, comment)
-        return Response(status=status.HTTP_200_OK)
-
-    approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
-    approve_validators = reject_validators = [
-        StateValidator(ReviewMixin.States.PENDING)
-    ]
-
-
-class CeleryStatsViewSet(APIView):
+class CeleryStatsViewSet(generics.GenericAPIView):
     permission_classes = [rf_permissions.IsAuthenticated, permissions.IsSupport]
+    filter_backends = []
+    serializer_class = EmptySerializer
 
     def get(self, request, *args, **kwargs):
-        from waldur_core.server.celery import app
+        from waldur_core.server.celeryconf import app
 
         inspect = app.control.inspect()
         data = {
@@ -701,6 +680,7 @@ def dictfetchall(cursor):
 class DatabaseStatsViewSet(APIView):
     permission_classes = [rf_permissions.IsAuthenticated, permissions.IsSupport]
 
+    @extend_schema(request=None, responses=TableSizeSerializer(many=True))
     def get(self, request, *args, **kwargs):
         data = []
         with connection.cursor() as cursor:
@@ -710,8 +690,17 @@ class DatabaseStatsViewSet(APIView):
         return Response(data, status=status.HTTP_200_OK)
 
 
-class QueryViewSet(APIView):
+@extend_schema(
+    description="Execute SQL query against readonly database",
+    request=QuerySerializer,
+    responses={
+        200: list[Any],
+        400: None,
+    },
+)
+class QueryViewSet(generics.GenericAPIView):
     permission_classes = [rf_permissions.IsAuthenticated, permissions.IsSupport]
+    serializer_class = QuerySerializer
 
     def post(self, request, *args, **kwargs):
         data = []
@@ -733,30 +722,85 @@ class QueryViewSet(APIView):
             f"User {user.full_name} / {user.uuid} executing query '{query}'",
         )
 
-        with connections["readonly"].cursor() as cursor:
-            cursor.execute(query)
-            data = cursor.fetchall()
+        try:
+            with connections["readonly"].cursor() as cursor:
+                cursor.execute(query)
+                data = cursor.fetchall()
+                return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response(data, status=status.HTTP_200_OK)
 
-
+@extend_schema(exclude=True)
 @api_view(["GET"])
 @permission_classes((rf_permissions.AllowAny,))
 def get_whitelabeling_logo(request, logo_type, default_image=None):
-    try:
-        file_name = getattr(config, logo_type)
-        content_type, encoding = mimetypes.guess_type(file_name)
-        return FileResponse(default_storage.open(file_name), content_type=content_type)
-    except NotImplementedError:  # storage cannot handle empty response
-        if default_image:
+    file_name = getattr(config, logo_type)
+    if file_name:
+        try:
+            content_type, encoding = mimetypes.guess_type(file_name)
+            return FileResponse(
+                default_storage.open(file_name), content_type=content_type
+            )
+        except FileNotFoundError:
+            logger.error(f"Custom logo file not found: {file_name}")
+    if default_image:
+        try:
             content_type, encoding = mimetypes.guess_type(default_image)
-            image_data = open(default_image, "rb").read()
-            return HttpResponse(image_data, content_type=content_type)
+            with open(default_image, "rb") as f:
+                return HttpResponse(f.read(), content_type=content_type)
+        except FileNotFoundError:
+            logger.error(f"Default logo file not found: {default_image}")
+    # Return 404 if we couldn't serve either custom or default
     return Response(
         {"error": f"{logo_type} not found"}, status=status.HTTP_404_NOT_FOUND
     )
 
 
+def get_latest_github_tag(timeout=5):
+    """
+    Fetch the latest tag from GitHub with caching.
+    Cache timeout is 1 hour to avoid hitting GitHub API too frequently.
+    """
+    cache_key = "waldur_latest_github_tag"
+    cached_version = cache.get(cache_key)
+    if cached_version:
+        return cached_version
+
+    try:
+        response = requests.get(
+            "https://api.github.com/repos/waldur/waldur-docs/git/refs/tags",
+            timeout=timeout,
+        )
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch latest GitHub tag: {str(e)}")
+        return None
+
+    try:
+        tags = response.json()
+    except requests.JSONDecodeError:
+        logger.error("Failed to decode JSON response from GitHub")
+        return None
+
+    # Get the last tag (most recent one)
+    try:
+        latest_tag = tags[-1]["ref"].replace("refs/tags/", "")
+        version.parse(latest_tag)
+    except (TypeError, KeyError, version.InvalidVersion):
+        logger.error("Invalid tag format in the GitHub response %s", tags)
+        return None
+
+    # Cache for 1 hour
+    cache.set(cache_key, latest_tag, timeout=3600)
+    return latest_tag
+
+
+@extend_schema(
+    description="Retrieve current version of the application and the latest available version from GitHub (if available).",
+    request=None,
+    responses=VersionSerializer,
+)
 @api_view(["GET"])
 @permission_classes(
     (
@@ -767,7 +811,15 @@ def get_whitelabeling_logo(request, logo_type, default_image=None):
 def version_detail(request):
     """Retrieve version of the application"""
 
-    return Response({"version": __version__})
+    response_data = {
+        "version": __version__,
+    }
+
+    latest_version = get_latest_github_tag()
+    if latest_version:
+        response_data["latest_version"] = latest_version
+    serializer = VersionSerializer(response_data)
+    return Response(serializer.data)
 
 
 class ActionMethodMixin:
@@ -787,7 +839,7 @@ class ActionMethodMixin:
             delete_validators=[],
             update_validators=[
                 core_validators.StateValidator(
-                    models.RequestedOffering.States.REQUESTED
+                    RequestedOfferingStates.REQUESTED
                 )
             ],
         )(self, request, uuid, obj_uuid)

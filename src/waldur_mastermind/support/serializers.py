@@ -4,7 +4,6 @@ from datetime import timedelta
 
 from constance import config
 from django.conf import settings
-from django.contrib.auth import get_user_model
 from django.core import signing
 from django.db import transaction
 from django.template import Context, Template
@@ -15,16 +14,19 @@ from rest_framework import exceptions, serializers
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core.clean_html import clean_html
+from waldur_core.core.enums import CoreStateType
+from waldur_core.core.models import User
 from waldur_core.core.utils import is_uuid_like, text2html
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.registry import get_resource_type
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.support.backend.atlassian import ServiceDeskBackend
+from waldur_mastermind.support.enums import SupportWebhookEvent
 
 from . import backend, models, utils
 
 logger = logging.getLogger(__name__)
-User = get_user_model()
 
 
 def render_issue_template(config_name, template_name, issue):
@@ -35,14 +37,16 @@ def render_issue_template(config_name, template_name, issue):
         template = Template(raw)
 
     return template.render(
-        Context({"issue": issue, "settings": settings}, autoescape=False)
+        Context(
+            {"issue": issue, "settings": settings, "config": config}, autoescape=False
+        )
     )
 
 
 class NestedFeedbackSerializer(serializers.HyperlinkedModelSerializer):
     state = serializers.ReadOnlyField(source="get_state_display")
-    evaluation = serializers.ReadOnlyField(source="get_evaluation_display")
-    evaluation_number = serializers.ReadOnlyField(source="evaluation")
+    evaluation = serializers.IntegerField(read_only=True)
+    evaluation_number = serializers.IntegerField(read_only=True, source="evaluation")
 
     class Meta:
         model = models.Feedback
@@ -87,7 +91,7 @@ class IssueSerializer(
         allow_null=True,
     )
     resource_type = serializers.SerializerMethodField()
-    resource_name = serializers.ReadOnlyField(source="resource.name")
+    resource_name = serializers.CharField(read_only=True, source="resource.name")
     type = serializers.ChoiceField(
         choices=[
             (t.strip(), t.strip()) for t in config.ATLASSIAN_ISSUE_TYPES.split(",")
@@ -101,7 +105,7 @@ class IssueSerializer(
         write_only=True,
         help_text=_("Set true if issue is created by regular user via portal."),
     )
-    feedback = NestedFeedbackSerializer(required=False, read_only=True)
+    feedback = NestedFeedbackSerializer(required=False, read_only=True, allow_null=True)
     update_is_available = serializers.SerializerMethodField()
     destroy_is_available = serializers.SerializerMethodField()
     add_comment_is_available = serializers.SerializerMethodField()
@@ -210,27 +214,30 @@ class IssueSerializer(
             return fields
 
         user = self.context["view"].request.user
-        if not user.is_staff and not user.is_support:
+        if user.is_authenticated and not user.is_staff and not user.is_support:
             del fields["link"]
 
         return fields
 
-    def get_resource_type(self, obj):
-        if isinstance(obj.resource, structure_models.BaseResource):
-            return get_resource_type(obj.resource_content_type.model_class())
-        if isinstance(obj.resource, marketplace_models.Resource):
-            return "Marketplace.Resource"
+    def get_resource_type(self, obj) -> str:
+        try:
+            if isinstance(obj.resource, structure_models.BaseResource):
+                return get_resource_type(obj.resource_content_type.model_class())
+            if isinstance(obj.resource, marketplace_models.Resource):
+                return "Marketplace.Resource"
+        except AttributeError:
+            return ""
 
-    def get_update_is_available(self, obj):
+    def get_update_is_available(self, obj) -> bool:
         return backend.get_active_backend().update_is_available(obj)
 
-    def get_destroy_is_available(self, obj):
+    def get_destroy_is_available(self, obj) -> bool:
         return backend.get_active_backend().destroy_is_available(obj)
 
-    def get_add_comment_is_available(self, obj):
+    def get_add_comment_is_available(self, obj) -> bool:
         return backend.get_active_backend().comment_create_is_available(obj)
 
-    def get_add_attachment_is_available(self, obj):
+    def get_add_attachment_is_available(self, obj) -> bool:
         return backend.get_active_backend().attachment_create_is_available(obj)
 
     def validate(self, attrs):
@@ -294,7 +301,7 @@ class IssueSerializer(
 
         return summary
 
-    def validate_customer(self, customer):
+    def validate_customer(self, customer: structure_models.Customer):
         """User has to be customer owner, staff or global support"""
         if not customer:
             return customer
@@ -303,14 +310,14 @@ class IssueSerializer(
             not customer
             or user.is_staff
             or user.is_support
-            or customer.has_user(user, structure_models.CustomerRole.OWNER)
+            or customer.has_user(user, CustomerRole.OWNER)
         ):
             return customer
         raise serializers.ValidationError(
             _("Only customer owner, staff or support can report customer issues.")
         )
 
-    def validate_project(self, project):
+    def validate_project(self, project: structure_models.Project):
         if not project:
             return project
         user = self.context["request"].user
@@ -318,10 +325,10 @@ class IssueSerializer(
             not project
             or user.is_staff
             or user.is_support
-            or project.customer.has_user(user, structure_models.CustomerRole.OWNER)
-            or project.has_user(user, structure_models.ProjectRole.MANAGER)
-            or project.has_user(user, structure_models.ProjectRole.ADMINISTRATOR)
-            or project.has_user(user, structure_models.ProjectRole.MEMBER)
+            or project.customer.has_user(user, CustomerRole.OWNER)
+            or project.has_user(user, ProjectRole.MANAGER)
+            or project.has_user(user, ProjectRole.ADMIN)
+            or project.has_user(user, ProjectRole.MEMBER)
         ):
             return project
         raise serializers.ValidationError(
@@ -337,7 +344,7 @@ class IssueSerializer(
 
     def validate_priority(self, priority):
         user = self.context["request"].user
-        if not user.is_staff and not user.is_support:
+        if user.is_authenticated and not user.is_staff and not user.is_support:
             raise serializers.ValidationError(
                 _("Only staff or support can specify issue priority.")
             )
@@ -404,7 +411,7 @@ class CommentSerializer(
         read_only=True,
     )
 
-    author_uuid = serializers.ReadOnlyField(source="author.user.uuid")
+    author_uuid = serializers.UUIDField(read_only=True, source="author.user.uuid")
     author_email = serializers.ReadOnlyField(source="author.user.email")
     update_is_available = serializers.SerializerMethodField()
     destroy_is_available = serializers.SerializerMethodField()
@@ -442,10 +449,10 @@ class CommentSerializer(
         )
         protected_fields = ("remote_id",)
 
-    def get_update_is_available(self, obj):
+    def get_update_is_available(self, obj) -> bool:
         return backend.get_active_backend().comment_update_is_available(obj)
 
-    def get_destroy_is_available(self, obj):
+    def get_destroy_is_available(self, obj) -> bool:
         return backend.get_active_backend().comment_destroy_is_available(obj)
 
     def validate_description(self, description):
@@ -515,23 +522,8 @@ class JiraIssueSerializer(serializers.Serializer):
 
 
 class WebHookReceiverSerializer(serializers.Serializer):
-    class Event:
-        ISSUE_UPDATE = 2
-        ISSUE_DELETE = 4
-        COMMENT_CREATE = 5
-        COMMENT_UPDATE = 6
-        COMMENT_DELETE = 7
-
-        ISSUE_ACTIONS = (ISSUE_UPDATE, ISSUE_DELETE)
-        COMMENT_ACTIONS = (COMMENT_CREATE, COMMENT_UPDATE, COMMENT_DELETE)
-
-        CHOICES = {
-            ("jira:issue_updated", ISSUE_UPDATE),
-            ("jira:issue_deleted", ISSUE_DELETE),
-            ("comment_created", COMMENT_CREATE),
-            ("comment_updated", COMMENT_UPDATE),
-            ("comment_deleted", COMMENT_DELETE),
-        }
+    class Event(SupportWebhookEvent):
+        pass
 
     webhookEvent = serializers.ChoiceField(choices=Event.CHOICES)
     issue = JiraIssueSerializer()
@@ -542,24 +534,40 @@ class WebHookReceiverSerializer(serializers.Serializer):
     )  # For old Jira's version
 
     def create(self, validated_data):
+        logger.debug("Processing webhook with data: %s", validated_data)
+
         event_type = dict(self.Event.CHOICES).get(validated_data["webhookEvent"])
+        logger.info("Processing webhook event type: %s", event_type)
+
         fields = validated_data["issue"]["fields"]
         key = validated_data["issue"]["key"]
+        logger.debug("Processing issue key: %s", key)
+
         backend = ServiceDeskBackend()
-        issue = self.get_issue(key)
+        issue: models.Issue = self.get_issue(key)
+        logger.info("Loaded issue %s from database", issue)
 
         if fields.get("comment", False):
             # The processing of hooks requests for the old and new Jira versions is different.
             # The main difference is that in the old version, when changing comments,
             # jira:issue_updated event is sent to the new comment_X event.
             old_jira = validated_data.get("issue_event_type_name", True)
+            logger.debug(
+                "Using old Jira format: %s, event type: %s",
+                old_jira,
+                validated_data.get("issue_event_type_name"),
+            )
         else:
             old_jira = False
 
         if event_type == self.Event.ISSUE_UPDATE:
+            logger.info("Processing issue update for key: %s", key)
             if old_jira:
                 if old_jira == "issue_commented":
                     comment_backend_id = validated_data["comment"]["id"]
+                    logger.debug(
+                        "Creating comment from Jira, comment ID: %s", comment_backend_id
+                    )
                     backend.create_comment_from_jira(issue, comment_backend_id)
 
                 if old_jira == "issue_comment_edited":
@@ -582,12 +590,15 @@ class WebHookReceiverSerializer(serializers.Serializer):
                 backend.update_attachment_from_jira(issue)
 
         elif event_type == self.Event.ISSUE_DELETE:
+            logger.info("Processing issue deletion for key: %s", key)
             backend.delete_issue_from_jira(issue)
 
         elif event_type in self.Event.COMMENT_ACTIONS:
+            logger.info("Processing comment action: %s for issue: %s", event_type, key)
             try:
                 comment_backend_id = validated_data["comment"]["id"]
             except KeyError:
+                logger.error("Missing comment ID in webhook data")
                 raise serializers.ValidationError(
                     "Request not include fields.comment.id"
                 )
@@ -607,6 +618,7 @@ class WebHookReceiverSerializer(serializers.Serializer):
                 backend.delete_comment_from_jira(comment)
                 backend.update_attachment_from_jira(issue)
 
+        logger.debug("Webhook processing completed for issue: %s", key)
         return validated_data
 
     def get_issue(self, key):
@@ -670,11 +682,11 @@ class AttachmentSerializer(
             issue=("key",),
         )
 
-    def get_file_name(self, attachment):
+    def get_file_name(self, attachment) -> str:
         _, file_name = os.path.split(attachment.file.name)
         return file_name
 
-    def get_destroy_is_available(self, obj):
+    def get_destroy_is_available(self, obj) -> bool:
         return backend.get_active_backend().attachment_destroy_is_available(obj)
 
     def validate(self, attrs):
@@ -697,10 +709,7 @@ class AttachmentSerializer(
 
         if (
             user.is_staff
-            or (
-                issue.customer
-                and issue.customer.has_user(user, structure_models.CustomerRole.OWNER)
-            )
+            or (issue.customer and issue.customer.has_user(user, CustomerRole.OWNER))
             or issue.caller == user
         ):
             return attrs
@@ -708,14 +717,18 @@ class AttachmentSerializer(
         raise exceptions.PermissionDenied()
 
 
+class CreateAttachmentsSerializer(serializers.Serializer):
+    attachments = serializers.ListSerializer(child=serializers.FileField())
+
+
 class TemplateAttachmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.TemplateAttachment
-        fields = ("name", "file")
+        fields = ("uuid", "name", "file", "mime_type", "file_size", "created")
 
 
 class TemplateSerializer(serializers.HyperlinkedModelSerializer):
-    attachments = TemplateAttachmentSerializer(many=True)
+    attachments = TemplateAttachmentSerializer(many=True, read_only=True)
 
     class Meta:
         model = models.Template
@@ -723,22 +736,13 @@ class TemplateSerializer(serializers.HyperlinkedModelSerializer):
             "url",
             "uuid",
             "name",
-            "native_name",
             "description",
-            "native_description",
             "issue_type",
             "attachments",
         )
         extra_kwargs = dict(
             url={"lookup_field": "uuid", "view_name": "support-template-detail"},
         )
-
-    def get_fields(self):
-        fields = super().get_fields()
-        if not settings.WALDUR_CORE["NATIVE_NAME_ENABLED"]:
-            del fields["native_name"]
-            del fields["native_description"]
-        return fields
 
 
 class CreateFeedbackSerializer(serializers.HyperlinkedModelSerializer):
@@ -788,10 +792,14 @@ class CreateFeedbackSerializer(serializers.HyperlinkedModelSerializer):
 
 
 class FeedbackSerializer(serializers.HyperlinkedModelSerializer):
-    issue_uuid = serializers.ReadOnlyField(source="issue.uuid")
+    issue_uuid = serializers.UUIDField(read_only=True, source="issue.uuid")
     issue_key = serializers.ReadOnlyField(source="issue.key")
     user_full_name = serializers.ReadOnlyField(source="issue.caller.full_name")
     issue_summary = serializers.ReadOnlyField(source="issue.summary")
+    state = serializers.SerializerMethodField()
+
+    def get_state(self, obj) -> CoreStateType:
+        return obj.get_state_display()
 
     class Meta:
         model = models.Feedback
@@ -807,3 +815,17 @@ class FeedbackSerializer(serializers.HyperlinkedModelSerializer):
             "issue_key",
             "issue_summary",
         )
+
+
+class SupportStatsSerializer(serializers.Serializer):
+    open_issues_count = serializers.IntegerField(read_only=True)
+    closed_this_month_count = serializers.IntegerField(read_only=True)
+    recent_broadcasts_count = serializers.IntegerField(read_only=True)
+
+
+class DeleteAttachmentsSerializer(serializers.Serializer):
+    attachment_ids = serializers.ListField(child=serializers.UUIDField())
+
+
+class SmaxWebHookReceiverSerializer(serializers.Serializer):
+    id = serializers.CharField()

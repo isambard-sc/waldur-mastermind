@@ -3,20 +3,20 @@ import logging
 import rest_framework
 from django.db.models import Count
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import OpenApiExample, extend_schema, extend_schema_view
 from rest_framework import (
     decorators,
+    generics,
     mixins,
     permissions,
     response,
     status,
-    views,
     viewsets,
 )
 
 from waldur_core.core import filters as core_filters
 from waldur_core.core import models as core_models
 from waldur_core.core import permissions as core_permissions
-from waldur_core.core import views as core_views
 from waldur_core.core.managers import SummaryQuerySet
 from waldur_core.logging import backend, filters, models, serializers, utils
 from waldur_core.logging.loggers import get_event_groups
@@ -34,19 +34,17 @@ class EventViewSet(viewsets.ReadOnlyModelViewSet):
     filter_backends = (DjangoFilterBackend, filters.EventFilterBackend)
     filterset_class = filters.EventFilter
 
+    @extend_schema(
+        examples=[
+            OpenApiExample(
+                name="Valid example",
+                value={"count": 12321},
+                response_only=True,
+            )
+        ],
+    )
     @decorators.action(detail=False)
     def count(self, request, *args, **kwargs):
-        """
-        To get a count of events - run **GET** against */api/events/count/* as authenticated user.
-        Endpoint support same filters as events list.
-
-        Response example:
-
-        .. code-block:: javascript
-
-            {"count": 12321}
-        """
-
         self.queryset = self.filter_queryset(self.get_queryset())
         return response.Response(
             {"count": self.queryset.count()}, status=status.HTTP_200_OK
@@ -69,7 +67,6 @@ class EventViewSet(viewsets.ReadOnlyModelViewSet):
 class BaseHookViewSet(viewsets.ModelViewSet):
     """
     Hooks API allows user to receive event notifications via different channel, like email or webhook.
-    To get a list of all your hooks, run **GET** against */api/hooks/* as an authenticated user.
     """
 
     filter_backends = (core_filters.StaffOrUserFilter, DjangoFilterBackend)
@@ -81,28 +78,23 @@ class WebHookViewSet(BaseHookViewSet):
     filterset_class = filters.WebHookFilter
     serializer_class = serializers.WebHookSerializer
 
+    @extend_schema(
+        examples=[
+            OpenApiExample(
+                request_only=True,
+                name="webhook-create",
+                value={
+                    "event_types": ["resource_start_succeeded"],
+                    "event_groups": ["users"],
+                    "destination_url": "http://example.com/",
+                },
+                description="You should specify list of event_types or event_groups.",
+            )
+        ]
+    )
     def create(self, request, *args, **kwargs):
         """
-        To create new web hook issue **POST** against */api/hooks-web/* as an authenticated user.
-        You should specify list of event_types or event_groups.
-
-        Example of a request:
-
-        .. code-block:: http
-
-            POST /api/hooks-web/ HTTP/1.1
-            Content-Type: application/json
-            Accept: application/json
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-            {
-                "event_types": ["resource_start_succeeded"],
-                "event_groups": ["users"],
-                "destination_url": "http://example.com/"
-            }
-
-        When hook is activated, **POST** request is issued against destination URL with the following data:
+        When hook is activated, POST request is issued against destination URL with the following data:
 
         .. code-block:: javascript
 
@@ -129,46 +121,41 @@ class WebHookViewSet(BaseHookViewSet):
         return super().create(request, *args, **kwargs)
 
 
+@extend_schema_view(
+    create=extend_schema(
+        examples=[
+            OpenApiExample(
+                request_only=True,
+                name="email-hook-create",
+                value={
+                    "event_types": ["openstack_instance_start_succeeded"],
+                    "event_groups": ["users"],
+                    "email": "test@example.com",
+                },
+                description="You should specify list of event_types or event_groups.",
+            )
+        ]
+    ),
+    partial_update=extend_schema(
+        examples=[
+            OpenApiExample(
+                request_only=True,
+                name="email-hook-update",
+                value={"is_active": "false"},
+                description="temporarily disable hook without deleting it.",
+            )
+        ]
+    ),
+)
 class EmailHookViewSet(BaseHookViewSet):
     queryset = models.EmailHook.objects.all()
     filterset_class = filters.EmailHookFilter
     serializer_class = serializers.EmailHookSerializer
 
-    def create(self, request, *args, **kwargs):
-        """
-        To create new email hook issue **POST** against */api/hooks-email/* as an authenticated user.
-        You should specify list of event_types or event_groups.
-
-        Example of a request:
-
-        .. code-block:: http
-
-            POST /api/hooks-email/ HTTP/1.1
-            Content-Type: application/json
-            Accept: application/json
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-            {
-                "event_types": ["openstack_instance_start_succeeded"],
-                "event_groups": ["users"],
-                "email": "test@example.com"
-            }
-
-        You may temporarily disable hook without deleting it by issuing following **PATCH** request against hook URL:
-
-        .. code-block:: javascript
-
-            {
-                "is_active": "false"
-            }
-        """
-        return super().create(request, *args, **kwargs)
-
 
 class HookSummary(mixins.ListModelMixin, viewsets.GenericViewSet):
     """
-    Use */api/hooks/* to get a list of all the hooks of any type that a user can see.
+    Use /api/hooks/ to get a list of all the hooks of any type that a user can see.
     """
 
     serializer_class = serializers.SummaryHookSerializer
@@ -178,10 +165,11 @@ class HookSummary(mixins.ListModelMixin, viewsets.GenericViewSet):
         return SummaryQuerySet(models.BaseHook.get_all_models())
 
 
-class EventsStatsViewSet(viewsets.ReadOnlyModelViewSet):
+class EventsStatsViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
     queryset = models.Event.objects.all()
     filter_backends = (filters.EventFilterBackend,)
 
+    @extend_schema(responses=serializers.EventStatsSerializer(many=True))
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
         aggregated_result = (
@@ -201,16 +189,18 @@ class EventsStatsViewSet(viewsets.ReadOnlyModelViewSet):
 
         return self.get_paginated_response(final_result)
 
-    def retrieve(self, request, *args, **kwargs):
-        return response.Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
-
-class EventSubscriptionViewSet(core_views.ActionsViewSet):
+class EventSubscriptionViewSet(
+    mixins.CreateModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.ListModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
     lookup_field = "uuid"
     queryset = models.EventSubscription.objects.all().order_by("-created")
     serializer_class = serializers.EventSubscriptionSerializer
     filterset_class = filters.EventSubscriptionFilter
-    disabled_actions = ["update", "partial_update"]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -248,8 +238,11 @@ class EventSubscriptionViewSet(core_views.ActionsViewSet):
         super().perform_destroy(instance)
 
 
-class RabbitMQVhostStats(views.APIView):
+class RabbitMQVhostStats(generics.GenericAPIView):
     permission_classes = [permissions.IsAuthenticated, core_permissions.IsSupport]
+    serializer_class = serializers.RmqVHostStatsSerializer
+    filter_backends = []
+    pagination_class = None
 
     def get(self, request, *args, **kwargs):
         rmq_backend = backend.RabbitMQManagementBackend()
@@ -283,17 +276,13 @@ class RabbitMQVhostStats(views.APIView):
 
             output.append(vhost_record)
 
-        return response.Response(
-            output,
-            status=status.HTTP_200_OK,
-        )
+        return response.Response(output, status=status.HTTP_200_OK)
 
 
-class RabbitMQUserStats(views.APIView):
+class RabbitMQUserStats(generics.GenericAPIView):
     permission_classes = [permissions.IsAuthenticated, core_permissions.IsSupport]
-    from waldur_core.core import pagination
-
-    pagination_class = pagination.LinkHeaderPagination
+    serializer_class = serializers.RmqUserStatsSerializer
+    filter_backends = []
 
     def get(self, request, *args, **kwargs):
         rmq_backend = backend.RabbitMQManagementBackend()
@@ -314,3 +303,14 @@ class RabbitMQUserStats(views.APIView):
         paginator = self.pagination_class()
         paginated_output = paginator.paginate_queryset(output, request)
         return paginator.get_paginated_response(paginated_output)
+
+
+class EmailLogView(viewsets.ReadOnlyModelViewSet):
+    queryset = models.EmailLog.objects.all()
+    lookup_field = "uuid"
+    permission_classes = (
+        permissions.IsAuthenticated,
+        core_permissions.IsSupport,
+    )
+    filterset_class = filters.EmailLogFilter
+    serializer_class = serializers.EmailLogSerializer

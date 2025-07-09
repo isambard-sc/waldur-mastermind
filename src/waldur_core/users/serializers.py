@@ -1,4 +1,3 @@
-from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
 from waldur_core.core.serializers import GenericRelatedField
@@ -7,20 +6,23 @@ from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import get_valid_models
 from waldur_core.structure.permissions import _get_customer
 from waldur_core.users import models
-
-User = get_user_model()
+from waldur_core.users.enums import InvitationStateType
 
 
 class BaseInvitationDetailsSerializer(serializers.HyperlinkedModelSerializer):
-    created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
-    created_by_username = serializers.ReadOnlyField(source="created_by.username")
-    scope_uuid = serializers.ReadOnlyField(source="scope.uuid")
-    scope_name = serializers.ReadOnlyField(source="scope.name")
+    created_by_full_name = serializers.CharField(
+        read_only=True, source="created_by.full_name"
+    )
+    created_by_username = serializers.CharField(
+        read_only=True, source="created_by.username"
+    )
+    scope_uuid = serializers.UUIDField(read_only=True, source="scope.uuid")
+    scope_name = serializers.CharField(read_only=True, source="scope.name")
     scope_type = serializers.SerializerMethodField()
-    customer_uuid = serializers.ReadOnlyField(source="customer.uuid")
-    customer_name = serializers.ReadOnlyField(source="customer.name")
-    role_name = serializers.ReadOnlyField(source="role.name")
-    role_description = serializers.ReadOnlyField(source="role.description")
+    customer_uuid = serializers.UUIDField(read_only=True, source="customer.uuid")
+    customer_name = serializers.CharField(read_only=True, source="customer.name")
+    role_name = serializers.CharField(read_only=True, source="role.name")
+    role_description = serializers.CharField(read_only=True, source="role.description")
 
     class Meta:
         model = models.BaseInvitation
@@ -36,7 +38,7 @@ class BaseInvitationDetailsSerializer(serializers.HyperlinkedModelSerializer):
             "created_by_username",
         )
 
-    def get_scope_type(self, invitation: models.Invitation):
+    def get_scope_type(self, invitation: models.Invitation) -> str:
         if not invitation.content_type:
             return
         for name, (app_label, model_name) in TYPE_MAP.items():
@@ -108,7 +110,6 @@ class InvitationSerializer(BaseInvitationSerializer):
         fields = BaseInvitationSerializer.Meta.fields + (
             "full_name",
             "native_name",
-            "tax_number",
             "phone_number",
             "organization",
             "job_title",
@@ -134,6 +135,8 @@ class InvitationSerializer(BaseInvitationSerializer):
 
 
 class VisibleInvitationDetailsSerializer(BaseInvitationDetailsSerializer):
+    state = serializers.SerializerMethodField()
+
     class Meta:
         model = models.Invitation
         fields = BaseInvitationDetailsSerializer.Meta.fields + (
@@ -147,19 +150,36 @@ class VisibleInvitationDetailsSerializer(BaseInvitationDetailsSerializer):
             "execution_state",
         )
 
+    def get_state(self, obj) -> InvitationStateType:
+        return obj.state
+
 
 class PermissionRequestSerializer(serializers.HyperlinkedModelSerializer):
-    created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
-    created_by_username = serializers.ReadOnlyField(source="created_by.username")
-    reviewed_by_full_name = serializers.ReadOnlyField(source="reviewed_by.full_name")
-    reviewed_by_username = serializers.ReadOnlyField(source="reviewed_by.username")
-    state = serializers.ReadOnlyField(source="get_state_display")
-    scope_uuid = serializers.ReadOnlyField(source="invitation.scope.uuid")
-    scope_name = serializers.ReadOnlyField(source="invitation.scope.name")
-    customer_uuid = serializers.ReadOnlyField(source="invitation.customer.uuid")
-    customer_name = serializers.ReadOnlyField(source="invitation.customer.name")
-    role_name = serializers.ReadOnlyField(source="invitation.role.name")
-    role_description = serializers.ReadOnlyField(source="invitation.role.description")
+    created_by_full_name = serializers.CharField(
+        read_only=True, source="created_by.full_name"
+    )
+    created_by_username = serializers.CharField(
+        read_only=True, source="created_by.username"
+    )
+    reviewed_by_full_name = serializers.CharField(
+        read_only=True, source="reviewed_by.full_name"
+    )
+    reviewed_by_username = serializers.CharField(
+        read_only=True, source="reviewed_by.username"
+    )
+    state = serializers.CharField(read_only=True, source="get_state_display")
+    scope_uuid = serializers.UUIDField(read_only=True, source="invitation.scope.uuid")
+    scope_name = serializers.CharField(read_only=True, source="invitation.scope.name")
+    customer_uuid = serializers.UUIDField(
+        read_only=True, source="invitation.customer.uuid"
+    )
+    customer_name = serializers.CharField(
+        read_only=True, source="invitation.customer.name"
+    )
+    role_name = serializers.CharField(read_only=True, source="invitation.role.name")
+    role_description = serializers.CharField(
+        read_only=True, source="invitation.role.description"
+    )
 
     class Meta:
         model = models.PermissionRequest
@@ -193,3 +213,12 @@ class PermissionRequestSerializer(serializers.HyperlinkedModelSerializer):
                 "view_name": "user-group-invitation-detail",
             },
         }
+
+
+class TokenSerializer(serializers.Serializer):
+    token = serializers.CharField()
+
+
+class InvitationCheckSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    civil_number_required = serializers.BooleanField(required=False)

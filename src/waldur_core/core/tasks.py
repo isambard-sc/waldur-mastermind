@@ -14,6 +14,7 @@ from django.db.models import ObjectDoesNotExist
 from django_fsm import TransitionNotAllowed
 
 from waldur_core.core import models, utils
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.exceptions import RuntimeStateException
 
 logger = logging.getLogger(__name__)
@@ -307,7 +308,7 @@ class ErrorMessageTask(Task):
                 error_message = instance.error_message or self.result.result or ""
                 error_traceback = str(self.result.traceback)
             except AttributeError as ex:
-                error_message = f"Internal error: {ex.message}"
+                error_message = f"Internal error: {ex}"
                 error_traceback = traceback.format_exc()
 
             instance.error_message = error_message
@@ -316,7 +317,7 @@ class ErrorMessageTask(Task):
             instance.save(update_fields=["error_message", "error_traceback"])
 
             # log exception if instance is not already ERRED.
-            if instance.state != models.StateMixin.States.ERRED:
+            if instance.state != CoreStates.ERRED:
                 message = "Instance: %s.\n" % utils.serialize_instance(instance)
                 message += "Error: %s.\n" % error_message
                 message += error_traceback
@@ -474,6 +475,10 @@ class PollRuntimeStateTask(Task):
         getattr(backend, backend_pull_method)(instance)
         instance.refresh_from_db()
         if instance.runtime_state not in (success_state, erred_state, deleted_state):
+            logger.info(
+                f"Instance {instance.pk} runtime state ({instance.runtime_state}) is not matching "
+                f"success ({success_state}), erred ({erred_state}) or deleted ({deleted_state}) states, retrying."
+            )
             self.retry()
         elif instance.runtime_state == erred_state:
             raise RuntimeStateException(
@@ -488,8 +493,8 @@ class PollStateTask(Task):
 
     def execute(self, instance, *args, **kwargs):
         if instance.state not in (
-            models.StateMixin.States.OK,
-            models.StateMixin.States.ERRED,
+            CoreStates.OK,
+            CoreStates.ERRED,
         ):
             self.retry()
 
@@ -536,9 +541,9 @@ class ExtensionTaskMixin(CeleryTask, metaclass=TaskType):
 @shared_task(name="waldur_core.reset_updating_resources")
 def reset_updating_resources():
     for model in models.ActionMixin.get_all_models():
-        for instance in model.objects.filter(
-            state=models.StateMixin.States.UPDATING
-        ).exclude(task_id=None):
+        for instance in model.objects.filter(state=CoreStates.UPDATING).exclude(
+            task_id=None
+        ):
             async_result = AsyncResult(instance.task_id)
             if async_result.ready():
                 instance_description = f"{instance.__class__.__name__} instance `{instance}` (PK: {instance.pk})"

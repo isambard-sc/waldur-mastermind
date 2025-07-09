@@ -10,9 +10,9 @@ from django_filters.filters import MultipleChoiceFilter
 from rest_framework.filters import BaseFilterBackend
 
 from waldur_core.core import fields as core_fields
-from waldur_core.core import mixins as core_mixins
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import ReviewStates
 
 
 class GenericKeyFilterBackend(BaseFilterBackend):
@@ -196,9 +196,9 @@ class ExternalFilterBackend(BaseFilterBackend):
 
     @classmethod
     def register(cls, external_filter):
-        assert isinstance(
-            external_filter, BaseFilterBackend
-        ), "Registered filter has to inherit BaseFilterBackend"
+        assert isinstance(external_filter, BaseFilterBackend), (
+            "Registered filter has to inherit BaseFilterBackend"
+        )
         if hasattr(cls, "_filters"):
             cls._filters.append(external_filter)
         else:
@@ -262,8 +262,8 @@ class ExtendedOrderingFilter(django_filters.OrderingFilter):
 
 
 class CreatedModifiedFilter(django_filters.FilterSet):
-    created = django_filters.DateFilter(lookup_expr="gte", label="Created after")
-    modified = django_filters.DateFilter(lookup_expr="gte", label="Modified after")
+    created = django_filters.DateTimeFilter(lookup_expr="gte", label="Created after")
+    modified = django_filters.DateTimeFilter(lookup_expr="gte", label="Modified after")
 
 
 def filter_by_full_name(queryset, value, field=""):
@@ -283,7 +283,7 @@ def filter_by_user_keyword(queryset, value):
 
 class ReviewStateFilter(MappedMultipleChoiceFilter):
     def __init__(self, *args, **kwargs):
-        kwargs["choices"] = core_mixins.ReviewMixin.States.CHOICES
+        kwargs["choices"] = ReviewStates.CHOICES
         super().__init__(*args, **kwargs)
 
 

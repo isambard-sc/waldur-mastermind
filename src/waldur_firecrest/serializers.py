@@ -3,7 +3,7 @@ from waldur_core.structure.serializers import BaseResourceSerializer
 from . import models
 
 
-class JobSerializer(BaseResourceSerializer):
+class FirecrestJobSerializer(BaseResourceSerializer):
     class Meta(BaseResourceSerializer.Meta):
         model = models.Job
         fields = BaseResourceSerializer.Meta.fields + (
@@ -11,7 +11,7 @@ class JobSerializer(BaseResourceSerializer):
             "file",
             "user",
             "user_uuid",
-            "user_name",
+            "user_username",
             "report",
         )
         read_only_fields = BaseResourceSerializer.Meta.read_only_fields + (
@@ -24,7 +24,7 @@ class JobSerializer(BaseResourceSerializer):
             "user": {"lookup_field": "uuid", "view_name": "user-detail"},
         }
         related_paths = {
-            "user": ("uuid", "name"),
+            "user": ("uuid", "username"),
         }
 
     def get_fields(self):

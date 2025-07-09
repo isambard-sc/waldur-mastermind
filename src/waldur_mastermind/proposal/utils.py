@@ -1,11 +1,17 @@
+import logging
+
 from django.db import transaction
 from django.db.models import OuterRef, QuerySet
 
 from waldur_core.core.utils import SubqueryCount, get_system_robot
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.utils import get_users
+from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.proposal import models as proposal_models
+from waldur_mastermind.proposal.enums import ProposalStates, RequestedOfferingStates
+
+logger = logging.getLogger(__name__)
 
 
 def get_available_reviewer(proposal: proposal_models.Proposal):
@@ -18,11 +24,12 @@ def get_available_reviewer(proposal: proposal_models.Proposal):
         .annotate(reviewers_count=SubqueryCount(reviews))
         .order_by("reviewers_count")
     )
-    number_of_needed_reviewers = (
+    number_of_needed_reviewers = max(
+        0,
         proposal.round.minimum_number_of_reviewers
         - proposal.review_set.exclude(
             state=proposal_models.Review.States.REJECTED
-        ).count()
+        ).count(),
     )
     return available_reviewer[:number_of_needed_reviewers]
 
@@ -31,14 +38,52 @@ def process_proposals_pending_reviewers(proposal: proposal_models.Proposal):
     for reviewer in get_available_reviewer(proposal):
         proposal_models.Review.objects.create(reviewer=reviewer, proposal=proposal)
 
-    proposal.state = proposal_models.Proposal.States.IN_REVIEW
+    proposal.state = ProposalStates.IN_REVIEW
     return proposal.save()
 
 
 def allocate_proposal(proposal: proposal_models.Proposal):
+    proposal_round = proposal.round
+    name = proposal.name
+    start_date = None
+    call_prefix = proposal_round.call.backend_id or proposal_round.call.slug
+    project_name = " - ".join(
+        [call_prefix, proposal_round.start_time.strftime("%Y-%m-%d"), name]
+    )[: structure_models.PROJECT_NAME_LENGTH]
+
+    if (
+        proposal.round.allocation_time
+        == proposal_models.Round.AllocationTimes.FIXED_DATE
+    ):
+        start_date = proposal.round.allocation_date
+
+    # need to create a unique short name for the project
+    short_name = f"{call_prefix}_{proposal.uuid}".replace(" ", "").lower()
+
+    # remove everything except lower-case letters, digits, underscores and hyphens
+    short_name = "".join(c for c in short_name if c.isalnum() or c in ("_", "-"))
+
+    if len(short_name) > 50:
+        short_name = short_name[:50]
+
+    project = structure_models.Project.objects.create(
+        customer=proposal_round.call.manager.customer,
+        name=project_name,
+        start_date=start_date,
+        short_name=short_name,
+    )
+
+    if start_date:
+        logger.info(
+            f"Field start_date of {project} has been changed to {proposal.round.allocation_date}."
+        )
+
+    proposal.project = project
+    proposal.save()
+
     requested_resources: QuerySet[proposal_models.RequestedResource] = (
         proposal.requestedresource_set.filter(
-            requested_offering__state=proposal_models.RequestedOffering.States.ACCEPTED
+            requested_offering__state=RequestedOfferingStates.ACCEPTED
         )
     )
 
@@ -48,6 +93,11 @@ def allocate_proposal(proposal: proposal_models.Proposal):
 
     for requested_resource in requested_resources:
         with transaction.atomic():
+            if "name" not in requested_resource.attributes:
+                requested_resource.attributes["name"] = str(
+                    requested_resource.requested_offering.offering.name
+                )
+
             attrs = dict(
                 project=proposal.project,
                 offering=requested_resource.requested_offering.offering,
@@ -57,7 +107,7 @@ def allocate_proposal(proposal: proposal_models.Proposal):
             )
             resource = marketplace_models.Resource(
                 **attrs,
-                name=proposal.project.name,
+                name=requested_resource.attributes["name"],
             )
             resource.init_cost()
             resource.save()
@@ -75,14 +125,14 @@ def allocate_proposal(proposal: proposal_models.Proposal):
 
 
 def create_reviews_of_round(call_round):
-    call_round.proposal_set.filter(state=proposal_models.Proposal.States.DRAFT).update(
-        state=proposal_models.Proposal.States.CANCELED
+    call_round.proposal_set.filter(state=ProposalStates.DRAFT).update(
+        state=ProposalStates.CANCELED
     )
 
     for proposal in call_round.proposal_set.filter(
         state__in=(
-            proposal_models.Proposal.States.SUBMITTED,
-            proposal_models.Proposal.States.IN_REVIEW,
+            ProposalStates.SUBMITTED,
+            ProposalStates.IN_REVIEW,
         )
     ):
         process_proposals_pending_reviewers(proposal)

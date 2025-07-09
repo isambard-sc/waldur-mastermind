@@ -2,13 +2,13 @@ import copy
 import logging
 from smtplib import SMTPException
 
+import html2text
 from celery import shared_task
 from constance import config
 from django.core import signing
 from django.template import Context, Template
 from django.template.loader import get_template
 
-import html2text
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core.utils import text2html
@@ -131,7 +131,7 @@ def _send_email(
 
     # Since support email notifications are sent out through this function rather that broadcast_email()
     # we need to check if the notification is enabled here. For that we introduce a new parameter notification_key
-    # which is used to identify the notification..
+    # which is used to identify the notification.
     if notification_key:
         try:
             notification = core_models.Notification.objects.get(key=notification_key)
@@ -202,7 +202,8 @@ def _send_email(
             html_message=html_message,
         )
     except SMTPException as e:
-        message = f"Failed to notify a user about an issue update. Issue uuid: {issue.uuid.hex}. Error: {e.message}"
+        error_message = str(e)
+        message = f"Failed to notify a user about an issue update. Issue uuid: {issue.uuid.hex}. Error: {error_message}"
         logger.warning(message)
 
 
@@ -241,10 +242,10 @@ def send_issue_feedback_notification(serialized_issue):
         "feedback_link": get_feedback_link(token),
         "feedback_links": [
             {
-                "label": value,
-                "link": get_feedback_link(token, key),
+                "label": str(index),
+                "link": get_feedback_link(token, str(index)),
             }
-            for (key, value) in models.Feedback.Evaluation.CHOICES
+            for index in range(1, 11)
         ],
     }
     _send_issue_feedback(

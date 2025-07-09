@@ -1,13 +1,14 @@
 import logging
 import re
 import decimal
+import datetime
 
 from django.conf import settings as django_settings
-from django.db import transaction
 
 from waldur_core.structure.backend import ServiceBackend
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import CoreStates
 
 from waldur_openportal import signals
 from waldur_openportal.client import OpenPortalClient
@@ -45,14 +46,35 @@ class OpenPortalBackend(ServiceBackend):
 
     def pull_resources(self):
         logger.debug(f"Pulling OpenPortal resources for settings: {self}")
+
+        fail_count = 0
+        now = datetime.datetime.now()
+
+        from . import tasks as openportal_tasks
+
         for allocation in self.get_allocation_queryset().filter(
-            state=models.Allocation.States.OK
+            state=CoreStates.OK, is_added=True
         ):
+            if openportal_tasks.is_task_running(openportal_tasks.sync):
+                logger.info(
+                    "Task sync is already running - skipping allocation %s",
+                    allocation,
+                )
+                continue
+
             try:
                 logger.debug("About to pull allocation %s", allocation)
                 self.pull_allocation(allocation)
             except Exception as e:
                 logger.error("Error while pulling allocation [%s]: %s", allocation, e)
+                fail_count += 1
+
+                if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                    logger.error("Too many failures - aborting")
+                    return
+                elif (datetime.datetime.now() - now).seconds > 120:
+                    logger.error("Took too long - aborting")
+                    return
 
     def ping(self, raise_exception=False):
         logger.debug("Pinging OpenPortal")
@@ -113,9 +135,14 @@ class OpenPortalBackend(ServiceBackend):
                 continue
 
             # get the association between the user and the allocation
-            (association, created) = models.Association.objects.get_or_create(
-                user=user, allocation=allocation
-            )
+            try:
+                (association, _) = models.Association.objects.get_or_create(
+                    user=user, allocation=allocation
+                )
+            except models.Association.MultipleObjectsReturned:
+                association = openportal_utils.get_association(
+                    user=user, allocation=allocation
+                )
 
             mapping = None
 
@@ -204,7 +231,7 @@ class OpenPortalBackend(ServiceBackend):
             allocation
             for allocation in existing_allocations
             if allocation.has_project_identifier()
-            and allocation.state != models.Allocation.States.ERRED
+            and allocation.state != CoreStates.ERRED
         ]
 
         if len(existing_allocations) > 0:
@@ -266,6 +293,9 @@ class OpenPortalBackend(ServiceBackend):
     def _add_allocated_project(
         self, allocation: models.Allocation
     ) -> models.Allocation:
+        if not isinstance(allocation, models.Allocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
         self.assert_can_create_allocation_for_project(allocation.project)
 
         if allocation.has_project_identifier():
@@ -351,6 +381,9 @@ class OpenPortalBackend(ServiceBackend):
     def check_added_allocation(
         self, allocation: models.Allocation
     ) -> models.Allocation:
+        if not isinstance(allocation, models.Allocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
         if allocation.has_project_identifier() and allocation.is_added_to_openportal():
             # all good
             return allocation
@@ -359,11 +392,11 @@ class OpenPortalBackend(ServiceBackend):
         # We don't want to get stuck in a loop continually trying
         # to add an allocation that has been deleted
         if allocation.state not in [
-            models.Allocation.States.CREATION_SCHEDULED,
-            models.Allocation.States.CREATING,
-            models.Allocation.States.UPDATE_SCHEDULED,
-            models.Allocation.States.UPDATING,
-            models.Allocation.States.OK,
+            CoreStates.CREATION_SCHEDULED,
+            CoreStates.CREATING,
+            CoreStates.UPDATE_SCHEDULED,
+            CoreStates.UPDATING,
+            CoreStates.OK,
         ]:
             logger.warning(
                 f"Allocation {allocation} is in state {allocation.state} - cannot add to OpenPortal"
@@ -387,6 +420,9 @@ class OpenPortalBackend(ServiceBackend):
         return allocation
 
     def create_allocation(self, allocation):
+        if not isinstance(allocation, models.Allocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
         allocation = self._add_allocated_project(allocation)
 
         default_limits = django_settings.WALDUR_OPENPORTAL["DEFAULT_LIMITS"]
@@ -412,6 +448,9 @@ class OpenPortalBackend(ServiceBackend):
             )
 
     def delete_allocation(self, allocation):
+        if not isinstance(allocation, models.Allocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
         logger.info(f"Deleting allocation: {allocation}")
 
         if not (
@@ -428,10 +467,6 @@ class OpenPortalBackend(ServiceBackend):
                 logger.error(
                     f"Unable to delete allocation {allocation} from OpenPortal: {e}"
                 )
-
-        project = allocation.project
-        if self.get_allocation_queryset().filter(project=project).count() == 0:
-            self.delete_project(project)
 
     def add_user(self, allocation: models.Allocation, user) -> bool:
         """
@@ -471,9 +506,14 @@ class OpenPortalBackend(ServiceBackend):
 
         # get or create the association between the user and the allocation
         # This association holds the username of the user in OpenPortal on this instance
-        (association, created) = models.Association.objects.get_or_create(
-            user=user, allocation=allocation
-        )
+        try:
+            (association, _) = models.Association.objects.get_or_create(
+                user=user, allocation=allocation
+            )
+        except models.Association.MultipleObjectsReturned:
+            association = openportal_utils.get_association(
+                user=user, allocation=allocation
+            )
 
         mapping = None
 
@@ -536,7 +576,7 @@ class OpenPortalBackend(ServiceBackend):
 
         # find the association between the user and the allocation
         try:
-            association = models.Association.objects.get(
+            association = openportal_utils.get_association(
                 user=user, allocation=allocation
             )
         except Exception as e:
@@ -616,7 +656,6 @@ class OpenPortalBackend(ServiceBackend):
         logger.debug(f"OpenPortal limits for project {project}: {limit}")
         return limit
 
-    @transaction.atomic()
     def _update_usage_from_report(
         self,
         allocation,

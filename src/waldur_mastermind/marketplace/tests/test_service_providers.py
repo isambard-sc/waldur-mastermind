@@ -1,4 +1,4 @@
-from constance.test.pytest import override_config
+from constance.test.unittest import override_config
 from ddt import data, ddt
 from rest_framework import status, test
 
@@ -9,6 +9,7 @@ from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.marketplace import models, utils
+from waldur_mastermind.marketplace.enums import OfferingStates, ResourceStates
 from waldur_mastermind.marketplace.tests import fixtures
 from waldur_mastermind.marketplace_support import PLUGIN_NAME
 
@@ -226,9 +227,7 @@ class ServiceProviderDeleteTest(test.APITransactionTestCase):
         )
 
     def test_service_provider_could_not_be_deleted_if_it_has_active_offerings(self):
-        factories.OfferingFactory(
-            customer=self.customer, state=models.Offering.States.ACTIVE
-        )
+        factories.OfferingFactory(customer=self.customer, state=OfferingStates.ACTIVE)
         response = self.delete_service_provider("staff")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue(
@@ -236,9 +235,7 @@ class ServiceProviderDeleteTest(test.APITransactionTestCase):
         )
 
     def test_service_provider_is_deleted_if_it_has_archived_offering(self):
-        factories.OfferingFactory(
-            customer=self.customer, state=models.Offering.States.ARCHIVED
-        )
+        factories.OfferingFactory(customer=self.customer, state=OfferingStates.ARCHIVED)
         response = self.delete_service_provider("staff")
         self.assertEqual(
             response.status_code, status.HTTP_204_NO_CONTENT, response.data
@@ -298,7 +295,7 @@ class ServiceProviderNotificationTest(test.APITransactionTestCase):
         )
 
         self.resource = factories.ResourceFactory(
-            offering=offering, state=models.Resource.States.OK, name="My resource"
+            offering=offering, state=ResourceStates.OK, name="My resource"
         )
 
     def test_get_customer_if_usages_are_not_exist(self):
@@ -519,7 +516,7 @@ class ServiceProviderUserCustomersTest(test.APITransactionTestCase):
         )
 
         resource = factories.ResourceFactory(
-            offering=offering, state=models.Resource.States.OK, name="My resource"
+            offering=offering, state=ResourceStates.OK, name="My resource"
         )
         resource.project.add_user(self.fixture.user, ProjectRole.ADMIN)
         self.client.force_authenticate(self.fixture.staff)

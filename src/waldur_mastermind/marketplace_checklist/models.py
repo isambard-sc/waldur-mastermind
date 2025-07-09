@@ -5,7 +5,8 @@ from model_utils.models import TimeStampedModel
 from waldur_core.core import models as core_models
 from waldur_core.media.mixins import ImageModelMixin
 from waldur_core.media.validators import ImageValidator
-from waldur_core.structure.models import Customer, CustomerRole, ProjectRole
+from waldur_core.permissions.models import Role
+from waldur_core.structure.models import Customer
 from waldur_mastermind.marketplace import models as marketplace_models
 
 
@@ -14,6 +15,8 @@ class Category(
     core_models.NameMixin,
     core_models.DescribableMixin,
 ):
+    checklists: models.Manager["Checklist"]
+
     icon = models.FileField(
         upload_to="marketplace_checklist_category_icons",
         blank=True,
@@ -35,6 +38,8 @@ class Checklist(
     core_models.DescribableMixin,
     TimeStampedModel,
 ):
+    questions: models.Manager["Question"]
+
     category = models.ForeignKey(
         to=Category,
         on_delete=models.SET_NULL,
@@ -43,26 +48,13 @@ class Checklist(
         related_name="checklists",
     )
     customers = models.ManyToManyField(Customer)
+    roles = models.ManyToManyField(to=Role)
 
     def __str__(self):
         return self.name
 
     class Meta:
         ordering = ("name",)
-
-
-class ChecklistCustomerRole(models.Model):
-    checklist = models.ForeignKey(
-        to=Checklist, on_delete=models.CASCADE, related_name="customer_roles"
-    )
-    role = CustomerRole()
-
-
-class ChecklistProjectRole(models.Model):
-    checklist = models.ForeignKey(
-        to=Checklist, on_delete=models.CASCADE, related_name="project_roles"
-    )
-    role = ProjectRole()
 
 
 class Question(core_models.UuidMixin, core_models.DescribableMixin, ImageModelMixin):

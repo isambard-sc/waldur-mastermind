@@ -391,7 +391,7 @@ class ProjectApiPermissionTest(test.APITransactionTestCase):
 
     def test_user_can_filter_by_projects_where_he_has_manager_role(self):
         self.client.force_authenticate(user=self.users["multirole"])
-        response = self.client.get(reverse("project-list") + "?can_manage")
+        response = self.client.get(reverse("project-list"), {"can_manage": True})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         managed_project_url = self._get_project_url(self.projects["manager"])
@@ -598,7 +598,10 @@ class ProjectMoveTest(test.APITransactionTestCase):
 
     def get_response(self, role, customer):
         self.client.force_authenticate(role)
-        payload = {"customer": {"url": factories.CustomerFactory.get_url(customer)}}
+        payload = {
+            "customer": factories.CustomerFactory.get_url(customer),
+            "preserve_permissions": True,
+        }
         return self.client.post(self.url, payload)
 
     def test_move_project_rest(self):
@@ -611,7 +614,6 @@ class ProjectMoveTest(test.APITransactionTestCase):
     def test_move_project_is_not_possible_when_customer_the_same(self):
         old_customer = self.project.customer
         response = self.get_response(self.fixture.staff, old_customer)
-
         self.project.refresh_from_db()
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(self.project.customer, old_customer)
@@ -745,3 +747,36 @@ class ProjectResourceQuotasTest(test.APITransactionTestCase):
         self.assertEqual(ram_component["usage"], 6)
         self.assertEqual(ram_component["limit"], 24)
         self.assertEqual(ram_component["measured_unit"], "GB")
+
+
+class ProjectOtherUsersTest(test.APITransactionTestCase):
+    def test_user_can_list_other_users(self):
+        fixture = fixtures.ProjectFixture()
+        ProjectRole.ADMIN.add_permission(PermissionEnum.LIST_PROJECTS)
+
+        project1 = factories.ProjectFactory(customer=fixture.customer)
+        project2 = factories.ProjectFactory(customer=fixture.customer)
+        project3 = factories.ProjectFactory(customer=fixture.customer)
+
+        user1 = factories.UserFactory()
+        user2 = factories.UserFactory()
+        user3 = factories.UserFactory()
+
+        project1.add_user(user1, ProjectRole.ADMIN)
+        project2.add_user(user1, ProjectRole.MANAGER)
+        project2.add_user(user2, ProjectRole.MANAGER)
+        project3.add_user(user3, ProjectRole.MANAGER)
+
+        url = factories.ProjectFactory.get_url(project1, "other_users")
+        self.client.force_authenticate(user1)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn(
+            user2.uuid.hex,
+            [user["uuid"] for user in response.data],
+        )
+        self.assertNotIn(
+            user3.uuid.hex,
+            [user["uuid"] for user in response.data],
+        )

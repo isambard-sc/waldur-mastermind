@@ -1,13 +1,17 @@
 import factory
 from rest_framework.reverse import reverse
 
-from waldur_core.core import models as core_models
+from waldur_core.core.enums import CoreStates
+from waldur_core.core.tests.types import BaseMetaFactory
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 from .. import models
 
 
-class GoogleCredentialsFactory(factory.django.DjangoModelFactory):
+class GoogleCredentialsFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.GoogleCredentials],
+):
     class Meta:
         model = models.GoogleCredentials
 
@@ -44,10 +48,12 @@ class GoogleCredentialsFactory(factory.django.DjangoModelFactory):
         return url if action is None else url + action + "/"
 
 
-class GoogleCalendarFactory(factory.django.DjangoModelFactory):
+class GoogleCalendarFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.GoogleCalendar]
+):
     class Meta:
         model = models.GoogleCalendar
 
     offering = factory.SubFactory(marketplace_factories.OfferingFactory)
     backend_id = factory.Sequence(lambda n: "%s@group.calendar.google.com" % n)
-    state = core_models.StateMixin.States.OK
+    state = CoreStates.OK

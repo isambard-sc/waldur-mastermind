@@ -8,6 +8,7 @@ from django.utils import timezone
 from factory import fuzzy
 
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.tests.types import BaseMetaFactory
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_openstack import models
@@ -102,7 +103,7 @@ class SecurityGroupFactory(
     name = factory.Sequence(lambda n: "security_group%s" % n)
     service_settings = factory.SubFactory(SettingsFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
-    state = models.SecurityGroup.States.OK
+    state = CoreStates.OK
     backend_id = factory.Sequence(lambda n: "security_group-id%s" % n)
 
     @classmethod
@@ -176,7 +177,7 @@ class TenantFactory(
     name = factory.Sequence(lambda n: "tenant%s" % n)
     service_settings = factory.SubFactory(SettingsFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
-    state = models.Tenant.States.OK
+    state = CoreStates.OK
     external_network_id = factory.LazyAttribute(lambda _: uuid.uuid4())
     backend_id = factory.Sequence(lambda n: "backend_id_%s" % n)
 
@@ -209,7 +210,7 @@ class NetworkFactory(
     service_settings = factory.SubFactory(SettingsFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
     tenant = factory.SubFactory(TenantFactory)
-    state = models.Network.States.OK
+    state = CoreStates.OK
 
     @classmethod
     def get_url(cls, network=None, action=None):
@@ -304,14 +305,19 @@ class PortFactory(
     service_settings = factory.SubFactory(SettingsFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
     tenant = factory.SubFactory(TenantFactory)
+    network = factory.SubFactory(NetworkFactory)
+    admin_state_up = True
+    status = "DOWN"
 
     @classmethod
-    def get_url(cls, port=None):
+    def get_url(cls, port=None, action=None):
         if port is None:
             port = PortFactory()
-        return "http://testserver" + reverse(
+
+        url = "http://testserver" + reverse(
             "openstack-port-detail", kwargs={"uuid": port.uuid.hex}
         )
+        return url if action is None else url + action + "/"
 
     @classmethod
     def get_list_url(cls):
@@ -329,7 +335,7 @@ class ServerGroupFactory(
     name = factory.Sequence(lambda n: "server_group%s" % n)
     backend_id = factory.Sequence(lambda n: "backend_id_%s" % n)
     policy = models.ServerGroup.AFFINITY
-    state = models.ServerGroup.States.OK
+    state = CoreStates.OK
     service_settings = factory.SubFactory(SettingsFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
     tenant = factory.SubFactory(TenantFactory)
@@ -359,7 +365,7 @@ class RouterFactory(
     project = factory.SubFactory(structure_factories.ProjectFactory)
     name = factory.Sequence(lambda n: "router%s" % n)
     backend_id = factory.Sequence(lambda n: "backend_id_%s" % n)
-    state = models.Network.States.OK
+    state = CoreStates.OK
 
     @classmethod
     def get_url(cls, router=None, action=None):
@@ -484,7 +490,7 @@ class InstanceFactory(
             project=self.project,
             size=20 * 1024,
             name=f"{self.name}-data",
-            state=models.Volume.States.OK,
+            state=CoreStates.OK,
         )
 
     @factory.post_generation
@@ -497,36 +503,6 @@ class InstanceFactory(
                 self.security_groups.add(group)
 
 
-class BackupScheduleFactory(
-    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.BackupSchedule]
-):
-    class Meta:
-        model = models.BackupSchedule
-
-    instance = factory.SubFactory(InstanceFactory)
-    state = models.BackupSchedule.States.OK
-    service_settings = factory.LazyAttribute(lambda o: o.tenant.service_settings)
-    tenant = factory.SubFactory(TenantFactory)
-    project = factory.SelfAttribute("instance.project")
-    retention_time = 10
-    is_active = True
-    maximal_number_of_resources = 3
-    schedule = "0 * * * *"
-
-    @classmethod
-    def get_url(cls, schedule, action=None):
-        if schedule is None:
-            schedule = BackupScheduleFactory()
-        url = "http://testserver" + reverse(
-            "openstack-backup-schedule-detail", kwargs={"uuid": schedule.uuid.hex}
-        )
-        return url if action is None else url + action + "/"
-
-    @classmethod
-    def get_list_url(cls):
-        return "http://testserver" + reverse("openstack-backup-schedule-list")
-
-
 class BackupFactory(
     factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Backup]
 ):
@@ -536,9 +512,8 @@ class BackupFactory(
     service_settings = factory.LazyAttribute(lambda o: o.tenant.service_settings)
     tenant = factory.SubFactory(TenantFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
-    backup_schedule = factory.SubFactory(BackupScheduleFactory)
-    instance = factory.LazyAttribute(lambda b: b.backup_schedule.instance)
-    state = models.Backup.States.OK
+    instance = factory.SubFactory(InstanceFactory)
+    state = CoreStates.OK
     kept_until = fuzzy.FuzzyDateTime(
         timezone.datetime(2017, 6, 6, tzinfo=ZoneInfo("UTC"))
     )
@@ -569,7 +544,7 @@ class SnapshotFactory(
     project = factory.SubFactory(structure_factories.ProjectFactory)
     source_volume = factory.SubFactory(VolumeFactory)
     name = factory.Sequence(lambda n: "Snapshot #%s" % n)
-    state = models.Snapshot.States.OK
+    state = CoreStates.OK
 
     @classmethod
     def get_url(cls, snapshot, action=None):
@@ -586,44 +561,15 @@ class SnapshotFactory(
         return url if action is None else url + action + "/"
 
 
-class SnapshotRestorationFactory(factory.django.DjangoModelFactory):
+class SnapshotRestorationFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.SnapshotRestoration],
+):
     class Meta:
         model = models.SnapshotRestoration
 
     snapshot = factory.SubFactory(SnapshotFactory)
     volume = factory.SubFactory(VolumeFactory)
-
-
-class SnapshotScheduleFactory(
-    factory.django.DjangoModelFactory,
-    metaclass=BaseMetaFactory[models.SnapshotSchedule],
-):
-    class Meta:
-        model = models.SnapshotSchedule
-
-    source_volume = factory.SubFactory(VolumeFactory)
-    state = models.SnapshotSchedule.States.OK
-    service_settings = factory.LazyAttribute(lambda o: o.tenant.service_settings)
-    tenant = factory.SubFactory(TenantFactory)
-    project = factory.SelfAttribute("source_volume.project")
-    retention_time = 10
-    is_active = True
-    maximal_number_of_resources = 3
-    schedule = "0 * * * *"
-
-    @classmethod
-    def get_url(cls, schedule, action=None):
-        if schedule is None:
-            schedule = SnapshotScheduleFactory()
-        url = "http://testserver" + reverse(
-            "openstack-snapshot-schedule-detail",
-            kwargs={"uuid": schedule.uuid.hex},
-        )
-        return url if action is None else url + action + "/"
-
-    @classmethod
-    def get_list_url(cls):
-        return "http://testserver" + reverse("openstack-snapshot-schedule-list")
 
 
 class VolumeAvailabilityZoneFactory(
@@ -649,3 +595,15 @@ class VolumeAvailabilityZoneFactory(
     @classmethod
     def get_list_url(cls):
         return "http://testserver" + reverse("openstack-volume-availability-zone-list")
+
+
+class NetworkRBACPolicyFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.NetworkRBACPolicy],
+):
+    class Meta:
+        model = models.NetworkRBACPolicy
+
+    network = factory.SubFactory(NetworkFactory)
+    target_tenant = factory.SubFactory(TenantFactory)
+    policy_type = models.NetworkRBACPolicy.NetworkShareType.SHARED

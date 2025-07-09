@@ -1,14 +1,35 @@
 import django_filters
-from django.contrib.auth import get_user_model
 from django.db.models import Q
 from django.utils import timezone
 from django_filters.widgets import BooleanWidget
 
 from waldur_core.core import filters as core_filters
+from waldur_mastermind.proposal.enums import (
+    CallStates,
+    ProposalStates,
+    RequestedOfferingStates,
+)
 
 from . import models
 
-User = get_user_model()
+
+class CallResourceTemplateFilter(django_filters.FilterSet):
+    call = core_filters.URLFilter(
+        view_name="proposal-protected-call-detail",
+        field_name="call__uuid",
+        label="Call",
+    )
+    call_uuid = django_filters.UUIDFilter(field_name="call__uuid")
+    requested_offering_uuid = django_filters.UUIDFilter(
+        field_name="requested_offering__uuid"
+    )
+    name = django_filters.CharFilter(lookup_expr="icontains")
+    is_required = django_filters.BooleanFilter()
+    o = django_filters.OrderingFilter(fields=("created", "name", "is_required"))
+
+    class Meta:
+        model = models.CallResourceTemplate
+        fields = []
 
 
 class CallManagingOrganisationFilter(django_filters.FilterSet):
@@ -38,7 +59,7 @@ class CallFilter(django_filters.FilterSet):
     customer_uuid = django_filters.UUIDFilter(field_name="manager__customer__uuid")
     customer_keyword = django_filters.CharFilter(method="filter_customer_keyword")
     offering_uuid = django_filters.UUIDFilter(method="filter_offering_uuid")
-    state = django_filters.MultipleChoiceFilter(choices=models.Call.States.CHOICES)
+    state = django_filters.MultipleChoiceFilter(choices=CallStates.CHOICES)
     o = django_filters.OrderingFilter(
         fields=("manager__customer__name", "created", "name")
     )
@@ -72,7 +93,7 @@ class CallFilter(django_filters.FilterSet):
 
 class ProposalFilter(django_filters.FilterSet):
     round = django_filters.UUIDFilter(field_name="round__uuid")
-    state = django_filters.MultipleChoiceFilter(choices=models.Proposal.States.CHOICES)
+    state = django_filters.MultipleChoiceFilter(choices=ProposalStates.CHOICES)
     name = django_filters.CharFilter(lookup_expr="icontains")
     call_uuid = django_filters.UUIDFilter(field_name="round__call__uuid")
     organization_uuid = django_filters.UUIDFilter(
@@ -98,6 +119,9 @@ class ReviewFilter(django_filters.FilterSet):
         view_name="proposal-proposal-detail", field_name="proposal__uuid"
     )
     proposal_uuid = django_filters.UUIDFilter(field_name="proposal__uuid")
+    proposal_name = django_filters.CharFilter(
+        field_name="proposal__name", lookup_expr="icontains"
+    )
     organization_uuid = django_filters.UUIDFilter(
         field_name="proposal__round__call__manager__customer__uuid"
     )
@@ -133,9 +157,7 @@ class RequestedOfferingFilter(django_filters.FilterSet):
     o = django_filters.OrderingFilter(
         fields=("created", "state", "offering__name", "call__name")
     )
-    state = django_filters.MultipleChoiceFilter(
-        choices=models.RequestedOffering.States.CHOICES
-    )
+    state = django_filters.MultipleChoiceFilter(choices=RequestedOfferingStates.CHOICES)
 
     class Meta:
         model = models.RequestedOffering
