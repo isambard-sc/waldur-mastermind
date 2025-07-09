@@ -1244,7 +1244,7 @@ class Job(models.Model):
         return self.__str__()
 
 
-class ProjectClass(models.Model):
+class ProjectClass(core_models.UuidMixin, models.Model):
     """
     This model is responsible for storing data about project classes.
     A ProjectClass represents a category or type of project that can

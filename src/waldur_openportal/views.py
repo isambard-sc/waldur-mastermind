@@ -2,10 +2,13 @@ import logging
 
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import extend_schema
 from rest_framework import permissions, response, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 
+from waldur_core.core.enums import ReviewStates
 from waldur_core.core import executors as core_executors
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
@@ -13,9 +16,14 @@ from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
 from waldur_core.core import views as core_views
 from waldur_core.core import models as core_models
+from waldur_core.core.serializers import ReviewCommentSerializer
+from waldur_core.structure.filters import GenericRoleFilter
+from waldur_core.core.validators import StateValidator
 
+from waldur_core.permissions.fixtures import ServiceProviderRole
 from waldur_core.core.permissions import IsAdminOrReadOnly
 from waldur_core.structure.permissions import IsAdminOrOwner
+from waldur_core.structure.permissions import _has_owner_access
 
 from . import executors, filters, models, serializers
 
@@ -205,6 +213,14 @@ class UserInfoViewSet(core_views.ActionsViewSet):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
+class ProjectClassViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.ProjectClass.objects.all().order_by("name")
+    serializer_class = serializers.ProjectClassSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.ProjectClassFilter
+
+
 class ProjectInfoViewSet(core_views.ActionsViewSet):
     queryset = models.ProjectInfo.objects.all().order_by("shortname")
     lookup_field = "project"
@@ -310,3 +326,66 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
         )
 
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+def user_is_service_provider_owner_or_service_provider_manager(
+    request, view, obj: models.ManagedProject | None = None
+):
+    if not obj:
+        return
+
+    if _has_owner_access(request.user, obj.project_class.customer):
+        return
+
+    if obj.project_class.customer.has_user(
+        request.user, role=ServiceProviderRole.MANAGER
+    ):
+        return
+
+    raise PermissionDenied()
+
+
+class ManagedProjectViewSet(core_views.ActionsViewSet):
+    queryset = models.ManagedProject.objects.all()
+    approve_permissions = reject_permissions = [
+        user_is_service_provider_owner_or_service_provider_manager
+    ]
+    serializer_class = serializers.ManagedProjectSerializer
+    filter_backends = [GenericRoleFilter, DjangoFilterBackend]
+    filterset_class = filters.ManagedProjectFilter
+
+    disabled_actions = ["create", "destroy", "update", "partial_update"]
+    lookup_field = "uuid"
+
+    @extend_schema(
+        request=ReviewCommentSerializer,
+        responses=None,
+        description="Approve project update request",
+    )
+    @action(detail=True, methods=["post"])
+    def approve(self, request, **kwargs):
+        review_request: models.ManagedProject = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        comment = serializer.validated_data.get("comment")
+        review_request.approve(request.user, comment)
+        return Response(status=status.HTTP_200_OK)
+
+    @extend_schema(
+        request=ReviewCommentSerializer,
+        responses=None,
+        description="Reject project update request",
+    )
+    @action(detail=True, methods=["post"])
+    def reject(self, request, **kwargs):
+        review_request: models.ManagedProject = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        comment = serializer.validated_data.get("comment")
+        review_request.reject(request.user, comment)
+        return Response(status=status.HTTP_200_OK)
+
+    approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
+    approve_validators = reject_validators = [
+        StateValidator(ReviewStates.PENDING, state_enum=ReviewStates)
+    ]

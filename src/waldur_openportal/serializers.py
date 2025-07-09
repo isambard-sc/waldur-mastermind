@@ -7,6 +7,7 @@ from rest_framework import serializers as rf_serializers
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.structure import serializers as structure_serializers
+from waldur_core.structure import models as structure_models
 
 from waldur_core.structure.permissions import _has_admin_access
 
@@ -315,3 +316,69 @@ class ProjectInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
                 "view_name": "project-detail",
             },
         }
+
+
+class ProjectClassSerializer(
+    rf_serializers.HyperlinkedModelSerializer,
+):
+    class Meta:
+        model = models.ProjectClass
+        fields = (
+            "uuid",
+            "name",
+            "portal",
+            "customer",
+            "shortname",
+            "offerings",
+            "approval_limit",
+            "max_credit_limit",
+            "role_mapping",
+        )
+
+
+class ManagedProjectSerializer(
+    structure_serializers.PermissionFieldFilteringMixin,
+    rf_serializers.ModelSerializer,
+):
+    state = rf_serializers.ReadOnlyField(source="get_state_display")
+
+    reviewed_by_full_name = rf_serializers.CharField(
+        read_only=True, source="reviewed_by.full_name"
+    )
+    reviewed_by_uuid = rf_serializers.UUIDField(
+        read_only=True, source="reviewed_by.uuid"
+    )
+
+    project = rf_serializers.HyperlinkedRelatedField(
+        queryset=structure_models.Project.objects.all(),
+        view_name="project-detail",
+        lookup_field="uuid",
+    )
+
+    project_class = rf_serializers.HyperlinkedRelatedField(
+        queryset=models.ProjectClass.objects.all(),
+        view_name="openportal-project-class",
+        lookup_field="uuid",
+    )
+
+    class Meta:
+        model = models.ManagedProject
+
+        fields = (
+            "state",
+            "created",
+            "reviewed_at",
+            "reviewed_by_full_name",
+            "reviewed_by_uuid",
+            "review_comment",
+            "identifier",
+            "details",
+            "project",
+            "project_class",
+            "local_identifier",
+        )
+
+        related_paths = ("project",)
+
+    def get_filtered_field_names(self):
+        return ("project",)

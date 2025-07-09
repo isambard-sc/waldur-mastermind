@@ -45,6 +45,16 @@ def register_in(router):
         views.ProjectInfoViewSet,
         basename="openportal-projectinfo",
     )
+    router.register(
+        r"openportal-project-class",
+        views.ProjectClassViewSet,
+        basename="openportal-project-class",
+    )
+    router.register(
+        r"openportal-managed-projects",
+        views.ManagedProjectViewSet,
+        basename="openportal-managed-project",
+    )
 
 
 urlpatterns = [
