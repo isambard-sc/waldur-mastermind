@@ -375,6 +375,11 @@ class ManagedProjectSerializer(
         lookup_field="uuid",
     )
 
+    details = rf_serializers.JSONField(
+        read_only=True,
+        help_text=_("Details of the project as provided by the remote OpenPortal."),
+    )
+
     # project_class = rf_serializers.HyperlinkedRelatedField(
     #    queryset=models.ProjectClass.objects.all(),
     #    view_name="openportal-project-class",

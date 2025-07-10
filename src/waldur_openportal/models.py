@@ -1,4 +1,5 @@
 import logging
+import json
 
 from . import op as openportal
 
@@ -1504,7 +1505,7 @@ class ManagedProject(ReviewMixin, models.Model):
 
     # This is the JSON representation of the OpenPortal ProjectDetails
     # that is synced between this portal and the managing portal
-    details = models.TextField(
+    details = models.JSONField(
         verbose_name=_("project data"),
         help_text=_("JSON representation of the project"),
         blank=True,
@@ -1653,14 +1654,14 @@ class ManagedProject(ReviewMixin, models.Model):
         if not isinstance(details, openportal.ProjectDetails):
             details = openportal.ProjectDetails(details)
 
-        self.details = str(details)
+        self.details = json.loads(str(details))
 
     def get_details(self) -> openportal.ProjectDetails:
         """
         Get the ProjectDetails object from the project data.
         If the project data is not set, return None.
         """
-        return openportal.ProjectDetails(self.details)
+        return openportal.ProjectDetails(json.dumps(self.details))
 
     def get_default_offerings(self) -> list[marketplace_models.Offering]:
         """

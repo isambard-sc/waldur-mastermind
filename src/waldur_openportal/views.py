@@ -347,7 +347,7 @@ class ProjectClassViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class ManagedProjectViewSet(core_views.ActionsViewSet):
-    queryset = models.ManagedProject.objects.all()
+    queryset = models.ManagedProject.objects.all().order_by("created")
     permission_classes = (
         permissions.IsAuthenticated,
         structure_permissions.IsAdminOrOwner,
