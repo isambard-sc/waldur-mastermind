@@ -4,6 +4,13 @@ import requests
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
+from waldur_auth_social.const import (
+    PROVIDER_DEFAULTS,
+    SECRET_PROVIDER_FIELDS,
+    WRITABLE_USER_FIELDS,
+    ProviderChoices,
+)
+
 from . import models
 
 
@@ -29,7 +36,7 @@ class IdentityProviderSerializer(serializers.ModelSerializer):
         }
 
     def validate_provider(self, provider):
-        if provider not in models.ProviderChoices.CHOICES:
+        if provider not in ProviderChoices.CHOICES:
             raise ValidationError("Invalid provider.")
         return provider
 
@@ -40,15 +47,32 @@ class IdentityProviderSerializer(serializers.ModelSerializer):
         hostname = parsed_url.hostname
         if not hostname or parsed_url.scheme.lower() not in ("http", "https"):
             raise ValidationError("Invalid discovery URL.")
-        if provider == models.ProviderChoices.TARA:
+        if provider == ProviderChoices.TARA:
             if hostname not in ("tara-test.ria.ee", "tara.ria.ee"):
                 raise ValidationError("Invalid discovery URL.")
-        if provider == models.ProviderChoices.KEYCLOAK:
+        if provider == ProviderChoices.KEYCLOAK:
             if hostname.endswith("eduteams.org") or hostname in (
                 "tara-test.ria.ee",
                 "tara.ria.ee",
             ):
                 raise ValidationError("Invalid discovery URL.")
+        return attrs
+
+    def validate_attribute_mapping(self, attrs: dict[str, str]):
+        invalid = set(attrs.keys()) - set(WRITABLE_USER_FIELDS)
+        if invalid:
+            raise ValidationError(
+                f"Invalid attribute mapping keys: {','.join(invalid)}"
+            )
+        for key, value in attrs.items():
+            if not isinstance(value, str):
+                raise ValidationError(
+                    f"Attribute mapping value for '{key}' must be a string."
+                )
+            if not value.strip():
+                raise ValidationError(
+                    f"Attribute mapping value for '{key}' is empty string."
+                )
         return attrs
 
     def get_fields(self):
@@ -64,7 +88,8 @@ class IdentityProviderSerializer(serializers.ModelSerializer):
             fields["provider"].read_only = True
 
         if not user.is_staff:
-            del fields["client_secret"]
+            for field in SECRET_PROVIDER_FIELDS:
+                del fields[field]
 
         return fields
 
@@ -101,15 +126,18 @@ class IdentityProviderSerializer(serializers.ModelSerializer):
         return super().update(instance, validated_data)
 
     def create(self, validated_data):
-        if models.IdentityProvider.objects.filter(
-            provider=validated_data["provider"]
-        ).exists():
+        provider = validated_data["provider"]
+        if models.IdentityProvider.objects.filter(provider=provider).exists():
             raise ValidationError("Identity provider already exists.")
 
         verify_ssl = validated_data.get("verify_ssl", True)
         validated_data |= self.discover_urls(
             validated_data["discovery_url"], verify_ssl
         )
+        default_values = PROVIDER_DEFAULTS.get(provider)
+        if default_values:
+            for key, value in default_values.items():
+                validated_data.setdefault(key, value)
         return super().create(validated_data)
 
 

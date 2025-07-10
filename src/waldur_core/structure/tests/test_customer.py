@@ -1,5 +1,6 @@
 import datetime
 from unittest import mock
+from urllib.parse import urlencode
 
 from ddt import data, ddt
 from django.urls import reverse
@@ -21,7 +22,7 @@ from waldur_core.structure.tests.utils import (
     client_delete_user,
     client_update_user,
 )
-from waldur_mastermind.marketplace.models import OfferingComponent
+from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
@@ -29,10 +30,14 @@ class CustomerBaseTest(test.APITransactionTestCase):
     def setUp(self):
         CustomerRole.OWNER.add_permission(PermissionEnum.LIST_PROJECTS)
 
-    def _get_customer_url(self, customer):
-        return "http://testserver" + reverse(
+    def _get_customer_url(self, customer, fields=None):
+        url = "http://testserver" + reverse(
             "customer-detail", kwargs={"uuid": customer.uuid.hex}
         )
+        if fields is not None:
+            query_string = urlencode({"field": fields}, doseq=True)
+            url += f"?{query_string}"
+        return url
 
     def _get_project_url(self, project):
         return "http://testserver" + reverse(
@@ -95,7 +100,9 @@ class CustomerListTest(CustomerBaseTest):
     def test_user_can_see_project_he_has_a_role_in_within_customer(self, user):
         self.client.force_authenticate(user=getattr(self.fixture, user))
 
-        response = self.client.get(self._get_customer_url(self.fixture.customer))
+        response = self.client.get(
+            self._get_customer_url(self.fixture.customer, fields=["projects", "url"])
+        )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         project_urls = set([project["url"] for project in response.data["projects"]])
@@ -111,7 +118,9 @@ class CustomerListTest(CustomerBaseTest):
 
         non_seen_project = factories.ProjectFactory(customer=self.fixture.customer)
 
-        response = self.client.get(self._get_customer_url(self.fixture.customer))
+        response = self.client.get(
+            self._get_customer_url(self.fixture.customer, fields=["projects", "url"])
+        )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         project_urls = set([project["url"] for project in response.data["projects"]])
@@ -140,7 +149,7 @@ class CustomerListTest(CustomerBaseTest):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
-        self.assertEqual(len(response.data[0]["projects"]), 0)
+        self.assertEqual(response.data[0]["projects_count"], 0)
 
         response = self.client.get(url, {"query": "abc"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -149,7 +158,7 @@ class CustomerListTest(CustomerBaseTest):
         response = self.client.get(url, {"query": customer_name})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
-        self.assertEqual(len(response.data[0]["projects"]), 0)
+        self.assertEqual(response.data[0]["projects_count"], 0)
 
     # Helper methods
     def _check_user_list_access_customers(self, customer, test_function):
@@ -519,8 +528,8 @@ class CustomerUsersListTest(test.APITransactionTestCase):
         self.assertEqual(len(response.data), 2)
 
         self.assertSetEqual(
-            {user["role"] for user in response.data},
-            {"owner", "support"},
+            {user["role_name"] for user in response.data},
+            {"CUSTOMER.OWNER", "CUSTOMER.SUPPORT"},
         )
         self.assertSetEqual(
             {user["uuid"] for user in response.data},
@@ -992,22 +1001,22 @@ class CustomerResourceQuotasTest(test.APITransactionTestCase):
             type="cpu",
             name="CPU",
             measured_unit="vCPU",
-            billing_type=OfferingComponent.BillingTypes.USAGE,
+            billing_type=BillingTypes.USAGE,
         )
         self.component2 = marketplace_factories.OfferingComponentFactory(
             offering=self.offering,
             type="ram",
             name="RAM",
             measured_unit="GB",
-            billing_type=OfferingComponent.BillingTypes.USAGE,
+            billing_type=BillingTypes.USAGE,
         )
         self.limit_based_component = marketplace_factories.OfferingComponentFactory(
             offering=self.offering,
             type="disk",
             name="Disk",
             measured_unit="GB",
-            billing_type=OfferingComponent.BillingTypes.LIMIT,
-            limit_period=OfferingComponent.LimitPeriods.ANNUAL,
+            billing_type=BillingTypes.LIMIT,
+            limit_period=LimitPeriods.ANNUAL,
         )
         self.resource1 = marketplace_factories.ResourceFactory(
             project=self.project1,

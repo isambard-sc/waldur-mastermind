@@ -25,6 +25,18 @@ include:
 before_script:
   - export
 
+.build_before_script: &build_before_script
+  - echo "[+] Adding SSH keys to the home directory"
+  - mkdir -p ~/.ssh
+  - cat "$SSH_JENKINS_GITHUB_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+  - cat "$SSH_JENKINS_GITHUB_PUBLIC_KEY" | tr -d '\r' > ~/.ssh/id_rsa.pub
+  - chmod 600 ~/.ssh/id_rsa
+  - chmod 600 ~/.ssh/id_rsa.pub
+  - ssh-keygen -lf ~/.ssh/id_rsa.pub
+  - ssh-keyscan -H "github.com" >> ~/.ssh/known_hosts
+  - git config --global user.name "$GITLAB_USER_NAME"
+  - git config --global user.email "$GITLAB_USER_EMAIL"
+
 Run linters:
   image: registry.hpc.ut.ee/mirror/library/python:3.11-bullseye
   stage: test
@@ -114,16 +126,19 @@ Run management command test:
 Run type checkings:
   extends: .Unit test runner
   script:
-    - pip3 install poetry==2.1.2
-    - pip3 install --upgrade setuptools==78.1.0
-    - poetry install -vvv
-    - pyright src/waldur_core/structure/models.py
-    - pyright src/waldur_mastermind/marketplace_remote/processors.py
-    - pyright src/waldur_mastermind/marketplace_rancher/
-    - pyright src/waldur_rancher/utils.py
-    - pyright src/waldur_rancher/tasks.py
-    - pyright src/waldur_rancher/backend.py
-    - pyright src/waldur_rancher/serializers.py
+    - |
+      pip3 install poetry==2.1.2
+      pip3 install --upgrade setuptools==78.1.0
+      poetry install -vvv
+      pyright src/waldur_core/structure/models.py \
+             src/waldur_mastermind/marketplace_remote/processors.py \
+             src/waldur_mastermind/marketplace_rancher/ \
+             src/waldur_mastermind/proposal/utils.py \
+             src/waldur_mastermind/proposal/tasks.py \
+             src/waldur_rancher/utils.py \
+             src/waldur_rancher/tasks.py \
+             src/waldur_rancher/backend.py \
+             src/waldur_rancher/serializers.py
 
 Try building docker image:
   image:
@@ -295,6 +310,7 @@ Upload configuration guide:
     FEATURES_GUIDE_PATH: docs/admin-guide/mastermind-configuration/features.md
     NOTIFICATIONS_GUIDE_PATH: docs/admin-guide/mastermind-configuration/notifications.md
     TEMPLATES_LIST_PATH: docs/admin-guide/mastermind-configuration/templates.md
+    SCHEDULED_JOB_LIST_PATH: docs/admin-guide/mastermind-configuration/scheduled.md
     DEVELOPER_DOCS_PATH: docs/developer-guide
     DJANGO_SETTINGS_MODULE: waldur_core.server.doc_settings
   script:
@@ -310,6 +326,7 @@ Upload configuration guide:
     - waldur print_commands > $CLI_GUIDE_PATH
     - waldur print_events > $CI_PROJECT_DIR/docs/events.md
     - waldur print_templates > $TEMPLATES_LIST_PATH
+    - waldur print_scheduled_jobs > $SCHEDULED_JOB_LIST_PATH
     - waldur graph_models structure -I Customer,Project,OrganizationGroup,ProjectType,User -o $DEVELOPER_DOCS_PATH/core_structure.png
     - waldur graph_models permissions -I User,Role,UserRole,RolePermission -o $DEVELOPER_DOCS_PATH/core_permissions.png
     - waldur graph_models marketplace -I CategoryGroup,Category,CategoryColumn,Section,Attribute,AttributeOption,CategoryComponent,CategoryComponentUsage,Offering,OfferingComponent,Plan,PlanComponent,Resource,Order -o $DEVELOPER_DOCS_PATH/marketplace.png
@@ -407,10 +424,10 @@ Generate TypeScript SDK:
   needs:
     - Generate OpenAPI schema
   script: |
-    npx --yes @hey-api/openapi-ts@0.65.0 -c @hey-api/client-fetch -i waldur-openapi-schema.yaml -o waldur-typescript-sdk
+    npx --yes @hey-api/openapi-ts@0.77.0
     # drop querySerializer because it is producing explode: false for multiple choice filter
     sed -i '/querySerializer: {/,/},/d' waldur-typescript-sdk/sdk.gen.ts
-    ls -l waldur-typescript-sdk
+    sed -i '1i export { formDataBodySerializer, RequestResult } from "./client";' waldur-typescript-sdk/index.ts
   artifacts:
     paths:
       - waldur-typescript-sdk/
@@ -425,9 +442,8 @@ Generate Python SDK:
   needs:
     - Generate OpenAPI schema
   script: |
-    pip install openapi-python-client==0.23.1
-    openapi-python-client generate --path waldur-openapi-schema.yaml --output-path py-client --overwrite --meta poetry
-    sed -i 's/prefix: str = "Bearer"/prefix: str = "Token"/' py-client/waldur_api_client/client.py
+      pip install git+https://github.com/waldur/openapi-python-client.git
+      openapi-python-client generate --path waldur-openapi-schema.yaml --output-path py-client --overwrite --meta poetry
   artifacts:
     paths:
       - py-client/
@@ -487,17 +503,7 @@ Upload Go SDK:
     - git add client.go
     - git commit -m "Update Waldur Go SDK" || exit 0
     - git push
-  before_script:
-    - echo "[+] Adding ssh keys to the home directory"
-    - mkdir -p ~/.ssh
-    - cat $SSH_JENKINS_GITHUB_PRIVATE_KEY | tr -d '\r' > ~/.ssh/id_rsa
-    - cat $SSH_JENKINS_GITHUB_PUBLIC_KEY | tr -d '\r' > ~/.ssh/id_rsa.pub
-    - chmod 600 ~/.ssh/id_rsa
-    - chmod 600 ~/.ssh/id_rsa.pub
-    - ssh-keygen -lf ~/.ssh/id_rsa.pub
-    - ssh-keyscan -H "github.com" >> ~/.ssh/known_hosts
-    - git config --global user.email "ci@waldur.com"
-    - git config --global user.name "Waldur Gitlab Runner"
+  before_script: *build_before_script
 
 Upload Python SDK:
   stage: postdeploy
@@ -518,17 +524,7 @@ Upload Python SDK:
     - git add waldur_api_client
     - git commit -m "Update Waldur Python SDK" || exit 0
     - git push
-  before_script:
-    - echo "[+] Adding ssh keys to the home directory"
-    - mkdir -p ~/.ssh
-    - cat $SSH_JENKINS_GITHUB_PRIVATE_KEY | tr -d '\r' > ~/.ssh/id_rsa
-    - cat $SSH_JENKINS_GITHUB_PUBLIC_KEY | tr -d '\r' > ~/.ssh/id_rsa.pub
-    - chmod 600 ~/.ssh/id_rsa
-    - chmod 600 ~/.ssh/id_rsa.pub
-    - ssh-keygen -lf ~/.ssh/id_rsa.pub
-    - ssh-keyscan -H "github.com" >> ~/.ssh/known_hosts
-    - git config --global user.email "ci@waldur.com"
-    - git config --global user.name "Waldur Gitlab Runner"
+  before_script: *build_before_script
 
 Upload Terraform SDK:
   stage: postdeploy
@@ -549,17 +545,7 @@ Upload Terraform SDK:
     - git add waldur_terraform_sdk
     - git commit -m "Update Waldur Terraform SDK" || exit 0
     - git push
-  before_script:
-    - echo "[+] Adding ssh keys to the home directory"
-    - mkdir -p ~/.ssh
-    - cat $SSH_JENKINS_GITHUB_PRIVATE_KEY | tr -d '\r' > ~/.ssh/id_rsa
-    - cat $SSH_JENKINS_GITHUB_PUBLIC_KEY | tr -d '\r' > ~/.ssh/id_rsa.pub
-    - chmod 600 ~/.ssh/id_rsa
-    - chmod 600 ~/.ssh/id_rsa.pub
-    - ssh-keygen -lf ~/.ssh/id_rsa.pub
-    - ssh-keyscan -H "github.com" >> ~/.ssh/known_hosts
-    - git config --global user.email "ci@waldur.com"
-    - git config --global user.name "Waldur Gitlab Runner"
+  before_script: *build_before_script
 
 Generate OpenAPI schema diff:
   stage: deploy
@@ -667,14 +653,4 @@ Upload TypeScript SDK:
     - git add src
     - git commit -m "Update Waldur TypeScript SDK" || exit 0
     - git push
-  before_script:
-    - echo "[+] Adding ssh keys to the home directory"
-    - mkdir -p ~/.ssh
-    - cat $SSH_JENKINS_GITHUB_PRIVATE_KEY | tr -d '\r' > ~/.ssh/id_rsa
-    - cat $SSH_JENKINS_GITHUB_PUBLIC_KEY | tr -d '\r' > ~/.ssh/id_rsa.pub
-    - chmod 600 ~/.ssh/id_rsa
-    - chmod 600 ~/.ssh/id_rsa.pub
-    - ssh-keygen -lf ~/.ssh/id_rsa.pub
-    - ssh-keyscan -H "github.com" >> ~/.ssh/known_hosts
-    - git config --global user.email "ci@waldur.com"
-    - git config --global user.name "Waldur Gitlab Runner"
+  before_script: *build_before_script

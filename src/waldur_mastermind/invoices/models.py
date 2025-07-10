@@ -2,6 +2,7 @@ import datetime
 import decimal
 import logging
 from calendar import monthrange
+from typing import cast
 
 from dateutil.parser import parse as parse_datetime
 from django.conf import settings
@@ -12,6 +13,7 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django_fsm import FSMIntegerField
 from model_utils import FieldTracker
+from model_utils.tracker import FieldInstanceTracker
 from rest_framework import exceptions as rf_exceptions
 from reversion import revisions as reversion
 
@@ -22,6 +24,7 @@ from waldur_core.structure import models as structure_models
 from waldur_mastermind.common import mixins as common_mixins
 from waldur_mastermind.common.utils import quantize_price
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
 
 from . import utils
 
@@ -117,7 +120,7 @@ class Invoice(
     def get_log_fields(self):
         return ("uuid", "name", "year", "month", "customer")
 
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     def update_cache(self):
         """Update cached total_cost and total_price fields if they have changed."""
@@ -313,7 +316,7 @@ class InvoiceItem(
         "CustomerCredit", on_delete=models.SET_NULL, null=True, editable=False
     )
 
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     @property
     def tax(self) -> decimal.Decimal:
@@ -416,15 +419,9 @@ class InvoiceItem(
         plan_component = self.get_plan_component()
         if not plan_component:
             return
-        if (
-            plan_component.component.billing_type
-            == marketplace_models.OfferingComponent.BillingTypes.FIXED
-            or (
-                plan_component.component.billing_type
-                == marketplace_models.OfferingComponent.BillingTypes.LIMIT
-                and plan_component.component.limit_period
-                != marketplace_models.OfferingComponent.LimitPeriods.TOTAL
-            )
+        if plan_component.component.billing_type == BillingTypes.FIXED or (
+            plan_component.component.billing_type == BillingTypes.LIMIT
+            and plan_component.component.limit_period != LimitPeriods.TOTAL
         ):
             self._update_quantity()
 
@@ -486,7 +483,7 @@ class PaymentProfile(core_models.UuidMixin, core_models.NameMixin, models.Model)
     attributes = models.JSONField(default=dict, blank=True)
     is_active = models.BooleanField(null=True, default=True)
 
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     def __str__(self):
         return f"{self.organization.name} ({self.payment_type})"
@@ -572,6 +569,13 @@ class BaseCredit(core_models.UuidMixin, core_models.TimeStampedModel):
         decimal_places=5,
     )
 
+    def save(self, *args, **kwargs):
+        if self.end_date and self.end_date.day != 1:
+            raise rf_exceptions.ValidationError(
+                {"end_date": "End date must be the first day of the month."}
+            )
+        super().save(*args, **kwargs)
+
     @property
     def time_left_factor(self) -> decimal.Decimal:
         today = datetime.date.today()
@@ -616,7 +620,7 @@ class CustomerCredit(BaseCredit):
     customer = models.OneToOneField(structure_models.Customer, on_delete=models.CASCADE)
     offerings = models.ManyToManyField(marketplace_models.Offering)
 
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Permissions:
         customer_path = "customer"
@@ -678,7 +682,7 @@ class ProjectCredit(BaseCredit):
         consumption = sum([i.total for i in items]) or 0
         return consumption * -1
 
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Permissions:
         customer_path = "project__customer"

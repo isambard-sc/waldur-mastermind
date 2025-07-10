@@ -1,3 +1,4 @@
+from unittest import mock
 from unittest.mock import call, patch
 
 from django.test import TestCase
@@ -57,7 +58,7 @@ class HandleNewUserTest(TestCase):
         return resource
 
     @patch("waldur_autoprovisioning.handlers.process_order_on_commit")
-    def test_handler(self, mock_process_order):
+    def test_handler(self, mock_process_order: mock.Mock):
         user = User.objects.create(username="testuser", email="test@example.com")
         self.assertEqual(mock_process_order.call_count, 2)
 
@@ -75,3 +76,32 @@ class HandleNewUserTest(TestCase):
         ).get()
         self.assertFalse(project.is_removed)
         self.assertTrue(project.has_user(user, ProjectRole.ADMIN))
+
+
+class CreateProjectWithOutResourcesTest(TestCase):
+    def setUp(self):
+        self.rule = autoprovisioning_factories.RuleFactory()
+        self.rule.user_email_patterns = [".+@example.com"]
+        self.rule.save()
+
+    @patch("waldur_autoprovisioning.handlers.process_order_on_commit")
+    def test_create_project_without_resource(self, mock_process_order):
+        user = User.objects.create(username="testuser", email="test@example.com")
+        self.assertEqual(mock_process_order.call_count, 0)
+        project = structure_models.Project.available_objects.filter(
+            name=user.username, customer=self.rule.customer
+        ).get()
+        self.assertFalse(project.is_removed)
+        self.assertTrue(project.has_user(user, ProjectRole.ADMIN))
+
+    @patch("waldur_autoprovisioning.handlers.process_order_on_commit")
+    def test_not_admin_project_role(self, mock_process_order):
+        self.rule.project_role = ProjectRole.MANAGER
+        self.rule.save()
+        user = User.objects.create(username="testuser", email="test@example.com")
+        self.assertEqual(mock_process_order.call_count, 0)
+        project = structure_models.Project.available_objects.filter(
+            name=user.username, customer=self.rule.customer
+        ).get()
+        self.assertFalse(project.is_removed)
+        self.assertTrue(project.has_user(user, ProjectRole.MANAGER))

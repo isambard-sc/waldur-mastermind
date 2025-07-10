@@ -2,6 +2,7 @@ import collections
 import datetime
 import hashlib
 import logging
+from typing import cast
 
 import requests
 from celery import shared_task
@@ -16,11 +17,11 @@ from rest_framework import status
 from waldur_core import _get_version
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
+from waldur_core.core.log import event_logger
 from waldur_core.core.models import User
 from waldur_core.logging import models as logging_models
 from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure import models as structure_models
-from waldur_core.structure.log import event_logger
 from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices import utils as invoice_utils
 from waldur_mastermind.marketplace import exceptions, models, plugins, utils
@@ -199,6 +200,7 @@ def calculate_usage_for_scope(start, end, scope):
 
 @shared_task(name="waldur_mastermind.marketplace.calculate_usage_for_current_month")
 def calculate_usage_for_current_month():
+    """Calculate marketplace resource usage for the current month across all customers and projects."""
     start = invoice_utils.get_current_month_start()
     end = invoice_utils.get_current_month_end()
     scopes = []
@@ -226,6 +228,7 @@ def terminate_resource(serialized_resource, serialized_user):
     name="waldur_mastermind.marketplace.terminate_resources_if_project_end_date_has_been_reached"
 )
 def terminate_resources_if_project_end_date_has_been_reached():
+    """Terminate resources when their project has reached its end date."""
     expired_projects = structure_models.Project.available_objects.exclude(
         end_date__isnull=True
     ).filter(end_date__lte=timezone.datetime.today())
@@ -235,10 +238,11 @@ def terminate_resources_if_project_end_date_has_been_reached():
         active_resources = project_resources.exclude(state=ResourceStates.TERMINATED)
 
         if not active_resources:
-            event_logger.project.info(
+            event_logger.info(
                 "Project {project_name} is going to be deleted because end date has been reached and there are no active resources.",
                 event_type="project_deletion_triggered",
                 event_context={"project": project},
+                group="project",
             )
             project.delete()
             return
@@ -262,6 +266,7 @@ def terminate_resources_if_project_end_date_has_been_reached():
     name="waldur_mastermind.marketplace.terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_order"
 )
 def terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_order():
+    """Clean up erred Slurm resources that failed both creation and termination."""
     termination_offerings_types = ["Marketplace.Slurm"]
     resources = models.Resource.objects.filter(
         state=ResourceStates.ERRED,
@@ -308,6 +313,7 @@ def terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_o
 
 @shared_task(name="waldur_mastermind.marketplace.notify_about_stale_resource")
 def notify_about_stale_resource():
+    """Notify customers about resources that have not generated invoice items in the last 3 months."""
     if not config.ENABLE_STALE_RESOURCE_NOTIFICATIONS:
         return
 
@@ -363,6 +369,7 @@ def notify_about_stale_resource():
 
 @shared_task(name="waldur_mastermind.marketplace.terminate_expired_resources")
 def terminate_expired_resources():
+    """Terminate marketplace resources that have reached their end date."""
     expired_resources = models.Resource.objects.filter(
         end_date__lte=timezone.datetime.today(),
         state__in=(ResourceStates.OK, ResourceStates.ERRED),
@@ -414,6 +421,7 @@ def notify_about_resource_termination(resource_uuid, user_uuid, is_staff_action=
 
 @shared_task(name="waldur_mastermind.marketplace.notification_about_project_ending")
 def notification_about_project_ending():
+    """Send notifications about projects ending in 1 day and 7 days."""
     date_1 = timezone.datetime.today().date() + datetime.timedelta(days=1)
     utils.notification_about_project_ending(date_1)
 
@@ -423,6 +431,7 @@ def notification_about_project_ending():
 
 @shared_task(name="waldur_mastermind.marketplace.notification_about_resource_ending")
 def notification_about_resource_ending():
+    """Send notifications about resources ending in 1 day and 7 days."""
     date_1 = timezone.datetime.today().date() + datetime.timedelta(days=1)
     date_7 = timezone.datetime.today().date() + datetime.timedelta(days=7)
     expired_resources = models.Resource.objects.exclude(end_date__isnull=True).filter(
@@ -458,6 +467,7 @@ def notification_about_resource_ending():
 
 @shared_task(name="waldur_mastermind.marketplace.send_metrics")
 def send_metrics():
+    """Send anonymous usage metrics and telemetry data to the Waldur team."""
     if not core_models.Feature.objects.filter(key="telemetry.send_metrics").exists():
         return
 
@@ -518,6 +528,7 @@ def copy_future_price_to_current_price():
 
 @shared_task(name="waldur_mastermind.marketplace.process_pending_project_orders")
 def process_pending_project_orders():
+    """Process orders for projects that have become active."""
     active_project_ids = structure_models.Project.objects.filter(
         start_date__lte=timezone.now()
     ).values_list("id", flat=True)
@@ -543,6 +554,7 @@ def process_pending_project_orders():
 
 @shared_task(name="waldur_mastermind.marketplace.mark_resources_as_erred_after_timeout")
 def mark_resources_as_erred_after_timeout():
+    """Mark stale orders and their resources as erred if they have been executing for more than 2 hours."""
     now = timezone.now()
     two_hours_ago = now - datetime.timedelta(hours=2)
     stale_orders = models.Order.objects.filter(
@@ -559,7 +571,7 @@ def mark_resources_as_erred_after_timeout():
         resource.set_state_erred()
         resource.backend_metadata.update({"state": "Erred"})
         resource.save(update_fields=["state", "backend_metadata"])
-        scope: structure_models.BaseResource = resource.scope
+        scope = cast(structure_models.BaseResource, resource.scope)
         if scope:
             scope.set_erred()
             scope.save(update_fields=["state"])

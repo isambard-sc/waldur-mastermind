@@ -13,6 +13,7 @@ from rest_framework import permissions as rf_permissions
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.exceptions import IncorrectStateException
+from waldur_core.core.log import event_logger
 from waldur_core.core.models import User
 from waldur_core.core.utils import SubqueryCount
 from waldur_core.core.views import (
@@ -45,7 +46,6 @@ from waldur_mastermind.proposal.enums import (
     RequestedOfferingStates,
 )
 
-from . import log
 from .managers import get_connected_call_organizers
 from .serializers import ReviewSubmitSerializer
 
@@ -406,10 +406,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             )
             if created:
                 instance.documents.add(obj)
-                log.event_logger.call.info(
+                event_logger.info(
                     f"Attachment for call {instance.name} has been added.",
                     event_type="call_document_added",
                     event_context={"call": instance},
+                    group="call",
                 )
                 logger.info(f"Attachment for {instance.name} has been added.")
 
@@ -442,10 +443,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 call=instance,
                 uuid=file_data,
             ).delete()
-            log.event_logger.call.info(
+            event_logger.info(
                 f"Attachment for call {instance.name} has been removed.",
                 event_type="call_document_removed",
                 event_context={"call": instance},
+                group="call",
             )
             logger.info(f"Attachment for {instance.name} has been removed.")
 
@@ -616,10 +618,11 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         serializer.is_valid(raise_exception=True)
         serializer.save(proposal=proposal)
 
-        log.event_logger.proposal.info(
+        event_logger.info(
             f"Attachment for proposal {proposal.name} has been added.",
             event_type="proposal_document_added",
             event_context={"proposal": proposal},
+            group="proposal",
         )
         return response.Response(status=status.HTTP_200_OK)
 
@@ -761,7 +764,7 @@ class ReviewViewSet(ActionsViewSet):
             raise exceptions.PermissionDenied()
         super().perform_destroy(instance)
 
-    def action_permission_check(request, view, obj: models.Review = None):
+    def action_permission_check(request, view, obj: models.Review | None = None):
         if not obj:
             return
 

@@ -5,13 +5,18 @@ from ddt import data, ddt
 from freezegun import freeze_time
 from rest_framework import status, test
 
+from waldur_core.core.models import NAME_LENGTH
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole, OfferingRole, ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.marketplace import models, plugins
-from waldur_mastermind.marketplace.enums import OfferingStates
+from waldur_mastermind.marketplace.enums import (
+    BillingTypes,
+    LimitPeriods,
+    OfferingStates,
+)
 from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
 from waldur_mastermind.marketplace.tests.utils import TestCreateProcessor
@@ -370,7 +375,7 @@ class OrderLimitsCreateTest(BaseOrderCreateTest):
             models.OfferingComponent.objects.create(
                 offering=offering,
                 type=key,
-                billing_type=models.OfferingComponent.BillingTypes.LIMIT,
+                billing_type=BillingTypes.LIMIT,
             )
 
         add_payload = {
@@ -396,7 +401,7 @@ class OrderLimitsCreateTest(BaseOrderCreateTest):
             models.OfferingComponent.objects.create(
                 offering=offering,
                 type=key,
-                billing_type=models.OfferingComponent.BillingTypes.FIXED,
+                billing_type=BillingTypes.FIXED,
             )
 
         add_payload = {
@@ -412,9 +417,9 @@ class OrderLimitsCreateTest(BaseOrderCreateTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     @data(
-        models.OfferingComponent.LimitPeriods.TOTAL,
-        models.OfferingComponent.LimitPeriods.MONTH,
-        models.OfferingComponent.LimitPeriods.ANNUAL,
+        LimitPeriods.TOTAL,
+        LimitPeriods.MONTH,
+        LimitPeriods.ANNUAL,
     )
     def test_offering_limit_is_valid(self, limit_period):
         offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
@@ -423,7 +428,7 @@ class OrderLimitsCreateTest(BaseOrderCreateTest):
         models.OfferingComponent.objects.create(
             offering=offering,
             type="cpu_count",
-            billing_type=models.OfferingComponent.BillingTypes.LIMIT,
+            billing_type=BillingTypes.LIMIT,
             limit_amount=10,
             limit_period=limit_period,
         )
@@ -441,9 +446,9 @@ class OrderLimitsCreateTest(BaseOrderCreateTest):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
     @data(
-        models.OfferingComponent.LimitPeriods.TOTAL,
-        models.OfferingComponent.LimitPeriods.MONTH,
-        models.OfferingComponent.LimitPeriods.ANNUAL,
+        LimitPeriods.TOTAL,
+        LimitPeriods.MONTH,
+        LimitPeriods.ANNUAL,
     )
     def test_offering_limit_is_invalid(self, limit_period):
         offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
@@ -452,7 +457,7 @@ class OrderLimitsCreateTest(BaseOrderCreateTest):
         models.OfferingComponent.objects.create(
             offering=offering,
             type="cpu_count",
-            billing_type=models.OfferingComponent.BillingTypes.LIMIT,
+            billing_type=BillingTypes.LIMIT,
             limit_amount=1,
             limit_period=limit_period,
         )
@@ -518,6 +523,7 @@ class OrderTermsOfServiceCreateTest(BaseOrderCreateTest):
 
 
 class OrderEndDateCreateTest(BaseOrderCreateTest):
+    @freeze_time("2024-01-01")
     def test_set_end_date(self):
         user = self.fixture.staff
         response = self.create_order(
@@ -543,6 +549,18 @@ class OrderEndDateCreateTest(BaseOrderCreateTest):
         resource = models.Resource.objects.last()
         end_date = resource.created + datetime.timedelta(days=7)
         self.assertEqual(resource.end_date, end_date.date())
+
+    def test_missing_default_offset_configuration(self):
+        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        offering.plugin_options = {
+            "is_resource_termination_date_required": True,
+            # Missing default_resource_termination_offset_in_days
+        }
+        offering.save()
+
+        response = self.create_order(self.fixture.owner, offering)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("end_date", response.data)
 
     @freeze_time("2022-01-01")
     def test_resource_is_not_created_if_end_date_later_than_max_end_date(self):
@@ -601,6 +619,113 @@ class OrderEndDateCreateTest(BaseOrderCreateTest):
             {"attributes": {"name": "test", "end_date": end_date}},
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @freeze_time("2022-01-01")
+    def test_default_date_truncated_by_global_limit(self):
+        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        offering.plugin_options = {
+            "is_resource_termination_date_required": True,
+            "default_resource_termination_offset_in_days": 3650,  # 10 years
+            "latest_date_for_resource_termination": "2025-01-01",
+        }
+        offering.save()
+
+        response = self.create_order(self.fixture.owner, offering)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        resource = models.Resource.objects.last()
+        self.assertEqual(resource.end_date, datetime.date(2025, 1, 1))
+
+    def test_malformed_date_string(self):
+        response = self.create_order(
+            self.fixture.staff,
+            add_payload={"attributes": {"end_date": "2025/01/01"}},  # Wrong format
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("end_date", response.data)
+
+    @freeze_time("2022-01-01")
+    def test_end_date_before_creation_date(self):
+        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        offering.plugin_options = {
+            "is_resource_termination_date_required": True,
+        }
+        offering.save()
+        end_date = datetime.date(2021, 12, 31)  # Before creation date
+
+        response = self.create_order(
+            self.fixture.owner,
+            offering,
+            {"attributes": {"name": "test", "end_date": end_date}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class OrderNameValidationTest(BaseOrderCreateTest):
+    def test_order_creation_succeeds_with_valid_name_length(self):
+        """Test that order creation succeeds when name is within valid length."""
+        valid_name = "a" * (NAME_LENGTH - 1)  # 149 characters
+        response = self.create_order(
+            self.fixture.owner, add_payload={"attributes": {"name": valid_name}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(order.resource.name, valid_name)
+
+    def test_order_creation_succeeds_with_maximum_name_length(self):
+        """Test that order creation succeeds when name is exactly at maximum length."""
+        max_length_name = "a" * NAME_LENGTH  # 150 characters
+        response = self.create_order(
+            self.fixture.owner, add_payload={"attributes": {"name": max_length_name}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(order.resource.name, max_length_name)
+
+    def test_order_creation_fails_with_name_too_long(self):
+        """Test that order creation fails when name exceeds maximum length."""
+        too_long_name = "a" * (NAME_LENGTH + 1)  # 151 characters
+        response = self.create_order(
+            self.fixture.owner, add_payload={"attributes": {"name": too_long_name}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Name is too long", str(response.data))
+        self.assertIn(str(NAME_LENGTH), str(response.data))
+
+    def test_order_creation_succeeds_with_empty_name(self):
+        """Test that order creation succeeds when name is empty."""
+        response = self.create_order(
+            self.fixture.owner, add_payload={"attributes": {"name": ""}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(order.resource.name, "")
+
+    def test_order_creation_succeeds_without_name_attribute(self):
+        """Test that order creation succeeds when name attribute is not provided."""
+        response = self.create_order(self.fixture.owner, add_payload={"attributes": {}})
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(order.resource.name, "")
+
+    def test_order_creation_with_unicode_name_within_limit(self):
+        """Test that order creation succeeds with unicode characters within length limit."""
+        unicode_name = "üõiõабвгдж" * 15  # Unicode characters, total length < 150
+        response = self.create_order(
+            self.fixture.owner, add_payload={"attributes": {"name": unicode_name}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(order.resource.name, unicode_name)
+
+    def test_order_creation_fails_with_unicode_name_exceeding_limit(self):
+        """Test that order creation fails with unicode characters exceeding length limit."""
+        unicode_name = "üõiõабвгд" * 20  # Unicode characters, total length > 150
+        response = self.create_order(
+            self.fixture.owner, add_payload={"attributes": {"name": unicode_name}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Name is too long", str(response.data))
 
 
 @ddt

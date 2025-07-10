@@ -1,6 +1,7 @@
 import logging
 import re
 from functools import lru_cache
+from typing import cast
 from uuid import UUID
 
 from django.apps import apps
@@ -15,6 +16,7 @@ from django_fsm import ConcurrentTransitionMixin, FSMIntegerField, transition
 from model_utils import FieldTracker
 from model_utils.fields import AutoLastModifiedField
 from model_utils.models import TimeStampedModel
+from model_utils.tracker import FieldInstanceTracker
 from rest_framework.authtoken.models import Token
 from reversion import revisions as reversion
 
@@ -36,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 
 DESCRIPTION_LENGTH = 2000
+
+NAME_LENGTH = 150
 
 USERNAME_REGEX = r"^[a-zA-Z0-9_.][a-zA-Z0-9_.-]*[a-zA-Z0-9_.$-]?$"
 
@@ -61,7 +65,9 @@ class NameMixin(models.Model):
     class Meta:
         abstract = True
 
-    name = models.CharField(_("name"), max_length=150, validators=[validate_name])
+    name = models.CharField(
+        _("name"), max_length=NAME_LENGTH, validators=[validate_name]
+    )
 
 
 SLUG_NAME_LIMIT = 8
@@ -346,7 +352,7 @@ class User(
         self.last_name = " ".join(names[1:])
         self.query_field = normalize_unicode(value)
 
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
     objects: UserManager = core_managers.UserActiveManager()
     all_objects = UserManager()
     auth_token: Token | None

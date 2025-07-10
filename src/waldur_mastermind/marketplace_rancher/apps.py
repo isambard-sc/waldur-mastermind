@@ -1,6 +1,10 @@
+from dataclasses import replace
+
 from django.apps import AppConfig
 from django.db.models import signals
 
+from waldur_mastermind.marketplace.enums import BillingTypes
+from waldur_mastermind.marketplace_openstack.const import TENANT_COMPONENTS
 from waldur_mastermind.marketplace_rancher import MANAGED_RANCHER_PLUGIN
 
 
@@ -13,6 +17,7 @@ class MarketplaceRancherConfig(AppConfig):
         from waldur_mastermind.marketplace import handlers as marketplace_handlers
         from waldur_mastermind.marketplace import models as marketplace_models
         from waldur_mastermind.marketplace.plugins import manager
+        from waldur_openstack import models as openstack_models
         from waldur_rancher import models as rancher_models
         from waldur_rancher.apps import RancherConfig
 
@@ -33,6 +38,10 @@ class MarketplaceRancherConfig(AppConfig):
             offering_type=MANAGED_RANCHER_PLUGIN,
             create_resource_processor=processors.ManagedRancherCreateProcessor,
             delete_resource_processor=processors.ManagedRancherDeleteProcessor,
+            components=[
+                replace(component, billing_type=BillingTypes.USAGE)
+                for component in TENANT_COMPONENTS
+            ],
         )
 
         marketplace_handlers.connect_resource_metadata_handlers(rancher_models.Cluster)
@@ -67,4 +76,10 @@ class MarketplaceRancherConfig(AppConfig):
             handlers.copy_invoice_items_when_cluster_is_provisioned,
             sender=marketplace_models.Resource,
             dispatch_uid="waldur_mastermind.marketplace_rancher.copy_invoice_items_when_cluster_is_provisioned",
+        )
+
+        signals.post_save.connect(
+            handlers.create_public_cluster_ip_for_floating_ip,
+            sender=openstack_models.FloatingIP,
+            dispatch_uid="waldur_mastermind.marketplace_rancher.create_public_cluster_ip_for_floating_ip",
         )

@@ -4,14 +4,13 @@ import re
 from django.db import transaction
 
 from waldur_autoprovisioning.models import Rule
-from waldur_core.permissions.fixtures import ProjectRole
+from waldur_core.core.models import User
+from waldur_core.permissions.models import Role
 from waldur_core.structure.models import Project
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.models import Order, Resource
-from waldur_mastermind.marketplace.tasks import (
-    process_order_on_commit,
-)
+from waldur_mastermind.marketplace.tasks import process_order_on_commit
 
 logger = logging.getLogger(__name__)
 
@@ -27,14 +26,15 @@ def get_rules(user):
     return rules
 
 
-def get_or_create_project(customer, user) -> Project | None:
+def get_or_create_project(customer, user, project_role) -> Project | None:
     project = None
+    project_role = project_role or Role.project_admin()
 
     try:
         project = Project.available_objects.get(name=user.username, customer=customer)
 
-        if not project.has_user(user, ProjectRole.ADMIN):
-            project.add_user(user, ProjectRole.ADMIN)
+        if not project.has_user(user, project_role):
+            project.add_user(user, project_role)
 
     except Project.MultipleObjectsReturned:
         logger.warning("Multiple projects with the same name %s exist.", user.username)
@@ -42,7 +42,7 @@ def get_or_create_project(customer, user) -> Project | None:
         project = Project.available_objects.create(
             customer=customer, name=user.username
         )
-        project.add_user(user, ProjectRole.ADMIN)
+        project.add_user(user, project_role)
 
     return project
 
@@ -114,7 +114,7 @@ def get_or_create_order(
     return order, True
 
 
-def handle_new_user(sender, instance, created=False, **kwargs):
+def handle_new_user(sender, instance: User, created=False, **kwargs):
     user = instance
 
     rules: list = get_rules(user)
@@ -123,10 +123,12 @@ def handle_new_user(sender, instance, created=False, **kwargs):
         return
 
     for rule in rules:
-        project: Project | None = get_or_create_project(rule.customer, user)
+        project: Project | None = get_or_create_project(
+            rule.customer, user, rule.project_role
+        )
 
         if not project:
-            return
+            continue
 
         for rule_plan in rule.ruleplans_set.all():
             plan = rule_plan.plan

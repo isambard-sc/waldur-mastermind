@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Literal, cast
 
 from django.conf import settings
 from django.core.validators import MinValueValidator
@@ -10,6 +10,7 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
+from model_utils.tracker import FieldInstanceTracker
 
 import waldur_core.media.mixins
 from waldur_core.core import models as core_models
@@ -143,6 +144,10 @@ class Call(
     @property
     def reviewers(self):
         return get_users(self, RoleEnum.CALL_REVIEWER)
+
+    @property
+    def customer(self):
+        return self.manager.customer
 
 
 class RequestedOffering(
@@ -299,6 +304,7 @@ class Round(
     start_time = models.DateTimeField()
     cutoff_time = models.DateTimeField()
     call = models.ForeignKey(Call, on_delete=models.PROTECT)
+    proposal_set: models.Manager["Proposal"]
 
     class Permissions:
         customer_path = "call__manager__customer"
@@ -394,7 +400,9 @@ class Proposal(
     resources = models.ManyToManyField(RequestedOffering, through="RequestedResource")
     allocation_comment = models.CharField(blank=True, max_length=150, null=True)
 
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
+    requestedresource_set: models.Manager["RequestedResource"]
+    review_set: models.Manager["Review"]
 
     class Permissions:
         customer_path = "round__call__manager__customer"
@@ -499,7 +507,7 @@ class Review(
         to=settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+"
     )
 
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     @classmethod
     def get_url_name(cls):

@@ -30,7 +30,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
-from waldur_auth_social.models import ProviderChoices
+from waldur_auth_social.const import ProviderChoices
 from waldur_auth_social.utils import pull_remote_eduteams_user
 from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
@@ -60,6 +60,7 @@ from waldur_core.structure.utils import get_components_usage_data_from_resources
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_mastermind.marketplace.enums import ResourceStates
+from waldur_mastermind.marketplace_site_agent import utils as remote_slurm_utils
 
 logger = logging.getLogger(__name__)
 
@@ -482,6 +483,25 @@ class ProjectViewSet(
         )
         return self.get_paginated_response(serializer.data)
 
+    @extend_schema(
+        description="Trigger user role sync for this project",
+        request=None,
+        responses={200: None},
+    )
+    @action(detail=True, methods=["post"])
+    def sync_user_roles(self, request, uuid=None):
+        """
+        Trigger user role sync message for this project.
+        Sends a notification to RabbitMQ that this project needs user role synchronization.
+        """
+        project: models.Project = self.get_object()
+
+        remote_slurm_utils.push_user_role_sync_message(project)
+
+        return Response(status=status.HTTP_200_OK)
+
+    sync_user_roles_permissions = [permissions.is_staff]
+
 
 class UserViewSet(core_views.ActionsViewSet):
     queryset = core_models.User.all_objects.select_related("auth_token")
@@ -650,11 +670,12 @@ class UserViewSet(core_views.ActionsViewSet):
         user.set_password(serializer.validated_data["new_password"])
         user.save()
 
-        event_logger.user.info(
+        event_logger.info(
             "Password has been changed for user {affected_user_username} by %s."
             % self.request.user,
             event_type="user_password_updated_by_staff",
             event_context={"affected_user": user},
+            group="user",
         )
         logger.info(
             f"Password has been changed for user {user} by {self.request.user}."
@@ -698,10 +719,11 @@ class UserViewSet(core_views.ActionsViewSet):
 
     def perform_create(self, serializer):
         user = serializer.save()
-        event_logger.user.info(
+        event_logger.info(
             "User {affected_user_username} has been created by %s." % self.request.user,
             event_type="user_has_been_created_by_staff",
             event_context={"affected_user": user},
+            group="user",
         )
         logger.info(f"User {user} has been created by {self.request.user}.")
 

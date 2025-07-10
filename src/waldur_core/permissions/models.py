@@ -1,13 +1,17 @@
+from typing import cast
+
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.utils import timezone
 from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
+from model_utils.tracker import FieldInstanceTracker
 
 from waldur_core.core.managers import GenericKeyMixin
 from waldur_core.core.mixins import ScopeMixin
 from waldur_core.core.models import DescribableMixin, User, UuidMixin
+from waldur_core.permissions.enums import RoleEnum
 
 from . import signals
 from .enums import TYPE_MAP
@@ -45,6 +49,17 @@ class Role(DescribableMixin, UuidMixin):
     def delete_permission(self, name):
         RolePermission.objects.filter(role=self, permission=name).delete()
 
+    @classmethod
+    def project_roles(cls):
+        return cls.objects.filter(is_active=True, name__startswith="PROJECT.")
+
+    @classmethod
+    def project_admin(cls):
+        return cls.objects.get_system_role(
+            RoleEnum.PROJECT_ADMIN,
+            content_type=ContentType.objects.get_by_natural_key("structure", "project"),
+        )
+
     def __str__(self):
         return f"{self.name}"
 
@@ -67,7 +82,9 @@ class UserRole(TimeStampedModel, ScopeMixin, UuidMixin):
     )
     expiration_time = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(null=True, default=True, db_index=True)
-    tracker = FieldTracker(fields=["expiration_time", "is_active"])
+    tracker = cast(
+        FieldInstanceTracker, FieldTracker(fields=["expiration_time", "is_active"])
+    )
     objects = UserRoleManager()
 
     def set_expiration_time(self, expiration_time, current_user=None):

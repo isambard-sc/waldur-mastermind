@@ -1,12 +1,10 @@
 import logging
 from datetime import timedelta
-from typing import cast
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import Q, signals
 from django.utils import timezone
-from model_utils.tracker import FieldInstanceTracker
 
 from waldur_core.core import utils as core_utils
 from waldur_mastermind.common import mixins as common_mixins
@@ -17,13 +15,17 @@ from waldur_mastermind.invoices.registrators import RegistrationManager
 from waldur_mastermind.invoices.utils import get_current_month_end, get_full_days
 from waldur_mastermind.marketplace import PLUGIN_NAME, utils
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace.enums import ResourceStates
+from waldur_mastermind.marketplace.enums import (
+    BillingTypes,
+    LimitPeriods,
+    ResourceStates,
+)
+from waldur_mastermind.marketplace.models import ComponentUsage
 from waldur_mastermind.promotions import models as promotions_models
 
 logger = logging.getLogger(__name__)
 
-BillingTypes = marketplace_models.OfferingComponent.BillingTypes
-LimitPeriods = marketplace_models.OfferingComponent.LimitPeriods
+LimitPeriods = LimitPeriods
 OrderTypes = marketplace_models.Order.Types
 
 
@@ -345,7 +347,7 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
         cls, sender, instance: marketplace_models.Resource, created=False, **kwargs
     ):
         resource = instance
-        resource_tracker = cast(FieldInstanceTracker, resource.tracker)
+        resource_tracker = resource.tracker
 
         if created:
             return
@@ -385,8 +387,8 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
         if created:
             return
 
-        resource_tracker = cast(FieldInstanceTracker, resource.tracker)
-        instance_tracker = cast(FieldInstanceTracker, instance.tracker)
+        resource_tracker = resource.tracker
+        instance_tracker = instance.tracker
 
         if (
             resource.state == ResourceStates.OK
@@ -498,7 +500,7 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
 
     @classmethod
     def update_invoice_when_usage_is_reported(
-        cls, sender, instance, created=False, **kwargs
+        cls, sender, instance: ComponentUsage, created=False, **kwargs
     ):
         component_usage = instance
         resource = component_usage.resource

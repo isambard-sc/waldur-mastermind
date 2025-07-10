@@ -15,6 +15,7 @@ from rest_framework.response import Response
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
+from waldur_core.core.log import event_logger
 from waldur_core.core.serializers import EmptySerializer
 from waldur_core.core.utils import is_uuid_like
 from waldur_core.structure import filters as structure_filters
@@ -26,7 +27,7 @@ from waldur_mastermind.common.utils import quantize_price
 from waldur_mastermind.invoices import compensations
 from waldur_mastermind.invoices.models import InvoiceItem
 
-from . import filters, log, models, serializers, tasks, utils
+from . import filters, models, serializers, tasks, utils
 
 
 class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
@@ -145,7 +146,7 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
 
             payment.save()
 
-            log.event_logger.invoice.info(
+            event_logger.info(
                 'Payment for invoice ({month}/{year}) has been added."',
                 event_type="payment_created",
                 event_context={
@@ -154,6 +155,7 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
                     "customer": invoice.customer,
                     "invoice": invoice,
                 },
+                group="invoice",
             )
 
         invoice.state = models.Invoice.States.PAID
@@ -450,12 +452,13 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
         invoice_item.invoice = invoice
         invoice_item.save()
 
-        log.event_logger.invoice_item.info(
+        event_logger.info(
             f"Invoice item has been migrated from {old_invoice} to {invoice}",
             event_type="invoice_item_updated",
             event_context={
                 "invoice_item": invoice_item,
             },
+            group="invoice_item",
         )
 
         return Response(
@@ -748,7 +751,7 @@ class PaymentViewSet(core_views.ActionsViewSet):
         payment.invoice = invoice
         payment.save(update_fields=["invoice"])
 
-        log.event_logger.invoice.info(
+        event_logger.info(
             "Payment for invoice ({month}/{year}) has been added.",
             event_type="payment_created",
             event_context={
@@ -757,6 +760,7 @@ class PaymentViewSet(core_views.ActionsViewSet):
                 "customer": invoice.customer,
                 "invoice": invoice,
             },
+            group="invoice",
         )
 
         return Response(
@@ -786,7 +790,7 @@ class PaymentViewSet(core_views.ActionsViewSet):
         payment.invoice = None
         payment.save(update_fields=["invoice"])
 
-        log.event_logger.invoice.info(
+        event_logger.info(
             "Payment for invoice ({month}/{year}) has been removed.",
             event_type="payment_removed",
             event_context={
@@ -795,6 +799,7 @@ class PaymentViewSet(core_views.ActionsViewSet):
                 "customer": invoice.customer,
                 "invoice": invoice,
             },
+            group="invoice",
         )
 
         return Response(
@@ -807,7 +812,7 @@ class PaymentViewSet(core_views.ActionsViewSet):
     def perform_create(self, serializer):
         super().perform_create(serializer)
         payment: models.Payment = serializer.instance
-        log.event_logger.payment.info(
+        event_logger.info(
             "Payment for {customer_name} in the amount of {amount} has been added.",
             event_type="payment_added",
             event_context={
@@ -815,6 +820,7 @@ class PaymentViewSet(core_views.ActionsViewSet):
                 "customer": payment.profile.organization,
                 "invoice": payment.invoice,
             },
+            group="payment",
         )
 
     def perform_destroy(self, instance: models.Payment):
@@ -822,7 +828,7 @@ class PaymentViewSet(core_views.ActionsViewSet):
         amount = instance.sum
         super().perform_destroy(instance)
 
-        log.event_logger.payment.info(
+        event_logger.info(
             "Payment for {customer_name} in the amount of {amount} has been removed.",
             event_type="payment_removed",
             event_context={
@@ -830,6 +836,7 @@ class PaymentViewSet(core_views.ActionsViewSet):
                 "customer": customer,
                 "invoice": instance.invoice,
             },
+            group="payment",
         )
 
 

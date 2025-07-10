@@ -1,6 +1,7 @@
 import logging
 from collections.abc import Callable
 from decimal import Decimal
+from typing import cast
 
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, RegexValidator
@@ -12,6 +13,7 @@ from django.utils.translation import gettext_lazy as _
 from django_fsm import FSMIntegerField, transition
 from model_utils import FieldTracker
 from model_utils.models import TimeFramedModel, TimeStampedModel
+from model_utils.tracker import FieldInstanceTracker
 from rest_framework import exceptions as rf_exceptions
 from reversion import revisions as reversion
 
@@ -33,7 +35,9 @@ from waldur_core.quotas import models as quotas_models
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.mixins import CoordinatesMixin
 from waldur_mastermind.marketplace.enums import (
+    BillingTypes,
     CategoryColumnWidget,
+    LimitPeriods,
     OfferingStates,
     OrderStates,
     RequestTypes,
@@ -502,7 +506,7 @@ class Offering(
     )
 
     objects = managers.OfferingManager()
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Permissions:
         customer_path = "customer"
@@ -563,22 +567,18 @@ class Offering(
     @cached_property
     def is_usage_based(self) -> bool:
         return self.components.filter(
-            billing_type=OfferingComponent.BillingTypes.USAGE,
+            billing_type=BillingTypes.USAGE,
         ).exists()
 
     def get_limit_components(self) -> dict[str, "OfferingComponent"]:
-        components = self.components.filter(
-            billing_type=OfferingComponent.BillingTypes.LIMIT
-        )
+        components = self.components.filter(billing_type=BillingTypes.LIMIT)
         return {component.type: component for component in components}
 
     @cached_property
     def is_limit_based(self) -> bool:
         if not plugins.manager.can_update_limits(self.type):
             return False
-        if not self.components.filter(
-            billing_type=OfferingComponent.BillingTypes.LIMIT
-        ).exists():
+        if not self.components.filter(billing_type=BillingTypes.LIMIT).exists():
             return False
         return True
 
@@ -624,50 +624,7 @@ class OfferingComponent(
         unique_together = ("type", "offering")
         ordering = ("name",)
 
-    class BillingTypes:
-        FIXED = "fixed"
-        USAGE = "usage"
-        ONE_TIME = "one"
-        ON_PLAN_SWITCH = "few"
-        LIMIT = "limit"
-
-        CHOICES = (
-            # if billing type is fixed, service provider specifies exact values of amount field of plan component model
-            (FIXED, "Fixed-price"),
-            # if billing type is usage-based billing is applied when usage report is submitted
-            (USAGE, "Usage-based"),
-            # if billing type is limit, user specifies limit when resource is provisioned or updated
-            (LIMIT, "Limit-based"),
-            # if billing type is one-time, billing is applied once on resource activation
-            (ONE_TIME, "One-time"),
-            # applies fee on resource activation and every time a plan has changed, using pricing of a new plan
-            (ON_PLAN_SWITCH, "One-time on plan switch"),
-        )
-
-    class LimitPeriods:
-        MONTH = "month"
-        ANNUAL = "annual"
-        TOTAL = "total"
-
-        CHOICES = (
-            (
-                MONTH,
-                "Maximum monthly - every month service provider "
-                "can report up to the amount requested by user.",
-            ),
-            (
-                ANNUAL,
-                "Maximum annually - every year service provider "
-                "can report up to the amount requested by user.",
-            ),
-            (
-                TOTAL,
-                "Maximum total - SP can report up to the requested "
-                "amount over the whole active state of resource.",
-            ),
-        )
-
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
     offering = models.ForeignKey(
         on_delete=models.CASCADE, to=Offering, related_name="components"
     )
@@ -703,9 +660,9 @@ class OfferingComponent(
 
         usages = ComponentUsage.objects.filter(resource=resource, component=self)
 
-        if self.limit_period == OfferingComponent.LimitPeriods.MONTH:
+        if self.limit_period == LimitPeriods.MONTH:
             usages = usages.filter(date=core_utils.month_start(date))
-        elif self.limit_period == OfferingComponent.LimitPeriods.ANNUAL:
+        elif self.limit_period == LimitPeriods.ANNUAL:
             usages = usages.filter(date__year=date.year)
 
         total = usages.aggregate(models.Sum("usage"))["usage__sum"] or 0
@@ -767,7 +724,7 @@ class Plan(
         structure_models.OrganizationGroup, related_name="plans", blank=True
     )
     objects = managers.PlanManager()
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Meta:
         ordering = ("name",)
@@ -803,15 +760,15 @@ class Plan(
 
     @property
     def fixed_price(self) -> float:
-        return self.sum_components(OfferingComponent.BillingTypes.FIXED)
+        return self.sum_components(BillingTypes.FIXED)
 
     @property
     def init_price(self) -> float:
-        return self.sum_components(OfferingComponent.BillingTypes.ONE_TIME)
+        return self.sum_components(BillingTypes.ONE_TIME)
 
     @property
     def switch_price(self) -> float:
-        return self.sum_components(OfferingComponent.BillingTypes.ON_PLAN_SWITCH)
+        return self.sum_components(BillingTypes.ON_PLAN_SWITCH)
 
     def sum_components(self, billing_type) -> float:
         components = self.components.filter(component__billing_type=billing_type)
@@ -869,7 +826,7 @@ class PlanComponent(LoggableMixin, models.Model):
         verbose_name=_("Price per unit for future month."),
         null=True,
     )
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     @property
     def has_connected_resources(self):
@@ -1071,7 +1028,7 @@ class Resource(
     report = models.JSONField(blank=True, null=True)
     options = models.JSONField(blank=True, null=True)
     current_usages = models.JSONField(blank=True, default=dict)
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
     objects = managers.ResourceManager()
     # Effective ID is used when resource is provisioned through remote Waldur
     effective_id = models.CharField(max_length=255, blank=True)
@@ -1241,7 +1198,7 @@ class Order(
         default=OrderStates.PENDING_CONSUMER, choices=OrderStates.CHOICES
     )
     output = models.TextField(blank=True)
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     created_by = models.ForeignKey(
         on_delete=models.CASCADE,
@@ -1409,7 +1366,7 @@ class ComponentUsage(
         to=User, related_name="+", blank=True, null=True, on_delete=models.SET_NULL
     )
 
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Meta:
         constraints = [
@@ -1510,7 +1467,7 @@ class OfferingUser(
         default=False,
         help_text=_("Signal to service if the user account is restricted or not"),
     )
-    tracker = FieldTracker()
+    tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Meta:
         unique_together = ("offering", "user")
@@ -1567,8 +1524,11 @@ class ScopedServiceAccount(BaseServiceAccount):
     def __str__(self):
         return f"Service account {self.username} for {self.scope}"
 
-    tracker = FieldTracker(
-        fields=["username", "email", "description", "preferred_identifier"]
+    tracker = cast(
+        FieldInstanceTracker,
+        FieldTracker(
+            fields=["username", "email", "description", "preferred_identifier"]
+        ),
     )
 
 
@@ -1617,7 +1577,10 @@ class RobotAccount(
     )
 
     # Get base fields from BaseServiceAccount's tracker and add new ones
-    tracker = FieldTracker(fields=["username", "state", "resource", "type", "keys"])
+    tracker = cast(
+        FieldInstanceTracker,
+        FieldTracker(fields=["username", "state", "resource", "type", "keys"]),
+    )
 
     users = models.ManyToManyField(
         User, blank=True, help_text=_("Users who have access to this robot account.")

@@ -1,7 +1,7 @@
 import logging
 
 from django.db import transaction
-from django.db.models import OuterRef, QuerySet
+from django.db.models import OuterRef
 
 from waldur_core.core.utils import SubqueryCount, get_system_robot
 from waldur_core.permissions.enums import RoleEnum
@@ -27,6 +27,7 @@ def get_available_reviewer(proposal: proposal_models.Proposal):
     number_of_needed_reviewers = max(
         0,
         proposal.round.minimum_number_of_reviewers
+        or 0
         - proposal.review_set.exclude(
             state=proposal_models.Review.States.REJECTED
         ).count(),
@@ -81,15 +82,13 @@ def allocate_proposal(proposal: proposal_models.Proposal):
     proposal.project = project
     proposal.save()
 
-    requested_resources: QuerySet[proposal_models.RequestedResource] = (
-        proposal.requestedresource_set.filter(
-            requested_offering__state=RequestedOfferingStates.ACCEPTED
-        )
+    requested_resources = proposal.requestedresource_set.filter(
+        requested_offering__state=RequestedOfferingStates.ACCEPTED
     )
 
     project_role = proposal.round.call.default_project_role or RoleEnum.PROJECT_ADMIN
     for user in get_users(proposal):
-        proposal.project.add_user(user, project_role)
+        project.add_user(user, project_role)
 
     for requested_resource in requested_resources:
         with transaction.atomic():
@@ -99,7 +98,7 @@ def allocate_proposal(proposal: proposal_models.Proposal):
                 )
 
             attrs = dict(
-                project=proposal.project,
+                project=project,
                 offering=requested_resource.requested_offering.offering,
                 plan=requested_resource.requested_offering.plan,
                 attributes=requested_resource.attributes,
@@ -107,7 +106,7 @@ def allocate_proposal(proposal: proposal_models.Proposal):
             )
             resource = marketplace_models.Resource(
                 **attrs,
-                name=requested_resource.attributes["name"],
+                name=project.name,
             )
             resource.init_cost()
             resource.save()
@@ -124,7 +123,7 @@ def allocate_proposal(proposal: proposal_models.Proposal):
             requested_resource.save()
 
 
-def create_reviews_of_round(call_round):
+def create_reviews_of_round(call_round: proposal_models.Round):
     call_round.proposal_set.filter(state=ProposalStates.DRAFT).update(
         state=ProposalStates.CANCELED
     )

@@ -5,12 +5,17 @@ from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
-from waldur_core.core.models import StateMixin
+from waldur_core.core.log import event_logger
+from waldur_core.core.models import ChangeEmailRequest, StateMixin
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import get_customer, get_permissions
-from waldur_core.structure.log import event_logger
 from waldur_core.structure.managers import count_customer_users
-from waldur_core.structure.models import Customer, Project, ServiceSettings
+from waldur_core.structure.models import (
+    AccessSubnet,
+    Customer,
+    Project,
+    ServiceSettings,
+)
 
 from . import tasks
 
@@ -29,7 +34,7 @@ def change_users_quota(sender, instance: UserRole, **kwargs):
     customer.set_quota_usage("nc_user_count", count_customer_users(customer))
 
 
-def revoke_roles_on_project_deletion(sender, instance=None, **kwargs):
+def revoke_roles_on_project_deletion(sender, instance: Project | None = None, **kwargs):
     """
     When project is deleted, all project permissions are cascade deleted
     by Django without emitting role_revoked signal.
@@ -39,14 +44,15 @@ def revoke_roles_on_project_deletion(sender, instance=None, **kwargs):
         permission.revoke()
 
 
-def log_customer_save(sender, instance, created=False, **kwargs):
+def log_customer_save(sender, instance: Customer, created=False, **kwargs):
     if created:
-        event_logger.customer.info(
+        event_logger.info(
             "Customer {customer_name} has been created.",
             event_type="customer_creation_succeeded",
             event_context={
                 "customer": instance,
             },
+            group="customer",
         )
     else:
         changed_fields = instance.tracker.changed().copy()
@@ -85,33 +91,36 @@ def log_customer_save(sender, instance, created=False, **kwargs):
             current_value = getattr(instance, name)
             message = f"{message} {name.capitalize()} has been changed from '{previous_value}' to '{current_value}'."
 
-        event_logger.customer.info(
+        event_logger.info(
             message,
             event_type="customer_update_succeeded",
             event_context={
                 "customer": instance,
             },
+            group="customer",
         )
 
 
-def log_customer_delete(sender, instance, **kwargs):
-    event_logger.customer.info(
+def log_customer_delete(sender, instance: Customer, **kwargs):
+    event_logger.info(
         "Customer {customer_name} has been deleted.",
         event_type="customer_deletion_succeeded",
         event_context={
             "customer": instance,
         },
+        group="customer",
     )
 
 
-def log_project_save(sender, instance, created=False, **kwargs):
+def log_project_save(sender, instance: Project, created=False, **kwargs):
     if created:
-        event_logger.project.info(
+        event_logger.info(
             "Project {project_name} has been created.",
             event_type="project_creation_succeeded",
             event_context={
                 "project": instance,
             },
+            group="project",
         )
     else:
         changed_fields = instance.tracker.changed().copy()
@@ -125,54 +134,60 @@ def log_project_save(sender, instance, created=False, **kwargs):
             current_value = getattr(instance, name)
             message = f"{message} {name.capitalize()} has been changed from '{previous_value}' to '{current_value}'."
 
-        event_logger.project.info(
+        event_logger.info(
             message,
             event_type="project_update_succeeded",
             event_context={"project": instance},
+            group="project",
         )
 
 
-def log_project_delete(sender, instance, **kwargs):
-    event_logger.project.info(
+def log_project_delete(sender, instance: Project, **kwargs):
+    event_logger.info(
         "Project {project_name} has been deleted.",
         event_type="project_deletion_succeeded",
         event_context={
             "project": instance,
         },
+        group="project",
     )
 
 
 def log_resource_deleted(sender, instance, **kwargs):
-    event_logger.resource.info(
+    event_logger.info(
         "{resource_full_name} has been deleted.",
         event_type="resource_deletion_succeeded",
         event_context={"resource": instance},
+        group="resource",
     )
 
 
 def log_resource_imported(sender, instance, **kwargs):
     if not instance.pk:
         return
-    event_logger.resource.info(
+    event_logger.info(
         "Resource {resource_full_name} has been imported.",
         event_type="resource_import_succeeded",
         event_context={"resource": instance},
+        group="resource",
     )
 
 
 def log_resource_creation_succeeded(instance):
-    event_logger.resource.info(
+    event_logger.info(
         "Resource {resource_name} has been created.",
         event_type="resource_creation_succeeded",
         event_context={"resource": instance},
+        group="resource",
     )
 
 
 def log_resource_creation_failed(instance):
-    event_logger.resource.error(
+    event_logger.error(
         "Resource {resource_name} creation has failed.",
         event_type="resource_creation_failed",
         event_context={"resource": instance},
+        group="resource",
     )
 
 
@@ -187,10 +202,11 @@ def log_resource_creation_scheduled(sender, instance, created=False, **kwargs):
 
 def _log_resource_creation_scheduled(instance):
     if instance.pk:
-        event_logger.resource.info(
+        event_logger.info(
             "Resource {resource_name} creation has been scheduled.",
             event_type="resource_creation_scheduled",
             event_context={"resource": instance},
+            group="resource",
         )
 
 
@@ -203,10 +219,11 @@ def log_resource_action(sender, instance, name, source, target, **kwargs):
                 log_resource_creation_failed(instance)
 
     if isinstance(instance, StateMixin) and target == CoreStates.DELETION_SCHEDULED:
-        event_logger.resource.info(
+        event_logger.info(
             "Resource {resource_name} deletion has been scheduled.",
             event_type="resource_deletion_scheduled",
             event_context={"resource": instance},
+            group="resource",
         )
 
 
@@ -222,30 +239,33 @@ def generate_access_subnet_changes(instance, created=False):
 
 def log_access_subnet_update_succeeded(instance):
     changes = generate_access_subnet_changes(instance)
-    event_logger.access_subnet.info(
+    event_logger.info(
         changes,
         event_type="access_subnet_update_succeeded",
         event_context={"access_subnet": instance},
+        group="access_subnet",
     )
 
 
 def log_access_subnet_creation_succeeded(instance):
-    event_logger.access_subnet.info(
+    event_logger.info(
         f"Access subnet {instance} has been created.",
         event_type="access_subnet_creation_succeeded",
         event_context={"access_subnet": instance},
+        group="access_subnet",
     )
 
 
-def log_access_subnet_deletion_succeeded(sender, instance, **kwargs):
-    event_logger.access_subnet.info(
+def log_access_subnet_deletion_succeeded(sender, instance: AccessSubnet, **kwargs):
+    event_logger.info(
         f"Access subnet {instance} has been deleted.",
         event_type="access_subnet_deletion_succeeded",
         event_context={"access_subnet": instance},
+        group="access_subnet",
     )
 
 
-def log_access_subnet_save(sender, instance, created=False, **kwargs):
+def log_access_subnet_save(sender, instance: AccessSubnet, created=False, **kwargs):
     if created:
         log_access_subnet_creation_succeeded(instance)
     else:
@@ -284,7 +304,9 @@ def update_customer_users_count(sender, **kwargs):
         customer.set_quota_usage("nc_user_count", usage)
 
 
-def change_email_has_been_requested(sender, instance, created=False, **kwargs):
+def change_email_has_been_requested(
+    sender, instance: ChangeEmailRequest, created=False, **kwargs
+):
     if not created:
         return
 
