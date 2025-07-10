@@ -1033,6 +1033,63 @@ class ProjectInfo(models.Model):
 
                     self.project.short_name = self.shortname
                     self.project.save()
+            else:
+                # no shortname set - need to get it from the slug
+                logger.warning(
+                    f"No shortname set for project {self.project} - using slug: {e}"
+                )
+                shortname = self.project.slug.strip()
+
+                if len(shortname) == 0:
+                    raise ValueError(
+                        "Project shortname cannot be empty. Please set it in OpenPortal."
+                    )
+
+                if len(shortname) > MAX_PROJECT_SHORTNAME_LENGTH:
+                    logger.warning(
+                        f"Project shortname {shortname} is too long, truncating to {MAX_PROJECT_SHORTNAME_LENGTH} characters."
+                    )
+                    shortname = shortname[:MAX_PROJECT_SHORTNAME_LENGTH]
+
+                self.shortname = shortname
+                self.save(force_accept_changed_shortname=True)
+
+                try:
+                    self.project.short_name = shortname
+                    self.project.save()
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to save project shortname {self.shortname} for project {self.project} - using slug: {e}"
+                    )
+
+        elif self.shortname is None:
+            # automatically generate a shortname if this is not set
+            logger.warning(
+                f"No shortname set for project {self.project} - using slug: {e}"
+            )
+            shortname = self.project.slug.strip()
+
+            if len(shortname) == 0:
+                raise ValueError(
+                    "Project shortname cannot be empty. Please set it in OpenPortal."
+                )
+
+            if len(shortname) > MAX_PROJECT_SHORTNAME_LENGTH:
+                logger.warning(
+                    f"Project shortname {shortname} is too long, truncating to {MAX_PROJECT_SHORTNAME_LENGTH} characters."
+                )
+                shortname = shortname[:MAX_PROJECT_SHORTNAME_LENGTH]
+
+            self.shortname = shortname
+            self.save(force_accept_changed_shortname=True)
+
+            try:
+                self.project.short_name = shortname
+                self.project.save()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to save project shortname {self.shortname} for project {self.project} - using slug: {e}"
+                )
 
         if self.shortname is None:
             # Raise an error as we don't have a shortname set!
