@@ -8,6 +8,7 @@ from rest_framework import serializers as rf_serializers
 from waldur_core.core import serializers as core_serializers
 from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure import models as structure_models
+from waldur_mastermind.marketplace import models as marketplace_models
 
 from waldur_core.structure.permissions import _has_admin_access
 
@@ -319,8 +320,22 @@ class ProjectInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
 
 
 class ProjectClassSerializer(
-    rf_serializers.HyperlinkedModelSerializer,
+    structure_serializers.PermissionFieldFilteringMixin,
+    rf_serializers.ModelSerializer,
 ):
+    customer = rf_serializers.HyperlinkedRelatedField(
+        queryset=structure_models.Customer.objects.all(),
+        view_name="customer-detail",
+        lookup_field="uuid",
+    )
+
+    # offerings = rf_serializers.HyperlinkedRelatedField(
+    #    many=True,
+    #    queryset=marketplace_models.Offering.objects.all(),
+    #    view_name="offering-detail",
+    #    lookup_field="uuid",
+    # )
+
     class Meta:
         model = models.ProjectClass
         fields = (
@@ -329,11 +344,16 @@ class ProjectClassSerializer(
             "portal",
             "customer",
             "shortname",
-            "offerings",
+            #        "offerings",
             "approval_limit",
             "max_credit_limit",
             "role_mapping",
         )
+
+        related_paths = ("customer", "offerings")
+
+    def get_filtered_field_names(self):
+        return ("customer", "offerings")
 
 
 class ManagedProjectSerializer(
@@ -355,11 +375,11 @@ class ManagedProjectSerializer(
         lookup_field="uuid",
     )
 
-    project_class = rf_serializers.HyperlinkedRelatedField(
-        queryset=models.ProjectClass.objects.all(),
-        view_name="openportal-project-class",
-        lookup_field="uuid",
-    )
+    # project_class = rf_serializers.HyperlinkedRelatedField(
+    #    queryset=models.ProjectClass.objects.all(),
+    #    view_name="openportal-project-class",
+    #    lookup_field="uuid",
+    # )
 
     class Meta:
         model = models.ManagedProject

@@ -213,14 +213,6 @@ class UserInfoViewSet(core_views.ActionsViewSet):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-class ProjectClassViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = models.ProjectClass.objects.all().order_by("name")
-    serializer_class = serializers.ProjectClassSerializer
-    permission_classes = (permissions.IsAuthenticated,)
-    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
-    filterset_class = filters.ProjectClassFilter
-
-
 class ProjectInfoViewSet(core_views.ActionsViewSet):
     queryset = models.ProjectInfo.objects.all().order_by("shortname")
     lookup_field = "project"
@@ -345,8 +337,22 @@ def user_is_service_provider_owner_or_service_provider_manager(
     raise PermissionDenied()
 
 
+class ProjectClassViewSet(viewsets.ReadOnlyModelViewSet):
+    lookup_field = "uuid"
+    queryset = models.ProjectClass.objects.all()
+    serializer_class = serializers.ProjectClassSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.ProjectClassFilter
+
+
 class ManagedProjectViewSet(core_views.ActionsViewSet):
     queryset = models.ManagedProject.objects.all()
+    permission_classes = (
+        permissions.IsAuthenticated,
+        structure_permissions.IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     approve_permissions = reject_permissions = [
         user_is_service_provider_owner_or_service_provider_manager
     ]
