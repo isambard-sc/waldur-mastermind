@@ -9,6 +9,8 @@ from waldur_core.core import serializers as core_serializers
 from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_core.structure.managers import filter_queryset_for_user
+
 
 from waldur_core.structure.permissions import _has_admin_access
 
@@ -323,6 +325,69 @@ class ProjectClassSerializer(
     structure_serializers.PermissionFieldFilteringMixin,
     rf_serializers.ModelSerializer,
 ):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Handle permission filtering for many-to-many fields
+        if hasattr(self, "context") and "request" in self.context:
+            user = self.context["request"].user
+            # Access the child field of the ManyRelatedField to set the queryset
+            if hasattr(self.fields["offerings"], "child"):
+                self.fields["offerings"].child.queryset = filter_queryset_for_user(
+                    marketplace_models.Offering.objects.all(), user
+                )
+
+    def get_fields(self):
+        fields = rf_serializers.ModelSerializer.get_fields(self)
+
+        try:
+            request = self.context["request"]
+            user = request.user
+        except (KeyError, AttributeError):
+            return fields
+
+        for field_name in self.get_filtered_field_names():
+            if field_name not in fields:  # field could be not required by user
+                continue
+            field = fields[field_name]
+
+            # Handle ManyRelatedField (many=True relationships)
+            if hasattr(field, "child") and hasattr(field.child, "queryset"):
+                field.child.queryset = filter_queryset_for_user(
+                    field.child.queryset, user
+                )
+            # Handle regular fields with queryset
+            elif hasattr(field, "queryset"):
+                field.queryset = filter_queryset_for_user(field.queryset, user)
+
+        return fields
+
+    def filter_field_queryset(self, field, queryset, field_name):
+        """Override to handle ManyRelatedField properly"""
+        logger.info(
+            f"Filtering field {field_name} for user {self.context['request'].user.username}"
+        )
+        # Check if this is a ManyRelatedField (many=True relationship)
+        if hasattr(field, "child") and hasattr(field.child, "queryset"):
+            logger.info(
+                f"Filtering ManyRelatedField {field_name} for user {self.context['request'].user.username}"
+            )
+            # Filter the child field's queryset instead
+            if hasattr(self, "context") and "request" in self.context:
+                user = self.context["request"].user
+                logger.info(
+                    f"Filtering queryset for user {user.username} on field {field_name}"
+                )
+                field.child.queryset = filter_queryset_for_user(
+                    field.child.queryset, user
+                )
+
+            logger.info("Returning filtered queryset for ManyRelatedField")
+
+            return field
+
+        # Use the default behavior for other fields
+        return super().filter_field_queryset(field, queryset, field_name)
+
     provider = rf_serializers.HyperlinkedRelatedField(
         queryset=structure_models.Customer.objects.all(),
         view_name="customer-detail",
@@ -335,12 +400,12 @@ class ProjectClassSerializer(
         lookup_field="uuid",
     )
 
-    # offerings = rf_serializers.HyperlinkedRelatedField(
-    #    many=True,
-    #    queryset=marketplace_models.Offering.objects.all(),
-    #    view_name="offering-detail",
-    #    lookup_field="uuid",
-    # )
+    offerings = rf_serializers.HyperlinkedRelatedField(
+        many=True,
+        queryset=marketplace_models.Offering.objects.all(),
+        view_name="marketplace-provider-offering-detail",
+        lookup_field="uuid",
+    )
 
     class Meta:
         model = models.ProjectClass
@@ -351,16 +416,16 @@ class ProjectClassSerializer(
             "portal",
             "customer",
             "shortname",
-            #        "offerings",
+            "offerings",
             "approval_limit",
             "max_credit_limit",
             "role_mapping",
         )
 
-        related_paths = ("provider", "customer")
+        related_paths = ("provider", "customer", "offerings")
 
     def get_filtered_field_names(self):
-        return ("provider", "customer")
+        return ("provider", "customer", "offerings")
 
 
 class ManagedProjectSerializer(
