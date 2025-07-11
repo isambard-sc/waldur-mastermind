@@ -333,7 +333,7 @@ def _has_owner_or_manager_access(user, customer):
 def user_is_staff_or_service_provider_owner_or_service_provider_manager(
     user, view, project: models.ManagedProject | None = None
 ):
-    logger.info(f"Checking if user {user} is staff or has access to project {project}")
+    logger.error(f"Checking if user {user} is staff or has access to project {project}")
 
     if not project:
         logger.error("Project is None, raising PermissionDenied")
@@ -352,7 +352,7 @@ def user_is_staff_or_service_provider_owner_or_service_provider_manager(
         raise PermissionDenied()
 
     if user.is_staff:
-        logger.info(f"User {user} is staff, granting access to project {project}")
+        logger.error(f"User {user} is staff, granting access to project {project}")
         return
 
     if _has_owner_or_manager_access(
@@ -401,11 +401,7 @@ class IsStaffOrServiceProviderOwnerOrManager(BasePermission):
 
 class ManagedProjectViewSet(core_views.ActionsViewSet):
     queryset = models.ManagedProject.objects.all().order_by("created")
-    permission_classes = (
-        permissions.IsAuthenticated,
-        structure_permissions.IsAdminOrOwner,
-        IsAdminOrReadOnly,
-    )
+    permission_classes = ()
     approve_permissions = reject_permissions = [IsStaffOrServiceProviderOwnerOrManager]
     serializer_class = serializers.ManagedProjectSerializer
     filter_backends = [GenericRoleFilter, DjangoFilterBackend]
@@ -424,23 +420,6 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     )
     @action(detail=True, methods=["post"])
     def approve(self, request, **kwargs):
-        logger.info(f"User: {request.user}")
-        logger.info(f"User is staff: {request.user.is_staff}")
-        logger.info(f"User is authenticated: {request.user.is_authenticated}")
-
-        # Manually check the permission
-        permission_result = (
-            user_is_staff_or_service_provider_owner_or_service_provider_manager(
-                request.user, self.get_object()
-            )
-        )
-        logger.info(f"Permission check result: {permission_result}")
-
-        if not permission_result:
-            return Response(
-                {"error": "Permission denied"}, status=status.HTTP_403_FORBIDDEN
-            )
-
         project: models.ManagedProject = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
