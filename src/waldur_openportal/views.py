@@ -379,7 +379,10 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     filterset_class = filters.ManagedProjectFilter
 
     disabled_actions = ["create", "destroy", "update", "partial_update"]
-    lookup_field = "uuid"
+    lookup_field = "identifier"
+    lookup_url_kwarg = "identifier"
+    # need to handle periods in the identifier
+    lookup_value_regex = r"[\w.-]+"
 
     @extend_schema(
         request=ReviewCommentSerializer,
