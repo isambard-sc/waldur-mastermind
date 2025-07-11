@@ -1317,6 +1317,21 @@ class ProjectClass(core_models.UuidMixin, models.Model):
         max_length=MAX_PROJECTCLASS_LENGTH, verbose_name=_("name"), db_index=True
     )
 
+    # The customer (organisation) that owns this project class and can
+    # make changes or approve / deny project requests for this class
+    # A user needs to be a staff member, or an owner or manager of both
+    # the provider and customer organisations to be able to approve or
+    # deny project requests for this class. Only staff members, or
+    # owners or managers of the provider organisation can make changes
+    # to this project class.
+    provider = models.ForeignKey(
+        to=structure_models.Customer,
+        on_delete=models.CASCADE,
+        related_name="op-projectclass-provider+",
+        verbose_name=_("provider"),
+        help_text=_("The organisation that owns this project class."),
+    )
+
     # The name of the portal (PortalIdentifier) that is allowed to create
     # this project class. The combination of name and portal must be unique.
     portal = models.CharField(

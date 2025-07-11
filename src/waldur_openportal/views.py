@@ -320,18 +320,36 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-def user_is_service_provider_owner_or_service_provider_manager(
-    request, view, obj: models.ManagedProject | None = None
+def _has_owner_or_manager_access(user, customer):
+    """
+    Check if the user has owner or manager access to the project class.
+    """
+    return _has_owner_access(user, customer) or customer.has_user(
+        user, role=ServiceProviderRole.MANAGER
+    )
+
+
+def user_is_staff_or_service_provider_owner_or_service_provider_manager(
+    request, view, project: models.ManagedProject | None = None
 ):
-    if not obj:
+    if not project:
+        raise PermissionDenied()
+
+    if project.project_class is None:
+        raise PermissionDenied()
+
+    if project.project_class.provider is None:
+        raise PermissionDenied()
+
+    if project.project_class.customer is None:
+        raise PermissionDenied()
+
+    if request.user.is_staff:
         return
 
-    if _has_owner_access(request.user, obj.project_class.customer):
-        return
-
-    if obj.project_class.customer.has_user(
-        request.user, role=ServiceProviderRole.MANAGER
-    ):
+    if _has_owner_or_manager_access(
+        request.user, project.project_class.provider
+    ) and _has_owner_access(request.user, project.project_class.customer):
         return
 
     raise PermissionDenied()
@@ -354,7 +372,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         IsAdminOrReadOnly,
     )
     approve_permissions = reject_permissions = [
-        user_is_service_provider_owner_or_service_provider_manager
+        user_is_staff_or_service_provider_owner_or_service_provider_manager
     ]
     serializer_class = serializers.ManagedProjectSerializer
     filter_backends = [GenericRoleFilter, DjangoFilterBackend]
@@ -370,11 +388,11 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     )
     @action(detail=True, methods=["post"])
     def approve(self, request, **kwargs):
-        review_request: models.ManagedProject = self.get_object()
+        project: models.ManagedProject = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
-        review_request.approve(request.user, comment)
+        project.approve(request.user, comment)
         return Response(status=status.HTTP_200_OK)
 
     @extend_schema(
@@ -384,11 +402,11 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     )
     @action(detail=True, methods=["post"])
     def reject(self, request, **kwargs):
-        review_request: models.ManagedProject = self.get_object()
+        project: models.ManagedProject = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
-        review_request.reject(request.user, comment)
+        project.reject(request.user, comment)
         return Response(status=status.HTTP_200_OK)
 
     approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
