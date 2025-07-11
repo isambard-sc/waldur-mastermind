@@ -7,6 +7,7 @@ from rest_framework import permissions, response, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import BasePermission
 
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core import executors as core_executors
@@ -330,27 +331,41 @@ def _has_owner_or_manager_access(user, customer):
 
 
 def user_is_staff_or_service_provider_owner_or_service_provider_manager(
-    request, view, project: models.ManagedProject | None = None
+    user, view, project: models.ManagedProject | None = None
 ):
+    logger.info(f"Checking if user {user} is staff or has access to project {project}")
+
     if not project:
+        logger.error("Project is None, raising PermissionDenied")
         raise PermissionDenied()
 
     if project.project_class is None:
+        logger.error("Project class is None, raising PermissionDenied")
         raise PermissionDenied()
 
     if project.project_class.provider is None:
+        logger.error("Project class provider is None, raising PermissionDenied")
         raise PermissionDenied()
 
     if project.project_class.customer is None:
+        logger.error("Project class customer is None, raising PermissionDenied")
         raise PermissionDenied()
 
-    if request.user.is_staff:
+    if user.is_staff:
+        logger.info(f"User {user} is staff, granting access to project {project}")
         return
 
     if _has_owner_or_manager_access(
-        request.user, project.project_class.provider
-    ) and _has_owner_access(request.user, project.project_class.customer):
+        user, project.project_class.provider
+    ) and _has_owner_access(user, project.project_class.customer):
+        logger.info(
+            f"User {user} has owner or manager access to project {project}, granting access"
+        )
         return
+
+    logger.error(
+        f"User {user} does not have access to project {project}, raising PermissionDenied"
+    )
 
     raise PermissionDenied()
 
@@ -364,6 +379,26 @@ class ProjectClassViewSet(viewsets.ReadOnlyModelViewSet):
     filterset_class = filters.ProjectClassFilter
 
 
+class IsStaffOrServiceProviderOwnerOrManager(BasePermission):
+    """
+    Permission class for staff or service provider owners/managers
+    """
+
+    def has_permission(self, request, view):
+        logger.info(f"Checking permission for user {request.user} on view {view}")
+        return user_is_staff_or_service_provider_owner_or_service_provider_manager(
+            request.user, view
+        )
+
+    def has_object_permission(self, request, view, obj):
+        logger.info(
+            f"Checking object permission for user {request.user} on view {view} for object {obj}"
+        )
+        return user_is_staff_or_service_provider_owner_or_service_provider_manager(
+            request.user, view, obj if isinstance(obj, models.ManagedProject) else None
+        )
+
+
 class ManagedProjectViewSet(core_views.ActionsViewSet):
     queryset = models.ManagedProject.objects.all().order_by("created")
     permission_classes = (
@@ -371,9 +406,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         structure_permissions.IsAdminOrOwner,
         IsAdminOrReadOnly,
     )
-    approve_permissions = reject_permissions = [
-        user_is_staff_or_service_provider_owner_or_service_provider_manager
-    ]
+    approve_permissions = reject_permissions = [IsStaffOrServiceProviderOwnerOrManager]
     serializer_class = serializers.ManagedProjectSerializer
     filter_backends = [GenericRoleFilter, DjangoFilterBackend]
     filterset_class = filters.ManagedProjectFilter
@@ -387,10 +420,27 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @extend_schema(
         request=ReviewCommentSerializer,
         responses=None,
-        description="Approve project update request",
+        description="Approve managed project request",
     )
     @action(detail=True, methods=["post"])
     def approve(self, request, **kwargs):
+        logger.info(f"User: {request.user}")
+        logger.info(f"User is staff: {request.user.is_staff}")
+        logger.info(f"User is authenticated: {request.user.is_authenticated}")
+
+        # Manually check the permission
+        permission_result = (
+            user_is_staff_or_service_provider_owner_or_service_provider_manager(
+                request.user, self.get_object()
+            )
+        )
+        logger.info(f"Permission check result: {permission_result}")
+
+        if not permission_result:
+            return Response(
+                {"error": "Permission denied"}, status=status.HTTP_403_FORBIDDEN
+            )
+
         project: models.ManagedProject = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -401,7 +451,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @extend_schema(
         request=ReviewCommentSerializer,
         responses=None,
-        description="Reject project update request",
+        description="Reject managed project request",
     )
     @action(detail=True, methods=["post"])
     def reject(self, request, **kwargs):
