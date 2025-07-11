@@ -83,6 +83,15 @@ class ManagedProjectFilter(django_filters.FilterSet):
     local_identifier = django_filters.CharFilter(
         field_name="local_identifier", lookup_expr="icontains"
     )
+
+    project = core_filters.URLFilter(
+        view_name="project-detail", field_name="project__uuid"
+    )
+
+    project_class = core_filters.URLFilter(
+        view_name="openportal-project-class", field_name="project_class__uuid"
+    )
+
     project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
     project_class_uuid = django_filters.UUIDFilter(field_name="project_class__uuid")
     state = core_filters.ReviewStateFilter()

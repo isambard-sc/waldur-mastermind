@@ -323,6 +323,12 @@ class ProjectClassSerializer(
     structure_serializers.PermissionFieldFilteringMixin,
     rf_serializers.ModelSerializer,
 ):
+    provider = rf_serializers.HyperlinkedRelatedField(
+        queryset=structure_models.Customer.objects.all(),
+        view_name="customer-detail",
+        lookup_field="uuid",
+    )
+
     customer = rf_serializers.HyperlinkedRelatedField(
         queryset=structure_models.Customer.objects.all(),
         view_name="customer-detail",
@@ -341,6 +347,7 @@ class ProjectClassSerializer(
         fields = (
             "uuid",
             "name",
+            "provider",
             "portal",
             "customer",
             "shortname",
@@ -350,10 +357,10 @@ class ProjectClassSerializer(
             "role_mapping",
         )
 
-        related_paths = ("customer", "offerings")
+        related_paths = ("provider", "customer")
 
     def get_filtered_field_names(self):
-        return ("customer", "offerings")
+        return ("provider", "customer")
 
 
 class ManagedProjectSerializer(
@@ -380,11 +387,11 @@ class ManagedProjectSerializer(
         help_text=_("Details of the project as provided by the remote OpenPortal."),
     )
 
-    # project_class = rf_serializers.HyperlinkedRelatedField(
-    #    queryset=models.ProjectClass.objects.all(),
-    #    view_name="openportal-project-class",
-    #    lookup_field="uuid",
-    # )
+    project_class = rf_serializers.HyperlinkedRelatedField(
+        queryset=models.ProjectClass.objects.all(),
+        view_name="openportal-project-class-detail",
+        lookup_field="uuid",
+    )
 
     class Meta:
         model = models.ManagedProject
