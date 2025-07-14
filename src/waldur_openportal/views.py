@@ -460,7 +460,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
-        # project.approve(request.user, comment)
+        project.approve(request.user, comment)
         return Response(status=status.HTTP_200_OK)
 
     @extend_schema(
@@ -474,7 +474,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
-        # project.reject(request.user, comment)
+        project.reject(request.user, comment)
         return Response(status=status.HTTP_200_OK)
 
     approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
