@@ -9,6 +9,7 @@ from waldur_core.core import serializers as core_serializers
 from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_core.structure.managers import filter_queryset_for_user
 
 
@@ -394,10 +395,18 @@ class ProjectClassSerializer(
         lookup_field="uuid",
     )
 
+    provider_data = structure_serializers.CustomerSerializer(
+        source="provider", read_only=True
+    )
+
     customer = rf_serializers.HyperlinkedRelatedField(
         queryset=structure_models.Customer.objects.all(),
         view_name="customer-detail",
         lookup_field="uuid",
+    )
+
+    customer_data = structure_serializers.CustomerSerializer(
+        source="customer", read_only=True
     )
 
     offerings = rf_serializers.HyperlinkedRelatedField(
@@ -407,16 +416,23 @@ class ProjectClassSerializer(
         lookup_field="uuid",
     )
 
+    offerings_data = marketplace_serializers.ProviderOfferingDetailsSerializer(
+        source="offerings", many=True, read_only=True
+    )
+
     class Meta:
         model = models.ProjectClass
         fields = (
             "uuid",
             "name",
             "provider",
+            "provider_data",
             "portal",
             "customer",
+            "customer_data",
             "shortname",
             "offerings",
+            "offerings_data",
             "approval_limit",
             "max_credit_limit",
             "role_mapping",
