@@ -40,7 +40,7 @@ class OpenPortalExtension(WaldurExtension):
             },
             "waldur-openportal-sync-remote": {
                 "task": "waldur_openportal.sync_remote",
-                "schedule": timedelta(minutes=1),
+                "schedule": timedelta(minutes=19),
                 "args": (),
             },
         }

@@ -92,7 +92,11 @@ class RemoteAllocationViewSet(structure_views.ResourceViewSet):
 class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = models.AllocationUserUsage.objects.all().order_by("year", "month")
     serializer_class = serializers.AllocationUserUsageSerializer
-    permission_classes = (permissions.IsAuthenticated,)
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.AllocationUserUsageFilter
 
@@ -100,7 +104,11 @@ class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
 class RemoteAllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = models.RemoteAllocationUserUsage.objects.all().order_by("year", "month")
     serializer_class = serializers.RemoteAllocationUserUsageSerializer
-    permission_classes = (permissions.IsAuthenticated,)
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.RemoteAllocationUserUsageFilter
 
@@ -109,7 +117,11 @@ class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
     queryset = models.Association.objects.all().order_by("username")
     serializer_class = serializers.AssociationSerializer
-    permission_classes = (permissions.IsAuthenticated,)
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.AssociationFilter
 
@@ -118,7 +130,11 @@ class RemoteAssociationViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
     queryset = models.RemoteAssociation.objects.all()
     serializer_class = serializers.RemoteAssociationSerializer
-    permission_classes = (permissions.IsAuthenticated,)
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.RemoteAssociationFilter
 
@@ -218,7 +234,11 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
     queryset = models.ProjectInfo.objects.all().order_by("shortname")
     lookup_field = "project"
     serializer_class = serializers.ProjectInfoSerializer
-    permission_classes = [permissions.IsAuthenticated, IsAdminOrReadOnly]
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     filterset_class = filters.ProjectInfoFilter
 
     def _get(self, project):
@@ -331,41 +351,27 @@ def _has_owner_or_manager_access(user, customer):
 
 
 def user_is_staff_or_service_provider_owner_or_service_provider_manager(
-    user, view, project: models.ManagedProject | None = None
+    user, project: models.ManagedProject | None = None
 ):
-    logger.error(f"Checking if user {user} is staff or has access to project {project}")
-
     if not project:
-        logger.error("Project is None, raising PermissionDenied")
         raise PermissionDenied()
 
     if project.project_class is None:
-        logger.error("Project class is None, raising PermissionDenied")
         raise PermissionDenied()
 
     if project.project_class.provider is None:
-        logger.error("Project class provider is None, raising PermissionDenied")
         raise PermissionDenied()
 
     if project.project_class.customer is None:
-        logger.error("Project class customer is None, raising PermissionDenied")
         raise PermissionDenied()
 
     if user.is_staff:
-        logger.error(f"User {user} is staff, granting access to project {project}")
-        return
+        return True
 
     if _has_owner_or_manager_access(
         user, project.project_class.provider
     ) and _has_owner_access(user, project.project_class.customer):
-        logger.info(
-            f"User {user} has owner or manager access to project {project}, granting access"
-        )
-        return
-
-    logger.error(
-        f"User {user} does not have access to project {project}, raising PermissionDenied"
-    )
+        return True
 
     raise PermissionDenied()
 
@@ -374,7 +380,11 @@ class ProjectClassViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
     queryset = models.ProjectClass.objects.all()
     serializer_class = serializers.ProjectClassSerializer
-    permission_classes = (permissions.IsAuthenticated,)
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.ProjectClassFilter
 
@@ -385,24 +395,35 @@ class IsStaffOrServiceProviderOwnerOrManager(BasePermission):
     """
 
     def has_permission(self, request, view):
-        logger.info(f"Checking permission for user {request.user} on view {view}")
-        return user_is_staff_or_service_provider_owner_or_service_provider_manager(
-            request.user, view
-        )
+        obj = view.get_object() if hasattr(view, "get_object") else None
+
+        if isinstance(obj, models.ManagedProject):
+            return user_is_staff_or_service_provider_owner_or_service_provider_manager(
+                request.user, obj
+            )
+        else:
+            raise PermissionDenied()
 
     def has_object_permission(self, request, view, obj):
-        logger.info(
-            f"Checking object permission for user {request.user} on view {view} for object {obj}"
-        )
-        return user_is_staff_or_service_provider_owner_or_service_provider_manager(
-            request.user, view, obj if isinstance(obj, models.ManagedProject) else None
-        )
+        if isinstance(obj, models.ManagedProject):
+            return user_is_staff_or_service_provider_owner_or_service_provider_manager(
+                request.user, obj
+            )
+        else:
+            raise PermissionDenied()
 
 
 class ManagedProjectViewSet(core_views.ActionsViewSet):
     queryset = models.ManagedProject.objects.all().order_by("created")
-    permission_classes = ()
-    approve_permissions = reject_permissions = [IsStaffOrServiceProviderOwnerOrManager]
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
+    approve_permissions = reject_permissions = [
+        permissions.IsAuthenticated,
+        IsStaffOrServiceProviderOwnerOrManager,
+    ]
     serializer_class = serializers.ManagedProjectSerializer
     filter_backends = [GenericRoleFilter, DjangoFilterBackend]
     filterset_class = filters.ManagedProjectFilter
@@ -412,6 +433,21 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     lookup_url_kwarg = "identifier"
     # need to handle periods in the identifier
     lookup_value_regex = r"[\w.-]+"
+
+    def get_permissions(self):
+        """
+        Instantiates and returns the list of permissions that this view requires.
+        """
+        if self.action == "approve" or self.action == "reject":
+            permission_classes = (
+                self.approve_permissions
+                if self.action == "approve"
+                else self.reject_permissions
+            )
+        else:
+            permission_classes = self.permission_classes
+
+        return [permission() for permission in permission_classes]
 
     @extend_schema(
         request=ReviewCommentSerializer,
@@ -424,7 +460,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
-        project.approve(request.user, comment)
+        # project.approve(request.user, comment)
         return Response(status=status.HTTP_200_OK)
 
     @extend_schema(
@@ -438,7 +474,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
-        project.reject(request.user, comment)
+        # project.reject(request.user, comment)
         return Response(status=status.HTTP_200_OK)
 
     approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
