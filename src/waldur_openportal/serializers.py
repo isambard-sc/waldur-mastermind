@@ -8,6 +8,7 @@ from rest_framework import serializers as rf_serializers
 from waldur_core.core import serializers as core_serializers
 from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure import models as structure_models
+from waldur_core.permissions import serializers as permissions_serializers
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_core.structure.managers import filter_queryset_for_user
@@ -420,6 +421,24 @@ class ProjectClassSerializer(
         source="offerings", many=True, read_only=True
     )
 
+    role_mapping_data = rf_serializers.SerializerMethodField()
+
+    def get_role_mapping_data(self, obj):
+        """
+        Serialize the role mapping dictionary returned by get_role_mapping()
+        """
+        role_mapping = obj.get_role_mapping()
+        if not role_mapping:
+            return {}
+
+        serialized_mapping = {}
+        for key, role in role_mapping.items():
+            serialized_mapping[key] = permissions_serializers.RoleDetailsSerializer(
+                role
+            ).data
+
+        return serialized_mapping
+
     class Meta:
         model = models.ProjectClass
         fields = (
@@ -436,6 +455,7 @@ class ProjectClassSerializer(
             "approval_limit",
             "max_credit_limit",
             "role_mapping",
+            "role_mapping_data",
         )
 
         related_paths = ("provider", "customer", "offerings")
