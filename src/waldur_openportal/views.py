@@ -435,19 +435,66 @@ class ProjectClassViewSet(core_views.ActionsViewSet):
         """
         Instantiates and returns the list of permissions that this view requires.
         """
-        if (
-            self.action == "delete"
-            or self.action == "update"
-            or self.action == "create"
-        ):
+        if self.action == "delete" or self.action == "update":
             permission_classes = (
                 permissions.IsAuthenticated,
                 IsStaffOrProjectClassOwner,
             )
+        elif self.action == "create":
+            permission_classes = (permissions.IsAuthenticated,)
         else:
             permission_classes = self.permission_classes
 
         return [permission() for permission in permission_classes]
+
+    # create the function to create a project class
+    @extend_schema(
+        request=serializers.ProjectClassSerializer,
+        responses=serializers.ProjectClassSerializer,
+        description="Create ProjectClass object",
+    )
+    def create(self, request, *args, **kwargs):
+        try:
+            logger.info(f"Creating ProjectClass by user {request.user}")
+            logger.info(f"Request data: {request.data}")
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            logger.info(f"Validated data: {serializer.validated_data}")
+
+            try:
+                is_staff = request.user.is_staff
+            except AttributeError:
+                is_staff = False
+
+            # we need to verify that the user has the right permission in the
+            # provider organization
+            if not (
+                is_staff
+                or _has_owner_access(
+                    request.user, serializer.validated_data.get("provider")
+                )
+            ):
+                logger.error(
+                    f"User {request.user} is not allowed to create ProjectClass for provider {serializer.validated_data.get('provider')}"
+                )
+                return Response(
+                    {
+                        "detail": _(
+                            "You do not have permission to create this project class."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            logger.info(f"Creating ProjectClass with data: {serializer.validated_data}")
+            project_class = serializer.save()
+
+            logger.info(f"Created ProjectClass {project_class} by user {request.user}")
+        except Exception as e:
+            logger.error(f"Error creating ProjectClass: {e}")
+            raise
+
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @extend_schema(
         responses=None,

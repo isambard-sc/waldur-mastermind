@@ -328,7 +328,9 @@ class ProjectClassSerializer(
     rf_serializers.ModelSerializer,
 ):
     def __init__(self, *args, **kwargs):
+        logger.info("Initializing ProjectClassSerializer")
         super().__init__(*args, **kwargs)
+        logger.info("ProjectClassSerializer initialized")
         # Handle permission filtering for many-to-many fields
         if hasattr(self, "context") and "request" in self.context:
             user = self.context["request"].user
@@ -337,6 +339,21 @@ class ProjectClassSerializer(
                 self.fields["offerings"].child.queryset = filter_queryset_for_user(
                     marketplace_models.Offering.objects.all(), user
                 )
+        logger.info(
+            "ProjectClassSerializer context and user set for permission filtering"
+        )
+
+    def validate(self, attrs):
+        logger.info("Validating ProjectClassSerializer")
+        logger.info(f"Attributes to validate: {attrs}")
+        if "provider" in attrs:
+            logger.info(f"Provider UUID: {attrs['provider']}")
+        if "customer" in attrs:
+            logger.info(f"Customer UUID: {attrs['customer']}")
+        if "offerings" in attrs:
+            logger.info(f"Offerings UUIDs: {attrs['offerings']}")
+
+        return super().validate(attrs)
 
     def get_fields(self):
         fields = rf_serializers.ModelSerializer.get_fields(self)
@@ -345,6 +362,12 @@ class ProjectClassSerializer(
             request = self.context["request"]
             user = request.user
         except (KeyError, AttributeError):
+            return fields
+
+        # Skip filtering during creation to avoid blocking valid relationships
+        if hasattr(self, "instance") and self.instance is None:
+            # This is a creation operation, be more permissive
+            logger.info("Skipping field filtering for creation operation")
             return fields
 
         for field_name in self.get_filtered_field_names():
