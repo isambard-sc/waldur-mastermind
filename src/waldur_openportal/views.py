@@ -376,9 +376,50 @@ def user_is_staff_or_service_provider_owner_or_service_provider_manager(
     raise PermissionDenied()
 
 
-class ProjectClassViewSet(viewsets.ReadOnlyModelViewSet):
+def user_is_staff_or_project_class_owner(
+    user, project_class: models.ProjectClass | None = None
+):
+    if not project_class:
+        raise PermissionDenied()
+
+    if project_class.provider is None:
+        raise PermissionDenied()
+
+    if project_class.customer is None:
+        raise PermissionDenied()
+
+    if user.is_staff:
+        return True
+
+    if _has_owner_access(user, project_class.provider):
+        return True
+
+    raise PermissionDenied()
+
+
+class IsStaffOrProjectClassOwner(BasePermission):
+    """
+    Permission class for staff or project class owners
+    """
+
+    def has_permission(self, request, view):
+        obj = view.get_object() if hasattr(view, "get_object") else None
+
+        if isinstance(obj, models.ProjectClass):
+            return user_is_staff_or_project_class_owner(request.user, obj)
+        else:
+            raise PermissionDenied()
+
+    def has_object_permission(self, request, view, obj):
+        if isinstance(obj, models.ProjectClass):
+            return user_is_staff_or_project_class_owner(request.user, obj)
+        else:
+            raise PermissionDenied()
+
+
+class ProjectClassViewSet(core_views.ActionsViewSet):
     lookup_field = "uuid"
-    queryset = models.ProjectClass.objects.all()
+    queryset = models.ProjectClass.objects.all().order_by("name")
     serializer_class = serializers.ProjectClassSerializer
     permission_classes = (
         permissions.IsAuthenticated,
@@ -387,6 +428,38 @@ class ProjectClassViewSet(viewsets.ReadOnlyModelViewSet):
     )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.ProjectClassFilter
+
+    disabled_actions = ["partial_update"]
+
+    def get_permissions(self):
+        """
+        Instantiates and returns the list of permissions that this view requires.
+        """
+        if (
+            self.action == "delete"
+            or self.action == "update"
+            or self.action == "create"
+        ):
+            permission_classes = (
+                permissions.IsAuthenticated,
+                IsStaffOrProjectClassOwner,
+            )
+        else:
+            permission_classes = self.permission_classes
+
+        return [permission() for permission in permission_classes]
+
+    @extend_schema(
+        responses=None,
+        description="Delete ProjectClass object",
+    )
+    @action(detail=True, methods=["delete"])
+    def delete(self, **kwargs):
+        project: models.ProjectClass = self.get_object()
+
+        logger.info(f"Deleting ProjectClass {project} by user {self.request.user}")
+
+        return Response(status=status.HTTP_200_OK)
 
 
 class IsStaffOrServiceProviderOwnerOrManager(BasePermission):
