@@ -429,13 +429,11 @@ class ProjectTemplateViewSet(core_views.ActionsViewSet):
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.ProjectTemplateFilter
 
-    disabled_actions = ["partial_update"]
-
     def get_permissions(self):
         """
         Instantiates and returns the list of permissions that this view requires.
         """
-        if self.action == "delete" or self.action == "update":
+        if self.action in ["delete", "update", "partial_update"]:
             permission_classes = (
                 permissions.IsAuthenticated,
                 IsStaffOrProjectTemplateOwner,
@@ -447,7 +445,6 @@ class ProjectTemplateViewSet(core_views.ActionsViewSet):
 
         return [permission() for permission in permission_classes]
 
-    # create the function to create a project class
     @extend_schema(
         request=serializers.ProjectTemplateSerializer,
         responses=serializers.ProjectTemplateSerializer,
@@ -499,6 +496,116 @@ class ProjectTemplateViewSet(core_views.ActionsViewSet):
             raise
 
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        request=serializers.ProjectTemplateSerializer,
+        responses=serializers.ProjectTemplateSerializer,
+        description="Update ProjectTemplate object (full update)",
+    )
+    def update(self, request, *args, **kwargs):
+        project_template = self.get_object()
+
+        try:
+            logger.info(
+                f"Updating ProjectTemplate {project_template} by user {request.user}"
+            )
+            logger.info(f"Request data: {request.data}")
+
+            serializer = self.get_serializer(project_template, data=request.data)
+            serializer.is_valid(raise_exception=True)
+            logger.info(f"Validated data: {serializer.validated_data}")
+
+            # Check if provider is being changed and validate permissions
+            if "provider" in serializer.validated_data:
+                try:
+                    is_staff = request.user.is_staff
+                except AttributeError:
+                    is_staff = False
+
+                if not (
+                    is_staff
+                    or _has_owner_access(
+                        request.user, serializer.validated_data.get("provider")
+                    )
+                ):
+                    logger.error(
+                        f"User {request.user} is not allowed to update ProjectTemplate for provider {serializer.validated_data.get('provider')}"
+                    )
+                    return Response(
+                        {
+                            "detail": _(
+                                "You do not have permission to update this project class with the specified provider."
+                            )
+                        },
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+
+            updated_project_template = serializer.save()
+            logger.info(
+                f"Updated ProjectTemplate {updated_project_template} by user {request.user}"
+            )
+
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.error(f"Error updating ProjectTemplate: {e}")
+            raise
+
+    @extend_schema(
+        request=serializers.ProjectTemplateSerializer,
+        responses=serializers.ProjectTemplateSerializer,
+        description="Partially update ProjectTemplate object",
+    )
+    def partial_update(self, request, *args, **kwargs):
+        project_template = self.get_object()
+
+        try:
+            logger.info(
+                f"Partially updating ProjectTemplate {project_template} by user {request.user}"
+            )
+            logger.info(f"Request data: {request.data}")
+
+            serializer = self.get_serializer(
+                project_template, data=request.data, partial=True
+            )
+            serializer.is_valid(raise_exception=True)
+            logger.info(f"Validated data: {serializer.validated_data}")
+
+            # Check if provider is being changed and validate permissions
+            if "provider" in serializer.validated_data:
+                try:
+                    is_staff = request.user.is_staff
+                except AttributeError:
+                    is_staff = False
+
+                if not (
+                    is_staff
+                    or _has_owner_access(
+                        request.user, serializer.validated_data.get("provider")
+                    )
+                ):
+                    logger.error(
+                        f"User {request.user} is not allowed to update ProjectTemplate for provider {serializer.validated_data.get('provider')}"
+                    )
+                    return Response(
+                        {
+                            "detail": _(
+                                "You do not have permission to update this project class with the specified provider."
+                            )
+                        },
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+
+            updated_project_template = serializer.save()
+            logger.info(
+                f"Partially updated ProjectTemplate {updated_project_template} by user {request.user}"
+            )
+
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.error(f"Error partially updating ProjectTemplate: {e}")
+            raise
 
     @extend_schema(
         responses=None,

@@ -436,7 +436,7 @@ class ProjectTemplateSerializer(
     offerings = rf_serializers.HyperlinkedRelatedField(
         many=True,
         queryset=marketplace_models.Offering.objects.all(),
-        view_name="marketplace-public-offering-detail",
+        view_name="marketplace-provider-offering-detail",
         lookup_field="uuid",
     )
 
