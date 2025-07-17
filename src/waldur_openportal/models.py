@@ -1326,7 +1326,9 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
     # to this project class.
     provider = models.ForeignKey(
         to=structure_models.Customer,
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
         related_name="op-projectclass-provider+",
         verbose_name=_("provider"),
         help_text=_("The organisation that owns this project class."),
@@ -1342,7 +1344,9 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
     # this project class by the specified portal.
     customer = models.ForeignKey(
         to=structure_models.Customer,
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
         related_name="op-projectclass-organisation+",
         verbose_name=_("organisation"),
         help_text=_("The organisation that this project class belongs to."),
@@ -1613,7 +1617,7 @@ class ManagedProject(ReviewMixin, models.Model):
     # This is the actual project in this Waldur
     project = models.ForeignKey(
         to=structure_models.Project,
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
         related_name="op-managedproject-project+",
         verbose_name=_("project"),
         blank=True,
@@ -1623,7 +1627,7 @@ class ManagedProject(ReviewMixin, models.Model):
     # This is the ProjectTemplate that this project belongs to.
     project_template = models.ForeignKey(
         to=ProjectTemplate,
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
         related_name="op-managedproject-projectclass+",
         verbose_name=_("project class"),
         blank=True,
