@@ -1407,7 +1407,7 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
         verbose_name=_("role mapping"),
         default=dict,
         help_text=_(
-            "The mapping of role names from the remote portal to role names in this portal for users in projects created in this class."
+            "The mapping of role names from the remote portal to role information in this portal for users in projects created in this class."
         ),
     )
 
@@ -1423,6 +1423,35 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
     def __repr__(self) -> str:
         return self.__str__()
 
+    def _get_role(self, role) -> Role:
+        """
+        Helper method to get a Role object from the role mapping.
+        If the role does not exist, raise an error.
+        """
+        if isinstance(role, Role):
+            return role
+
+        if isinstance(role, str):
+            # Try the UUID first, then the name
+            try:
+                return Role.objects.get(uuid=role)
+            except Role.DoesNotExist:
+                return Role.objects.get(name=role)
+
+        if isinstance(role, dict):
+            # If it's a dict, it should have 'name' or 'uuid'
+            if "uuid" in role:
+                try:
+                    return Role.objects.get(uuid=role["uuid"])
+                except Role.DoesNotExist:
+                    pass
+
+            if "name" in role:
+                return Role.objects.get(name=role["name"])
+
+        logger.warning(f"Role {role} does not exist in this portal.")
+        raise ValueError(f"Role {role} does not exist in this portal.")
+
     def get_role_mapping(self) -> dict[str, Role]:
         """
         Get the role mapping for this project class.
@@ -1433,7 +1462,7 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
 
         for remote_role, local_role in self.role_mapping.items():
             try:
-                mappings[remote_role] = Role.objects.get(name=local_role)
+                mappings[remote_role] = self._get_role(local_role)
             except Role.DoesNotExist:
                 logger.warning(
                     f"Role {local_role} does not exist in this portal. Skipping mapping for {remote_role}."
@@ -1447,21 +1476,19 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
         This maps a role name from the remote portal to a role name in this portal
         for users in projects created in this class.
         """
-        if not isinstance(local_role, Role):
-            role = Role.objects.get(name=local_role)
-            if not role:
-                raise ValueError(
-                    f"Local role {local_role} does not exist in this portal."
-                )
-
-            local_role = role
+        local_role = self._get_role(local_role)
 
         if remote_role in self.role_mapping:
             logger.warning(
                 f"Role mapping for {remote_role} already exists. Overwriting with {local_role.name}."
             )
 
-        self.role_mapping[remote_role] = str(local_role.name)
+        # We save both the name and UUID in case the role name changes in the future.
+        # We search for UUID first, then name
+        self.role_mapping[remote_role] = {
+            "name": local_role.name,
+            "uuid": local_role.uuid,
+        }
         self.save()
 
     def get_local_role_for(self, remote_role: str) -> Role:
@@ -1472,12 +1499,11 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
         if remote_role not in self.role_mapping:
             raise ValueError(f"Remote role {remote_role} does not exist in this class.")
 
-        local_role_name = self.role_mapping[remote_role]
         try:
-            return Role.objects.get(name=local_role_name)
+            return self._get_role(self.role_mapping[remote_role])
         except Role.DoesNotExist:
             raise ValueError(
-                f"Local role {local_role_name} does not exist in this portal."
+                f"Local role {self.role_mapping[remote_role]} does not exist in this portal."
             )
 
     def action_needs_approval(self, credit_limit: float = 0.0) -> bool:
