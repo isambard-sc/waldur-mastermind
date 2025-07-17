@@ -651,7 +651,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         IsAdminOrOwner,
         IsAdminOrReadOnly,
     )
-    approve_permissions = reject_permissions = [
+    approve_permissions = reject_permissions = delete_permissions = [
         permissions.IsAuthenticated,
         IsStaffOrServiceProviderOwnerOrManager,
     ]
@@ -659,7 +659,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     filter_backends = [GenericRoleFilter, DjangoFilterBackend]
     filterset_class = filters.ManagedProjectFilter
 
-    disabled_actions = ["create", "destroy", "update", "partial_update"]
+    disabled_actions = ["create", "update", "partial_update"]
     lookup_field = "identifier"
     lookup_url_kwarg = "identifier"
     # need to handle periods in the identifier
@@ -675,6 +675,8 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
                 if self.action == "approve"
                 else self.reject_permissions
             )
+        elif self.action == "delete":
+            permission_classes = self.delete_permissions
         else:
             permission_classes = self.permission_classes
 
@@ -712,3 +714,15 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     approve_validators = reject_validators = [
         StateValidator(ReviewStates.PENDING, state_enum=ReviewStates)
     ]
+
+    @extend_schema(
+        responses=None,
+        description="Delete ManagedProject object",
+    )
+    @action(detail=True, methods=["delete"])
+    def delete(self, **kwargs):
+        project: models.ManagedProject = self.get_object()
+
+        logger.info(f"Deleting ManagedProject {project} by user {self.request.user}")
+
+        return Response(status=status.HTTP_200_OK)

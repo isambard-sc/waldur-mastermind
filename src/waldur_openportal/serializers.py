@@ -328,9 +328,7 @@ class ProjectTemplateSerializer(
     rf_serializers.ModelSerializer,
 ):
     def __init__(self, *args, **kwargs):
-        logger.info("Initializing ProjectTemplateSerializer")
         super().__init__(*args, **kwargs)
-        logger.info("ProjectTemplateSerializer initialized")
         # Handle permission filtering for many-to-many fields
         if hasattr(self, "context") and "request" in self.context:
             user = self.context["request"].user
@@ -339,21 +337,6 @@ class ProjectTemplateSerializer(
                 self.fields["offerings"].child.queryset = filter_queryset_for_user(
                     marketplace_models.Offering.objects.all(), user
                 )
-        logger.info(
-            "ProjectTemplateSerializer context and user set for permission filtering"
-        )
-
-    def validate(self, attrs):
-        logger.info("Validating ProjectTemplateSerializer")
-        logger.info(f"Attributes to validate: {attrs}")
-        if "provider" in attrs:
-            logger.info(f"Provider UUID: {attrs['provider']}")
-        if "customer" in attrs:
-            logger.info(f"Customer UUID: {attrs['customer']}")
-        if "offerings" in attrs:
-            logger.info(f"Offerings UUIDs: {attrs['offerings']}")
-
-        return super().validate(attrs)
 
     def get_fields(self):
         fields = rf_serializers.ModelSerializer.get_fields(self)
@@ -367,7 +350,6 @@ class ProjectTemplateSerializer(
         # Skip filtering during creation to avoid blocking valid relationships
         if hasattr(self, "instance") and self.instance is None:
             # This is a creation operation, be more permissive
-            logger.info("Skipping field filtering for creation operation")
             return fields
 
         for field_name in self.get_filtered_field_names():
@@ -388,25 +370,14 @@ class ProjectTemplateSerializer(
 
     def filter_field_queryset(self, field, queryset, field_name):
         """Override to handle ManyRelatedField properly"""
-        logger.info(
-            f"Filtering field {field_name} for user {self.context['request'].user.username}"
-        )
         # Check if this is a ManyRelatedField (many=True relationship)
         if hasattr(field, "child") and hasattr(field.child, "queryset"):
-            logger.info(
-                f"Filtering ManyRelatedField {field_name} for user {self.context['request'].user.username}"
-            )
             # Filter the child field's queryset instead
             if hasattr(self, "context") and "request" in self.context:
                 user = self.context["request"].user
-                logger.info(
-                    f"Filtering queryset for user {user.username} on field {field_name}"
-                )
                 field.child.queryset = filter_queryset_for_user(
                     field.child.queryset, user
                 )
-
-            logger.info("Returning filtered queryset for ManyRelatedField")
 
             return field
 
@@ -506,6 +477,10 @@ class ManagedProjectSerializer(
         lookup_field="uuid",
     )
 
+    project_data = structure_serializers.ProjectSerializer(
+        source="project", read_only=True
+    )
+
     details = rf_serializers.JSONField(
         read_only=True,
         help_text=_("Details of the project as provided by the remote OpenPortal."),
@@ -515,6 +490,10 @@ class ManagedProjectSerializer(
         queryset=models.ProjectTemplate.objects.all(),
         view_name="openportal-project-template-detail",
         lookup_field="uuid",
+    )
+
+    project_template_data = ProjectTemplateSerializer(
+        source="project_template", read_only=True
     )
 
     class Meta:
@@ -530,7 +509,9 @@ class ManagedProjectSerializer(
             "identifier",
             "details",
             "project",
+            "project_data",
             "project_template",
+            "project_template_data",
             "local_identifier",
         )
 
