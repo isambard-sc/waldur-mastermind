@@ -42,7 +42,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
     def get_client(self, settings):
         return RemoteOpenPortalClient(
             instance_name=settings.options.get("instance_name", None),
-            project_class=settings.options.get("project_class", None),
+            project_template=settings.options.get("project_template", None),
         )
 
     def pull_resources(self):

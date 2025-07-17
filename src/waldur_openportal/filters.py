@@ -70,7 +70,7 @@ class ProjectInfoFilter(django_filters.FilterSet):
     project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
 
 
-class ProjectClassFilter(django_filters.FilterSet):
+class ProjectTemplateFilter(django_filters.FilterSet):
     name = django_filters.CharFilter(field_name="name", lookup_expr="icontains")
     portal = django_filters.CharFilter(field_name="portal", lookup_expr="icontains")
     uuid = django_filters.UUIDFilter(field_name="uuid")
@@ -88,12 +88,14 @@ class ManagedProjectFilter(django_filters.FilterSet):
         view_name="project-detail", field_name="project__uuid"
     )
 
-    project_class = core_filters.URLFilter(
-        view_name="openportal-project-class", field_name="project_class__uuid"
+    project_template = core_filters.URLFilter(
+        view_name="openportal-project-template", field_name="project_template__uuid"
     )
 
     project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
-    project_class_uuid = django_filters.UUIDFilter(field_name="project_class__uuid")
+    project_template_uuid = django_filters.UUIDFilter(
+        field_name="project_template__uuid"
+    )
     state = core_filters.ReviewStateFilter()
 
     class Meta:

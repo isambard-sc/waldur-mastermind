@@ -18,19 +18,19 @@ class RemoteOpenPortalClient:
     See also: https://github.com/isambard-sc/openportal
     """
 
-    def __init__(self, instance_name, project_class):
+    def __init__(self, instance_name, project_template):
         if instance_name is None:
             raise openportal.OpenPortalError("Instance name cannot be None")
 
-        if project_class is None:
+        if project_template is None:
             logger.warning(
                 "Project class is not specified, using default 'default' project class"
             )
-            project_class = "default"
+            project_template = "default"
 
         self._runner = OpenPortalRunner()
         self._destination = openportal.Destination(instance_name)
-        self._project_class = openportal.ProjectClass(project_class)
+        self._project_template = openportal.ProjectTemplate(project_template)
 
     def _to_project_identifier(self, project) -> openportal.ProjectIdentifier:
         """
@@ -51,7 +51,7 @@ class RemoteOpenPortalClient:
         if not isinstance(details, openportal.ProjectDetails):
             details = openportal.ProjectDetails(str(details))
 
-        details.project_class = self._project_class
+        details.project_template = self._project_template
 
         return details
 

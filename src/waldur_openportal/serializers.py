@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 class OpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer):
     class Meta:
-        secret_fields = ("instance_name", "project_class")
+        secret_fields = ("instance_name", "project_template")
 
     instance_name = rf_serializers.CharField(
         source="options.instance_name",
@@ -32,8 +32,8 @@ class OpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer
         required=False,
     )
 
-    project_class = rf_serializers.CharField(
-        source="options.project_class",
+    project_template = rf_serializers.CharField(
+        source="options.project_template",
         label=_("Class for projects created on the remote OpenPortal instance"),
         default=None,
         required=False,
@@ -323,14 +323,14 @@ class ProjectInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
         }
 
 
-class ProjectClassSerializer(
+class ProjectTemplateSerializer(
     structure_serializers.PermissionFieldFilteringMixin,
     rf_serializers.ModelSerializer,
 ):
     def __init__(self, *args, **kwargs):
-        logger.info("Initializing ProjectClassSerializer")
+        logger.info("Initializing ProjectTemplateSerializer")
         super().__init__(*args, **kwargs)
-        logger.info("ProjectClassSerializer initialized")
+        logger.info("ProjectTemplateSerializer initialized")
         # Handle permission filtering for many-to-many fields
         if hasattr(self, "context") and "request" in self.context:
             user = self.context["request"].user
@@ -340,11 +340,11 @@ class ProjectClassSerializer(
                     marketplace_models.Offering.objects.all(), user
                 )
         logger.info(
-            "ProjectClassSerializer context and user set for permission filtering"
+            "ProjectTemplateSerializer context and user set for permission filtering"
         )
 
     def validate(self, attrs):
-        logger.info("Validating ProjectClassSerializer")
+        logger.info("Validating ProjectTemplateSerializer")
         logger.info(f"Attributes to validate: {attrs}")
         if "provider" in attrs:
             logger.info(f"Provider UUID: {attrs['provider']}")
@@ -463,7 +463,7 @@ class ProjectClassSerializer(
         return serialized_mapping
 
     class Meta:
-        model = models.ProjectClass
+        model = models.ProjectTemplate
         fields = (
             "uuid",
             "name",
@@ -511,9 +511,9 @@ class ManagedProjectSerializer(
         help_text=_("Details of the project as provided by the remote OpenPortal."),
     )
 
-    project_class = rf_serializers.HyperlinkedRelatedField(
-        queryset=models.ProjectClass.objects.all(),
-        view_name="openportal-project-class-detail",
+    project_template = rf_serializers.HyperlinkedRelatedField(
+        queryset=models.ProjectTemplate.objects.all(),
+        view_name="openportal-project-template-detail",
         lookup_field="uuid",
     )
 
@@ -530,7 +530,7 @@ class ManagedProjectSerializer(
             "identifier",
             "details",
             "project",
-            "project_class",
+            "project_template",
             "local_identifier",
         )
 

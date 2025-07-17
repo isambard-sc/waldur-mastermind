@@ -1302,13 +1302,13 @@ class Job(models.Model):
         return self.__str__()
 
 
-class ProjectClass(core_models.UuidMixin, models.Model):
+class ProjectTemplate(core_models.UuidMixin, models.Model):
     """
     This model is responsible for storing data about project classes.
-    A ProjectClass represents a category or type of project that can
-    be created via OpenPortal. It is up to Waldur to map the ProjectClass
+    A ProjectTemplate represents a category or type of project that can
+    be created via OpenPortal. It is up to Waldur to map the ProjectTemplate
     combined with the calling portal to the Organisation that the project
-    should be created in. In addition, the ProjectClass controls
+    should be created in. In addition, the ProjectTemplate controls
     which portals can create which types of projects.
     """
 
@@ -1594,9 +1594,9 @@ class ManagedProject(ReviewMixin, models.Model):
         null=True,
     )
 
-    # This is the ProjectClass that this project belongs to.
-    project_class = models.ForeignKey(
-        to=ProjectClass,
+    # This is the ProjectTemplate that this project belongs to.
+    project_template = models.ForeignKey(
+        to=ProjectTemplate,
         on_delete=models.CASCADE,
         related_name="op-managedproject-projectclass+",
         verbose_name=_("project class"),
@@ -1613,37 +1613,37 @@ class ManagedProject(ReviewMixin, models.Model):
         help_text=_("The local project identifier in this portal."),
     )
 
-    def has_project_class(self) -> bool:
+    def has_project_template(self) -> bool:
         """
         Check if this project has a project class set.
         This is used to determine whether or not the project
         can be created in this portal.
         """
-        return self.project_class is not None
+        return self.project_template is not None
 
-    def get_project_class(self) -> ProjectClass:
+    def get_project_template(self) -> ProjectTemplate:
         """
-        Get the ProjectClass for this project.
+        Get the ProjectTemplate for this project.
         If the project class is not set, raise an error.
         """
-        if not self.project_class:
+        if not self.project_template:
             raise ValueError("Project class is not set for this project.")
-        return self.project_class
+        return self.project_template
 
-    def set_project_class(self, project_class: ProjectClass):
+    def set_project_template(self, project_template: ProjectTemplate):
         """
-        Set the ProjectClass for this project.
-        If the project class is not an instance of ProjectClass, raise an error.
+        Set the ProjectTemplate for this project.
+        If the project class is not an instance of ProjectTemplate, raise an error.
         """
-        if not isinstance(project_class, ProjectClass):
-            raise ValueError("Project class must be an instance of ProjectClass.")
+        if not isinstance(project_template, ProjectTemplate):
+            raise ValueError("Project class must be an instance of ProjectTemplate.")
 
-        if self.project_class and self.project_class != project_class:
+        if self.project_template and self.project_template != project_template:
             logger.warning(
-                f"Project class for project {self.project} is being changed from {self.project_class} to {project_class}."
+                f"Project class for project {self.project} is being changed from {self.project_template} to {project_template}."
             )
 
-        self.project_class = project_class
+        self.project_template = project_template
 
     def has_local_identifier(self) -> bool:
         """
@@ -1740,8 +1740,8 @@ class ManagedProject(ReviewMixin, models.Model):
         Get the default marketplace offerings for this project.
         If the project class is not set, return an empty list.
         """
-        if self.project_class and self.project_class.offerings.exists():
-            return list(self.project_class.offerings.all())
+        if self.project_template and self.project_template.offerings.exists():
+            return list(self.project_template.offerings.all())
         else:
             return []
 

@@ -46,9 +46,9 @@ def register_in(router):
         basename="openportal-projectinfo",
     )
     router.register(
-        r"openportal-project-class",
-        views.ProjectClassViewSet,
-        basename="openportal-project-class",
+        r"openportal-project-template",
+        views.ProjectTemplateViewSet,
+        basename="openportal-project-template",
     )
     router.register(
         r"openportal-managed-projects",

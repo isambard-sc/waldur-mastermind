@@ -356,48 +356,48 @@ def user_is_staff_or_service_provider_owner_or_service_provider_manager(
     if not project:
         raise PermissionDenied()
 
-    if project.project_class is None:
+    if project.project_template is None:
         raise PermissionDenied()
 
-    if project.project_class.provider is None:
+    if project.project_template.provider is None:
         raise PermissionDenied()
 
-    if project.project_class.customer is None:
+    if project.project_template.customer is None:
         raise PermissionDenied()
 
     if user.is_staff:
         return True
 
     if _has_owner_or_manager_access(
-        user, project.project_class.provider
-    ) and _has_owner_access(user, project.project_class.customer):
+        user, project.project_template.provider
+    ) and _has_owner_access(user, project.project_template.customer):
         return True
 
     raise PermissionDenied()
 
 
-def user_is_staff_or_project_class_owner(
-    user, project_class: models.ProjectClass | None = None
+def user_is_staff_or_project_template_owner(
+    user, project_template: models.ProjectTemplate | None = None
 ):
-    if not project_class:
+    if not project_template:
         raise PermissionDenied()
 
-    if project_class.provider is None:
+    if project_template.provider is None:
         raise PermissionDenied()
 
-    if project_class.customer is None:
+    if project_template.customer is None:
         raise PermissionDenied()
 
     if user.is_staff:
         return True
 
-    if _has_owner_access(user, project_class.provider):
+    if _has_owner_access(user, project_template.provider):
         return True
 
     raise PermissionDenied()
 
 
-class IsStaffOrProjectClassOwner(BasePermission):
+class IsStaffOrProjectTemplateOwner(BasePermission):
     """
     Permission class for staff or project class owners
     """
@@ -405,29 +405,29 @@ class IsStaffOrProjectClassOwner(BasePermission):
     def has_permission(self, request, view):
         obj = view.get_object() if hasattr(view, "get_object") else None
 
-        if isinstance(obj, models.ProjectClass):
-            return user_is_staff_or_project_class_owner(request.user, obj)
+        if isinstance(obj, models.ProjectTemplate):
+            return user_is_staff_or_project_template_owner(request.user, obj)
         else:
             raise PermissionDenied()
 
     def has_object_permission(self, request, view, obj):
-        if isinstance(obj, models.ProjectClass):
-            return user_is_staff_or_project_class_owner(request.user, obj)
+        if isinstance(obj, models.ProjectTemplate):
+            return user_is_staff_or_project_template_owner(request.user, obj)
         else:
             raise PermissionDenied()
 
 
-class ProjectClassViewSet(core_views.ActionsViewSet):
+class ProjectTemplateViewSet(core_views.ActionsViewSet):
     lookup_field = "uuid"
-    queryset = models.ProjectClass.objects.all().order_by("name")
-    serializer_class = serializers.ProjectClassSerializer
+    queryset = models.ProjectTemplate.objects.all().order_by("name")
+    serializer_class = serializers.ProjectTemplateSerializer
     permission_classes = (
         permissions.IsAuthenticated,
         IsAdminOrOwner,
         IsAdminOrReadOnly,
     )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
-    filterset_class = filters.ProjectClassFilter
+    filterset_class = filters.ProjectTemplateFilter
 
     disabled_actions = ["partial_update"]
 
@@ -438,7 +438,7 @@ class ProjectClassViewSet(core_views.ActionsViewSet):
         if self.action == "delete" or self.action == "update":
             permission_classes = (
                 permissions.IsAuthenticated,
-                IsStaffOrProjectClassOwner,
+                IsStaffOrProjectTemplateOwner,
             )
         elif self.action == "create":
             permission_classes = (permissions.IsAuthenticated,)
@@ -449,13 +449,13 @@ class ProjectClassViewSet(core_views.ActionsViewSet):
 
     # create the function to create a project class
     @extend_schema(
-        request=serializers.ProjectClassSerializer,
-        responses=serializers.ProjectClassSerializer,
-        description="Create ProjectClass object",
+        request=serializers.ProjectTemplateSerializer,
+        responses=serializers.ProjectTemplateSerializer,
+        description="Create ProjectTemplate object",
     )
     def create(self, request, *args, **kwargs):
         try:
-            logger.info(f"Creating ProjectClass by user {request.user}")
+            logger.info(f"Creating ProjectTemplate by user {request.user}")
             logger.info(f"Request data: {request.data}")
             serializer = self.get_serializer(data=request.data)
             serializer.is_valid(raise_exception=True)
@@ -475,7 +475,7 @@ class ProjectClassViewSet(core_views.ActionsViewSet):
                 )
             ):
                 logger.error(
-                    f"User {request.user} is not allowed to create ProjectClass for provider {serializer.validated_data.get('provider')}"
+                    f"User {request.user} is not allowed to create ProjectTemplate for provider {serializer.validated_data.get('provider')}"
                 )
                 return Response(
                     {
@@ -486,25 +486,29 @@ class ProjectClassViewSet(core_views.ActionsViewSet):
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
-            logger.info(f"Creating ProjectClass with data: {serializer.validated_data}")
-            project_class = serializer.save()
+            logger.info(
+                f"Creating ProjectTemplate with data: {serializer.validated_data}"
+            )
+            project_template = serializer.save()
 
-            logger.info(f"Created ProjectClass {project_class} by user {request.user}")
+            logger.info(
+                f"Created ProjectTemplate {project_template} by user {request.user}"
+            )
         except Exception as e:
-            logger.error(f"Error creating ProjectClass: {e}")
+            logger.error(f"Error creating ProjectTemplate: {e}")
             raise
 
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @extend_schema(
         responses=None,
-        description="Delete ProjectClass object",
+        description="Delete ProjectTemplate object",
     )
     @action(detail=True, methods=["delete"])
     def delete(self, **kwargs):
-        project: models.ProjectClass = self.get_object()
+        project: models.ProjectTemplate = self.get_object()
 
-        logger.info(f"Deleting ProjectClass {project} by user {self.request.user}")
+        logger.info(f"Deleting ProjectTemplate {project} by user {self.request.user}")
 
         return Response(status=status.HTTP_200_OK)
 
