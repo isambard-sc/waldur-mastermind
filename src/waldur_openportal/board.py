@@ -2,8 +2,6 @@ import logging
 import os
 import json
 
-from django.utils import timezone
-
 from waldur_core.structure import models as structure_models
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.utils import get_system_robot

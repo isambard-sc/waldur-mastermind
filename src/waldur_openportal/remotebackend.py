@@ -431,8 +431,9 @@ class RemoteOpenPortalBackend(ServiceBackend):
             return
 
         try:
-            self.client.update_project(project_identifier, project_details)
+            mapping = self.client.update_project(project_identifier, project_details)
             allocation.successfully_updated(version)
+            allocation.update_mapping(mapping)
         except Exception as e:
             logger.warning(
                 f"Unable to update OpenPortal project {project_identifier}: {e}."

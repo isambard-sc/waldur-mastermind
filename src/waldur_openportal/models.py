@@ -447,6 +447,27 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
         self.set_project_identifier(mapping.project)
         self.set_remote_project_identifier(mapping.local_group)
 
+    def update_mapping(self, mapping: openportal.ProjectMapping):
+        if not isinstance(mapping, openportal.ProjectMapping):
+            mapping = openportal.ProjectMapping(mapping)
+
+        if not self.has_mapping():
+            self.set_mapping(mapping)
+            return
+
+        if mapping.project != self.get_project_identifier():
+            raise ValueError(
+                f"Project {mapping.project} does not match allocation {self.get_project_identifier()}"
+            )
+
+        if mapping.local_group != self.get_remote_project_identifier():
+            logger.warning(
+                f"Changing remote project identifier from {self.remote_project_identifier} to {mapping.local_group} for {self}"
+            )
+
+            self.remote_project_identifier = str(mapping.local_group)
+            self.save()
+
     @classmethod
     def get_backend_fields(cls):
         return super().get_backend_fields() + ("node_usage",)
