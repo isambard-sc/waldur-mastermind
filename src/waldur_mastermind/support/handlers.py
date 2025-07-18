@@ -2,12 +2,35 @@ from django.conf import settings
 from django.db import transaction
 
 from waldur_core.core import utils as core_utils
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
+from waldur_core.structure.models import Project
+from waldur_mastermind.support.models import Issue
 
 from . import models, tasks
-from .log import event_logger
 
 
-def log_issue_save(sender, instance, created=False, **kwargs):
+def get_issue_scopes(issue: Issue) -> set:
+    result = set()
+    if issue.resource:
+        project_id = issue.resource.project_id
+        result.add(issue.resource)
+    else:
+        project_id = issue.project_id
+    project = None
+    try:
+        project = Project.all_objects.get(id=project_id)
+    except Project.DoesNotExist:
+        pass
+    if project:
+        result.add(project)
+        result.add(project.customer)
+    if issue.customer:
+        result.add(issue.customer)
+    return result
+
+
+def log_issue_save(sender, instance: models.Issue, created=False, **kwargs):
     if created:
         return
 
@@ -18,72 +41,80 @@ def log_issue_save(sender, instance, created=False, **kwargs):
 
     # If issue got a key, it means that it has been actually created on backend.
     if instance.tracker.has_changed("key"):
-        event_logger.waldur_issue.info(
+        event_logger.emit(
             "Issue {issue_key} has been created.",
-            event_type="issue_creation_succeeded",
+            event_type=EventType.ISSUE_CREATION_SUCCEEDED,
             event_context={
                 "issue": instance,
             },
+            scopes=get_issue_scopes(instance),
         )
     else:
         updated_fields = instance.tracker.changed()
         updated_fields.pop("modified", None)  # waldur-specific field
         if len(updated_fields.keys()) > 0:
-            event_logger.waldur_issue.info(
+            event_logger.emit(
                 "Issue {issue_key} has been updated. Changed fields: %s."
                 % ", ".join(updated_fields.keys()),
-                event_type="issue_update_succeeded",
+                event_type=EventType.ISSUE_UPDATE_SUCCEEDED,
                 event_context={
                     "issue": instance,
                 },
+                scopes=get_issue_scopes(instance),
             )
 
 
-def log_issue_delete(sender, instance, **kwargs):
+def log_issue_delete(sender, instance: models.Issue, **kwargs):
     if not instance.key:
         # If issue does not have key, it is not actually created on backend.
         # Therefore it is okay to skip logging in this case.
         return
 
-    event_logger.waldur_issue.info(
+    event_logger.emit(
         "Issue {issue_key} has been deleted.",
-        event_type="issue_deletion_succeeded",
+        event_type=EventType.ISSUE_DELETION_SUCCEEDED,
         event_context={
             "issue": instance,
         },
+        scopes=get_issue_scopes(instance),
     )
 
 
-def log_attachment_save(sender, instance, created=False, **kwargs):
+def log_attachment_save(sender, instance: models.Attachment, created=False, **kwargs):
     if created:
-        event_logger.waldur_attachment.info(
+        event_logger.emit(
             "Attachment for issue {issue_key} has been created.",
-            event_type="attachment_created",
+            event_type=EventType.ATTACHMENT_CREATED,
             event_context={
                 "attachment": instance,
             },
+            scopes=get_issue_scopes(instance.issue),
         )
     else:
-        event_logger.waldur_attachment.info(
+        event_logger.emit(
             "Attachment for issue {issue_key} has been updated.",
-            event_type="attachment_updated",
+            event_type=EventType.ATTACHMENT_UPDATED,
             event_context={
                 "attachment": instance,
             },
+            scopes=get_issue_scopes(instance.issue),
         )
 
 
-def log_attachment_delete(sender, instance, **kwargs):
-    event_logger.waldur_attachment.info(
+def log_attachment_delete(sender, instance: models.Attachment, **kwargs):
+    event_logger.emit(
         "Attachment for issue {issue_key} has been deleted.",
-        event_type="attachment_deleted",
+        event_type=EventType.ATTACHMENT_DELETED,
         event_context={
             "attachment": instance,
         },
+        scopes=get_issue_scopes(instance.issue),
     )
 
 
-def send_comment_added_notification(sender, instance, created=False, **kwargs):
+def send_comment_added_notification(
+    sender, instance: models.Comment, created=False, **kwargs
+):
     comment = instance
 
     # Skip notifications for private comments
@@ -109,7 +140,9 @@ def send_comment_added_notification(sender, instance, created=False, **kwargs):
             )
 
 
-def send_issue_updated_notification(sender, instance, created=False, **kwargs):
+def send_issue_updated_notification(
+    sender, instance: models.Issue, created=False, **kwargs
+):
     issue = instance
 
     # Skip notification if issue just have been created in Waldur
@@ -150,8 +183,9 @@ def send_issue_updated_notification(sender, instance, created=False, **kwargs):
 
 
 def create_feedback_if_issue_has_been_resolved(
-    sender, instance, created=False, **kwargs
+    sender, instance: models.Issue, created=False, **kwargs
 ):
+    """Create feedback request when support issue transitions to resolved state."""
     if not settings.ISSUE_FEEDBACK_ENABLE:
         return
 

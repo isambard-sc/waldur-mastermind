@@ -349,13 +349,21 @@ class RancherNestedPublicIPSerializer(
     ip_address = serializers.IPAddressField(
         source="floating_ip.address", read_only=True
     )
+    external_ip_address = serializers.IPAddressField(
+        source="floating_ip.external_address", read_only=True
+    )
+    floating_ip = serializers.HyperlinkedRelatedField(
+        read_only=True, view_name="openstack-fip-detail", lookup_field="uuid"
+    )
+    floating_ip_uuid = serializers.UUIDField(source="floating_ip.uuid", read_only=True)
 
     class Meta:
         model = models.ClusterPublicIP
         fields = (
             "floating_ip",
-            "cluster",
+            "floating_ip_uuid",
             "ip_address",
+            "external_ip_address",
         )
 
 
@@ -405,6 +413,8 @@ class RancherClusterSerializer(
 
     public_ips = RancherNestedPublicIPSerializer(many=True, read_only=True)
 
+    router_ips = serializers.SerializerMethodField()
+
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.Cluster
         fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
@@ -421,6 +431,7 @@ class RancherClusterSerializer(
             "capacity",
             "requested",
             "kubernetes_version",
+            "router_ips",
         )
         read_only_fields = (
             structure_serializers.BaseResourceSerializer.Meta.read_only_fields
@@ -531,6 +542,18 @@ class RancherClusterSerializer(
             raise serializers.ValidationError(_("Count of agent nodes must be min 1."))
 
         return nodes
+
+    def get_router_ips(self, cluster: models.Cluster) -> list:
+        if not cluster.tenant:
+            return []
+
+        router_ips = []
+        for router in cluster.tenant.routers.all():
+            if not router.fixed_ips:
+                continue
+            router_ips.extend(router.fixed_ips)
+
+        return router_ips
 
 
 class RancherNodeSerializer(serializers.HyperlinkedModelSerializer):
@@ -1315,6 +1338,7 @@ def get_rancher_cluster_for_openstack_instance(
 
 
 def add_rancher_cluster_to_openstack_instance(sender, fields, **kwargs):
+    """Add Rancher cluster information to OpenStack instance serializer."""
     fields["rancher_cluster"] = serializers.SerializerMethodField()
     setattr(sender, "get_rancher_cluster", get_rancher_cluster_for_openstack_instance)
 

@@ -1,9 +1,11 @@
 import logging
 
 from waldur_mastermind.invoices import models as invoices_models
+from waldur_mastermind.invoices.models import CustomerCredit, ProjectCredit
 from waldur_mastermind.marketplace import models as marketplace_models
 
 from . import models, utils
+from .models import ProjectEstimatedCostPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -11,6 +13,7 @@ logger = logging.getLogger(__name__)
 def customer_estimated_cost_policy_trigger_handler(
     sender, instance, created=False, **kwargs
 ):
+    """Evaluate customer cost policies when invoice items are updated."""
     invoice_item = instance
     policies = models.CustomerEstimatedCostPolicy.objects.filter(
         scope=invoice_item.invoice.customer
@@ -26,6 +29,7 @@ def customer_estimated_cost_policy_trigger_handler(
 def project_estimated_cost_policy_trigger_handler(
     sender, instance, created=False, **kwargs
 ):
+    """Evaluate project cost policies when invoice items are updated."""
     invoice_item = instance
     policies = models.ProjectEstimatedCostPolicy.objects.filter(
         scope=invoice_item.project
@@ -66,6 +70,10 @@ def get_estimated_cost_policy_handler_for_observable_class(klass, observable_cla
             return
 
         observable_object = instance
+
+        if getattr(observable_object, "is_mocked", False):
+            return
+
         policies = klass.objects.filter(
             scope=klass.get_scope_from_observable_object(observable_object)
         )
@@ -90,7 +98,10 @@ def get_estimated_cost_policy_handler_for_observable_class(klass, observable_cla
     return handler
 
 
-def customer_credit_changed_handler(sender, instance, created=False, **kwargs):
+def customer_credit_changed_handler(
+    sender, instance: CustomerCredit, created=False, **kwargs
+):
+    """Handle customer credit value changes and evaluate related policies."""
     customer_credit = instance
 
     if not customer_credit.tracker.has_changed("value"):
@@ -122,7 +133,9 @@ def customer_credit_changed_handler(sender, instance, created=False, **kwargs):
         logger.info("Project policies are not found, skipping evaluation")
 
 
-def project_credit_changed_handler(sender, instance, created=False, **kwargs):
+def project_credit_changed_handler(
+    sender, instance: ProjectCredit, created=False, **kwargs
+):
     project_credit = instance
 
     if not project_credit.tracker.has_changed("value"):
@@ -145,19 +158,28 @@ def customer_credit_offerings_list_changed_handler(
     sender, instance, action, reverse, model, pk_set, **kwargs
 ):
     if action in ("post_add", "post_remove", "post_clear"):
-        offerings = marketplace_models.Offering.objects.filter(pk__in=pk_set)
-        customer_ids = invoices_models.CustomerCredit.objects.filter(
-            offerings__in=offerings
-        ).values_list("customer_id", flat=True)
+        # Handle the case when pk_set is None (e.g., during clear() operation)
+        if pk_set is None:
+            # For clear operations, evaluate policies for the customer credit instance
+            policies = models.CustomerEstimatedCostPolicy.objects.filter(
+                scope_id=instance.customer_id
+            )
+        else:
+            offerings = marketplace_models.Offering.objects.filter(pk__in=pk_set)
+            customer_ids = invoices_models.CustomerCredit.objects.filter(
+                offerings__in=offerings
+            ).values_list("customer_id", flat=True)
+            policies = models.CustomerEstimatedCostPolicy.objects.filter(
+                scope_id__in=customer_ids
+            )
 
-        policies = models.CustomerEstimatedCostPolicy.objects.filter(
-            scope_id__in=customer_ids
-        )
         if policies.count() > 0:
             utils.evaluate_policies(policies)
 
 
-def run_reset_actions_upon_cost_policy_deletion(sender, instance, **kwargs) -> None:
+def run_reset_actions_upon_cost_policy_deletion(
+    sender, instance: ProjectEstimatedCostPolicy, **kwargs
+) -> None:
     """
     Execute reset actions when a cost policy is deleted.
 

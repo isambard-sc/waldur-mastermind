@@ -2,6 +2,8 @@ from django.apps import AppConfig
 from django.conf import settings as django_settings
 from django.db.models import signals
 
+from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
+
 
 class MarketplaceOpenPortalRemoteConfig(AppConfig):
     name = "waldur_mastermind.marketplace_openportal_remote"
@@ -40,8 +42,8 @@ class MarketplaceOpenPortalRemoteConfig(AppConfig):
             openportal_models.RemoteAllocation
         )
 
-        USAGE = marketplace_models.OfferingComponent.BillingTypes.USAGE
-        TOTAL = marketplace_models.OfferingComponent.LimitPeriods.TOTAL
+        USAGE = BillingTypes.USAGE
+        TOTAL = LimitPeriods.TOTAL
         default_limits = django_settings.WALDUR_OPENPORTAL["DEFAULT_LIMITS"]
 
         manager.register(

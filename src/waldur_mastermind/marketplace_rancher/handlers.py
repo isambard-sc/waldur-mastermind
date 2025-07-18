@@ -19,8 +19,10 @@ from waldur_mastermind.marketplace.utils import (
 )
 from waldur_mastermind.marketplace_openstack import TENANT_TYPE
 from waldur_mastermind.marketplace_rancher import MANAGED_RANCHER_PLUGIN
+from waldur_mastermind.marketplace_rancher.const import OS_LB_PREFIX
+from waldur_openstack import models as openstack_models
 from waldur_rancher.exceptions import RancherException
-from waldur_rancher.models import Cluster, RancherUser
+from waldur_rancher.models import Cluster, ClusterPublicIP, RancherUser
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,7 @@ logger = logging.getLogger(__name__)
 def create_marketplace_resource_for_imported_cluster(
     sender, instance: Cluster, offering=None, plan=None, **kwargs
 ):
+    """Create marketplace resource when Rancher cluster is imported from external system."""
     if not offering:
         # When cluster is imported directly (ie without marketplace),
         # marketplace resources are not created.
@@ -125,6 +128,7 @@ def update_argocd_secret_when_resource_options_changed(
 def copy_invoice_items_when_cluster_is_provisioned(
     sender, instance: marketplace_models.Resource, **kwargs
 ):
+    """Copy invoice items from parent project to provisioned Rancher cluster resource."""
     resource = instance
     tracker = cast(FieldInstanceTracker, resource.tracker)
     if not tracker.has_changed("state"):
@@ -244,3 +248,68 @@ def copy_invoice_items_when_cluster_is_provisioned(
             details=details,
             quantity=total_quantity,
         )
+
+
+def create_public_cluster_ip_for_floating_ip(
+    sender, instance: openstack_models.FloatingIP, created=False, **kwargs
+):
+    floating_ip = instance
+    tracker = cast(FieldInstanceTracker, floating_ip.tracker)
+
+    if not (
+        tracker.has_changed("runtime_state") and floating_ip.runtime_state == "ACTIVE"
+    ):
+        return
+
+    floating_ip_instance = floating_ip.port.instance if floating_ip.port else None
+
+    if not floating_ip_instance:
+        logger.warning(
+            "Skipping creation of public cluster IP for floating IP %s because "
+            "floating IP instance is not found.",
+            floating_ip,
+        )
+        return
+
+    # Naming convention for Managed Rancher load balancer IPs
+    # See ManagedRancherCreateProcessor.create_load_balancers method for details
+    if not floating_ip_instance.name.startswith(OS_LB_PREFIX):
+        return
+
+    resource_slug = floating_ip_instance.name.replace(OS_LB_PREFIX, "", 1)
+
+    resource = marketplace_models.Resource.objects.filter(slug=resource_slug).first()
+
+    if not resource:
+        logger.warning(
+            "Skipping creation of public cluster IP for floating IP %s because "
+            "resource with slug %s is not found.",
+            floating_ip,
+            resource_slug,
+        )
+        return
+
+    cluster_resource = resource.scope
+
+    if not cluster_resource:
+        logger.warning(
+            "Skipping creation of public cluster IP for floating IP %s because "
+            "cluster resource is not found.",
+            floating_ip,
+        )
+        return
+
+    cluster = cast(Cluster, cluster_resource.scope)
+
+    if not cluster:
+        logger.warning(
+            "Skipping creation of public cluster IP for floating IP %s because "
+            "cluster is not found.",
+            floating_ip,
+        )
+        return
+
+    ClusterPublicIP.objects.get_or_create(
+        cluster=cluster,
+        floating_ip=floating_ip,
+    )

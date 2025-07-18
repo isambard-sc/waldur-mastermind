@@ -19,6 +19,7 @@ from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import (
+    BillingTypes,
     OfferingStates,
     OrderStates,
     ResourceStates,
@@ -28,7 +29,6 @@ from waldur_mastermind.marketplace_support import PLUGIN_NAME
 from waldur_mastermind.marketplace_support.utils import get_order_issue
 from waldur_mastermind.support import models as support_models
 from waldur_mastermind.support.backend import SupportBackend
-from waldur_mastermind.support.log import IssueEventLogger
 from waldur_mastermind.support.tests import factories as support_factories
 from waldur_mastermind.support.tests.base import BaseTest
 
@@ -229,7 +229,7 @@ class RequestActionBaseTest(BaseTest):
         )
         self.offering_component = marketplace_factories.OfferingComponentFactory(
             offering=self.offering,
-            billing_type=marketplace_models.OfferingComponent.BillingTypes.FIXED,
+            billing_type=BillingTypes.FIXED,
         )
 
         self.plan_component = marketplace_factories.PlanComponentFactory(
@@ -491,7 +491,7 @@ class UpdateLimitsTest(BaseTest):
 
         self.offering_component = marketplace_factories.OfferingComponentFactory(
             offering=self.offering,
-            billing_type=marketplace_models.OfferingComponent.BillingTypes.LIMIT,
+            billing_type=BillingTypes.LIMIT,
         )
         self.plan = marketplace_factories.PlanFactory(
             offering=self.offering, unit_price=10
@@ -646,17 +646,6 @@ class NotificationTest(BaseTest):
         # Trigger handler
         self.issue.backend_id = "TST-1"
         self.issue.save()
-
-
-class IssueLogTest(test.APITransactionTestCase):
-    def test_get_logger_scope_if_issue_resource_is_order(self):
-        order = marketplace_factories.OrderFactory()
-        issue = support_factories.IssueFactory()
-        issue.resource = order
-        issue.save()
-        logger = IssueEventLogger
-        scope = logger.get_scopes({"issue": issue})
-        self.assertTrue(order.project in scope)
 
 
 class ProcessingTest(test.APITransactionTestCase):

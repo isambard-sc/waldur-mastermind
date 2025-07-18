@@ -12,11 +12,13 @@ from django.template.loader import render_to_string
 from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices.utils import get_previous_month
 from waldur_mastermind.marketplace.tasks import copy_future_price_to_current_price
 
-from . import compensations, log, models, registrators, serializers, utils
+from . import compensations, models, registrators, serializers, utils
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,7 @@ def create_monthly_invoices():
         try:
             with transaction.atomic():
                 process_invoice_credits(invoice)
+                set_to_zero_overdue_credits()
                 invoice.set_created()
         except Exception:
             logger.exception("Unable to process invoice %s", invoice)
@@ -204,6 +207,7 @@ def format_invoice_csv(invoices):
 
 @shared_task(name="invoices.update_invoices_total_cost")
 def update_invoices_total_cost():
+    """Update cached total cost for current month invoices."""
     year = utils.get_current_year()
     month = utils.get_current_month()
 
@@ -230,6 +234,7 @@ def send_new_invoices_notification():
 
 @shared_task(name="invoices.send_notifications_about_upcoming_ends")
 def send_notifications_about_upcoming_ends():
+    """Send notifications about upcoming end dates of fixed payment profiles."""
     upcoming_ends = utils.get_upcoming_ends_of_fixed_payment_profiles()
 
     for profile in upcoming_ends:
@@ -249,6 +254,7 @@ def send_notifications_about_upcoming_ends():
 
 @shared_task(name="invoices.send_monthly_invoicing_reports_about_customers")
 def send_monthly_invoicing_reports_about_customers():
+    """Send monthly invoicing reports via email to configured recipients."""
     if settings.WALDUR_INVOICES["INVOICE_REPORTING"]["ENABLE"]:
         report = utils.get_monthly_invoicing_reports()
         today = timezone.datetime.today()
@@ -273,16 +279,15 @@ def send_monthly_invoicing_reports_about_customers():
         )
 
 
-@shared_task(name="invoices.set_to_zero_overdue_credits")
 def set_to_zero_overdue_credits():
     for credit in models.CustomerCredit.objects.filter(
         end_date__lt=datetime.date.today()
     ).exclude(value=0):
         credit.value = 0
         credit.save()
-        log.event_logger.credit.info(
+        event_logger.emit(
             "Credit has been set to zero due as the end date {credit_end_date} has arrived.",
-            event_type="set_to_zero_overdue_credit",
+            event_type=EventType.SET_TO_ZERO_OVERDUE_CREDIT,
             event_context={
                 "customer": credit.customer,
                 "credit_end_date": credit.end_date,

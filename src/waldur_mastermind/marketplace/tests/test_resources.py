@@ -20,9 +20,11 @@ from waldur_core.structure.tests.factories import ProjectFactory, UserFactory
 from waldur_mastermind.common.utils import parse_date
 from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices.tests import factories as invoices_factories
-from waldur_mastermind.marketplace import callbacks, log, models, plugins
+from waldur_mastermind.marketplace import callbacks, models, plugins
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import (
+    BillingTypes,
+    LimitPeriods,
     OfferingStates,
     OrderStates,
     ResourceStates,
@@ -66,10 +68,8 @@ class ResourceGetTest(test.APITransactionTestCase):
 
     def test_resource_is_usage_based(self):
         factories.OfferingComponentFactory(
-            offering=self.offering,
-            billing_type=models.OfferingComponent.BillingTypes.USAGE,
+            offering=self.offering, billing_type=BillingTypes.USAGE
         )
-
         self.assertTrue(self.get_resource().data["is_usage_based"])
 
     def test_resource_is_not_usage_based(self):
@@ -609,12 +609,12 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
         offering = factories.OfferingFactory(type=PLUGIN_NAME)
         one_time_offering_component = factories.OfferingComponentFactory(
             offering=offering,
-            billing_type=models.OfferingComponent.BillingTypes.ONE_TIME,
+            billing_type=BillingTypes.ONE_TIME,
             type="signup",
         )
         usage_offering_component = factories.OfferingComponentFactory(
             offering=offering,
-            billing_type=models.OfferingComponent.BillingTypes.USAGE,
+            billing_type=BillingTypes.USAGE,
             type="cpu",
         )
 
@@ -658,12 +658,12 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
         offering = factories.OfferingFactory(type=PLUGIN_NAME)
         switch_offering_component = factories.OfferingComponentFactory(
             offering=offering,
-            billing_type=models.OfferingComponent.BillingTypes.ON_PLAN_SWITCH,
+            billing_type=BillingTypes.ON_PLAN_SWITCH,
             type="plan_switch",
         )
         usage_offering_component = factories.OfferingComponentFactory(
             offering=offering,
-            billing_type=models.OfferingComponent.BillingTypes.USAGE,
+            billing_type=BillingTypes.USAGE,
             type="cpu",
         )
 
@@ -682,36 +682,6 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
         )
         order.init_cost()
         self.assertEqual(order.cost, 50)
-
-
-@ddt
-class ResourceNotificationTest(test.APITransactionTestCase):
-    @data(
-        "log_resource_creation_succeeded",
-        "log_resource_creation_failed",
-        "log_resource_update_succeeded",
-        "log_resource_update_failed",
-        "log_resource_terminate_succeeded",
-        "log_resource_terminate_failed",
-    )
-    @mock.patch("waldur_mastermind.marketplace.log.tasks")
-    def test_notify_about_resource_change(self, log_func_name, mock_tasks):
-        resource = factories.ResourceFactory()
-        log_func = getattr(log, log_func_name)
-
-        if log_func_name == "log_resource_update_succeeded":
-            changed_data = [
-                {"name": "field1", "from": "old_value1", "to": "new_value1"},
-                {"name": "field2", "from": "old_value2", "to": "new_value2"},
-            ]
-            log_func(resource, changed_data)
-        else:
-            log_func(resource)
-
-        if log_func_name != "log_resource_update_succeeded":
-            mock_tasks.notify_about_resource_change.delay.assert_called_once()
-        else:
-            mock_tasks.notify_about_resource_change.delay.assert_not_called()
 
 
 class ResourceUpdateTest(test.APITransactionTestCase):
@@ -1471,8 +1441,8 @@ class ResourceUsageLimitsTest(test.APITransactionTestCase):
         self.resource.limits = {"cpu": 100}
         self.offering_component = factories.OfferingComponentFactory(
             offering=self.resource.offering,
-            billing_type=models.OfferingComponent.BillingTypes.LIMIT,
-            limit_period=models.OfferingComponent.LimitPeriods.TOTAL,
+            billing_type=BillingTypes.LIMIT,
+            limit_period=LimitPeriods.TOTAL,
         )
         self.resource.plan = factories.PlanFactory(offering=self.resource.offering)
         factories.PlanComponentFactory(
@@ -1504,9 +1474,7 @@ class ResourceUsageLimitsTest(test.APITransactionTestCase):
         self.assertEqual(response.data["limit_usage"], {"cpu": 15})
 
     def test_if_limit_period_is_annual(self):
-        self.offering_component.limit_period = (
-            models.OfferingComponent.LimitPeriods.ANNUAL
-        )
+        self.offering_component.limit_period = LimitPeriods.ANNUAL
         self.offering_component.save()
 
         self.client.force_authenticate(self.user)
@@ -1663,7 +1631,7 @@ class ProviderResourceLimitsSetTest(test.APITransactionTestCase):
         self.fixture = MarketplaceFixture()
         self.resource = self.fixture.resource
         self.component = self.fixture.offering_component
-        self.component.billing_type = models.OfferingComponent.BillingTypes.LIMIT
+        self.component.billing_type = BillingTypes.LIMIT
         self.component.save()
         self.resource.limits = {"cpu": 10}
         self.resource.save()

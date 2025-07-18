@@ -4,7 +4,7 @@ from unittest.mock import patch
 from django.test import TestCase
 
 from waldur_core.core import utils as core_utils
-from waldur_core.core.models import SshPublicKey
+from waldur_core.logging.enums import EventType
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
 
@@ -15,9 +15,7 @@ from .. import factories
 class SshKeysHandlersTest(TestCase):
     def setUp(self):
         self.user = structure_factories.UserFactory()
-        self.ssh_key: SshPublicKey = structure_factories.SshPublicKeyFactory(
-            user=self.user
-        )
+        self.ssh_key = structure_factories.SshPublicKeyFactory(user=self.user)
         self.tenant = factories.TenantFactory()
 
     def test_ssh_key_will_be_removed_if_user_lost_connection_to_tenant(
@@ -81,16 +79,17 @@ class LogTenantQuotaUpdateTest(TestCase):
         tenant = factories.TenantFactory()
         tenant.set_quota_limit("vcpu", 10)
 
-        with patch("waldur_openstack.handlers.event_logger") as logger_mock:
+        with patch("waldur_core.logging.event_logger.emit") as logger_mock:
             tenant.set_quota_limit("vcpu", 20)
 
-            logger_mock.openstack_tenant_quota.info.assert_called_once_with(
+            logger_mock.assert_called_once_with(
                 mock.ANY,
-                event_type="openstack_tenant_quota_limit_updated",
+                event_type=EventType.OPENSTACK_TENANT_QUOTA_LIMIT_UPDATED,
                 event_context={
                     "quota_name": "vcpu",
                     "tenant": tenant,
                     "limit": 20,
                     "old_limit": 10,
                 },
+                scopes=mock.ANY,
             )

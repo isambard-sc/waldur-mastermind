@@ -7,6 +7,7 @@ from celery import shared_task
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.models import User
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.marketplace import models as marketplace_models
@@ -498,6 +499,44 @@ def sync_remote():
     # First, try to create all of the remote projects that are not
     # already created in the remote portal
     for remote_allocation in models.RemoteAllocation.objects.filter(is_active=True):
+        project = remote_allocation.project
+
+        if project is None:
+            logger.warning(
+                f"Remote allocation {remote_allocation} has no associated project - deleting"
+            )
+            try:
+                remote_allocation.delete()
+            except Exception as e:
+                logger.error(
+                    f"Failed to delete remote allocation {remote_allocation}: {e}"
+                )
+            continue
+
+        if project.is_expired or project.is_removed:
+            logger.info(
+                f"Remote allocation {remote_allocation} is for an expired or removed project - deleting"
+            )
+            try:
+                remote_allocation.delete()
+            except Exception as e:
+                logger.error(
+                    f"Failed to delete remote allocation {remote_allocation}: {e}"
+                )
+            continue
+
+        if remote_allocation.state not in [
+            CoreStates.CREATION_SCHEDULED,
+            CoreStates.CREATING,
+            CoreStates.UPDATE_SCHEDULED,
+            CoreStates.UPDATING,
+            CoreStates.OK,
+        ]:
+            logger.debug(
+                f"Remote allocation {remote_allocation} is not in a valid state for syncing - skipping"
+            )
+            continue
+
         try:
             backend = remote_allocation.get_backend()
 
@@ -508,7 +547,7 @@ def sync_remote():
                 backend.add_allocated_project(remote_allocation)
             elif remote_allocation.needs_updating():
                 logger.info(
-                    f"Remote allocation {remote_allocation} needs updating ({remote_allocation.local_version} vs {remote_allocation.remote_version} - updating"
+                    f"Remote allocation {remote_allocation} needs updating ({remote_allocation.local_version} vs {remote_allocation.remote_version}) - updating"
                 )
                 backend.update_allocated_project(remote_allocation, force_update=False)
 

@@ -34,9 +34,10 @@ from waldur_core.core.views import (
     logout_failed,
     validate_authentication_method,
 )
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 
 from . import filters, models, serializers, utils
-from .log import event_logger
 
 logger = logging.getLogger(__name__)
 
@@ -262,10 +263,11 @@ class Saml2LoginCompleteView(BaseSaml2View):
             "Authenticated with SAML token. Returning token for successful login of user %s",
             user,
         )
-        event_logger.saml2_auth.info(
+        event_logger.emit(
             "User {user_username} with full name {user_full_name} logged in successfully with SAML2.",
-            event_type="auth_logged_in_with_saml2",
+            event_type=EventType.AUTH_LOGGED_IN_WITH_SAML2,
             event_context={"user": user, "request": request},
+            scopes=[user],
         )
         set_authentication_method(request, AuthenticationMethod.SAML2)
         return login_completed(token.key, "saml2")
@@ -366,10 +368,11 @@ class Saml2LogoutCompleteView(BaseSaml2View):
             return http_response
         Token.objects.get(user=user).delete()
         auth.logout(request)
-        event_logger.saml2_auth.info(
+        event_logger.emit(
             "User {user_username} with full name {user_full_name} logged out successfully with SAML2.",
-            event_type="auth_logged_out_with_saml2",
+            event_type=EventType.AUTH_LOGGED_OUT_WITH_SAML2,
             event_context={"user": user},
+            scopes=[user],
         )
         return http_response
 

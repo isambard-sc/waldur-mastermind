@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from waldur_core.core.clean_html import clean_html
+from waldur_core.core import serializers as core_serializers
 from waldur_core.core.serializers import RestrictedSerializerMixin
 from waldur_core.structure.models import Customer
 from waldur_mastermind.marketplace.models import Offering
@@ -59,12 +59,6 @@ class BroadcastMessageSerializer(
             "send_at",
         )
 
-    def validate(self, attrs):
-        attrs = super().validate(attrs)
-        if attrs.get("send_at"):
-            attrs["state"] = models.BroadcastMessage.States.SCHEDULED
-        return attrs
-
     def validate_query(self, query):
         serializer = QuerySerializer(data=query)
         serializer.is_valid()
@@ -88,6 +82,9 @@ class BroadcastMessageSerializer(
 class MessageTemplateSerializer(
     serializers.HyperlinkedModelSerializer,
 ):
+    subject = core_serializers.HTMLCleanField()
+    body = core_serializers.HTMLCleanField()
+
     class Meta:
         model = models.MessageTemplate
         fields = (
@@ -97,15 +94,7 @@ class MessageTemplateSerializer(
             "subject",
             "body",
         )
-        extra_kwargs = {
-            "url": {"lookup_field": "uuid"},
-        }
-
-    def validate_subject(self, value):
-        return clean_html(value.strip())
-
-    def validate_body(self, value):
-        return clean_html(value.strip())
+        extra_kwargs = {"url": {"lookup_field": "uuid"}}
 
 
 class AdminAnnouncementSerializer(
