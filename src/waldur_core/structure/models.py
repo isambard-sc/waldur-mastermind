@@ -17,7 +17,7 @@ from django.core.validators import (
     RegexValidator,
 )
 from django.db import models, transaction
-from django.db.models import Q, signals
+from django.db.models import Model, Q, signals
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from model_utils import FieldTracker
@@ -60,17 +60,43 @@ from waldur_core.structure.registry import SupportedServices, get_resource_type
 
 
 def validate_service_type(service_type):
+    """
+    Validate that a service type is supported.
+
+    Checks against the SupportedServices registry to ensure the service type
+    is valid and supported by the system.
+
+    Args:
+        service_type: String representing the service type to validate
+
+    Raises:
+        ValidationError: If the service type is not supported
+    """
     if not SupportedServices.has_service_type(service_type):
         raise ValidationError(_("Invalid service type."))  # type: ignore
 
 
 class StructureLoggableMixin(LoggableMixin):
+    """
+    Extends LoggableMixin with structure-specific permission filtering.
+
+    Provides permission filtering for logging operations based on
+    structure-specific user permissions and visibility rules.
+    """
+
     @classmethod
     def get_permitted_objects(cls, user):
         return filter_queryset_for_user(cls.objects.all(), user)  # type: ignore
 
 
 class VATException(Exception):
+    """
+    Custom exception for VAT-related errors.
+
+    Raised when VAT calculations or validations fail,
+    such as missing country codes or VAT service issues.
+    """
+
     pass
 
 
@@ -132,6 +158,14 @@ class VATMixin(models.Model):
 
 
 class BasePermission(models.Model):
+    """
+    Abstract base class for permission models.
+
+    Provides common fields and functionality for permission tracking
+    including user, creator, creation time, expiration, and active status.
+    Used as a base for specific permission types throughout the system.
+    """
+
     class Meta:
         abstract = True
 
@@ -167,6 +201,14 @@ class BasePermission(models.Model):
 
 
 class OrganizationGroup(core_models.UuidMixin, core_models.NameMixin, models.Model):
+    """
+    Hierarchical organization grouping model.
+
+    Provides tree structure for organizing customers with parent-child
+    relationships. Allows for hierarchical organization of customers
+    into groups and sub-groups.
+    """
+
     customers: models.Manager["Customer"]
 
     parent = models.ForeignKey["OrganizationGroup"](
@@ -217,11 +259,30 @@ CUSTOMER_DETAILS_FIELDS = (
 
 
 def validate_cidr_32(value):
+    """
+    Validate that a CIDR address has a /32 mask.
+
+    Ensures that the provided CIDR address uses a /32 subnet mask,
+    which represents a single IP address.
+
+    Args:
+        value: CIDR address string to validate
+
+    Raises:
+        ValidationError: If the CIDR address doesn't have a /32 mask
+    """
     if not value.endswith("/32"):
         raise ValidationError("Only /32 mask is allowed.")
 
 
 class AccessSubnet(core_models.UuidMixin, core_models.DescribableMixin, LoggableMixin):
+    """
+    Model for customer access subnets.
+
+    Stores CIDR addresses with /32 mask validation for IP-based access control.
+    Used to restrict access to customer resources based on source IP addresses.
+    """
+
     customer = models.ForeignKey["Customer"](
         on_delete=models.CASCADE, to="Customer", related_name="access_subnet_set"
     )
@@ -239,6 +300,14 @@ class AccessSubnet(core_models.UuidMixin, core_models.DescribableMixin, Loggable
 
 
 class CustomerDetailsMixin(core_models.NameMixin, VATMixin, CoordinatesMixin):
+    """
+    Mixin containing customer detail fields.
+
+    Provides comprehensive customer information fields including
+    native name, contact details, agreement number, email, phone,
+    address, banking information, and external system integration.
+    """
+
     class Meta:
         abstract = True
 
@@ -285,7 +354,13 @@ class CustomerDetailsMixin(core_models.NameMixin, VATMixin, CoordinatesMixin):
 
 
 class ServiceAccountMixin(models.Model):
-    """Mixin for models that support service accounts."""
+    """
+    Mixin for models that support service accounts.
+
+    Provides functionality for managing service accounts with
+    configurable maximum limits. Used by customers and projects
+    to control service account creation.
+    """
 
     class Meta:
         abstract = True
@@ -299,6 +374,18 @@ class ServiceAccountMixin(models.Model):
 
 
 def filter_customers(user):
+    """
+    Filter customers based on user permissions for call managing organizations.
+
+    Returns a Q object that filters customers based on the user's connection
+    to call managing organizations, either directly or through calls.
+
+    Args:
+        user: User object to filter customers for
+
+    Returns:
+        Q object for filtering customers
+    """
     from waldur_mastermind.proposal.managers import (
         get_connected_call_organizers,
         get_connected_calls,
@@ -321,6 +408,15 @@ class Customer(
     ServiceAccountMixin,
     TimeStampedModel,
 ):
+    """
+    Main organization model.
+
+    Represents an organization/customer with comprehensive functionality
+    including accounting, tax management, blocking, archiving, and
+    organization group relationships. Provides user management,
+    billing functionality, and quota tracking.
+    """
+
     access_subnet_set: models.Manager["AccessSubnet"]
     projects: models.Manager["Project"]
     reviews: models.Manager["CustomerPermissionReview"]
@@ -425,6 +521,14 @@ class Customer(
 class ProjectType(
     core_models.DescribableMixin, core_models.UuidMixin, core_models.NameMixin
 ):
+    """
+    Simple model for categorizing projects.
+
+    Provides project type classification with name, description,
+    and UUID identification. Used to categorize projects into
+    different types for organizational purposes.
+    """
+
     class Meta:
         verbose_name = _("Project type")
         verbose_name_plural = _("Project types")
@@ -439,6 +543,14 @@ class ProjectType(
 
 
 class SoftDeletableManager(SoftDeletableManagerMixin, models.Manager):
+    """
+    Manager for soft-deletable models.
+
+    Provides management for models that can be marked as deleted
+    without actual removal from the database. Combines soft deletion
+    functionality with standard Django model management.
+    """
+
     pass
 
 
@@ -454,6 +566,14 @@ PROJECT_DETAILS_FIELDS = (
 
 
 class ProjectOECDFOS2007CodeMixin(models.Model):
+    """
+    Mixin providing OECD FOS 2007 classification codes for research projects.
+
+    Provides standardized classification codes for different scientific fields
+    according to the OECD Fields of Science and Technology (FOS) 2007 standard.
+    Used to categorize research projects by their scientific domain.
+    """
+
     class Meta:
         abstract = True
 
@@ -529,6 +649,14 @@ class Project(
     TimeStampedModel,
     SoftDeletableModel,
 ):
+    """
+    Project model with comprehensive functionality.
+
+    Supports soft deletion, OECD classification, start/end dates,
+    and customer relationships. Provides quota management, user
+    permissions, and resource organization within customers.
+    """
+
     class Permissions:
         customer_path = "customer"
         project_path = "self"
@@ -655,6 +783,14 @@ class Project(
 
 
 class CustomerPermissionReview(core_models.UuidMixin):
+    """
+    Model for tracking customer permission reviews.
+
+    Tracks permission review processes with pending status,
+    creation/closure dates, and reviewer information.
+    Used for auditing and managing customer access permissions.
+    """
+
     class Permissions:
         customer_path = "customer"
         list_permission = PermissionEnum.LIST_CUSTOMER_PERMISSION_REVIEWS
@@ -684,6 +820,18 @@ class CustomerPermissionReview(core_models.UuidMixin):
 
 
 def build_service_settings_query(user):
+    """
+    Build query for service settings based on sharing and customer visibility.
+
+    Creates a Q object that includes shared service settings or private
+    service settings that belong to customers visible to the user.
+
+    Args:
+        user: User object to build query for
+
+    Returns:
+        Q object for filtering service settings
+    """
     return Q(shared=True) | Q(
         shared=False,
         customer__in=get_visible_customers(user),
@@ -698,6 +846,14 @@ class ServiceSettings(
     core_models.StateMixin,
     StructureLoggableMixin,
 ):
+    """
+    Configuration model for external service integrations.
+
+    Stores authentication credentials, options, and backend connection
+    details for external services. Supports both shared and private
+    configurations with quota management and state tracking.
+    """
+
     class Meta:
         verbose_name = "Service settings"
         verbose_name_plural = "Service settings"
@@ -774,7 +930,13 @@ class ServiceSettings(
 
 
 class SharedServiceSettings(ServiceSettings):
-    """Required for a clear separation of shared/private service settings on admin."""
+    """
+    Proxy model for shared service configurations.
+
+    Required for clear separation of shared/private service settings
+    in the admin interface. Provides specialized management for
+    service settings that can be used by multiple customers.
+    """
 
     objects = SharedServiceSettingsManager()
 
@@ -784,7 +946,13 @@ class SharedServiceSettings(ServiceSettings):
 
 
 class PrivateServiceSettings(ServiceSettings):
-    """Required for a clear separation of shared/private service settings on admin."""
+    """
+    Proxy model for private service configurations.
+
+    Required for clear separation of shared/private service settings
+    in the admin interface. Provides specialized management for
+    service settings that belong to specific customers.
+    """
 
     objects = PrivateServiceSettingsManager()
 
@@ -799,8 +967,12 @@ class BaseServiceProperty(
     core_models.NameMixin,
     models.Model,
 ):
-    """Base service properties like image, flavor, region,
-    which are usually used for Resource provisioning.
+    """
+    Abstract base class for service properties.
+
+    Provides common functionality for service properties like images,
+    flavors, and regions that are typically used for resource provisioning.
+    Includes backend integration and URL naming capabilities.
     """
 
     class Meta:
@@ -820,6 +992,14 @@ class BaseServiceProperty(
 
 
 class ServiceProperty(BaseServiceProperty):
+    """
+    Service property model connected to specific service settings.
+
+    Extends BaseServiceProperty with service settings relationship
+    and backend ID uniqueness constraint. Used for properties that
+    are specific to particular service configurations.
+    """
+
     class Meta:
         abstract = True
         unique_together = ("settings", "backend_id")
@@ -835,7 +1015,11 @@ class ServiceProperty(BaseServiceProperty):
 
 class GeneralServiceProperty(BaseServiceProperty):
     """
-    Service property which is not connected to settings
+    Service property model not connected to specific settings.
+
+    Provides service properties that are independent of specific
+    service settings, with unique backend ID constraint.
+    Used for global or shared service properties.
     """
 
     class Meta:
@@ -857,8 +1041,13 @@ class BaseResource(
     StructureLoggableMixin,
     TimeStampedModel,
 ):
-    """Base resource class. Resource is a provisioned entity of a service,
-    for example: a VM in OpenStack or AWS, or a repository in Github.
+    """
+    Abstract base class for all provisioned resources.
+
+    Represents a provisioned entity of a service such as a VM in OpenStack
+    or AWS, or a repository in GitHub. Provides common functionality for
+    all resource types including service settings, project relationships,
+    backend integration, and state management.
     """
 
     class Meta:
@@ -888,7 +1077,7 @@ class BaseResource(
 
     @classmethod
     @lru_cache(maxsize=1)
-    def get_all_models(cls):
+    def get_all_models(cls) -> list[type[Model]]:
         return [model for model in apps.get_models() if issubclass(model, cls)]
 
     @classmethod
@@ -947,6 +1136,14 @@ class BaseResource(
 
 
 class VirtualMachine(IPCoordinatesMixin, core_models.RuntimeStateMixin, BaseResource):
+    """
+    Abstract model for virtual machines.
+
+    Provides VM-specific functionality including CPU, RAM, disk specifications,
+    IP address handling, and runtime state management. Defines common interface
+    for all VM implementations across different cloud providers.
+    """
+
     def __init__(self, *args, **kwargs):
         AbstractFieldTracker().finalize_class(self.__class__, "tracker")
         super().__init__(*args, **kwargs)
@@ -1013,6 +1210,14 @@ class VirtualMachine(IPCoordinatesMixin, core_models.RuntimeStateMixin, BaseReso
 
 
 class Storage(core_models.RuntimeStateMixin, BaseResource):
+    """
+    Abstract model for storage resources.
+
+    Provides storage-specific functionality with size specification
+    and runtime state management. Used as base class for all
+    storage resource implementations.
+    """
+
     size = models.PositiveIntegerField(help_text=_("Size in MiB"))
 
     class Meta:
@@ -1020,6 +1225,14 @@ class Storage(core_models.RuntimeStateMixin, BaseResource):
 
 
 class UserAgreement(core_models.UuidMixin, LoggableMixin, TimeStampedModel):
+    """
+    Model for storing user agreements.
+
+    Stores different types of user agreements such as Terms of Service
+    and Privacy Policy with content and agreement type classification.
+    Used for legal compliance and user consent tracking.
+    """
+
     class UserAgreements:
         TOS = "TOS"
         PP = "PP"

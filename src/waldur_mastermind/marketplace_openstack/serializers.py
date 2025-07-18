@@ -16,11 +16,13 @@ class MarketplaceTenantCreateSerializer(
 ):
     quotas = serializers.JSONField(required=False, default=dict)
     skip_connection_extnet = serializers.BooleanField(default=False)
+    skip_creation_of_default_router = serializers.BooleanField(default=False)
     mtu = serializers.IntegerField(min_value=68, max_value=9000, required=False)
 
     class Meta(openstack_serializers.OpenStackTenantSerializer.Meta):
         fields = openstack_serializers.OpenStackTenantSerializer.Meta.fields + (
             "skip_connection_extnet",
+            "skip_creation_of_default_router",
             "quotas",
             "mtu",
         )
@@ -46,6 +48,7 @@ def get_marketplace_resource_uuid(serializer, volume) -> str | None:
 
 
 def add_marketplace_resource_uuid(sender, fields, **kwargs):
+    """Add a marketplace resource UUID field to the serializer."""
     fields["marketplace_resource_uuid"] = serializers.SerializerMethodField()
     setattr(sender, "get_marketplace_resource_uuid", get_marketplace_resource_uuid)
 
@@ -74,6 +77,7 @@ def get_router_external_ips(serializer, router) -> list[str] | None:
 
 
 def add_router_external_ips(sender, fields, **kwargs):
+    """Add router external IPs to the serializer."""
     fields["offering_external_ips"] = serializers.SerializerMethodField()
     setattr(sender, "get_offering_external_ips", get_router_external_ips)
 

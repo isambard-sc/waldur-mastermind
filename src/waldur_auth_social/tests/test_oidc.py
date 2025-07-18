@@ -205,6 +205,27 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
             ).exists()
         )
 
+    def test_login_fails_for_deactivated_user(self):
+        user_info = {
+            "sub": "existing_user",
+            "given_name": "Deactivated",
+            "family_name": "User",
+            "email": "deactivated@example.com",
+        }
+        # Create a user that is already in the system but is not active
+        structure_factories.UserFactory(
+            username=user_info["sub"],
+            is_active=False,
+        )
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        # Assert that the login fails with a specific error message
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertIn("User is deactivated", str(response.content))
+
     def test_invalid_state(self):
         response = self.client.get(
             self.url, {"state": "invalid_state", "code": self.code}
@@ -271,9 +292,9 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
 
         self.client.get(self.url, {"state": self.state, "code": self.code})
 
-        mock_event_logger.info.assert_called_once()
+        mock_event_logger.emit.assert_called_once()
         user = User.objects.get(username=user_info["sub"])
-        _args, kwargs = mock_event_logger.info.call_args
+        _args, kwargs = mock_event_logger.emit.call_args
         self.assertEqual(kwargs["event_type"], "auth_logged_in_with_oauth")
         self.assertEqual(kwargs["event_context"]["user"], user)
         self.assertEqual(kwargs["event_context"]["provider"], self.provider.provider)

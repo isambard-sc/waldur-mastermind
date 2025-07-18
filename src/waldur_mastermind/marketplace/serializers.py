@@ -24,12 +24,12 @@ from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
 from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
-from waldur_core.core.clean_html import clean_html
 from waldur_core.core.enums import CoreStates, CoreStateType
 from waldur_core.core.fields import NaturalChoiceField
 from waldur_core.core.mixins import GetValueMixin
 from waldur_core.core.models import NAME_LENGTH, User, get_ssh_key_fingerprints
 from waldur_core.core.validators import BackendURLValidator, validate_ssh_public_key
+from waldur_core.permissions import models as permission_models
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import (
@@ -125,6 +125,15 @@ class LifecyclePluginOptionsSerializer(serializers.Serializer):
     supports_pausing = serializers.BooleanField(
         required=False,
         help_text="If set to True, it will be possible to pause resources",
+    )
+    minimal_team_count_for_provisioning = serializers.IntegerField(
+        required=False,
+        help_text="Minimal team count required for provisioning of resources",
+        min_value=1,
+    )
+    required_team_role_for_provisioning = serializers.CharField(
+        required=False,
+        help_text="Required user role in a project for provisioning of resources",
     )
 
 
@@ -255,7 +264,7 @@ class ManagedRancherPluginOptionsSerializer(serializers.Serializer):
         required=False,
     )
     managed_rancher_tenant_max_ram = serializers.IntegerField(
-        help_text=_("Max number of RAM for tenants"),
+        help_text=_("Max number of RAM for tenants (GB)"),
         required=False,
     )
     managed_rancher_tenant_max_disk = serializers.IntegerField(
@@ -655,15 +664,14 @@ class CategoryHelpArticleSerializer(serializers.ModelSerializer):
         fields = ("title", "url")
 
 
-class CategorySerializerForForNestedFields(serializers.HyperlinkedModelSerializer):
+class CategorySerializerForForNestedFields(
+    serializers.HyperlinkedModelSerializer,
+):
     class Meta:
         model = models.Category
         fields = ("url", "uuid", "title")
         extra_kwargs = {
-            "url": {
-                "lookup_field": "uuid",
-                "view_name": "marketplace-category-detail",
-            },
+            "url": {"lookup_field": "uuid", "view_name": "marketplace-category-detail"}
         }
 
 
@@ -907,12 +915,14 @@ class QuotasUpdateSerializer(serializers.Serializer):
 
 
 class BasePlanSerializer(
-    core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
+    core_serializers.AugmentedSerializerMixin,
+    serializers.HyperlinkedModelSerializer,
 ):
     organization_groups = structure_serializers.OrganizationGroupSerializer(
         many=True, read_only=True
     )
     is_active = serializers.SerializerMethodField()
+    description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
 
     class Meta:
         model = models.Plan
@@ -1009,9 +1019,6 @@ class BasePlanSerializer(
                     price += plan_component.price
 
         return price
-
-    def validate_description(self, value):
-        return clean_html(value)
 
 
 class BasePublicPlanSerializer(BasePlanSerializer):
@@ -1271,13 +1278,18 @@ class OfferingComponentSerializer(serializers.ModelSerializer):
 
         return super().create(validated_data)
 
-    def get_factor(self, offering_component: models.OfferingComponent) -> int:
+    def get_factor(self, offering_component: models.OfferingComponent) -> int | None:
         builtin_components = plugins.manager.get_components(
             offering_component.offering.type
         )
         for c in builtin_components:
             if c.type == offering_component.type:
                 return c.factor
+
+
+# Used only for OpenAPI schema generation
+class UpdateOfferingComponent(OfferingComponentSerializer):
+    uuid = serializers.UUIDField()
 
 
 class ExportImportOfferingComponentSerializer(OfferingComponentSerializer):
@@ -1859,6 +1871,10 @@ class OfferingCreateSerializer(ProviderOfferingDetailsSerializer):
     )
     options = OfferingOptionsSerializer(required=False)
     resource_options = OfferingOptionsSerializer(required=False)
+    description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    full_description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    terms_of_service = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    vendor_details = core_serializers.HTMLCleanField(required=False, allow_blank=True)
 
     def validate(self, attrs):
         if not self.instance:
@@ -1882,18 +1898,6 @@ class OfferingCreateSerializer(ProviderOfferingDetailsSerializer):
         if offering_type not in plugins.manager.backends.keys():
             raise rf_exceptions.ValidationError(_("Invalid value."))
         return offering_type
-
-    def validate_terms_of_service(self, value):
-        return clean_html(value.strip())
-
-    def validate_description(self, value):
-        return clean_html(value.strip())
-
-    def validate_full_description(self, value):
-        return clean_html(value.strip())
-
-    def validate_vendor_details(self, value):
-        return clean_html(value.strip())
 
     def _validate_attributes(self, attrs):
         category = attrs.get("category")
@@ -2071,14 +2075,9 @@ class OfferingOverviewUpdateSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
-    def validate_terms_of_service(self, value):
-        return clean_html(value.strip())
-
-    def validate_description(self, value):
-        return clean_html(value.strip())
-
-    def validate_full_description(self, value):
-        return clean_html(value.strip())
+    description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    full_description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    terms_of_service = core_serializers.HTMLCleanField(required=False, allow_blank=True)
 
     class Meta:
         model = models.Offering
@@ -2852,6 +2851,60 @@ class OrderCreateSerializer(
                 _("Terms of service for offering '%s' have not been accepted.")
                 % offering
             )
+
+        project = cast(structure_models.Project, attrs["project"])
+        minimal_team_count_for_provisioning = offering.plugin_options.get(
+            "minimal_team_count_for_provisioning"
+        )
+
+        project_user_count = project.get_users().count()
+
+        if minimal_team_count_for_provisioning:
+            try:
+                minimal_team_count_for_provisioning_int = int(
+                    minimal_team_count_for_provisioning
+                )
+            except ValueError or TypeError:
+                raise ValidationError(
+                    "Invalid value for minimal_team_count_for_provisioning setting, expected positive integer."
+                )
+
+            if project_user_count < minimal_team_count_for_provisioning_int:
+                raise ValidationError(
+                    _(
+                        "The required minimal team count is not satisfied for the project '%s'. Required - %s, actual - %s."
+                    )
+                    % (project, minimal_team_count_for_provisioning, project_user_count)
+                )
+
+        required_team_role_for_provisioning = offering.plugin_options.get(
+            "required_team_role_for_provisioning"
+        )
+        if required_team_role_for_provisioning:
+            project_ct = ContentType.objects.get_for_model(structure_models.Project)
+            role = permission_models.Role.objects.filter(
+                name=required_team_role_for_provisioning,
+                content_type=project_ct,
+                is_active=True,
+            ).first()
+            if not role:
+                raise ValidationError(
+                    _(
+                        "The required active project role '%s' for provisioning does not exist in the system."
+                    )
+                    % required_team_role_for_provisioning
+                )
+
+            if not project.get_users(role).exists():
+                raise ValidationError(
+                    _(
+                        "Users with the required role '%s' are not found in the project '%s'."
+                    )
+                    % (
+                        project,
+                        required_team_role_for_provisioning,
+                    )
+                )
         return attrs
 
 
@@ -3190,7 +3243,7 @@ class ResourceUpdateSerializer(serializers.ModelSerializer):
             resource.end_date = end_date
             resource.end_date_requested_by = user
             resource.save(update_fields=["end_date", "end_date_requested_by"])
-        log.log_marketplace_resource_end_date_has_been_updated(resource, user)
+        log.log_resource_end_date_has_been_updated(resource, user)
 
 
 class ResourceEndDateByProviderSerializer(serializers.ModelSerializer):
@@ -3231,6 +3284,10 @@ class ResourceBackendMetadataSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Resource
         fields = ("backend_metadata",)
+
+
+class ResourceResponseStatusSerializer(serializers.Serializer):
+    status = serializers.CharField(read_only=True)
 
 
 class ResourceUpdateLimitsSerializer(serializers.ModelSerializer):
@@ -4071,11 +4128,13 @@ def get_is_service_provider(serializer, scope) -> bool:
 
 
 def add_service_provider(sender, fields, **kwargs):
+    """Add a service provider field to the serializer."""
     fields["is_service_provider"] = serializers.SerializerMethodField()
     setattr(sender, "get_is_service_provider", get_is_service_provider)
 
 
 def add_service_provider_uuid(sender, fields, **kwargs):
+    """Add a service provider UUID field to the serializer."""
     fields["service_provider_uuid"] = serializers.SlugRelatedField(
         slug_field="uuid",
         source="serviceprovider",
@@ -4085,6 +4144,7 @@ def add_service_provider_uuid(sender, fields, **kwargs):
 
 
 def add_service_provider_url(sender, fields, **kwargs):
+    """Add a service provider URL field to the serializer."""
     fields["service_provider"] = serializers.HyperlinkedRelatedField(
         lookup_field="uuid",
         view_name="marketplace-service-provider-detail",
@@ -4105,6 +4165,7 @@ def get_call_managing_organization_uuid(serializer, scope) -> str | None:
 
 
 def add_call_managing_organization_uuid(sender, fields, **kwargs):
+    """Add a call managing organization UUID field to the serializer."""
     fields["call_managing_organization_uuid"] = serializers.SerializerMethodField()
     setattr(
         sender,
@@ -4182,6 +4243,7 @@ def get_marketplace_resource_count(
 
 
 def add_marketplace_resource_count(sender, fields, **kwargs):
+    """Add a marketplace resource count field to the serializer."""
     fields["marketplace_resource_count"] = serializers.SerializerMethodField()
     setattr(sender, "get_marketplace_resource_count", get_marketplace_resource_count)
 
@@ -5213,6 +5275,7 @@ def get_integration_status(serializer, offering):
 
 
 def add_integration_status(sender, fields, **kwargs):
+    """Add an integration status field to the serializer."""
     fields["integration_status"] = serializers.SerializerMethodField()
     setattr(sender, "get_integration_status", get_integration_status)
 
@@ -5296,3 +5359,267 @@ class OfferingGroupsSerializer(serializers.Serializer):
     customer_name = serializers.CharField(read_only=True)
     customer_uuid = serializers.CharField(read_only=True)
     offerings = OfferingReferenceSerializer(many=True, read_only=True)
+
+
+class BackendResourceSerializer(
+    core_serializers.AugmentedSerializerMixin,
+    serializers.HyperlinkedModelSerializer,
+):
+    project = serializers.SlugRelatedField(
+        queryset=structure_models.Project.objects.all(), slug_field="uuid"
+    )
+    project_name = serializers.CharField(read_only=True, source="project.name")
+    project_url = serializers.HyperlinkedRelatedField(
+        source="project",
+        lookup_field="uuid",
+        view_name="project-detail",
+        read_only=True,
+    )
+
+    offering = serializers.SlugRelatedField(
+        queryset=models.Offering.objects.all(),
+        slug_field="uuid",
+    )
+    offering_name = serializers.CharField(read_only=True, source="offering.name")
+    offering_url = serializers.HyperlinkedRelatedField(
+        source="offering",
+        lookup_field="uuid",
+        view_name="marketplace-public-offering-detail",
+        read_only=True,
+    )
+
+    class Meta:
+        model = models.BackendResource
+        fields = (
+            "url",
+            "uuid",
+            "name",
+            "created",
+            "modified",
+            "project",
+            "project_name",
+            "project_url",
+            "offering",
+            "offering_name",
+            "offering_url",
+            "backend_id",
+            "backend_metadata",
+        )
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+            },
+        }
+        view_name = "backend-resource-detail"
+
+
+class BackendResourceImportSerializer(serializers.Serializer):
+    plan = serializers.SlugRelatedField(
+        queryset=models.Plan.objects.all(), slug_field="uuid", required=False
+    )
+
+
+# Using shortened "Request" name due to conflict resulting a `spectacular` error
+class BackendResourceReqSerializer(
+    core_serializers.AugmentedSerializerMixin,
+    serializers.HyperlinkedModelSerializer,
+):
+    offering = serializers.SlugRelatedField(
+        queryset=models.Offering.objects.all(), slug_field="uuid", required=True
+    )
+    offering_name = serializers.CharField(read_only=True, source="offering.name")
+    offering_url = serializers.HyperlinkedRelatedField(
+        source="offering",
+        lookup_field="uuid",
+        view_name="marketplace-public-offering-detail",
+        read_only=True,
+    )
+
+    class Meta:
+        model = models.BackendResourceRequest
+        fields = (
+            "url",
+            "created",
+            "modified",
+            "started",
+            "finished",
+            "state",
+            "offering",
+            "offering_name",
+            "offering_url",
+        )
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+            },
+        }
+        view_name = "backend-resource-request-detail"
+        read_only_fields = (
+            "state",
+            "started",
+            "finished",
+        )
+
+
+class BackendResourceRequestSetErredSerializer(
+    core_serializers.AugmentedSerializerMixin, serializers.ModelSerializer
+):
+    class Meta:
+        model = models.BackendResourceRequest
+        fields = ("error_message", "error_traceback")
+        protected_fields = ("error_message", "error_traceback")
+
+
+class MaintenanceAnnouncementOfferingSerializer(serializers.HyperlinkedModelSerializer):
+    class Meta:
+        model = models.MaintenanceAnnouncementOffering
+        fields = [
+            "url",
+            "uuid",
+            "maintenance",
+            "offering",
+            "impact_level",
+            "impact_description",
+        ]
+        extra_kwargs = {
+            "url": {
+                "view_name": "marketplace-maintenance-announcement-offering-detail",
+                "lookup_field": "uuid",
+            },
+            "maintenance": {
+                "view_name": "marketplace-maintenance-announcement-detail",
+                "lookup_field": "uuid",
+            },
+            "offering": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-provider-offering-detail",
+            },
+        }
+
+    def validate_maintenance(self, value):
+        user = self.context["request"].user
+        if not (user.is_staff or value.service_provider.customer.has_user(user)):
+            raise serializers.ValidationError(
+                "You are not related to this service provider's customer."
+            )
+        return value
+
+
+class MaintenanceAnnouncementSerializer(serializers.HyperlinkedModelSerializer):
+    affected_offerings = MaintenanceAnnouncementOfferingSerializer(
+        source="affected_offerings.all",
+        many=True,
+        read_only=True,
+    )
+
+    class Meta:
+        model = models.MaintenanceAnnouncement
+        fields = [
+            "url",
+            "uuid",
+            "name",
+            "message",
+            "maintenance_type",
+            "state",
+            "scheduled_start",
+            "scheduled_end",
+            "actual_start",
+            "actual_end",
+            "service_provider",
+            "created_by",
+            "affected_offerings",
+        ]
+        read_only_fields = ("state", "actual_start", "actual_end", "created_by")
+        extra_kwargs = {
+            "service_provider": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-service-provider-detail",
+            },
+            "url": {
+                "view_name": "marketplace-maintenance-announcement-detail",
+                "lookup_field": "uuid",
+            },
+            "created_by": {
+                "view_name": "user-detail",
+                "lookup_field": "uuid",
+                "read_only": True,
+            },
+        }
+
+    def validate_service_provider(self, value):
+        user = self.context["request"].user
+        if not (user.is_staff or value.customer.has_user(user)):
+            raise serializers.ValidationError(
+                "You are not related to this service provider's customer."
+            )
+        return value
+
+    def create(self, validated_data):
+        request = self.context["request"]
+        validated_data["created_by"] = request.user
+        return super().create(validated_data)
+
+
+class MaintenanceAnnouncementOfferingTemplateSerializer(
+    MaintenanceAnnouncementOfferingSerializer
+):
+    class Meta(MaintenanceAnnouncementOfferingSerializer.Meta):
+        model = models.MaintenanceAnnouncementOfferingTemplate
+        fields = [
+            "url",
+            "uuid",
+            "maintenance_template",
+            "offering",
+            "impact_level",
+            "impact_description",
+        ]
+
+        extra_kwargs = {
+            "url": {
+                "view_name": "marketplace-maintenance-announcement-offering-detail",
+                "lookup_field": "uuid",
+            },
+            "maintenance_template": {
+                "view_name": "marketplace-maintenance-announcement-template-detail",
+                "lookup_field": "uuid",
+            },
+            "offering": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-provider-offering-detail",
+            },
+        }
+
+    def validate_maintenance_template(self, value):
+        user = self.context["request"].user
+        if not (user.is_staff or value.service_provider.customer.has_user(user)):
+            raise serializers.ValidationError(
+                "You are not related to this service provider's customer."
+            )
+        return value
+
+
+class MaintenanceAnnouncementTemplateSerializer(MaintenanceAnnouncementSerializer):
+    class Meta(MaintenanceAnnouncementSerializer.Meta):
+        model = models.MaintenanceAnnouncementTemplate
+        fields = [
+            "url",
+            "uuid",
+            "name",
+            "message",
+            "maintenance_type",
+            "service_provider",
+            "affected_offerings",
+        ]
+        extra_kwargs = {
+            "service_provider": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-service-provider-detail",
+            },
+            "url": {
+                "view_name": "marketplace-maintenance-announcement-template-detail",
+                "lookup_field": "uuid",
+            },
+        }
+
+    def create(self, validated_data):
+        return serializers.HyperlinkedModelSerializer.create(self, validated_data)

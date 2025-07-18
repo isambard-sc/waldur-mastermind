@@ -51,7 +51,7 @@ def format_schedule(schedule):
             else:
                 cron_expr = schedule_str
 
-            return f"Cron: {cron_expr}"
+            return f"Cron: `{cron_expr}`"
 
     return str(schedule)
 
@@ -143,8 +143,6 @@ td:nth-child(4) {
             all_jobs[name] = config
 
         # Write jobs section
-        markdown += "## Scheduled Jobs\n\n"
-
         if all_jobs:
             markdown += "| Job Name | Task | Schedule | Description |\n"
             markdown += "|----------|------|----------|-------------|\n"

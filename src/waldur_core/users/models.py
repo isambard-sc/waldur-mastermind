@@ -84,9 +84,6 @@ class Invitation(
     class Permissions:
         customer_path = "customer"
 
-    class State(InvitationState):
-        pass
-
     class ExecutionState:
         SCHEDULED = "Scheduled"
         PROCESSING = "Processing"
@@ -109,7 +106,7 @@ class Invitation(
     )
 
     state = models.CharField(
-        max_length=10, choices=State.CHOICES, default=State.PENDING
+        max_length=10, choices=InvitationState.CHOICES, default=InvitationState.PENDING
     )
     execution_state = FSMField(
         choices=ExecutionState.CHOICES, default=ExecutionState.SCHEDULED
@@ -128,7 +125,7 @@ class Invitation(
         ),
     )
     full_name = models.CharField(_("full name"), max_length=100, blank=True)
-    extra_invitation_text = models.TextField(blank=True)
+    extra_invitation_text = models.TextField(blank=True, max_length=250)
 
     def get_expiration_time(self):
         return self.created + settings.WALDUR_CORE["INVITATION_LIFETIME"]

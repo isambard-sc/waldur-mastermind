@@ -19,11 +19,23 @@ def get_rules(user):
     rules = []
     for rule in Rule.objects.all():
         if set(user.affiliations or []) & set(rule.user_affiliations) or any(
-            re.match(pattern, user.email) for pattern in rule.user_email_patterns
+            _is_pattern_match(pattern, user.email)
+            for pattern in rule.user_email_patterns
         ):
             rules.append(rule)
 
     return rules
+
+
+def _is_pattern_match(pattern, email):
+    """Safely check if email matches pattern, handling invalid regex patterns."""
+    if not pattern or not isinstance(pattern, str):
+        return False
+    try:
+        return bool(re.match(pattern, email))
+    except re.error as e:
+        logger.warning("Invalid regex pattern '%s': %s", pattern, e)
+        return False
 
 
 def get_or_create_project(customer, user, project_role) -> Project | None:
@@ -115,6 +127,7 @@ def get_or_create_order(
 
 
 def handle_new_user(sender, instance: User, created=False, **kwargs):
+    """Create project and order for new user based on autoprovisioning rules."""
     user = instance
 
     rules: list = get_rules(user)
@@ -130,10 +143,10 @@ def handle_new_user(sender, instance: User, created=False, **kwargs):
         if not project:
             continue
 
-        for rule_plan in rule.ruleplans_set.all():
-            plan = rule_plan.plan
-            attributes = rule_plan.attributes
-            limits = rule_plan.limits
+        if rule.plan:
+            plan = rule.plan
+            attributes = rule.plan_attributes
+            limits = rule.plan_limits
 
             order, order_created = get_or_create_order(
                 project, user, plan.offering, plan, limits, attributes

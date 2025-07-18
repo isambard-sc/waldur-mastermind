@@ -3,6 +3,7 @@ import datetime
 import logging
 import textwrap
 import uuid
+from typing import cast
 
 import httpx
 import reversion
@@ -61,7 +62,8 @@ from waldur_core.core.utils import (
     month_start,
     order_with_nulls,
 )
-from waldur_core.logging.loggers import event_logger
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.filters import UserPermissionFilter
 from waldur_core.permissions.fixtures import (
@@ -127,6 +129,7 @@ from waldur_mastermind.support import models as support_models
 from waldur_pid import models as pid_models
 
 from . import filters, log, models, permissions, plugins, serializers, tasks, utils
+from .handlers import get_plan_scopes
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +143,8 @@ class BaseMarketplaceView(core_views.ActionsViewSet):
 
 
 class PublicViewsetMixin:
+    """Mixin to allow anonymous access to offerings when configured."""
+
     def get_permissions(self):
         if config.ANONYMOUS_USER_CAN_VIEW_OFFERINGS and self.action in [
             "list",
@@ -151,6 +156,8 @@ class PublicViewsetMixin:
 
 
 class ConnectedOfferingDetailsMixin:
+    """Mixin to provide offering details action for connected resources."""
+
     @extend_schema(responses=serializers.PublicOfferingDetailsSerializer, filters=False)
     @action(detail=True, methods=["get"])
     def offering(self, request, *args, **kwargs):
@@ -1897,7 +1904,7 @@ class ProviderOfferingViewSet(
         )
 
     @extend_schema(
-        request=serializers.OfferingComponentSerializer,
+        request=serializers.UpdateOfferingComponent,
         responses=None,
     )
     @action(detail=True, methods=["post"])
@@ -2140,6 +2147,10 @@ class ProviderOfferingViewSet(
         structure_permissions.is_owner
     ]
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.ResourceResponseStatusSerializer},
+        description="Refresh offering user usernames.",
+    )
     @action(detail=True, methods=["post"])
     def refresh_offering_usernames(self, request, uuid=None):
         offering: models.Offering = self.get_object()
@@ -2455,7 +2466,7 @@ class ProviderPlanViewSet(core_views.UpdateReversionMixin, core_views.ActionsVie
     filterset_class = filters.PlanFilter
     filter_backends = (DjangoFilterBackend, filters.ProviderPlanFilterBackend)
 
-    disabled_actions = ["destroy"]
+    destroy_permissions = [structure_permissions.is_staff]
     update_validators = partial_update_validators = [validate_plan_update]
 
     update_permissions = partial_update_permissions = [
@@ -2464,6 +2475,21 @@ class ProviderPlanViewSet(core_views.UpdateReversionMixin, core_views.ActionsVie
             ["offering.customer"],
         )
     ]
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        logger.info(
+            f"Plan {instance.name} from {instance.offering.name} deleted by user {user}."
+        )
+        event_logger.emit(
+            f"Plan {instance.name} from {instance.offering.name} deleted by user {user}.",
+            event_type=EventType.MARKETPLACE_PLAN_DELETED,
+            event_context={
+                "plan": instance,
+            },
+            scopes=get_plan_scopes(instance),
+        )
+        super().perform_destroy(instance)
 
     @extend_schema(
         request=serializers.PricesUpdateSerializer,
@@ -2925,7 +2951,7 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
     set_state_erred_permissions = [
         permission_factory(
             PermissionEnum.APPROVE_ORDER,
-            ["offering.customer"],
+            ["offering.customer", "offering.customer.serviceprovider"],
         )
     ]
 
@@ -2974,11 +3000,20 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
     def unlink(self, request, uuid=None):
         if not request.user.is_staff:
             raise PermissionDenied()
-        obj: models.Order = self.get_object()
-        logger.info("Starting unlink for order %s", obj.uuid)
-        log.log_order_unlink(obj)
+        order: models.Order = self.get_object()
+        logger.info("Starting unlink for order %s", order.uuid)
+        event_logger.emit(
+            "Order {order_uuid} for resource {resource_name} has been unlinked. Type: {type}",
+            event_type=EventType.MARKETPLACE_ORDER_UNLINKED,
+            event_context={
+                "order": order,
+                "type": order.get_type_display(),
+                "resource_name": order.resource.name,
+            },
+            scopes=log.get_order_scopes(order),
+        )
         try:
-            obj.delete()
+            order.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
         except Exception as e:
             logger.error(
@@ -3052,19 +3087,24 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
         and without checking current state of the resource. It is intended to be used
         for removing resource stuck in transitioning state.
         """
-        obj: models.Resource = self.get_object()
-        log.log_resource_unlink(obj)
-        logger.info("Starting unlink for resource %s", obj.uuid)
+        resource: models.Resource = self.get_object()
+        event_logger.emit(
+            "Resource {resource_name} has been unlinked.",
+            event_type=EventType.MARKETPLACE_RESOURCE_UNLINKED,
+            event_context={"resource": resource},
+            scopes=log.get_resource_scopes(resource),
+        )
+        logger.info("Starting unlink for resource %s", resource.uuid)
         try:
-            if obj.scope:
-                obj.scope.delete()
-            obj.delete()
-            logger.debug("Resource %s has been unlinked", obj.uuid)
+            if resource.scope:
+                resource.scope.delete()
+            resource.delete()
+            logger.debug("Resource %s has been unlinked", resource.uuid)
             return Response(status=status.HTTP_204_NO_CONTENT)
         except Exception as e:
             logger.error(
                 "Error during resource unlink. Error %s",
-                obj,
+                resource,
                 str(e),
             )
 
@@ -3201,13 +3241,18 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
         )
 
         if not is_staff_action:
-            log.log_marketplace_resource_end_date_has_been_updated_by_provider(
-                resource, request.user
+            template = (
+                "End date of marketplace resource %(resource_name)s has been updated by provider."
+                " End date: %(end_date)s."
+                " User: %(user)s."
             )
         else:
-            log.log_marketplace_resource_end_date_has_been_updated_by_staff(
-                resource, request.user
+            template = (
+                "End date of marketplace resource %(resource_name)s has been updated by staff."
+                " End date: %(end_date)s."
+                " User: %(user)s."
             )
+        log.log_resource_end_date_has_been_updated(resource, request.user, template)
 
         return Response(status=status.HTTP_200_OK)
 
@@ -3431,6 +3476,10 @@ class ConsumerResourceViewSet(BaseResourceViewSet):
         core_validators.StateValidator(ResourceStates.OK),
     ]
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.ResourceResponseStatusSerializer},
+        description="Update resource options.",
+    )
     @action(detail=True, methods=["post"])
     def update_options(self, request, uuid=None):
         resource = self.get_object()
@@ -3464,6 +3513,10 @@ class ProviderResourceViewSet(BaseResourceViewSet):
         permissions.user_can_set_end_date_by_provider
     ]
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.ResourceResponseStatusSerializer},
+        description="Set resource backend ID.",
+    )
     @action(detail=True, methods=["post"])
     def set_backend_id(self, request, uuid=None):
         resource = self.get_object()
@@ -3499,6 +3552,10 @@ class ProviderResourceViewSet(BaseResourceViewSet):
     ]
     set_backend_id_serializer_class = serializers.ResourceBackendIDSerializer
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.ResourceResponseStatusSerializer},
+        description="Submit resource report.",
+    )
     @action(detail=True, methods=["post"])
     def submit_report(self, request, uuid=None):
         resource = self.get_object()
@@ -3517,6 +3574,9 @@ class ProviderResourceViewSet(BaseResourceViewSet):
     ]
     submit_report_serializer_class = serializers.ResourceReportSerializer
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.ResourceResponseStatusSerializer}
+    )
     @action(detail=True, methods=["post"])
     def set_backend_metadata(self, request, uuid=None):
         resource = self.get_object()
@@ -3541,9 +3601,13 @@ class ProviderResourceViewSet(BaseResourceViewSet):
         serializers.ResourceBackendMetadataSerializer
     )
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: None},
+        description="Set the resource as erred.",
+    )
     @action(detail=True, methods=["post"])
     def set_as_erred(self, request, uuid=None):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -3578,7 +3642,7 @@ class ProviderResourceViewSet(BaseResourceViewSet):
     )
     @action(detail=True, methods=["post"])
     def set_as_ok(self, request, uuid=None):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
 
         if resource.state == ResourceStates.OK:
             logger.warning("Resource %s is already in OK state", resource)
@@ -3620,9 +3684,12 @@ class ProviderResourceViewSet(BaseResourceViewSet):
         )
     ]
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.ResourceResponseStatusSerializer}
+    )
     @action(detail=True, methods=["post"])
     def set_limits(self, request, uuid=None):
-        resource = self.get_object()
+        resource: models.Resource = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -3682,7 +3749,7 @@ class ResourceOfferingsViewSet(ListAPIView):
     def get_queryset(self):
         user = self.request.user
         category = self.get_category()
-        qs: ResourceQuerySet = models.Resource.objects.all()
+        qs = cast(ResourceQuerySet, models.Resource.objects.all())
         offerings = (
             qs.filter_for_service_consumer(user)
             .filter(offering__category=category)
@@ -4005,11 +4072,10 @@ class OfferingUsersViewSet(
         serializer.is_valid(raise_exception=True)
         offering_user.is_restricted = serializer.validated_data["is_restricted"]
         offering_user.save(update_fields=["is_restricted"])
-        event_logger.info(
+        event_logger.emit(
             f"Restriction status for user {offering_user.user.username} in offering {offering_user.offering.name} has been set to {offering_user.is_restricted} by {request.user.username}.",
-            event_type="marketplace_offering_user_restriction_updated",
+            event_type=EventType.MARKETPLACE_OFFERING_USER_RESTRICTION_UPDATED,
             event_context={"offering_user": offering_user},
-            group="marketplace_offering_user",
         )
         logger.info(
             f"Restriction status for user {offering_user.user.username} in offering {offering_user.offering.name} has been set to {offering_user.is_restricted} by {request.user.username}."
@@ -5313,3 +5379,256 @@ class ComponentUserUsageLimitViewSet(core_views.ActionsViewSet):
             ["resource.project.customer", "resource.project"],
         )
     ]
+
+
+class BackendResourceViewSet(core_views.ActionsViewSet):
+    """
+    The viewset provides endpoints for management over backend resources.
+    A site agent is expected to call these endpoints for creation, update and deletion of backend resources.
+    The `import_resource` endpoint is responsible for importing of a backend resorce into Waldur and
+    only staff can perform this operation.
+    """
+
+    lookup_field = "uuid"
+    queryset = models.BackendResource.objects.all().order_by("-created")
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.BackendResourceFilter
+    serializer_class = serializers.BackendResourceSerializer
+    disabled_actions = ["update", "partial_update"]
+    import_resource_serializer_class = serializers.BackendResourceImportSerializer
+
+    def check_create_permissions(request, view, obj=None):
+        serializer = view.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        offering = serializer.validated_data.get("offering")
+
+        if not offering:
+            raise PermissionDenied()
+
+        if has_permission(
+            request, PermissionEnum.MANAGE_OFFERING_BACKEND_RESOURCES, offering
+        ) or has_permission(
+            request,
+            PermissionEnum.MANAGE_OFFERING_BACKEND_RESOURCES,
+            offering.customer,
+        ):
+            return
+
+        raise PermissionDenied()
+
+    create_permissions = [check_create_permissions]
+
+    list_permissions = retrieve_permissions = destroy_permissions = (
+        update_permissions
+    ) = partial_update_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_OFFERING_BACKEND_RESOURCES,
+            ["offering", "offering.customer"],
+        )
+    ]
+
+    @extend_schema(
+        request=serializers.BackendResourceImportSerializer,
+        responses={status.HTTP_200_OK: serializers.ResourceSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def import_resource(self, request, uuid=None):
+        import_resource_serializer = self.get_serializer(data=request.data)
+        import_resource_serializer.is_valid(raise_exception=True)
+
+        backend_resource = self.get_object()
+
+        plan = import_resource_serializer.validated_data.get("plan", None)
+        project = backend_resource.project
+        offering = backend_resource.offering
+
+        backend_id = backend_resource.backend_id
+        logger.info(
+            "Importing the backend resource %s (%s)", backend_resource.name, backend_id
+        )
+
+        if models.Resource.objects.filter(
+            offering=offering, backend_id=backend_id, state=ResourceStates.OK
+        ).exists():
+            raise rf_exceptions.ValidationError(
+                _("Resource has been imported already.")
+            )
+
+        limits = backend_resource.backend_metadata.get("limits", {})
+        resource = models.Resource(
+            project=project,
+            offering=offering,
+            backend_id=backend_id,
+            plan=plan,
+            state=ResourceStates.OK,
+            name=backend_resource.name,
+            limits=limits,
+        )
+        resource.init_cost()
+        resource.save()
+
+        logger.info(
+            "The backend resource %s (%s) has been imported, creating a fake order",
+            backend_resource.name,
+            backend_id,
+        )
+
+        order = models.Order(
+            created=resource.created,
+            created_by=request.user,
+            resource=resource,
+            offering=resource.offering,
+            project=resource.project,
+            limits=resource.limits,
+            state=OrderStates.DONE,
+            consumer_reviewed_by=request.user,
+            provider_reviewed_by=request.user,
+            consumer_reviewed_at=resource.created,
+            provider_reviewed_at=resource.created,
+        )
+        order.save()
+
+        logger.info(
+            "The automatic order for resource %s (%s) has been created",
+            resource.name,
+            resource.backend_id,
+        )
+
+        logger.info(
+            "Deleting BackendResource instance %s (%s) after succesful import",
+            backend_resource.name,
+            backend_resource.backend_id,
+        )
+
+        backend_resource.delete()
+
+        resource_serializer = serializers.ResourceSerializer(
+            resource, context=self.get_serializer_context()
+        )
+        return Response(data=resource_serializer.data, status=status.HTTP_201_CREATED)
+
+    import_resource_permissions = [structure_permissions.is_staff]
+
+
+class BackendResourceRequestViewSet(core_views.ActionsViewSet):
+    """
+    The viewset provides endpoints for requesting list of ready-to-import backend resources.
+    After creation of the request, a site agent is expected to process it.
+    The agent should:
+    - create BackendResources missing in Waldur using the BackendResourceViewSet
+    - manage the state of the request using `start_processing`, `set_done`, `set_erred` endpoints in this class
+    """
+
+    lookup_field = "uuid"
+    queryset = models.BackendResourceRequest.objects.all().order_by("-created")
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.BackendResourceRequestFilter
+    serializer_class = serializers.BackendResourceReqSerializer
+    disabled_actions = ["update", "partial_update", "destroy"]
+    create_permissions = [structure_permissions.is_staff]
+
+    def perform_create(self, serializer) -> None:
+        serializer.save()
+        request = serializer.instance
+        utils.publish_backend_resource_request(request)
+
+    @extend_schema(
+        request=None,
+        responses={status.HTTP_200_OK: dict},
+    )
+    @action(detail=True, methods=["post"])
+    def start_processing(self, request, uuid=None):
+        resource_request = self.get_object()
+        resource_request.start_processing()
+        resource_request.save()
+
+        return Response(
+            {"status": _("Request state set to processing.")}, status=status.HTTP_200_OK
+        )
+
+    start_processing_validators = [
+        core_validators.StateValidator(models.BackendResourceRequest.States.SENT)
+    ]
+
+    @extend_schema(
+        request=None,
+        responses={status.HTTP_200_OK: dict},
+    )
+    @action(detail=True, methods=["post"])
+    def set_done(self, request, uuid=None):
+        resource_request = self.get_object()
+
+        resource_request.set_done()
+        resource_request.save()
+
+        return Response(
+            {"status": _("Request state set to done.")}, status=status.HTTP_200_OK
+        )
+
+    set_done_validators = [
+        core_validators.StateValidator(models.BackendResourceRequest.States.PROCESSING)
+    ]
+
+    @extend_schema(
+        request=serializers.BackendResourceRequestSetErredSerializer,
+        responses={status.HTTP_200_OK: dict},
+    )
+    @action(detail=True, methods=["post"])
+    def set_erred(self, request, uuid=None):
+        resource_request = self.get_object()
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        error_message = serializer.validated_data["error_message"]
+        error_traceback = serializer.validated_data["error_traceback"]
+
+        resource_request.set_erred()
+        resource_request.error_message = error_message
+        resource_request.error_traceback = error_traceback
+        resource_request.save(
+            update_fields=["error_message", "error_traceback", "state", "finished"]
+        )
+        resource_request.save()
+
+        return Response(
+            {"status": _("Request state set to erred.")}, status=status.HTTP_200_OK
+        )
+
+    set_erred_serializer_class = serializers.BackendResourceRequestSetErredSerializer
+
+    start_processing_permissions = set_done_permissions = set_erred_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_OFFERING_BACKEND_RESOURCES,
+            ["offering", "offering.customer"],
+        )
+    ]
+
+
+class MaintenanceAnnouncementViewSet(core_views.ActionsViewSet):
+    lookup_field = "uuid"
+    queryset = models.MaintenanceAnnouncement.objects.all().order_by("-created")
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    serializer_class = serializers.MaintenanceAnnouncementSerializer
+
+
+class MaintenanceAnnouncementOfferingViewSet(core_views.ActionsViewSet):
+    lookup_field = "uuid"
+    queryset = models.MaintenanceAnnouncementOffering.objects.all().order_by("-created")
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    serializer_class = serializers.MaintenanceAnnouncementOfferingSerializer
+
+
+class MaintenanceAnnouncementTemplateViewSet(core_views.ActionsViewSet):
+    lookup_field = "uuid"
+    queryset = models.MaintenanceAnnouncementTemplate.objects.all().order_by("-created")
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    serializer_class = serializers.MaintenanceAnnouncementTemplateSerializer
+
+
+class MaintenanceAnnouncementOfferingTemplateViewSet(core_views.ActionsViewSet):
+    lookup_field = "uuid"
+    queryset = models.MaintenanceAnnouncementOfferingTemplate.objects.all().order_by(
+        "-created"
+    )
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    serializer_class = serializers.MaintenanceAnnouncementOfferingTemplateSerializer

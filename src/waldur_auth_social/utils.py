@@ -90,13 +90,11 @@ def create_or_update_oauth_user(
         # Use all_objects to reactivate a user who might have been deactivated
         user = cast(User, User.all_objects.get(**lookup_params))
 
+        if not user.is_active:
+            raise OAuthException(identity_provider.provider, "User is deactivated.")
+
         # Prepare for update
         update_fields = set()
-        if not user.is_active:
-            user.is_active = True
-            update_fields.add("is_active")
-        user.last_sync = timezone.now()
-        update_fields.add("last_sync")
 
         for field, value in payload.items():
             if getattr(user, field) != value:
@@ -104,22 +102,30 @@ def create_or_update_oauth_user(
                 update_fields.add(field)
 
         if update_fields:
+            user.last_sync = timezone.now()
+            update_fields.add("last_sync")
             user.save(update_fields=update_fields)
 
     except User.DoesNotExist:
         created = True
+        merged_dict = {**lookup_params, **payload}
+        registration_method = identity_provider.provider
+        if identity_provider.provider == ProviderChoices.REMOTE_EDUTEAMS:
+            registration_method = ProviderChoices.EDUTEAMS
         user = cast(
             User,
             User.objects.create_user(
-                registration_method=identity_provider.provider,
-                **lookup_params,
-                **payload,
+                registration_method=registration_method,
+                **merged_dict,
             ),
         )
         user.set_unusable_password()
         user.save()
 
-    if identity_provider.provider == ProviderChoices.EDUTEAMS:
+    if identity_provider.provider in [
+        ProviderChoices.EDUTEAMS,
+        ProviderChoices.REMOTE_EDUTEAMS,
+    ]:
         eduteams_keys = backend_user.get("ssh_public_key", [])
         lookup_value = get_lookup_value(identity_provider, backend_user)
         sync_user_ssh_keys(user, eduteams_keys, lookup_value)
@@ -165,6 +171,12 @@ def sync_user_ssh_keys(user, eduteams_keys, username):
 def pull_remote_eduteams_user(username):
     try:
         user_info = get_remote_eduteams_user_info(username)
+        if "mail" in user_info and type(user_info["mail"]) is list:
+            if len(user_info["mail"]) > 0:
+                user_email = user_info["mail"][0]
+                user_info["mail"] = user_email
+            else:
+                user_info["mail"] = ""
     except NotFound:
         try:
             # check across active users with default manager
@@ -175,13 +187,16 @@ def pull_remote_eduteams_user(username):
             user.is_active = False
             user.last_sync = timezone.now()
             user.save(update_fields=["is_active", "last_sync"])
+            return user
     else:
         try:
-            config = IdentityProvider.objects.get(provider=ProviderChoices.EDUTEAMS)
+            config = IdentityProvider.objects.get(
+                provider=ProviderChoices.REMOTE_EDUTEAMS
+            )
         except IdentityProvider.DoesNotExist:
             config = IdentityProvider(
-                provider=ProviderChoices.EDUTEAMS,
-                **PROVIDER_DEFAULTS[ProviderChoices.EDUTEAMS],
+                provider=ProviderChoices.REMOTE_EDUTEAMS,
+                **PROVIDER_DEFAULTS[ProviderChoices.REMOTE_EDUTEAMS],
             )
         user, _ = create_or_update_oauth_user(config, user_info)
     return user

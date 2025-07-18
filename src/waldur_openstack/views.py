@@ -23,7 +23,8 @@ from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.serializers import EmptySerializer
-from waldur_core.logging.loggers import event_logger
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.permissions.models import UserRole
@@ -182,6 +183,20 @@ class VolumeTypeViewSet(structure_views.BaseServicePropertyViewSet):
     serializer_class = serializers.OpenStackVolumeTypeSerializer
     lookup_field = "uuid"
     filterset_class = filters.VolumeTypeFilter
+
+    @extend_schema(
+        description="Return a list of unique volume type names.",
+        responses=list[str],
+    )
+    @decorators.action(detail=False, methods=["get"])
+    def names(self, request):
+        names = (
+            models.VolumeType.objects.filter(disabled=False)
+            .values_list("name", flat=True)
+            .distinct()
+            .order_by("name")
+        )
+        return response.Response(names, status=status.HTTP_200_OK)
 
 
 class SecurityGroupViewSet(structure_views.ResourceViewSet):
@@ -715,9 +730,9 @@ class RouterViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
         router.save(update_fields=["routes"])
         executors.RouterSetRoutesExecutor().execute(router)
 
-        event_logger.info(
+        event_logger.emit(
             "Static routes have been updated.",
-            event_type="openstack_router_updated",
+            event_type=EventType.OPENSTACK_ROUTER_UPDATED,
             event_context={
                 "router": router,
                 "old_routes": old_routes,
@@ -725,7 +740,7 @@ class RouterViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
                 "tenant_backend_id": router.tenant.backend_id,
                 "changed_interface": {},
             },
-            group="openstack_router",
+            scopes=[router, router.project, router.project.customer],
         )
 
         logger.info(
@@ -820,9 +835,9 @@ class RouterViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
             added_interface = {"type": "subnet", "backend_id": subnet.backend_id}
         elif port:
             added_interface = {"type": "port", "backend_id": port.backend_id}
-        event_logger.info(
+        event_logger.emit(
             "Interface was added to router.",
-            event_type="openstack_router_updated",
+            event_type=EventType.OPENSTACK_ROUTER_UPDATED,
             event_context={
                 "router": router,
                 "old_routes": old_routes,
@@ -830,7 +845,7 @@ class RouterViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
                 "tenant_backend_id": router.tenant.backend_id,
                 "changed_interface": added_interface,
             },
-            group="openstack_router",
+            scopes=[router, router.project, router.project.customer],
         )
         backend.pull_tenant_routers(router.tenant, router.backend_id)
         return response.Response(

@@ -17,9 +17,10 @@ from rest_framework import status
 from waldur_core import _get_version
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
-from waldur_core.core.log import event_logger
 from waldur_core.core.models import User
+from waldur_core.logging import event_logger
 from waldur_core.logging import models as logging_models
+from waldur_core.logging.enums import EventType
 from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices import models as invoices_models
@@ -35,7 +36,6 @@ from waldur_mastermind.marketplace.utils import (
     get_consumer_approvers,
     get_provider_approvers,
 )
-from waldur_mastermind.support.backend import get_active_backend
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,7 @@ def process_order(serialized_order, serialized_user):
 
 @shared_task
 def create_screenshot_thumbnail(uuid):
+    """Create a thumbnail for a screenshot."""
     screenshot = models.Screenshot.objects.get(uuid=uuid)
     utils.create_screenshot_thumbnail(screenshot)
 
@@ -216,6 +217,7 @@ def calculate_usage_for_current_month():
 
 @shared_task
 def terminate_resource(serialized_resource, serialized_user):
+    """Terminate a resource."""
     resource = core_utils.deserialize_instance(serialized_resource)
     user = core_utils.deserialize_instance(serialized_user)
     response = utils.terminate_resource(resource, user)
@@ -238,11 +240,11 @@ def terminate_resources_if_project_end_date_has_been_reached():
         active_resources = project_resources.exclude(state=ResourceStates.TERMINATED)
 
         if not active_resources:
-            event_logger.info(
+            event_logger.emit(
                 "Project {project_name} is going to be deleted because end date has been reached and there are no active resources.",
-                event_type="project_deletion_triggered",
+                event_type=EventType.PROJECT_DELETION_TRIGGERED,
                 event_context={"project": project},
-                group="project",
+                scopes=[project, project.customer],
             )
             project.delete()
             return
@@ -481,7 +483,7 @@ def send_metrics():
     params = {
         "deployment_id": hashlib.sha256(site_name.encode()).hexdigest(),
         "deployment_type": deployment_type,
-        "helpdesk_backend": get_active_backend().backend_name,
+        "helpdesk_backend": config.WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE,
         "helpdesk_integration_status": config.WALDUR_SUPPORT_ENABLED,
         "number_of_users": core_models.User.objects.filter(is_active=True).count(),
         "number_of_offerings": models.Offering.objects.filter(

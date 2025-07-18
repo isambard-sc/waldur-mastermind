@@ -10,7 +10,10 @@ from rest_framework import exceptions as rf_exceptions
 from rest_framework.filters import BaseFilterBackend
 
 from waldur_core.core import filters as core_filters
-from waldur_core.core.filters import LooseMultipleChoiceFilter
+from waldur_core.core.filters import (
+    LooseMultipleChoiceFilter,
+    get_generic_field_filter,
+)
 from waldur_core.core.models import User
 from waldur_core.core.utils import is_uuid_like
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
@@ -99,8 +102,8 @@ class OfferingFilter(
     description = django_filters.CharFilter(lookup_expr="icontains")
     keyword = django_filters.CharFilter(method="filter_keyword", label="Keyword")
     scope_uuid = django_filters.UUIDFilter(
-        method=core_filters.get_generic_field_filter(
-            [structure_models.ServiceSettings]
+        method=get_generic_field_filter(
+            models_to_search=[structure_models.ServiceSettings]
         ),
         label="Scope UUID",
     )
@@ -262,6 +265,8 @@ class OfferingImportableFilterBackend(BaseFilterBackend):
 
 
 class OfferingFilterMixin(django_filters.FilterSet):
+    """Mixin to provide common offering-related filters."""
+
     offering = core_filters.URLFilter(
         view_name="marketplace-provider-offering-detail",
         field_name="offering__uuid",
@@ -993,6 +998,40 @@ class ProviderPlanFilterBackend(BaseFilterBackend):
 
         customer_ids = get_connected_customers(user)
         return queryset.filter(offering__customer_id__in=customer_ids)
+
+
+class BackendResourceFilter(
+    core_filters.CreatedModifiedFilter,
+    structure_filters.NameFilterSet,
+    django_filters.FilterSet,
+):
+    o = django_filters.OrderingFilter(fields=("created",))
+    offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
+    project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
+    backend_id = django_filters.CharFilter(
+        field_name="backend_id", lookup_expr="exact", label="Backend ID"
+    )
+
+    class Meta:
+        model = models.BackendResource
+        fields = []
+
+
+class BackendResourceRequestFilter(
+    core_filters.CreatedModifiedFilter,
+    django_filters.FilterSet,
+):
+    o = django_filters.OrderingFilter(fields=("created",))
+    offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
+    started = django_filters.DateTimeFilter(lookup_expr="gte", label="Created after")
+    finished = django_filters.DateTimeFilter(lookup_expr="gte", label="Modified after")
+    state = core_filters.MappedMultipleChoiceFilter(
+        models.BackendResourceRequest.States.CHOICES
+    )
+
+    class Meta:
+        models = models.BackendResourceRequest
+        fields = []
 
 
 def user_extra_query(user):

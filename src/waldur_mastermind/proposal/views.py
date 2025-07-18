@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime, timedelta
+from typing import cast
 
 from django.db.models import OuterRef, ProtectedError, Q
 from django.db.models.functions import Coalesce
@@ -13,7 +14,6 @@ from rest_framework import permissions as rf_permissions
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.exceptions import IncorrectStateException
-from waldur_core.core.log import event_logger
 from waldur_core.core.models import User
 from waldur_core.core.utils import SubqueryCount
 from waldur_core.core.views import (
@@ -21,6 +21,8 @@ from waldur_core.core.views import (
     ActionsViewSet,
     ReadOnlyActionsViewSet,
 )
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import ProposalRole
@@ -31,6 +33,7 @@ from waldur_core.structure.managers import (
     filter_queryset_for_user,
     get_connected_customers,
 )
+from waldur_core.structure.permissions import _get_customer
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.views import BaseMarketplaceView, PublicViewsetMixin
 from waldur_mastermind.proposal import (
@@ -406,11 +409,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             )
             if created:
                 instance.documents.add(obj)
-                event_logger.info(
+                event_logger.emit(
                     f"Attachment for call {instance.name} has been added.",
-                    event_type="call_document_added",
+                    event_type=EventType.CALL_DOCUMENT_ADDED,
                     event_context={"call": instance},
-                    group="call",
+                    scopes=[_get_customer(instance)],
                 )
                 logger.info(f"Attachment for {instance.name} has been added.")
 
@@ -443,11 +446,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 call=instance,
                 uuid=file_data,
             ).delete()
-            event_logger.info(
+            event_logger.emit(
                 f"Attachment for call {instance.name} has been removed.",
-                event_type="call_document_removed",
+                event_type=EventType.CALL_DOCUMENT_REMOVED,
                 event_context={"call": instance},
-                group="call",
+                scopes=[_get_customer(instance)],
             )
             logger.info(f"Attachment for {instance.name} has been removed.")
 
@@ -610,7 +613,7 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     )
     @decorators.action(detail=True, methods=["post"])
     def attach_document(self, request, uuid=None):
-        proposal = self.get_object()
+        proposal = cast(models.Proposal, self.get_object())
         serializer = self.get_serializer(
             context=self.get_serializer_context(),
             data=request.data,
@@ -618,11 +621,11 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         serializer.is_valid(raise_exception=True)
         serializer.save(proposal=proposal)
 
-        event_logger.info(
+        event_logger.emit(
             f"Attachment for proposal {proposal.name} has been added.",
-            event_type="proposal_document_added",
+            event_type=EventType.PROPOSAL_DOCUMENT_ADDED,
             event_context={"proposal": proposal},
-            group="proposal",
+            scopes=[_get_customer(proposal)],
         )
         return response.Response(status=status.HTTP_200_OK)
 
@@ -973,3 +976,17 @@ class RoundViewSet(ReadOnlyActionsViewSet):
             page, many=True, context={"round_obj": round_obj}
         )
         return self.get_paginated_response(serializer.data)
+
+
+class ProposalProjectRoleMappingViewSet(ActionsViewSet):
+    lookup_field = "uuid"
+    serializer_class = serializers.ProposalProjectRoleMappingSerializer
+    queryset = models.ProposalProjectRoleMapping.objects.all().order_by("call")
+    filterset_class = filters.ProposalProjectRoleMappingFilter
+    filter_backends = (DjangoFilterBackend,)
+    permission_classes = [proposal_permissions.CanUpdateCallPermission]
+
+    def get_queryset(self):
+        return filter_queryset_for_user(
+            super().get_queryset(), self.request.user
+        ).order_by("call")
