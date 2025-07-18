@@ -199,6 +199,13 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
     def get_url_name(cls):
         return "openportal-remote-allocation"
 
+    def get_version(self) -> int:
+        """
+        Get the current local version of the remote project.
+        This is used to track changes to the project.
+        """
+        return int(self.local_version)
+
     def increment_version(self) -> int:
         """
         Update the local version of the remote project.
@@ -1120,6 +1127,23 @@ class ProjectInfo(models.Model):
         self.save(force_accept_changed_shortname=force)
         self.sanitise()
 
+    def has_shortname(self) -> bool:
+        """
+        Check if the project has a shortname set.
+        This is used to determine if we need to generate a new shortname.
+        """
+        return self.shortname is not None and len(self.shortname) > 0
+
+    def get_shortname(self) -> str:
+        """
+        Get the shortname for the project.
+        This will raise an error if the shortname is not set.
+        """
+        if self.shortname is not None:
+            return self.shortname.strip()
+        else:
+            raise ValueError("Project shortname is not set!")
+
     def generate_shortname(self, generator: ProjectShortNameGenerator) -> str:
         """
         Generate a shortname using the provided generator.
@@ -1775,7 +1799,9 @@ class ManagedProject(ReviewMixin, models.Model):
         else:
             return []
 
-    def set_needs_approval(self, needs_approval: bool = True):
+    def set_needs_approval(
+        self, needs_approval: bool = True, comment: str | None = None
+    ):
         """
         Set whether or not this project needs approval from a local admin.
         This is used to control whether or not changes to this project
@@ -1786,7 +1812,7 @@ class ManagedProject(ReviewMixin, models.Model):
                 self.state = ReviewStates.PENDING
                 self.reviewed_by = None
                 self.reviewed_at = None
-                self.review_comment = None
+                self.review_comment = comment
                 self.save(
                     update_fields=[
                         "state",

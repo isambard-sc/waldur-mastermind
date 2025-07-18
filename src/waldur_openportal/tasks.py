@@ -547,7 +547,7 @@ def sync_remote():
                 backend.add_allocated_project(remote_allocation)
             elif remote_allocation.needs_updating():
                 logger.info(
-                    f"Remote allocation {remote_allocation} needs updating ({remote_allocation.local_version} vs {remote_allocation.remote_version} - updating"
+                    f"Remote allocation {remote_allocation} needs updating ({remote_allocation.local_version} vs {remote_allocation.remote_version}) - updating"
                 )
                 backend.update_allocated_project(remote_allocation, force_update=False)
 

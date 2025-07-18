@@ -421,6 +421,8 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
         if force_update:
             version = allocation.increment_version()
+        else:
+            version = allocation.get_version()
 
         if not allocation.needs_updating():
             logger.debug(
