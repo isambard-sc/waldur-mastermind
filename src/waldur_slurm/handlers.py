@@ -8,8 +8,10 @@ from waldur_core.core import utils as core_utils
 from waldur_core.permissions.models import UserRole
 from waldur_core.structure.models import Customer, Project
 from waldur_freeipa import models as freeipa_models
+from waldur_freeipa.models import Profile
 
 from . import models, tasks, utils
+from .models import Allocation
 
 
 def if_plugin_enabled(f):
@@ -24,7 +26,8 @@ def if_plugin_enabled(f):
 
 
 @if_plugin_enabled
-def process_user_creation(sender, instance, created=False, **kwargs):
+def process_user_creation(sender, instance: Profile, created=False, **kwargs):
+    """Process user creation for FreeIPA profiles."""
     if not created:
         return
     transaction.on_commit(
@@ -33,7 +36,8 @@ def process_user_creation(sender, instance, created=False, **kwargs):
 
 
 @if_plugin_enabled
-def process_user_deletion(sender, instance, **kwargs):
+def process_user_deletion(sender, instance: Profile, **kwargs):
+    """Process user deletion for FreeIPA profiles."""
     transaction.on_commit(
         lambda: tasks.delete_user.delay(core_utils.serialize_instance(instance))
     )
@@ -41,6 +45,7 @@ def process_user_deletion(sender, instance, **kwargs):
 
 @if_plugin_enabled
 def process_role_granted(sender, instance: UserRole, **kwargs):
+    """Process role granted events for FreeIPA synchronization."""
     # Skip synchronization of custom roles
     if not instance.role.is_system_role:
         return
@@ -63,6 +68,7 @@ def process_role_granted(sender, instance: UserRole, **kwargs):
 
 @if_plugin_enabled
 def process_role_revoked(sender, instance, **kwargs):
+    """Process role revoked events for FreeIPA synchronization."""
     # Skip synchronization of custom roles
     if not instance.role.is_system_role:
         return
@@ -84,7 +90,10 @@ def process_role_revoked(sender, instance, **kwargs):
 
 
 @if_plugin_enabled
-def update_quotas_on_allocation_usage_update(sender, instance, created=False, **kwargs):
+def update_quotas_on_allocation_usage_update(
+    sender, instance: Allocation, created=False, **kwargs
+):
+    """Update quotas on allocation usage update."""
     if created:
         return
 

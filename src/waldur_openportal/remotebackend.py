@@ -42,7 +42,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
     def get_client(self, settings):
         return RemoteOpenPortalClient(
             instance_name=settings.options.get("instance_name", None),
-            project_class=settings.options.get("project_class", None),
+            project_template=settings.options.get("project_template", None),
         )
 
     def pull_resources(self):
@@ -177,13 +177,40 @@ class RemoteOpenPortalBackend(ServiceBackend):
         # Note that we don't remove remote users - the membership is solely
         # managed by the PI on the remote system - we only add people here
 
-    def assert_can_create_allocation_for_project(self, project):
+    def assert_can_add_allocation(self, allocation: models.RemoteAllocation):
         """
-        This checks to see if the passed project is allowed to create an allocation
+        This checks to see if the passed allocation is allowed to be created
         on the instance managed by this backend. Projects are only allowed to create
         a single allocation per instance, and they must have a routing path
         that matches the destination of this instance.
         """
+        if not isinstance(allocation, models.RemoteAllocation):
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
+
+        if allocation.state not in [
+            CoreStates.CREATION_SCHEDULED,
+            CoreStates.CREATING,
+            CoreStates.UPDATE_SCHEDULED,
+            CoreStates.UPDATING,
+            CoreStates.OK,
+        ]:
+            logger.warning(
+                f"Remote allocation {allocation} is not in a valid state for adding - skipping"
+            )
+            raise ServiceBackendError(
+                f"Remote allocation {allocation} is not in a valid state for adding - skipping"
+            )
+
+        project = allocation.project
+
+        if not project:
+            logger.error(
+                f"Allocation {allocation} does not have a project - cannot create in OpenPortal"
+            )
+            raise ServiceBackendError(
+                f"Allocation {allocation} does not have a project - cannot create in OpenPortal"
+            )
+
         destination = str(self.client.destination())
 
         logger.debug(
@@ -194,11 +221,12 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
         # find all of these allocations that are active and that have a project identifier
         existing_allocations = [
-            allocation
-            for allocation in existing_allocations
-            if allocation.has_project_identifier()
-            and allocation.state != CoreStates.ERRED
-            and allocation.has_remote_project_identifier()
+            alloc
+            for alloc in existing_allocations
+            if alloc.has_project_identifier()
+            and alloc.state != CoreStates.ERRED
+            and alloc.has_remote_project_identifier()
+            and alloc != allocation
         ]
 
         if len(existing_allocations) > 0:
@@ -206,6 +234,14 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 f"Project {project} already has existing remote allocation(s) in OpenPortal for {destination}"
             )
             logger.error(f"These are {existing_allocations}")
+
+            allocation.set_erred()
+            allocation.error_message = (
+                f"Project {project} already has an allocation for {destination} in OpenPortal. "
+                + "You may only have a single active allocation per destination per project."
+            )
+            allocation.save()
+
             raise ServiceBackendError(
                 f"Project {project} already has an allocation for {destination} in OpenPortal. "
                 + "You may only have a single active allocation per destination per project. "
@@ -277,7 +313,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
         if not isinstance(allocation, models.RemoteAllocation):
             raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
 
-        self.assert_can_create_allocation_for_project(allocation.project)
+        self.assert_can_add_allocation(allocation)
 
         if allocation.has_project_identifier():
             project = allocation.get_project_identifier()
@@ -362,6 +398,20 @@ class RemoteOpenPortalBackend(ServiceBackend):
         if not isinstance(allocation, models.RemoteAllocation):
             raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
 
+        if allocation.state not in [
+            CoreStates.CREATION_SCHEDULED,
+            CoreStates.CREATING,
+            CoreStates.UPDATE_SCHEDULED,
+            CoreStates.UPDATING,
+            CoreStates.OK,
+        ]:
+            logger.warning(
+                f"Remote allocation {allocation} is not in a valid state for adding - skipping"
+            )
+            raise ServiceBackendError(
+                f"Remote allocation {allocation} is not in a valid state for adding - skipping"
+            )
+
         if not self._allocation_is_in_openportal(allocation):
             logger.warning(f"Allocation {allocation} is not in OpenPortal - re-adding")
             return self.add_allocated_project(allocation)
@@ -371,6 +421,8 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
         if force_update:
             version = allocation.increment_version()
+        else:
+            version = allocation.get_version()
 
         if not allocation.needs_updating():
             logger.debug(
@@ -379,8 +431,9 @@ class RemoteOpenPortalBackend(ServiceBackend):
             return
 
         try:
-            self.client.update_project(project_identifier, project_details)
+            mapping = self.client.update_project(project_identifier, project_details)
             allocation.successfully_updated(version)
+            allocation.update_mapping(mapping)
         except Exception as e:
             logger.warning(
                 f"Unable to update OpenPortal project {project_identifier}: {e}."

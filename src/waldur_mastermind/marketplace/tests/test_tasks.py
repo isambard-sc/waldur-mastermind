@@ -1,4 +1,5 @@
 import datetime
+from unittest import mock
 from unittest.mock import patch
 
 from constance.test.unittest import override_config
@@ -16,6 +17,7 @@ from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices.tests import factories as invoices_factories
 from waldur_mastermind.marketplace import models, tasks
 from waldur_mastermind.marketplace.enums import (
+    BillingTypes,
     OrderStates,
     ResourceStates,
     RobotAccountStates,
@@ -35,7 +37,7 @@ class CalculateUsageForCurrentMonthTest(test.APITransactionTestCase):
         self.offering_component = factories.OfferingComponentFactory(
             offering=offering,
             parent=category_component,
-            billing_type=models.OfferingComponent.BillingTypes.USAGE,
+            billing_type=BillingTypes.USAGE,
         )
         factories.PlanComponentFactory(plan=plan, component=self.offering_component)
         plan_period = models.ResourcePlanPeriod.objects.create(
@@ -193,13 +195,15 @@ class TerminateResource(test.APITransactionTestCase):
             state=OrderStates.EXECUTING,
         )
 
-    @patch("waldur_mastermind.marketplace.utils.logger")
-    def test_not_raise_exception_if_order_has_not_been_created(self, mock_logger):
+    @patch("waldur_mastermind.marketplace.utils.logger.info")
+    def test_not_raise_exception_if_order_has_not_been_created(
+        self, mock_logger: mock.Mock
+    ):
         tasks.terminate_resource(
             core_utils.serialize_instance(self.resource),
             core_utils.serialize_instance(self.user),
         )
-        mock_logger.info.assert_called_once_with(
+        mock_logger.assert_called_once_with(
             "Terminate order has not been created because other executing orders exist."
         )
 
@@ -373,8 +377,8 @@ class ResourceEndDateTest(test.APITransactionTestCase):
             is_staff=True,
             is_active=True,
         )
-        self.fixtures = fixtures.MarketplaceFixture()
-        self.resource = self.fixtures.resource
+        self.fixture = fixtures.MarketplaceFixture()
+        self.resource = self.fixture.resource
         self.resource.end_date = datetime.datetime(day=1, month=1, year=2020).date()
         self.resource.set_state_ok()
         self.resource.save()
@@ -387,12 +391,12 @@ class ResourceEndDateTest(test.APITransactionTestCase):
 
             self.assertTrue(
                 models.Order.objects.filter(
-                    resource=self.fixtures.resource,
+                    resource=self.fixture.resource,
                     type=models.Order.Types.TERMINATE,
                 ).count()
             )
             order = models.Order.objects.get(
-                resource=self.fixtures.resource, type=models.Order.Types.TERMINATE
+                resource=self.fixture.resource, type=models.Order.Types.TERMINATE
             )
             self.assertTrue(order.state, OrderStates.EXECUTING)
             self.assertEqual(order.created_by, self.system_robot)
@@ -409,20 +413,20 @@ class ResourceEndDateTest(test.APITransactionTestCase):
 
             self.assertTrue(
                 models.Order.objects.filter(
-                    resource=self.fixtures.resource,
+                    resource=self.fixture.resource,
                     type=models.Order.Types.TERMINATE,
                 ).count()
             )
             order = models.Order.objects.get(
-                resource=self.fixtures.resource, type=models.Order.Types.TERMINATE
+                resource=self.fixture.resource, type=models.Order.Types.TERMINATE
             )
             self.assertTrue(order.state, OrderStates.EXECUTING)
             self.assertEqual(order.created_by, user)
 
     def test_notification_about_resource_ending(self):
-        self.fixtures.manager
-        self.fixtures.admin
-        self.fixtures.member
+        self.fixture.manager
+        self.fixture.admin
+        self.fixture.member
 
         with freeze_time("2019-12-25"):
             event_type = "notification_about_resource_ending"

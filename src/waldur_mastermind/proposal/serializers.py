@@ -12,11 +12,9 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.reverse import reverse
 
 from waldur_core.core import serializers as core_serializers
-from waldur_core.core.clean_html import clean_html
 from waldur_core.permissions import enums as permissions_enums
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.models import Role
-from waldur_core.structure.models import Project
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import permissions as marketplace_permissions
 from waldur_mastermind.marketplace.serializers import (
@@ -110,6 +108,7 @@ class NestedRequestedOfferingSerializer(serializers.HyperlinkedModelSerializer):
             "plan_details",
             "options",
             "components",
+            "created",
         ]
         extra_kwargs = {
             "offering": {
@@ -555,6 +554,7 @@ class PublicCallSerializer(
     documents = CallDocumentSerializer(many=True, read_only=True)
     resource_templates = serializers.SerializerMethodField()
     fixed_duration_in_days = serializers.ReadOnlyField()
+    description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
 
     class Meta:
         model = models.Call
@@ -598,9 +598,6 @@ class PublicCallSerializer(
             "reviewer_identity_visible_to_submitters": {"required": False},
             "reviews_visible_to_submitters": {"required": False},
         }
-
-    def validate_description(self, value):
-        return clean_html(value.strip())
 
     def get_start_date(self, obj) -> datetime:
         first_round = obj.round_set.order_by("start_time").first()
@@ -906,15 +903,6 @@ class ProviderRequestedOfferingSerializer(NestedRequestedOfferingSerializer):
 
 class ProtectedCallSerializer(PublicCallSerializer):
     reference_code = serializers.CharField(source="backend_id", required=False)
-    default_project_role = serializers.SlugRelatedField(
-        queryset=Role.objects.filter(is_active=True), slug_field="uuid", required=False
-    )
-    default_project_role_name = serializers.ReadOnlyField(
-        source="default_project_role.name"
-    )
-    default_project_role_description = serializers.ReadOnlyField(
-        source="default_project_role.description"
-    )
     fixed_duration_in_days = serializers.IntegerField(required=False, allow_null=True)
     reviewer_identity_visible_to_submitters = serializers.BooleanField(
         help_text="Whether proposal submitters can see reviewer identities",
@@ -929,9 +917,6 @@ class ProtectedCallSerializer(PublicCallSerializer):
         fields = PublicCallSerializer.Meta.fields + (
             "created_by",
             "reference_code",
-            "default_project_role",
-            "default_project_role_name",
-            "default_project_role_description",
         )
         view_name = "proposal-protected-call-detail"
         protected_fields = ("manager",)
@@ -952,11 +937,6 @@ class ProtectedCallSerializer(PublicCallSerializer):
 
         return manager
 
-    def validate_default_project_role(self, default_project_role: Role):
-        if default_project_role.content_type.model_class() != Project:
-            raise serializers.ValidationError("Role should belong to the project type.")
-        return default_project_role
-
     def create(self, validated_data):
         request = self.context["request"]
         customer = validated_data.get("manager", None).customer
@@ -969,6 +949,19 @@ class ProtectedCallSerializer(PublicCallSerializer):
 
         validated_data["created_by"] = request.user
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if "fixed_duration_in_days" in validated_data:
+            fixed_duration_in_days = validated_data["fixed_duration_in_days"]
+            proposals = models.Proposal.objects.filter(
+                round__call=instance,
+                state__in=[ProposalStates.DRAFT, ProposalStates.IN_REVIEW],
+            )
+            for proposal in proposals:
+                proposal.duration_in_days = fixed_duration_in_days
+                proposal.save()
+
+        return super().update(instance, validated_data)
 
 
 class ProtectedRoundSerializer(
@@ -1062,6 +1055,7 @@ class ProposalSerializer(
     created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
     created_by_uuid = serializers.UUIDField(source="created_by.uuid", read_only=True)
     project_name = serializers.ReadOnlyField(source="project.name")
+    description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
 
     class Meta:
         model = models.Proposal
@@ -1104,9 +1098,6 @@ class ProposalSerializer(
             "approved_by": {"lookup_field": "uuid", "view_name": "user-detail"},
             "project": {"lookup_field": "uuid", "view_name": "project-detail"},
         }
-
-    def validate_description(self, value):
-        return clean_html(value.strip())
 
     def validate(self, attrs):
         if self.instance:
@@ -1237,3 +1228,65 @@ class CallAttachDocumentsSerializer(serializers.Serializer):
 
 class CallDetachDocumentsSerializer(serializers.Serializer):
     documents = serializers.ListField(child=serializers.UUIDField())
+
+
+class ProposalProjectRoleMappingSerializer(serializers.HyperlinkedModelSerializer):
+    call_uuid = serializers.UUIDField(source="call.uuid", read_only=True)
+    call_name = serializers.ReadOnlyField(source="call.name")
+    proposal_role = serializers.SlugRelatedField(
+        slug_field="name",
+        queryset=Role.objects.filter(is_active=True, content_type__model="proposal"),
+        required=True,
+        allow_null=False,
+    )
+    project_role = serializers.SlugRelatedField(
+        slug_field="name",
+        queryset=Role.objects.filter(is_active=True, content_type__model="project"),
+        required=False,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = models.ProposalProjectRoleMapping
+        fields = [
+            "url",
+            "uuid",
+            "call",
+            "call_uuid",
+            "call_name",
+            "proposal_role",
+            "project_role",
+        ]
+        read_only_fields = ("uuid",)
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "call-proposal-project-role-mapping-detail",
+            },
+            "call": {
+                "lookup_field": "uuid",
+                "view_name": "proposal-protected-call-detail",
+            },
+        }
+
+    def validate(self, attrs):
+        if self.instance:
+            call = self.instance.call
+        else:
+            call = attrs["call"]
+        if not permissions_utils.has_permission(
+            self.context["request"],
+            permissions_enums.PermissionEnum.UPDATE_CALL,
+            call,
+        ):
+            raise PermissionDenied()
+
+        return attrs
+
+    def get_fields(self):
+        fields = super().get_fields()
+        # Make only project_role updatable if instance exists
+        if hasattr(self, "instance") and self.instance:
+            fields["proposal_role"].read_only = True
+            fields["call"].read_only = True
+        return fields

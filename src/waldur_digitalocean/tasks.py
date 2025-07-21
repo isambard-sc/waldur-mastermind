@@ -4,8 +4,8 @@ from celery import shared_task
 
 from waldur_core.core import utils
 from waldur_core.core.tasks import Task
-
-from . import log
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,9 @@ class LogDropletResized(Task):
     def execute(self, droplet, serialized_size, *args, **kwargs):
         size = utils.deserialize_instance(serialized_size)
         logger.info("Successfully resized droplet %s", droplet.uuid.hex)
-        log.event_logger.droplet_resize.info(
+        event_logger.emit(
             "Droplet {droplet_name} has been resized.",
-            event_type="droplet_resize_succeeded",
+            event_type=EventType.DROPLET_RESIZE_SUCCEEDED,
             event_context={"droplet": droplet, "size": size},
+            scopes=[droplet, droplet.project, droplet.project.customer],
         )

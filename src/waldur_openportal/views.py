@@ -2,10 +2,14 @@ import logging
 
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import extend_schema
 from rest_framework import permissions, response, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import BasePermission
 
+from waldur_core.core.enums import ReviewStates
 from waldur_core.core import executors as core_executors
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
@@ -13,9 +17,14 @@ from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
 from waldur_core.core import views as core_views
 from waldur_core.core import models as core_models
+from waldur_core.core.serializers import ReviewCommentSerializer
+from waldur_core.structure.filters import GenericRoleFilter
+from waldur_core.core.validators import StateValidator
 
+from waldur_core.permissions.fixtures import ServiceProviderRole
 from waldur_core.core.permissions import IsAdminOrReadOnly
 from waldur_core.structure.permissions import IsAdminOrOwner
+from waldur_core.structure.permissions import _has_owner_access
 
 from . import executors, filters, models, serializers
 
@@ -83,7 +92,11 @@ class RemoteAllocationViewSet(structure_views.ResourceViewSet):
 class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = models.AllocationUserUsage.objects.all().order_by("year", "month")
     serializer_class = serializers.AllocationUserUsageSerializer
-    permission_classes = (permissions.IsAuthenticated,)
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.AllocationUserUsageFilter
 
@@ -91,7 +104,11 @@ class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
 class RemoteAllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = models.RemoteAllocationUserUsage.objects.all().order_by("year", "month")
     serializer_class = serializers.RemoteAllocationUserUsageSerializer
-    permission_classes = (permissions.IsAuthenticated,)
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.RemoteAllocationUserUsageFilter
 
@@ -100,7 +117,11 @@ class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
     queryset = models.Association.objects.all().order_by("username")
     serializer_class = serializers.AssociationSerializer
-    permission_classes = (permissions.IsAuthenticated,)
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.AssociationFilter
 
@@ -109,7 +130,11 @@ class RemoteAssociationViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
     queryset = models.RemoteAssociation.objects.all()
     serializer_class = serializers.RemoteAssociationSerializer
-    permission_classes = (permissions.IsAuthenticated,)
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.RemoteAssociationFilter
 
@@ -209,7 +234,11 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
     queryset = models.ProjectInfo.objects.all().order_by("shortname")
     lookup_field = "project"
     serializer_class = serializers.ProjectInfoSerializer
-    permission_classes = [permissions.IsAuthenticated, IsAdminOrReadOnly]
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
     filterset_class = filters.ProjectInfoFilter
 
     def _get(self, project):
@@ -310,3 +339,390 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
         )
 
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+def _has_owner_or_manager_access(user, customer):
+    """
+    Check if the user has owner or manager access to the project class.
+    """
+    return _has_owner_access(user, customer) or customer.has_user(
+        user, role=ServiceProviderRole.MANAGER
+    )
+
+
+def user_is_staff_or_service_provider_owner_or_service_provider_manager(
+    user, project: models.ManagedProject | None = None
+):
+    if not project:
+        raise PermissionDenied()
+
+    if project.project_template is None:
+        raise PermissionDenied()
+
+    if project.project_template.provider is None:
+        raise PermissionDenied()
+
+    if project.project_template.customer is None:
+        raise PermissionDenied()
+
+    if user.is_staff:
+        return True
+
+    if _has_owner_or_manager_access(
+        user, project.project_template.provider
+    ) and _has_owner_access(user, project.project_template.customer):
+        return True
+
+    raise PermissionDenied()
+
+
+def user_is_staff_or_project_template_owner(
+    user, project_template: models.ProjectTemplate | None = None
+):
+    if not project_template:
+        raise PermissionDenied()
+
+    if project_template.provider is None:
+        raise PermissionDenied()
+
+    if project_template.customer is None:
+        raise PermissionDenied()
+
+    if user.is_staff:
+        return True
+
+    if _has_owner_access(user, project_template.provider):
+        return True
+
+    raise PermissionDenied()
+
+
+class IsStaffOrProjectTemplateOwner(BasePermission):
+    """
+    Permission class for staff or project class owners
+    """
+
+    def has_permission(self, request, view):
+        obj = view.get_object() if hasattr(view, "get_object") else None
+
+        if isinstance(obj, models.ProjectTemplate):
+            return user_is_staff_or_project_template_owner(request.user, obj)
+        else:
+            raise PermissionDenied()
+
+    def has_object_permission(self, request, view, obj):
+        if isinstance(obj, models.ProjectTemplate):
+            return user_is_staff_or_project_template_owner(request.user, obj)
+        else:
+            raise PermissionDenied()
+
+
+class ProjectTemplateViewSet(core_views.ActionsViewSet):
+    lookup_field = "uuid"
+    queryset = models.ProjectTemplate.objects.all().order_by("name")
+    serializer_class = serializers.ProjectTemplateSerializer
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.ProjectTemplateFilter
+
+    def get_permissions(self):
+        """
+        Instantiates and returns the list of permissions that this view requires.
+        """
+        if self.action in ["delete", "update", "partial_update"]:
+            permission_classes = (
+                permissions.IsAuthenticated,
+                IsStaffOrProjectTemplateOwner,
+            )
+        elif self.action == "create":
+            permission_classes = (permissions.IsAuthenticated,)
+        else:
+            permission_classes = self.permission_classes
+
+        return [permission() for permission in permission_classes]
+
+    @extend_schema(
+        request=serializers.ProjectTemplateSerializer,
+        responses=serializers.ProjectTemplateSerializer,
+        description="Create ProjectTemplate object",
+    )
+    def create(self, request, *args, **kwargs):
+        try:
+            logger.info(f"Creating ProjectTemplate by user {request.user}")
+            logger.info(f"Request data: {request.data}")
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            logger.info(f"Validated data: {serializer.validated_data}")
+
+            try:
+                is_staff = request.user.is_staff
+            except AttributeError:
+                is_staff = False
+
+            # we need to verify that the user has the right permission in the
+            # provider organization
+            if not (
+                is_staff
+                or _has_owner_access(
+                    request.user, serializer.validated_data.get("provider")
+                )
+            ):
+                logger.error(
+                    f"User {request.user} is not allowed to create ProjectTemplate for provider {serializer.validated_data.get('provider')}"
+                )
+                return Response(
+                    {
+                        "detail": _(
+                            "You do not have permission to create this project class."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            logger.info(
+                f"Creating ProjectTemplate with data: {serializer.validated_data}"
+            )
+            project_template = serializer.save()
+
+            logger.info(
+                f"Created ProjectTemplate {project_template} by user {request.user}"
+            )
+        except Exception as e:
+            logger.error(f"Error creating ProjectTemplate: {e}")
+            raise
+
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        request=serializers.ProjectTemplateSerializer,
+        responses=serializers.ProjectTemplateSerializer,
+        description="Update ProjectTemplate object (full update)",
+    )
+    def update(self, request, *args, **kwargs):
+        project_template = self.get_object()
+
+        try:
+            logger.info(
+                f"Updating ProjectTemplate {project_template} by user {request.user}"
+            )
+            logger.info(f"Request data: {request.data}")
+
+            serializer = self.get_serializer(project_template, data=request.data)
+            serializer.is_valid(raise_exception=True)
+            logger.info(f"Validated data: {serializer.validated_data}")
+
+            # Check if provider is being changed and validate permissions
+            if "provider" in serializer.validated_data:
+                try:
+                    is_staff = request.user.is_staff
+                except AttributeError:
+                    is_staff = False
+
+                if not (
+                    is_staff
+                    or _has_owner_access(
+                        request.user, serializer.validated_data.get("provider")
+                    )
+                ):
+                    logger.error(
+                        f"User {request.user} is not allowed to update ProjectTemplate for provider {serializer.validated_data.get('provider')}"
+                    )
+                    return Response(
+                        {
+                            "detail": _(
+                                "You do not have permission to update this project class with the specified provider."
+                            )
+                        },
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+
+            updated_project_template = serializer.save()
+            logger.info(
+                f"Updated ProjectTemplate {updated_project_template} by user {request.user}"
+            )
+
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.error(f"Error updating ProjectTemplate: {e}")
+            raise
+
+    @extend_schema(
+        request=serializers.ProjectTemplateSerializer,
+        responses=serializers.ProjectTemplateSerializer,
+        description="Partially update ProjectTemplate object",
+    )
+    def partial_update(self, request, *args, **kwargs):
+        project_template = self.get_object()
+
+        try:
+            logger.info(
+                f"Partially updating ProjectTemplate {project_template} by user {request.user}"
+            )
+            logger.info(f"Request data: {request.data}")
+
+            serializer = self.get_serializer(
+                project_template, data=request.data, partial=True
+            )
+            serializer.is_valid(raise_exception=True)
+            logger.info(f"Validated data: {serializer.validated_data}")
+
+            # Check if provider is being changed and validate permissions
+            if "provider" in serializer.validated_data:
+                try:
+                    is_staff = request.user.is_staff
+                except AttributeError:
+                    is_staff = False
+
+                if not (
+                    is_staff
+                    or _has_owner_access(
+                        request.user, serializer.validated_data.get("provider")
+                    )
+                ):
+                    logger.error(
+                        f"User {request.user} is not allowed to update ProjectTemplate for provider {serializer.validated_data.get('provider')}"
+                    )
+                    return Response(
+                        {
+                            "detail": _(
+                                "You do not have permission to update this project class with the specified provider."
+                            )
+                        },
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+
+            updated_project_template = serializer.save()
+            logger.info(
+                f"Partially updated ProjectTemplate {updated_project_template} by user {request.user}"
+            )
+
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.error(f"Error partially updating ProjectTemplate: {e}")
+            raise
+
+    @extend_schema(
+        responses=None,
+        description="Delete ProjectTemplate object",
+    )
+    @action(detail=True, methods=["delete"])
+    def delete(self, **kwargs):
+        project: models.ProjectTemplate = self.get_object()
+
+        logger.info(f"Deleting ProjectTemplate {project} by user {self.request.user}")
+
+        return Response(status=status.HTTP_200_OK)
+
+
+class IsStaffOrServiceProviderOwnerOrManager(BasePermission):
+    """
+    Permission class for staff or service provider owners/managers
+    """
+
+    def has_permission(self, request, view):
+        obj = view.get_object() if hasattr(view, "get_object") else None
+
+        if isinstance(obj, models.ManagedProject):
+            return user_is_staff_or_service_provider_owner_or_service_provider_manager(
+                request.user, obj
+            )
+        else:
+            raise PermissionDenied()
+
+    def has_object_permission(self, request, view, obj):
+        if isinstance(obj, models.ManagedProject):
+            return user_is_staff_or_service_provider_owner_or_service_provider_manager(
+                request.user, obj
+            )
+        else:
+            raise PermissionDenied()
+
+
+class ManagedProjectViewSet(core_views.ActionsViewSet):
+    queryset = models.ManagedProject.objects.all().order_by("created")
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsAdminOrOwner,
+        IsAdminOrReadOnly,
+    )
+    approve_permissions = reject_permissions = delete_permissions = [
+        permissions.IsAuthenticated,
+        IsStaffOrServiceProviderOwnerOrManager,
+    ]
+    serializer_class = serializers.ManagedProjectSerializer
+    filter_backends = [GenericRoleFilter, DjangoFilterBackend]
+    filterset_class = filters.ManagedProjectFilter
+
+    disabled_actions = ["create", "update", "partial_update"]
+    lookup_field = "identifier"
+    lookup_url_kwarg = "identifier"
+    # need to handle periods in the identifier
+    lookup_value_regex = r"[\w.-]+"
+
+    def get_permissions(self):
+        """
+        Instantiates and returns the list of permissions that this view requires.
+        """
+        if self.action == "approve" or self.action == "reject":
+            permission_classes = (
+                self.approve_permissions
+                if self.action == "approve"
+                else self.reject_permissions
+            )
+        elif self.action == "delete":
+            permission_classes = self.delete_permissions
+        else:
+            permission_classes = self.permission_classes
+
+        return [permission() for permission in permission_classes]
+
+    @extend_schema(
+        request=ReviewCommentSerializer,
+        responses=None,
+        description="Approve managed project request",
+    )
+    @action(detail=True, methods=["post"])
+    def approve(self, request, **kwargs):
+        project: models.ManagedProject = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        comment = serializer.validated_data.get("comment")
+        project.approve(request.user, comment)
+        return Response(status=status.HTTP_200_OK)
+
+    @extend_schema(
+        request=ReviewCommentSerializer,
+        responses=None,
+        description="Reject managed project request",
+    )
+    @action(detail=True, methods=["post"])
+    def reject(self, request, **kwargs):
+        project: models.ManagedProject = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        comment = serializer.validated_data.get("comment")
+        project.reject(request.user, comment)
+        return Response(status=status.HTTP_200_OK)
+
+    approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
+    approve_validators = reject_validators = [
+        StateValidator(ReviewStates.PENDING, state_enum=ReviewStates)
+    ]
+
+    @extend_schema(
+        responses=None,
+        description="Delete ManagedProject object",
+    )
+    @action(detail=True, methods=["delete"])
+    def delete(self, **kwargs):
+        project: models.ManagedProject = self.get_object()
+
+        logger.info(f"Deleting ManagedProject {project} by user {self.request.user}")
+
+        return Response(status=status.HTTP_200_OK)

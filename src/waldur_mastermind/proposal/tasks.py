@@ -3,11 +3,12 @@ import logging
 from celery import shared_task
 from django.utils import timezone
 
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
+from waldur_core.structure.permissions import _get_customer
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal import utils
 from waldur_mastermind.proposal.enums import CallStates, ProposalStates
-
-from . import log
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
     name="waldur_mastermind.proposal.create_reviews_if_strategy_is_after_round"
 )
 def create_reviews_if_strategy_is_after_round():
+    """Create reviews for active rounds with 'after round' review strategy."""
     rounds = proposal_models.Round.objects.filter(
         start_time__lte=timezone.now(),
         cutoff_time__gte=timezone.now(),
@@ -31,6 +33,7 @@ def create_reviews_if_strategy_is_after_round():
     name="waldur_mastermind.proposal.create_reviews_if_strategy_is_after_proposal"
 )
 def create_reviews_if_strategy_is_after_proposal():
+    """Create reviews for active rounds with 'after proposal' review strategy."""
     rounds = proposal_models.Round.objects.filter(
         call__state=CallStates.ACTIVE,
         review_strategy=proposal_models.Round.ReviewStrategies.AFTER_PROPOSAL,
@@ -50,6 +53,7 @@ def create_reviews_if_strategy_is_after_proposal():
     name="waldur_mastermind.proposal.proposals_for_ended_rounds_should_be_cancelled"
 )
 def proposals_for_ended_rounds_should_be_cancelled():
+    """Cancel proposals for rounds that have ended."""
     for proposal in proposal_models.Proposal.objects.exclude(
         state__in=(
             ProposalStates.ACCEPTED,
@@ -60,16 +64,18 @@ def proposals_for_ended_rounds_should_be_cancelled():
         proposal.state = ProposalStates.CANCELED
         proposal.save(update_fields=["state"])
 
-        log.event_logger.proposal.info(
+        event_logger.emit(
             f"Proposal {proposal.name} has been canceled.",
-            event_type="proposal_canceled",
+            event_type=EventType.PROPOSAL_CANCELED,
             event_context={"proposal": proposal},
+            scopes=[_get_customer(proposal)],
         )
         logger.info(f"Proposal {proposal.name} has been canceled.")
 
 
 @shared_task(name="waldur_mastermind.proposal.expired_reviews_should_be_cancelled")
 def expired_reviews_should_be_cancelled():
+    """Cancel reviews that have expired."""
     for review in proposal_models.Review.objects.filter(
         state__in=(
             proposal_models.Review.States.IN_REVIEW,
@@ -80,9 +86,10 @@ def expired_reviews_should_be_cancelled():
             review.state = proposal_models.Review.States.REJECTED
             review.save(update_fields=["state"])
 
-            log.event_logger.review.info(
+            event_logger.emit(
                 f"Review for {review.proposal.name} has been canceled.",
-                event_type="review_canceled",
+                event_type=EventType.REVIEW_CANCELED,
                 event_context={"review": review},
+                scopes=[_get_customer(review)],
             )
             logger.info(f"Review {review.proposal.name} has been canceled.")

@@ -16,7 +16,7 @@ class BroadcastMessageViewSet(ActionsViewSet):
     permission_classes = [permissions.IsAuthenticated, core_permissions.IsSupport]
     filter_backends = [DjangoFilterBackend]
     filterset_class = filters.BroadcastMessageFilterSet
-    update_validators = [
+    update_validators = destroy_validators = [
         core_validators.StateValidator(
             models.BroadcastMessage.States.DRAFT,
             models.BroadcastMessage.States.SCHEDULED,
@@ -30,6 +30,14 @@ class BroadcastMessageViewSet(ActionsViewSet):
         broadcast_message: models.BroadcastMessage = self.get_object()
         tasks.send_broadcast_message_email.delay(broadcast_message.uuid)
         return Response(status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(request=None, responses=None)
+    @decorators.action(detail=True, methods=["post"])
+    def schedule(self, request, *args, **kwargs):
+        broadcast_message: models.BroadcastMessage = self.get_object()
+        broadcast_message.state = models.BroadcastMessage.States.SCHEDULED
+        broadcast_message.save(update_fields=["state"])
+        return Response(status=status.HTTP_200_OK)
 
     @extend_schema(request=serializers.QuerySerializer)
     @decorators.action(detail=False)

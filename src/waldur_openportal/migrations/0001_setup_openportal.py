@@ -11,9 +11,10 @@ from django.db import migrations, models
 import waldur_core.core.fields
 import waldur_core.core.models
 import waldur_core.core.validators
-import waldur_core.logging.loggers
+import waldur_core.logging.mixins
 
 MAX_OP_USERNAME_LENGTH = 64
+
 
 class Migration(migrations.Migration):
     initial = True
@@ -111,7 +112,6 @@ class Migration(migrations.Migration):
                 models.Model,
             ),
         ),
-
         migrations.CreateModel(
             name="Allocation",
             fields=[
@@ -200,11 +200,10 @@ class Migration(migrations.Migration):
             bases=(
                 waldur_core.core.models.DescendantMixin,
                 waldur_core.core.models.BackendModelMixin,
-                waldur_core.logging.loggers.LoggableMixin,
+                waldur_core.logging.mixins.LoggableMixin,
                 models.Model,
             ),
         ),
-
         migrations.CreateModel(
             name="Association",
             fields=[
@@ -237,7 +236,6 @@ class Migration(migrations.Migration):
                 "abstract": False,
             },
         ),
-
         migrations.CreateModel(
             name="AllocationUserUsage",
             fields=[

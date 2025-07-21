@@ -9,7 +9,7 @@ from waldur_core.core import filters as core_filters
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core.mixins import ScopeMixin
 from waldur_core.logging import models, utils
-from waldur_core.logging.loggers import expand_event_groups
+from waldur_core.logging.event_logger import expand_event_groups
 
 
 class BaseHookFilter(django_filters.FilterSet):
@@ -119,18 +119,16 @@ class EventFilterBackend(filters.BaseFilterBackend):
                 return queryset.none()
 
             content_type = ContentType.objects.get_for_model(scope)
-            events = models.Feed.objects.filter(
-                content_type=content_type,
-                object_id=scope.id,
-            ).values_list("event_id", flat=True)
+            subquery = Q(feed__content_type=content_type, feed__object_id=scope.id)
 
             # Include scope if it exists:
             if isinstance(scope, ScopeMixin) and scope.content_type and scope.object_id:
-                events |= models.Feed.objects.filter(
-                    content_type=scope.content_type,
-                    object_id=scope.object_id,
-                ).values_list("event_id", flat=True)
-            queryset = queryset.filter(id__in=events)
+                subquery |= Q(
+                    feed__content_type=scope.content_type,
+                    feed__object_id=scope.object_id,
+                )
+
+            queryset = queryset.filter(subquery)
 
         elif not request.user.is_staff and not request.user.is_support:
             # If user is not staff nor support, he is allowed to see

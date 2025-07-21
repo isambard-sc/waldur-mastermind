@@ -1,5 +1,6 @@
 import datetime
 import hashlib
+import json
 import logging
 import math
 import os
@@ -11,6 +12,7 @@ import uuid
 from collections import defaultdict
 from enum import Enum
 from io import BytesIO
+from typing import cast
 
 import httpx
 from constance import config
@@ -34,6 +36,9 @@ from waldur_core.core import serializers as core_serializers
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.models import User
+from waldur_core.logging import models as logging_models
+from waldur_core.logging import tasks as logging_tasks
+from waldur_core.logging import utils as logging_utils
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import (
@@ -57,13 +62,15 @@ from waldur_mastermind.invoices import registrators
 from waldur_mastermind.invoices.utils import get_full_days
 from waldur_mastermind.marketplace import attribute_types
 from waldur_mastermind.marketplace.enums import (
+    BillingTypes,
+    LimitPeriods,
     OrderStates,
     ResourceStates,
     RobotAccountStates,
 )
 from waldur_mastermind.marketplace_remote import PLUGIN_NAME as REMOTE_PLUGIN_NAME
-from waldur_mastermind.marketplace_slurm_remote import (
-    PLUGIN_NAME as SLURM_REMOTE_PLUGIN_NAME,
+from waldur_mastermind.marketplace_site_agent import (
+    PLUGIN_NAME as SITE_AGENT_PLUGIN_NAME,
 )
 
 from . import PLUGIN_NAME as BASIC_PLUGIN_NAME
@@ -157,6 +164,7 @@ def validate_order(order, request):
 
 
 def create_screenshot_thumbnail(screenshot):
+    """Create a thumbnail for a screenshot."""
     pic = screenshot.image
     fh = storage.open(pic.name, "rb")
     image = Image.open(fh)
@@ -239,7 +247,7 @@ def get_info_about_missing_usage_reports():
     ]
 
     offering_ids = models.OfferingComponent.objects.filter(
-        billing_type=models.OfferingComponent.BillingTypes.USAGE,
+        billing_type=BillingTypes.USAGE,
         offering__type__in=whitelist_types,
     ).values_list("offering_id", flat=True)
     resource_with_usages = models.ComponentUsage.objects.filter(
@@ -271,7 +279,7 @@ def validate_limit_amount(value, component):
     if not component.limit_amount:
         return
 
-    if component.limit_period == models.OfferingComponent.LimitPeriods.MONTH:
+    if component.limit_period == LimitPeriods.MONTH:
         current = (
             (
                 models.ComponentQuota.objects.filter(
@@ -289,7 +297,7 @@ def validate_limit_amount(value, component):
                 _("Monthly limit exceeds threshold %s.") % component.limit_amount
             )
 
-    elif component.limit_period == models.OfferingComponent.LimitPeriods.ANNUAL:
+    elif component.limit_period == LimitPeriods.ANNUAL:
         current = (
             (
                 models.ComponentQuota.objects.filter(
@@ -306,7 +314,7 @@ def validate_limit_amount(value, component):
                 _("Annual limit exceeds threshold %s.") % component.limit_amount
             )
 
-    elif component.limit_period == models.OfferingComponent.LimitPeriods.TOTAL:
+    elif component.limit_period == LimitPeriods.TOTAL:
         current = (
             (
                 models.ComponentQuota.objects.filter(
@@ -373,9 +381,9 @@ def validate_min_max_limit(value, component):
 
 def get_components_map(limits, offering):
     valid_component_types = set(
-        offering.components.filter(
-            billing_type=models.OfferingComponent.BillingTypes.LIMIT
-        ).values_list("type", flat=True)
+        offering.components.filter(billing_type=BillingTypes.LIMIT).values_list(
+            "type", flat=True
+        )
     )
 
     invalid_types = set(limits.keys()) - valid_component_types
@@ -566,6 +574,7 @@ def get_is_limit_based(serializer, scope) -> bool | None:
 
 
 def add_marketplace_offering(sender, fields, **kwargs):
+    """Add marketplace offering related fields to the serializer."""
     fields["marketplace_offering_uuid"] = serializers.SerializerMethodField()
     setattr(sender, "get_marketplace_offering_uuid", get_marketplace_offering_uuid)
 
@@ -873,6 +882,29 @@ def get_plan_period(resource, date):
         .order_by("start")
         .last()
     )
+
+
+def get_or_create_plan_period(resource: models.Resource, date):
+    plan_period = get_plan_period(resource, date)
+
+    if (
+        plan_period is None
+        and resource.plan
+        and resource.state in [ResourceStates.OK, ResourceStates.UPDATING]
+    ):
+        logger.info(
+            "Creating missing Resource Plan Period for resource %s (UUID: %s)",
+            resource.name,
+            resource.uuid.hex,
+        )
+        plan_period = models.ResourcePlanPeriod.objects.create(
+            resource=resource,
+            plan=resource.plan,
+            start=resource.created,
+            end=None,
+        )
+
+    return plan_period
 
 
 def import_current_usages(resource):
@@ -1337,7 +1369,7 @@ def order_should_not_be_reviewed_by_provider(order: models.Order):
     offering = order.offering
     user = order.consumer_reviewed_by or order.created_by
 
-    if offering.type == SLURM_REMOTE_PLUGIN_NAME:
+    if offering.type == SITE_AGENT_PLUGIN_NAME:
         return False
 
     if offering.type == BASIC_PLUGIN_NAME:
@@ -1446,74 +1478,65 @@ def refresh_integration_agent_status(request, agent_type):
     integration_status.save()
 
 
+def parse_date(date_str: str | int | None) -> datetime.date | None:
+    if not isinstance(date_str, str):
+        return None
+    try:
+        return datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise serializers.ValidationError(
+            {"end_date": _("Invalid date format. Use YYYY-MM-DD.")}
+        )
+
+
 def validate_end_date(
-    resource,
-    user,
-    end_date=None,
-):
-    is_resource_termination_date_required = resource.offering.plugin_options.get(
-        "is_resource_termination_date_required"
-    )
-    max_resource_termination_offset_in_days = resource.offering.plugin_options.get(
-        "max_resource_termination_offset_in_days"
-    )
-    default_resource_termination_offset_in_days = resource.offering.plugin_options.get(
-        "default_resource_termination_offset_in_days"
-    )
-    latest_date_for_resource_termination = resource.offering.plugin_options.get(
-        "latest_date_for_resource_termination"
-    )
+    offering: models.Offering,
+    created_date: datetime.date,
+    end_date: datetime.date | None = None,
+) -> None | datetime.date:
+    """
+    Validate or compute the resource end date based on plugin options.
+    Raises ValidationError if constraints are violated or configuration is invalid.
+    """
 
-    if latest_date_for_resource_termination:
-        latest_date_for_resource_termination = datetime.datetime.strptime(
-            latest_date_for_resource_termination, "%Y-%m-%d"
-        ).date()
+    options = cast(dict[str, int | str | None], offering.plugin_options)
 
-    if is_resource_termination_date_required:
-        if not end_date:
-            resource_termination_date = resource.created + datetime.timedelta(
-                days=int(default_resource_termination_offset_in_days)
-            )
-            resource_termination_date = resource_termination_date.date()
-            if latest_date_for_resource_termination:
-                resource_termination_date = min(
-                    resource_termination_date, latest_date_for_resource_termination
-                )
-            resource.end_date = resource_termination_date
-        elif max_resource_termination_offset_in_days:
-            calculated_max_end_date = resource.created + datetime.timedelta(
-                days=int(max_resource_termination_offset_in_days)
-            )
-            resource_termination_date = datetime.datetime.strptime(
-                str(end_date), "%Y-%m-%d"
-            ).date()
-            calculated_max_end_date_date = calculated_max_end_date.date()
-            if resource_termination_date > calculated_max_end_date_date:
-                raise serializers.ValidationError(
-                    {
-                        "end_date": _(
-                            "End date can not be later than the maximal date set for termination."
-                        )
-                    }
-                )
-            resource.end_date = resource_termination_date
-        else:
-            resource_termination_date = datetime.datetime.strptime(
-                str(end_date), "%Y-%m-%d"
-            ).date()
-            if latest_date_for_resource_termination:
-                if resource_termination_date > latest_date_for_resource_termination:
-                    raise serializers.ValidationError(
-                        {
-                            "end_date": _(
-                                "End date can not be later than the maximal date set for termination."
-                            )
-                        }
-                    )
-            resource.end_date = resource_termination_date
+    is_required = options.get("is_resource_termination_date_required")
+    max_offset = options.get("max_resource_termination_offset_in_days")
+    default_offset = options.get("default_resource_termination_offset_in_days")
+
+    latest_date = parse_date(options.get("latest_date_for_resource_termination"))
 
     if end_date:
-        resource.end_date_requested_by = user
+        if end_date and end_date < timezone.datetime.today().date():
+            raise serializers.ValidationError(
+                {"end_date": _("Cannot be earlier than the current date.")}
+            )
+
+        if latest_date and end_date > latest_date:
+            raise serializers.ValidationError(
+                {"end_date": _("End date exceeds global termination limit.")}
+            )
+        if isinstance(max_offset, int):
+            if end_date > created_date + datetime.timedelta(days=max_offset):
+                raise serializers.ValidationError(
+                    {"end_date": _("End date exceeds maximum allowed offset.")}
+                )
+        return end_date
+
+    if not is_required:
+        return
+
+    if not isinstance(default_offset, int):
+        raise serializers.ValidationError(
+            {"end_date": _("Missing default termination offset configuration.")}
+        )
+
+    termination_date = created_date + datetime.timedelta(days=default_offset)
+    if latest_date:
+        return min(termination_date, latest_date)
+    else:
+        return termination_date
 
 
 def sync_component_user_usage(allocation_user_usage, plugin_name):
@@ -2078,3 +2101,96 @@ def move_offering(
             logger.info(f"Permission {permission} has been revoked")
 
     logger.info("Offering %s has been moved to provider %s", offering, target_customer)
+
+
+def prepare_messages(
+    offering: models.Offering,
+    message_payload: dict,
+    affected_object: logging_utils.ObservableObjectType,
+) -> list[dict[str, str]]:
+    """Helper function to prepare event messages for marketplace events.
+
+    Generates event messages for users who have subscribed to events related to marketplace
+    offerings they have access to. Each message includes a vhost, topic and payload.
+
+    Args:
+        offering: Marketplace offering instance to generate messages for
+        message_payload: Dictionary containing event-specific data to be included in the message
+        affected_object: Type of event for the topic name (e.g. "order" or "user_role")
+
+    Returns:
+        List of dictionaries, each containing:
+            - vhost: User UUID hex string
+            - topic: Topic string in format "subscription/{sub_uuid}/offering/{offering_uuid}/{affected_object}"
+            - payload: JSON string containing the input payload plus offering_uuid
+
+    Example:
+        >>> messages = prepare_messages(
+        ...     offering=some_offering,
+        ...     payload={"order_uuid": "123"},
+        ...     affected_object=ObservableObjectType.ORDER
+        ... )
+        >>> messages[0]
+        {
+            'vhost': 'user-uuid-hex',
+            'topic': 'subscription/sub-uuid/offering/off-uuid/order',
+            'payload': '{"order_uuid": "123", "offering_uuid": "off-uuid"}'
+        }
+    """
+
+    logger.debug(
+        "Preparing messages for event %s, offering %s",
+        affected_object.value,
+        offering,
+    )
+    event_subscriptions = logging_models.EventSubscription.objects.filter(
+        observable_objects__contains=[{"object_type": affected_object.value}]
+    )
+
+    if not event_subscriptions.exists():
+        logger.debug(
+            "No event subscriptions exist for %s, skipping message sending",
+            affected_object.value,
+        )
+        return []
+
+    messages_to_send = []
+    for event_subscription in event_subscriptions:
+        user = event_subscription.user
+        logger.info("Processing subscription for user %s", user)
+
+        # Check if user has access to offering
+        linked_offerings = models.Offering.objects.all().filter_for_user(user)
+        if not linked_offerings.filter(id=offering.id).exists():
+            logger.debug(
+                "The user %s does not have access to the offering %s", user, offering
+            )
+            continue
+
+        topic_name = f"subscription/{event_subscription.uuid.hex}/offering/{offering.uuid.hex}/{affected_object.value}"
+        message_payload["offering_uuid"] = offering.uuid.hex
+        message_payload_str = json.dumps(message_payload)
+        vhost_name = user.uuid.hex
+        messages_to_send.append(
+            {"vhost": vhost_name, "topic": topic_name, "payload": message_payload_str}
+        )
+
+    return messages_to_send
+
+
+def publish_backend_resource_request(request: models.BackendResourceRequest):
+    """
+    Send a message to RabbitMQ requesting a list of resources for the offering.
+    """
+    logger.info("Requesting a list of backend resources for offering %s via RabbitMQ")
+
+    payload = {
+        "backend_resource_request_uuid": request.uuid.hex,
+    }
+    messages = prepare_messages(
+        request.offering,
+        payload,
+        logging_utils.ObservableObjectType.IMPORTABLE_RESOURCES,
+    )
+    if messages:
+        logging_tasks.publish_messages.delay(messages)

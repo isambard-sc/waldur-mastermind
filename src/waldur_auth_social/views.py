@@ -15,8 +15,9 @@ from rest_framework.exceptions import AuthenticationFailed, NotFound, Validation
 from rest_framework.response import Response
 from rest_framework.reverse import reverse
 
+from waldur_auth_social.const import ProviderChoices
 from waldur_auth_social.exceptions import OAuthException
-from waldur_auth_social.models import OAuthToken, ProviderChoices
+from waldur_auth_social.models import OAuthToken
 from waldur_auth_social.utils import (
     create_or_update_oauth_user,
     pull_remote_eduteams_user,
@@ -25,9 +26,10 @@ from waldur_core.core import permissions as core_permissions
 from waldur_core.core.authentication import refresh_token, set_authentication_method
 from waldur_core.core.serializers import EmptySerializer
 from waldur_core.core.utils import format_homeport_link
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 
 from . import models
-from .log import event_logger
 from .serializers import (
     AuthSerializer,
     IdentityProviderSerializer,
@@ -81,9 +83,7 @@ class OAuthViewInit(BaseOAuthView):
         """
         self.validate_config(provider)
         redirect_uri = reverse(f"auth_{provider}_complete", request=request)
-        scope = "openid"
-        if provider == ProviderChoices.EDUTEAMS:
-            scope = "openid profile email eduperson_assurance ssh_public_key"
+        scope = f"openid {self.config.extra_scope or ''}".strip()
 
         oidc_state = secrets.token_urlsafe(32)
         request.session[OIDC_STATE_KEY] = oidc_state
@@ -140,14 +140,15 @@ class OAuthViewComplete(BaseOAuthView):
         user.save(update_fields=["last_login"])
         set_authentication_method(request, provider)
 
-        event_logger.auth_social.info(
+        event_logger.emit(
             "User {user_username} with full name {user_full_name} authenticated successfully with {provider}.",
-            event_type="auth_logged_in_with_oauth",
+            event_type=EventType.AUTH_LOGGED_IN_WITH_OAUTH,
             event_context={
                 "provider": provider,
                 "user": user,
                 "request": request,
             },
+            scopes=[user],
         )
         return redirect(
             format_homeport_link(f"oauth_login_completed/{provider}/?token={token.key}")
@@ -166,7 +167,7 @@ class OAuthViewComplete(BaseOAuthView):
         user_info = self.get_user_info(access_token)
         logger.info("Received user info: %s", user_info)
 
-        user, created = create_or_update_oauth_user(self.config.provider, user_info)
+        user, created = create_or_update_oauth_user(self.config, user_info)
 
         if config.AUTO_APPROVE_USER_TOS and user.agreement_date is None:
             user.agreement_date = timezone.now()

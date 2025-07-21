@@ -1,7 +1,6 @@
 import logging
 import os
-
-from django.utils import timezone
+import json
 
 from waldur_core.structure import models as structure_models
 from waldur_core.core.enums import ReviewStates
@@ -179,9 +178,9 @@ class OpenPortalBoard:
         if details.credit is not None:
             logger.warning("Need to verify project credit!")
 
-    def _get_project_class(
+    def _get_project_template(
         self, managed_project: models.ManagedProject, details: openportal.ProjectDetails
-    ) -> models.ProjectClass:
+    ) -> models.ProjectTemplate:
         """
         Get the project class for the managed project.
 
@@ -189,10 +188,10 @@ class OpenPortalBoard:
         is invalid and cannot be determined. This is because an invalid
         project class means that this project cannot be created
         """
-        if managed_project.has_project_class():
+        if managed_project.has_project_template():
             managed_project.set_details(details)
             managed_project.save()
-            return managed_project.get_project_class()
+            return managed_project.get_project_template()
 
         if not managed_project.has_remote_identifier():
             managed_project.delete()
@@ -204,70 +203,313 @@ class OpenPortalBoard:
         identifier = managed_project.get_remote_identifier()
 
         # get the project class of the new project
-        if details.project_class is None:
+        if details.project_template is None:
             managed_project.delete()
 
             raise openportal.OpenPortalError(
                 f"Project class is not set for project {details}"
             )
 
-        if not isinstance(details.project_class, openportal.ProjectClass):
+        if not isinstance(details.project_template, openportal.ProjectTemplate):
             managed_project.delete()
 
             raise openportal.OpenPortalError(
-                f"Invalid project class: {details.project_class}"
+                f"Invalid project class: {details.project_template}"
             )
 
-        project_class = str(details.project_class).strip()
+        project_template = str(details.project_template).strip()
 
-        if len(project_class) == 0:
+        if len(project_template) == 0:
             managed_project.delete()
 
             raise openportal.OpenPortalError(
                 f"Project class is empty for project {project}"
             )
 
-        # See if we have an existing ProjectClass for the requesting remote portal and class
+        # See if we have an existing ProjectTemplate for the requesting remote portal and class
         remote_portal = str(identifier.portal)
 
         try:
-            project_class = models.ProjectClass.objects.filter(
-                portal=remote_portal, name=project_class
+            project_template = models.ProjectTemplate.objects.filter(
+                portal=remote_portal, name=project_template
             ).first()
         except Exception:
             managed_project.delete()
 
             logger.warning(
-                f"Failed to get the project class for portal {remote_portal} and class {project_class}. "
+                f"Failed to get the project class for portal {remote_portal} and class {project_template}. "
                 "This suggests that the portal is not allowed to create projects in this class."
             )
             raise openportal.OpenPortalError(
-                f"Project class '{project_class}' is not allowed for portal '{remote_portal}'"
+                f"Project class '{project_template}' is not allowed for portal '{remote_portal}'"
             )
 
-        if not project_class:
+        if not project_template:
             managed_project.delete()
 
             logger.warning(
-                f"Project class '{details.project_class}' not found for portal '{remote_portal}'. "
+                f"Project class '{details.project_template}' not found for portal '{remote_portal}'. "
                 "This suggests that the portal is not allowed to create projects in this class."
             )
             raise openportal.OpenPortalError(
-                f"Project class '{details.project_class}' is not allowed for portal '{remote_portal}'"
+                f"Project class '{details.project_template}' is not allowed for portal '{remote_portal}'"
             )
 
         # The remote portal is allowed to create projects in this class,
         # so we can now safely save the ManagedProject and create the project
-        managed_project.set_project_class(project_class)
+        managed_project.set_project_template(project_template)
         managed_project.set_details(details)
         managed_project.save()
 
-        return project_class
+        return project_template
+
+    def _attach_existing_project(
+        self,
+        managed_project: models.ManagedProject,
+        existing_project: structure_models.Project,
+    ) -> openportal.ProjectMapping:
+        if managed_project.project is None:
+            managed_project.project = existing_project
+            managed_project.save()
+        elif managed_project.project != existing_project:
+            # This is a bug - we should not have a ManagedProject with a different project
+            logger.error(
+                f"ManagedProject {managed_project} already has a project {managed_project.project}, but we are trying to attach {existing_project}"
+            )
+            raise openportal.OpenPortalError(
+                f"ManagedProject {managed_project} already has a project {managed_project.project}, but we are trying to attach {existing_project}"
+            )
+
+        identifier = managed_project.get_remote_identifier()
+
+        if identifier is None:
+            # This is a bug - we should not have a ManagedProject without an identifier
+            logger.error(f"{managed_project} does not have an identifier set.")
+            managed_project.reject(
+                get_system_robot(),
+                f"{managed_project} does not have an identifier set.",
+            )
+            raise openportal.OpenPortalError("Project is rejected!")
+
+        if managed_project.project.is_expired or managed_project.project.is_removed:
+            # any changes to this project are now not allowed - this is rejected
+            logger.warning(
+                f"{identifier} is expired or removed, cannot create project."
+            )
+            managed_project.reject(
+                get_system_robot(),
+                f"{identifier} is expired or removed, cannot create project.",
+            )
+            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+
+        # we have already created this project, so we can just return the mapping - check
+        # there the project details are in agreement with the existing project
+        if managed_project.details is None:
+            # This is a bug
+            logger.warning(
+                f"Details for {identifier} are None, but the project already exists."
+            )
+            managed_project.reject(
+                get_system_robot(),
+                f"{identifier} details are None, but the project already exists.",
+            )
+            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+
+        if managed_project.local_identifier is None:
+            self._get_local_identifier(managed_project)
+
+        return managed_project.get_mapping()
+
+    def _get_local_identifier(self, managed_project: models.ManagedProject):
+        # Now create a unique shortname for this project using
+        # the generator from the project class
+        if managed_project is None:
+            raise openportal.OpenPortalError(
+                f"ManagedProject {managed_project} is None - cannot generate local identifier"
+            )
+
+        waldur_project = managed_project.project
+        project_template = managed_project.get_project_template()
+
+        if waldur_project is None:
+            logger.error(
+                f"ManagedProject {managed_project} does not have a project set."
+            )
+            managed_project.reject(
+                get_system_robot(),
+                f"ManagedProject {managed_project} does not have a project set.",
+            )
+            raise openportal.OpenPortalError(f"{managed_project} is rejected!")
+
+        project_info, created = models.ProjectInfo.objects.get_or_create(
+            project=waldur_project,
+        )
+
+        if project_info.has_shortname():
+            shortname = project_info.get_shortname()
+        else:
+            project_template = managed_project.get_project_template()
+
+            if project_template is None:
+                logger.error(
+                    f"Project class is not set for project {managed_project.project}"
+                )
+                managed_project.reject(
+                    get_system_robot(),
+                    f"Project class is not set for project {managed_project.project}",
+                )
+                raise openportal.OpenPortalError(f"{managed_project} is rejected!")
+
+            generator = project_template.get_generator()
+
+            if generator is None:
+                logger.error(
+                    f"Project class {project_template} does not have a generator set."
+                )
+                managed_project.reject(
+                    get_system_robot(),
+                    f"Project class {project_template} does not have a generator set.",
+                )
+                raise openportal.OpenPortalError(f"{managed_project} is rejected!")
+
+            shortname = project_info.generate_shortname(generator)
+
+        managed_project.local_identifier = str(self._to_project_identifier(shortname))
+        managed_project.save()
+
+    def _create_local_project(self, managed_project: models.ManagedProject):
+        if managed_project.project is not None:
+            # This project already exists - nothing to do?
+            return
+
+        identifier = managed_project.get_remote_identifier()
+        project_template: models.ProjectTemplate = managed_project.project_template
+        details: openportal.ProjectDetails = managed_project.get_details()
+
+        if identifier is None or project_template is None or details is None:
+            # This is a bug - we should not have a ManagedProject without a project class
+            logger.error(f"{managed_project} is in an invalid state.")
+            managed_project.reject(
+                get_system_robot(),
+                f"{managed_project} is in an invalid state - project class or customer is not set.",
+            )
+            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+
+        # get the customer (organisation) in which the project should be created
+        if project_template.customer is None:
+            managed_project.reject(
+                get_system_robot(),
+                f"Project class {project_template} does not have a customer set.",
+            )
+            logger.warning(
+                f"Project class {project_template} does not have a customer set."
+            )
+            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+
+        customer = project_template.customer
+
+        # there is a change that this project has already been created.
+        # Look for an existing project in this customer that has the
+        # same name as the project we are trying to create
+        existing_projects = structure_models.Project.objects.filter(
+            customer=customer,
+            name=str(details.name).strip(),
+        )
+
+        orphaned_existing_project = None
+
+        for existing_project in existing_projects:
+            # check if this project already has a ManagedProject
+            try:
+                existing_managed_project = models.ManagedProject.objects.get(
+                    project=existing_project,
+                )
+                logger.info(
+                    f"Found existing ManagedProject {existing_managed_project} for project {existing_project}"
+                )
+            except models.ManagedProject.DoesNotExist:
+                logger.info(
+                    f"Found existing project {existing_project} without a ManagedProject"
+                )
+
+                if not (existing_project.is_expired or existing_project.is_removed):
+                    # this project is not expired or removed, so we can use it
+                    # as an orphaned project
+                    logger.info(
+                        f"Using existing project {existing_project} as orphaned project for identifier {identifier}"
+                    )
+                    orphaned_existing_project = existing_project
+                    break
+
+        if orphaned_existing_project:
+            # We have found an existing project that does not have a ManagedProject
+            # associated with it. This means that the project was created in the
+            # customer, but not managed by OpenPortal.
+            logger.info(
+                f"Using orphaned existing project {orphaned_existing_project} for identifier {identifier}"
+            )
+
+            # We can now attach this project to the ManagedProject
+            self._attach_existing_project(managed_project, orphaned_existing_project)
+
+            if managed_project.is_rejected():
+                raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            else:
+                # We need to ask the site admin to approve this connection
+                managed_project.set_needs_approval(
+                    True,
+                    comment=f"Project {orphaned_existing_project} already exists in customer {customer} and is being attached to ManagedProject {managed_project}.",
+                )
+                raise openportal.OpenPortalError(f"{identifier} needs approval!")
+
+        # now get a generator for the project shortname
+        generator = project_template.get_generator()
+
+        if not generator:
+            managed_project.reject(
+                get_system_robot(),
+                f"Project class {project_template} does not have a generator.",
+            )
+            logger.warning(
+                f"Project class {project_template} does not have a generator."
+            )
+            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+
+        # at a minimum, we need to know the name of the project
+        if details.name is None:
+            managed_project.reject(
+                get_system_robot(),
+                f"Project name is not set for project {details}",
+            )
+            logger.warning(f"Project name is not set for project {details}")
+            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+
+        project_name = str(details.name).strip()
+
+        if len(project_name) == 0:
+            managed_project.reject(
+                get_system_robot(),
+                f"Project name is empty for project {identifier}",
+            )
+            logger.warning(f"Project name is empty for project {identifier}")
+            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+
+        # create the project in the customer
+        waldur_project = structure_models.Project.objects.create(
+            name=project_name,
+            customer=customer,
+        )
+
+        managed_project.project = waldur_project
+        managed_project.save()
+
+        self._get_local_identifier(managed_project)
 
     def create_project(
         self,
         identifier: openportal.ProjectIdentifier,
         details: openportal.ProjectDetails,
+        force_request_approval: bool = False,
     ) -> openportal.ProjectMapping:
         """
         Create a project in OpenPortal with the given identifier and details.
@@ -288,9 +530,9 @@ class OpenPortalBoard:
         managed_project, created = models.ManagedProject.objects.get_or_create(
             identifier=str(identifier),
             defaults={
-                "details": str(details),
+                "details": json.loads(str(details)),
                 "local_identifier": None,
-                "project_class": None,
+                "project_template": None,
                 "project": None,
                 "state": ReviewStates.DRAFT,
                 "reviewed_by": None,
@@ -308,7 +550,18 @@ class OpenPortalBoard:
                 f"Retrieved existing ManagedProject for identifier {identifier}: {managed_project}"
             )
 
-        # We can't do anything if the project is pending approval or cancelled
+        # get the project class of this project
+        project_template = self._get_project_template(managed_project, details)
+
+        if force_request_approval:
+            if not managed_project.is_rejected():
+                # If the project is not rejected, we need to set it to needs approval
+                logger.info(
+                    f"Project {identifier} requires approval for creation due to force_request_approval"
+                )
+                managed_project.set_needs_approval()
+
+        # We can't do anything if the project is pending approval or canceled
         if managed_project.is_pending():
             logger.warning(f"{identifier} is pending approval!")
             raise openportal.OpenPortalError(f"{identifier} is pending approval!")
@@ -319,10 +572,7 @@ class OpenPortalBoard:
             logger.warning(f"{identifier} is rejected!")
             raise openportal.OpenPortalError(f"{identifier} is rejected!")
 
-        # get the project class of this project
-        project_class = self._get_project_class(managed_project, details)
-
-        if project_class is None:
+        if project_template is None:
             # This is a bug - we should not have a ManagedProject without a project class
             logger.error(f"{identifier} does not have a project class set.")
             managed_project.delete()
@@ -331,10 +581,13 @@ class OpenPortalBoard:
                 f"{identifier} does not have a project class set"
             )
 
-        if project_class.action_needs_approval() and not managed_project.is_approved():
+        if (
+            project_template.action_needs_approval()
+            and not managed_project.is_approved()
+        ):
             # We need to approve creation requests for this project class
             logger.info(
-                f"Project {identifier} with class {managed_project.project_class} requires approval for project creation"
+                f"Project {identifier} with class {managed_project.project_template} requires approval for project creation"
             )
             managed_project.set_needs_approval()
 
@@ -347,153 +600,23 @@ class OpenPortalBoard:
         elif not managed_project.is_approved():
             # If the project class does not require approval, we can proceed
             logger.info(
-                f"Project {identifier} with class {managed_project.project_class} does not require approval for project creation."
+                f"Project {identifier} with class {managed_project.project_template} does not require approval for project creation."
             )
             managed_project.set_needs_approval(False)
 
         if managed_project.project is not None:
-            if managed_project.project.is_expired or managed_project.project.is_removed:
-                # we can't make any changes to this project - return an error
-                logger.error(
-                    f"{identifier} is expired or removed, cannot create project."
-                )
-                raise openportal.OpenPortalError(
-                    f"{identifier} is expired or removed, cannot create project"
-                )
-
-            # we have already created this project, so we can just return the mapping - check
-            # there the project details are in agreement with the existing project
-            if managed_project.details is None:
-                # This is a bug
-                logger.error(
-                    f"Details for {identifier} are None, but the project already exists."
-                )
-                raise openportal.OpenPortalError(
-                    f"Details for {identifier} are None, but the project already exists."
-                )
-            elif managed_project.details != str(details):
-                logger.warning(
-                    f"Details for {identifier} do not match the existing project details."
-                )
-                raise openportal.OpenPortalError(
-                    f"Details for {identifier} do not match the existing project details."
-                )
-
-            if managed_project.local_identifier is None:
-                project_info = models.ProjectInfo.objects.filter(
-                    project=managed_project.project
-                ).first()
-
-                if project_info is None:
-                    logger.error(
-                        f"ProjectInfo for project {managed_project.project} not found."
-                    )
-                    raise openportal.OpenPortalError(
-                        f"ProjectInfo for project '{managed_project.project}' not found"
-                    )
-
-                if project_info.shortname is None:
-                    # generate the shortname now for this project
-                    logger.warning(
-                        f"ProjectInfo for project {managed_project.project} does not have a shortname, generating one."
-                    )
-
-                    if managed_project.project_class is None:
-                        logger.error(
-                            f"Project class is not set for project {managed_project.project}"
-                        )
-                        managed_project.delete()
-
-                        raise openportal.OpenPortalError(
-                            f"Project class is not set for project {managed_project.project}"
-                        )
-
-                    generator = managed_project.project_class.get_generator()
-
-                    if not generator:
-                        logger.error(
-                            f"Project class {managed_project.project_class} does not have a generator."
-                        )
-                        raise openportal.OpenPortalError(
-                            f"Project class '{managed_project.project_class}' does not have a generator"
-                        )
-
-                    project_info.generate_shortname(generator)
-
-                    if project_info.shortname is None:
-                        logger.error(
-                            f"Failed to generate shortname for project {managed_project.project}"
-                        )
-                        raise openportal.OpenPortalError(
-                            f"Failed to generate shortname for project '{managed_project.project}'"
-                        )
-
-                local_identifier = self._to_project_identifier(project_info.shortname)
-
-                managed_project.local_identifier = str(local_identifier)
-                managed_project.save()
-
-            return managed_project.get_mapping()
-
-        # The project does not exist, so we need to create it
-
-        # get the customer (organisation) in which the project should be created
-        if project_class.customer is None:
-            raise openportal.OpenPortalError(
-                f"Customer is not set for project {details}"
+            return self._attach_existing_project(
+                managed_project, managed_project.project
             )
 
-        customer = project_class.customer
-
-        # now get a generator for the project shortname
-        generator = project_class.get_generator()
-
-        if not generator:
-            raise openportal.OpenPortalError(
-                f"Project class '{project_class}' does not have a generator"
-            )
-
-        # at a minimum, we need to know the name of the project
-        if details.name is None:
-            raise openportal.OpenPortalError(
-                f"Project name is not set for project {details}"
-            )
-
-        project_name = str(details.name).strip()
-
-        if len(project_name) == 0:
-            raise openportal.OpenPortalError(
-                f"Project name is empty for project {identifier}"
-            )
-
-        # create the project in the customer
-        waldur_project = structure_models.Project.objects.create(
-            name=project_name,
-            customer=customer,
-        )
-
-        managed_project.project = waldur_project
-        managed_project.save()
-
-        # Now create a unique shortname for this project using
-        # the generator from the project class
-        project_info = models.ProjectInfo.objects.create(
-            project=waldur_project,
-        )
-
-        shortname = project_info.generate_shortname(generator)
-
-        managed_project.local_identifier = str(self._to_project_identifier(shortname))
-        managed_project.save()
+        self._create_local_project(managed_project)
 
         # now force an update of the project details
-        self.update_project(
+        return self.update_project(
             identifier=identifier,
             new_details=details,
             force_update=True,
         )
-
-        return managed_project.get_mapping()
 
     def update_project(
         self,
@@ -522,14 +645,17 @@ class OpenPortalBoard:
                 identifier=str(identifier)
             )
         except models.ManagedProject.DoesNotExist:
-            logger.error(
-                f"Project for identifier {identifier} does not exist. Cannot update project."
-            )
-            raise openportal.OpenPortalError(
-                f"Project for identifier '{identifier}' does not exist"
+            logger.warning(
+                f"ManagedProject for identifier {identifier} does not exist - recreating."
             )
 
-        # We can't do anything if the project is pending approval or cancelled
+            # recreate the project, but make sure to ask for approval
+            # so that the site admin can reject this request
+            return self.create_project(
+                identifier=identifier, details=new_details, force_request_approval=True
+            )
+
+        # We can't do anything if the project is pending approval or canceled
         if managed_project.is_pending():
             logger.warning(f"{identifier} is pending approval!")
             raise openportal.OpenPortalError(f"{identifier} is pending approval!")
@@ -540,7 +666,7 @@ class OpenPortalBoard:
             logger.warning(f"{identifier} is rejected!")
             raise openportal.OpenPortalError(f"{identifier} is rejected!")
 
-        if managed_project.project_class is None:
+        if managed_project.project_template is None:
             # This is a bug - we should not have a ManagedProject without a project class
             logger.error(
                 f"{identifier} does not have a project class set. Cannot update project."
@@ -550,12 +676,12 @@ class OpenPortalBoard:
             )
 
         if (
-            managed_project.project_class.action_needs_approval()
+            managed_project.project_template.action_needs_approval()
             and not managed_project.is_approved()
         ):
             # We need to approve update requests for this project class
             logger.info(
-                f"{identifier} with class {managed_project.project_class} requires approval for project updates."
+                f"{identifier} with class {managed_project.project_template} requires approval for project updates."
             )
 
             managed_project.set_needs_approval()
@@ -564,23 +690,32 @@ class OpenPortalBoard:
             # the person responsible for approving project update requests.
             # For now, we will just raise an error to indicate that approval is needed.
             raise openportal.OpenPortalError(
-                f"{identifier} with class {managed_project.project_class} requires approval for project updates"
+                f"{identifier} with class {managed_project.project_template} requires approval for project updates"
             )
 
         if managed_project.project is None:
-            logger.error(
-                f"{identifier} does not have an associated project. Cannot update project."
+            # we actually need to create the project
+            logger.warning(
+                f"ManagedProject {managed_project} does not have an associated project, creating a new one."
             )
-            raise openportal.OpenPortalError(
-                f"{identifier} does not have an associated project"
-            )
+            self._create_local_project(managed_project)
 
         if managed_project.project.is_expired or managed_project.project.is_removed:
             # we can't make any changes to this project - return an error
-            logger.error(f"{identifier} is expired or removed, cannot update project.")
-            raise openportal.OpenPortalError(
-                f"{identifier} is expired or removed, cannot update project"
+            managed_project.reject(
+                get_system_robot(),
+                f"{identifier} is expired or removed, cannot update project.",
             )
+            logger.warning(
+                f"{identifier} is expired or removed, cannot update project."
+            )
+            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+
+        if managed_project.local_identifier is None:
+            logger.warning(
+                f"ManagedProject {managed_project} does not have a local identifier, copying from the Project."
+            )
+            self._get_local_identifier(managed_project)
 
         # first, make sure that the current project details are properly
         # set in the project...
@@ -600,20 +735,14 @@ class OpenPortalBoard:
         if new_details.credit is not None:
             if details.credit != new_details.credit:
                 # check that we approve this credit change
-                if managed_project.project_class.action_needs_approval(
+                if managed_project.project_template.action_needs_approval(
                     credit_limit=float(details.hours)
                 ):
                     logger.info(
-                        f"{identifier} with class {managed_project.project_class} requires approval for credit changes."
+                        f"{identifier} with class {managed_project.project_template} requires approval for credit changes."
                     )
-
                     managed_project.set_needs_approval()
-
-                    # Here you would typically send a notification to the admin or
-                    # the person responsible for approving credit changes.
-                    raise openportal.OpenPortalError(
-                        f"{identifier} with class {managed_project.project_class} requires approval for credit changes"
-                    )
+                    raise openportal.OpenPortalError(f"{identifier} needs approval!")
 
                 logger.info(
                     f"Setting credit {new_details.credit} for project {identifier}"
@@ -709,9 +838,9 @@ class OpenPortalBoard:
         if project.description is not None:
             details.description = str(project.description).strip()
 
-        if managed_project.project_class is not None:
-            details.project_class = openportal.ProjectClass(
-                managed_project.project_class.name,
+        if managed_project.project_template is not None:
+            details.project_template = openportal.ProjectTemplate(
+                managed_project.project_template.name,
             )
 
         # Eventually add in the users in their roles etc.

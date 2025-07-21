@@ -9,7 +9,11 @@ from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.marketplace import PLUGIN_NAME
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace.enums import OfferingStates, OrderStates
+from waldur_mastermind.marketplace.enums import (
+    BillingTypes,
+    OfferingStates,
+    OrderStates,
+)
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
@@ -51,7 +55,7 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
     def offering_component(self):
         return marketplace_factories.OfferingComponentFactory(
             offering=self.offering,
-            billing_type=marketplace_models.OfferingComponent.BillingTypes.FIXED,
+            billing_type=BillingTypes.FIXED,
         )
 
     @cached_property
@@ -67,7 +71,7 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
             offering=self.offering,
             type="ram",
             name="RAM",
-            billing_type=marketplace_models.OfferingComponent.BillingTypes.USAGE,
+            billing_type=BillingTypes.USAGE,
         )
 
     @cached_property
@@ -158,3 +162,30 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
         self.offering_customer.add_user(user, ServiceProviderRole.MANAGER)
         self.offering.add_user(user, OfferingRole.MANAGER)
         return user
+
+    @cached_property
+    def maintenance_announcement(self):
+        return marketplace_factories.MaintenanceAnnouncementFactory(
+            service_provider=self.service_provider,
+            created_by=self.service_owner,
+        )
+
+    @cached_property
+    def maintenance_announcement_offering(self):
+        return marketplace_factories.MaintenanceAnnouncementOfferingFactory(
+            maintenance=self.maintenance_announcement,
+            offering=self.offering,
+        )
+
+    @cached_property
+    def maintenance_announcement_template(self):
+        return marketplace_factories.MaintenanceAnnouncementTemplateFactory(
+            service_provider=self.service_provider,
+        )
+
+    @cached_property
+    def maintenance_announcement_offering_template(self):
+        return marketplace_factories.MaintenanceAnnouncementOfferingTemplateFactory(
+            maintenance_template=self.maintenance_announcement_template,
+            offering=self.offering,
+        )
