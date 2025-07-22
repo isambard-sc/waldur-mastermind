@@ -175,8 +175,8 @@ class OpenPortalBoard:
             # been added to the project, or for invitations already sent
             logger.warning("Need to verify project members!")
 
-        if details.credit is not None:
-            logger.warning("Need to verify project credit!")
+        if details.allocation is not None:
+            logger.warning("Need to verify project allocation!")
 
     def _get_project_template(
         self, managed_project: models.ManagedProject, details: openportal.ProjectDetails
@@ -732,22 +732,22 @@ class OpenPortalBoard:
         project = managed_project.project
         details = managed_project.get_details()
 
-        if new_details.credit is not None:
-            if details.credit != new_details.credit:
-                # check that we approve this credit change
+        if new_details.allocation is not None:
+            if details.allocation != new_details.allocation:
+                # check that we approve this allocation change
                 if managed_project.project_template.action_needs_approval(
-                    credit_limit=float(details.hours)
+                    allocation=new_details.allocation
                 ):
                     logger.info(
-                        f"{identifier} with class {managed_project.project_template} requires approval for credit changes."
+                        f"{identifier} with class {managed_project.project_template} requires approval for allocation changes."
                     )
                     managed_project.set_needs_approval()
                     raise openportal.OpenPortalError(f"{identifier} needs approval!")
 
                 logger.info(
-                    f"Setting credit {new_details.credit} for project {identifier}"
+                    f"Setting allocation {new_details.allocation} for project {identifier}"
                 )
-                details.credit = new_details.credit
+                details.allocation = new_details.allocation
 
         if new_details.name is not None:
             if details.name != new_details.name:

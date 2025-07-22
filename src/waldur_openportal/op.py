@@ -4,10 +4,12 @@ class OpenPortalError(Exception):
 
 try:
     from openportal import (
+        Allocation,
         Destination,
         Health,
         Instruction,
         Job,
+        Node,
         PortalIdentifier,
         ProjectDetails,
         ProjectIdentifier,
@@ -54,6 +56,10 @@ except ImportError:
     def _raise_no_openportal_error():
         raise OpenPortalError("OpenPortal is not installed.")
 
+    class Allocation:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
     class Destination:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
@@ -62,7 +68,15 @@ except ImportError:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
+    class Instruction:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
     class Job:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class Node:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 

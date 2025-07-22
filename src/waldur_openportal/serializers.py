@@ -53,6 +53,13 @@ class OpenPortalServiceSerializer(structure_serializers.ServiceOptionsSerializer
         required=False,
     )
 
+    max_allocation = rf_serializers.FloatField(
+        source="options.max_allocation",
+        label=_("Maximum allocation for new projects on this resource"),
+        default=None,
+        required=False,
+    )
+
 
 class AllocationSerializer(
     structure_serializers.BaseResourceSerializer,

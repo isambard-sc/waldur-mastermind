@@ -277,6 +277,72 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
 
         return openportal.ProjectIdentifier(self.backend_id)
 
+    def _get_requested_allocation(self):
+        """
+        Return the requested allocation and units from the passed allocation.
+        """
+        # The service_settings.options provide the fixed options for the offering
+        service_options: dict = self.service_settings.options or {}
+
+        allocation_unit = str(service_options.get("allocation_unit", "NHR")).strip()
+
+        if len(allocation_unit) == 0:
+            allocation_unit = "NHR"
+
+        if "default_allocation" in service_options:
+            try:
+                default_allocation = float(service_options["default_allocation"])
+            except Exception as e:
+                logger.warning(f"Invalid default allocation value: {e}")
+                default_allocation = None
+        else:
+            default_allocation = None
+
+        if "max_allocation" in service_options:
+            try:
+                max_allocation = float(service_options["max_allocation"])
+            except Exception as e:
+                logger.warning(f"Invalid max allocation value: {e}")
+                max_allocation = None
+        else:
+            max_allocation = None
+
+        # Now we need to get the resource to see if any options have been set
+        try:
+            resource = marketplace_models.Resource.objects.get(
+                uuid=self.marketplace_uuid
+            )
+        except marketplace_models.Resource.DoesNotExist:
+            logger.warning(
+                f"Resource with UUID {self.marketplace_uuid} does not exist. Cannot get allocation."
+            )
+            resource = None
+
+        allocation = default_allocation
+
+        if resource is not None:
+            options = resource.options or {}
+
+            if "allocation" in options:
+                try:
+                    allocation = float(options["allocation"])
+                except Exception as e:
+                    logger.warning(f"Invalid allocation value: {e}")
+                    allocation = default_allocation
+
+        if allocation is not None and max_allocation is not None:
+            if allocation > max_allocation:
+                logger.warning(
+                    f"Allocation {allocation} exceeds maximum allocation {max_allocation}. Setting to maximum."
+                )
+                allocation = max_allocation
+
+        logger.info(
+            f"Requested credits from allocation {allocation} with unit {allocation_unit}"
+        )
+
+        return (allocation, allocation_unit)
+
     def get_project_details(self) -> openportal.ProjectDetails:
         if self.project is None:
             raise ValueError("Project is not set!")
@@ -297,24 +363,21 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
         if project.end_date is not None:
             details.end_date = project.end_date
 
-        # find any credit given to this project
-        try:
-            credit = None
+        # now get the allocation for this project (if requested)
+        allocation, allocation_unit = self._get_requested_allocation()
 
-            for obj in invoice_models.ProjectCredit.objects.filter(project=project):
-                if credit is None:
-                    credit = obj.value
-                else:
-                    credit += obj.value
-        except Exception as e:
-            logger.warning(f"No credits associated with {project}: {e}.")
-            credit = None
+        if allocation is not None:
+            if allocation_unit is None:
+                allocation_unit = "NHR"
 
-        if credit is not None:
             try:
-                details.credit = openportal.Usage.from_hours(credit)
-            except Exception:
-                details.credit = openportal.Usage.from_hours(float(credit))
+                details.allocation = openportal.Allocation.parse(
+                    f"{allocation} {allocation_unit}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to parse allocation {allocation} {allocation_unit}: {e}"
+                )
 
         # now try to add in any members for this project
         for user_id in get_project_users(project.id):
@@ -401,6 +464,8 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                     details.add_member(email, role_name)
             except Exception as e:
                 logger.warning(f"Failed to add user {user} to project {project}: {e}")
+
+        logger.info(f"Returning project details for project {project}: {details}")
 
         return details
 
@@ -1460,6 +1525,16 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
         ),
     )
 
+    # The mapping of allocation units to credits, i.e. how many credits
+    # to award per GPU hour allocated etc.
+    allocation_units_mapping = models.JSONField(
+        verbose_name=_("allocation units mapping"),
+        default=dict,
+        help_text=_(
+            "The mapping of allocation units to credits, i.e. how many credits to award per GPU hour allocated etc."
+        ),
+    )
+
     # Combination of name and portal must be unique
     class Meta:
         unique_together = ("name", "portal")
@@ -1538,7 +1613,7 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
             "name": local_role.name,
             "uuid": local_role.uuid,
         }
-        self.save()
+        self.save(update_fields=["role_mapping"])
 
     def get_local_role_for(self, remote_role: str) -> Role:
         """
@@ -1555,23 +1630,91 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
                 f"Local role {self.role_mapping[remote_role]} does not exist in this portal."
             )
 
-    def action_needs_approval(self, credit_limit: float = 0.0) -> bool:
+    def get_allocation_units_mapping(self) -> dict[str, float]:
         """
-        Check if the action needs approval based on the credit limit.
+        Get the allocation units mapping for this project class.
+        This returns a dictionary mapping allocation unit names to credit values.
+        """
+        return self.allocation_units_mapping
+
+    def get_allocation_mapping_for(self, allocation_unit: str) -> float:
+        """
+        Get the credit value for a given allocation unit in this project class.
+        If the allocation unit does not exist, raise an error.
+        """
+        if allocation_unit not in self.allocation_units_mapping:
+            raise ValueError(
+                f"Allocation unit {allocation_unit} does not exist in this class."
+            )
+
+        return self.allocation_units_mapping[allocation_unit]
+
+    def create_allocation_mappings_from_node(self, node: openportal.Node):
+        """
+        Create allocation mappings for a given node.
+        This will create a mapping for each allocation unit in the node's
+        allocation units, using the credit value from the project class.
+        """
+        if not isinstance(node, openportal.Node):
+            raise ValueError("Node must be an instance of openportal.Node")
+
+        mappings = {
+            "NHR": 1.0,
+            "GPUHR": 1.0 / node.gpus if node.gpus > 0 else 1.0,
+            "CPUHR": 1.0 / node.cpus if node.cpus > 0 else 1.0,
+            "COREHR": 1.0 / node.cores if node.cores > 0 else 1.0,
+            "GBHR": 1.0 / node.memory_gb if node.memory_gb > 0 else 1.0,
+        }
+
+        self.allocation_units_mapping = mappings
+        self.save(update_fields=["allocation_units_mapping"])
+
+    def add_allocation_mapping(self, allocation_unit: str, credit_value: float):
+        """
+        Add an allocation mapping for this project class.
+        This maps an allocation unit name to a credit value.
+        If the allocation unit already exists, it will be overwritten.
+        """
+        if not isinstance(allocation_unit, str):
+            raise ValueError("Allocation unit must be a string.")
+
+        if not isinstance(credit_value, int | float):
+            raise ValueError("Credit value must be a number.")
+
+        self.allocation_units_mapping[allocation_unit] = float(credit_value)
+        self.save(update_fields=["allocation_units_mapping"])
+
+    def convert_to_credits(self, allocation: openportal.Allocation | None) -> float:
+        """
+        Convert the given allocation to credits based on the allocation units mapping.
+        If the allocation units are not found in the mapping, it defaults to 1:1 mapping.
+        """
+        if allocation is None:
+            return 0.0
+        elif allocation.units in self.allocation_units_mapping:
+            return allocation.size * self.allocation_units_mapping[allocation.units]
+        else:
+            logger.warning(
+                f"Allocation units {allocation.units} not found in project class {self.name}. Defaulting to 1 to 1 mapping."
+            )
+            return allocation.size
+
+    def action_needs_approval(
+        self, allocation: openportal.Allocation | None = None
+    ) -> bool:
+        """
+        Check if the action needs approval based on the passed allocation.
         If the approval limit is None, then no approval is needed.
         If the approval limit is 0, then all actions need to be approved.
         """
         if self.approval_limit is None and self.max_credit_limit is None:
             return False
 
-        if credit_limit is None:
-            credit_limit = 0.0
-        elif credit_limit < 0:
-            credit_limit = 0.0
+        credits = self.convert_to_credits(allocation)
 
-        return self.exceeds_approval_limit(
-            credit_limit
-        ) or self.exceeds_max_credit_limit(credit_limit)
+        return self.exceeds_approval_limit(credits) or self.exceeds_max_credit_limit(
+            credits
+        )
 
     def exceeds_max_credit_limit(self, credit_limit: float) -> bool:
         """

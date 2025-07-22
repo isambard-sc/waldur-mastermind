@@ -11,6 +11,8 @@ from waldur_core.structure.managers import (
     get_connected_projects,
 )
 
+from waldur_mastermind.marketplace import models as marketplace_models
+
 from . import models
 
 logger = logging.getLogger(__name__)
