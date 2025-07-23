@@ -1950,6 +1950,47 @@ class ManagedProject(ReviewMixin, models.Model):
             f"{self.get_remote_identifier()}:{self.get_local_identifier()}"
         )
 
+    def merge_details(self, new_details: openportal.ProjectDetails):
+        """
+        Merge the new ProjectDetails into the existing details.
+        If the new details are not an instance of ProjectDetails, convert it.
+        """
+        if not isinstance(new_details, openportal.ProjectDetails):
+            new_details = openportal.ProjectDetails(new_details)
+
+        if self.details is None:
+            self.set_details(new_details)
+        else:
+            old_details = self.get_details()
+
+            if (
+                new_details.project_class is not None
+                and new_details.project_class != old_details.project_class
+            ):
+                raise ValueError(
+                    "Cannot change project class of an existing project. Please create a new project with the desired class."
+                )
+
+            if new_details.name is not None:
+                old_details.name = new_details.name
+
+            if new_details.description is not None:
+                old_details.description = new_details.description
+
+            if new_details.start_date is not None:
+                old_details.start_date = new_details.start_date
+
+            if new_details.end_date is not None:
+                old_details.end_date = new_details.end_date
+
+            if new_details.allocation is not None:
+                old_details.allocation = new_details.allocation
+
+            if new_details.members is not None:
+                old_details.members = new_details.members
+
+            self.set_details(old_details)
+
     def set_details(self, details: openportal.ProjectDetails):
         """
         Set the ProjectDetails object for this project.

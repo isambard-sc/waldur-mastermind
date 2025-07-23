@@ -658,6 +658,11 @@ class OpenPortalBoard:
         # We can't do anything if the project is pending approval or canceled
         if managed_project.is_pending():
             logger.warning(f"{identifier} is pending approval!")
+
+            # We should update the project details to reflect the pending state
+            managed_project.merge_details(new_details)
+            managed_project.save()
+
             raise openportal.OpenPortalError(f"{identifier} is pending approval!")
         elif managed_project.is_canceled():
             logger.warning(f"{identifier} is canceled!")
