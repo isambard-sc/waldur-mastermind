@@ -9,7 +9,6 @@ try:
         Instruction,
         Job,
         PortalIdentifier,
-        ProjectClass,
         ProjectDetails,
         ProjectIdentifier,
         ProjectMapping,
@@ -29,6 +28,17 @@ try:
         Usage,
         ProjectUsageReport,
     )
+
+    try:
+        # Fix for compatibility with older versions of OpenPortal
+        # which haven't renamed ProjectClass to ProjectTemplate
+        from openportal import ProjectClass as ProjectTemplate
+
+        if not hasattr(ProjectDetails, "project_template"):
+            ProjectDetails.project_template = ProjectDetails.project_class
+
+    except ImportError:
+        from openportal import ProjectTemplate
 
     _have_openportal = True
 
@@ -89,6 +99,10 @@ except ImportError:
             _raise_no_openportal_error()
 
     class ProjectUsageReport:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class ProjectTemplate:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 

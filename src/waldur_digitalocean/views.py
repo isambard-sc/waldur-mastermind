@@ -6,9 +6,11 @@ from waldur_core.core import executors as core_executors
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.serializers import EmptySerializer
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 from waldur_core.structure import views as structure_views
 
-from . import executors, filters, log, models, serializers
+from . import executors, filters, models, serializers
 
 
 class ImageViewSet(structure_views.BaseServicePropertyViewSet):
@@ -152,10 +154,11 @@ class DropletViewSet(structure_views.ResourceViewSet):
         message = _("Droplet {droplet_name} has been scheduled to %s resize.") % (
             disk and _("permanent") or _("flexible")
         )
-        log.event_logger.droplet_resize.info(
+        event_logger.emit(
             message,
-            event_type="droplet_resize_scheduled",
+            event_type=EventType.DROPLET_RESIZE_SCHEDULED,
             event_context={"droplet": droplet, "size": size},
+            scopes=[droplet, droplet.project, droplet.project.customer],
         )
 
         droplet.cores = size.cores

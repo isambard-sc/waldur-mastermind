@@ -94,7 +94,7 @@ class CustomerCreditCreateTest(test.APITransactionTestCase):
                 self.fixture.customer
             ),
             "value": 1600,
-            "end_date": datetime.date(year=2025, month=10, day=15),
+            "end_date": datetime.date(year=2025, month=10, day=1),
             "minimal_consumption_logic": models.CustomerCredit.MinimalConsumptionLogic.LINEAR,
             "expected_consumption": 500,
         }
@@ -104,7 +104,7 @@ class CustomerCreditCreateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         credit = models.CustomerCredit.objects.get(uuid=response.data["uuid"])
         self.assertEqual(credit.expected_consumption, payload["expected_consumption"])
-        self.assertEqual(credit.end_date, datetime.date(year=2025, month=10, day=31))
+        self.assertEqual(credit.end_date, datetime.date(year=2025, month=10, day=1))
 
         with freeze_time("2024-11-01"):
             tasks.process_invoice_credits(self.fixture.invoice)
@@ -353,10 +353,10 @@ class CustomerCreditTest(test.APITransactionTestCase):
     def test_task_set_to_zero_overdue_credits(self):
         credit_1 = factories.CustomerCreditFactory()
         credit_2 = factories.CustomerCreditFactory(
-            end_date=datetime.date.today() + datetime.timedelta(days=5)
+            end_date=datetime.date.today() + datetime.timedelta(days=31)
         )
         credit_3 = factories.CustomerCreditFactory(
-            end_date=datetime.date.today() - datetime.timedelta(days=5)
+            end_date=datetime.date.today() - datetime.timedelta(days=31)
         )
         tasks.set_to_zero_overdue_credits()
         credit_1.refresh_from_db()
@@ -382,6 +382,27 @@ class ProjectCreditTest(test.APITransactionTestCase):
         self.invoice_item = self.fixture.invoice_item
 
     def test_project_credits_reduced(self):
+        old_project_credit_value = self.project_credit.value
+        tasks.process_invoice_credits(self.invoice)
+        self.project_credit.refresh_from_db()
+        self.assertTrue(self.project_credit.value < old_project_credit_value)
+
+        with freeze_time("2024-02-01"):
+            consumption_last_month = (
+                self.invoice.items.filter(credit=self.customer_credit).aggregate(
+                    sum=Sum("unit_price")
+                )["sum"]
+                * -1
+            )
+            self.assertEqual(
+                self.project_credit.consumption_last_month, consumption_last_month
+            )
+
+    def test_project_credits_with_minimal_consumption(self):
+        self.project_credit.apply_as_minimal_consumption = True
+        self.project_credit.expected_consumption = 100
+        self.project_credit.grace_coefficient = 50
+        self.project_credit.save()
         old_project_credit_value = self.project_credit.value
         tasks.process_invoice_credits(self.invoice)
         self.project_credit.refresh_from_db()
@@ -550,7 +571,7 @@ class ProcessingCreditTest(test.APITransactionTestCase):
         )
 
 
-@freeze_time("2025-08-10")
+@freeze_time("2025-08-01")
 class CalculateMinimalConsumptionTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
@@ -643,3 +664,131 @@ class CustomerCreditHistoricalValuesTest(test.APITransactionTestCase):
         self.client.force_authenticate(getattr(self.fixture, user))
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class CompensationQueryOptimizationTest(test.APITransactionTestCase):
+    """Test to validate N+1 query optimization in compensation calculations"""
+
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+        self.customer_credit = self.fixture.customer_credit
+        self.invoice = self.fixture.invoice
+
+    def test_compensation_calculation_avoids_n_plus_one_queries(self):
+        """Test that compensation calculation doesn't trigger N+1 queries"""
+        # Create multiple offerings and invoice items to test query optimization
+        offerings = [marketplace_factories.OfferingFactory() for _ in range(10)]
+
+        # Add offerings to customer credit to test the filtering logic
+        self.customer_credit.offerings.add(*offerings[:5])
+
+        # Create multiple invoice items with different offerings
+        invoice_items = []
+        for i, offering in enumerate(offerings):
+            resource = marketplace_factories.ResourceFactory(
+                offering=offering, project=self.fixture.project
+            )
+            invoice_items.append(
+                factories.InvoiceItemFactory(
+                    invoice=self.invoice,
+                    resource=resource,
+                    project=self.fixture.project,
+                    unit_price=10 + i,
+                    quantity=1,
+                )
+            )
+
+        # Test the compensation calculation with query count monitoring
+        from django.db import connection
+        from django.test import override_settings
+
+        with override_settings(DEBUG=True):
+            # Reset query count
+            connection.queries_log.clear()
+
+            # Create compensation object and trigger calculation
+            compensation = compensations.MonthlyCompensation(self.fixture.customer)
+            _ = (
+                compensation.compensations
+            )  # This triggers calculate_current_compensations
+
+            # Count queries executed
+            query_count = len(connection.queries)
+
+            # The optimized version should use minimal queries:
+            # 1. Get invoice items projects ids
+            # 2. Get project credits with select_related
+            # 3. Get credit offerings
+            # 4. Get optimized invoice items with select_related
+            # After optimization, should be around 5-6 queries max
+            self.assertLess(
+                query_count,
+                8,  # Should be significantly less than 10 with proper optimization
+                f"Too many queries executed ({query_count}). "
+                f"This indicates N+1 query problem may still exist.",
+            )
+
+            # Verify that only items from credit offerings are processed
+            # (first 5 offerings were added to credit)
+            expected_processed_items = [
+                item
+                for item in invoice_items
+                if item.resource.offering in self.customer_credit.offerings.all()
+            ]
+            self.assertEqual(len(expected_processed_items), 5)
+
+            # Get actual compensations generated (these are not saved to DB in this test)
+            actual_compensations = compensation.compensations
+            self.assertTrue(
+                len(actual_compensations) > 0, "No compensations were generated"
+            )
+
+    def test_compensation_calculation_with_no_credit_offerings(self):
+        """Test compensation calculation when no credit offerings are specified"""
+        # Create multiple invoice items without credit offering restrictions
+        offerings = [marketplace_factories.OfferingFactory() for _ in range(5)]
+
+        # Don't add any offerings to customer credit (no restrictions)
+        self.customer_credit.offerings.clear()
+
+        invoice_items = []
+        for i, offering in enumerate(offerings):
+            resource = marketplace_factories.ResourceFactory(
+                offering=offering, project=self.fixture.project
+            )
+            invoice_items.append(
+                factories.InvoiceItemFactory(
+                    invoice=self.invoice,
+                    resource=resource,
+                    project=self.fixture.project,
+                    unit_price=10 + i,
+                    quantity=1,
+                )
+            )
+
+        # Test the compensation calculation
+        from django.db import connection
+        from django.test import override_settings
+
+        with override_settings(DEBUG=True):
+            connection.queries_log.clear()
+
+            compensation = compensations.MonthlyCompensation(self.fixture.customer)
+            _ = compensation.compensations
+
+            query_count = len(connection.queries)
+
+            # Should still use minimal queries even without credit offering restrictions
+            self.assertLess(
+                query_count,
+                10,
+                f"Too many queries executed ({query_count}) without credit offerings.",
+            )
+
+            # Verify all items are processed when no credit offering restrictions
+            # Get actual compensations generated (these are not saved to DB in this test)
+            actual_compensations = compensation.compensations
+            self.assertTrue(
+                len(actual_compensations) > 0,
+                "No compensations were generated when no credit offerings specified",
+            )

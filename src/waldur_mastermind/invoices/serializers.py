@@ -19,6 +19,7 @@ from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_mastermind.common.mixins import PRICE_DECIMAL_PLACES, PRICE_MAX_DIGITS
 from waldur_mastermind.common.utils import quantize_price
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import BillingTypes
 
 from . import log, models, utils
 
@@ -160,10 +161,7 @@ class InvoiceItemUpdateSerializer(serializers.HyperlinkedModelSerializer):
         if self.instance:
             plan_component = self.instance.get_plan_component()
             if plan_component:
-                if (
-                    plan_component.component.billing_type
-                    == marketplace_models.OfferingComponent.BillingTypes.FIXED
-                ):
+                if plan_component.component.billing_type == BillingTypes.FIXED:
                     del fields["quantity"]
                 else:
                     del fields["start"]
@@ -178,10 +176,7 @@ class InvoiceItemUpdateSerializer(serializers.HyperlinkedModelSerializer):
         plan_component = invoice_item.get_plan_component()
         if plan_component:
             offering_component = plan_component.component
-            if (
-                offering_component.billing_type
-                == marketplace_models.OfferingComponent.BillingTypes.USAGE
-            ):
+            if offering_component.billing_type == BillingTypes.USAGE:
                 resource = invoice_item.resource
                 if not resource:
                     raise ValidationError(
@@ -202,10 +197,7 @@ class InvoiceItemUpdateSerializer(serializers.HyperlinkedModelSerializer):
                 quantity = validated_data.get("quantity")
                 component_usage.usage = quantity
                 component_usage.save(update_fields=["usage"])
-            elif (
-                offering_component.billing_type
-                == marketplace_models.OfferingComponent.BillingTypes.FIXED
-            ):
+            elif offering_component.billing_type == BillingTypes.FIXED:
                 invoice_item = super().update(invoice_item, validated_data)
                 invoice_item._update_quantity()
                 return invoice_item
@@ -881,6 +873,7 @@ def get_payment_profiles(serializer, customer: structure_models.Customer):
 
 
 def add_payment_profile(sender, fields, **kwargs):
+    """Add a payment profile field to the serializer."""
     fields["payment_profiles"] = serializers.SerializerMethodField()
     setattr(sender, "get_payment_profiles", get_payment_profiles)
 
@@ -979,8 +972,12 @@ class CreateCustomerCreditSerializer(CustomerCreditSerializer):
                 _("The end date must be greater than today's date.")
             )
 
-        month_end = core_utils.month_end(end_date)
-        return month_end.date()
+        if end_date.day != 1:
+            raise exceptions.ValidationError(
+                _("End date must be the first day of the month.")
+            )
+
+        return end_date
 
     def get_from_attrs_or_instance(self, attrs, field_name, default=None):
         return attrs.get(field_name, getattr(self.instance, field_name, default))
@@ -1120,6 +1117,7 @@ def get_project_credit(serializer, project) -> float | None:
 
 
 def add_project_credit(sender, fields, **kwargs):
+    """Add a project credit field to the serializer."""
     fields["project_credit"] = serializers.SerializerMethodField()
     setattr(sender, "get_project_credit", get_project_credit)
 
@@ -1138,6 +1136,7 @@ def get_customer_credit(serializer, customer) -> float | None:
 
 
 def add_customer_credit(sender, fields, **kwargs):
+    """Add a customer credit field to the serializer."""
     fields["customer_credit"] = serializers.SerializerMethodField()
     setattr(sender, "get_customer_credit", get_customer_credit)
 
@@ -1158,6 +1157,7 @@ def get_customer_unallocated_credit(serializer, customer) -> float | None:
 
 
 def add_customer_unallocated_credit(sender, fields, **kwargs):
+    """Add a customer unallocated credit field to the serializer."""
     fields["customer_unallocated_credit"] = serializers.SerializerMethodField()
     setattr(sender, "get_customer_unallocated_credit", get_customer_unallocated_credit)
 

@@ -3,18 +3,22 @@ import logging
 from django.conf import settings
 from django.db import transaction
 
-from waldur_auth_social.models import ProviderChoices
+from waldur_auth_social.const import ProviderChoices
 from waldur_core.core import middleware
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.utils import serialize_instance
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 from waldur_core.permissions import signals as permission_signals
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.fixtures import ServiceProviderRole
 from waldur_core.permissions.models import UserRole
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
+from waldur_core.structure.models import Project
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace_remote import PLUGIN_NAME, log, models, tasks, utils
+from waldur_mastermind.marketplace.models import Order, Resource
+from waldur_mastermind.marketplace_remote import PLUGIN_NAME, models, tasks, utils
 from waldur_mastermind.marketplace_remote.utils import INVALID_RESOURCE_STATES
 
 logger = logging.getLogger(__name__)
@@ -58,7 +62,9 @@ def sync_permission_with_remote(sender, instance: UserRole, signal, **kwargs):
         )
 
 
-def create_request_when_project_is_updated(sender, instance, created=False, **kwargs):
+def create_request_when_project_is_updated(
+    sender, instance: Project, created=False, **kwargs
+):
     if created:
         return
 
@@ -126,7 +132,7 @@ def create_request_when_project_is_updated(sender, instance, created=False, **kw
 
 
 def sync_remote_project_when_request_is_approved(
-    sender, instance, created=False, **kwargs
+    sender, instance: models.ProjectUpdateRequest, created=False, **kwargs
 ):
     if not settings.WALDUR_AUTH_SOCIAL["ENABLE_EDUTEAMS_SYNC"]:
         return
@@ -145,7 +151,7 @@ def sync_remote_project_when_request_is_approved(
     )
 
 
-def delete_remote_project(sender, instance, **kwargs):
+def delete_remote_project(sender, instance: Project, **kwargs):
     project = instance
     transaction.on_commit(
         lambda: tasks.delete_remote_project.delay(
@@ -154,32 +160,38 @@ def delete_remote_project(sender, instance, **kwargs):
     )
 
 
-def log_request_events(sender, instance, created=False, **kwargs):
+def log_request_events(
+    sender, instance: models.ProjectUpdateRequest, created=False, **kwargs
+):
     event_context = {"project": instance.project, "offering": instance.offering}
     if created:
-        log.event_logger.project_update_request.info(
+        event_logger.emit(
             "Project update request has been created.",
-            event_type="project_update_request_created",
+            event_type=EventType.PROJECT_UPDATE_REQUEST_CREATED,
             event_context=event_context,
+            scopes=[instance.project],
         )
         return
     if not instance.tracker.has_changed("state"):
         return
     if instance.state == ReviewStates.APPROVED:
-        log.event_logger.project_update_request.info(
+        event_logger.emit(
             "Project update request has been approved.",
-            event_type="project_update_request_approved",
+            event_type=EventType.PROJECT_UPDATE_REQUEST_APPROVED,
             event_context=event_context,
+            scopes=[instance.project],
         )
     elif instance.state == ReviewStates.REJECTED:
-        log.event_logger.project_update_request.info(
+        event_logger.emit(
             "Project update request has been rejected.",
-            event_type="project_update_request_rejected",
+            event_type=EventType.PROJECT_UPDATE_REQUEST_REJECTED,
             event_context=event_context,
+            scopes=[instance.project],
         )
 
 
-def trigger_order_callback(sender, instance, created=False, **kwargs):
+def trigger_order_callback(sender, instance: Order, created=False, **kwargs):
+    """Trigger HTTP callback when marketplace order state changes."""
     if not instance.callback_url:
         return
 
@@ -191,7 +203,9 @@ def trigger_order_callback(sender, instance, created=False, **kwargs):
     )
 
 
-def notify_about_project_details_update(sender, instance, created=False, **kwargs):
+def notify_about_project_details_update(
+    sender, instance: models.ProjectUpdateRequest, created=False, **kwargs
+):
     if created:
         return
 
@@ -208,7 +222,7 @@ def notify_about_project_details_update(sender, instance, created=False, **kwarg
     )
 
 
-def update_remote_resource_options(sender, instance, created=False, **kwargs):
+def update_remote_resource_options(sender, instance: Resource, created=False, **kwargs):
     if not instance.tracker.has_changed("options"):
         return
 

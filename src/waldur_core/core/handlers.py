@@ -6,19 +6,22 @@ from rest_framework.authtoken.models import Token
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
-from waldur_core.core.log import event_logger
-from waldur_core.core.models import User
+from waldur_core.core.models import SshPublicKey, User
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.structure.managers import get_connected_customers
 from waldur_core.structure.models import Customer
 
 
-def create_auth_token(sender, instance, created=False, **kwargs):
+def create_auth_token(sender, instance: User, created=False, **kwargs):
+    """Create a token for a new user."""
     if created:
         Token.objects.create(user=instance)
 
 
-def preserve_fields_before_update(sender, instance, **kwargs):
+def preserve_fields_before_update(sender, instance: User, **kwargs):
+    """Preserve fields of a user instance before it is updated."""
     if instance.pk is None:
         return
 
@@ -40,7 +43,8 @@ def delete_error_message(sender, instance, name, source, target, **kwargs):
     instance.save(update_fields=["error_message"])
 
 
-def set_default_token_lifetime(sender, instance, created=False, **kwargs):
+def set_default_token_lifetime(sender, instance: User, created=False, **kwargs):
+    """Set the default token lifetime for a new user."""
     if created:
         # if settings used directly in model - django creates new migration every time settings change
         # Therefore - set default token_lifetime value in handler.
@@ -50,12 +54,14 @@ def set_default_token_lifetime(sender, instance, created=False, **kwargs):
             instance.save(update_fields=["token_lifetime"])
 
 
-def log_user_save(sender, instance, created=False, **kwargs):
+def log_user_save(sender, instance: User, created=False, **kwargs):
+    """Log user creation, update, and activation/deactivation events."""
     if created:
-        event_logger.user.info(
+        event_logger.emit(
             "User {affected_user_username} has been created.",
-            event_type="user_creation_succeeded",
+            event_type=EventType.USER_CREATION_SUCCEEDED,
             event_context={"affected_user": instance},
+            scopes=[instance],
         )
     else:
         old_values = instance._old_values
@@ -77,41 +83,46 @@ def log_user_save(sender, instance, created=False, **kwargs):
         )
 
         if password_changed:
-            event_logger.user.info(
+            event_logger.emit(
                 "Password has been changed for user {affected_user_username}.",
-                event_type="user_password_updated",
+                event_type=EventType.USER_PASSWORD_UPDATED,
                 event_context={"affected_user": instance},
+                scopes=[instance],
             )
 
         if activation_changed:
             if instance.is_active:
-                event_logger.user.info(
+                event_logger.emit(
                     "User {affected_user_username} has been activated.",
-                    event_type="user_activated",
+                    event_type=EventType.USER_ACTIVATED,
                     event_context={"affected_user": instance},
+                    scopes=[instance],
                 )
             else:
-                event_logger.user.info(
+                event_logger.emit(
                     "User {affected_user_username} has been deactivated.",
-                    event_type="user_deactivated",
+                    event_type=EventType.USER_DEACTIVATED,
                     event_context={"affected_user": instance},
+                    scopes=[instance],
                 )
 
         if token_lifetime_changed:
-            event_logger.token.info(
+            event_logger.emit(
                 "Token lifetime has been changed for {affected_user_username} to {affected_user_token_lifetime}",
-                event_type="token_lifetime_updated",
+                event_type=EventType.TOKEN_LIFETIME_UPDATED,
                 event_context={"affected_user": instance},
+                scopes=[instance],
             )
 
         if user_details_changed:
-            event_logger.user.info(
+            event_logger.emit(
                 "Details for {{affected_user_username}} have been updated from {} to {}.".format(
                     str(old_values["details"]).strip("{}"),
                     str(instance.details).strip("{}"),
                 ),
-                event_type="user_details_update_succeeded",
+                event_type=EventType.USER_DETAILS_UPDATE_SUCCEEDED,
                 event_context={"affected_user": instance},
+                scopes=[instance],
             )
 
         if user_updated:
@@ -122,11 +133,12 @@ def log_user_save(sender, instance, created=False, **kwargs):
                 and old_value != getattr(instance, field_name)
             ]
 
-            event_logger.user.info(
+            event_logger.emit(
                 "User {affected_user_username} has been updated. Details:\n%s"
                 % "\n".join(diff),
-                event_type="user_update_succeeded",
+                event_type=EventType.USER_UPDATE_SUCCEEDED,
                 event_context={"affected_user": instance},
+                scopes=[instance],
             )
 
             organizations = get_connected_customers(instance, RoleEnum.CUSTOMER_OWNER)
@@ -171,41 +183,50 @@ def log_user_save(sender, instance, created=False, **kwargs):
                 )
 
 
-def log_user_delete(sender, instance, **kwargs):
-    event_logger.user.info(
+def log_user_delete(sender, instance: User, **kwargs):
+    """Log user deletion events."""
+    event_logger.emit(
         "User {affected_user_username} has been deleted.",
-        event_type="user_deletion_succeeded",
+        event_type=EventType.USER_DELETION_SUCCEEDED,
         event_context={"affected_user": instance},
+        scopes=[instance],
     )
 
 
-def log_ssh_key_save(sender, instance, created=False, **kwargs):
+def log_ssh_key_save(sender, instance: SshPublicKey, created=False, **kwargs):
+    """Log SSH key creation events."""
     if created:
-        event_logger.sshkey.info(
+        event_logger.emit(
             "SSH key {ssh_key_name} has been created for user%s with username {user_username}."
             % (" {user_full_name}" if instance.user.full_name else ""),
-            event_type="ssh_key_creation_succeeded",
+            event_type=EventType.SSH_KEY_CREATION_SUCCEEDED,
             event_context={"ssh_key": instance, "user": instance.user},
+            scopes=[instance.user],
         )
 
 
-def log_ssh_key_delete(sender, instance, **kwargs):
-    event_logger.sshkey.info(
+def log_ssh_key_delete(sender, instance: SshPublicKey, **kwargs):
+    """Log SSH key deletion events."""
+    event_logger.emit(
         "SSH key {ssh_key_name} has been deleted for user%s with username {user_username}."
         % (" {user_full_name}" if instance.user.full_name else ""),
-        event_type="ssh_key_deletion_succeeded",
+        event_type=EventType.SSH_KEY_DELETION_SUCCEEDED,
         event_context={"ssh_key": instance, "user": instance.user},
+        scopes=[instance.user],
     )
 
 
-def log_token_create(sender, instance, created=False, **kwargs):
+def log_token_create(sender, instance: Token, created=False, **kwargs):
+    """Log token creation events."""
     if created:
-        event_logger.token.info(
+        event_logger.emit(
             "Token has been updated for {affected_user_username}",
-            event_type="token_created",
+            event_type=EventType.TOKEN_CREATED,
             event_context={"affected_user": instance.user},
+            scopes=[instance.user],
         )
 
 
 def constance_updated(sender, key, old_value, new_value, **kwargs):
+    """Clear the API configuration cache when a Constance setting is updated."""
     cache.delete("API_CONFIGURATION")

@@ -167,6 +167,36 @@ def register_in(router):
         views.ComponentUserUsageLimitViewSet,
         basename="component-user-usage-limit",
     )
+    router.register(
+        r"backend-resources",
+        views.BackendResourceViewSet,
+        basename="backend-resource",
+    )
+    router.register(
+        r"backend-resource-requests",
+        views.BackendResourceRequestViewSet,
+        basename="backend-resource-request",
+    )
+    router.register(
+        r"marketplace-maintenance-announcements",
+        views.MaintenanceAnnouncementViewSet,
+        basename="marketplace-maintenance-announcement",
+    )
+    router.register(
+        r"marketplace-maintenance-announcement-offerings",
+        views.MaintenanceAnnouncementOfferingViewSet,
+        basename="marketplace-maintenance-announcement-offering",
+    )
+    router.register(
+        r"marketplace-maintenance-announcements-template",
+        views.MaintenanceAnnouncementTemplateViewSet,
+        basename="marketplace-maintenance-announcement-template",
+    )
+    router.register(
+        r"marketplace-maintenance-announcement-template-offerings",
+        views.MaintenanceAnnouncementOfferingTemplateViewSet,
+        basename="marketplace-maintenance-announcement-template-offering",
+    )
 
 
 urlpatterns = [

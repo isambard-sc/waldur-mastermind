@@ -2,37 +2,57 @@ import logging
 from decimal import Decimal
 
 import httpx
+from constance import config
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import signals
+from django.template import Context, Template
 from django.utils.timezone import now
 
 from waldur_core.core import utils as core_utils
+from waldur_core.core.models import User
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 from waldur_core.structure import models as structure_models
+from waldur_core.structure.models import Customer, Project
 from waldur_core.users import models as users_models
+from waldur_core.users.enums import InvitationState
 from waldur_core.users.tasks import process_invitation
+from waldur_freeipa.models import Profile
 from waldur_mastermind.marketplace.enums import (
     OfferingStates,
     OrderStates,
     ResourceStates,
 )
+from waldur_mastermind.marketplace.models import (
+    Offering,
+    OfferingComponent,
+    OfferingUser,
+    OfferingUserRole,
+    Order,
+    Plan,
+    PlanComponent,
+    Resource,
+    RobotAccount,
+    ScopedServiceAccount,
+    Screenshot,
+)
 from waldur_mastermind.marketplace.permissions import (
     order_should_not_be_reviewed_by_consumer,
 )
 from waldur_mastermind.marketplace_script import PLUGIN_NAME as SCRIPT_PLUGIN_NAME
-from waldur_mastermind.marketplace_slurm_remote import (
-    PLUGIN_NAME as SLURM_REMOTE_PLUGIN_NAME,
+from waldur_mastermind.marketplace_site_agent import (
+    PLUGIN_NAME as SITE_AGENT_PLUGIN_NAME,
 )
 
 from . import PLUGIN_NAME, callbacks, log, models, tasks, utils
-from .log import event_logger
 
 logger = logging.getLogger(__name__)
 
 OFFERING_USER_ALLOWED_OFFERING_TYPES = [
     PLUGIN_NAME,
-    SLURM_REMOTE_PLUGIN_NAME,
+    SITE_AGENT_PLUGIN_NAME,
     SCRIPT_PLUGIN_NAME,
 ]
 
@@ -40,7 +60,8 @@ ROBOT_ACCOUNT_TYPE = "Robot account"
 SERVICE_ACCOUNT_TYPE = "Service account"
 
 
-def create_screenshot_thumbnail(sender, instance, created=False, **kwargs):
+def create_screenshot_thumbnail(sender, instance: Screenshot, created=False, **kwargs):
+    """Create a thumbnail for a screenshot."""
     if not created:
         return
 
@@ -49,44 +70,115 @@ def create_screenshot_thumbnail(sender, instance, created=False, **kwargs):
     )
 
 
-def log_order_events(sender, instance, created=False, **kwargs):
-    order: models.Order = instance
+def get_plan_component_scopes(plan_component: models.PlanComponent):
+    offering = plan_component.plan.offering
+    return [offering, offering.customer]
+
+
+def get_offering_component_scopes(offering_component: models.OfferingComponent):
+    offering = offering_component.offering
+    return [offering, offering.customer]
+
+
+def get_plan_scopes(plan: models.Plan):
+    offering = plan.offering
+    return [offering, offering.customer]
+
+
+def get_offering_role_scopes(offering_role: models.OfferingUserRole):
+    offering = offering_role.offering
+    return [offering, offering.customer]
+
+
+def get_order_scopes(order: models.Order):
+    return [order, order.project, order.project.customer, order.resource]
+
+
+ORDER_STATE_HANDLERS = {
+    OrderStates.EXECUTING: (
+        EventType.MARKETPLACE_ORDER_APPROVED,
+        "Marketplace order for resource {resource_name} has been approved. Type: {type}",
+    ),
+    OrderStates.REJECTED: (
+        EventType.MARKETPLACE_ORDER_REJECTED,
+        "Marketplace order for resource {resource_name} has been rejected. Type: {type}",
+    ),
+    OrderStates.DONE: (
+        EventType.MARKETPLACE_ORDER_COMPLETED,
+        "Marketplace order for resource {resource_name} has been completed. Type: {type}",
+    ),
+    OrderStates.CANCELED: (
+        EventType.MARKETPLACE_ORDER_TERMINATED,
+        "Marketplace order for resource {resource_name} has been terminated. Type: {type}",
+    ),
+    OrderStates.ERRED: (
+        EventType.MARKETPLACE_ORDER_FAILED,
+        "Marketplace order for resource {resource_name} has been marked as failed. Type: {type}",
+    ),
+}
+
+RESOURCE_TYPE_HANDLERS = {
+    models.Order.Types.TERMINATE: (
+        EventType.MARKETPLACE_RESOURCE_TERMINATE_REQUESTED,
+        "Resource {resource_name} deletion has been requested.",
+    ),
+    models.Order.Types.UPDATE: (
+        EventType.MARKETPLACE_RESOURCE_UPDATE_REQUESTED,
+        "Resource {resource_name} update has been requested.",
+    ),
+}
+
+
+def log_order_events(sender, instance: Order, created=False, **kwargs):
+    """Log order creation and state transition events."""
+    order = instance
+
     if created:
-        if order.state not in (
-            OrderStates.PENDING_CONSUMER,
-            OrderStates.PENDING_PROVIDER,
+        if (
+            order.state
+            not in (OrderStates.PENDING_CONSUMER, OrderStates.PENDING_PROVIDER)
+            or not order.resource
         ):
-            # Skip logging for imported order
             return
-        if not order.resource:
-            return
-        if order.type == models.Order.Types.TERMINATE:
-            log.log_resource_terminate_requested(order.resource)
-        elif order.type == models.Order.Types.UPDATE:
-            log.log_resource_update_requested(order.resource)
-    else:
-        if not order.tracker.has_changed("state"):
-            return
-        if order.state == OrderStates.EXECUTING:
-            log.log_order_approved(order)
-        elif order.state == OrderStates.REJECTED:
-            log.log_order_rejected(order)
-        elif order.state == OrderStates.DONE:
-            log.log_order_completed(order)
-        elif order.state == OrderStates.CANCELED:
-            log.log_order_canceled(order)
-        elif order.state == OrderStates.ERRED:
-            log.log_order_failed(order)
+
+        if order.state in RESOURCE_TYPE_HANDLERS:
+            event_type, message = RESOURCE_TYPE_HANDLERS[order.state]
+            event_logger.emit(
+                message,
+                event_type=event_type,
+                event_context={"resource": order.resource},
+                scopes=log.get_resource_scopes(order.resource),
+            )
+
+    elif order.tracker.has_changed("state") and order.state in ORDER_STATE_HANDLERS:
+        event_type, message = ORDER_STATE_HANDLERS[order.state]
+        event_logger.emit(
+            message,
+            event_type=event_type,
+            event_context={
+                "order": order,
+                "type": order.get_type_display(),
+                "resource_name": order.resource.name,
+            },
+            scopes=get_order_scopes(order),
+        )
 
 
-def log_resource_events(sender, instance, created=False, **kwargs):
+def log_resource_events(sender, instance: Resource, created=False, **kwargs):
+    """Log resource creation request events."""
     resource = instance
     # Skip logging for imported resource
     if created and instance.state == ResourceStates.CREATING:
-        log.log_resource_creation_requested(resource)
+        event_logger.emit(
+            "Resource {resource_name} creation has been requested.",
+            event_type=EventType.MARKETPLACE_RESOURCE_CREATE_REQUESTED,
+            event_context={"resource": resource},
+            scopes=log.get_resource_scopes(resource),
+        )
 
 
-def init_resource_parent(sender, instance, created=False, **kwargs):
+def init_resource_parent(sender, instance: Resource, created=False, **kwargs):
+    """Initialize the parent resource for a newly created resource."""
     if not created or instance.tracker.has_changed("parent_id"):
         return
 
@@ -116,7 +208,10 @@ def init_resource_parent(sender, instance, created=False, **kwargs):
     resource.save(update_fields=["parent"])
 
 
-def notify_approvers_when_order_is_created(sender, instance, created=False, **kwargs):
+def notify_approvers_when_order_is_created(
+    sender, instance: Order, created=False, **kwargs
+):
+    """Notify approvers when an order is created."""
     order: models.Order = instance
     if created and order.state in (
         OrderStates.PENDING_CONSUMER,
@@ -150,7 +245,8 @@ def notify_approvers_when_order_is_created(sender, instance, created=False, **kw
             )
 
 
-def close_service_accounts_on_project_deletion(sender, instance, **kwargs):
+def close_service_accounts_on_project_deletion(sender, instance: Project, **kwargs):
+    """Close service accounts associated with a project when the project is deleted."""
     project: structure_models.Project = instance
 
     service_accounts = models.ProjectServiceAccount.objects.filter(project=project)
@@ -170,7 +266,10 @@ def close_service_accounts_on_project_deletion(sender, instance, **kwargs):
             continue
 
 
-def close_customer_service_accounts_on_customer_deletion(sender, instance, **kwargs):
+def close_customer_service_accounts_on_customer_deletion(
+    sender, instance: Customer, **kwargs
+):
+    """Close service accounts associated with a customer when the customer is deleted."""
     customer: structure_models.Customer = instance
     service_accounts = models.CustomerServiceAccount.objects.filter(customer=customer)
     if not service_accounts.exists():
@@ -189,8 +288,9 @@ def close_customer_service_accounts_on_customer_deletion(sender, instance, **kwa
 
 
 def process_invitations_and_orders_when_project_start_date_is_unset(
-    sender, instance, created=False, **kwargs
+    sender, instance: Project, created=False, **kwargs
 ):
+    """Process pending invitations and orders when a project's start date is unset."""
     if created:
         return
 
@@ -204,14 +304,16 @@ def process_invitations_and_orders_when_project_start_date_is_unset(
 
     project_content_type = ContentType.objects.get_for_model(structure_models.Project)
     invitations = users_models.Invitation.objects.filter(
-        state=users_models.Invitation.State.PENDING_PROJECT,
+        state=InvitationState.PENDING_PROJECT,
         object_id=project.id,
         content_type=project_content_type,
     )
     for invitation in invitations:
-        invitation.state = models.Invitation.State.PENDING
+        invitation.state = InvitationState.PENDING
         invitation.save()
-        sender = invitation.created_by.full_name or invitation.created_by.username
+        sender = invitation.created_by and (
+            invitation.created_by.full_name or invitation.created_by.username
+        )
         transaction.on_commit(
             lambda: process_invitation.delay(invitation.uuid.hex, sender)
         )
@@ -237,8 +339,9 @@ def process_invitations_and_orders_when_project_start_date_is_unset(
 
 
 def update_resource_when_order_is_rejected_or_erred(
-    sender, instance, created=False, **kwargs
+    sender, instance: Order, created=False, **kwargs
 ):
+    """Update resource state when an order is rejected or erred."""
     order: models.Order = instance
     if not order.tracker.has_changed("state"):
         return
@@ -263,7 +366,8 @@ def update_resource_when_order_is_rejected_or_erred(
         resource.save(update_fields=["state"])
 
 
-def sync_resource_limit_when_order(sender, instance, created=False, **kwargs):
+def sync_resource_limit_when_order(sender, instance: Order, created=False, **kwargs):
+    """Synchronize resource limits when an order is created."""
     order: models.Order = instance
     if order.type != models.Order.Types.CREATE:
         return
@@ -279,8 +383,10 @@ def sync_resource_limit_when_order(sender, instance, created=False, **kwargs):
 
 
 def update_category_quota_when_offering_is_created(
-    sender, instance, created=False, **kwargs
+    sender, instance: Offering, created=False, **kwargs
 ):
+    """Update category quota when an offering is created or its state changes."""
+
     def get_delta():
         if created:
             if instance.state == OfferingStates.ACTIVE:
@@ -297,12 +403,16 @@ def update_category_quota_when_offering_is_created(
         instance.category.add_quota_usage("offering_count", delta)
 
 
-def update_category_quota_when_offering_is_deleted(sender, instance, **kwargs):
+def update_category_quota_when_offering_is_deleted(
+    sender, instance: Offering, **kwargs
+):
+    """Update category quota when an offering is deleted."""
     if instance.state == OfferingStates.ACTIVE:
         instance.category.add_quota_usage("offering_count", -1)
 
 
 def update_category_offerings_count(sender, **kwargs):
+    """Update the count of offerings for each category."""
     for category in models.Category.objects.all():
         value = models.Offering.objects.filter(
             category=category, state=OfferingStates.ACTIVE
@@ -310,7 +420,10 @@ def update_category_offerings_count(sender, **kwargs):
         category.set_quota_usage("offering_count", value)
 
 
-def delete_service_setting_when_offering_is_deleted(sender, instance, **kwargs):
+def delete_service_setting_when_offering_is_deleted(
+    sender, instance: Offering, **kwargs
+):
+    """Delete service settings when an offering is deleted."""
     offering: models.Offering = instance
     try:
         service_settings = offering.scope
@@ -324,8 +437,9 @@ def delete_service_setting_when_offering_is_deleted(sender, instance, **kwargs):
 
 
 def create_resource_plan_period_when_resource_is_created(
-    sender, instance, created=False, **kwargs
+    sender, instance: Resource, created=False, **kwargs
 ):
+    """Create a resource plan period when a resource is created."""
     if created:
         return
 
@@ -345,7 +459,7 @@ def create_resource_plan_period_when_resource_is_created(
 
 
 def close_resource_plan_period_when_resource_is_terminated(
-    sender, instance, created=False, **kwargs
+    sender, instance: Resource, created=False, **kwargs
 ):
     """
     Handle case when resource has been terminated by service provider.
@@ -367,8 +481,9 @@ def close_resource_plan_period_when_resource_is_terminated(
 
 
 def switch_resource_plan_period_when_plan_is_updated(
-    sender, instance, created=False, **kwargs
+    sender, instance: Resource, created=False, **kwargs
 ):
+    """Switch the resource plan period when a resource's plan is updated."""
     if created:
         return
 
@@ -388,6 +503,7 @@ def switch_resource_plan_period_when_plan_is_updated(
 
 
 def change_order_state(sender, instance, created=False, **kwargs):
+    """Change the state of an order based on resource state changes."""
     if created or not instance.tracker.has_changed("state"):
         return
 
@@ -405,6 +521,7 @@ def change_order_state(sender, instance, created=False, **kwargs):
 
 
 def terminate_resource(sender, instance, **kwargs):
+    """Terminate a resource."""
     try:
         resource = models.Resource.objects.get(scope=instance)
     except ObjectDoesNotExist:
@@ -436,6 +553,7 @@ def connect_resource_handlers(*resources):
 
 
 def synchronize_resource_metadata_on_save(sender, instance, created=False, **kwargs):
+    """Synchronize resource metadata on save."""
     fields = {
         "action",
         "action_details",
@@ -462,6 +580,7 @@ def synchronize_resource_metadata_on_save(sender, instance, created=False, **kwa
 
 
 def synchronize_resource_metadata_on_delete(sender, instance, **kwargs):
+    """Synchronize resource metadata on delete."""
     try:
         resource = models.Resource.objects.get(scope=instance)
     except ObjectDoesNotExist:
@@ -493,7 +612,7 @@ def connect_resource_metadata_handlers(*resources):
         )
 
 
-def update_or_create_quotas(resource):
+def update_or_create_quotas(resource: Resource):
     components_map = resource.offering.get_limit_components()
     for key, value in resource.limits.items():
         component = components_map.get(key)
@@ -503,7 +622,8 @@ def update_or_create_quotas(resource):
             )
 
 
-def sync_limits(sender, instance, created=False, **kwargs):
+def sync_limits(sender, instance: Resource, created=False, **kwargs):
+    """Synchronize resource limits."""
     if not created and not instance.tracker.has_changed("limits"):
         return
     transaction.on_commit(lambda: update_or_create_quotas(instance))
@@ -511,6 +631,7 @@ def sync_limits(sender, instance, created=False, **kwargs):
 
 @transaction.atomic()
 def limit_update_succeeded(sender, order: models.Order, **kwargs):
+    """Handle successful limit updates."""
     resource = order.resource
     old_limits = resource.limits
     resource.limits = order.limits
@@ -529,7 +650,8 @@ def limit_update_succeeded(sender, order: models.Order, **kwargs):
     log.log_resource_limit_update_succeeded(resource)
 
 
-def limit_update_failed(sender, order, error_message, **kwargs):
+def limit_update_failed(sender, order: models.Order, error_message, **kwargs):
+    """Handle failed limit updates."""
     order.set_state_erred()
     order.error_message = error_message
     order.save()
@@ -542,12 +664,18 @@ def limit_update_failed(sender, order, error_message, **kwargs):
         order.created_by,
         error_message,
     )
-    log.log_resource_limit_update_failed(resource)
+    event_logger.emit(
+        "Updating limits of resource {resource_name} has failed.",
+        event_type=EventType.MARKETPLACE_RESOURCE_UPDATE_LIMITS_FAILED,
+        event_context={"resource": resource},
+        scopes=log.get_resource_scopes(resource),
+    )
 
 
 def update_customer_of_offering_if_project_has_been_moved(
     sender, project, old_customer, new_customer, **kwargs
 ):
+    """Update the customer of an offering if the project has been moved."""
     for offering in models.Offering.objects.filter(
         project=project, customer=old_customer
     ):
@@ -599,8 +727,9 @@ def enable_nonempty_service_settings(offering):
 
 
 def disable_archived_service_settings_without_existing_resource(
-    sender, instance, created=False, **kwargs
+    sender, instance: Resource, created=False, **kwargs
 ):
+    """Disable archived service settings if there are no existing resources."""
     if created:
         return
 
@@ -619,8 +748,9 @@ def disable_archived_service_settings_without_existing_resource(
 
 
 def disable_service_settings_without_existing_resource_when_archived(
-    sender, instance, created=False, **kwargs
+    sender, instance: Offering, created=False, **kwargs
 ):
+    """Disable service settings without existing resources when an offering is archived."""
     if created:
         return
 
@@ -634,8 +764,9 @@ def disable_service_settings_without_existing_resource_when_archived(
 
 
 def enable_service_settings_with_existing_resource(
-    sender, instance, created=False, **kwargs
+    sender, instance: Resource, created=False, **kwargs
 ):
+    """Enable service settings if there are existing resources."""
     if created:
         return
 
@@ -652,8 +783,9 @@ def enable_service_settings_with_existing_resource(
 
 
 def enable_service_settings_when_not_archived(
-    sender, instance, created=False, **kwargs
+    sender, instance: Offering, created=False, **kwargs
 ):
+    """Enable service settings when an offering is not archived."""
     if created:
         return
 
@@ -666,14 +798,17 @@ def enable_service_settings_when_not_archived(
     enable_nonempty_service_settings(instance)
 
 
-def plan_component_has_been_updated(sender, instance, created=False, **kwargs):
+def plan_component_has_been_updated(
+    sender, instance: PlanComponent, created=False, **kwargs
+):
+    """Log plan component updates."""
     if created:
         return
 
     if instance.tracker.has_changed("price"):
-        event_logger.marketplace_plan_component.info(
+        event_logger.emit(
             f"Current price of component {instance.component.type} in plan {instance.plan.name} has been updated.",
-            event_type="marketplace_plan_component_current_price_updated",
+            event_type=EventType.MARKETPLACE_PLAN_COMPONENT_CURRENT_PRICE_UPDATED,
             event_context={
                 "plan_component": instance,
                 "old_value": instance.tracker.previous("price"),
@@ -681,11 +816,12 @@ def plan_component_has_been_updated(sender, instance, created=False, **kwargs):
                 if isinstance(instance.price, str)
                 else instance.price,
             },
+            scopes=get_plan_component_scopes(instance),
         )
     if instance.tracker.has_changed("future_price"):
-        event_logger.marketplace_plan_component.info(
+        event_logger.emit(
             f"Future price of component {instance.component.type} in plan {instance.plan.name} has been updated.",
-            event_type="marketplace_plan_component_future_price_updated",
+            event_type=EventType.MARKETPLACE_PLAN_COMPONENT_FUTURE_PRICE_UPDATED,
             event_context={
                 "plan_component": instance,
                 "old_value": instance.tracker.previous("future_price"),
@@ -693,11 +829,12 @@ def plan_component_has_been_updated(sender, instance, created=False, **kwargs):
                 if isinstance(instance.future_price, str)
                 else instance.future_price,
             },
+            scopes=get_plan_component_scopes(instance),
         )
     if instance.tracker.has_changed("amount"):
-        event_logger.marketplace_plan_component.info(
+        event_logger.emit(
             f"Quota of component {instance.component.type} in plan {instance.plan.name} has been updated.",
-            event_type="marketplace_plan_component_quota_updated",
+            event_type=EventType.MARKETPLACE_PLAN_COMPONENT_QUOTA_UPDATED,
             event_context={
                 "plan_component": instance,
                 "old_value": instance.tracker.previous("amount"),
@@ -705,19 +842,22 @@ def plan_component_has_been_updated(sender, instance, created=False, **kwargs):
                 if isinstance(instance.amount, str)
                 else instance.amount,
             },
+            scopes=get_plan_component_scopes(instance),
         )
 
 
 def offering_component_has_been_created_or_updated(
-    sender, instance, created=False, **kwargs
+    sender, instance: OfferingComponent, created=False, **kwargs
 ):
+    """Log offering component creation and updates."""
     if created:
-        event_logger.marketplace_offering_component.info(
+        event_logger.emit(
             f"Offering component {instance.name} has been created.",
-            event_type="marketplace_offering_component_created",
+            event_type=EventType.MARKETPLACE_OFFERING_COMPONENT_CREATED,
             event_context={
                 "offering_component": instance,
             },
+            scopes=get_offering_component_scopes(instance),
         )
     else:
         changes = [
@@ -726,42 +866,48 @@ def offering_component_has_been_created_or_updated(
         ]
         if changes:
             diff = ", ".join(changes)
-            event_logger.marketplace_offering_component.info(
+            event_logger.emit(
                 f"Offering component {instance.name} has been updated. Details: {diff}.",
-                event_type="marketplace_offering_component_updated",
+                event_type=EventType.MARKETPLACE_OFFERING_COMPONENT_UPDATED,
                 event_context={
                     "offering_component": instance,
                 },
+                scopes=get_offering_component_scopes(instance),
             )
 
 
-def offering_component_has_been_deleted(sender, instance, **kwargs):
-    event_logger.marketplace_offering_component.info(
+def offering_component_has_been_deleted(sender, instance: OfferingComponent, **kwargs):
+    """Log offering component deletion."""
+    event_logger.emit(
         f"Offering component {instance.name} has been deleted.",
-        event_type="marketplace_offering_component_deleted",
+        event_type=EventType.MARKETPLACE_OFFERING_COMPONENT_DELETED,
         event_context={
             "offering_component": instance,
         },
+        scopes=get_offering_component_scopes(instance),
     )
 
 
-def plan_has_been_created_or_updated(sender, instance, created=False, **kwargs):
+def plan_has_been_created_or_updated(sender, instance: Plan, created=False, **kwargs):
+    """Log plan creation, update, and archiving events."""
     if created:
-        event_logger.marketplace_plan.info(
+        event_logger.emit(
             f"Plan {instance.name} has been created.",
-            event_type="marketplace_plan_created",
+            event_type=EventType.MARKETPLACE_PLAN_CREATED,
             event_context={
                 "plan": instance,
             },
+            scopes=get_plan_scopes(instance),
         )
     else:
         if instance.tracker.has_changed("archived"):
-            event_logger.marketplace_plan.info(
+            event_logger.emit(
                 f"Plan {instance.name} has been archived.",
-                event_type="marketplace_plan_archived",
+                event_type=EventType.MARKETPLACE_PLAN_ARCHIVED,
                 event_context={
                     "plan": instance,
                 },
+                scopes=get_plan_scopes(instance),
             )
         else:
             excluded_fields = {"modified", "created"}
@@ -772,29 +918,34 @@ def plan_has_been_created_or_updated(sender, instance, created=False, **kwargs):
             ]
             if changes:
                 diff = ", ".join(changes)
-                event_logger.marketplace_plan.info(
+                event_logger.emit(
                     f"Plan {instance.name} has been updated. Details: {diff}.",
-                    event_type="marketplace_plan_updated",
+                    event_type=EventType.MARKETPLACE_PLAN_UPDATED,
                     event_context={
                         "plan": instance,
                     },
+                    scopes=get_plan_scopes(instance),
                 )
 
 
-def offering_has_been_created_or_updated(sender, instance, created=False, **kwargs):
+def offering_has_been_created_or_updated(
+    sender, instance: Offering, created=False, **kwargs
+):
+    """Log offering creation and state updates."""
     if created:
-        event_logger.marketplace_offering.info(
+        event_logger.emit(
             "Offering has been created.",
-            event_type="marketplace_offering_created",
+            event_type=EventType.MARKETPLACE_OFFERING_CREATED,
             event_context={
                 "offering": instance,
             },
+            scopes=[instance, instance.customer],
         )
     else:
         if instance.tracker.has_changed("state"):
-            event_logger.marketplace_offering.info(
+            event_logger.emit(
                 "Offering state has been updated.",
-                event_type="marketplace_offering_updated",
+                event_type=EventType.MARKETPLACE_OFFERING_UPDATED,
                 event_context={
                     "offering": instance,
                     "old_value": models.Offering(
@@ -802,10 +953,12 @@ def offering_has_been_created_or_updated(sender, instance, created=False, **kwar
                     ).get_state_display(),
                     "new_value": instance.get_state_display(),
                 },
+                scopes=[instance, instance.customer],
             )
 
 
-def resource_has_been_changed(sender, instance, created=False, **kwargs):
+def resource_has_been_changed(sender, instance: Resource, created=False, **kwargs):
+    """Log resource changes."""
     if created:
         return
 
@@ -833,29 +986,83 @@ def resource_has_been_changed(sender, instance, created=False, **kwargs):
 
     for field, old_value in sorted(changed_fields.items()):
         if field == "state":
-            old_value = models.Resource.get_state_display(
-                models.Resource(state=old_value)
-            )
-            new_value = instance.get_state_display()
+            old_value_display = models.Resource(state=old_value).get_state_display()
+            new_value_display = instance.get_state_display()
+            # Skip if display values are equal
+            if old_value_display == new_value_display:
+                continue
+            old_value = old_value_display
+            new_value = new_value_display
         elif field == "project_id":
-            old_value = get_relative_object_name("project_id", old_value)
-            new_value = get_relative_object_name("project_id", getattr(instance, field))
+            old_value_display = get_relative_object_name("project_id", old_value)
+            new_value_display = get_relative_object_name(
+                "project_id", getattr(instance, field)
+            )
+            if old_value_display == new_value_display:
+                continue
+            old_value = old_value_display
+            new_value = new_value_display
         elif field == "offering_id":
-            old_value = get_relative_object_name("offering_id", old_value)
-            new_value = get_relative_object_name(
+            old_value_display = get_relative_object_name("offering_id", old_value)
+            new_value_display = get_relative_object_name(
                 "offering_id", getattr(instance, field)
             )
+            if old_value_display == new_value_display:
+                continue
+            old_value = old_value_display
+            new_value = new_value_display
         else:
             new_value = getattr(instance, field)
+            if old_value == new_value:
+                continue
 
         if not old_value and not new_value:
             continue
         changed.append({"name": field, "from": old_value, "to": new_value})
 
-    log.log_resource_update_succeeded(instance, changed)
+    if not changed:
+        return
+
+    resource = instance
+
+    template = (
+        "Marketplace resource '{{ resource_name }}' has been changed. "
+        "{% for field in changed %}"
+        "{% if forloop.first %}Field{% else %}field{% endif %} "
+        "'{{ field.name }}': from {{ field.from|safe }} to {{ field.to|safe }}"
+        "{% if forloop.last %}.{% else %}, {% endif %}"
+        "{% endfor %}"
+    )
+
+    context = {
+        "resource_name": resource.name,
+        "changed": changed,
+    }
+
+    event_logger.emit(
+        Template(template)
+        .render(Context(context))
+        .replace("{", "{{")
+        .replace("}", "}}"),
+        event_type=EventType.MARKETPLACE_RESOURCE_UPDATE_SUCCEEDED,
+        event_context={
+            "resource": resource,
+        },
+        scopes=log.get_resource_scopes(resource),
+    )
+
+    if not config.DISABLE_SENDING_NOTIFICATIONS_ABOUT_RESOURCE_UPDATE:
+        transaction.on_commit(
+            lambda: tasks.notify_about_resource_change.delay(
+                EventType.MARKETPLACE_RESOURCE_UPDATE_SUCCEEDED, context, resource.uuid
+            )
+        )
 
 
-def resource_state_has_been_changed(sender, instance, created=False, **kwargs):
+def resource_state_has_been_changed(
+    sender, instance: Resource, created=False, **kwargs
+):
+    """Handle resource state changes."""
     if created:
         return
 
@@ -874,8 +1081,9 @@ def resource_state_has_been_changed(sender, instance, created=False, **kwargs):
 
 
 def delete_expired_project_if_every_resource_has_been_terminated(
-    sender, instance, created=False, **kwargs
+    sender, instance: Resource, created=False, **kwargs
 ):
+    """Delete an expired project if all its resources have been terminated."""
     if created:
         return
 
@@ -899,22 +1107,35 @@ def delete_expired_project_if_every_resource_has_been_terminated(
             .exists()
         )
         if not resources:
-            event_logger.project.info(
+            event_logger.emit(
                 "Project {project_name} is going to be deleted because end date has been reached and there are no active resources.",
-                event_type="project_deletion_triggered",
+                event_type=EventType.PROJECT_DELETION_TRIGGERED,
                 event_context={"project": project},
+                scopes=[project, project.customer],
             )
             project.delete()
 
 
-def log_offering_user_created(sender, instance, created=False, **kwargs):
+def log_offering_user_created(sender, instance: OfferingUser, created=False, **kwargs):
+    """Log offering user creation."""
     if not created:
         return
-    log.log_offering_user_created(instance)
+    event_logger.emit(
+        f"Account for user {instance.user.username} in offering {instance.offering.name} has been created.",
+        event_type=EventType.MARKETPLACE_OFFERING_USER_CREATED,
+        event_context={"offering_user": instance},
+        scopes=get_offering_role_scopes(instance),
+    )
 
 
-def log_offering_user_deleted(sender, instance, **kwargs):
-    log.log_offering_user_deleted(instance)
+def log_offering_user_deleted(sender, instance: OfferingUser, **kwargs):
+    """Log offering user deletion."""
+    event_logger.emit(
+        f"Account for user {instance.user.username} in offering {instance.offering.name} has been deleted.",
+        event_type=EventType.MARKETPLACE_OFFERING_USER_DELETED,
+        event_context={"offering_user": instance},
+        scopes=get_offering_role_scopes(instance),
+    )
 
 
 def generate_changes_string(changed_dict, instance, account_type):
@@ -939,61 +1160,74 @@ def generate_changes_string(changed_dict, instance, account_type):
     return changes_string
 
 
-def log_service_account_created_or_updated(sender, instance, created=False, **kwargs):
+def log_service_account_created_or_updated(
+    sender, instance: ScopedServiceAccount, created=False, **kwargs
+):
+    """Log service account creation and updates."""
     if not created:
         changed_string = generate_changes_string(
             instance.tracker.changed(), instance, SERVICE_ACCOUNT_TYPE
         )
-        event_logger.marketplace_service_account.info(
+        event_logger.emit(
             changed_string,
-            event_type="service_account_updated",
+            event_type=EventType.SERVICE_ACCOUNT_UPDATED,
             event_context={"service_account": instance},
+            scopes=[instance, instance.scope],
         )
         return
-    event_logger.marketplace_service_account.info(
+    event_logger.emit(
         "Service account {service_account_username} has been created.",
-        event_type="service_account_created",
+        event_type=EventType.SERVICE_ACCOUNT_CREATED,
         event_context={"service_account": instance},
+        scopes=[instance, instance.scope],
     )
 
 
-def log_service_account_deleted(sender, instance, **kwargs):
-    event_logger.marketplace_service_account.info(
+def log_service_account_deleted(sender, instance: ScopedServiceAccount, **kwargs):
+    """Log service account deletion."""
+    event_logger.emit(
         "Service account {service_account_username} has been deleted.",
-        event_type="service_account_deleted",
+        event_type=EventType.SERVICE_ACCOUNT_DELETED,
         event_context={"service_account": instance},
+        scopes=[instance, instance.scope],
     )
 
 
 def log_resource_robot_account_created_or_updated(
-    sender, instance, created=False, **kwargs
+    sender, instance: RobotAccount, created=False, **kwargs
 ):
+    """Log resource robot account creation and updates."""
     if not created:
         changed_string = generate_changes_string(
             instance.tracker.changed(), instance, ROBOT_ACCOUNT_TYPE
         )
-        event_logger.marketplace_robot_account.info(
+        event_logger.emit(
             changed_string,
-            event_type="resource_robot_account_updated",
+            event_type=EventType.RESOURCE_ROBOT_ACCOUNT_UPDATED,
             event_context={"robot_account": instance},
+            scopes=[instance, instance.resource],
         )
         return
-    event_logger.marketplace_robot_account.info(
+    event_logger.emit(
         "Robot account {robot_account_username} has been created.",
-        event_type="resource_robot_account_created",
+        event_type=EventType.RESOURCE_ROBOT_ACCOUNT_CREATED,
         event_context={"robot_account": instance},
+        scopes=[instance, instance.resource],
     )
 
 
-def log_resource_robot_account_deleted(sender, instance, **kwargs):
-    event_logger.marketplace_robot_account.info(
+def log_resource_robot_account_deleted(sender, instance: RobotAccount, **kwargs):
+    """Log resource robot account deletion."""
+    event_logger.emit(
         "Robot account {robot_account_username} has been deleted.",
-        event_type="resource_robot_account_deleted",
+        event_type=EventType.RESOURCE_ROBOT_ACCOUNT_DELETED,
         event_context={"robot_account": instance},
+        scopes=[instance, instance.resource],
     )
 
 
 def create_offering_users_when_project_role_granted(sender, instance, **kwargs):
+    """Create offering users when a project role is granted."""
     if not isinstance(instance.scope, structure_models.Project):
         return
     project = instance.scope
@@ -1030,7 +1264,8 @@ def create_offering_users_when_project_role_granted(sender, instance, **kwargs):
         offering_user.save(update_fields=["backend_metadata"])
 
 
-def create_offering_user_for_new_resource(sender, instance, **kwargs):
+def create_offering_user_for_new_resource(sender, instance: Resource, **kwargs):
+    """Create an offering user for a new resource."""
     resource = instance
     project = resource.project
     users = project.get_users()
@@ -1070,8 +1305,9 @@ def create_offering_user_for_new_resource(sender, instance, **kwargs):
 
 
 def update_offering_user_username_after_offering_settings_change(
-    sender, instance, created=False, **kwargs
+    sender, instance: Offering, created=False, **kwargs
 ):
+    """Update offering user usernames after offering settings change."""
     if created:
         return
 
@@ -1094,7 +1330,7 @@ def update_offering_user_username_after_offering_settings_change(
         offering_user.save(update_fields=["username", "backend_metadata"])
 
 
-def update_offering_user_username_after_user_change(sender, instance, **kwargs):
+def update_offering_user_username_after_user_change(sender, instance: User, **kwargs):
     """Set new username for offering users after site_username in user details has been changed."""
     user = instance
 
@@ -1119,11 +1355,10 @@ def update_offering_user_username_after_user_change(sender, instance, **kwargs):
 
 
 def update_offering_user_username_after_freeipa_profile_update(
-    sender, instance, created=False, **kwargs
+    sender, instance: Profile, created=False, **kwargs
 ):
-    from waldur_freeipa.models import Profile
-
-    profile: Profile = instance
+    """Update offering user usernames after FreeIPA profile update."""
+    profile = instance
 
     if not profile.tracker.has_changed("username") or not created:
         return
@@ -1147,7 +1382,8 @@ def update_offering_user_username_after_freeipa_profile_update(
         offering_user.save(update_fields=["username"])
 
 
-def notify_user_about_rejected_order(sender, instance, created=False, **kwargs):
+def notify_user_about_rejected_order(sender, instance: Order, created=False, **kwargs):
+    """Notify user about rejected order."""
     if created:
         return
 
@@ -1164,55 +1400,66 @@ def notify_user_about_rejected_order(sender, instance, created=False, **kwargs):
             tasks.notify_user_that_order_been_rejected.delay(order.uuid.hex)
 
 
-def log_offering_role_created_or_updated(sender, instance, created=False, **kwargs):
+def log_offering_role_created_or_updated(
+    sender, instance: OfferingUserRole, created=False, **kwargs
+):
+    """Log offering role creation and updates."""
     if created:
-        event_logger.marketplace_offering_role.info(
+        event_logger.emit(
             f"Offering role {instance.name} has been created.",
-            event_type="marketplace_offering_role_created",
+            event_type=EventType.MARKETPLACE_OFFERING_ROLE_CREATED,
             event_context={
                 "offering_role": instance,
             },
+            scopes=get_offering_role_scopes(instance),
         )
     else:
-        event_logger.marketplace_offering_role.info(
+        event_logger.emit(
             f"Offering role {instance.name} has been updated.",
-            event_type="marketplace_offering_role_updated",
+            event_type=EventType.MARKETPLACE_OFFERING_ROLE_UPDATED,
             event_context={
                 "offering_role": instance,
             },
+            scopes=get_offering_role_scopes(instance),
         )
 
 
 def log_resource_user_created(
     sender, instance: models.ResourceUser, created=False, **kwargs
 ):
+    """Log resource user creation."""
     if created:
-        event_logger.marketplace_resource_user.info(
+        event_logger.emit(
             f"User {instance.user.username} has been assigned"
             f" role {instance.role.name} in resource {instance.resource.name}.",
-            event_type="marketplace_resource_user_created",
+            event_type=EventType.MARKETPLACE_RESOURCE_USER_CREATED,
             event_context={
                 "resource_user": instance,
             },
+            scopes=[instance.resource.offering, instance.resource.offering.customer],
         )
 
 
-def log_offering_role_deleted(sender, instance, **kwargs):
-    event_logger.marketplace_offering_role.info(
+def log_offering_role_deleted(sender, instance: OfferingUserRole, **kwargs):
+    """Log offering role deletion."""
+    event_logger.emit(
         f"Offering role {instance.name} has been deleted.",
-        event_type="marketplace_offering_role_deleted",
+        event_type=EventType.MARKETPLACE_OFFERING_ROLE_DELETED,
         event_context={
             "offering_role": instance,
         },
+        scopes=get_offering_role_scopes(instance),
     )
 
 
 def log_resource_user_deleted(sender, instance: models.ResourceUser, **kwargs):
-    event_logger.marketplace_resource_user.info(
+    """Log resource user deletion."""
+    event_logger.emit(
         f"User {instance.user.username} has been unassigned"
         f" role {instance.role.name} in resource {instance.resource.name}.",
-        event_type="marketplace_resource_user_deleted",
+        event_type=EventType.MARKETPLACE_RESOURCE_USER_DELETED,
         event_context={
             "resource_user": instance,
         },
+        scopes=[instance.resource.offering, instance.resource.offering.customer],
     )

@@ -40,12 +40,7 @@ from waldur_rancher import models as rancher_models
 from waldur_rancher import views as rancher_views
 from waldur_rancher.enums import AGENT_ROLE, SERVER_ROLE, NodeRoleType
 
-from . import PLUGIN_NAME, serializers
-
-OS_LB_SECURITY_GROUPS = ["k8s_admin", "k8s_public"]
-OS_SUBNET_4_OCTET_START_IP = 11
-OS_SUBNET_4_OCTET_END_IP = 200
-OS_LB_VM_4_OCTET_IP = 10
+from . import PLUGIN_NAME, const, serializers
 
 
 class RancherCreateProcessor(processors.BaseCreateResourceProcessor):
@@ -77,7 +72,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
         self.create_security_groups(tenants)
         load_balancers = self.create_load_balancers(user, project, tenants)
         cluster_resource = self.create_cluster(user, project, tenants)
-        for sg in OS_LB_SECURITY_GROUPS:
+        for sg in const.OS_LB_SECURITY_GROUPS:
             rancher_models.ClusterSecurityGroup.objects.create(
                 cluster=cast(rancher_models.Cluster, cluster_resource.scope),
                 name=sg,
@@ -118,7 +113,52 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
         )
 
     def create_tenants(self, user, project: Project) -> list[os_models.Tenant]:
+        def validate_all_tenant_limits(tenant_limits: list[dict[str, int]]):
+            aggregated_limits = {
+                CORES_TYPE: sum(limits[CORES_TYPE] for limits in tenant_limits),
+                RAM_TYPE: sum(limits[RAM_TYPE] for limits in tenant_limits),
+            }
+
+            type_to_max_limit = {
+                CORES_TYPE: self.order.offering.plugin_options.get(
+                    "managed_rancher_tenant_max_cpu"
+                ),
+                RAM_TYPE: self.order.offering.plugin_options.get(
+                    "managed_rancher_tenant_max_ram"
+                ),
+                STORAGE_TYPE: self.order.offering.plugin_options.get(
+                    "managed_rancher_tenant_max_disk"
+                ),
+            }
+
+            # Collect limits for storage quotas across the tenants and sum them
+            tenant_storage_limits = []
+            for tenant_limit in tenant_limits:
+                tenant_storage_limit = sum(
+                    limit_value
+                    for limit_type, limit_value in tenant_limit.items()
+                    if limit_type.startswith("gigabytes_") or limit_type == STORAGE_TYPE
+                )
+                tenant_storage_limits.append(tenant_storage_limit)
+            aggregated_limits[STORAGE_TYPE] = sum(tenant_storage_limits)
+
+            for limit_type, aggregated_limit in aggregated_limits.items():
+                max_allowed_limit = type_to_max_limit[limit_type]
+
+                if not max_allowed_limit:
+                    continue
+
+                if limit_type != CORES_TYPE:
+                    # Convert GBs to MBs
+                    max_allowed_limit *= 1024
+
+                if aggregated_limit > max_allowed_limit:
+                    raise rf_serializers.ValidationError(
+                        f"The requested total {limit_type} limit {aggregated_limit} cores exceeds the maximum allowed {max_allowed_limit} for tenants."
+                    )
+
         orders = []
+        orders_data = []
         openstack_offering_uuid_list = cast(
             list[str], self.order.attributes["openstack_offering_uuid_list"]
         )
@@ -129,8 +169,28 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                 "name": f"os-tenant-{project.slug}-{offering.slug}",
             }
             limits = self.get_tenant_limits(offering)
+            orders_data.append(
+                {
+                    "offering": offering,
+                    "plan": plan,
+                    "attributes": attributes,
+                    "limits": limits,
+                }
+            )
+
+        tenant_limits = [order_data["limits"] for order_data in orders_data]
+        validate_all_tenant_limits(tenant_limits)
+
+        for order_data in orders_data:
             orders.append(
-                submit_creation_order(user, offering, plan, project, attributes, limits)
+                submit_creation_order(
+                    user,
+                    order_data["offering"],
+                    order_data["plan"],
+                    project,
+                    order_data["attributes"],
+                    order_data["limits"],
+                )
             )
 
         return [
@@ -146,8 +206,8 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                 continue
 
             network = ip_network(subnet.cidr, strict=False)
-            first_host = network.network_address + OS_SUBNET_4_OCTET_START_IP
-            last_host = network.network_address + OS_SUBNET_4_OCTET_END_IP
+            first_host = network.network_address + const.OS_SUBNET_4_OCTET_START_IP
+            last_host = network.network_address + const.OS_SUBNET_4_OCTET_END_IP
 
             subnet.allocation_pools = [
                 {
@@ -399,7 +459,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
     ):
         view = os_views.TenantViewSet.as_view({"post": "create_security_group"})
         for tenant in tenants:
-            for group in OS_LB_SECURITY_GROUPS:
+            for group in const.OS_LB_SECURITY_GROUPS:
                 # Wait for tenant to become OK in case if it is being pulled
                 wait_for_tenant(tenant.uuid)
                 response = create_request(
@@ -462,7 +522,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
             data_volume_type_name = self.order.offering.plugin_options.get(
                 "managed_rancher_load_balancer_data_volume_type_name"
             )
-            cloud_init_template = self.order.offering.plugin_options.get(
+            cloud_init_template = self.order.offering.secret_options.get(
                 "managed_rancher_load_balancer_cloud_init_template"
             )
 
@@ -474,16 +534,16 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
             )
             security_groups = os_models.SecurityGroup.objects.filter(
                 tenant=tenant,
-                name__in=OS_LB_SECURITY_GROUPS + ["default"],
+                name__in=const.OS_LB_SECURITY_GROUPS + ["default"],
             )
             subnet_3_oct = subnet.cidr.rsplit(".", maxsplit=1)[0]
             cloud_init_scipt = cloud_init_template.format(subnet_3_oct=subnet_3_oct)
 
             network = ip_network(subnet.cidr, strict=False)
-            lb_address = str(network.network_address + OS_LB_VM_4_OCTET_IP)
+            lb_address = str(network.network_address + const.OS_LB_VM_4_OCTET_IP)
 
             post_data = {
-                "name": f"k8s-lb-{self.order.resource.slug}",
+                "name": f"{const.OS_LB_PREFIX}{self.order.resource.slug}",
                 "flavor": reverse(
                     "openstack-flavor-detail", kwargs={"uuid": flavor.uuid.hex}
                 ),
