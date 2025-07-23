@@ -574,7 +574,7 @@ class OpenPortalBoard:
 
         if project_template is None:
             # This is a bug - we should not have a ManagedProject without a project class
-            logger.error(f"{identifier} does not have a project class set.")
+            logger.error(f"{identifier} does not have a project class set")
             managed_project.delete()
 
             raise openportal.OpenPortalError(
@@ -671,6 +671,7 @@ class OpenPortalBoard:
             logger.error(
                 f"{identifier} does not have a project class set. Cannot update project."
             )
+            managed_project.delete()
             raise openportal.OpenPortalError(
                 f"{identifier} does not have a project class set"
             )

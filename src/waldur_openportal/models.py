@@ -453,7 +453,13 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                         )
                         continue
 
-                    role_name = str(role.name).strip()
+                    if role.description is not None:
+                        role_name = str(role.description).strip()
+                    else:
+                        role_name = ""
+
+                    if len(role_name) == 0 and role.name is not None:
+                        role_name = str(role.name).strip()
 
                     if len(role_name) == 0:
                         logger.warning(
@@ -1525,13 +1531,13 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
         ),
     )
 
-    # The mapping of allocation units to credits, i.e. how many credits
-    # to award per GPU hour allocated etc.
+    # The mapping of credits to allocation units, e.g. how many GPU hours
+    # to award per credit allocated
     allocation_units_mapping = models.JSONField(
         verbose_name=_("allocation units mapping"),
         default=dict,
         help_text=_(
-            "The mapping of allocation units to credits, i.e. how many credits to award per GPU hour allocated etc."
+            "The mapping of credits to allocation units, i.e. how many allocation units to award per credit allocated."
         ),
     )
 
@@ -1692,7 +1698,15 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
         if allocation is None:
             return 0.0
         elif allocation.units in self.allocation_units_mapping:
-            return allocation.size * self.allocation_units_mapping[allocation.units]
+            scale_factor = self.allocation_units_mapping[allocation.units]
+
+            if scale_factor <= 0:
+                logger.warning(
+                    f"Allocation units {allocation.units} have a non-positive scale factor ({scale_factor}). Defaulting to 0 mapping."
+                )
+                return 0.0
+
+            return allocation.size / scale_factor
         else:
             logger.warning(
                 f"Allocation units {allocation.units} not found in project class {self.name}. Defaulting to 1 to 1 mapping."

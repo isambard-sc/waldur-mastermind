@@ -455,6 +455,7 @@ class ProjectTemplateSerializer(
             "offerings_data",
             "approval_limit",
             "max_credit_limit",
+            "allocation_units_mapping",
             "role_mapping",
             "role_mapping_data",
         )
