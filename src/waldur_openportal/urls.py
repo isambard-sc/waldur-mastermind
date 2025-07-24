@@ -55,6 +55,11 @@ def register_in(router):
         views.ManagedProjectViewSet,
         basename="openportal-managed-project",
     )
+    router.register(
+        r"openportal-unmanaged-projects",
+        views.UnmanagedProjectViewSet,
+        basename="openportal-unmanaged-project",
+    )
 
 
 urlpatterns = [

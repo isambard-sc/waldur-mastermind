@@ -726,3 +726,20 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         logger.info(f"Deleting ManagedProject {project} by user {self.request.user}")
 
         return Response(status=status.HTTP_200_OK)
+
+
+class UnmanagedProjectViewSet(structure_views.ProjectViewSet):
+    """
+    ViewSet that only matches Projects that do not have an associated ManagedProject.
+    """
+
+    def get_queryset(self):
+        base_queryset = super().get_queryset()
+
+        managed_project_ids = models.ManagedProject.objects.filter(
+            project__isnull=False
+        ).values_list("project_id", flat=True)
+
+        unmanaged_queryset = base_queryset.exclude(id__in=managed_project_ids)
+
+        return unmanaged_queryset
