@@ -466,6 +466,22 @@ class ProjectTemplateSerializer(
         return ("provider", "customer", "offerings")
 
 
+class ProjectAttachSerializer(rf_serializers.Serializer):
+    project_uuid = rf_serializers.UUIDField(
+        help_text="UUID of the project to attach to this managed project"
+    )
+
+    def validate_project_uuid(self, value):
+        """Validate that the project exists and is accessible"""
+        try:
+            structure_models.Project.objects.get(uuid=value)
+            return value
+        except structure_models.Project.DoesNotExist:
+            raise rf_serializers.ValidationError(
+                "Project with this UUID does not exist"
+            )
+
+
 class ManagedProjectSerializer(
     structure_serializers.PermissionFieldFilteringMixin,
     rf_serializers.ModelSerializer,

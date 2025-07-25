@@ -655,7 +655,12 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         permissions.IsAuthenticated,
         IsStaffOrServiceProviderOwnerOrManager,
     ]
+    attach_permissions = detach_permissions = approve_permissions
+
     serializer_class = serializers.ManagedProjectSerializer
+    attach_serializer_class = serializers.ProjectAttachSerializer
+    detach_serializer_class = None
+
     filter_backends = [GenericRoleFilter, DjangoFilterBackend]
     filterset_class = filters.ManagedProjectFilter
 
@@ -677,6 +682,10 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
             )
         elif self.action == "delete":
             permission_classes = self.delete_permissions
+        elif self.action == "attach":
+            permission_classes = self.attach_permissions
+        elif self.action == "detach":
+            permission_classes = self.detach_permissions
         else:
             permission_classes = self.permission_classes
 
@@ -726,6 +735,81 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         logger.info(f"Deleting ManagedProject {project} by user {self.request.user}")
 
         return Response(status=status.HTTP_200_OK)
+
+    @extend_schema(
+        request=serializers.ProjectAttachSerializer,
+        responses=None,
+        description="Attach a project to this managed project",
+    )
+    @action(detail=True, methods=["post"])
+    def attach(self, request, **kwargs):
+        managed_project: models.ManagedProject = self.get_object()
+        serializer = serializers.ProjectAttachSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        project_uuid = serializer.validated_data["project_uuid"]
+
+        try:
+            project = structure_models.Project.objects.get(uuid=project_uuid)
+
+            # Check if project is already attached to another ManagedProject
+            existing_managed = (
+                models.ManagedProject.objects.filter(project=project)
+                .exclude(id=managed_project.id)
+                .first()
+            )
+
+            if existing_managed:
+                return Response(
+                    {
+                        "error": f"Project is already attached to managed project {existing_managed.identifier}"
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            managed_project.project = project
+            managed_project.save(update_fields=["project"])
+
+            logger.info(
+                f"Project {project.uuid} attached to ManagedProject {managed_project.identifier} "
+                f"by user {request.user}"
+            )
+
+            return Response(
+                {"message": "Project attached successfully"}, status=status.HTTP_200_OK
+            )
+
+        except structure_models.Project.DoesNotExist:
+            return Response(
+                {"error": "Project not found"}, status=status.HTTP_404_NOT_FOUND
+            )
+
+    @extend_schema(
+        responses=None,
+        description="Detach the project from this managed project",
+    )
+    @action(detail=True, methods=["post"])
+    def detach(self, request, **kwargs):
+        managed_project: models.ManagedProject = self.get_object()
+
+        if not managed_project.project:
+            return Response(
+                {"error": "No project is currently attached"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        old_project = managed_project.project
+        managed_project.project = None
+        managed_project.save(update_fields=["project"])
+
+        logger.info(
+            f"Project {old_project.uuid} detached from ManagedProject {managed_project.identifier} "
+            f"by user {request.user}"
+        )
+
+        return Response(
+            {"message": "Project detached successfully"}, status=status.HTTP_200_OK
+        )
 
 
 class UnmanagedProjectViewSet(structure_views.ProjectViewSet):
