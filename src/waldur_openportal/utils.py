@@ -5,6 +5,7 @@ from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core import models as core_models
+from waldur_core.structure import models as structure_models
 
 from waldur_core.structure.managers import (
     get_connected_customers,
@@ -250,3 +251,41 @@ def get_remote_association(user, allocation):
             raise models.RemoteAssociation.DoesNotExist(
                 f"No association found for {user} and {allocation}"
             )
+
+
+def set_project_credits(project, credits: float):
+    """
+    Set the credits for the project to the passed value
+    """
+    if not isinstance(project, structure_models.Project):
+        raise TypeError("project must be an instance of Project")
+
+    try:
+        credits = float(credits)
+    except (ValueError, TypeError) as e:
+        logger.error(f"Invalid credits value: {credits}. Must be a float.")
+        raise ValueError(f"Invalid credits value: {credits}. Must be a float.") from e
+
+    if credits < 0:
+        credits = 0.0
+
+    logger.info(
+        f"Setting credits for project {project} to {credits} - NEEDS IMPLEMENTING"
+    )
+
+
+def invite_user_to_project(project, email, role, send_email: bool = True):
+    """
+    Invite a user to the project with the specified email and role.
+    If the user already exists, update their role in the project.
+    If send_email is True, send an invitation email.
+    """
+    if not isinstance(project, structure_models.Project):
+        raise TypeError("project must be an instance of Project")
+
+    if not isinstance(email, str) or not email:
+        raise ValueError("email must be a non-empty string")
+
+    logger.info(
+        f"Inviting user with email {email} to project {project} with role {role} - NEEDS IMPLEMENTING"
+    )

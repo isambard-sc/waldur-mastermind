@@ -8,6 +8,7 @@ from waldur_core.core.utils import get_system_robot
 
 from . import op as openportal
 from . import models
+from . import utils
 
 logger = logging.getLogger(__name__)
 
@@ -671,7 +672,9 @@ class OpenPortalBoard:
             logger.warning(f"{identifier} is rejected!")
             raise openportal.OpenPortalError(f"{identifier} is rejected!")
 
-        if managed_project.project_template is None:
+        project_template = managed_project.get_project_template()
+
+        if project_template is None:
             # This is a bug - we should not have a ManagedProject without a project class
             logger.error(
                 f"{identifier} does not have a project class set. Cannot update project."
@@ -682,17 +685,17 @@ class OpenPortalBoard:
             )
 
         if (
-            managed_project.project_template.action_needs_approval()
+            project_template.action_needs_approval()
             and not managed_project.is_approved()
         ):
             logger.info(
-                f"{identifier} with class {managed_project.project_template} requires approval for project updates."
+                f"{identifier} with class {project_template} requires approval for project updates."
             )
 
             managed_project.set_needs_approval()
 
             raise openportal.OpenPortalError(
-                f"{identifier} with class {managed_project.project_template} requires approval for project updates"
+                f"{identifier} with class {project_template} requires approval for project updates"
             )
 
         if managed_project.project is None:
@@ -734,20 +737,28 @@ class OpenPortalBoard:
         project = managed_project.project
         details = managed_project.get_details()
 
+        ####
+        #### WE NEED TO CHANGE THE LOGIC TO COMPARE AGAINST THE ACTUAL PROJECT
+        #### DETAILS, NOT THE MANAGED PROJECT DETAILS
+        ####
+
         if new_details.allocation is not None:
             if details.allocation != new_details.allocation:
                 # check that we approve this allocation change
-                if managed_project.project_template.action_needs_approval(
+                if project_template.action_needs_approval(
                     allocation=new_details.allocation
                 ):
                     logger.info(
-                        f"{identifier} with class {managed_project.project_template} requires approval for allocation changes."
+                        f"{identifier} with class {project_template} requires approval for allocation changes."
                     )
                     managed_project.set_needs_approval()
                     raise openportal.OpenPortalError(f"{identifier} needs approval!")
 
                 logger.info(
                     f"Setting allocation {new_details.allocation} for project {identifier}"
+                )
+                utils.set_project_credits(
+                    project, project_template.convert_to_credits(new_details.allocation)
                 )
                 details.allocation = new_details.allocation
 
@@ -771,21 +782,61 @@ class OpenPortalBoard:
                 project.end_date = new_details.end_date
                 details.end_date = new_details.end_date
 
+        project.save()
+
+        if project.is_expired or project.is_removed:
+            # we can't make any changes to this project - return an error
+            managed_project.reject(
+                get_system_robot(),
+                f"{identifier} is expired or removed, cannot update project.",
+            )
+            logger.warning(
+                f"{identifier} is expired or removed, cannot update project."
+            )
+            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+
+        # Updating membership last, as we need to know the project is ok
         if new_details.members is not None:
             # Update the members of the project
-            for member, role in new_details.members.items():
-                old_role = details.members.get(member, None)
+            new_members = []
 
-                if old_role is None or old_role != role:
-                    logger.info(
-                        f"Adding member {member} with role {role} to project {identifier}"
+            if details.members is None:
+                details.members = new_details.members
+                new_members = list(new_details.members.items())
+            else:
+                for member, role in new_details.members.items():
+                    old_role = details.members.get(member, None)
+
+                    if old_role is None or old_role != role:
+                        details.members[member] = role
+                        new_members.append((member, role))
+
+                    # note that we don't remove people from a project!
+
+            # Go through the new members and either change their role
+            # if they exist, or send an invitation to join the project
+            for email, role in new_members:
+                # Get the matching role from the project class
+                try:
+                    role = project_template.get_local_role_for(role)
+                except Exception:
+                    logger.warning(
+                        f"No matching role found for {role} in {project_template}. Skipping."
                     )
-                    details.members[member] = role
+                    continue
 
-                # note that we don't remove people from a project!
+                if role is not None:
+                    # always send an email invitation to the user so
+                    # that they have to actively accept the role in the
+                    # project
+                    utils.invite_user_to_project(
+                        project=project,
+                        email=email,
+                        role=role,
+                        send_email=True,
+                    )
 
         # save the updated project and details
-        project.save()
         managed_project.set_details(details)
         managed_project.save()
 

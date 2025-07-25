@@ -422,10 +422,6 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                 )
 
                 if roles.exists():
-                    logger.info(
-                        f"Adding user {user} with roles {roles} to project {project}"
-                    )
-
                     if len(roles) > 1:
                         logger.warning(
                             f"User {user} has multiple roles in project {project}: {roles}. Only using the first one."
@@ -466,6 +462,10 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                             f"User {user} has empty role name in project {project}. Not adding user!"
                         )
                         continue
+
+                    logger.info(
+                        f"Adding user {user} with role {role_name} to project {project}"
+                    )
 
                     details.add_member(email, role_name)
             except Exception as e:
