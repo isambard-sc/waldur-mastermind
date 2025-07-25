@@ -16,6 +16,7 @@ from rest_framework.permissions import IsAuthenticated
 from http import HTTPStatus as status
 
 from waldur_core.core import utils as core_utils
+from waldur_core.users.enums import InvitationState
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import get_connected_projects
 
@@ -473,8 +474,8 @@ def access_for_email(request):
 
     for invitation in qs:
         if invitation.state in [
-            invitation.State.PENDING,
-            invitation.State.REQUESTED,
+            InvitationState.PENDING,
+            InvitationState.REQUESTED,
         ]:
             is_authorised = True
             email_in_waldur = invitation.email
