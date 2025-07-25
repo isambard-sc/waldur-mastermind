@@ -685,16 +685,12 @@ class OpenPortalBoard:
             managed_project.project_template.action_needs_approval()
             and not managed_project.is_approved()
         ):
-            # We need to approve update requests for this project class
             logger.info(
                 f"{identifier} with class {managed_project.project_template} requires approval for project updates."
             )
 
             managed_project.set_needs_approval()
 
-            # Here you would typically send a notification to the admin or
-            # the person responsible for approving project update requests.
-            # For now, we will just raise an error to indicate that approval is needed.
             raise openportal.OpenPortalError(
                 f"{identifier} with class {managed_project.project_template} requires approval for project updates"
             )

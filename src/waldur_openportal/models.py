@@ -1856,10 +1856,51 @@ class ManagedProject(ReviewMixin, models.Model):
     def get_project_template(self) -> ProjectTemplate:
         """
         Get the ProjectTemplate for this project.
-        If the project class is not set, raise an error.
+        This will try to resolve the project template
+        from the information in the project details if
+        one is not set
         """
-        if not self.project_template:
-            raise ValueError("Project class is not set for this project.")
+        if self.project_template is None:
+            details = self.get_details()
+
+            if details.project_template is None:
+                logger.error(
+                    "Project does not have a project template set and no project template is defined in the project details."
+                )
+                self.delete()
+                raise ValueError(
+                    "Project does not have a project template set and no project template is defined in the project details."
+                )
+
+            try:
+                remote_identifier = self.get_remote_identifier()
+            except Exception:
+                logger.error(
+                    "Project does not have a remote identifier set, cannot resolve project template."
+                )
+                self.delete()
+                raise ValueError(
+                    "Project does not have a remote identifier set, cannot resolve project template."
+                )
+
+            remote_portal = remote_identifier.portal
+
+            try:
+                self.project_template = ProjectTemplate.objects.get(
+                    name=details.project_template,
+                    portal=remote_portal,
+                )
+            except ProjectTemplate.DoesNotExist:
+                logger.error(
+                    f"Project template {details.project_template} for portal {remote_portal} does not exist."
+                )
+                self.delete()
+                raise ValueError(
+                    f"Project template {details.project_template} for portal {remote_portal} does not exist."
+                )
+
+            self.save(update_fields=["project_template"])
+
         return self.project_template
 
     def set_project_template(self, project_template: ProjectTemplate):

@@ -356,21 +356,25 @@ def user_is_staff_or_service_provider_owner_or_service_provider_manager(
     if not project:
         raise PermissionDenied()
 
-    if project.project_template is None:
-        raise PermissionDenied()
+    # Force getting the project_template, as this will
+    # delete the project if there is no template or it is not valid
+    project_template = project.get_project_template()
 
-    if project.project_template.provider is None:
-        raise PermissionDenied()
-
-    if project.project_template.customer is None:
+    if project_template is None:
         raise PermissionDenied()
 
     if user.is_staff:
         return True
 
+    if project_template.provider is None:
+        raise PermissionDenied()
+
+    if project_template.customer is None:
+        raise PermissionDenied()
+
     if _has_owner_or_manager_access(
-        user, project.project_template.provider
-    ) and _has_owner_access(user, project.project_template.customer):
+        user, project_template.provider
+    ) and _has_owner_access(user, project_template.customer):
         return True
 
     raise PermissionDenied()
@@ -801,6 +805,9 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         old_project = managed_project.project
         managed_project.project = None
         managed_project.save(update_fields=["project"])
+
+        # We will need to approve any further changes to this managed project
+        managed_project.set_needs_approval(True)
 
         logger.info(
             f"Project {old_project.uuid} detached from ManagedProject {managed_project.identifier} "

@@ -138,6 +138,23 @@ def delete_project(sender, instance, **kwargs):
             )
         )
 
+    # Also make sure that any connected managed project is marked as needing approval.
+    # This ensures that the site admin will be aware of the deletion and
+    # will need to approve any further changes.
+    managed_projects = models.ManagedProject.objects.filter(project=project)
+
+    for managed_project in managed_projects:
+        managed_project.set_needs_approval(
+            True,
+            comment="Attached project was deleted.",
+        )
+        managed_project.project = None
+        managed_project.save(update_fields=["project"])
+        logger.info(
+            f"ManagedProject {managed_project.identifier} marked as needing approval "
+            f"due to deletion of attached project: {project}"
+        )
+
 
 @if_plugin_enabled
 def update_user(sender, instance, force_add=False, **kwargs):
