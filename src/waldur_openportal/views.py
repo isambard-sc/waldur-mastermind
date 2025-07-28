@@ -25,8 +25,9 @@ from waldur_core.permissions.fixtures import ServiceProviderRole
 from waldur_core.core.permissions import IsAdminOrReadOnly
 from waldur_core.structure.permissions import IsAdminOrOwner
 from waldur_core.structure.permissions import _has_owner_access
+from waldur_core.core import utils as core_utils
 
-from . import executors, filters, models, serializers
+from . import executors, filters, models, serializers, tasks
 
 logger = logging.getLogger(__name__)
 
@@ -707,6 +708,10 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
         project.approve(request.user, comment)
+
+        # trigger a task to update the project
+        tasks.managed_project_approved.delay(core_utils.serialize_instance(project))
+
         return Response(status=status.HTTP_200_OK)
 
     @extend_schema(

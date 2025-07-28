@@ -253,6 +253,19 @@ def get_remote_association(user, allocation):
             )
 
 
+def get_project_credits(project) -> float:
+    """
+    Get the credits for the project.
+    If the project has no credits, return 0.0
+    """
+    if not isinstance(project, structure_models.Project):
+        raise TypeError("project must be an instance of Project")
+
+    logger.warning("NEED TO IMPLEMENT get_project_credits")
+
+    return 0.0
+
+
 def set_project_credits(project, credits: float):
     """
     Set the credits for the project to the passed value
@@ -260,18 +273,20 @@ def set_project_credits(project, credits: float):
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
 
-    try:
-        credits = float(credits)
-    except (ValueError, TypeError) as e:
-        logger.error(f"Invalid credits value: {credits}. Must be a float.")
-        raise ValueError(f"Invalid credits value: {credits}. Must be a float.") from e
+    logger.warning("NEED TO IMPLEMENT set_project_credits")
 
-    if credits < 0:
-        credits = 0.0
 
-    logger.info(
-        f"Setting credits for project {project} to {credits} - NEEDS IMPLEMENTING"
-    )
+def get_current_members(project) -> dict[str, str]:
+    """
+    Return a dictionary of all of the current members of the project,
+    (email addresses) and their current roles.
+    """
+    if not isinstance(project, structure_models.Project):
+        raise TypeError("project must be an instance of Project")
+
+    members = {}
+
+    return members
 
 
 def invite_user_to_project(project, email, role, send_email: bool = True):

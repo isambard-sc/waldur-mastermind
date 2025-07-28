@@ -34,6 +34,7 @@ MAX_PROJECTIDENTIFIER_LENGTH = 64
 MAX_PORTALIDENTIFIER_LENGTH = 32
 MAX_PROJECTCLASS_LENGTH = 128
 MAX_ALLOWED_DESTINATIONS_LENGTH = 1024
+MAX_DESTINATION_LENGTH = 256
 
 
 class OnceTask(models.Model):
@@ -1714,7 +1715,7 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
             return allocation.size
 
     def action_needs_approval(
-        self, allocation: openportal.Allocation | None = None
+        self, allocation: openportal.Allocation | float | None = None
     ) -> bool:
         """
         Check if the action needs approval based on the passed allocation.
@@ -1724,7 +1725,15 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
         if self.approval_limit is None and self.max_credit_limit is None:
             return False
 
-        credits = self.convert_to_credits(allocation)
+        if isinstance(allocation, float):
+            # If allocation is a float, treat it as credits directly
+            credits = allocation
+        elif isinstance(allocation, openportal.Allocation):
+            # If allocation is an Allocation object, convert it to credits
+            credits = self.convert_to_credits(allocation)
+        elif allocation is None:
+            # If allocation is None, treat it as 0 credits
+            credits = 0.0
 
         return self.exceeds_approval_limit(credits) or self.exceeds_max_credit_limit(
             credits
@@ -1798,6 +1807,18 @@ class ManagedProject(ReviewMixin, models.Model):
     and to ensure that we don't create the same project multiple times.
     """
 
+    # This is the destination used to send instructions from the
+    # remote portal to this portal
+    destination = models.CharField(
+        max_length=MAX_DESTINATION_LENGTH,
+        verbose_name=_("destination"),
+        help_text=_(
+            "The destination used to send instructions from the remote portal."
+        ),
+        blank=True,
+        null=True,
+    )
+
     # This is the OpenPortal ProjectIdentifier from the portal that
     # requested and manages this project
     identifier = models.CharField(
@@ -1844,6 +1865,34 @@ class ManagedProject(ReviewMixin, models.Model):
         null=True,
         help_text=_("The local project identifier in this portal."),
     )
+
+    def assert_same_destination(self, destination: openportal.Destination):
+        """
+        Assert that the destination matches the one set in this project.
+        If it does not match, raise an error.
+        """
+        if not isinstance(destination, openportal.Destination):
+            destination = openportal.Destination(destination)
+
+        if self.destination is None:
+            # If the destination is not set, set it to the one provided
+            self.destination = str(destination)
+            self.save(update_fields=["destination"])
+            return
+
+        if self.destination != str(destination):
+            raise ValueError(
+                f"Destination {self.destination} does not match expected destination {destination}."
+            )
+
+    def get_destination(self) -> openportal.Destination:
+        """
+        Get the destination for this project.
+        If the destination is not set, raise an error.
+        """
+        if self.destination is None:
+            raise ValueError("Destination is not set for this project.")
+        return openportal.Destination(self.destination)
 
     def has_project_template(self) -> bool:
         """
@@ -1991,56 +2040,27 @@ class ManagedProject(ReviewMixin, models.Model):
             f"{self.get_remote_identifier()}:{self.get_local_identifier()}"
         )
 
-    def merge_details(self, new_details: openportal.ProjectDetails):
-        """
-        Merge the new ProjectDetails into the existing details.
-        If the new details are not an instance of ProjectDetails, convert it.
-        """
-        if not isinstance(new_details, openportal.ProjectDetails):
-            new_details = openportal.ProjectDetails(new_details)
-
-        if self.details is None:
-            self.set_details(new_details)
-        else:
-            old_details = self.get_details()
-
-            if (
-                new_details.project_class is not None
-                and new_details.project_class != old_details.project_class
-            ):
-                raise ValueError(
-                    "Cannot change project class of an existing project. Please create a new project with the desired class."
-                )
-
-            if new_details.name is not None:
-                old_details.name = new_details.name
-
-            if new_details.description is not None:
-                old_details.description = new_details.description
-
-            if new_details.start_date is not None:
-                old_details.start_date = new_details.start_date
-
-            if new_details.end_date is not None:
-                old_details.end_date = new_details.end_date
-
-            if new_details.allocation is not None:
-                old_details.allocation = new_details.allocation
-
-            if new_details.members is not None:
-                old_details.members = new_details.members
-
-            self.set_details(old_details)
-
     def set_details(self, details: openportal.ProjectDetails):
         """
         Set the ProjectDetails object for this project.
         If the details are not an instance of ProjectDetails, convert it.
         """
         if not isinstance(details, openportal.ProjectDetails):
-            details = openportal.ProjectDetails(details)
+            if not isinstance(details, str):
+                details = openportal.ProjectDetails(json.dumps(details))
+            else:
+                details = openportal.ProjectDetails(details)
 
-        self.details = json.loads(str(details))
+        new_details = json.loads(str(details))
+
+        if not isinstance(new_details, dict):
+            raise ValueError(
+                "Project details must be a dict, not a string or other type."
+            )
+
+        if self.details != new_details:
+            self.details = new_details
+            self.save(update_fields=["details"])
 
     def get_details(self) -> openportal.ProjectDetails:
         """

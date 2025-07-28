@@ -39,6 +39,51 @@ try:
         if not hasattr(ProjectDetails, "project_template"):
             ProjectDetails.project_template = ProjectDetails.project_class
 
+        if not hasattr(ProjectDetails, "merge"):
+
+            def _merge(slf, other):
+                from copy import deepcopy
+
+                merged = deepcopy(slf)
+
+                # We only update the project template if it is not already set
+                if merged.project_template is None:
+                    merged.project_template = other.project_template
+                elif (
+                    other.project_template is not None
+                    and merged.project_template != other.project_template
+                ):
+                    raise ValueError(
+                        "Cannot merge project details with different project templates."
+                    )
+
+                # Otherwise, overwrite the existing fields if they are set
+                if other.name is not None:
+                    merged.name = other.name
+
+                if other.description is not None:
+                    merged.description = other.description
+
+                if other.start_date is not None:
+                    merged.start_date = other.start_date
+
+                if other.end_date is not None:
+                    merged.end_date = other.end_date
+
+                if other.allocation is not None:
+                    merged.allocation = other.allocation
+
+                if other.members is not None:
+                    if merged.members is None:
+                        merged.members = other.members
+                    else:
+                        for key, value in other.members.items():
+                            merged.members[key] = value
+
+                return merged
+
+            ProjectDetails.merge = _merge
+
     except ImportError:
         from openportal import ProjectTemplate
 

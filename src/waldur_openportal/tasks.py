@@ -1069,13 +1069,12 @@ def update_project(
     board: OpenPortalBoard,
     project: openportal.ProjectIdentifier,
     details: openportal.ProjectDetails,
-    force_update: bool = False,
 ) -> openportal.ProjectMapping:
     """
     Update the project in the OpenPortal board with the given details.
     If the project does not exist, then there will be an error.
     """
-    mapping = board.update_project(project, details, force_update=force_update)
+    mapping = board.update_project(project, details)
 
     # schedule creation of default resources again in case any were missed
     try:
@@ -1108,9 +1107,43 @@ def create_project(
 
     # next, update the details of the project to match the details provided.
     # This will also create the default resources for the project
-    mapping = update_project(board, mapping.project, details, force_update=True)
+    mapping = update_project(board, mapping.project, details)
 
     return mapping
+
+
+@shared_task(name="waldur_openportal.managed_project_approved")
+def managed_project_approved(serialized_managed_project):
+    """
+    This task is called when a managed project is approved. It will create the
+    default resources for the project.
+    """
+    logger.info(
+        f"OpenPortal task.managed_project_approved: {serialized_managed_project}"
+    )
+
+    if isinstance(serialized_managed_project, models.ManagedProject):
+        managed_project = serialized_managed_project
+    else:
+        managed_project = core_utils.deserialize_instance(serialized_managed_project)
+
+    if not isinstance(managed_project, models.ManagedProject):
+        logger.error(
+            f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(managed_project)}"
+        )
+        raise ValueError(
+            f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(managed_project)}"
+        )
+
+    board = OpenPortalBoard(managed_project.get_destination())
+    identifier = managed_project.get_remote_identifier()
+    details = managed_project.get_details()
+
+    result = update_project(board, identifier, details)
+
+    logger.info(
+        f"OpenPortal - Managed project {managed_project} approved - mapping is {result}"
+    )
 
 
 @shared_task(name="waldur_openportal.run_job")

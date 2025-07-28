@@ -71,6 +71,13 @@ class OpenPortalBoard:
                 f"Failed to get portal name from destination {self._destination}: {e}"
             )
 
+    def destination(self) -> openportal.Destination:
+        """
+        Return the destination that this board is connected to.
+        This is the destination that the OpenPortal Bridge is connected to.
+        """
+        return self._destination
+
     def load_config(self):
         """
         Load the OpenPortal configuration from the file specified
@@ -132,53 +139,6 @@ class OpenPortalBoard:
 
         return job
 
-    def _verify_existing_project_details(self, managed_project: models.ManagedProject):
-        """
-        Verify that the existing project details match the managed project.
-        If not, update the project to have the correct details
-        """
-        project = managed_project.project
-
-        if project is None:
-            logger.error(
-                f"ManagedProject {managed_project} does not have an associated project."
-            )
-            return
-
-        details = managed_project.get_details()
-
-        if details is None:
-            logger.error(
-                f"ManagedProject {managed_project} does not have project details."
-            )
-            return
-
-        if details.name is not None and details.name != project.name:
-            project.name = details.name
-
-        if (
-            details.description is not None
-            and details.description != project.description
-        ):
-            project.description = details.description
-
-        if details.start_date is not None and details.start_date != project.start_date:
-            project.start_date = details.start_date
-
-        if details.end_date is not None and details.end_date != project.end_date:
-            project.end_date = details.end_date
-
-        project.save()
-
-        if details.members is not None:
-            # Check that these members are already in the project...
-            # Note that we don't change roles for people who have already
-            # been added to the project, or for invitations already sent
-            logger.warning("Need to verify project members!")
-
-        if details.allocation is not None:
-            logger.warning("Need to verify project allocation!")
-
     def _get_project_template(
         self, managed_project: models.ManagedProject, details: openportal.ProjectDetails
     ) -> models.ProjectTemplate:
@@ -229,6 +189,14 @@ class OpenPortalBoard:
 
         # See if we have an existing ProjectTemplate for the requesting remote portal and class
         remote_portal = str(identifier.portal)
+
+        # Make sure that this portal matches the one we are connected to
+        if remote_portal != self.portal():
+            managed_project.delete()
+
+            raise openportal.OpenPortalError(
+                f"Project class '{project_template}' is not allowed for portal '{remote_portal}'"
+            )
 
         try:
             project_template = models.ProjectTemplate.objects.filter(
@@ -551,6 +519,8 @@ class OpenPortalBoard:
                 f"Retrieved existing ManagedProject for identifier {identifier}: {managed_project}"
             )
 
+        managed_project.assert_same_destination(self.destination())
+
         # get the project class of this project
         project_template = self._get_project_template(managed_project, details)
 
@@ -616,14 +586,12 @@ class OpenPortalBoard:
         return self.update_project(
             identifier=identifier,
             new_details=details,
-            force_update=True,
         )
 
     def update_project(
         self,
         identifier: openportal.ProjectIdentifier,
         new_details: openportal.ProjectDetails,
-        force_update: bool = False,
     ) -> openportal.ProjectMapping:
         """
         Update a project in OpenPortal with the given identifier and details.
@@ -656,13 +624,16 @@ class OpenPortalBoard:
                 identifier=identifier, details=new_details, force_request_approval=True
             )
 
+        managed_project.assert_same_destination(self.destination())
+
         # We can't do anything if the project is pending approval or canceled
         if managed_project.is_pending():
             logger.warning(f"{identifier} is pending approval!")
 
             # We should update the project details to reflect the pending state
-            managed_project.merge_details(new_details)
-            managed_project.save()
+            managed_project.set_details(
+                managed_project.get_details().merge(new_details)
+            )
 
             raise openportal.OpenPortalError(f"{identifier} is pending approval!")
         elif managed_project.is_canceled():
@@ -722,70 +693,63 @@ class OpenPortalBoard:
             )
             self._get_local_identifier(managed_project)
 
-        # first, make sure that the current project details are properly
-        # set in the project...
-        self._verify_existing_project_details(managed_project)
-
-        # check to see any of the details have changed - if not, skip the update
-        if not force_update and managed_project.details == str(new_details):
-            logger.info(
-                f"Project {identifier} details have not changed, skipping update."
-            )
-            return managed_project.get_mapping()
-
         # get the project being managed
         project = managed_project.project
-        details = managed_project.get_details()
 
-        ####
-        #### WE NEED TO CHANGE THE LOGIC TO COMPARE AGAINST THE ACTUAL PROJECT
-        #### DETAILS, NOT THE MANAGED PROJECT DETAILS
-        ####
+        # merge in the new details
+        logger.info(f"Merging new details into project {identifier}: {new_details}")
+        details = managed_project.get_details().merge(new_details)
+        logger.info(f"New details after merge: {details}")
+        managed_project.set_details(details)
+        logger.info(f"Updated ManagedProject {managed_project} with new details.")
 
-        if new_details.allocation is not None:
-            if details.allocation != new_details.allocation:
-                # check that we approve this allocation change
-                if project_template.action_needs_approval(
-                    allocation=new_details.allocation
-                ):
-                    logger.info(
-                        f"{identifier} with class {project_template} requires approval for allocation changes."
-                    )
-                    managed_project.set_needs_approval()
-                    raise openportal.OpenPortalError(f"{identifier} needs approval!")
+        # We still go through and check everything, in case the
+        # project has moved away from the requested details
+        # (or previous syncs failed to complete)
+        update_fields = []
 
+        logger.info("Updating project details...")
+
+        if details.name is not None:
+            if details.name != project.name:
                 logger.info(
-                    f"Setting allocation {new_details.allocation} for project {identifier}"
+                    f"Updating project name from {project.name} to {details.name}"
                 )
-                utils.set_project_credits(
-                    project, project_template.convert_to_credits(new_details.allocation)
+                project.name = details.name
+                update_fields.append("name")
+
+        if details.description is not None:
+            if details.description != project.description:
+                logger.info(
+                    f"Updating project description from {project.description} to {details.description}"
                 )
-                details.allocation = new_details.allocation
+                project.description = details.description
+                update_fields.append("description")
 
-        if new_details.name is not None:
-            if details.name != new_details.name:
-                project.name = str(new_details.name).strip()
-                details.name = str(new_details.name).strip()
-
-        if new_details.description is not None:
-            if details.description != new_details.description:
-                project.description = str(new_details.description).strip()
-                details.description = str(new_details.description).strip()
-
-        if new_details.start_date is not None:
-            if details.start_date != new_details.start_date:
+        if details.start_date is not None:
+            if details.start_date != project.start_date:
+                logger.info(
+                    f"Updating project start date from {project.start_date} to {details.start_date}"
+                )
                 project.start_date = new_details.start_date
-                details.start_date = new_details.start_date
+                update_fields.append("start_date")
 
-        if new_details.end_date is not None:
-            if details.end_date != new_details.end_date:
-                project.end_date = new_details.end_date
-                details.end_date = new_details.end_date
+        if details.end_date is not None:
+            if details.end_date != project.end_date:
+                logger.info(
+                    f"Updating project end date from {project.end_date} to {details.end_date}"
+                )
+                project.end_date = details.end_date
+                update_fields.append("end_date")
 
-        project.save()
+        if len(update_fields) > 0:
+            logger.info(
+                f"Updating project {identifier} with fields: {', '.join(update_fields)}"
+            )
+            project.save(update_fields=update_fields)
 
         if project.is_expired or project.is_removed:
-            # we can't make any changes to this project - return an error
+            # we can't make any further changes to this project - return an error
             managed_project.reject(
                 get_system_robot(),
                 f"{identifier} is expired or removed, cannot update project.",
@@ -795,34 +759,54 @@ class OpenPortalBoard:
             )
             raise openportal.OpenPortalError(f"{identifier} is rejected!")
 
+        if details.allocation is not None:
+            new_credits = project_template.convert_to_credits(details.allocation)
+            current_credits = utils.get_project_credits(project)
+
+            if current_credits != new_credits:
+                logger.info(
+                    f"Allocation for project {identifier} has changed from {current_credits} to {new_credits}"
+                )
+
+                # check that we approve this allocation change
+                if project_template.action_needs_approval(allocation=new_credits):
+                    logger.info(
+                        f"{identifier} with class {project_template} requires approval for allocation changes."
+                    )
+                    managed_project.set_needs_approval()
+                    raise openportal.OpenPortalError(f"{identifier} needs approval!")
+
+                logger.info(
+                    f"Setting allocation {details.allocation} for project {identifier}"
+                )
+                utils.set_project_credits(project, new_credits)
+
+                details.allocation = new_details.allocation
+
         # Updating membership last, as we need to know the project is ok
-        if new_details.members is not None:
+        if details.members is not None:
             # Update the members of the project
-            new_members = []
-
-            if details.members is None:
-                details.members = new_details.members
-                new_members = list(new_details.members.items())
-            else:
-                for member, role in new_details.members.items():
-                    old_role = details.members.get(member, None)
-
-                    if old_role is None or old_role != role:
-                        details.members[member] = role
-                        new_members.append((member, role))
-
-                    # note that we don't remove people from a project!
+            current_members = utils.get_project_members(project)
 
             # Go through the new members and either change their role
             # if they exist, or send an invitation to join the project
-            for email, role in new_members:
+            for email, role in details.members.items():
                 # Get the matching role from the project class
                 try:
                     role = project_template.get_local_role_for(role)
                 except Exception:
                     logger.warning(
-                        f"No matching role found for {role} in {project_template}. Skipping."
+                        f"No matching role found for {role} in {project_template}."
                     )
+                    role = None
+
+                role_name = role.name if role else None
+
+                # Get the existing role for this user if they are already a member
+                existing_role_name = current_members.get(email, None)
+
+                if existing_role_name == role_name:
+                    # nothing to do
                     continue
 
                 if role is not None:
@@ -835,10 +819,6 @@ class OpenPortalBoard:
                         role=role,
                         send_email=True,
                     )
-
-        # save the updated project and details
-        managed_project.set_details(details)
-        managed_project.save()
 
         return managed_project.get_mapping()
 
