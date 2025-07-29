@@ -14,9 +14,12 @@ from waldur_core.structure.managers import (
     get_project_users,
 )
 
+from waldur_core.core.utils import get_system_robot
+
 from waldur_core.permissions.utils import get_permissions
 from waldur_core.users.enums import InvitationState
 from waldur_core.users import models as user_models
+from waldur_core.users import tasks as user_tasks
 
 from waldur_mastermind.invoices import models as invoice_models
 
@@ -499,3 +502,26 @@ def invite_user_to_project(project, email, role, send_email: bool = True):
     logger.info(
         f"Inviting user with email {email} to project {project} with role {role} - NEEDS IMPLEMENTING"
     )
+
+    sender = get_system_robot()
+    sender = sender.full_name or sender.username
+
+    invitation = user_models.Invitation.objects.create(
+        scope=project,
+        email=email,
+        role=role,
+        state=InvitationState.PENDING,
+        customer=project.customer,
+    )
+
+    if project.start_date and project.start_date > timezone.now().date():
+        invitation.state = InvitationState.PENDING_PROJECT
+
+    logger.info(
+        f"Created invitation {invitation} for user {email} to project {project} with role {role}"
+    )
+
+    invitation.save()
+
+    if send_email:
+        user_tasks.process_invitation.delay(invitation.uuid.hex, sender)
