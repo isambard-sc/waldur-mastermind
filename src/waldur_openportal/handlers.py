@@ -9,6 +9,7 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.models import User
 from waldur_core.permissions.models import UserRole
 from waldur_core.structure.models import Customer, Project
+from waldur_mastermind.marketplace import models as marketplace_models
 
 from . import models, tasks, utils
 
@@ -79,6 +80,38 @@ def schedule_sync_on_quota_change(sender, instance, created=False, **kwargs):
         return
 
     transaction.on_commit(schedule_sync)
+
+
+@if_plugin_enabled
+def update_allocation_credits(sender, instance, **kwargs):
+    """
+    Update the allocation credits for the given resource. This is called
+    when a resource is created or updated, and will ensure that the
+    allocation credits are correctly set in OpenPortal.
+    """
+    resource = instance
+
+    if not isinstance(resource, marketplace_models.Resource):
+        logger.error(
+            f"OpenPortal - {resource} is not a Resource instance - it is {type(resource)}"
+        )
+        return
+
+    # Check to see if there is a remote allocation associated with this resource
+    uuid = str(resource.uuid)
+
+    for remote_allocation in models.RemoteAllocation.objects.filter(is_active=True):
+        if remote_allocation.marketplace_uuid == uuid:
+            project = remote_allocation.project
+
+            if not project.is_expired or project.is_removed:
+                logger.info(f"OpenPortal - updating project {project}")
+
+                transaction.on_commit(
+                    lambda: tasks.update_remote_project.delay(
+                        core_utils.serialize_instance(project)
+                    )
+                )
 
 
 @if_plugin_enabled

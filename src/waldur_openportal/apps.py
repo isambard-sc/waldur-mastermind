@@ -14,6 +14,7 @@ class OpenPortalConfig(AppConfig):
         from waldur_core.quotas.fields import CounterQuotaField, QuotaField
         from waldur_core.structure import models as structure_models
         from waldur_core.structure.registry import SupportedServices
+        from waldur_mastermind.marketplace import models as marketplace_models
 
         from . import handlers, models, utils
         from .backend import OpenPortalBackend
@@ -54,6 +55,12 @@ class OpenPortalConfig(AppConfig):
             handlers.schedule_sync_on_quota_change,
             sender=quota_models.QuotaLimit,
             dispatch_uid="waldur_openportal.handlers.schedule_sync_on_quota_save",
+        )
+
+        signals.post_save.connect(
+            handlers.update_allocation_credits,
+            sender=marketplace_models.Resource,
+            dispatch_uid="waldur_openportal.handlers.update_allocation_credits",
         )
 
         permission_signals.role_granted.connect(
