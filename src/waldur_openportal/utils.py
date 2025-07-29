@@ -1,4 +1,5 @@
 import re
+import decimal
 import logging
 
 from django.utils import timezone
@@ -12,7 +13,7 @@ from waldur_core.structure.managers import (
     get_connected_projects,
 )
 
-from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.invoices import models as invoice_models
 
 from . import models
 
@@ -253,7 +254,49 @@ def get_remote_association(user, allocation):
             )
 
 
-def get_project_credits(project) -> float:
+def get_project_spend_info(project) -> (decimal.Decimal, decimal.Decimal):
+    """
+    Return a tuple of the total credits and total spend for the passed project
+    """
+    if not isinstance(project, structure_models.Project):
+        raise TypeError("project must be an instance of Project")
+
+    total_credits = decimal.Decimal(0.0)
+    total_spend = decimal.Decimal(0.0)
+
+    # Get all the allocations for the project
+    try:
+        project_credit = invoice_models.ProjectCredit.objects.get(project=project)
+        total_credits = project_credit.value if project_credit else decimal.Decimal(0.0)
+    except invoice_models.ProjectCredit.DoesNotExist:
+        total_credits = decimal.Decimal(0.0)
+
+    # Get all the spend for the project
+    try:
+        invoice_items = invoice_models.InvoiceItem.objects.filter(project=project)
+    except Exception:
+        invoice_items = []
+
+    for invoice_item in invoice_items:
+        usage = decimal.Decimal(invoice_item.price)
+
+        if usage < 0:
+            # this is a credit, so add it to the total credits
+            total_credits += abs(usage)
+        elif usage > 0:
+            # this is a charge, so add it to the total spend
+            total_spend += usage
+
+        # no need to do anything if usage == 0
+
+    logger.info(
+        f"Project {project} has total credits: {total_credits}, total spend: {total_spend}"
+    )
+
+    return (total_credits, total_spend)
+
+
+def get_project_credits(project) -> decimal.Decimal:
     """
     Get the credits for the project.
     If the project has no credits, return 0.0
@@ -261,19 +304,104 @@ def get_project_credits(project) -> float:
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
 
-    logger.warning("NEED TO IMPLEMENT get_project_credits")
+    (total_credits, _) = get_project_spend_info(project)
 
-    return 0.0
+    return total_credits
 
 
-def set_project_credits(project, credits: float):
+def set_project_credits(project, credits: decimal.Decimal | float):
     """
     Set the credits for the project to the passed value
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
 
-    logger.warning("NEED TO IMPLEMENT set_project_credits")
+    try:
+        credits = decimal.Decimal(credits)
+    except (ValueError, TypeError):
+        logger.error(f"Invalid credits value: {credits} for project {project}")
+        raise ValueError(f"Invalid credits value: {credits} for project {project}")
+
+    if project.is_expired or project.is_removed:
+        logger.warning(
+            f"Cannot set credits for project {project} as it is expired or removed"
+        )
+        raise ValueError(
+            f"Cannot set credits for project {project} as it is expired or removed"
+        )
+
+    if credits < 0:
+        credits = decimal.Decimal(0.0)
+
+    (total_credits, total_spend) = get_project_spend_info(project)
+
+    if credits < total_credits:
+        # cannot reduce to less than the current total spend
+        if credits < total_spend:
+            logger.warning(
+                f"Cannot set project credits to {credits} as it is less than the total spend {total_spend} for project {project}"
+            )
+            logger.warning(
+                f"Instead, setting project credits to the total spend {total_spend} so that no more can be consumed"
+            )
+            credits = total_spend
+
+    change_in_credits = credits - total_credits
+
+    if abs(change_in_credits) < decimal.Decimal(0.01):
+        # no change in credits, so nothing to do
+        logger.info(
+            f"No change in credits for project {project}: {total_credits} -> {credits}"
+        )
+        return
+
+    if change_in_credits > decimal.Decimal(0):
+        # Increasing credits -
+        # Get the CustomerCredit and make sure that it has enough credits itself...
+        customer_credit, created = invoice_models.CustomerCredit.objects.get_or_create(
+            customer=project.customer,
+        )
+
+        remaining_customer_credit = (
+            customer_credit.value - customer_credit.allocated_to_projects
+        )
+
+        # We need a little more than the change just for safety
+        needed_customer_credit = change_in_credits + decimal.Decimal(0.1)
+
+        if remaining_customer_credit < needed_customer_credit:
+            logger.warning(
+                f"Not enough customer credit to allocate {change_in_credits} to project {project}. "
+                f"Remaining customer credit is {remaining_customer_credit} while "
+                f"we need {needed_customer_credit}."
+            )
+
+            customer_credit.value = (
+                customer_credit.value
+                + needed_customer_credit
+                - remaining_customer_credit
+            )
+            customer_credit.save(update_fields=["value"])
+            logger.warning(
+                f"Customer credit for {project.customer} increased to {customer_credit.value}"
+            )
+
+    # Now set the credits
+    project_credit, created = invoice_models.ProjectCredit.objects.get_or_create(
+        project=project,
+    )
+
+    try:
+        project_credit.value = project_credit.value + change_in_credits
+        project_credit.save(update_fields=["value"])
+        logger.info(
+            f"Project credits for project {project} set to {project_credit.value} (was {total_credits})"
+        )
+    except Exception as e:
+        logger.error(
+            f"Failed to set project credits for project {project} to {credits + change_in_credits}: {e}"
+        )
+        raise
 
 
 def get_current_members(project) -> dict[str, str]:

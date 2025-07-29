@@ -1069,12 +1069,13 @@ def update_project(
     board: OpenPortalBoard,
     project: openportal.ProjectIdentifier,
     details: openportal.ProjectDetails,
+    force_approve: bool = False,
 ) -> openportal.ProjectMapping:
     """
     Update the project in the OpenPortal board with the given details.
     If the project does not exist, then there will be an error.
     """
-    mapping = board.update_project(project, details)
+    mapping = board.update_project(project, details, force_approve=force_approve)
 
     # schedule creation of default resources again in case any were missed
     try:
@@ -1135,11 +1136,19 @@ def managed_project_approved(serialized_managed_project):
             f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(managed_project)}"
         )
 
+    if not managed_project.is_approved:
+        logger.error(
+            f"OpenPortal - ManagedProject {managed_project} is not approved - cannot call handler!"
+        )
+        raise ValueError(
+            f"OpenPortal - ManagedProject {managed_project} is not approved - cannot call handler!"
+        )
+
     board = OpenPortalBoard(managed_project.get_destination())
     identifier = managed_project.get_remote_identifier()
     details = managed_project.get_details()
 
-    result = update_project(board, identifier, details)
+    result = update_project(board, identifier, details, force_approve=True)
 
     logger.info(
         f"OpenPortal - Managed project {managed_project} approved - mapping is {result}"
