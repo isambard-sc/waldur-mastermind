@@ -11,7 +11,12 @@ from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import (
     get_connected_customers,
     get_connected_projects,
+    get_project_users,
 )
+
+from waldur_core.permissions.utils import get_permissions
+from waldur_core.users.enums import InvitationState
+from waldur_core.users import models as user_models
 
 from waldur_mastermind.invoices import models as invoice_models
 
@@ -404,7 +409,7 @@ def set_project_credits(project, credits: decimal.Decimal | float):
         raise
 
 
-def get_current_members(project) -> dict[str, str]:
+def get_project_members(project) -> dict[str, str]:
     """
     Return a dictionary of all of the current members of the project,
     (email addresses) and their current roles.
@@ -413,6 +418,68 @@ def get_current_members(project) -> dict[str, str]:
         raise TypeError("project must be an instance of Project")
 
     members = {}
+
+    project_user_ids = get_project_users(project.id)
+
+    users = core_models.User.objects.filter(id__in=project_user_ids)
+
+    for user in users:
+        if not user.is_active:
+            continue
+
+        if user.email is None:
+            continue
+
+        email = str(user.email).strip().lower()
+
+        if len(email) == 0:
+            continue
+
+        try:
+            permission = get_permissions(project, user).first()
+        except Exception:
+            continue
+
+        if permission is None:
+            continue
+
+        if permission.role is None:
+            continue
+
+        if permission.role.name is None:
+            continue
+
+        members[email] = str(permission.role.name)
+
+    invitations = user_models.Invitation.objects.filter(
+        state=InvitationState.PENDING,
+    )
+
+    for invite in invitations:
+        if invite.scope != project:
+            continue
+
+        if invite.email is None:
+            continue
+
+        email = str(invite.email).strip().lower()
+
+        if len(email) == 0:
+            continue
+
+        if invite.role is None:
+            continue
+
+        if invite.role.name is None:
+            continue
+
+        if email in members:
+            # already a member, so skip
+            continue
+
+        members[email] = str(invite.role.name)
+
+    logger.info(f"Current members of project {project}: {members}")
 
     return members
 
