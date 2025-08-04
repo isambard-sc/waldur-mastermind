@@ -100,12 +100,23 @@ def update_allocation_credits(sender, instance, **kwargs):
     # Check to see if there is a remote allocation associated with this resource
     uuid = str(resource.uuid)
 
+    logger.info(f"OpenPortal - checking remote allocations for resource {uuid}")
+
     for remote_allocation in models.RemoteAllocation.objects.filter(is_active=True):
+        # Don't do anything to allocations that are not yet in OpenPortal
+        if not remote_allocation.is_added_to_openportal():
+            logger.warning(
+                "Skipping remote allocation that is not added to OpenPortal."
+            )
+            continue
+
         if remote_allocation.marketplace_uuid == uuid:
             project = remote_allocation.project
 
             if not project.is_expired or project.is_removed:
-                logger.info(f"OpenPortal - updating project {project}")
+                logger.info(
+                    f"OpenPortal.update_allocation_credits - updating project {project}"
+                )
 
                 transaction.on_commit(
                     lambda: tasks.update_remote_project.delay(

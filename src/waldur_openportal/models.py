@@ -337,6 +337,22 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                 )
                 allocation = max_allocation
 
+        if resource is not None:
+            options = resource.options or {}
+
+            if "allocation" in options:
+                # make sure that the used allocation is reflected in
+                # the resource options
+                try:
+                    if float(resource.options["allocation"]) != float(allocation):
+                        logger.info(
+                            f"Updating allocation for resource {resource} to {allocation} {allocation_unit}"
+                        )
+                        resource.options["allocation"] = allocation
+                        resource.save(update_fields=["options"])
+                except Exception as e:
+                    logger.warning(f"Failed to set allocation: {e}")
+
         logger.info(
             f"Requested credits from allocation {allocation} with unit {allocation_unit}"
         )

@@ -187,26 +187,23 @@ class OpenPortalBoard:
                 f"Project class is empty for project {project}"
             )
 
-        # See if we have an existing ProjectTemplate for the requesting remote portal and class
-        remote_portal = str(identifier.portal)
+        # Make sure that we are the right board to manage this project
         project_destination = managed_project.get_destination()
 
-        # The portal that send the message is the first agent in the list
-        remote_portal_check = str(project_destination.agents[0])
-
-        # Make sure that this portal matches the one we are connected to
-        if remote_portal != remote_portal_check:
+        if project_destination != self.destination():
+            logger.error(
+                f"ManagedProject {managed_project} is not managed by this board. "
+                f"Expected destination {self.destination()}, got {project_destination}."
+            )
             managed_project.delete()
 
-            logger.error(
-                f"Inconsistent portal: {remote_portal} != {remote_portal_check} - cannot approve project! "
-                f"The project identifier is {identifier}, but the destination for the message is {project_destination}. "
-                f"This board manages the portal {self.portal()} via {self.destination()}."
+            raise openportal.OpenPortalError(
+                f"ManagedProject {managed_project} is not managed by this board. "
+                f"Expected destination {self.destination()}, got {project_destination}."
             )
 
-            raise openportal.OpenPortalError(
-                f"Inconsistent portal: {remote_portal} != {remote_portal_check} - cannot approve project!"
-            )
+        # See if we have an existing ProjectTemplate for the requesting remote portal and class
+        remote_portal = str(identifier.portal)
 
         try:
             project_template = models.ProjectTemplate.objects.filter(

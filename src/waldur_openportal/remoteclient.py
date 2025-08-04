@@ -28,6 +28,10 @@ class RemoteOpenPortalClient:
             )
             project_template = "default"
 
+        logger.info(
+            f"Creating OpenPortal client for instance '{instance_name}' with project template '{project_template}'"
+        )
+
         self._runner = OpenPortalRunner()
         self._destination = openportal.Destination(instance_name)
         self._project_template = openportal.ProjectTemplate(project_template)
@@ -140,7 +144,7 @@ class RemoteOpenPortalClient:
         details = self._to_project_details(details)
 
         logger.info(
-            f"Creating remote OpenPortal project {project} with details {details}"
+            f"Creating remote OpenPortal project {project} with details {details} on destination {self.destination()}"
         )
 
         mapping = self.run(f"{self.destination()} create_project {project} {details}")
