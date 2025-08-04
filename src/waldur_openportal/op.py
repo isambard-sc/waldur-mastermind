@@ -74,11 +74,7 @@ try:
                     merged.allocation = other.allocation
 
                 if other.members is not None:
-                    if merged.members is None:
-                        merged.members = other.members
-                    else:
-                        for key, value in other.members.items():
-                            merged.members[key] = value
+                    merged.members = other.members
 
                 return merged
 

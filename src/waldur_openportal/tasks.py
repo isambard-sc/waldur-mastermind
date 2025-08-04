@@ -214,6 +214,21 @@ def update_user(serialized_user):
         except Exception as e:
             logger.error(f"Failed to add {user} to {allocation}: {e}")
 
+    for allocation in utils.get_remote_project_allocations(user):
+        try:
+            # adding and updating are the same thing in OpenPortal
+            backend = allocation.get_backend()
+
+            # This call will make sure to create the project if it
+            # failed creation before
+            allocation = backend.check_added_allocation(allocation)
+
+            logger.info(f"Adding user {user} to remote {allocation}")
+
+            backend.add_user(allocation, user)
+        except Exception as e:
+            logger.error(f"Failed to add {user} to remote {allocation}: {e}")
+
 
 @shared_task(name="waldur_openportal.delete_user")
 def delete_user(serialized_user):
@@ -251,6 +266,21 @@ def delete_user(serialized_user):
             backend.delete_user(allocation, user)
         except Exception as e:
             logger.error(f"Failed to delete {user} from {allocation}: {e}")
+
+    for allocation in utils.get_remote_project_allocations(user):
+        try:
+            if not allocation.is_added_to_openportal():
+                logger.warning(f"{allocation} not in OpenPortal - skipping")
+                continue
+
+            backend = allocation.get_backend()
+            allocation = backend.check_added_allocation(allocation)
+
+            logger.info(f"Deleting user {user} from remote project {allocation}")
+
+            backend.delete_user(allocation, user)
+        except Exception as e:
+            logger.error(f"Failed to delete {user} from remote {allocation}: {e}")
 
 
 @shared_task(name="waldur_openportal.sync_allocation_usage")

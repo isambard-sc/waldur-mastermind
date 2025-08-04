@@ -532,12 +532,14 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                 f"Project {mapping.project} does not match allocation {self.get_project_identifier()}"
             )
 
-        if mapping.local_group != self.get_remote_project_identifier():
+        remote_identifier = openportal.ProjectIdentifier(mapping.local_group)
+
+        if remote_identifier != self.get_remote_project_identifier():
             logger.warning(
-                f"Changing remote project identifier from {self.remote_project_identifier} to {mapping.local_group} for {self}"
+                f"Changing remote project identifier from {self.get_remote_project_identifier()} to {remote_identifier} for {self}"
             )
 
-            self.remote_project_identifier = str(mapping.local_group)
+            self.set_remote_project_identifier(remote_identifier)
             self.save()
 
     @classmethod

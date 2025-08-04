@@ -60,8 +60,6 @@ def get_customer_allocations(user):
         is_active=True, project__customer__in=connected_customers
     )
 
-    print(f"customer_allocations for user {user}: {customer_allocations}")
-
     return customer_allocations
 
 
@@ -77,7 +75,21 @@ def get_project_allocations(user):
         is_active=True, project__in=connected_projects
     )
 
-    print(f"project_allocations for user {user}: {project_allocations}")
+    return project_allocations
+
+
+def get_remote_project_allocations(user):
+    """
+    Return all of the remote allocations associated with the passed user
+    to any project. This gives the projects in which the user is active.
+    Projects in which the user is inactive are ignored
+    """
+    connected_projects = get_connected_projects(user)
+
+    project_allocations = models.RemoteAllocation.objects.filter(
+        is_active=True, project__in=connected_projects
+    )
+
     return project_allocations
 
 
@@ -503,9 +515,6 @@ def invite_user_to_project(project, email, role, send_email: bool = True):
         f"Inviting user with email {email} to project {project} with role {role} - NEEDS IMPLEMENTING"
     )
 
-    sender = get_system_robot()
-    sender = sender.full_name or sender.username
-
     invitation = user_models.Invitation.objects.create(
         scope=project,
         email=email,
@@ -524,4 +533,4 @@ def invite_user_to_project(project, email, role, send_email: bool = True):
     invitation.save()
 
     if send_email:
-        user_tasks.process_invitation.delay(invitation.uuid.hex, sender)
+        user_tasks.process_invitation.delay(invitation.uuid.hex, "OpenPortal")

@@ -571,11 +571,10 @@ class RemoteOpenPortalBackend(ServiceBackend):
         if not isinstance(allocation, models.RemoteAllocation):
             raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
 
-        logger.warning(
-            "Remote user management is not implemented in OpenPortal backend."
-        )
+        # We just do an update to the project - this syncs the users
+        self.update_allocated_project(allocation, force_update=True)
 
-        return False
+        return True
 
     def delete_user(self, allocation: models.RemoteAllocation, user) -> bool:
         """
@@ -584,11 +583,10 @@ class RemoteOpenPortalBackend(ServiceBackend):
         if not isinstance(allocation, models.RemoteAllocation):
             raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
 
-        logger.warning(
-            "Remote user management is not implemented in OpenPortal backend."
-        )
+        # We just do an update to the project - this syncs the users
+        self.update_allocated_project(allocation, force_update=True)
 
-        return False
+        return True
 
     def set_resource_limits(self, allocation: models.RemoteAllocation):
         if not isinstance(allocation, models.RemoteAllocation):
