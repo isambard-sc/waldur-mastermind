@@ -2,6 +2,8 @@ import re
 import decimal
 import logging
 
+from constance import config
+
 from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
@@ -14,8 +16,6 @@ from waldur_core.structure.managers import (
     get_project_users,
 )
 
-from waldur_core.core.utils import get_system_robot
-
 from waldur_core.permissions.utils import get_permissions
 from waldur_core.users.enums import InvitationState
 from waldur_core.users import models as user_models
@@ -23,7 +23,8 @@ from waldur_core.users import tasks as user_tasks
 
 from waldur_mastermind.invoices import models as invoice_models
 
-from . import models
+from . import models, utils
+
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,28 @@ MAPPING = {
 FIELD_NAMES = MAPPING.keys()
 
 QUOTA_NAMES = MAPPING.values()
+
+
+def get_openportal_robot():
+    """
+    Return the OpenPortal robot user.
+    This is used for system-level operations that require a user context.
+    """
+    from waldur_core.core import models
+
+    robot_user, created = models.User.objects.get_or_create(
+        username="openportal_robot", is_staff=True, is_active=True
+    )
+    if created:
+        robot_user.set_unusable_password()
+        robot_user.description = (
+            "Special user used for performing actions on behalf of OpenPortal."
+        )
+        robot_user.first_name = "OpenPortal"
+        robot_user.last_name = "Robot"
+        robot_user.email = config.SITE_EMAIL
+        robot_user.save()
+    return robot_user
 
 
 def format_current_month():
@@ -519,6 +542,7 @@ def invite_user_to_project(project, email, role, send_email: bool = True):
         scope=project,
         email=email,
         role=role,
+        created_by=utils.get_openportal_robot(),
         state=InvitationState.PENDING,
         customer=project.customer,
     )

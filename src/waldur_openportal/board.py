@@ -5,7 +5,6 @@ import decimal
 
 from waldur_core.structure import models as structure_models
 from waldur_core.core.enums import ReviewStates
-from waldur_core.core.utils import get_system_robot
 
 from . import op as openportal
 from . import models
@@ -266,7 +265,7 @@ class OpenPortalBoard:
             # This is a bug - we should not have a ManagedProject without an identifier
             logger.error(f"{managed_project} does not have an identifier set.")
             managed_project.reject(
-                get_system_robot(),
+                utils.get_openportal_robot(),
                 f"{managed_project} does not have an identifier set.",
             )
             raise openportal.OpenPortalError("Project is rejected!")
@@ -277,7 +276,7 @@ class OpenPortalBoard:
                 f"{identifier} is expired or removed, cannot create project."
             )
             managed_project.reject(
-                get_system_robot(),
+                utils.get_openportal_robot(),
                 f"{identifier} is expired or removed, cannot create project.",
             )
             raise openportal.OpenPortalError(f"{identifier} is rejected!")
@@ -290,7 +289,7 @@ class OpenPortalBoard:
                 f"Details for {identifier} are None, but the project already exists."
             )
             managed_project.reject(
-                get_system_robot(),
+                utils.get_openportal_robot(),
                 f"{identifier} details are None, but the project already exists.",
             )
             raise openportal.OpenPortalError(f"{identifier} is rejected!")
@@ -316,7 +315,7 @@ class OpenPortalBoard:
                 f"ManagedProject {managed_project} does not have a project set."
             )
             managed_project.reject(
-                get_system_robot(),
+                utils.get_openportal_robot(),
                 f"ManagedProject {managed_project} does not have a project set.",
             )
             raise openportal.OpenPortalError(f"{managed_project} is rejected!")
@@ -335,7 +334,7 @@ class OpenPortalBoard:
                     f"Project class is not set for project {managed_project.project}"
                 )
                 managed_project.reject(
-                    get_system_robot(),
+                    utils.get_openportal_robot(),
                     f"Project class is not set for project {managed_project.project}",
                 )
                 raise openportal.OpenPortalError(f"{managed_project} is rejected!")
@@ -347,7 +346,7 @@ class OpenPortalBoard:
                     f"Project class {project_template} does not have a generator set."
                 )
                 managed_project.reject(
-                    get_system_robot(),
+                    utils.get_openportal_robot(),
                     f"Project class {project_template} does not have a generator set.",
                 )
                 raise openportal.OpenPortalError(f"{managed_project} is rejected!")
@@ -370,7 +369,7 @@ class OpenPortalBoard:
             # This is a bug - we should not have a ManagedProject without a project class
             logger.error(f"{managed_project} is in an invalid state.")
             managed_project.reject(
-                get_system_robot(),
+                utils.get_openportal_robot(),
                 f"{managed_project} is in an invalid state - project class or customer is not set.",
             )
             raise openportal.OpenPortalError(f"{identifier} is rejected!")
@@ -378,7 +377,7 @@ class OpenPortalBoard:
         # get the customer (organisation) in which the project should be created
         if project_template.customer is None:
             managed_project.reject(
-                get_system_robot(),
+                utils.get_openportal_robot(),
                 f"Project class {project_template} does not have a customer set.",
             )
             logger.warning(
@@ -447,7 +446,7 @@ class OpenPortalBoard:
 
         if not generator:
             managed_project.reject(
-                get_system_robot(),
+                utils.get_openportal_robot(),
                 f"Project class {project_template} does not have a generator.",
             )
             logger.warning(
@@ -458,7 +457,7 @@ class OpenPortalBoard:
         # at a minimum, we need to know the name of the project
         if details.name is None:
             managed_project.reject(
-                get_system_robot(),
+                utils.get_openportal_robot(),
                 f"Project name is not set for project {details}",
             )
             logger.warning(f"Project name is not set for project {details}")
@@ -468,7 +467,7 @@ class OpenPortalBoard:
 
         if len(project_name) == 0:
             managed_project.reject(
-                get_system_robot(),
+                utils.get_openportal_robot(),
                 f"Project name is empty for project {identifier}",
             )
             logger.warning(f"Project name is empty for project {identifier}")
@@ -691,7 +690,7 @@ class OpenPortalBoard:
         if managed_project.project.is_expired or managed_project.project.is_removed:
             # we can't make any changes to this project - return an error
             managed_project.reject(
-                get_system_robot(),
+                utils.get_openportal_robot(),
                 f"{identifier} is expired or removed, cannot update project.",
             )
             logger.warning(
@@ -763,7 +762,7 @@ class OpenPortalBoard:
         if project.is_expired or project.is_removed:
             # we can't make any further changes to this project - return an error
             managed_project.reject(
-                get_system_robot(),
+                utils.get_openportal_robot(),
                 f"{identifier} is expired or removed, cannot update project.",
             )
             logger.warning(

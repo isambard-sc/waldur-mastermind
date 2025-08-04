@@ -11,7 +11,6 @@ from waldur_core.core.enums import CoreStates
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_core.core.utils import get_system_robot
 
 from . import backend, models, utils
 
@@ -1053,8 +1052,8 @@ def create_default_resources(serialized_managed_project):
                 project=project,
                 offering=offering,
                 resource=resource,
-                created_by=get_system_robot(),
-                consumer_reviewed_by=get_system_robot(),
+                created_by=utils.get_openportal_robot(),
+                consumer_reviewed_by=utils.get_openportal_robot(),
                 plan=offering.plans.first(),
                 attributes={
                     "name": str(offering.name),

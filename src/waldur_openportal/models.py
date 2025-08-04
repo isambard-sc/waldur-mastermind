@@ -20,7 +20,6 @@ from waldur_core.structure.managers import get_project_users
 from waldur_core.permissions.models import UserRole, Role
 from waldur_core.core.mixins import ReviewMixin
 from waldur_core.core.enums import ReviewStates
-from waldur_core.core.utils import get_system_robot
 from waldur_openportal import utils
 
 logger = logging.getLogger(__name__)
@@ -2104,7 +2103,9 @@ class ManagedProject(ReviewMixin, models.Model):
                     ]
                 )
         else:
-            self.approve(get_system_robot(), comment="Approved automatically.")
+            self.approve(
+                utils.get_openportal_robot(), comment="Approved automatically."
+            )
 
     def is_pending(self) -> bool:
         """
