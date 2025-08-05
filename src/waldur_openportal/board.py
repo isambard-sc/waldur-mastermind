@@ -559,6 +559,21 @@ class OpenPortalBoard:
                 f"{identifier} does not have a project class set"
             )
 
+        if details.allocation is not None:
+            credits = decimal.Decimal(
+                project_template.convert_to_credits(details.allocation)
+            )
+
+            if project_template.action_is_rejected(allocation=float(credits)):
+                logger.info(
+                    f"{identifier} with class {project_template} is rejected as the allocation exceeds the limit."
+                )
+                managed_project.reject(
+                    utils.get_openportal_robot(),
+                    f"{identifier} is rejected as allocation exceeds the limit.",
+                )
+                raise openportal.OpenPortalError(f"{identifier} is rejected!")
+
         if (
             project_template.action_needs_approval()
             and not managed_project.is_approved()
@@ -662,6 +677,21 @@ class OpenPortalBoard:
             raise openportal.OpenPortalError(
                 f"{identifier} does not have a project class set"
             )
+
+        if new_details.allocation is not None:
+            credits = decimal.Decimal(
+                project_template.convert_to_credits(new_details.allocation)
+            )
+
+            if project_template.action_is_rejected(allocation=float(credits)):
+                logger.info(
+                    f"{identifier} with class {project_template} is rejected as the allocation exceeds the limit."
+                )
+                managed_project.reject(
+                    utils.get_openportal_robot(),
+                    f"{identifier} is rejected as allocation exceeds the limit.",
+                )
+                raise openportal.OpenPortalError(f"{identifier} is rejected!")
 
         if (
             project_template.action_needs_approval()
@@ -779,7 +809,17 @@ class OpenPortalBoard:
                 )
 
                 # check that we approve this allocation change
-                if (
+                if project_template.action_is_rejected(allocation=float(new_credits)):
+                    logger.info(
+                        f"{identifier} with class {project_template} is rejected as the allocation exceeds the limit."
+                    )
+                    managed_project.reject(
+                        utils.get_openportal_robot(),
+                        f"{identifier} is rejected as allocation exceeds the limit.",
+                    )
+                    raise openportal.OpenPortalError(f"{identifier} is rejected!")
+
+                elif (
                     project_template.action_needs_approval(
                         allocation=float(new_credits)
                     )

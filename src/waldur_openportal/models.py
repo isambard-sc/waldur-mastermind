@@ -1766,6 +1766,31 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
             credits
         )
 
+    def action_is_rejected(
+        self, allocation: openportal.Allocation | float | None = None
+    ) -> bool:
+        """
+        Check if the action is rejected based on the passed allocation.
+        If the maximum credit limit is None, then nothing is automatically
+        rejected. If the maximum credit limit is 0, then all actions are
+        rejected. Otherwise, only requests that involve requesting more
+        credits than the maximum credit limit are rejected.
+        """
+        if self.max_credit_limit is None:
+            return False
+
+        if isinstance(allocation, float):
+            # If allocation is a float, treat it as credits directly
+            credits = allocation
+        elif isinstance(allocation, openportal.Allocation):
+            # If allocation is an Allocation object, convert it to credits
+            credits = self.convert_to_credits(allocation)
+        elif allocation is None:
+            # If allocation is None, treat it as 0 credits
+            credits = 0.0
+
+        return self.exceeds_max_credit_limit(credits)
+
     def exceeds_max_credit_limit(self, credit_limit: float) -> bool:
         """
         Check if the given credit limit exceeds the maximum credit limit for this project class.
