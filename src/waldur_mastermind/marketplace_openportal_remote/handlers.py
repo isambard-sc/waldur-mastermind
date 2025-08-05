@@ -298,3 +298,66 @@ def send_resource_update_message_to_mqtt(
         return
 
     utils.push_resource_update_message(instance)
+
+
+def synch_offering_resource_options(sender, instance, **kwargs):
+    logger.info(
+        f"Synchronizing OpenPortal Remote resource options for Offering {instance}"
+    )
+
+    offering = instance
+    if offering.type != PLUGIN_NAME:
+        logger.info(f"Skipping as {offering.type} is not {PLUGIN_NAME}")
+        return
+
+    # check to make sure that the offering has the right resource_options
+    must_update = False
+
+    if offering.resource_options is None:
+        # this is the default from Waldur
+        must_update = True
+        offering.resource_options = {"options": {}, "order": []}
+
+    if "allocation" not in offering.resource_options["order"]:
+        # add allocation to the order
+        offering.resource_options["order"].append("allocation")
+
+    # The service settings are held in the offerings scope
+    max_allocation = None
+
+    if offering.scope:
+        try:
+            max_allocation = offering.scope.get_option("max_allocation")
+        except Exception as e:
+            logger.error(f"Error getting max_allocation from scope: {e}")
+
+    allocation_options = {
+        "type": "integer",
+        "label": "Allocation",
+        "help_text": "Allocation in resource units",
+        "required": False,
+        "min": 0,
+    }
+
+    if max_allocation is not None:
+        try:
+            allocation_options["max"] = int(max_allocation)
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error converting max_allocation to int: {e}.")
+
+    if "options" not in offering.resource_options:
+        # initialize options if not present
+        must_update = True
+        offering.resource_options["options"] = {}
+
+    if (
+        must_update
+        or offering.resource_options["options"].get("allocation") != allocation_options
+    ):
+        # update allocation options if they are different
+        logger.info(
+            f"Updating allocation options for offering {offering.uuid} with {allocation_options}"
+        )
+
+        offering.resource_options["options"]["allocation"] = allocation_options
+        offering.save(update_fields=["resource_options"])

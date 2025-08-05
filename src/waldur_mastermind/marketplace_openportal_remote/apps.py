@@ -80,6 +80,13 @@ class MarketplaceOpenPortalRemoteConfig(AppConfig):
         )
 
         signals.post_save.connect(
+            handlers.synch_offering_resource_options,
+            sender=marketplace_models.Offering,
+            dispatch_uid="waldur_mastermind.marketplace_openportal_remote."
+            "synch_offering_resource_options",
+        )
+
+        signals.post_save.connect(
             handlers.sync_component_user_usage_when_allocation_user_usage_is_submitted,
             sender=openportal_models.RemoteAllocationUserUsage,
             dispatch_uid="waldur_mastermind.marketplace_openportal_remote.sync_component_user_usage_when_allocation_user_usage_is_submitted",
