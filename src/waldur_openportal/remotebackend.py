@@ -325,10 +325,18 @@ class RemoteOpenPortalBackend(ServiceBackend):
             # add it again just to be sure
             try:
                 remote_identifier = self.client.add_project(project, details)
+            except openportal.ManagedProjectRejectedError as e:
+                logger.warning(f"OpenPortal project {project} is rejected: {e}. ")
+                allocation.error_message = str(e)
+                allocation.set_erred()
+                allocation.save()
+                return allocation
             except Exception as e:
                 logger.warning(
                     f"Unable to re-add project {project} to OpenPortal: {e}. This will be re-added later..."
                 )
+                allocation.state = CoreStates.CREATING
+                allocation.save()
                 return allocation
 
             logger.debug(
@@ -434,10 +442,21 @@ class RemoteOpenPortalBackend(ServiceBackend):
             mapping = self.client.update_project(project_identifier, project_details)
             allocation.successfully_updated(version)
             allocation.update_mapping(mapping)
+            allocation.state = CoreStates.OK
+            allocation.save()
+        except openportal.ManagedProjectRejectedError as e:
+            logger.warning(
+                f"OpenPortal project {project_identifier} is rejected: {e}. "
+            )
+            allocation.error_message = str(e)
+            allocation.set_erred()
+            allocation.save()
         except Exception as e:
             logger.warning(
                 f"Unable to update OpenPortal project {project_identifier}: {e}."
             )
+            allocation.state = CoreStates.UPDATING
+            allocation.save()
 
     def delete_allocated_project(self, allocation: models.RemoteAllocation):
         if not isinstance(allocation, models.RemoteAllocation):

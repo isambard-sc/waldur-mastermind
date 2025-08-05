@@ -265,7 +265,7 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"{managed_project} does not have an identifier set.",
             )
-            raise openportal.OpenPortalError("Project is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         if managed_project.project.is_expired or managed_project.project.is_removed:
             # any changes to this project are now not allowed - this is rejected
@@ -276,7 +276,7 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"{identifier} is expired or removed, cannot create project.",
             )
-            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         # we have already created this project, so we can just return the mapping - check
         # there the project details are in agreement with the existing project
@@ -289,7 +289,7 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"{identifier} details are None, but the project already exists.",
             )
-            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         if managed_project.local_identifier is None:
             self._get_local_identifier(managed_project)
@@ -300,7 +300,7 @@ class OpenPortalBoard:
         # Now create a unique shortname for this project using
         # the generator from the project class
         if managed_project is None:
-            raise openportal.OpenPortalError(
+            raise openportal.ManagedProjectRejectedError(
                 f"ManagedProject {managed_project} is None - cannot generate local identifier"
             )
 
@@ -315,7 +315,7 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"ManagedProject {managed_project} does not have a project set.",
             )
-            raise openportal.OpenPortalError(f"{managed_project} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         project_info, created = models.ProjectInfo.objects.get_or_create(
             project=waldur_project,
@@ -334,7 +334,7 @@ class OpenPortalBoard:
                     utils.get_openportal_robot(),
                     f"Project class is not set for project {managed_project.project}",
                 )
-                raise openportal.OpenPortalError(f"{managed_project} is rejected!")
+                raise openportal.ManagedProjectRejectedError()
 
             generator = project_template.get_generator()
 
@@ -346,7 +346,7 @@ class OpenPortalBoard:
                     utils.get_openportal_robot(),
                     f"Project class {project_template} does not have a generator set.",
                 )
-                raise openportal.OpenPortalError(f"{managed_project} is rejected!")
+                raise openportal.ManagedProjectRejectedError()
 
             shortname = project_info.generate_shortname(generator)
 
@@ -369,7 +369,7 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"{managed_project} is in an invalid state - project class or customer is not set.",
             )
-            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         # get the customer (organisation) in which the project should be created
         if project_template.customer is None:
@@ -380,7 +380,7 @@ class OpenPortalBoard:
             logger.warning(
                 f"Project class {project_template} does not have a customer set."
             )
-            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         customer = project_template.customer
 
@@ -429,14 +429,14 @@ class OpenPortalBoard:
             self._attach_existing_project(managed_project, orphaned_existing_project)
 
             if managed_project.is_rejected():
-                raise openportal.OpenPortalError(f"{identifier} is rejected!")
+                raise openportal.ManagedProjectRejectedError()
             else:
                 # We need to ask the site admin to approve this connection
                 managed_project.set_needs_approval(
                     True,
                     comment=f"Project {orphaned_existing_project} already exists in customer {customer} and is being attached to ManagedProject {managed_project}.",
                 )
-                raise openportal.OpenPortalError(f"{identifier} needs approval!")
+                raise openportal.ManagedProjectPendingError()
 
         # now get a generator for the project shortname
         generator = project_template.get_generator()
@@ -449,7 +449,7 @@ class OpenPortalBoard:
             logger.warning(
                 f"Project class {project_template} does not have a generator."
             )
-            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         # at a minimum, we need to know the name of the project
         if details.name is None:
@@ -458,7 +458,7 @@ class OpenPortalBoard:
                 f"Project name is not set for project {details}",
             )
             logger.warning(f"Project name is not set for project {details}")
-            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         project_name = str(details.name).strip()
 
@@ -468,7 +468,7 @@ class OpenPortalBoard:
                 f"Project name is empty for project {identifier}",
             )
             logger.warning(f"Project name is empty for project {identifier}")
-            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         # create the project in the customer
         waldur_project = structure_models.Project.objects.create(
@@ -542,13 +542,13 @@ class OpenPortalBoard:
         # We can't do anything if the project is pending approval or canceled
         if managed_project.is_pending():
             logger.warning(f"{identifier} is pending approval!")
-            raise openportal.OpenPortalError(f"{identifier} is pending approval!")
+            raise openportal.ManagedProjectPendingError()
         elif managed_project.is_canceled():
             logger.warning(f"{identifier} is canceled!")
-            raise openportal.OpenPortalError(f"{identifier} is canceled!")
+            raise openportal.ManagedProjectRejectedError("The project is canceled.")
         elif managed_project.is_rejected():
             logger.warning(f"{identifier} is rejected!")
-            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         if project_template is None:
             # This is a bug - we should not have a ManagedProject without a project class
@@ -572,7 +572,7 @@ class OpenPortalBoard:
                     utils.get_openportal_robot(),
                     f"{identifier} is rejected as allocation exceeds the limit.",
                 )
-                raise openportal.OpenPortalError(f"{identifier} is rejected!")
+                raise openportal.ManagedProjectRejectedError()
 
         if (
             project_template.action_needs_approval()
@@ -587,9 +587,7 @@ class OpenPortalBoard:
             # Here you would typically send a notification to the admin or
             # the person responsible for approving project creation requests.
             # For now, we will just raise an error to indicate that approval is needed.
-            raise openportal.OpenPortalError(
-                f"{identifier} requires approval for project creation"
-            )
+            raise openportal.ManagedProjectPendingError()
         elif not managed_project.is_approved():
             # If the project class does not require approval, we can proceed
             logger.info(
@@ -658,13 +656,13 @@ class OpenPortalBoard:
                 managed_project.get_details().merge(new_details)
             )
 
-            raise openportal.OpenPortalError(f"{identifier} is pending approval!")
+            raise openportal.ManagedProjectPendingError()
         elif managed_project.is_canceled():
             logger.warning(f"{identifier} is canceled!")
-            raise openportal.OpenPortalError(f"{identifier} is canceled!")
+            raise openportal.ManagedProjectRejectedError("The project is canceled.")
         elif managed_project.is_rejected():
             logger.warning(f"{identifier} is rejected!")
-            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         project_template = managed_project.get_project_template()
 
@@ -691,7 +689,7 @@ class OpenPortalBoard:
                     utils.get_openportal_robot(),
                     f"{identifier} is rejected as allocation exceeds the limit.",
                 )
-                raise openportal.OpenPortalError(f"{identifier} is rejected!")
+                raise openportal.ManagedProjectRejectedError()
 
         if (
             project_template.action_needs_approval()
@@ -703,9 +701,7 @@ class OpenPortalBoard:
 
             managed_project.set_needs_approval()
 
-            raise openportal.OpenPortalError(
-                f"{identifier} with class {project_template} requires approval for project updates"
-            )
+            raise openportal.ManagedProjectPendingError()
 
         if managed_project.project is None:
             # we actually need to create the project
@@ -723,7 +719,7 @@ class OpenPortalBoard:
             logger.warning(
                 f"{identifier} is expired or removed, cannot update project."
             )
-            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         if managed_project.local_identifier is None:
             logger.warning(
@@ -795,7 +791,7 @@ class OpenPortalBoard:
             logger.warning(
                 f"{identifier} is expired or removed, cannot update project."
             )
-            raise openportal.OpenPortalError(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         if details.allocation is not None:
             new_credits = decimal.Decimal(
@@ -817,7 +813,7 @@ class OpenPortalBoard:
                         utils.get_openportal_robot(),
                         f"{identifier} is rejected as allocation exceeds the limit.",
                     )
-                    raise openportal.OpenPortalError(f"{identifier} is rejected!")
+                    raise openportal.ManagedProjectRejectedError()
 
                 elif (
                     project_template.action_needs_approval(
@@ -829,7 +825,7 @@ class OpenPortalBoard:
                         f"{identifier} with class {project_template} requires approval for allocation changes."
                     )
                     managed_project.set_needs_approval()
-                    raise openportal.OpenPortalError(f"{identifier} needs approval!")
+                    raise openportal.ManagedProjectPendingError()
 
                 logger.info(
                     f"Setting allocation {details.allocation} for project {identifier}"

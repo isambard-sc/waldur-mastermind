@@ -28,10 +28,6 @@ class RemoteOpenPortalClient:
             )
             project_template = "default"
 
-        logger.info(
-            f"Creating OpenPortal client for instance '{instance_name}' with project template '{project_template}'"
-        )
-
         self._runner = OpenPortalRunner()
         self._destination = openportal.Destination(instance_name)
         self._project_template = openportal.ProjectTemplate(project_template)
@@ -274,9 +270,7 @@ class RemoteOpenPortalClient:
 
         if op_job.is_error:
             logger.error(f"Job {command} has failed: {op_job.error_message}")
-            raise openportal.OpenPortalError(
-                f"Job '{command}' failed: {op_job.error_message}"
-            )
+            raise openportal.convert_to_openportal_error(op_job.error_message)
         else:
             logger.debug(f"Job finished: {command} - SUCCESS")
             return op_job.result
