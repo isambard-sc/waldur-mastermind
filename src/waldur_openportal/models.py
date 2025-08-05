@@ -352,6 +352,16 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                         resource.save(update_fields=["options"])
                 except Exception as e:
                     logger.warning(f"Failed to set allocation: {e}")
+            else:
+                try:
+                    logger.info(
+                        f"Recording default allocation {allocation} for resource {resource}"
+                    )
+                    options["allocation"] = allocation
+                    resource.options = options
+                    resource.save(update_fields=["options"])
+                except Exception as e:
+                    logger.warning(f"Failed to set allocation: {e}")
 
         logger.info(
             f"Requested credits from allocation {allocation} with unit {allocation_unit}"
