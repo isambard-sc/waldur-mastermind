@@ -336,6 +336,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
                     f"Unable to re-add project {project} to OpenPortal: {e}. This will be re-added later..."
                 )
                 allocation.state = CoreStates.CREATING
+                allocation.error_message = "Project creation is still pending..."
                 allocation.save()
                 return allocation
 
@@ -362,15 +363,27 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
             try:
                 mapping = self.client.add_project(project_shortname, details)
+            except openportal.ManagedProjectRejectedError as e:
+                logger.warning(
+                    f"OpenPortal project {project_shortname} is rejected: {e}. "
+                )
+                allocation.error_message = str(e)
+                allocation.set_erred()
+                allocation.save()
+                return allocation
             except Exception as e:
                 logger.warning(
                     f"Unable to create OpenPortal project {project_shortname}: {e}. This will be created later..."
                 )
+                allocation.state = CoreStates.CREATING
+                allocation.error_message = "Project creation is still pending..."
+                allocation.save()
                 return allocation
 
             logger.info(
                 f"Created OpenPortal project {allocation.project} with mapping {mapping}"
             )
+            allocation.state = CoreStates.OK
             allocation.set_mapping(mapping)
             allocation.is_added = True
 
@@ -456,6 +469,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 f"Unable to update OpenPortal project {project_identifier}: {e}."
             )
             allocation.state = CoreStates.UPDATING
+            allocation.error_message = "Project update is still pending..."
             allocation.save()
 
     def delete_allocated_project(self, allocation: models.RemoteAllocation):

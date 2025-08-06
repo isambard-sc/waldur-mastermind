@@ -873,6 +873,39 @@ class OpenPortalBoard:
 
         return managed_project.get_mapping()
 
+    def remove_project(
+        self, identifier: openportal.ProjectIdentifier
+    ) -> openportal.ProjectMapping:
+        """
+        Remove a project in OpenPortal with the given identifier.
+        This will delete the ManagedProject, but will not delete
+        the project itself - this just severs the link between
+        the remote portal and the site portal.
+        """
+        logger.info(f"Removing project {identifier}")
+
+        if not isinstance(identifier, openportal.ProjectIdentifier):
+            raise openportal.OpenPortalError(
+                f"Invalid project identifier: {identifier}"
+            )
+
+        # Get the ManagedProject for this identifier, which must already exist
+        try:
+            managed_project = models.ManagedProject.objects.get(
+                identifier=str(identifier)
+            )
+        except models.ManagedProject.DoesNotExist:
+            logger.error(f"ManagedProject for identifier {identifier} does not exist.")
+            raise openportal.OpenPortalError(
+                f"ManagedProject for identifier '{identifier}' does not exist"
+            )
+
+        # Delete the ManagedProject
+        managed_project.delete()
+
+        # If the project was deleted, we can return None as there is no mapping anymore
+        return openportal.ProjectMapping(f"{identifier}:None")
+
     def get_project(
         self, identifier: openportal.ProjectIdentifier
     ) -> openportal.ProjectDetails:
@@ -930,6 +963,41 @@ class OpenPortalBoard:
         # Eventually add in the users in their roles etc.
 
         return details
+
+    def get_projects(
+        self, portal: openportal.PortalIdentifier
+    ) -> list[openportal.ProjectMapping]:
+        """
+        Get all projects in OpenPortal for the given portal identifier.
+        This returns a list of project mappings, which contain the
+        identifier in the requesting portal and the OpenPortal project
+        identifier used internally.
+        """
+        if not isinstance(portal, openportal.PortalIdentifier):
+            raise openportal.OpenPortalError(f"Invalid portal identifier: {identifier}")
+
+        mappings = []
+
+        for project in models.ManagedProject.objects.filter(
+            destination=self.destination()
+        ):
+            if not project.has_remote_identifier():
+                continue
+
+            remote_identifier = project.get_remote_identifier()
+
+            if remote_identifier.portal_identifier != portal:
+                # This project is not in the requested portal
+                continue
+
+            if project.has_local_identifier():
+                mappings.append(project.get_mapping())
+            else:
+                mappings.append(openportal.ProjectMapping(f"{remote_identifier}:None"))
+
+        logger.info(f"Mappings for portal {portal}: {mappings}")
+
+        return mappings
 
     def get_project_mapping(
         self, identifier: openportal.ProjectIdentifier
@@ -1020,6 +1088,40 @@ class OpenPortalBoard:
             )
 
         return openportal.UsageReport(openportal.PortalIdentifier("brics"))
+
+    def get_usage_reports(
+        self, portal: openportal.PortalIdentifier, date_range: openportal.DateRange
+    ) -> openportal.UsageReport:
+        """
+        Return a usage report that covers all of the projects managed by the
+        specified portal.
+        """
+        if not isinstance(portal, openportal.PortalIdentifier):
+            raise openportal.OpenPortalError(f"Invalid portal identifier: {portal}")
+
+        reports = []
+
+        for project in models.ManagedProject.objects.filter(
+            destination=self.destination()
+        ):
+            if not project.has_remote_identifier():
+                continue
+
+            remote_identifier = project.get_remote_identifier()
+
+            if remote_identifier.portal_identifier != portal:
+                # This project is not in the requested portal
+                continue
+
+            if project.has_local_identifier():
+                reports.append(
+                    self.get_usage_report(
+                        identifier=remote_identifier,
+                        date_range=date_range,
+                    )
+                )
+
+        return openportal.UsageReport.combine(reports)
 
     def send_result(self, job: openportal.Job) -> None:
         """

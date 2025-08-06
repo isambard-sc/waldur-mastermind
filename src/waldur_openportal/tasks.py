@@ -1239,6 +1239,9 @@ def run_job(serialized_job):
             identifier = openportal.ProjectIdentifier(args[0])
             details = openportal.ProjectDetails(args[1])
             result = create_project(board, identifier, details)
+        elif command == "remove_project":
+            identifier = openportal.ProjectIdentifier(args[0])
+            result = board.remove_project(identifier)
         elif command == "update_project":
             identifier = openportal.ProjectIdentifier(args[0])
             details = openportal.ProjectDetails(args[1])
@@ -1246,24 +1249,20 @@ def run_job(serialized_job):
         elif command == "get_project":
             identifier = openportal.ProjectIdentifier(args[0])
             result = board.get_project(identifier)
+        elif command == "get_projects":
+            identifier = openportal.PortalIdentifier(args[0])
+            result = board.get_projects(identifier)
         elif command == "get_project_mapping":
             identifier = openportal.ProjectIdentifier(args[0])
             result = board.get_project_mapping(identifier)
         elif command == "get_usage_report":
             identifier = openportal.ProjectIdentifier(args[0])
-            # This is the code we want, but need to wait for next release
-            # dates = openportal.DateRange.parse(args[1])
-
-            dates = args[1].split(":")
-
-            if len(dates) != 2:
-                raise ValueError(f"Invalid date range format: {args[1]}")
-
-            start_date = datetime.datetime.strptime(dates[0], "%Y-%m-%d").date()
-            end_date = datetime.datetime.strptime(dates[1], "%Y-%m-%d").date()
-            dates = openportal.DateRange(start_date, end_date)
-
+            dates = openportal.DateRange.parse(args[1])
             result = board.get_usage_report(identifier, dates)
+        elif command == "get_usage_reports":
+            identifier = openportal.PortalIdentifier(args[0])
+            dates = openportal.DateRange.parse(args[1])
+            result = board.get_usage_reports(identifier, dates)
         else:
             raise ValueError(f"Unknown command {command} for job {job.id}")
 
