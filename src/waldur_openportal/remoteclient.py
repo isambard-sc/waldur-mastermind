@@ -3,8 +3,10 @@ import os
 import datetime
 
 from . import op as openportal
+from . import utils as openportal_utils
 
 from waldur_slurm.structures import Account
+from waldur_core.structure import models as structure_models
 
 from .client import OpenPortalRunner
 
@@ -126,6 +128,44 @@ class RemoteOpenPortalClient:
         self.run(f"{self.destination()} remove_user {user}")
 
         logger.info(f"Deleted OpenPortal user '{user}'")
+
+    def _get_project_shortname(self, project: structure_models.Project) -> str:
+        """
+        Return the preferred shortname for the passed project.
+        """
+        shortname = openportal_utils.get_project_shortname(project)
+
+        if shortname is None:
+            logger.warning(
+                f"Project {project} does not have a shortname set - using default"
+            )
+            shortname = openportal_utils.set_default_project_shortname(project)
+
+        if shortname is None or len(shortname.strip()) == 0:
+            logger.error(f"Empty shortname for project: {project}")
+            raise openportal.OpenPortalOtherError(
+                f"Project {project} does not have a valid shortname set."
+            )
+
+        return shortname
+
+    def get_project_identifier(
+        self, project: structure_models.Project
+    ) -> openportal.ProjectIdentifier:
+        if project is None:
+            raise openportal.OpenPortalOtherError("Project cannot be None")
+
+        project_shortname = self._get_project_shortname(project)
+
+        if project_shortname is None or not project_shortname.strip():
+            logger.error(
+                f"Empty project_shortname for allocation: {allocation} - cannot create in OpenPortal"
+            )
+            raise openportal.OpenPortalOtherError(
+                f"Empty project_shortname for allocation. Please set a short name for {allocation.project}"
+            )
+
+        return self._to_project_identifier(project_shortname)
 
     def add_project(
         self, project: openportal.ProjectIdentifier, details: openportal.ProjectDetails

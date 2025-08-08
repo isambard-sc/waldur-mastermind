@@ -562,7 +562,7 @@ def sync_remote():
             CoreStates.OK,
         ]:
             logger.debug(
-                f"Remote allocation {remote_allocation} is not in a valid state for syncing - skipping"
+                f"Remote allocation {remote_allocation} is not in a valid state {remote_allocation.state} for syncing - skipping"
             )
             continue
 
@@ -941,8 +941,7 @@ def delete_remote_project(serialized_project):
 
             logger.info(f"Deleting remote project {remote_allocation}")
 
-            # Delete the remote project with the latest details
-            backend.delete_allocated_project(remote_allocation)
+            backend.delete_allocation(remote_allocation)
         except Exception as e:
             logger.error(f"Failed to delete remote project {remote_allocation}: {e}")
 

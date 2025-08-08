@@ -531,6 +531,35 @@ class OpenPortalBoard:
         # get the project class of this project
         project_template = self._get_project_template(managed_project, details)
 
+        if project_template is None:
+            # This is a bug - we should not have a ManagedProject without a project class
+            logger.error(f"{identifier} does not have a project class set")
+            managed_project.delete()
+
+            raise openportal.ManagedProjectRejectedError(
+                f"{identifier} does not have a project class set"
+            )
+
+        if details.allocation is not None:
+            credits = decimal.Decimal(
+                project_template.convert_to_credits(details.allocation)
+            )
+
+            if project_template.action_is_rejected(allocation=float(credits)):
+                logger.info(
+                    f"{identifier} with class {project_template} is rejected as the allocation exceeds the limit."
+                )
+
+                # Save the merged details so can debug
+                details = managed_project.get_details().merge(details)
+                managed_project.set_details(details)
+
+                managed_project.reject(
+                    utils.get_openportal_robot(),
+                    f"{identifier} is rejected as allocation exceeds the limit.",
+                )
+                raise openportal.ManagedProjectRejectedError()
+
         if force_request_approval:
             if not managed_project.is_rejected():
                 # If the project is not rejected, we need to set it to needs approval
@@ -549,30 +578,6 @@ class OpenPortalBoard:
         elif managed_project.is_rejected():
             logger.warning(f"{identifier} is rejected!")
             raise openportal.ManagedProjectRejectedError()
-
-        if project_template is None:
-            # This is a bug - we should not have a ManagedProject without a project class
-            logger.error(f"{identifier} does not have a project class set")
-            managed_project.delete()
-
-            raise openportal.OpenPortalError(
-                f"{identifier} does not have a project class set"
-            )
-
-        if details.allocation is not None:
-            credits = decimal.Decimal(
-                project_template.convert_to_credits(details.allocation)
-            )
-
-            if project_template.action_is_rejected(allocation=float(credits)):
-                logger.info(
-                    f"{identifier} with class {project_template} is rejected as the allocation exceeds the limit."
-                )
-                managed_project.reject(
-                    utils.get_openportal_robot(),
-                    f"{identifier} is rejected as allocation exceeds the limit.",
-                )
-                raise openportal.ManagedProjectRejectedError()
 
         if (
             project_template.action_needs_approval()
@@ -647,23 +652,6 @@ class OpenPortalBoard:
 
         managed_project.assert_same_destination(self.destination())
 
-        # We can't do anything if the project is pending approval or canceled
-        if managed_project.is_pending():
-            logger.warning(f"{identifier} is pending approval!")
-
-            # We should update the project details to reflect the pending state
-            managed_project.set_details(
-                managed_project.get_details().merge(new_details)
-            )
-
-            raise openportal.ManagedProjectPendingError()
-        elif managed_project.is_canceled():
-            logger.warning(f"{identifier} is canceled!")
-            raise openportal.ManagedProjectRejectedError("The project is canceled.")
-        elif managed_project.is_rejected():
-            logger.warning(f"{identifier} is rejected!")
-            raise openportal.ManagedProjectRejectedError()
-
         project_template = managed_project.get_project_template()
 
         if project_template is None:
@@ -672,7 +660,7 @@ class OpenPortalBoard:
                 f"{identifier} does not have a project class set. Cannot update project."
             )
             managed_project.delete()
-            raise openportal.OpenPortalError(
+            raise openportal.ManagedProjectRejectedError(
                 f"{identifier} does not have a project class set"
             )
 
@@ -685,6 +673,11 @@ class OpenPortalBoard:
                 logger.info(
                     f"{identifier} with class {project_template} is rejected as the allocation exceeds the limit."
                 )
+
+                # Save the merged details so can debug
+                new_details = managed_project.get_details().merge(new_details)
+                managed_project.set_details(new_details)
+
                 managed_project.reject(
                     utils.get_openportal_robot(),
                     f"{identifier} is rejected as allocation exceeds the limit.",
@@ -702,6 +695,23 @@ class OpenPortalBoard:
             managed_project.set_needs_approval()
 
             raise openportal.ManagedProjectPendingError()
+
+        # We can't do anything if the project is pending approval or canceled
+        if managed_project.is_pending():
+            logger.warning(f"{identifier} is pending approval!")
+
+            # We should update the project details to reflect the pending state
+            managed_project.set_details(
+                managed_project.get_details().merge(new_details)
+            )
+
+            raise openportal.ManagedProjectPendingError()
+        elif managed_project.is_canceled():
+            logger.warning(f"{identifier} is canceled!")
+            raise openportal.ManagedProjectRejectedError("The project is canceled.")
+        elif managed_project.is_rejected():
+            logger.warning(f"{identifier} is rejected!")
+            raise openportal.ManagedProjectRejectedError()
 
         if managed_project.project is None:
             # we actually need to create the project

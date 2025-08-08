@@ -89,26 +89,6 @@ class RemoteOpenPortalBackend(ServiceBackend):
         else:
             return True
 
-    def get_project_shortname(self, project):
-        """
-        Return the preferred shortname for the passed project.
-        """
-        shortname = openportal_utils.get_project_shortname(project)
-
-        if shortname is None:
-            logger.warning(
-                f"Project {project} does not have a shortname set - using default"
-            )
-            shortname = openportal_utils.set_default_project_shortname(project)
-
-        if shortname is None or len(shortname.strip()) == 0:
-            logger.error(f"Empty shortname for project: {project}")
-            raise ServiceBackendError(
-                f"Project {project} does not have a valid shortname set."
-            )
-
-        return shortname
-
     def sync_users(self, allocation: models.RemoteAllocation) -> None:
         if not isinstance(allocation, models.RemoteAllocation):
             raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
@@ -195,10 +175,10 @@ class RemoteOpenPortalBackend(ServiceBackend):
             CoreStates.OK,
         ]:
             logger.warning(
-                f"Remote allocation {allocation} is not in a valid state for adding - skipping"
+                f"Remote allocation {allocation} is not in a valid state {allocation.state} for adding - skipping"
             )
             raise ServiceBackendError(
-                f"Remote allocation {allocation} is not in a valid state for adding - skipping"
+                f"Remote allocation {allocation} is not in a valid state {allocation.state} for adding - skipping"
             )
 
         project = allocation.project
@@ -324,7 +304,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
             # add it again just to be sure
             try:
-                remote_identifier = self.client.add_project(project, details)
+                mapping = self.client.add_project(project, details)
             except openportal.ManagedProjectRejectedError as e:
                 logger.warning(f"OpenPortal project {project} is rejected: {e}. ")
                 allocation.error_message = str(e)
@@ -335,54 +315,26 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 logger.warning(
                     f"Unable to re-add project {project} to OpenPortal: {e}. This will be re-added later..."
                 )
-                allocation.state = CoreStates.CREATING
-                allocation.error_message = "Project creation is still pending..."
-                allocation.save()
                 return allocation
-
-            logger.debug(
-                f"Re-added allocation {allocation} to OpenPortal with remote identifier {remote_identifier}"
-            )
-            allocation.is_added = True
-            allocation.set_remote_project_identifier(remote_identifier)
         else:
-            project_shortname = self.get_project_shortname(allocation.project)
+            project = self.client.get_project_identifier(allocation.project)
             details = allocation.get_project_details()
 
-            logger.debug(
-                f"Creating allocation: {allocation} for project {project_shortname} with details {details}"
-            )
-
-            if project_shortname is None or not project_shortname.strip():
-                logger.error(
-                    f"Empty project_shortname for allocation: {allocation} - cannot create in OpenPortal"
-                )
-                raise ServiceBackendError(
-                    f"Empty project_shortname for allocation. Please set a short name for {allocation.project}"
-                )
-
             try:
-                mapping = self.client.add_project(project_shortname, details)
+                mapping = self.client.add_project(project, details)
             except openportal.ManagedProjectRejectedError as e:
-                logger.warning(
-                    f"OpenPortal project {project_shortname} is rejected: {e}. "
-                )
+                logger.warning(f"OpenPortal project {project} is rejected: {e}. ")
                 allocation.error_message = str(e)
                 allocation.set_erred()
                 allocation.save()
                 return allocation
             except Exception as e:
                 logger.warning(
-                    f"Unable to create OpenPortal project {project_shortname}: {e}. This will be created later..."
+                    f"Unable to create OpenPortal project for {project}: {e}. This will be created later..."
                 )
-                allocation.state = CoreStates.CREATING
-                allocation.error_message = "Project creation is still pending..."
-                allocation.save()
                 return allocation
 
-            logger.info(
-                f"Created OpenPortal project {allocation.project} with mapping {mapping}"
-            )
+            logger.info(f"Created OpenPortal project {project} with mapping {mapping}")
             allocation.state = CoreStates.OK
             allocation.set_mapping(mapping)
             allocation.is_added = True
@@ -427,10 +379,10 @@ class RemoteOpenPortalBackend(ServiceBackend):
             CoreStates.OK,
         ]:
             logger.warning(
-                f"Remote allocation {allocation} is not in a valid state for adding - skipping"
+                f"Remote allocation {allocation} is not in a valid state {allocation.state} for adding - skipping"
             )
             raise ServiceBackendError(
-                f"Remote allocation {allocation} is not in a valid state for adding - skipping"
+                f"Remote allocation {allocation} is not in a valid state {allocation.state} for adding - skipping"
             )
 
         if not self._allocation_is_in_openportal(allocation):
@@ -471,28 +423,6 @@ class RemoteOpenPortalBackend(ServiceBackend):
             allocation.state = CoreStates.UPDATING
             allocation.error_message = "Project update is still pending..."
             allocation.save()
-
-    def delete_allocated_project(self, allocation: models.RemoteAllocation):
-        if not isinstance(allocation, models.RemoteAllocation):
-            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
-
-        if not self._allocation_is_in_openportal(allocation):
-            logger.warning(
-                f"Allocation {allocation} is not in OpenPortal - nothing to delete"
-            )
-            return
-
-        project_identifier = allocation.get_project_identifier()
-
-        try:
-            self.client.delete_project(project_identifier)
-            allocation.remote_project_identifier = None
-            allocation.is_added = False
-            allocation.save()
-        except Exception as e:
-            logger.error(
-                f"Unable to delete OpenPortal project {project_identifier}: {e}"
-            )
 
     def check_added_allocation(
         self, allocation: models.RemoteAllocation
@@ -578,23 +508,20 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
         logger.info(f"Deleting allocation: {allocation}")
 
-        if not (
-            allocation.has_project_identifier()
-            or allocation.is_added_to_openportal()
-            or allocation.has_remote_project_identifier()
-        ):
-            logger.debug(f"Allocation already deleted: {allocation}")
-        else:
-            try:
-                project = allocation.get_project_identifier()
-                self.client.delete_project(project)
-                allocation.remote_project_identifier = None
-                allocation.is_added = False
-                allocation.save()
-            except Exception as e:
-                logger.error(
-                    f"Unable to delete allocation {allocation} from OpenPortal: {e}"
-                )
+        try:
+            project = allocation.get_project_identifier()
+        except Exception:
+            project = self.client.get_project_identifier(allocation.project)
+
+        try:
+            self.client.delete_project(project)
+            allocation.remote_project_identifier = None
+            allocation.is_added = False
+            allocation.save()
+        except Exception as e:
+            logger.error(
+                f"Unable to delete allocation {allocation} from OpenPortal: {e}"
+            )
 
     def add_user(self, allocation: models.RemoteAllocation, user) -> bool:
         """
