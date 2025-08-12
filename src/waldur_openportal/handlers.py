@@ -83,7 +83,7 @@ def schedule_sync_on_quota_change(sender, instance, created=False, **kwargs):
 
 
 @if_plugin_enabled
-def update_allocation_credits(sender, instance, **kwargs):
+def update_allocation_credits(sender, instance, force_update=False, **kwargs):
     """
     Update the allocation credits for the given resource. This is called
     when a resource is created or updated, and will ensure that the
@@ -99,25 +99,30 @@ def update_allocation_credits(sender, instance, **kwargs):
         )
         return
 
-    # Check to see if there is a remote allocation associated with this resource
-    uuid = str(resource.uuid)
+    # Only update if the 'options' have changed - these contain the
+    # allocation that must be communicated to the remote project
+    if force_update or set(resource.tracker.changed()) & {
+        "options",
+    }:
+        # Check to see if there is a remote allocation associated with this resource
+        uuid = str(resource.uuid)
 
-    logger.info(f"OpenPortal - checking remote allocations for resource {uuid}")
+        logger.info(f"OpenPortal - checking remote allocations for resource {uuid}")
 
-    for remote_allocation in models.RemoteAllocation.objects.filter(is_active=True):
-        if remote_allocation.marketplace_uuid == uuid:
-            project = remote_allocation.project
+        for remote_allocation in models.RemoteAllocation.objects.filter(is_active=True):
+            if remote_allocation.marketplace_uuid == uuid:
+                project = remote_allocation.project
 
-            if not project.is_expired or project.is_removed:
-                logger.info(
-                    f"OpenPortal.update_allocation_credits - updating project {project}"
-                )
-
-                transaction.on_commit(
-                    lambda: tasks.update_remote_project.delay(
-                        core_utils.serialize_instance(project)
+                if not project.is_expired or project.is_removed:
+                    logger.info(
+                        f"OpenPortal.update_allocation_credits - updating project {project}"
                     )
-                )
+
+                    transaction.on_commit(
+                        lambda: tasks.update_remote_project.delay(
+                            core_utils.serialize_instance(project)
+                        )
+                    )
 
 
 @if_plugin_enabled
