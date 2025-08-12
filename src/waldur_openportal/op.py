@@ -92,6 +92,7 @@ def convert_to_openportal_error(error_message: str) -> OpenPortalError:
 try:
     from openportal import (
         Allocation,
+        DailyProjectUsageReport,
         Destination,
         Health,
         Instruction,
@@ -185,6 +186,10 @@ except ImportError:
         raise OpenPortalError("OpenPortal is not installed.")
 
     class Allocation:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class DailyProjectUsageReport:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 

@@ -197,6 +197,13 @@ def get_user_shortname(user):
     return user_info.shortname
 
 
+def get_first_day_of_month(date):
+    """
+    Return the first day of the month for the given date.
+    """
+    return date.replace(day=1)
+
+
 def get_last_day_of_month(date):
     """
     Return the last day of the month for the given date.
