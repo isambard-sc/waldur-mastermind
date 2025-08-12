@@ -694,6 +694,11 @@ class OpenPortalBoard:
                 f"{identifier} with class {project_template} requires approval for project updates."
             )
 
+            # Make sure to save the updated request
+            managed_project.set_details(
+                managed_project.get_details().merge(new_details)
+            )
+
             managed_project.set_needs_approval()
 
             raise openportal.ManagedProjectPendingError()
