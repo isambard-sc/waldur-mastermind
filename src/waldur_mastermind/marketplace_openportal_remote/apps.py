@@ -87,12 +87,6 @@ class MarketplaceOpenPortalRemoteConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.sync_component_user_usage_when_allocation_user_usage_is_submitted,
-            sender=openportal_models.RemoteAllocationUserUsage,
-            dispatch_uid="waldur_mastermind.marketplace_openportal_remote.sync_component_user_usage_when_allocation_user_usage_is_submitted",
-        )
-
-        signals.post_save.connect(
             handlers.send_done_order_to_message_queue,
             sender=marketplace_models.Order,
             dispatch_uid="waldur_mastermind.marketplace_openportal_remote.send_done_order_to_message_queue",

@@ -102,18 +102,6 @@ class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
     filterset_class = filters.AllocationUserUsageFilter
 
 
-class RemoteAllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = models.RemoteAllocationUserUsage.objects.all().order_by("year", "month")
-    serializer_class = serializers.RemoteAllocationUserUsageSerializer
-    permission_classes = (
-        permissions.IsAuthenticated,
-        IsAdminOrOwner,
-        IsAdminOrReadOnly,
-    )
-    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
-    filterset_class = filters.RemoteAllocationUserUsageFilter
-
-
 class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
     queryset = models.Association.objects.all().order_by("username")

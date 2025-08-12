@@ -592,7 +592,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
         # this will be the total usage this month - check that we have
         # dates that are all in the same month...
         if len(report.dates) == 0:
-            logger.error(f"Empty usage report for {allocation}")
+            # this is an empty report with no usage
             return
 
         day = report.dates[0]
@@ -624,35 +624,6 @@ class RemoteOpenPortalBackend(ServiceBackend):
             allocation.save(update_fields=["node_usage"])
 
             # TODO - check if we need to update anything missed during a change of month?
-
-        associations = models.RemoteAssociation.objects.filter(allocation=allocation)
-
-        for association in associations:
-            user = association.user
-
-            if not association.has_user_identifier():
-                continue
-
-            user_identifier = association.get_user_identifier()
-
-            # look up the usage for this user from the report - record this in node-hours
-            try:
-                usage = report.usage(user_identifier).hours
-            except Exception as e:
-                logger.warning(f"User {user} has no usage in the report: {e}")
-                usage = 0
-
-            # we save usage using the UserIdentifier rather than the local
-            # username, so that a consistent identifier is used across
-            # all resources in a project
-            models.RemoteAllocationUserUsage.objects.update_or_create(
-                allocation=allocation,
-                year=day.year,
-                month=day.month,
-                user=user,
-                username=str(user_identifier),
-                defaults={"node_usage": usage},
-            )
 
     def sync_usage(self, allocation: models.RemoteAllocation):
         if not isinstance(allocation, models.RemoteAllocation):
@@ -717,10 +688,10 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
             report = self.client.get_usage_report(project, month)
 
-            logger.debug(f"Total usage for project in {month} = {report.total_usage}")
-            self._update_usage_from_report(
-                allocation, report, update_current=is_current_month
-            )
+            if report.total_usage.seconds > 0:
+                self._update_usage_from_report(
+                    allocation, report, update_current=is_current_month
+                )
 
             historical_report.node_usage = report.total_usage.hours
             historical_report.is_complete = (

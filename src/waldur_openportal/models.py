@@ -787,36 +787,6 @@ class AllocationUserUsage(UsageMixin):
         return self.__str__()
 
 
-class RemoteAllocationUserUsage(UsageMixin):
-    """
-    Allocation usage per user. This model is responsible for the allocation usage definition for particular user.
-    """
-
-    allocation = models.ForeignKey(
-        to=RemoteAllocation,
-        on_delete=models.CASCADE,
-        related_name="op-remote-allocationuser-remote-allocation+",
-    )
-    year = models.PositiveSmallIntegerField()
-    month = models.PositiveSmallIntegerField(
-        validators=[MinValueValidator(1), MaxValueValidator(12)]
-    )
-
-    user = models.ForeignKey(
-        to=settings.AUTH_USER_MODEL,
-        related_name="op-remote-allocationuser-user+",
-        on_delete=models.CASCADE,
-        blank=True,
-        null=True,
-    )
-
-    def __str__(self):
-        return f"{self.user}: {self.allocation.name}"
-
-    def __repr__(self) -> str:
-        return self.__str__()
-
-
 class HistoricalAllocation(UsageMixin):
     """
     This model holds the historical usage of an allocation.

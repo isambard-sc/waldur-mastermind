@@ -91,6 +91,8 @@ def update_allocation_credits(sender, instance, **kwargs):
     """
     resource = instance
 
+    logger.info(f"OpenPortal - task update_allocation_credits {resource}")
+
     if not isinstance(resource, marketplace_models.Resource):
         logger.error(
             f"OpenPortal - {resource} is not a Resource instance - it is {type(resource)}"
@@ -126,6 +128,11 @@ def update_project(sender, instance, force_add=False, **kwargs):
     commands to update the project in the remote portal
     """
     project = instance
+
+    logger.info(f"OpenPortal - task update_project {project}")
+    logger.info(
+        f"OpenPortal - force_add={force_add}, changed={project.tracker.changed()}"
+    )
 
     if force_add or set(project.tracker.changed()) & {
         "name",
@@ -319,6 +326,8 @@ def update_quotas_on_allocation_usage_update(sender, instance, created=False, **
     if not allocation.usage_changed():
         return
 
+    logger.info(f"OpenPortal - updating quotas for allocation {allocation}")
+
     project = allocation.project
     update_quotas(project, models.Allocation.Permissions.project_path)
     update_quotas(project.customer, models.Allocation.Permissions.customer_path)
@@ -335,6 +344,8 @@ def update_quotas_on_remote_allocation_usage_update(
     if not allocation.usage_changed():
         return
 
+    logger.info(f"OpenPortal - updating remote quotas for allocation {allocation}")
+
     project = allocation.project
     update_remote_quotas(project, models.RemoteAllocation.Permissions.project_path)
     update_remote_quotas(
@@ -343,6 +354,8 @@ def update_quotas_on_remote_allocation_usage_update(
 
 
 def update_quotas(scope, path):
+    logger.info(f"OpenPortal - updating quotas for {scope} at {path}")
+
     qs = models.Allocation.objects.filter(**{path: scope}).values(path)
     for quota in utils.FIELD_NAMES:
         qs = qs.annotate(**{"total_%s" % quota: Sum(quota)})
@@ -353,6 +366,8 @@ def update_quotas(scope, path):
 
 
 def update_remote_quotas(scope, path):
+    logger.info(f"OpenPortal - updating remote quotas for {scope} at {path}")
+
     qs = models.RemoteAllocation.objects.filter(**{path: scope}).values(path)
     for quota in utils.FIELD_NAMES:
         qs = qs.annotate(**{"total_%s" % quota: Sum(quota)})

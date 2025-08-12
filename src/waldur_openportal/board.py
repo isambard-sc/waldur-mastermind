@@ -1099,76 +1099,111 @@ class OpenPortalBoard:
                 f"ManagedProject '{managed_project}' is removed"
             )
 
+        # Get the units we should report the usage in - this should be the
+        # same unit as used for the project allocation
+        details = managed_project.get_details()
+
+        scale_factor = 1.0
+
+        if details.allocation is not None:
+            allocation_units = details.allocation.units
+
+            if allocation_units is not None:
+                template = managed_project.get_project_template()
+
+                try:
+                    scale_factor = template.get_allocation_mapping_for(allocation_units)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to get the allocation mapping for {allocation_units}: {e}"
+                    )
+
         report = openportal.ProjectUsageReport(managed_project.get_remote_identifier())
 
-        # get all of the invoice items for this project - this contains
-        # all of the consumption details, and is not deleted when the
-        # project is deleted
-        try:
-            invoice_items = invoice_models.InvoiceItem.objects.filter(project=project)
-        except Exception as e:
-            logger.warning(
-                f"Failed to retrieve invoice items for project {project}: {e}"
+        this_month = date.today().month
+        this_year = date.today().year
+
+        # Get the usage month by month
+        for month_range in date_range.months:
+            # get all of the invoice items for this project for this month
+            # These are the consumption details, and are not deleted when the
+            # project is deleted
+            month = month_range.start_date.month
+            year = month_range.start_date.year
+
+            logger.debug(
+                f"Fetching invoice items for project {project} for {month}/{year}"
             )
-            invoice_items = []
 
-        # Accounting is based on months, so make sure that the requested
-        # range covers full months
-        start_date = utils.get_first_day_of_month(date_range.start_date)
-        end_date = utils.get_last_day_of_month(date_range.end_date)
-
-        for invoice_item in invoice_items:
-            usage = float(invoice_item.price)
-
-            logger.info(f"Invoice {invoice_item} : Usage {usage}")
-
-            if usage == 0:
-                continue
-            elif usage < 0:
-                # this is a credit, so can be safely ignored here
-                continue
-
-            # get the month and year of the usage
             try:
-                month = invoice_item.invoice.month
-                year = invoice_item.invoice.year
-            except Exception:
+                invoice_items = invoice_models.InvoiceItem.objects.filter(
+                    project=project, invoice__month=month, invoice__year=year
+                )
+            except Exception as e:
                 logger.warning(
-                    f"Invoice item {invoice_item} has no invoice month/year - skipping"
+                    f"Failed to retrieve invoice items for project {project}: {e}"
                 )
-                continue
+                invoice_items = []
 
-            if month is None or year is None:
-                logger.warning(
-                    f"Invoice item {invoice_item} has no invoice month/year - skipping"
-                )
-                continue
+            for invoice_item in invoice_items:
+                usage = float(invoice_item.price)
 
-            if month < 1 or month > 12:
-                logger.warning(
-                    f"Invoice item {invoice_item} has invalid month {month} - skipping"
-                )
-                continue
+                logger.info(f"Invoice {invoice_item} : Usage {usage}")
 
-            consumption_date = date(year=year, month=month, day=1)
+                if usage == 0:
+                    continue
+                elif usage < 0:
+                    # this is a credit, so can be safely ignored here
+                    continue
 
-            # change the day to the first of the month
-            consumption_date = utils.get_first_day_of_month(consumption_date)
+                # get the month and year of the usage
+                try:
+                    invoice_month = invoice_item.invoice.month
+                    invoice_year = invoice_item.invoice.year
+                except Exception:
+                    logger.warning(
+                        f"Invoice item {invoice_item} has no invoice month/year - skipping"
+                    )
+                    continue
 
-            # make sure that the consumption date is within the requested
-            # date range
-            if not (start_date <= consumption_date <= end_date):
-                logger.info(
-                    f"Skipping as {consumption_date} is outside of {start_date} - {end_date}"
-                )
-                continue
+                if invoice_month is None or invoice_year is None:
+                    logger.warning(
+                        f"Invoice item {invoice_item} has no invoice month/year - skipping"
+                    )
+                    continue
 
-            d = openportal.DailyProjectUsageReport()
-            d.add_unattributed_usage(openportal.Usage.from_hours(usage))
+                if invoice_month < 1 or invoice_month > 12:
+                    logger.warning(
+                        f"Invoice item {invoice_item} has invalid month {invoice_month} - skipping"
+                    )
+                    continue
 
-            report.add_report(consumption_date, d)
+                if invoice_month != month or invoice_year != year:
+                    logger.warning(
+                        f"Invoice item {invoice_item} has mismatched month/year - skipping"
+                    )
+                    continue
 
-        return report.to_usage_report()
+                consumption_date = date(year=year, month=month, day=1)
+
+                # change the day to the first of the month
+                consumption_date = utils.get_first_day_of_month(consumption_date)
+
+                d = openportal.DailyProjectUsageReport()
+                d.add_unattributed_usage(openportal.Usage.from_hours(usage))
+
+                if year <= this_year and month < this_month:
+                    # this is a month in the past - we don't expect the usage to change
+                    d.set_complete()
+
+                report.add_report(consumption_date, d)
+
+        if scale_factor is None or scale_factor <= 0:
+            logger.warning(f"Invalid scale factor: {scale_factor}")
+        elif scale_factor != 1.0:
+            report *= scale_factor
+
+        return report
 
     def get_usage_reports(
         self, portal: openportal.PortalIdentifier, date_range: openportal.DateRange
@@ -1199,7 +1234,7 @@ class OpenPortalBoard:
                     self.get_usage_report(
                         identifier=remote_identifier,
                         date_range=date_range,
-                    )
+                    ).to_usage_report()
                 )
 
         return openportal.UsageReport.combine(reports)

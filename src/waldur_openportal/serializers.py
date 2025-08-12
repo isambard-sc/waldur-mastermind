@@ -174,23 +174,6 @@ class AllocationUserUsageCreateSerializer(rf_serializers.HyperlinkedModelSeriali
         }
 
 
-class RemoteAllocationUserUsageCreateSerializer(
-    rf_serializers.HyperlinkedModelSerializer
-):
-    class Meta:
-        model = models.RemoteAllocationUserUsage
-        fields = (
-            "node_usage",
-            "user",
-        )
-        extra_kwargs = {
-            "user": {
-                "lookup_field": "uuid",
-                "view_name": "user-detail",
-            },
-        }
-
-
 class AllocationUserUsageSerializer(rf_serializers.HyperlinkedModelSerializer):
     full_name = rf_serializers.ReadOnlyField(source="user.full_name")
 
@@ -203,31 +186,6 @@ class AllocationUserUsageSerializer(rf_serializers.HyperlinkedModelSerializer):
             "allocation",
             "user",
             "username",
-            "full_name",
-        )
-        extra_kwargs = {
-            "allocation": {
-                "lookup_field": "uuid",
-                "view_name": "openportal-allocation-detail",
-            },
-            "user": {
-                "lookup_field": "uuid",
-                "view_name": "user-detail",
-            },
-        }
-
-
-class RemoteAllocationUserUsageSerializer(rf_serializers.HyperlinkedModelSerializer):
-    full_name = rf_serializers.ReadOnlyField(source="user.full_name")
-
-    class Meta:
-        model = models.RemoteAllocationUserUsage
-        fields = (
-            "node_usage",
-            "month",
-            "year",
-            "allocation",
-            "user",
             "full_name",
         )
         extra_kwargs = {

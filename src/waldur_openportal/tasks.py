@@ -382,6 +382,31 @@ def sync_allocation_users(serialized_allocation):
     backend.sync_users(allocation)
 
 
+@shared_task(name="waldur_openportal.sync_remote_usage")
+@run_once_task(takeover_timeout=60 * 60)
+def sync_remote_usage():
+    """
+    This task is called to synchronise the usage for all remote allocations
+    """
+    logger.info("OpenPortal task.sync_remote_usage")
+    now = datetime.datetime.now()
+    fail_count = 0
+
+    for allocation in models.RemoteAllocation.objects.filter(is_active=True):
+        try:
+            sync_remote_allocation_usage(allocation)
+        except Exception as e:
+            logger.error(f"Failed to sync usage for {allocation}: {e}")
+            fail_count += 1
+
+            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+                logger.error("Too many failures - aborting")
+                return
+            elif (datetime.datetime.now() - now).seconds > 120:
+                logger.error("Took too long - aborting")
+                return
+
+
 @shared_task(name="waldur_openportal.sync_usage")
 @run_once_task(takeover_timeout=60 * 60)
 def sync_usage():
@@ -395,20 +420,6 @@ def sync_usage():
     for allocation in models.Allocation.objects.filter(is_active=True):
         try:
             sync_allocation_usage(allocation)
-        except Exception as e:
-            logger.error(f"Failed to sync usage for {allocation}: {e}")
-            fail_count += 1
-
-            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
-                logger.error("Too many failures - aborting")
-                return
-            elif (datetime.datetime.now() - now).seconds > 120:
-                logger.error("Took too long - aborting")
-                return
-
-    for allocation in models.RemoteAllocation.objects.filter(is_active=True):
-        try:
-            sync_remote_allocation_usage(allocation)
         except Exception as e:
             logger.error(f"Failed to sync usage for {allocation}: {e}")
             fail_count += 1
