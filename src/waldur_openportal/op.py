@@ -79,6 +79,8 @@ def convert_to_openportal_error(error_message: str) -> OpenPortalError:
     """
     Converts a Waldur OpenPortal error to an OpenPortalError.
     """
+    error_message = error_message.lstrip("RuntimeError{").rstrip("}")
+
     if error_message.startswith("OpenPortalError: "):
         return OpenPortalOtherError(error_message[16:])
     elif error_message.startswith("ManagedProjectRejectedError: "):
