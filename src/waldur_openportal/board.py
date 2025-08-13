@@ -159,7 +159,7 @@ class OpenPortalBoard:
         if not managed_project.has_remote_identifier():
             managed_project.delete()
 
-            raise openportal.OpenPortalError(
+            raise openportal.ManagedProjectRejectedError(
                 f"ManagedProject {managed_project} does not have an identifier set"
             )
 
@@ -169,14 +169,14 @@ class OpenPortalBoard:
         if details.project_template is None:
             managed_project.delete()
 
-            raise openportal.OpenPortalError(
+            raise openportal.ManagedProjectRejectedError(
                 f"Project class is not set for project {details}"
             )
 
         if not isinstance(details.project_template, openportal.ProjectTemplate):
             managed_project.delete()
 
-            raise openportal.OpenPortalError(
+            raise openportal.ManagedProjectRejectedError(
                 f"Invalid project class: {details.project_template}"
             )
 
@@ -185,7 +185,7 @@ class OpenPortalBoard:
         if len(project_template) == 0:
             managed_project.delete()
 
-            raise openportal.OpenPortalError(
+            raise openportal.ManagedProjectRejectedError(
                 f"Project class is empty for project {project}"
             )
 
@@ -199,7 +199,7 @@ class OpenPortalBoard:
             )
             managed_project.delete()
 
-            raise openportal.OpenPortalError(
+            raise openportal.ManagedProjectRejectedError(
                 f"ManagedProject {managed_project} is not managed by this board. "
                 f"Expected destination {self.destination()}, got {project_destination}."
             )
@@ -218,7 +218,7 @@ class OpenPortalBoard:
                 f"Failed to get the project class for portal {remote_portal} and class {project_template}. "
                 "This suggests that the portal is not allowed to create projects in this class."
             )
-            raise openportal.OpenPortalError(
+            raise openportal.ManagedProjectRejectedError(
                 f"Project class '{project_template}' is not allowed for portal '{remote_portal}'"
             )
 
@@ -229,7 +229,7 @@ class OpenPortalBoard:
                 f"Project class '{details.project_template}' not found for portal '{remote_portal}'. "
                 "This suggests that the portal is not allowed to create projects in this class."
             )
-            raise openportal.OpenPortalError(
+            raise openportal.ManagedProjectRejectedError(
                 f"Project class '{details.project_template}' is not allowed for portal '{remote_portal}'"
             )
 
@@ -497,12 +497,14 @@ class OpenPortalBoard:
         logger.info(f"Creating project {identifier} with details {details}")
 
         if not isinstance(identifier, openportal.ProjectIdentifier):
-            raise openportal.OpenPortalError(
+            raise openportal.ManagedProjectRejectedError(
                 f"Invalid project identifier: {identifier}"
             )
 
         if not isinstance(details, openportal.ProjectDetails):
-            raise openportal.OpenPortalError(f"Invalid project details: {details}")
+            raise openportal.ManagedProjectRejectedError(
+                f"Invalid project details: {details}"
+            )
 
         # Get (or create) the ManagedProject for the given project identifier
         managed_project, created = models.ManagedProject.objects.get_or_create(
@@ -528,7 +530,15 @@ class OpenPortalBoard:
                 f"Retrieved existing ManagedProject for identifier {identifier}: {managed_project}"
             )
 
-        managed_project.assert_same_destination(self.destination())
+        try:
+            managed_project.assert_same_destination(self.destination())
+        except Exception as e:
+            logger.error(f"Destination mismatch for project {identifier}: {e}")
+            managed_project.reject(
+                utils.get_openportal_robot(),
+                f"Destination mismatch for project {identifier}: {e}",
+            )
+            raise openportal.ManagedProjectRejectedError()
 
         # get the project class of this project
         project_template = self._get_project_template(managed_project, details)
@@ -629,12 +639,14 @@ class OpenPortalBoard:
         logger.info(f"Updating project {identifier} with details {new_details}")
 
         if not isinstance(identifier, openportal.ProjectIdentifier):
-            raise openportal.OpenPortalError(
+            raise openportal.ManagedProjectRejectedError(
                 f"Invalid project identifier: {identifier}"
             )
 
         if not isinstance(new_details, openportal.ProjectDetails):
-            raise openportal.OpenPortalError(f"Invalid project details: {new_details}")
+            raise openportal.ManagedProjectRejectedError(
+                f"Invalid project details: {new_details}"
+            )
 
         # Get the ManagedProject for this identifier, which must already exist
         try:
@@ -652,7 +664,15 @@ class OpenPortalBoard:
                 identifier=identifier, details=new_details, force_request_approval=True
             )
 
-        managed_project.assert_same_destination(self.destination())
+        try:
+            managed_project.assert_same_destination(self.destination())
+        except Exception as e:
+            logger.error(f"Destination mismatch for project {identifier}: {e}")
+            managed_project.reject(
+                utils.get_openportal_robot(),
+                f"Destination mismatch for project {identifier}: {e}",
+            )
+            raise openportal.ManagedProjectRejectedError()
 
         project_template = managed_project.get_project_template()
 
