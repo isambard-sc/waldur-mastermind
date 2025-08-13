@@ -839,8 +839,7 @@ class OpenPortalBoard:
             if new_credits < decimal.Decimal(0.0):
                 new_credits = decimal.Decimal(0.0)
 
-            # Only check for approval if the number of credits increases
-            if new_credits - current_credits > decimal.Decimal(0.0):
+            if abs(new_credits - current_credits) > decimal.Decimal(0.0):
                 logger.info(
                     f"Allocation for project {identifier} has changed from {current_credits} to {new_credits}"
                 )
@@ -856,8 +855,10 @@ class OpenPortalBoard:
                     )
                     raise openportal.ManagedProjectRejectedError()
 
+                # Only check credits if we are increasing the allocation
                 elif (
-                    project_template.action_needs_approval(
+                    new_credits - current_credits > decimal.Decimal(0.0)
+                    and project_template.action_needs_approval(
                         allocation=float(new_credits)
                     )
                     and not force_approve
