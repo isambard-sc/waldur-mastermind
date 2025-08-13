@@ -40,10 +40,10 @@ class WaldurCore(BaseModel):
         description="Defines for how long user token should remain valid if there was no action from user.",
     )
     INVITATION_LIFETIME = Field(
-        timedelta(weeks=1), description="Defines for how long invitation remains valid."
+        timedelta(weeks=4), description="Defines for how long invitation remains valid."
     )
     GROUP_INVITATION_LIFETIME = Field(
-        timedelta(weeks=1),
+        timedelta(weeks=4),
         description="Defines for how long group invitation remains valid.",
     )
     BACKEND_FIELDS_EDITABLE = Field(

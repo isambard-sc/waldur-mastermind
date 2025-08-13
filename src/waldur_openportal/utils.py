@@ -380,7 +380,7 @@ def set_project_credits(project, credits: decimal.Decimal | float):
             f"Cannot set credits for project {project} as it is expired or removed"
         )
 
-    if credits < 0:
+    if credits < decimal.Decimal(0.0):
         credits = decimal.Decimal(0.0)
 
     (total_credits, total_spend) = get_project_spend_info(project)

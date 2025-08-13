@@ -836,7 +836,11 @@ class OpenPortalBoard:
             )
             current_credits = utils.get_project_credits(project)
 
-            if abs(current_credits - new_credits) > decimal.Decimal(0.01):
+            if new_credits < decimal.Decimal(0.0):
+                new_credits = decimal.Decimal(0.0)
+
+            # Only check for approval if the number of credits increases
+            if new_credits - current_credits > decimal.Decimal(0.0):
                 logger.info(
                     f"Allocation for project {identifier} has changed from {current_credits} to {new_credits}"
                 )

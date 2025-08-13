@@ -1,15 +1,25 @@
 <html>
 <head lang="en">
     <meta charset="UTF-8">
-    <title>Invitation to {{ name }} {{ type }}</title>
+    <title>Invitation to {{ name }} "{{ type }}"</title>
 </head>
 <body>
 <p>
     Hello!
 </p>
 <p>
-    {{ sender }} has invited you to join {{ name }} {{ type }} in {{ role }} role.<br>
+    {{ sender }} has invited you to join the {{ type }}
+</p>
+<p>
+    "{{ name }}"
+</p>
+<p>
+    in role "{{ role }}".
+</p>
+<p>
     Please visit <a href="{{ link }}">this page</a> to sign up and accept your invitation.
+</p>
+</p>
     Please note: this invitation expires at {{ invitation.get_expiration_time|date:'d.m.Y H:i' }}!
 </p>
 <p>
