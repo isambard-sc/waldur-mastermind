@@ -774,6 +774,10 @@ def send_notifications():
         #  portal should be handling this)
         allocations = models.Allocation.objects.filter(project=project, is_active=True)
 
+        # Skip projects with no allocations
+        if not allocations.exists():
+            continue
+
         # Calculate the total usage so far this month across OpenPortal allocations
         total_spend = 0.0
 
