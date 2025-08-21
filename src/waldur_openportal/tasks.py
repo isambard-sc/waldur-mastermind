@@ -451,9 +451,7 @@ def sync_usage():
         allocations = models.Allocation.objects.filter(project=project, is_active=True)
 
         if not allocations:
-            logger.warning(
-                f"Project {project} has no OpenPortal allocations - skipping"
-            )
+            logger.debug(f"Project {project} has no OpenPortal allocations - skipping")
             continue
 
         # Calculate the total usage so far this month across OpenPortal allocations
@@ -775,7 +773,8 @@ def send_notifications():
         allocations = models.Allocation.objects.filter(project=project, is_active=True)
 
         # Skip projects with no allocations
-        if not allocations.exists():
+        if not allocations:
+            logger.debug(f"Project {project} has no OpenPortal allocations - skipping")
             continue
 
         # Calculate the total usage so far this month across OpenPortal allocations
