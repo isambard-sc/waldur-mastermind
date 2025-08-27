@@ -5,8 +5,6 @@ from django.db import migrations
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("structure", "0054_merge_20250612_0633"),
-        ("marketplace", "0166_cleanup_noisy_resource_update_logs"),
         (
             "waldur_openportal",
             "0022_projectclass_provider_alter_managedproject_details",

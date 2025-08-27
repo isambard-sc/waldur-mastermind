@@ -7,29 +7,105 @@ import django.db.models.deletion
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
-        ('structure', '0047_alter_customer_phone_number'),
-        ('waldur_openportal', '0005_association_groupname'),
+        ("waldur_openportal", "0005_association_groupname"),
     ]
 
     operations = [
         migrations.CreateModel(
-            name='UserInfo',
+            name="UserInfo",
             fields=[
-                ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('shortname', models.CharField(help_text='A short, unique name for you. It will be used to form your local username on any systems. Should only contain lower-case letters and digits and must start with a letter.', max_length=32, null=True, unique=True, validators=[django.core.validators.RegexValidator(message='Must start with a letter and only contain numbers and letters.', regex='^[a-z][a-z0-9]+$'), django.core.validators.RegexValidator(inverse_match=True, regex='(admin)|(root)$'), django.core.validators.MinLengthValidator(4), django.core.validators.MaxLengthValidator(32)], verbose_name='shortname')),
-                ('user', models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name='op-userinfo-user+', to=settings.AUTH_USER_MODEL)),
+                (
+                    "id",
+                    models.AutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                (
+                    "shortname",
+                    models.CharField(
+                        help_text="A short, unique name for you. It will be used to form your local username on any systems. Should only contain lower-case letters and digits and must start with a letter.",
+                        max_length=32,
+                        null=True,
+                        unique=True,
+                        validators=[
+                            django.core.validators.RegexValidator(
+                                message="Must start with a letter and only contain numbers and letters.",
+                                regex="^[a-z][a-z0-9]+$",
+                            ),
+                            django.core.validators.RegexValidator(
+                                inverse_match=True, regex="(admin)|(root)$"
+                            ),
+                            django.core.validators.MinLengthValidator(4),
+                            django.core.validators.MaxLengthValidator(32),
+                        ],
+                        verbose_name="shortname",
+                    ),
+                ),
+                (
+                    "user",
+                    models.OneToOneField(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="op-userinfo-user+",
+                        to=settings.AUTH_USER_MODEL,
+                    ),
+                ),
             ],
         ),
         migrations.CreateModel(
-            name='ProjectInfo',
+            name="ProjectInfo",
             fields=[
-                ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('shortname', models.CharField(help_text='A short, unique name for the project. It will be used to form the local username of any users in the project on any systems. Should only contain lower-case letters and digits and must start with a letter.', max_length=30, null=True, unique=True, validators=[django.core.validators.RegexValidator(regex='^[a-z0-9\\-_]+$'), django.core.validators.RegexValidator(inverse_match=True, regex='(-admin)|(-root)$'), django.core.validators.MinLengthValidator(3), django.core.validators.MaxLengthValidator(30)], verbose_name='shortname')),
-                ('allowed_destinations', models.TextField(blank=True, help_text="A comma-separated list of allowable destinations of instances that              can be attached to this project. For example, a project may only allow              'brics.aip1.*', meaning that only instances that start with 'brics.aip1.'              can be attached to this project.", max_length=1024, null=True, verbose_name='allowed destinations')),
-                ('project', models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name='op-projectinfo-project+', to='structure.project')),
+                (
+                    "id",
+                    models.AutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                (
+                    "shortname",
+                    models.CharField(
+                        help_text="A short, unique name for the project. It will be used to form the local username of any users in the project on any systems. Should only contain lower-case letters and digits and must start with a letter.",
+                        max_length=30,
+                        null=True,
+                        unique=True,
+                        validators=[
+                            django.core.validators.RegexValidator(
+                                regex="^[a-z0-9\\-_]+$"
+                            ),
+                            django.core.validators.RegexValidator(
+                                inverse_match=True, regex="(-admin)|(-root)$"
+                            ),
+                            django.core.validators.MinLengthValidator(3),
+                            django.core.validators.MaxLengthValidator(30),
+                        ],
+                        verbose_name="shortname",
+                    ),
+                ),
+                (
+                    "allowed_destinations",
+                    models.TextField(
+                        blank=True,
+                        help_text="A comma-separated list of allowable destinations of instances that              can be attached to this project. For example, a project may only allow              'brics.aip1.*', meaning that only instances that start with 'brics.aip1.'              can be attached to this project.",
+                        max_length=1024,
+                        null=True,
+                        verbose_name="allowed destinations",
+                    ),
+                ),
+                (
+                    "project",
+                    models.OneToOneField(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="op-projectinfo-project+",
+                        to="structure.project",
+                    ),
+                ),
             ],
         ),
     ]

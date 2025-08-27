@@ -6,7 +6,6 @@ import django.db.models.deletion
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("structure", "0054_merge_20250612_0633"),
         ("waldur_openportal", "0021_auto_20250709_1116"),
     ]
 

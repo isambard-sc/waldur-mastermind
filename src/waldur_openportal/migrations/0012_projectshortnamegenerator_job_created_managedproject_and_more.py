@@ -7,7 +7,6 @@ import django.utils.timezone
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("structure", "0053_alter_project_short_name"),
         ("waldur_openportal", "0011_job_alter_allocation_state_and_more"),
     ]
 
