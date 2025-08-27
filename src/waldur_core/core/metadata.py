@@ -350,6 +350,19 @@ class WaldurHPC(BaseModel):
     )
 
 
+class WaldurOpenPortal(BaseModel):
+    ENABLED = Field(
+        False,
+        description="Enable support for OpenPortal plugin in a deployment",
+    )
+    DEFAULT_LIMITS = Field(
+        {
+            "NODE": 1000,  # Measured unit is node-hours
+        },
+        description="Default limits of account that are set when OpenPortal account is provisioned.",
+    )
+
+
 class WaldurSlurm(BaseModel):
     ENABLED = Field(
         False,
@@ -611,6 +624,7 @@ class WaldurConfiguration(BaseModel):
     WALDUR_SLURM = WaldurSlurm()
     WALDUR_PID = WaldurPID()
     WALDUR_OPENSTACK = WaldurOpenstack()
+    WALDUR_OPENPORTAL = WaldurOpenPortal()
     WALDUR_AUTH_SAML2 = WaldurAuthSAML2()
     VERIFY_WEBHOOK_REQUESTS = Field(
         True,
