@@ -7,6 +7,9 @@ python3 -m pip install --upgrade setuptools==78.1.0
 python3 -m pip install poetry==2.1.2 gunicorn==22.0.0
 poetry config virtualenvs.create false
 
+# Recreate poetry lock file - comment out if you want reproducible builds
+poetry lock
+
 # Install Python dependencies for Waldur MasterMind from PyPI
 poetry install --without dev
 
