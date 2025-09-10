@@ -402,8 +402,8 @@ def sync_remote_usage():
             if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                 logger.error("Too many failures - aborting")
                 return
-            elif (datetime.datetime.now() - now).seconds > 120:
-                logger.error("Took too long - aborting")
+            elif (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_remote_usage took too long - aborting")
                 return
 
 
@@ -427,8 +427,8 @@ def sync_usage():
             if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                 logger.error("Too many failures - aborting")
                 return
-            elif (datetime.datetime.now() - now).seconds > 120:
-                logger.error("Took too long - aborting")
+            elif (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_usage took too long - aborting")
                 return
 
     # Now update any limits that will be changed by the above usage
@@ -518,8 +518,8 @@ def sync_usage():
                 if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                     logger.error("Too many failures - aborting")
                     return
-                elif (datetime.datetime.now() - now).seconds > 120:
-                    logger.error("Took too long - aborting")
+                elif (datetime.datetime.now() - now).seconds > 3600:
+                    logger.error("sync_usage took too long - aborting")
                     return
 
 
@@ -596,8 +596,8 @@ def sync_remote():
             if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                 logger.error("Too many failures - aborting")
                 break
-            elif (datetime.datetime.now() - now).seconds > 300:
-                logger.error("Took too long - aborting")
+            elif (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_remote_usage took too long - aborting")
                 break
 
 
@@ -626,8 +626,8 @@ def sync():
                 if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                     logger.error("Too many failures - aborting")
                     break
-                elif (datetime.datetime.now() - now).seconds > 300:
-                    logger.error("Took too long - aborting")
+                elif (datetime.datetime.now() - now).seconds > 3600:
+                    logger.error("sync_usage took too long - aborting")
                     break
 
         for allocation in get_structure_remote_allocations(customer):
@@ -640,8 +640,8 @@ def sync():
                 if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                     logger.error("Too many failures - aborting")
                     break
-                elif (datetime.datetime.now() - now).seconds > 300:
-                    logger.error("Took too long - aborting")
+                elif (datetime.datetime.now() - now).seconds > 3600:
+                    logger.error("sync_remote_usage took too long - aborting")
                     break
 
 
@@ -676,8 +676,8 @@ def sync_project(serialized_project):
             if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                 logger.error("Too many failures - aborting")
                 break
-            elif (datetime.datetime.now() - now).seconds > 120:
-                logger.error("Took too long - aborting")
+            elif (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_project took too long - aborting")
                 break
 
     for allocation in get_structure_remote_allocations(project):
@@ -690,8 +690,8 @@ def sync_project(serialized_project):
             if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                 logger.error("Too many failures - aborting")
                 break
-            elif (datetime.datetime.now() - now).seconds > 300:
-                logger.error("Took too long - aborting")
+            elif (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_remote_usage took too long - aborting")
                 break
 
 

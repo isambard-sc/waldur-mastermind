@@ -48,6 +48,9 @@ class RemoteOpenPortalBackend(ServiceBackend):
     def pull_resources(self):
         logger.debug(f"Pulling OpenPortal remote resources for settings: {self}")
 
+        logger.warning("Skipping pull_resources")
+        return
+        # --- IGNORE ---
         fail_count = 0
         now = datetime.datetime.now()
 

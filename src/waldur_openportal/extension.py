@@ -27,7 +27,7 @@ class OpenPortalExtension(WaldurExtension):
             # user management failed when called directly
             "waldur-openportal-sync-users": {
                 "task": "waldur_openportal.sync",
-                "schedule": timedelta(minutes=59),
+                "schedule": timedelta(minutes=119),
                 "args": (),
             },
             # This task synchronises all usage from the OpenPortal resources
