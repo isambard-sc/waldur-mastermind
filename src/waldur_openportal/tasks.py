@@ -415,21 +415,19 @@ def sync_usage():
     """
     logger.info("OpenPortal task.sync_usage")
     now = datetime.datetime.now()
-    fail_count = 0
 
-    for allocation in models.Allocation.objects.filter(is_active=True):
+    # loop through, using a different order each time to ensure every
+    # project is updated even if this individual task fails
+    for allocation in models.Allocation.objects.filter(is_active=True).order_by("?"):
         try:
             sync_allocation_usage(allocation)
         except Exception as e:
             logger.error(f"Failed to sync usage for {allocation}: {e}")
-            fail_count += 1
 
-            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
-                logger.error("Too many failures - aborting")
-                return
-            elif (datetime.datetime.now() - now).seconds > 3600:
-                logger.error("sync_usage took too long - aborting")
-                return
+        # make sure we will finish within an hour
+        if (datetime.datetime.now() - now).seconds > 3600:
+            logger.error("sync_usage took too long - aborting")
+            return
 
     # Now update any limits that will be changed by the above usage
     logger.info("OpenPortal task.sync_usage [limits]")
@@ -513,14 +511,10 @@ def sync_usage():
 
             except Exception as e:
                 logger.error(f"Failed to sync limits for {allocation}: {e}")
-                fail_count += 1
 
-                if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
-                    logger.error("Too many failures - aborting")
-                    return
-                elif (datetime.datetime.now() - now).seconds > 3600:
-                    logger.error("sync_usage took too long - aborting")
-                    return
+            if (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_usage took too long - aborting")
+                return
 
 
 @shared_task(name="waldur_openportal.sync_remote")
