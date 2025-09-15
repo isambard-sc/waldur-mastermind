@@ -971,7 +971,7 @@ def create_default_resources(serialized_managed_project):
 
     if not isinstance(managed_project, models.ManagedProject):
         logger.error(
-            f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(project)}"
+            f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(managed_project)}"
         )
         raise ValueError(
             f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(managed_project)}"
@@ -1003,6 +1003,7 @@ def create_default_resources(serialized_managed_project):
         # find any existing orders for this project and offering
         num_erred = 0
         have_existing = False
+        resource = None
 
         for existing_resource in marketplace_models.Resource.objects.filter(
             project=project,
@@ -1016,6 +1017,7 @@ def create_default_resources(serialized_managed_project):
                 logger.info(
                     f"OpenPortal - Found existing resource {existing_resource} for {offering} in {project}"
                 )
+                resource = existing_resource
                 break
             else:
                 num_erred += 1
@@ -1033,6 +1035,24 @@ def create_default_resources(serialized_managed_project):
             logger.info(
                 f"OpenPortal - Skipping creation of {offering} for {project} - already exists"
             )
+
+            if resource is not None:
+                # check that we haven't created too many plans for this resource
+                plan_period = marketplace_models.ResourcePlanPeriod.objects.filter(
+                    resource=resource, end=None
+                )
+
+                if len(plan_period) > 1:
+                    # This indicates we've created multiple plans for the same resource
+                    # and project. We should not try to create it again.
+                    logger.error(
+                        f"OpenPortal - Too many active plans for {resource} in {project} - deleting extras"
+                    )
+
+                    for extra_plan in plan_period[1:]:
+                        logger.error(f"OpenPortal - Deleting extra plan {extra_plan}")
+                        extra_plan.delete()
+
             continue
 
         logger.info(f"OpenPortal - Creating {offering} for {project}")
@@ -1069,6 +1089,22 @@ def create_default_resources(serialized_managed_project):
             )
 
             created_resource = True
+
+            # make sure we don't have too many plans for this resource
+            plan_period = marketplace_models.ResourcePlanPeriod.objects.filter(
+                resource=resource, end=None
+            )
+
+            if len(plan_period) > 1:
+                # This indicates we've created multiple plans for the same resource
+                # and project. We should not try to create it again.
+                logger.error(
+                    f"OpenPortal - Too many active plans for {resource} in {project} - deleting extras"
+                )
+
+                for extra_plan in plan_period[1:]:
+                    logger.error(f"OpenPortal - Deleting extra plan {extra_plan}")
+                    extra_plan.delete()
 
         except Exception as e:
             logger.error(
