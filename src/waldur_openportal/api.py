@@ -9,8 +9,6 @@ from django.http import JsonResponse
 from waldur_core.core import models
 from django.core.cache import cache
 from waldur_core.core.authentication import refresh_token
-from waldur_core.core.authentication import OIDCAuthentication
-from django.conf import settings
 from rest_framework import status
 from waldur_core.core.authentication import set_user_context
 from rest_framework.decorators import (
@@ -34,6 +32,7 @@ from waldur_mastermind.invoices import models as invoice_models
 from . import models, tasks, utils
 from .board import OpenPortalBoard
 from . import op as openportal
+from waldur_auth_social.models import IdentityProvider
 
 logger = logging.getLogger(__name__)
 
@@ -954,12 +953,23 @@ def get_API_token(request):
     if not raw_oidc_token:
         return JsonResponse({"error":"Bearer token not provided"}, status=status.BAD_REQUEST)
 
-    config = settings.WALDUR_CORE
-    introspection_url = config.get("OIDC_INTROSPECTION_URL")
-    client_id = config.get("OIDC_CLIENT_ID")
-    client_secret = config.get("OIDC_CLIENT_SECRET")
-    user_field = config.get("OIDC_USER_FIELD", "username")
-    cache_timeout = config.get("OIDC_CACHE_TIMEOUT", 300)  # default 5 min
+    provider = IdentityProvider.objects.filter(is_active=True).first()
+
+    discovery_url = provider.discovery_url
+    client_id = provider.client_id
+    client_secret = provider.client_secret
+    user_field = "email"
+    cache_timeout = 300.0  # default 5 min
+
+    if not (discovery_url):
+        raise JsonResponse({"error":"No discovery url found"}, status=status.BAD_REQUEST)
+
+    data_discovery_url = response = httpx.get(
+                discovery_url,
+                timeout=5.0,
+            )
+    introspection_url = data_discovery_url.json()["introspection_endpoint"]
+
     if not (introspection_url and client_id and client_secret):
         raise JsonResponse({"error":"OIDC config incomplete"}, status=status.BAD_REQUEST)
     # Use SHA-256 to hash token to avoid very long keys
