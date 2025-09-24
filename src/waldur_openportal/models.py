@@ -1845,18 +1845,25 @@ class ManagedProject(ReviewMixin, models.Model):
         help_text=_(
             "The destination used to send instructions from the remote portal."
         ),
-        blank=True,
-        null=True,
+        blank=False,
+        null=False,
     )
 
     # This is the OpenPortal ProjectIdentifier from the portal that
     # requested and manages this project
     identifier = models.CharField(
         max_length=MAX_PROJECTIDENTIFIER_LENGTH,
-        unique=True,
+        unique=False,
         verbose_name=_("ID"),
-        db_index=True,
+        db_index=False,
     )
+
+    # It is the combination of the destination and identifier that
+    # should be unique and used to identify the project
+    class Meta:
+        unique_together = ("destination", "identifier")
+        verbose_name = _("Managed Project")
+        verbose_name_plural = _("Managed Projects")
 
     # This is the JSON representation of the OpenPortal ProjectDetails
     # that is synced between this portal and the managing portal

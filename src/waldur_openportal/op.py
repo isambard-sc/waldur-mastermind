@@ -104,6 +104,7 @@ try:
         ProjectDetails,
         ProjectIdentifier,
         ProjectMapping,
+        ProjectTemplate,
         Status,
         UserIdentifier,
         UserMapping,
@@ -122,13 +123,6 @@ try:
     )
 
     try:
-        # Fix for compatibility with older versions of OpenPortal
-        # which haven't renamed ProjectClass to ProjectTemplate
-        from openportal import ProjectClass as ProjectTemplate
-
-        if not hasattr(ProjectDetails, "project_template"):
-            ProjectDetails.project_template = ProjectDetails.project_class
-
         if not hasattr(ProjectDetails, "merge"):
 
             def _merge(slf, other):

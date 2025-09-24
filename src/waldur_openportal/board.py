@@ -508,6 +508,7 @@ class OpenPortalBoard:
 
         # Get (or create) the ManagedProject for the given project identifier
         managed_project, created = models.ManagedProject.objects.get_or_create(
+            destination=self.destination(),
             identifier=str(identifier),
             defaults={
                 "details": json.loads(str(details)),
@@ -529,16 +530,6 @@ class OpenPortalBoard:
             logger.info(
                 f"Retrieved existing ManagedProject for identifier {identifier}: {managed_project}"
             )
-
-        try:
-            managed_project.assert_same_destination(self.destination())
-        except Exception as e:
-            logger.error(f"Destination mismatch for project {identifier}: {e}")
-            managed_project.reject(
-                utils.get_openportal_robot(),
-                f"Destination mismatch for project {identifier}: {e}",
-            )
-            raise openportal.ManagedProjectRejectedError()
 
         # get the project class of this project
         project_template = self._get_project_template(managed_project, details)
