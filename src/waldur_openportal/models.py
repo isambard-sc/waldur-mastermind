@@ -389,6 +389,14 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
         if project.end_date is not None:
             details.end_date = project.end_date
 
+        # The project key is the UUID of the organisation that owns
+        # the project. This way, only projects within the approved
+        # organisation can create remote projects using this
+        # allocation, thereby preventing an admin of another
+        # organisation from guessing the project template name
+        # and using that
+        details.key = str(project.customer.uuid)
+
         # now get the allocation for this project (if requested)
         allocation, allocation_unit = self._get_requested_allocation()
 
