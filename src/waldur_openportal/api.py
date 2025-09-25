@@ -1,10 +1,16 @@
 import logging
 import datetime
+import hashlib
+import httpx
 
 from django.contrib import auth
 from django.utils.translation import gettext_lazy as _
 from django.http import JsonResponse
-
+from waldur_core.core import models
+from django.core.cache import cache
+from waldur_core.core.authentication import refresh_token
+from rest_framework import status
+from waldur_core.core.authentication import set_user_context
 from rest_framework.decorators import (
     api_view,
     authentication_classes,
@@ -18,6 +24,7 @@ from http import HTTPStatus as status
 from waldur_core.core import utils as core_utils
 from waldur_core.users.enums import InvitationState
 from waldur_core.structure import models as structure_models
+from waldur_core.core import models as core_models
 from waldur_core.structure.managers import get_connected_projects
 
 from waldur_mastermind.invoices import models as invoice_models
@@ -25,6 +32,7 @@ from waldur_mastermind.invoices import models as invoice_models
 from . import models, tasks, utils
 from .board import OpenPortalBoard
 from . import op as openportal
+from waldur_auth_social.models import IdentityProvider
 
 logger = logging.getLogger(__name__)
 
@@ -888,3 +896,133 @@ def fetch_job(request):
     response = JsonResponse({})
     response.status_code = status.OK
     return response
+
+
+@api_view(["GET"])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def whoami(request):
+    user = request.user
+
+    if not (user.is_authenticated or user.is_active):
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    response = JsonResponse(
+        {
+            "first_name": f"{user.first_name}",
+            "last_name": f"{user.last_name}",
+            "user_name": f"{user.username}",
+            "email": f"{user.email}",
+            "date_joined": f"{user.date_joined}",
+            "organization": f"{user.organization}",
+            "job_title": f"{user.job_title}",
+            "phone_number": f"{user.phone_number}",
+            "is_staff": f"{user.is_staff}",
+        }
+    )
+    return response
+
+
+@api_view(["GET"])
+@authentication_classes([])
+@permission_classes([])
+def get_api_token(request):
+    # Extract OIDC token from Authorisation header
+    auth_header = request.headers.get("Authorization", "")
+
+    if not auth_header.lower().startswith("bearer "):
+        return JsonResponse(
+            {"error": "Authorisation header missing or invalid"},
+            status=status.BAD_REQUEST,
+        )
+
+    raw_oidc_token = auth_header.split(" ", 1)[1].strip()
+
+    if not raw_oidc_token:
+        return JsonResponse(
+            {"error": "Bearer token not provided"}, status=status.BAD_REQUEST
+        )
+
+    provider = IdentityProvider.objects.filter(is_active=True).first()
+
+    discovery_url = provider.discovery_url
+    client_id = provider.client_id
+    client_secret = provider.client_secret
+    user_field = "email"
+    cache_timeout = 300.0  # default 5 min
+
+    if not (discovery_url):
+        raise JsonResponse(
+            {"error": "No discovery url found"}, status=status.BAD_REQUEST
+        )
+
+    data_discovery_url = response = httpx.get(
+        discovery_url,
+        timeout=5.0,
+    )
+    introspection_url = data_discovery_url.json()["introspection_endpoint"]
+
+    if not (introspection_url and client_id and client_secret):
+        raise JsonResponse(
+            {"error": "OIDC config incomplete"}, status=status.BAD_REQUEST
+        )
+    # Use SHA-256 to hash token to avoid very long keys
+    cache_key = f"oidc_token:{hashlib.sha256(raw_oidc_token.encode()).hexdigest()}"
+
+    data = cache.get(cache_key)
+
+    if not data:
+        try:
+            response = httpx.post(
+                introspection_url,
+                data={"token": raw_oidc_token},
+                auth=(client_id, client_secret),
+                timeout=5.0,
+            )
+
+        except Exception as e:
+            return JsonResponse(
+                {"error": "Introspection failed"}, status=status.BAD_REQUEST
+            )
+
+        if response.status_code != 200:
+            return JsonResponse({"error": "Introspection endpoint error."})
+            # raise AuthenticationFailed("Introspection endpoint error.")
+
+        data = response.json()
+        if not data.get("active"):
+            return JsonResponse({"error": "Token is inactive or invalid."})
+            # raise AuthenticationFailed("Token is inactive or invalid.")
+
+        cache.set(cache_key, data, timeout=cache_timeout)
+
+    # logger.error(f"Introspection response: {response.json()}")
+    user_identifier = data.get(user_field)
+
+    if not user_identifier:
+        return JsonResponse(
+            {"error": f"Token missing '{user_field}' field"}, status=status.UNAUTHORIZED
+        )
+
+    # GET Waldur user
+    user, _ = core_models.User.objects.get_or_create(username=user_identifier)
+    set_user_context(user)
+
+    # Check staff access
+    user_access = "staff" if user.is_staff else "not a staff"
+
+    # Sync email with Keycloak response email
+    email = data.get("email")
+    if email and user.email != email:
+        user_email = user.email  # Sync email with response returned from Keycloak
+        user.save(update_fields=["email"])
+
+    # Generate Waldur API token
+    waldur_api_token_obj = refresh_token(user)
+    waldur_api_token = waldur_api_token_obj.key
+
+    return JsonResponse(
+        {"token": waldur_api_token, "user_access": user_access, "user_email": email}
+    )
