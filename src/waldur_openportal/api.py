@@ -897,30 +897,20 @@ def fetch_job(request):
     response.status_code = status.OK
     return response
 
-@api_view(['GET'])
+
+@api_view(["GET"])
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
 def whoami(request):
-
     user = request.user
 
     if not (user.is_authenticated or user.is_active):
         response = JsonResponse({})
         response.status_code = status.UNAUTHORIZED
         return response
-    email = request.query_params.get("email")
 
-    if not email:
-        response = JsonResponse({"error": "An email must be provided"})
-        response.status_code = status.BAD_REQUEST
-        return response
-
-    users = core_models.User.objects.filter(email=f"{email}")
-
-    if len(users)>0:
-        user = users[0]
-        if user.email==email:
-            response = JsonResponse({
+    response = JsonResponse(
+        {
             "first_name": f"{user.first_name}",
             "last_name": f"{user.last_name}",
             "user_name": f"{user.username}",
@@ -930,28 +920,30 @@ def whoami(request):
             "job_title": f"{user.job_title}",
             "phone_number": f"{user.phone_number}",
             "is_staff": f"{user.is_staff}",
-            })
-            return response
-        response = JsonResponse({"error":"The email does not match or the user has been disabled."})
-    else:
-        response = JsonResponse({"No users found."})
+        }
+    )
     return response
 
 
 @api_view(["GET"])
 @authentication_classes([])
 @permission_classes([])
-def get_API_token(request):
-    #Extract OIDC token from Authorisation header
+def get_api_token(request):
+    # Extract OIDC token from Authorisation header
     auth_header = request.headers.get("Authorization", "")
 
     if not auth_header.lower().startswith("bearer "):
-        return JsonResponse({"error":"Authorisation header missing or invalid"}, status=status.BAD_REQUEST)
+        return JsonResponse(
+            {"error": "Authorisation header missing or invalid"},
+            status=status.BAD_REQUEST,
+        )
 
     raw_oidc_token = auth_header.split(" ", 1)[1].strip()
 
     if not raw_oidc_token:
-        return JsonResponse({"error":"Bearer token not provided"}, status=status.BAD_REQUEST)
+        return JsonResponse(
+            {"error": "Bearer token not provided"}, status=status.BAD_REQUEST
+        )
 
     provider = IdentityProvider.objects.filter(is_active=True).first()
 
@@ -962,16 +954,20 @@ def get_API_token(request):
     cache_timeout = 300.0  # default 5 min
 
     if not (discovery_url):
-        raise JsonResponse({"error":"No discovery url found"}, status=status.BAD_REQUEST)
+        raise JsonResponse(
+            {"error": "No discovery url found"}, status=status.BAD_REQUEST
+        )
 
     data_discovery_url = response = httpx.get(
-                discovery_url,
-                timeout=5.0,
-            )
+        discovery_url,
+        timeout=5.0,
+    )
     introspection_url = data_discovery_url.json()["introspection_endpoint"]
 
     if not (introspection_url and client_id and client_secret):
-        raise JsonResponse({"error":"OIDC config incomplete"}, status=status.BAD_REQUEST)
+        raise JsonResponse(
+            {"error": "OIDC config incomplete"}, status=status.BAD_REQUEST
+        )
     # Use SHA-256 to hash token to avoid very long keys
     cache_key = f"oidc_token:{hashlib.sha256(raw_oidc_token.encode()).hexdigest()}"
 
@@ -987,7 +983,9 @@ def get_API_token(request):
             )
 
         except Exception as e:
-            return JsonResponse({"error":"Introspection failed"}, status=status.BAD_REQUEST)
+            return JsonResponse(
+                {"error": "Introspection failed"}, status=status.BAD_REQUEST
+            )
 
         if response.status_code != 200:
             return JsonResponse({"error": "Introspection endpoint error."})
@@ -1004,7 +1002,9 @@ def get_API_token(request):
     user_identifier = data.get(user_field)
 
     if not user_identifier:
-        return JsonResponse({"error": f"Token missing '{user_field}' field"}, status=status.UNAUTHORIZED)
+        return JsonResponse(
+            {"error": f"Token missing '{user_field}' field"}, status=status.UNAUTHORIZED
+        )
 
     # GET Waldur user
     user, _ = core_models.User.objects.get_or_create(username=user_identifier)
@@ -1016,11 +1016,13 @@ def get_API_token(request):
     # Sync email with Keycloak response email
     email = data.get("email")
     if email and user.email != email:
-        user_email = user.email # Sync email with response returned from Keycloak
+        user_email = user.email  # Sync email with response returned from Keycloak
         user.save(update_fields=["email"])
 
     # Generate Waldur API token
     waldur_api_token_obj = refresh_token(user)
     waldur_api_token = waldur_api_token_obj.key
 
-    return JsonResponse({"token":waldur_api_token, "user_access": user_access, "user_email": email})
+    return JsonResponse(
+        {"token": waldur_api_token, "user_access": user_access, "user_email": email}
+    )

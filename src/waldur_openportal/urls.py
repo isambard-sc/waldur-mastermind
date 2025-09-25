@@ -1,7 +1,14 @@
 from django.urls import re_path
 
 from . import views
-from .api import access_for_email, project_spend_info, customer_spend_info, fetch_job, whoami, get_API_token
+from .api import (
+    access_for_email,
+    project_spend_info,
+    customer_spend_info,
+    fetch_job,
+    whoami,
+    get_api_token,
+)
 
 
 def register_in(router):
@@ -78,14 +85,14 @@ urlpatterns = [
         fetch_job,
         name="fetch-job",
     ),
-        re_path(
+    re_path(
         r"^api/openportal/whoami/",
         whoami,
         name="whoami",
     ),
-        re_path(
-        r"^api/openportal/get_API_token/",
-        get_API_token,
-        name="get_API_token",
+    re_path(
+        r"^api/openportal/get_api_token/",
+        get_api_token,
+        name="get_api_token",
     ),
 ]
