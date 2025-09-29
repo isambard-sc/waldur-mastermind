@@ -1903,25 +1903,6 @@ class ManagedProject(ReviewMixin, models.Model):
         help_text=_("The local project identifier in this portal."),
     )
 
-    def assert_same_destination(self, destination: openportal.Destination):
-        """
-        Assert that the destination matches the one set in this project.
-        If it does not match, raise an error.
-        """
-        if not isinstance(destination, openportal.Destination):
-            destination = openportal.Destination(destination)
-
-        if self.destination is None:
-            # If the destination is not set, set it to the one provided
-            self.destination = str(destination)
-            self.save(update_fields=["destination"])
-            return
-
-        if self.destination != str(destination):
-            raise ValueError(
-                f"Destination {self.destination} does not match expected destination {destination}."
-            )
-
     def get_destination(self) -> openportal.Destination:
         """
         Get the destination for this project.

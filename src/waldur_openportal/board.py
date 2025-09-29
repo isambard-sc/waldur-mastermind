@@ -355,6 +355,91 @@ class OpenPortalBoard:
         managed_project.local_identifier = str(self._to_project_identifier(shortname))
         managed_project.save()
 
+    def _link_existing_project(self, managed_project: models.ManagedProject):
+        if managed_project.project is not None:
+            # This project already exists - nothing to do?
+            return
+
+        identifier = managed_project.get_remote_identifier()
+        project_template: models.ProjectTemplate = managed_project.project_template
+        details: openportal.ProjectDetails = managed_project.get_details()
+
+        if identifier is None or project_template is None or details is None:
+            # This is a bug - we should not have a ManagedProject without a project class
+            logger.error(f"{managed_project} is in an invalid state.")
+            managed_project.reject(
+                utils.get_openportal_robot(),
+                f"{managed_project} is in an invalid state - project class or customer is not set.",
+            )
+            raise openportal.ManagedProjectRejectedError(
+                f"{managed_project} is in an invalid state - project class or customer is not set."
+            )
+
+        if project_template.customer is None:
+            managed_project.reject(
+                utils.get_openportal_robot(),
+                f"Project class {project_template} does not have a customer set.",
+            )
+            logger.warning(
+                f"Project class {project_template} does not have a customer set."
+            )
+            raise openportal.ManagedProjectRejectedError(
+                f"Project class {project_template} does not have a customer set."
+            )
+
+        customer = project_template.customer
+
+        existing_projects = structure_models.Project.objects.filter(
+            customer=customer,
+            name=str(details.name).strip(),
+        )
+
+        orphaned_existing_project = None
+
+        for existing_project in existing_projects:
+            # check if this project already has a ManagedProject for any destination
+            try:
+                existing_managed_project = models.ManagedProject.objects.get(
+                    project=existing_project,
+                )
+                logger.info(
+                    f"Found existing ManagedProject {existing_managed_project} for project {existing_project}"
+                )
+            except models.ManagedProject.DoesNotExist:
+                logger.info(
+                    f"Found existing project {existing_project} without a ManagedProject"
+                )
+
+                if not (existing_project.is_expired or existing_project.is_removed):
+                    # this project is not expired or removed, so we can use it
+                    # as an orphaned project
+                    logger.info(
+                        f"Using existing project {existing_project} for identifier {identifier}"
+                    )
+                    orphaned_existing_project = existing_project
+                    break
+
+        if orphaned_existing_project:
+            # We have found an existing project that does not have a ManagedProject
+            # associated with it. This means that the project was created in the
+            # customer, but not managed by OpenPortal.
+            logger.info(
+                f"Using orphaned existing project {orphaned_existing_project} for identifier {identifier}"
+            )
+
+            # We can now attach this project to the ManagedProject
+            self._attach_existing_project(managed_project, orphaned_existing_project)
+
+            if managed_project.is_rejected():
+                raise openportal.ManagedProjectRejectedError()
+            else:
+                # We need to ask the site admin to approve this connection
+                managed_project.set_needs_approval(
+                    True,
+                    comment=f"Project '{orphaned_existing_project}' already exists in customer '{customer}' and is being attached to '{managed_project}'.",
+                )
+                raise openportal.ManagedProjectPendingError()
+
     def _create_local_project(self, managed_project: models.ManagedProject):
         if managed_project.project is not None:
             # This project already exists - nothing to do?
@@ -386,59 +471,8 @@ class OpenPortalBoard:
 
         customer = project_template.customer
 
-        # there is a change that this project has already been created.
-        # Look for an existing project in this customer that has the
-        # same name as the project we are trying to create
-        existing_projects = structure_models.Project.objects.filter(
-            customer=customer,
-            name=str(details.name).strip(),
-        )
-
-        orphaned_existing_project = None
-
-        for existing_project in existing_projects:
-            # check if this project already has a ManagedProject
-            try:
-                existing_managed_project = models.ManagedProject.objects.get(
-                    project=existing_project,
-                )
-                logger.info(
-                    f"Found existing ManagedProject {existing_managed_project} for project {existing_project}"
-                )
-            except models.ManagedProject.DoesNotExist:
-                logger.info(
-                    f"Found existing project {existing_project} without a ManagedProject"
-                )
-
-                if not (existing_project.is_expired or existing_project.is_removed):
-                    # this project is not expired or removed, so we can use it
-                    # as an orphaned project
-                    logger.info(
-                        f"Using existing project {existing_project} as orphaned project for identifier {identifier}"
-                    )
-                    orphaned_existing_project = existing_project
-                    break
-
-        if orphaned_existing_project:
-            # We have found an existing project that does not have a ManagedProject
-            # associated with it. This means that the project was created in the
-            # customer, but not managed by OpenPortal.
-            logger.info(
-                f"Using orphaned existing project {orphaned_existing_project} for identifier {identifier}"
-            )
-
-            # We can now attach this project to the ManagedProject
-            self._attach_existing_project(managed_project, orphaned_existing_project)
-
-            if managed_project.is_rejected():
-                raise openportal.ManagedProjectRejectedError()
-            else:
-                # We need to ask the site admin to approve this connection
-                managed_project.set_needs_approval(
-                    True,
-                    comment=f"Project {orphaned_existing_project} already exists in customer {customer} and is being attached to ManagedProject {managed_project}.",
-                )
-                raise openportal.ManagedProjectPendingError()
+        # make sure to try to link an existing project first
+        self._link_existing_project(managed_project)
 
         # now get a generator for the project shortname
         generator = project_template.get_generator()
@@ -506,9 +540,14 @@ class OpenPortalBoard:
                 f"Invalid project details: {details}"
             )
 
+        if self.destination() is None:
+            raise openportal.ManagedProjectRejectedError(
+                "Board is not connected to a destination"
+            )
+
         # Get (or create) the ManagedProject for the given project identifier
         managed_project, created = models.ManagedProject.objects.get_or_create(
-            destination=self.destination(),
+            destination=str(self.destination()),
             identifier=str(identifier),
             defaults={
                 "details": json.loads(str(details)),
@@ -524,11 +563,11 @@ class OpenPortalBoard:
 
         if created:
             logger.info(
-                f"Created new ManagedProject for identifier {identifier}: {managed_project}"
+                f"Created new ManagedProject for identifier {identifier} in {self.destination()}: {managed_project}"
             )
         else:
             logger.info(
-                f"Retrieved existing ManagedProject for identifier {identifier}: {managed_project}"
+                f"Retrieved existing ManagedProject for identifier {identifier} in {self.destination()}: {managed_project}"
             )
 
         # get the project class of this project
@@ -562,6 +601,9 @@ class OpenPortalBoard:
                     f"{identifier} is rejected as allocation exceeds the limit.",
                 )
                 raise openportal.ManagedProjectRejectedError()
+
+        # Try to link an existing project first
+        self._link_existing_project(managed_project)
 
         if force_request_approval:
             if not managed_project.is_rejected():
@@ -642,11 +684,12 @@ class OpenPortalBoard:
         # Get the ManagedProject for this identifier, which must already exist
         try:
             managed_project = models.ManagedProject.objects.get(
-                identifier=str(identifier)
+                identifier=str(identifier),
+                destination=str(self.destination()),
             )
         except models.ManagedProject.DoesNotExist:
             logger.warning(
-                f"ManagedProject for identifier {identifier} does not exist - recreating."
+                f"ManagedProject for identifier {identifier} and destination {self.destination()} does not exist - recreating."
             )
 
             # recreate the project, but make sure to ask for approval
@@ -654,16 +697,6 @@ class OpenPortalBoard:
             return self.create_project(
                 identifier=identifier, details=new_details, force_request_approval=True
             )
-
-        try:
-            managed_project.assert_same_destination(self.destination())
-        except Exception as e:
-            logger.error(f"Destination mismatch for project {identifier}: {e}")
-            managed_project.reject(
-                utils.get_openportal_robot(),
-                f"Destination mismatch for project {identifier}: {e}",
-            )
-            raise openportal.ManagedProjectRejectedError()
 
         project_template = managed_project.get_project_template()
 
@@ -925,7 +958,8 @@ class OpenPortalBoard:
         # Get the ManagedProject for this identifier, which must already exist
         try:
             managed_project = models.ManagedProject.objects.get(
-                identifier=str(identifier)
+                identifier=str(identifier),
+                destination=str(self.destination()),
             )
         except models.ManagedProject.DoesNotExist:
             logger.error(f"ManagedProject for identifier {identifier} does not exist.")
@@ -955,7 +989,8 @@ class OpenPortalBoard:
         # Get the ManagedProject for this identifier, which must already exist
         try:
             managed_project = models.ManagedProject.objects.get(
-                identifier=str(identifier)
+                identifier=str(identifier),
+                destination=str(self.destination()),
             )
         except models.ManagedProject.DoesNotExist:
             logger.error(f"ManagedProject for identifier {identifier} does not exist.")
@@ -1012,7 +1047,7 @@ class OpenPortalBoard:
         mappings = []
 
         for project in models.ManagedProject.objects.filter(
-            destination=self.destination()
+            destination=str(self.destination())
         ):
             if not project.has_remote_identifier():
                 continue
@@ -1048,7 +1083,8 @@ class OpenPortalBoard:
         # Get the ManagedProject for this identifier, which must already exist
         try:
             managed_project = models.ManagedProject.objects.get(
-                identifier=str(identifier)
+                identifier=str(identifier),
+                destination=str(self.destination()),
             )
         except models.ManagedProject.DoesNotExist:
             logger.error(f"ManagedProject for identifier {identifier} does not exist.")
@@ -1095,7 +1131,8 @@ class OpenPortalBoard:
         # Get the ManagedProject for this identifier, which must already exist
         try:
             managed_project = models.ManagedProject.objects.get(
-                identifier=str(identifier)
+                identifier=str(identifier),
+                destination=str(self.destination()),
             )
         except models.ManagedProject.DoesNotExist:
             logger.error(f"ManagedProject for identifier {identifier} does not exist.")
@@ -1239,7 +1276,7 @@ class OpenPortalBoard:
         reports = []
 
         for project in models.ManagedProject.objects.filter(
-            destination=self.destination()
+            destination=str(self.destination())
         ):
             if not project.has_remote_identifier():
                 continue
