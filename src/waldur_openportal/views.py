@@ -1,5 +1,6 @@
 import logging
 
+from django.http import Http404
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
@@ -658,10 +659,36 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     filterset_class = filters.ManagedProjectFilter
 
     disabled_actions = ["create", "update", "partial_update"]
-    lookup_field = "identifier"
-    lookup_url_kwarg = "identifier"
-    # need to handle periods in the identifier
-    lookup_value_regex = r"[\w.-]+"
+
+    # Remove single lookup configuration
+    lookup_field = None
+    lookup_url_kwarg = None
+
+    def get_object(self):
+        """
+        Override get_object to lookup by both identifier and destination.
+        """
+        queryset = self.filter_queryset(self.get_queryset())
+
+        # Get identifier and destination from URL kwargs
+        identifier = self.kwargs.get("identifier")
+        destination = self.kwargs.get("destination")
+
+        if not identifier or not destination:
+            raise ValueError("Both identifier and destination must be provided")
+
+        # Perform the lookup
+        filter_kwargs = {"identifier": identifier, "destination": destination}
+
+        try:
+            obj = queryset.get(**filter_kwargs)
+        except models.ManagedProject.DoesNotExist:
+            raise Http404("No ManagedProject matches the given query.")
+
+        # May raise a permission denied
+        self.check_object_permissions(self.request, obj)
+
+        return obj
 
     def get_permissions(self):
         """
@@ -726,10 +753,10 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         description="Delete ManagedProject object",
     )
     @action(detail=True, methods=["delete"])
-    def delete(self, **kwargs):
+    def delete(self, request, **kwargs):
         project: models.ManagedProject = self.get_object()
 
-        logger.info(f"Deleting ManagedProject {project} by user {self.request.user}")
+        logger.info(f"Deleting ManagedProject {project} by user {request.user}")
 
         return Response(status=status.HTTP_200_OK)
 

@@ -31,8 +31,11 @@ class OpenPortalBoard:
         if not openportal.is_config_loaded():
             self.load_config()
 
-        if destination is not None and isinstance(destination, openportal.Destination):
-            self._destination = destination
+        if destination is not None:
+            if not isinstance(destination, openportal.Destination):
+                destination = openportal.Destination(destination)
+
+        self._destination = destination
 
     def _to_project_identifier(self, project) -> openportal.ProjectIdentifier:
         """
@@ -78,7 +81,20 @@ class OpenPortalBoard:
         Return the destination that this board is connected to.
         This is the destination that the OpenPortal Bridge is connected to.
         """
+        if self._destination is None:
+            raise openportal.OpenPortalError("Board is not connected to a destination")
+
         return self._destination
+
+    def offering(self) -> str:
+        """
+        Return the offering connected to this board. This is the final agent
+        name in the destination
+        """
+        if self._destination is None:
+            raise openportal.OpenPortalError("Board is not connected to a destination")
+
+        return str(self._destination.agents[-1])
 
     def load_config(self):
         """

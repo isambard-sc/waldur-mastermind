@@ -34,6 +34,8 @@ MAX_PORTALIDENTIFIER_LENGTH = 32
 MAX_PROJECTCLASS_LENGTH = 128
 MAX_ALLOWED_DESTINATIONS_LENGTH = 1024
 MAX_DESTINATION_LENGTH = 256
+MAX_OFFERING_LENGTH = 256
+MAX_KEY_LENGTH = 256
 
 
 class OnceTask(models.Model):
@@ -1434,9 +1436,21 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
     which portals can create which types of projects.
     """
 
-    # The name of the project class, e.g. "isambard-ai"
+    # The name of the project template, e.g. "ukri"
     name = models.CharField(
-        max_length=MAX_PROJECTCLASS_LENGTH, verbose_name=_("name"), db_index=True
+        max_length=MAX_PROJECTCLASS_LENGTH,
+        verbose_name=_("name"),
+        db_index=False,
+        unique=False,
+    )
+
+    # The offering for which this template applies, e.g. "isambard-ai"
+    offering = models.CharField(
+        max_length=MAX_OFFERING_LENGTH,
+        verbose_name=_("offering"),
+        help_text=_("The offering for which this template applies."),
+        blank=True,
+        null=True,
     )
 
     # The customer (organisation) that owns this project class and can
@@ -1457,9 +1471,19 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
     )
 
     # The name of the portal (PortalIdentifier) that is allowed to create
-    # this project class. The combination of name and portal must be unique.
+    # this project class, e.g. "airr".
+    # The combination of name, destination and portal must be unique.
     portal = models.CharField(
-        max_length=MAX_PORTALIDENTIFIER_LENGTH, verbose_name=_("portal"), db_index=True
+        max_length=MAX_PORTALIDENTIFIER_LENGTH, verbose_name=_("portal"), db_index=False
+    )
+
+    # The key that is used to authenticate requests for this class
+    key = models.CharField(
+        max_length=MAX_KEY_LENGTH,
+        verbose_name=_("key"),
+        help_text=_("The key that is used to authenticate requests for this class."),
+        blank=True,
+        null=True,
     )
 
     # The customer (organisation) in which to place projects which are created in
@@ -1547,14 +1571,15 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
         ),
     )
 
-    # Combination of name and portal must be unique
+    # Combination of name, offering and portal must be unique
     class Meta:
-        unique_together = ("name", "portal")
-        verbose_name = _("Project Class")
-        verbose_name_plural = _("Project Classes")
+        unique_together = ("name", "offering", "portal")
+        ordering = ["name"]
+        verbose_name = _("Project class")
+        verbose_name_plural = _("Project classes")
 
     def __str__(self) -> str:
-        return f"{self.portal} <=> {self.name}"
+        return f"{self.portal} <=> {self.name}@{self.offering}"
 
     def __repr__(self) -> str:
         return self.__str__()
@@ -1910,7 +1935,14 @@ class ManagedProject(ReviewMixin, models.Model):
         """
         if self.destination is None:
             raise ValueError("Destination is not set for this project.")
+
         return openportal.Destination(self.destination)
+
+    def get_offering(self) -> str:
+        """
+        Return the name of the offering connected to this destination
+        """
+        return str(self.get_destination().agents[-1])
 
     def has_project_template(self) -> bool:
         """
