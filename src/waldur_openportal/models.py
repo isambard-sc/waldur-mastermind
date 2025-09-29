@@ -2189,7 +2189,10 @@ class ManagedProject(ReviewMixin, models.Model):
         return self.state == ReviewStates.APPROVED
 
     def __str__(self) -> str:
-        return f"ManagedProject {self.identifier} => {self.project}"
+        try:
+            return f"ManagedProject for {self.get_offering()} [{self.identifier} => {self.project}]"
+        except Exception:
+            return f"ManagedProject for 'null offering' [{self.identifier} => {self.project}]"
 
     def __repr__(self) -> str:
         return self.__str__()

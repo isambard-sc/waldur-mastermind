@@ -186,7 +186,7 @@ class OpenPortalBoard:
             managed_project.delete()
 
             raise openportal.ManagedProjectRejectedError(
-                f"Project class is not set for project {details}"
+                f"Project template is not set for project {details}"
             )
 
         if not isinstance(details.project_template, openportal.ProjectTemplate):
@@ -225,28 +225,28 @@ class OpenPortalBoard:
 
         try:
             project_template = models.ProjectTemplate.objects.filter(
-                portal=remote_portal, name=project_template
+                portal=remote_portal, name=project_template, offering=self.offering()
             ).first()
         except Exception:
             managed_project.delete()
 
             logger.warning(
-                f"Failed to get the project class for portal {remote_portal} and class {project_template}. "
-                "This suggests that the portal is not allowed to create projects in this class."
+                f"Failed to get the project template for portal {remote_portal} for {project_template}@{self.offering()}. "
+                "This suggests that the portal is not allowed to create projects in this template for this offering."
             )
             raise openportal.ManagedProjectRejectedError(
-                f"Project class '{project_template}' is not allowed for portal '{remote_portal}'"
+                f"{project_template}@{self.offering()} is not allowed for portal '{remote_portal}'"
             )
 
         if not project_template:
             managed_project.delete()
 
             logger.warning(
-                f"Project class '{details.project_template}' not found for portal '{remote_portal}'. "
-                "This suggests that the portal is not allowed to create projects in this class."
+                f"Failed to get the project template for portal {remote_portal} for {details.project_template}@{self.offering()}. "
+                "This suggests that the portal is not allowed to create projects in this template for this offering."
             )
             raise openportal.ManagedProjectRejectedError(
-                f"Project class '{details.project_template}' is not allowed for portal '{remote_portal}'"
+                f"{details.project_template}@{self.offering()} is not allowed for portal '{remote_portal}'"
             )
 
         # The remote portal is allowed to create projects in this class,

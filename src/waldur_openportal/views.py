@@ -756,7 +756,8 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     def delete(self, request, **kwargs):
         project: models.ManagedProject = self.get_object()
 
-        logger.info(f"Deleting ManagedProject {project} by user {request.user}")
+        logger.info(f"Deleting {project} by user {request.user}")
+        project.delete()
 
         return Response(status=status.HTTP_200_OK)
 
