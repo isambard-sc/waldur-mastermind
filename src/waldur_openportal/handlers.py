@@ -380,3 +380,7 @@ def update_remote_quotas(scope, path):
 
     for quota in utils.FIELD_NAMES:
         scope.set_quota_usage(utils.MAPPING[quota], qs["total_%s" % quota])
+
+
+def update_offering_agents(**kwargs):
+    transaction.on_commit(lambda: tasks.sync_offering_agents.delay())

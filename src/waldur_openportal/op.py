@@ -114,63 +114,41 @@ try:
         load_config,
         health,
         get,
+        get_portal,
         run,
         send_result,
+        sync_offerings,
         DateRange,
         UsageReport,
         Usage,
         ProjectUsageReport,
     )
 
-    try:
-        if not hasattr(ProjectDetails, "merge"):
-
-            def _merge(slf, other):
-                from copy import deepcopy
-
-                merged = deepcopy(slf)
-
-                # We only update the project template if it is not already set
-                if merged.project_template is None:
-                    merged.project_template = other.project_template
-                elif (
-                    other.project_template is not None
-                    and merged.project_template != other.project_template
-                ):
-                    raise ValueError(
-                        "Cannot merge project details with different project templates."
-                    )
-
-                # Otherwise, overwrite the existing fields if they are set
-                if other.name is not None:
-                    merged.name = other.name
-
-                if other.description is not None:
-                    merged.description = other.description
-
-                if other.start_date is not None:
-                    merged.start_date = other.start_date
-
-                if other.end_date is not None:
-                    merged.end_date = other.end_date
-
-                if other.allocation is not None:
-                    merged.allocation = other.allocation
-
-                if other.members is not None:
-                    merged.members = other.members
-
-                return merged
-
-            ProjectDetails.merge = _merge
-
-    except ImportError:
-        from openportal import ProjectTemplate
-
     _have_openportal = True
 
     def have_openportal():
         return _have_openportal
+
+    def ensure_config_loaded():
+        if not is_config_loaded():
+            try:
+                import os
+
+                config_file = os.environ.get("OPENPORTAL_CONFIG")
+            except KeyError:
+                raise OpenPortalError("OPENPORTAL_CONFIG environment variable not set")
+
+            if not config_file:
+                raise OpenPortalError("OPENPORTAL_CONFIG environment variable not set")
+
+            try:
+                # this isn't thread-safe - we should make it thread-save
+                # in the OpenPortal python layer
+                load_config(config_file)
+            except Exception as e:
+                raise OpenPortalError(
+                    f"Failed to load OpenPortal config from '{config_file}': {e}"
+                )
 
 except ImportError:
     _have_openportal = False
@@ -261,5 +239,14 @@ except ImportError:
     def get(*args, **kwargs):
         _raise_no_openportal_error()
 
+    def get_portal(*args, **kwargs):
+        _raise_no_openportal_error()
+
+    def sync_offerings(*args, **kwargs):
+        _raise_no_openportal_error()
+
     def run(*args, **kwargs):
+        _raise_no_openportal_error()
+
+    def ensure_config_loaded():
         _raise_no_openportal_error()

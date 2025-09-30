@@ -1370,6 +1370,40 @@ def run_job(serialized_job):
             )
 
 
+@shared_task(name="waldur_openportal.sync_offering_agents")
+def sync_offering_agents():
+    """
+    This task is called to sync the agents for all offerings
+    that are associated with remote OpenPortal backends.
+    """
+    if not openportal.have_openportal():
+        return
+
+    logger.info("OpenPortal task.sync_offering_agents")
+
+    openportal.ensure_config_loaded()
+
+    # get the name of this portal
+    portal = openportal.get_portal()
+
+    offerings = []
+
+    # get all of the ProjectTemplate objects
+    for template in models.ProjectTemplate.objects.all():
+        try:
+            offering = openportal.Destination(
+                f"{template.get_offering()}.{portal}.{template.get_portal()}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to get offering for template {template}: {e}")
+            continue
+
+        offerings.append(offering)
+
+    # now run the jobs to sync all the agent offerings
+    openportal.sync_offerings(offerings)
+
+
 @shared_task(name="waldur_openportal.sync_board")
 def sync_board():
     """
@@ -1379,6 +1413,8 @@ def sync_board():
     """
     if not openportal.have_openportal():
         return
+
+    openportal.ensure_config_loaded()
 
     jobs = openportal.fetch_jobs()
 

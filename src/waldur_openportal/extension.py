@@ -62,6 +62,12 @@ class OpenPortalExtension(WaldurExtension):
                 "schedule": timedelta(minutes=9),
                 "args": (),
             },
+            # This task synchronises all offering agents
+            "waldur-openportal-sync-offering-agents": {
+                "task": "waldur_openportal.sync_offering_agents",
+                "schedule": timedelta(minutes=19),
+                "args": (),
+            },
         }
 
     @staticmethod

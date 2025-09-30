@@ -1744,6 +1744,26 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
             )
             return allocation.size
 
+    def get_offering(self) -> str:
+        """
+        Get the offering for this project class.
+        If the offering is not set, return None.
+        """
+        if self.offering is None:
+            raise ValueError("ProjectTemplate offering is not set!")
+
+        return self.offering.strip()
+
+    def get_portal(self) -> openportal.PortalIdentifier:
+        """
+        Get the portal for this project class.
+        If the portal is not set, return None.
+        """
+        if self.portal is None:
+            raise ValueError("ProjectTemplate portal is not set!")
+
+        return openportal.PortalIdentifier(self.portal.strip())
+
     def action_needs_approval(
         self, allocation: openportal.Allocation | float | None = None
     ) -> bool:
@@ -1853,6 +1873,18 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
             logger.info(f"Created new ProjectShortNameGenerator: {generator}")
 
         return generator
+
+    def assert_matching_key(self, key: str):
+        """
+        Assert that the given key matches the key for this project class.
+        If the keys do not match, raise an error.
+        If the project class key is None, then no key is required.
+        """
+        if self.key is None:
+            return
+
+        if key is None or str(self.key) != str(key):
+            raise ValueError("Invalid key for project class.")
 
 
 class ManagedProject(ReviewMixin, models.Model):

@@ -63,6 +63,12 @@ class OpenPortalConfig(AppConfig):
             dispatch_uid="waldur_openportal.handlers.update_allocation_credits",
         )
 
+        signals.post_save.connect(
+            handlers.update_offering_agents,
+            sender=models.ProjectTemplate,
+            dispatch_uid="waldur_openportal.handlers.update_offering_agents",
+        )
+
         permission_signals.role_granted.connect(
             handlers.role_granted,
             dispatch_uid="waldur_openportal.handlers.role_granted",
