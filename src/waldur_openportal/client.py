@@ -29,28 +29,7 @@ class OpenPortalRunner:
         OpenPortalException if the environment variable is not set
         or if the config file cannot be loaded
         """
-        # the name of the config file is held in the
-        # OPENPORTAL_CONFIG environment variable
-        try:
-            config_file = os.environ.get("OPENPORTAL_CONFIG")
-        except KeyError:
-            raise openportal.OpenPortalError(
-                "OPENPORTAL_CONFIG environment variable not set"
-            )
-
-        if not config_file:
-            raise openportal.OpenPortalError(
-                "OPENPORTAL_CONFIG environment variable not set"
-            )
-
-        try:
-            # this isn't thread-safe - we should make it thread-save
-            # in the OpenPortal python layer
-            openportal.load_config(config_file)
-        except Exception as e:
-            raise openportal.OpenPortalError(
-                f"Failed to load OpenPortal config from '{config_file}': {e}"
-            )
+        openportal.ensure_config_loaded()
 
     def health(self):
         if not openportal.have_openportal():

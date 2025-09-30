@@ -47,34 +47,8 @@ class OpenPortalBackend(ServiceBackend):
     def pull_resources(self):
         logger.debug(f"Pulling OpenPortal resources for settings: {self}")
 
-        fail_count = 0
-        now = datetime.datetime.now()
-
-        from . import tasks as openportal_tasks
-
-        for allocation in self.get_allocation_queryset().filter(
-            state=CoreStates.OK, is_added=True
-        ):
-            if openportal_tasks.is_task_running(openportal_tasks.sync):
-                logger.info(
-                    "Task sync is already running - skipping allocation %s",
-                    allocation,
-                )
-                continue
-
-            try:
-                logger.debug("About to pull allocation %s", allocation)
-                self.pull_allocation(allocation)
-            except Exception as e:
-                logger.error("Error while pulling allocation [%s]: %s", allocation, e)
-                fail_count += 1
-
-                if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
-                    logger.error("Too many failures - aborting")
-                    return
-                elif (datetime.datetime.now() - now).seconds > 120:
-                    logger.error("Took too long - aborting")
-                    return
+        logger.warning("Skipping pull_resources")
+        return
 
     def ping(self, raise_exception=False):
         logger.debug("Pinging OpenPortal")

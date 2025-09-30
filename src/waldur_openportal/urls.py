@@ -1,7 +1,12 @@
 from django.urls import re_path
 
 from . import views
-from .api import access_for_email, project_spend_info, customer_spend_info, fetch_job
+from .api import (
+    access_for_email,
+    project_spend_info,
+    customer_spend_info,
+    fetch_job,
+)
 
 
 def register_in(router):
@@ -77,5 +82,35 @@ urlpatterns = [
         r"^api/openportal/fetch_job/",
         fetch_job,
         name="fetch-job",
+    ),
+    re_path(
+        r"^api/openportal-managed-projects/(?P<identifier>[\w.-]+)/(?P<destination>[\w.-]+)/$",
+        views.ManagedProjectViewSet.as_view({"get": "retrieve"}),
+        name="openportal-managed-project-detail",
+    ),
+    re_path(
+        r"^api/openportal-managed-projects/(?P<identifier>[\w.-]+)/(?P<destination>[\w.-]+)/approve/$",
+        views.ManagedProjectViewSet.as_view({"post": "approve"}),
+        name="openportal-managed-project-approve",
+    ),
+    re_path(
+        r"^api/openportal-managed-projects/(?P<identifier>[\w.-]+)/(?P<destination>[\w.-]+)/reject/$",
+        views.ManagedProjectViewSet.as_view({"post": "reject"}),
+        name="openportal-managed-project-reject",
+    ),
+    re_path(
+        r"^api/openportal-managed-projects/(?P<identifier>[\w.-]+)/(?P<destination>[\w.-]+)/delete/$",
+        views.ManagedProjectViewSet.as_view({"delete": "delete"}),
+        name="openportal-managed-project-delete",
+    ),
+    re_path(
+        r"^api/openportal-managed-projects/(?P<identifier>[\w.-]+)/(?P<destination>[\w.-]+)/attach/$",
+        views.ManagedProjectViewSet.as_view({"post": "attach"}),
+        name="openportal-managed-project-attach",
+    ),
+    re_path(
+        r"^api/openportal-managed-projects/(?P<identifier>[\w.-]+)/(?P<destination>[\w.-]+)/detach/$",
+        views.ManagedProjectViewSet.as_view({"post": "detach"}),
+        name="openportal-managed-project-detach",
     ),
 ]

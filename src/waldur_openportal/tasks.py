@@ -402,8 +402,8 @@ def sync_remote_usage():
             if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                 logger.error("Too many failures - aborting")
                 return
-            elif (datetime.datetime.now() - now).seconds > 120:
-                logger.error("Took too long - aborting")
+            elif (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_remote_usage took too long - aborting")
                 return
 
 
@@ -415,21 +415,19 @@ def sync_usage():
     """
     logger.info("OpenPortal task.sync_usage")
     now = datetime.datetime.now()
-    fail_count = 0
 
-    for allocation in models.Allocation.objects.filter(is_active=True):
+    # loop through, using a different order each time to ensure every
+    # project is updated even if this individual task fails
+    for allocation in models.Allocation.objects.filter(is_active=True).order_by("?"):
         try:
             sync_allocation_usage(allocation)
         except Exception as e:
             logger.error(f"Failed to sync usage for {allocation}: {e}")
-            fail_count += 1
 
-            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
-                logger.error("Too many failures - aborting")
-                return
-            elif (datetime.datetime.now() - now).seconds > 120:
-                logger.error("Took too long - aborting")
-                return
+        # make sure we will finish within an hour
+        if (datetime.datetime.now() - now).seconds > 3600:
+            logger.error("sync_usage took too long - aborting")
+            return
 
     # Now update any limits that will be changed by the above usage
     logger.info("OpenPortal task.sync_usage [limits]")
@@ -513,14 +511,10 @@ def sync_usage():
 
             except Exception as e:
                 logger.error(f"Failed to sync limits for {allocation}: {e}")
-                fail_count += 1
 
-                if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
-                    logger.error("Too many failures - aborting")
-                    return
-                elif (datetime.datetime.now() - now).seconds > 120:
-                    logger.error("Took too long - aborting")
-                    return
+            if (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_usage took too long - aborting")
+                return
 
 
 @shared_task(name="waldur_openportal.sync_remote")
@@ -596,8 +590,8 @@ def sync_remote():
             if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                 logger.error("Too many failures - aborting")
                 break
-            elif (datetime.datetime.now() - now).seconds > 300:
-                logger.error("Took too long - aborting")
+            elif (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_remote_usage took too long - aborting")
                 break
 
 
@@ -626,8 +620,8 @@ def sync():
                 if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                     logger.error("Too many failures - aborting")
                     break
-                elif (datetime.datetime.now() - now).seconds > 300:
-                    logger.error("Took too long - aborting")
+                elif (datetime.datetime.now() - now).seconds > 3600:
+                    logger.error("sync_usage took too long - aborting")
                     break
 
         for allocation in get_structure_remote_allocations(customer):
@@ -640,8 +634,8 @@ def sync():
                 if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                     logger.error("Too many failures - aborting")
                     break
-                elif (datetime.datetime.now() - now).seconds > 300:
-                    logger.error("Took too long - aborting")
+                elif (datetime.datetime.now() - now).seconds > 3600:
+                    logger.error("sync_remote_usage took too long - aborting")
                     break
 
 
@@ -676,8 +670,8 @@ def sync_project(serialized_project):
             if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                 logger.error("Too many failures - aborting")
                 break
-            elif (datetime.datetime.now() - now).seconds > 120:
-                logger.error("Took too long - aborting")
+            elif (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_project took too long - aborting")
                 break
 
     for allocation in get_structure_remote_allocations(project):
@@ -690,8 +684,8 @@ def sync_project(serialized_project):
             if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
                 logger.error("Too many failures - aborting")
                 break
-            elif (datetime.datetime.now() - now).seconds > 300:
-                logger.error("Took too long - aborting")
+            elif (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_remote_usage took too long - aborting")
                 break
 
 
@@ -977,7 +971,7 @@ def create_default_resources(serialized_managed_project):
 
     if not isinstance(managed_project, models.ManagedProject):
         logger.error(
-            f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(project)}"
+            f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(managed_project)}"
         )
         raise ValueError(
             f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(managed_project)}"
@@ -1009,6 +1003,7 @@ def create_default_resources(serialized_managed_project):
         # find any existing orders for this project and offering
         num_erred = 0
         have_existing = False
+        resource = None
 
         for existing_resource in marketplace_models.Resource.objects.filter(
             project=project,
@@ -1022,6 +1017,7 @@ def create_default_resources(serialized_managed_project):
                 logger.info(
                     f"OpenPortal - Found existing resource {existing_resource} for {offering} in {project}"
                 )
+                resource = existing_resource
                 break
             else:
                 num_erred += 1
@@ -1039,6 +1035,24 @@ def create_default_resources(serialized_managed_project):
             logger.info(
                 f"OpenPortal - Skipping creation of {offering} for {project} - already exists"
             )
+
+            if resource is not None:
+                # check that we haven't created too many plans for this resource
+                plan_period = marketplace_models.ResourcePlanPeriod.objects.filter(
+                    resource=resource, end=None
+                )
+
+                if len(plan_period) > 1:
+                    # This indicates we've created multiple plans for the same resource
+                    # and project. We should not try to create it again.
+                    logger.error(
+                        f"OpenPortal - Too many active plans for {resource} in {project} - deleting extras"
+                    )
+
+                    for extra_plan in plan_period[1:]:
+                        logger.error(f"OpenPortal - Deleting extra plan {extra_plan}")
+                        extra_plan.delete()
+
             continue
 
         logger.info(f"OpenPortal - Creating {offering} for {project}")
@@ -1075,6 +1089,22 @@ def create_default_resources(serialized_managed_project):
             )
 
             created_resource = True
+
+            # make sure we don't have too many plans for this resource
+            plan_period = marketplace_models.ResourcePlanPeriod.objects.filter(
+                resource=resource, end=None
+            )
+
+            if len(plan_period) > 1:
+                # This indicates we've created multiple plans for the same resource
+                # and project. We should not try to create it again.
+                logger.error(
+                    f"OpenPortal - Too many active plans for {resource} in {project} - deleting extras"
+                )
+
+                for extra_plan in plan_period[1:]:
+                    logger.error(f"OpenPortal - Deleting extra plan {extra_plan}")
+                    extra_plan.delete()
 
         except Exception as e:
             logger.error(
@@ -1121,18 +1151,19 @@ def update_project(
 
     # schedule creation of default resources again in case any were missed
     try:
-        managed_project = models.ManagedProject.objects.filter(
-            identifier=str(mapping.project)
-        ).first()
+        managed_projects = models.ManagedProject.objects.filter(
+            identifier=str(mapping.project),
+            destination=str(board.destination()),
+        )
+
+        for managed_project in managed_projects:
+            if managed_project.is_approved():
+                create_default_resources.delay(
+                    core_utils.serialize_instance(managed_project)
+                )
     except Exception as e:
         logger.error(f"Failed to find managed project for {mapping.project}: {e}")
         raise ValueError(f"Failed to find managed project for {mapping.project}")
-
-    if not managed_project:
-        logger.error(f"Managed project for {mapping.project} not found")
-        raise ValueError(f"Managed project for {mapping.project} not found")
-
-    create_default_resources.delay(core_utils.serialize_instance(managed_project))
 
     return mapping
 
@@ -1340,6 +1371,40 @@ def run_job(serialized_job):
             )
 
 
+@shared_task(name="waldur_openportal.sync_offering_agents")
+def sync_offering_agents():
+    """
+    This task is called to sync the agents for all offerings
+    that are associated with remote OpenPortal backends.
+    """
+    if not openportal.have_openportal():
+        return
+
+    logger.info("OpenPortal task.sync_offering_agents")
+
+    openportal.ensure_config_loaded()
+
+    # get the name of this portal
+    portal = openportal.get_portal()
+
+    offerings = []
+
+    # get all of the ProjectTemplate objects
+    for template in models.ProjectTemplate.objects.all():
+        try:
+            offering = openportal.Destination(
+                f"{template.get_offering()}.{portal}.{template.get_portal()}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to get offering for template {template}: {e}")
+            continue
+
+        offerings.append(offering)
+
+    # now run the jobs to sync all the agent offerings
+    openportal.sync_offerings(offerings)
+
+
 @shared_task(name="waldur_openportal.sync_board")
 def sync_board():
     """
@@ -1349,6 +1414,8 @@ def sync_board():
     """
     if not openportal.have_openportal():
         return
+
+    openportal.ensure_config_loaded()
 
     jobs = openportal.fetch_jobs()
 

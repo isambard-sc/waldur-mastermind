@@ -27,7 +27,7 @@ class OpenPortalExtension(WaldurExtension):
             # user management failed when called directly
             "waldur-openportal-sync-users": {
                 "task": "waldur_openportal.sync",
-                "schedule": timedelta(minutes=59),
+                "schedule": timedelta(minutes=119),
                 "args": (),
             },
             # This task synchronises all usage from the OpenPortal resources
@@ -60,6 +60,12 @@ class OpenPortalExtension(WaldurExtension):
             "waldur-openportal-sync-remote-usage": {
                 "task": "waldur_openportal.sync_remote_usage",
                 "schedule": timedelta(minutes=9),
+                "args": (),
+            },
+            # This task synchronises all offering agents
+            "waldur-openportal-sync-offering-agents": {
+                "task": "waldur_openportal.sync_offering_agents",
+                "schedule": timedelta(minutes=19),
                 "args": (),
             },
         }

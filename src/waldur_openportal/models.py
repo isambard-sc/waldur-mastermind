@@ -34,6 +34,8 @@ MAX_PORTALIDENTIFIER_LENGTH = 32
 MAX_PROJECTCLASS_LENGTH = 128
 MAX_ALLOWED_DESTINATIONS_LENGTH = 1024
 MAX_DESTINATION_LENGTH = 256
+MAX_OFFERING_LENGTH = 256
+MAX_KEY_LENGTH = 256
 
 
 class OnceTask(models.Model):
@@ -388,6 +390,14 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
 
         if project.end_date is not None:
             details.end_date = project.end_date
+
+        # The project key is the UUID of the organisation that owns
+        # the project. This way, only projects within the approved
+        # organisation can create remote projects using this
+        # allocation, thereby preventing an admin of another
+        # organisation from guessing the project template name
+        # and using that
+        details.key = str(project.customer.uuid)
 
         # now get the allocation for this project (if requested)
         allocation, allocation_unit = self._get_requested_allocation()
@@ -1426,9 +1436,21 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
     which portals can create which types of projects.
     """
 
-    # The name of the project class, e.g. "isambard-ai"
+    # The name of the project template, e.g. "ukri"
     name = models.CharField(
-        max_length=MAX_PROJECTCLASS_LENGTH, verbose_name=_("name"), db_index=True
+        max_length=MAX_PROJECTCLASS_LENGTH,
+        verbose_name=_("name"),
+        db_index=False,
+        unique=False,
+    )
+
+    # The offering for which this template applies, e.g. "isambard-ai"
+    offering = models.CharField(
+        max_length=MAX_OFFERING_LENGTH,
+        verbose_name=_("offering"),
+        help_text=_("The offering for which this template applies."),
+        blank=True,
+        null=True,
     )
 
     # The customer (organisation) that owns this project class and can
@@ -1449,9 +1471,19 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
     )
 
     # The name of the portal (PortalIdentifier) that is allowed to create
-    # this project class. The combination of name and portal must be unique.
+    # this project class, e.g. "airr".
+    # The combination of name, destination and portal must be unique.
     portal = models.CharField(
-        max_length=MAX_PORTALIDENTIFIER_LENGTH, verbose_name=_("portal"), db_index=True
+        max_length=MAX_PORTALIDENTIFIER_LENGTH, verbose_name=_("portal"), db_index=False
+    )
+
+    # The key that is used to authenticate requests for this class
+    key = models.CharField(
+        max_length=MAX_KEY_LENGTH,
+        verbose_name=_("key"),
+        help_text=_("The key that is used to authenticate requests for this class."),
+        blank=True,
+        null=True,
     )
 
     # The customer (organisation) in which to place projects which are created in
@@ -1539,14 +1571,15 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
         ),
     )
 
-    # Combination of name and portal must be unique
+    # Combination of name, offering and portal must be unique
     class Meta:
-        unique_together = ("name", "portal")
-        verbose_name = _("Project Class")
-        verbose_name_plural = _("Project Classes")
+        unique_together = ("name", "offering", "portal")
+        ordering = ["name"]
+        verbose_name = _("Project class")
+        verbose_name_plural = _("Project classes")
 
     def __str__(self) -> str:
-        return f"{self.portal} <=> {self.name}"
+        return f"{self.portal} <=> {self.name}@{self.offering}"
 
     def __repr__(self) -> str:
         return self.__str__()
@@ -1711,6 +1744,26 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
             )
             return allocation.size
 
+    def get_offering(self) -> str:
+        """
+        Get the offering for this project class.
+        If the offering is not set, return None.
+        """
+        if self.offering is None:
+            raise ValueError("ProjectTemplate offering is not set!")
+
+        return self.offering.strip()
+
+    def get_portal(self) -> openportal.PortalIdentifier:
+        """
+        Get the portal for this project class.
+        If the portal is not set, return None.
+        """
+        if self.portal is None:
+            raise ValueError("ProjectTemplate portal is not set!")
+
+        return openportal.PortalIdentifier(self.portal.strip())
+
     def action_needs_approval(
         self, allocation: openportal.Allocation | float | None = None
     ) -> bool:
@@ -1821,6 +1874,18 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
 
         return generator
 
+    def assert_matching_key(self, key: str):
+        """
+        Assert that the given key matches the key for this project class.
+        If the keys do not match, raise an error.
+        If the project class key is None, then no key is required.
+        """
+        if self.key is None:
+            return
+
+        if key is None or str(self.key) != str(key):
+            raise ValueError("Invalid key for project class.")
+
 
 class ManagedProject(ReviewMixin, models.Model):
     """
@@ -1837,18 +1902,25 @@ class ManagedProject(ReviewMixin, models.Model):
         help_text=_(
             "The destination used to send instructions from the remote portal."
         ),
-        blank=True,
-        null=True,
+        blank=False,
+        null=False,
     )
 
     # This is the OpenPortal ProjectIdentifier from the portal that
     # requested and manages this project
     identifier = models.CharField(
         max_length=MAX_PROJECTIDENTIFIER_LENGTH,
-        unique=True,
+        unique=False,
         verbose_name=_("ID"),
-        db_index=True,
+        db_index=False,
     )
+
+    # It is the combination of the destination and identifier that
+    # should be unique and used to identify the project
+    class Meta:
+        unique_together = ("destination", "identifier")
+        verbose_name = _("Managed Project")
+        verbose_name_plural = _("Managed Projects")
 
     # This is the JSON representation of the OpenPortal ProjectDetails
     # that is synced between this portal and the managing portal
@@ -1888,25 +1960,6 @@ class ManagedProject(ReviewMixin, models.Model):
         help_text=_("The local project identifier in this portal."),
     )
 
-    def assert_same_destination(self, destination: openportal.Destination):
-        """
-        Assert that the destination matches the one set in this project.
-        If it does not match, raise an error.
-        """
-        if not isinstance(destination, openportal.Destination):
-            destination = openportal.Destination(destination)
-
-        if self.destination is None:
-            # If the destination is not set, set it to the one provided
-            self.destination = str(destination)
-            self.save(update_fields=["destination"])
-            return
-
-        if self.destination != str(destination):
-            raise ValueError(
-                f"Destination {self.destination} does not match expected destination {destination}."
-            )
-
     def get_destination(self) -> openportal.Destination:
         """
         Get the destination for this project.
@@ -1914,7 +1967,14 @@ class ManagedProject(ReviewMixin, models.Model):
         """
         if self.destination is None:
             raise ValueError("Destination is not set for this project.")
+
         return openportal.Destination(self.destination)
+
+    def get_offering(self) -> str:
+        """
+        Return the name of the offering connected to this destination
+        """
+        return str(self.get_destination().agents[-1])
 
     def has_project_template(self) -> bool:
         """
@@ -2161,7 +2221,10 @@ class ManagedProject(ReviewMixin, models.Model):
         return self.state == ReviewStates.APPROVED
 
     def __str__(self) -> str:
-        return f"ManagedProject {self.identifier} => {self.project}"
+        try:
+            return f"ManagedProject for {self.get_offering()} [{self.identifier} => {self.project}]"
+        except Exception:
+            return f"ManagedProject for 'null offering' [{self.identifier} => {self.project}]"
 
     def __repr__(self) -> str:
         return self.__str__()
