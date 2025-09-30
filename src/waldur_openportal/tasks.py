@@ -1151,18 +1151,19 @@ def update_project(
 
     # schedule creation of default resources again in case any were missed
     try:
-        managed_project = models.ManagedProject.objects.filter(
-            identifier=str(mapping.project)
-        ).first()
+        managed_projects = models.ManagedProject.objects.filter(
+            identifier=str(mapping.project),
+            destination=str(board.destination()),
+        )
+
+        for managed_project in managed_projects:
+            if managed_project.is_approved():
+                create_default_resources.delay(
+                    core_utils.serialize_instance(managed_project)
+                )
     except Exception as e:
         logger.error(f"Failed to find managed project for {mapping.project}: {e}")
         raise ValueError(f"Failed to find managed project for {mapping.project}")
-
-    if not managed_project:
-        logger.error(f"Managed project for {mapping.project} not found")
-        raise ValueError(f"Managed project for {mapping.project} not found")
-
-    create_default_resources.delay(core_utils.serialize_instance(managed_project))
 
     return mapping
 
