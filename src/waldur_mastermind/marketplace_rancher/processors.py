@@ -1,7 +1,11 @@
+import collections
 from ipaddress import ip_network
 from time import sleep
 from typing import cast
 
+from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
+from django.db import transaction
 from rest_framework import serializers as rf_serializers
 from rest_framework import status
 from rest_framework.reverse import reverse
@@ -9,14 +13,12 @@ from rest_framework.reverse import reverse
 from waldur_core.core.models import User
 from waldur_core.core.utils import get_system_robot
 from waldur_core.structure.models import Customer, Project, ServiceSettings
+from waldur_core.structure.views import ResourceViewSet
 from waldur_mastermind.common.utils import create_request
 from waldur_mastermind.marketplace import (
     processors,
 )
-from waldur_mastermind.marketplace import (
-    serializers as marketplace_serializers,
-)
-from waldur_mastermind.marketplace.enums import OfferingStates
+from waldur_mastermind.marketplace.enums import OPENSTACK_TENANT_OFFERING
 from waldur_mastermind.marketplace.models import Offering, Order, Plan, Resource
 from waldur_mastermind.marketplace_openstack import (
     CORES_TYPE,
@@ -24,7 +26,6 @@ from waldur_mastermind.marketplace_openstack import (
     STORAGE_MODE_DYNAMIC,
     STORAGE_MODE_FIXED,
     STORAGE_TYPE,
-    TENANT_TYPE,
 )
 from waldur_mastermind.marketplace_rancher.utils import (
     submit_creation_order,
@@ -37,33 +38,28 @@ from waldur_openstack import views as os_views
 from waldur_openstack.utils import volume_type_name_to_quota_name
 from waldur_rancher import exceptions
 from waldur_rancher import models as rancher_models
-from waldur_rancher import views as rancher_views
 from waldur_rancher.enums import AGENT_ROLE, SERVER_ROLE, NodeRoleType
+from waldur_rancher.executors import ClusterCreateExecutor, ClusterDeleteExecutor
+from waldur_rancher.serializers import RancherClusterCreateSerializer
+from waldur_rancher.validators import related_vm_can_be_deleted
 
-from . import PLUGIN_NAME, const, serializers
-
-
-class RancherCreateProcessor(processors.BaseCreateResourceProcessor):
-    viewset = rancher_views.ClusterViewSet
-    fields = (
-        "name",
-        "description",
-        "nodes",
-        "tenant",
-        "ssh_public_key",
-        "install_longhorn",
-        "security_groups",
-        "vm_project",
-    )
+from . import const, serializers
 
 
-class RancherDeleteProcessor(processors.DeleteScopedResourceProcessor):
-    viewset = rancher_views.ClusterViewSet
+class RancherCreateProcessor(processors.AbstractCreateResourceProcessor):
+    def send_request(self, user):
+        deployment_mode = self.order.offering.plugin_options.get(
+            "deployment_mode", const.DEPLOYMENT_MODE_SELF_MANAGED
+        )
+        if deployment_mode == const.DEPLOYMENT_MODE_MANAGED:
+            return self._create_managed_cluster(user)
+        else:
+            return self._create_self_managed_cluster(user)
 
-
-class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
-    def send_request(self, user) -> Resource:
-        serializer = serializers.ClusterCreateSerializer(data=self.order.attributes)
+    def _create_managed_cluster(self, user) -> rancher_models.Cluster:
+        serializer = serializers.ManagedClusterCreateSerializer(
+            data=self.order.attributes
+        )
         serializer.is_valid(raise_exception=True)
 
         project = self.create_project()
@@ -71,22 +67,60 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
         self.update_subnets(tenants)
         self.create_security_groups(tenants)
         load_balancers = self.create_load_balancers(user, project, tenants)
-        cluster_resource = self.create_cluster(user, project, tenants)
+        cluster = self.create_cluster(user, project, tenants)
         for sg in const.OS_LB_SECURITY_GROUPS:
-            rancher_models.ClusterSecurityGroup.objects.create(
-                cluster=cast(rancher_models.Cluster, cluster_resource.scope),
-                name=sg,
-            )
+            rancher_models.ClusterSecurityGroup.objects.create(cluster=cluster, name=sg)
 
         for load_balancer in load_balancers:
             if load_balancer.floating_ips.count() == 0:
                 continue
             rancher_models.ClusterPublicIP.objects.get_or_create(
-                cluster=cast(rancher_models.Cluster, cluster_resource.scope),
+                cluster=cluster,
                 floating_ip=load_balancer.floating_ips.first(),
             )
 
-        return cluster_resource
+        return cluster
+
+    def _get_post_data(self):
+        return processors.get_order_post_data(
+            self.order,
+            (
+                "name",
+                "description",
+                "nodes",
+                "tenant",
+                "ssh_public_key",
+                "install_longhorn",
+                "security_groups",
+                "vm_project",
+            ),
+        )
+
+    def _create_self_managed_cluster(self, user):
+        return self._trigger_cluster_creation(user, self._get_post_data())
+
+    def _trigger_cluster_creation(self, user, data) -> rancher_models.Cluster:
+        serializer = RancherClusterCreateSerializer(data=data)
+        serializer.is_valid(raise_exception=True)
+
+        cluster: rancher_models.Cluster = serializer.save()
+        nodes = serializer.validated_data.get("node_set")
+        install_longhorn = serializer.validated_data["install_longhorn"]
+
+        for node_data in nodes:
+            node_data["cluster"] = cluster
+            rancher_models.Node.objects.create(**node_data)
+
+        transaction.on_commit(
+            lambda: ClusterCreateExecutor.execute(
+                cluster,
+                user=user,
+                install_longhorn=install_longhorn,
+                is_heavy_task=True,
+            )
+        )
+
+        return cluster
 
     def create_project(self) -> Project:
         """
@@ -106,59 +140,15 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                 self.order.attributes["name"],
             ]
         )
-        return Project.objects.create(
+        project = Project.objects.create(
             customer=provider_customer,
             name=project_name,
             description="Automatically created project for Rancher cluster",
         )
+        return cast(Project, project)
 
     def create_tenants(self, user, project: Project) -> list[os_models.Tenant]:
-        def validate_all_tenant_limits(tenant_limits: list[dict[str, int]]):
-            aggregated_limits = {
-                CORES_TYPE: sum(limits[CORES_TYPE] for limits in tenant_limits),
-                RAM_TYPE: sum(limits[RAM_TYPE] for limits in tenant_limits),
-            }
-
-            type_to_max_limit = {
-                CORES_TYPE: self.order.offering.plugin_options.get(
-                    "managed_rancher_tenant_max_cpu"
-                ),
-                RAM_TYPE: self.order.offering.plugin_options.get(
-                    "managed_rancher_tenant_max_ram"
-                ),
-                STORAGE_TYPE: self.order.offering.plugin_options.get(
-                    "managed_rancher_tenant_max_disk"
-                ),
-            }
-
-            # Collect limits for storage quotas across the tenants and sum them
-            tenant_storage_limits = []
-            for tenant_limit in tenant_limits:
-                tenant_storage_limit = sum(
-                    limit_value
-                    for limit_type, limit_value in tenant_limit.items()
-                    if limit_type.startswith("gigabytes_") or limit_type == STORAGE_TYPE
-                )
-                tenant_storage_limits.append(tenant_storage_limit)
-            aggregated_limits[STORAGE_TYPE] = sum(tenant_storage_limits)
-
-            for limit_type, aggregated_limit in aggregated_limits.items():
-                max_allowed_limit = type_to_max_limit[limit_type]
-
-                if not max_allowed_limit:
-                    continue
-
-                if limit_type != CORES_TYPE:
-                    # Convert GBs to MBs
-                    max_allowed_limit *= 1024
-
-                if aggregated_limit > max_allowed_limit:
-                    raise rf_serializers.ValidationError(
-                        f"The requested total {limit_type} limit {aggregated_limit} cores exceeds the maximum allowed {max_allowed_limit} for tenants."
-                    )
-
-        orders = []
-        orders_data = []
+        tenants = []
         openstack_offering_uuid_list = cast(
             list[str], self.order.attributes["openstack_offering_uuid_list"]
         )
@@ -169,34 +159,14 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                 "name": f"os-tenant-{project.slug}-{offering.slug}",
             }
             limits = self.get_tenant_limits(offering)
-            orders_data.append(
-                {
-                    "offering": offering,
-                    "plan": plan,
-                    "attributes": attributes,
-                    "limits": limits,
-                }
+            order_uuid = submit_creation_order(
+                user, offering, plan, project, attributes, limits
             )
+            order = Order.objects.get(uuid=order_uuid)
+            tenant = cast(os_models.Tenant, order.resource.scope)
+            tenants.append(tenant)
 
-        tenant_limits = [order_data["limits"] for order_data in orders_data]
-        validate_all_tenant_limits(tenant_limits)
-
-        for order_data in orders_data:
-            orders.append(
-                submit_creation_order(
-                    user,
-                    order_data["offering"],
-                    order_data["plan"],
-                    project,
-                    order_data["attributes"],
-                    order_data["limits"],
-                )
-            )
-
-        return [
-            cast(os_models.Tenant, order.resource.scope)
-            for order in Order.objects.filter(uuid__in=orders)
-        ]
+        return tenants
 
     def update_subnets(self, tenants: list[os_models.Tenant]):
         # Limit applocation pools for subnets used for Rancher nodes
@@ -228,54 +198,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
         user: User,
         project: Project,
         tenants: list[os_models.Tenant],
-    ) -> Resource:
-        offering = self.order.offering
-        rancher_offering = cast(Offering, offering.scope)
-        if not rancher_offering:
-            name = f"{offering.name} (private)"
-            rancher_offering = Offering.objects.create(
-                type=PLUGIN_NAME,
-                shared=False,
-                billable=False,
-                customer=offering.customer,
-                name=name,
-                description=offering.description,
-                plugin_options=offering.plugin_options,
-                secret_options=offering.secret_options,
-                category=offering.category,
-            )
-            marketplace_serializers.update_or_create_service_settings_for_offering(
-                rancher_offering, offering.secret_options
-            )
-            offering.scope = rancher_offering
-            offering.save()
-            settings = cast(ServiceSettings, rancher_offering.scope)
-            settings.begin_creating()
-            settings.save()
-            backend = settings.get_backend()
-            backend.sync()
-            settings.set_ok()
-            settings.save()
-        else:
-            marketplace_serializers.update_or_create_service_settings_for_offering(
-                rancher_offering, offering.secret_options
-            )
-
-        # Sync plans from the offering to the rancher_offering
-        for plan in offering.plans.all():
-            rancher_offering.plans.update_or_create(
-                name=plan.name,
-                defaults={
-                    "backend_id": plan.id,
-                },
-            )
-
-        if rancher_offering.state != OfferingStates.ACTIVE:
-            rancher_offering.activate()
-            rancher_offering.save()
-
-        plan = Plan.objects.filter(offering=rancher_offering).first()
-
+    ) -> rancher_models.Cluster:
         nodes = []
 
         worker_nodes_count = self.order.attributes["worker_nodes_count"]
@@ -299,29 +222,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
             "install_longhorn": self.order.attributes.get("install_longhorn", False),
             "vm_project": reverse("project-detail", kwargs={"uuid": project.uuid.hex}),
         }
-
-        # TODO: consider lower wait timeout
-        try:
-            order_uuid = submit_creation_order(
-                user,
-                rancher_offering,
-                plan,
-                self.order.project,
-                attributes,
-                order_wait_timeout=60 * 60,
-            )
-        except exceptions.RancherException as e:
-            resource = self.order.resource
-            order_uuid_raw = str(e).split()[2]
-            order_uuid = order_uuid_raw.replace('"', "")
-            order = Order.objects.filter(uuid=order_uuid).first()
-            if order:
-                cluster_resource = order.resource
-                resource.scope = cluster_resource
-                resource.save()
-            raise
-
-        return Order.objects.get(uuid=order_uuid).resource
+        return self._trigger_cluster_creation(user, attributes)
 
     def format_node(
         self,
@@ -383,7 +284,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
             ),
         }
         data_volume_spec: dict[str, int | str] = {
-            "size": data_volume_size * 1024,
+            "size": data_volume_size,
             "mount_point": "/opt/rke2_storage",
             "filesystem": "btrfs",
         }
@@ -432,7 +333,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                 "worker_nodes_longhorn_volume_size"
             ]
             longhorn_volume_spec: dict[str, int | str] = {
-                "size": longhorn_volume_size * 1024,
+                "size": longhorn_volume_size,
                 "mount_point": "/opt/longhorn_storage",
                 "filesystem": "btrfs",
             }
@@ -604,9 +505,28 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
         return instances
 
     def validate_order(self, request):
-        available_service_settings = self.validate_openstack_offerings()
-        self.validate_flavors(available_service_settings)
-        self.validate_volume_types(available_service_settings)
+        if settings.WALDUR_RANCHER["READ_ONLY_MODE"]:
+            raise rf_serializers.ValidationError(
+                "Rancher integration is in read-only mode."
+            )
+        if (
+            self.order.offering.plugin_options.get(
+                "deployment_mode", const.DEPLOYMENT_MODE_SELF_MANAGED
+            )
+            == const.DEPLOYMENT_MODE_MANAGED
+        ):
+            serializer = serializers.ManagedClusterCreateSerializer(
+                data=self.order.attributes
+            )
+            serializer.is_valid(raise_exception=True)
+
+            available_service_settings = self.validate_openstack_offerings()
+            self.validate_flavors(available_service_settings)
+            self.validate_volume_types(available_service_settings)
+            self.validate_limits()
+        else:
+            serializer = RancherClusterCreateSerializer(data=self._get_post_data())
+            serializer.is_valid(raise_exception=True)
 
     def validate_flavors(self, available_service_settings: list[int]):
         worker_nodes_flavor_name = self.order.attributes["worker_nodes_flavor_name"]
@@ -681,6 +601,54 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                         f"Volume type {volume_type_name} is not available in OpenStack offering {service_setting}"
                     )
 
+    def validate_limits(self):
+        aggregated_limits = collections.defaultdict(int)
+        openstack_offering_uuid_list = cast(
+            list[str], self.order.attributes["openstack_offering_uuid_list"]
+        )
+        for offering_uuid in openstack_offering_uuid_list:
+            offering = Offering.objects.get(uuid=offering_uuid)
+            limits = self.get_tenant_limits(offering)
+            aggregated_limits[CORES_TYPE] += limits[CORES_TYPE]
+            aggregated_limits[RAM_TYPE] += limits[RAM_TYPE]
+            aggregated_limits[STORAGE_TYPE] += sum(
+                limit_value
+                for limit_type, limit_value in limits.items()
+                if limit_type.startswith("gigabytes_") or limit_type == STORAGE_TYPE
+            )
+
+        type_to_max_limit = {
+            CORES_TYPE: self.order.offering.plugin_options.get(
+                "managed_rancher_tenant_max_cpu"
+            ),
+            RAM_TYPE: self.order.offering.plugin_options.get(
+                "managed_rancher_tenant_max_ram"
+            ),
+            STORAGE_TYPE: self.order.offering.plugin_options.get(
+                "managed_rancher_tenant_max_disk"
+            ),
+        }
+
+        for limit_type, aggregated_limit in aggregated_limits.items():
+            max_allowed_limit = type_to_max_limit[limit_type]
+
+            if not max_allowed_limit:
+                continue
+
+            if limit_type != CORES_TYPE:
+                # Convert GBs to MBs
+                max_allowed_limit *= 1024
+
+            if limit_type == CORES_TYPE:
+                units = "cores"
+            else:
+                units = "MB"
+
+            if aggregated_limit > max_allowed_limit:
+                raise rf_serializers.ValidationError(
+                    f"The requested total {limit_type} limit {aggregated_limit} {units} exceeds the maximum allowed {max_allowed_limit} for tenants."
+                )
+
     def validate_openstack_offerings(self):
         available_offerings = set(
             self.order.offering.plugin_options["openstack_offering_uuid_list"]
@@ -706,7 +674,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
 
         return list(
             Offering.objects.filter(
-                type=TENANT_TYPE,
+                type=OPENSTACK_TENANT_OFFERING,
                 uuid__in=self.order.attributes["openstack_offering_uuid_list"],
             ).values_list("object_id", flat=True)
         )
@@ -765,7 +733,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
             "managed_rancher_worker_system_volume_type_name"
         )
 
-        worker_data_volume_size_gb: int = self.order.attributes[
+        worker_data_volume_size_mb: int = self.order.attributes[
             "worker_nodes_data_volume_size"
         ]
 
@@ -792,9 +760,9 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
         )
 
         install_longhorn = self.order.attributes.get("install_longhorn", False)
-        worker_longhorn_volume_size_gb = 0
+        worker_longhorn_volume_size_mb = 0
         if install_longhorn:
-            worker_longhorn_volume_size_gb = self.order.attributes[
+            worker_longhorn_volume_size_mb = self.order.attributes[
                 "worker_nodes_longhorn_volume_size"
             ]
 
@@ -807,8 +775,8 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                 * server_nodes_count
                 + (
                     worker_system_volume_size_gb
-                    + worker_data_volume_size_gb
-                    + worker_longhorn_volume_size_gb
+                    + (worker_data_volume_size_mb / 1024)
+                    + (worker_longhorn_volume_size_mb / 1024)
                 )
                 * worker_nodes_count
                 + load_balancer_system_volume_size_gb
@@ -831,7 +799,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                 ),
                 (
                     worker_data_volume_type_name,
-                    worker_nodes_count * worker_data_volume_size_gb,
+                    worker_nodes_count * (worker_data_volume_size_mb / 1024),
                 ),
                 (
                     load_balancer_system_volume_type_name,
@@ -849,7 +817,7 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                 volumes.append(
                     (
                         worker_longhorn_volume_type_name,
-                        worker_nodes_count * worker_longhorn_volume_size_gb,
+                        worker_nodes_count * (worker_longhorn_volume_size_mb / 1024),
                     )
                 )
             for volume_type_name, volume_size in volumes:
@@ -860,28 +828,42 @@ class ManagedRancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                 limits[volume_type_quota_name] += volume_size * 1024
         return limits
 
+    @classmethod
+    def get_resource_model(cls):
+        return rancher_models.Cluster
 
-class ManagedRancherDeleteProcessor(processors.AbstractDeleteResourceProcessor):
-    def send_request(self, user, resource: Resource) -> bool:
-        resource.set_state_terminating()
-        resource.save(update_fields=["state"])
 
-        cluster_resource = cast(Resource, resource.scope)
-        if not cluster_resource:
-            return True
-        cluster = cast(rancher_models.Cluster, cluster_resource.scope)
-        tenant_resource = (
-            Resource.objects.filter(scope=cluster.tenant).first()
-            if cluster.tenant
-            else None
+class RancherDeleteProcessor(processors.AbstractDeleteResourceProcessor):
+    def validate_order(self, request):
+        cluster = cast(rancher_models.Cluster, self.get_resource().scope)
+        for validator in ResourceViewSet.destroy_validators:
+            validator(cluster)
+        for node in cluster.node_set.all():
+            related_vm_can_be_deleted(node)
+
+    def send_request(self, user, resource: Resource):
+        cluster = cast(rancher_models.Cluster, resource.scope)
+
+        deployment_mode = self.order.offering.plugin_options.get(
+            "deployment_mode", const.DEPLOYMENT_MODE_SELF_MANAGED
         )
-        submit_termination_order(cluster_resource)
-        if not tenant_resource:
-            project = Project.objects.filter(name__icontains=resource.name).first()
-            if project:
-                tenant_resource = Resource.objects.filter(
-                    project=project, name__istartswith=f"os-tenant-{project.slug}"
-                ).first()
-        if tenant_resource:
-            submit_termination_order(tenant_resource)
-        return True
+        if deployment_mode == const.DEPLOYMENT_MODE_MANAGED:
+            self.delete_managed_cluster(user, cluster)
+        else:
+            self.delete_self_managed_cluster(user, cluster)
+        return False
+
+    def delete_self_managed_cluster(self, user, cluster: rancher_models.Cluster):
+        ClusterDeleteExecutor.execute(
+            cluster,
+            user=user,
+            is_heavy_task=True,
+        )
+
+    def delete_managed_cluster(self, user, cluster: rancher_models.Cluster):
+        self.delete_self_managed_cluster(user, cluster)
+        for resource in Resource.objects.filter(
+            object_id__in=cluster.linked_tenant_ids,
+            content_type=ContentType.objects.get_for_model(os_models.Tenant),
+        ):
+            submit_termination_order(resource)

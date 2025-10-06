@@ -17,10 +17,12 @@ from waldur_core.permissions.fixtures import (
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures
 from waldur_core.structure.tests import fixtures as structure_fixtures
-from waldur_mastermind.marketplace import PLUGIN_NAME, models, tasks
+from waldur_mastermind.marketplace import models, tasks
 from waldur_mastermind.marketplace.enums import (
+    BASIC_OFFERING,
     BillingTypes,
     OrderStates,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.tasks import process_order
@@ -74,7 +76,7 @@ class OrderApproveByConsumerTest(test.APITransactionTestCase):
     ):
         mocked_delay.side_effect = process_order
         offering = factories.OfferingFactory(
-            customer=self.fixture.customer, type=PLUGIN_NAME
+            customer=self.fixture.customer, type=BASIC_OFFERING
         )
         order = factories.OrderFactory(
             offering=offering, project=self.project, created_by=self.manager
@@ -90,6 +92,34 @@ class OrderApproveByConsumerTest(test.APITransactionTestCase):
         with freeze_time("2020-01-01"):
             response = self.approve_order(self.fixture.staff)
             self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_order_approval_handles_project_start_date_correctly(self):
+        """Test that project start_date (DateField) is correctly compared with timezone.now()."""
+        # Set a future start date (as date, not datetime)
+        future_date = datetime.datetime(year=2030, month=1, day=1).date()
+        self.project.start_date = future_date
+        self.project.save()
+
+        # Order should go to PENDING_PROJECT state when project has future start date
+        response = self.approve_order(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.state, OrderStates.PENDING_PROJECT)
+
+        # Set a past start date
+        past_date = datetime.datetime(year=2020, month=1, day=1).date()
+        self.project.start_date = past_date
+        self.project.save()
+
+        # Reset order state
+        self.order.state = OrderStates.PENDING_CONSUMER
+        self.order.save()
+
+        # Order should not go to PENDING_PROJECT state when project has past start date
+        response = self.approve_order(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.assertNotEqual(self.order.state, OrderStates.PENDING_PROJECT)
 
     def approve_order(self, user, order=None):
         order = order or self.order
@@ -123,7 +153,7 @@ class OrderApproveByProviderTest(test.APITransactionTestCase):
     ):
         offering = factories.OfferingFactory(
             customer=self.fixture.customer,
-            type=PLUGIN_NAME,
+            type=BASIC_OFFERING,
         )
         offering_component = factories.OfferingComponentFactory(
             offering=offering,
@@ -149,7 +179,7 @@ class OrderApproveByProviderTest(test.APITransactionTestCase):
             offering=offering,
             project=self.project,
             created_by=self.manager,
-            type=models.Order.Types.UPDATE,
+            type=OrderTypes.UPDATE,
             state=OrderStates.PENDING_PROVIDER,
             resource=resource,
             attributes=dict(old_limits=old_limits),
@@ -168,14 +198,14 @@ class OrderApproveByProviderTest(test.APITransactionTestCase):
         self,
     ):
         offering = factories.OfferingFactory(
-            customer=self.fixture.customer, type=PLUGIN_NAME
+            customer=self.fixture.customer, type=BASIC_OFFERING
         )
         resource = factories.ResourceFactory(offering=offering)
         order = factories.OrderFactory(
             offering=offering,
             project=self.project,
             created_by=self.manager,
-            type=models.Order.Types.TERMINATE,
+            type=OrderTypes.TERMINATE,
             resource=resource,
             state=OrderStates.PENDING_PROVIDER,
         )
@@ -185,7 +215,7 @@ class OrderApproveByProviderTest(test.APITransactionTestCase):
 
     def test_when_order_with_basic_offering_is_approved_resource_is_marked_as_ok(self):
         offering = factories.OfferingFactory(
-            customer=self.fixture.customer, type=PLUGIN_NAME
+            customer=self.fixture.customer, type=BASIC_OFFERING
         )
         order = factories.OrderFactory(
             offering=offering,
@@ -257,7 +287,7 @@ class OrderRejectByProviderTest(test.APITransactionTestCase):
         self.project = self.fixture.project
         self.manager = self.fixture.manager
         self.offering = factories.OfferingFactory(
-            type=PLUGIN_NAME, customer=self.fixture.customer
+            type=BASIC_OFFERING, customer=self.fixture.customer
         )
         resource = factories.ResourceFactory(offering=self.offering)
         self.order = factories.OrderFactory(
@@ -302,7 +332,7 @@ class OrderRejectByProviderTest(test.APITransactionTestCase):
     def test_when_create_order_with_basic_offering_is_rejected_resource_is_marked_as_terminated(
         self,
     ):
-        self.offering.type = PLUGIN_NAME
+        self.offering.type = BASIC_OFFERING
         self.offering.save()
 
         self.reject_order("owner")
@@ -312,9 +342,9 @@ class OrderRejectByProviderTest(test.APITransactionTestCase):
     def test_when_update_order_with_basic_offering_is_rejected_resource_is_marked_as_erred(
         self,
     ):
-        self.offering.type = PLUGIN_NAME
+        self.offering.type = BASIC_OFFERING
         self.offering.save()
-        self.order.type = models.Order.Types.UPDATE
+        self.order.type = OrderTypes.UPDATE
         self.order.save()
 
         plan_period = factories.ResourcePlanPeriodFactory()
@@ -340,9 +370,9 @@ class OrderRejectByProviderTest(test.APITransactionTestCase):
     def test_when_terminate_order_with_basic_offering_is_rejected_resource_is_marked_as_ok(
         self,
     ):
-        self.offering.type = PLUGIN_NAME
+        self.offering.type = BASIC_OFFERING
         self.offering.save()
-        self.order.type = models.Order.Types.TERMINATE
+        self.order.type = OrderTypes.TERMINATE
         self.order.save()
 
         self.reject_order("owner")

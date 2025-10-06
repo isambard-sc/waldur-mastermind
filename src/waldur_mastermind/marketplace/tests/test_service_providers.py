@@ -10,12 +10,12 @@ from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.marketplace import models, utils
 from waldur_mastermind.marketplace.enums import (
+    SUPPORT_OFFERING,
     BillingTypes,
     OfferingStates,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.tests import fixtures
-from waldur_mastermind.marketplace_support import PLUGIN_NAME
 
 from . import factories
 
@@ -25,6 +25,8 @@ class ServiceProviderGetTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.service_provider = self.fixture.service_provider
+        # Create consent so users are visible to service providers
+        self.fixture.user_offering_consent
 
     @data("staff", "owner", "user", "customer_support", "admin", "manager")
     def test_service_provider_should_be_visible_to_all_authenticated_users(self, user):
@@ -291,7 +293,7 @@ class ServiceProviderNotificationTest(test.APITransactionTestCase):
         )
         offering = factories.OfferingFactory(
             customer=self.fixture.customer,
-            type=PLUGIN_NAME,
+            type=SUPPORT_OFFERING,
             name="First",
         )
         self.component = factories.OfferingComponentFactory(
@@ -399,6 +401,8 @@ class ConsumerUserListTest(test.APITransactionTestCase):
             self.mp_fixture.service_provider, action="users"
         )
         CustomerRole.OWNER.add_permission(PermissionEnum.LIST_SERVICE_PROVIDER_USERS)
+        # Create consent so users are visible to service providers
+        self.mp_fixture.user_offering_consent
 
     def test_service_provider_can_view_users_in_project_with_purchased_resource(self):
         self.client.force_login(self.mp_fixture.offering_owner)
@@ -515,7 +519,7 @@ class ServiceProviderUserCustomersTest(test.APITransactionTestCase):
     def test_user_uuid(self):
         offering = factories.OfferingFactory(
             customer=self.fixture.customer,
-            type=PLUGIN_NAME,
+            type=SUPPORT_OFFERING,
             name="First",
         )
 
@@ -526,3 +530,108 @@ class ServiceProviderUserCustomersTest(test.APITransactionTestCase):
         self.client.force_authenticate(self.fixture.staff)
         response = self.client.get(self.url, {"user_uuid": self.fixture.user.uuid.hex})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class ServiceProviderProjectServiceAccountsTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.service_provider = self.fixture.service_provider
+        self.url = factories.ServiceProviderFactory.get_url(
+            self.service_provider, "project_service_accounts"
+        )
+        CustomerRole.OWNER.add_permission(
+            PermissionEnum.LIST_SERVICE_PROVIDER_SERVICE_ACCOUNTS
+        )
+
+        self.resource = self.fixture.resource
+        self.service_account = factories.ProjectServiceAccountFactory(
+            project=self.resource.project,
+            username="test-svc-username",
+        )
+
+        self.service_account_hidden = factories.ProjectServiceAccountFactory(
+            project=structure_factories.ProjectFactory(),
+            username="test-svc-username-2",
+        )
+
+    def test_get_project_service_accounts(self):
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()), 1)
+
+        service_account = response.json()[0]
+        self.assertEqual(service_account["username"], self.service_account.username)
+        self.assertEqual(
+            service_account["project_uuid"], self.resource.project.uuid.hex
+        )
+
+    def test_filter_project_service_accounts(self):
+        self.client.force_authenticate(self.fixture.offering_owner)
+        new_resource = factories.ResourceFactory(
+            name="New resource", offering=self.fixture.offering, state=ResourceStates.OK
+        )
+        new_project = new_resource.project
+
+        new_service_account = factories.ProjectServiceAccountFactory(
+            project=new_project,
+            username="test-svc-new-username",
+        )
+        url = f"{self.url}?project_uuid={new_project.uuid.hex}"
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()), 1)
+
+        service_account = response.json()[0]
+        self.assertEqual(service_account["username"], new_service_account.username)
+        self.assertEqual(service_account["project_uuid"], new_project.uuid.hex)
+
+
+class ServiceProviderCourseAccountsTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.service_provider = self.fixture.service_provider
+        self.url = factories.ServiceProviderFactory.get_url(
+            self.service_provider, "course_accounts"
+        )
+        CustomerRole.OWNER.add_permission(
+            PermissionEnum.LIST_SERVICE_PROVIDER_COURSE_ACCOUNTS
+        )
+
+        self.resource = self.fixture.resource
+        self.course_account = factories.CourseAccountFactory(
+            project=self.resource.project,
+        )
+
+        self.course_account_hidden = factories.CourseAccountFactory(
+            project=structure_factories.ProjectFactory(),
+        )
+
+    def test_get_course_accounts(self):
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()), 1)
+
+        course_account = response.json()[0]
+        self.assertEqual(course_account["username"], self.course_account.user.username)
+        self.assertEqual(course_account["project_uuid"], self.resource.project.uuid.hex)
+
+    def test_filter_course_accounts(self):
+        self.client.force_authenticate(self.fixture.offering_owner)
+        new_resource = factories.ResourceFactory(
+            name="New resource", offering=self.fixture.offering, state=ResourceStates.OK
+        )
+        new_project = new_resource.project
+
+        new_course_account = factories.CourseAccountFactory(
+            project=new_project,
+        )
+        url = f"{self.url}?project_uuid={new_project.uuid.hex}"
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()), 1)
+
+        course_account = response.json()[0]
+        self.assertEqual(course_account["username"], new_course_account.user.username)
+        self.assertEqual(course_account["project_uuid"], new_project.uuid.hex)

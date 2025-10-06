@@ -10,6 +10,11 @@ def register_in(router):
         views.CustomerPermissionReviewViewSet,
         basename="customer_permission_review",
     )
+    router.register(
+        r"project-permissions-reviews",
+        views.ProjectPermissionReviewViewSet,
+        basename="project-permissions-review",
+    )
     router.register(r"service-settings", views.ServiceSettingsViewSet)
     router.register(r"users", views.UserViewSet)
     router.register(r"keys", views.SshKeyViewSet)
@@ -42,6 +47,11 @@ def register_in(router):
         r"access-subnets",
         views.AccessSubnetViewSet,
         basename="access-subnets",
+    )
+    router.register(
+        r"external-links",
+        views.ExternalLinkViewSet,
+        basename="external-links",
     )
 
 urlpatterns = []

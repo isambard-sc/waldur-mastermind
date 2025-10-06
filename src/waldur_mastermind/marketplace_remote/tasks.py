@@ -2,22 +2,30 @@ import collections
 import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
+from uuid import UUID
 
 import requests
 from celery.app import shared_task
 from dateutil.relativedelta import relativedelta
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import Q
 from django.utils import dateparse, timezone
 from httpx import TimeoutException
 from rest_framework import exceptions as rf_exceptions
 from rest_framework import status
 from waldur_api_client.api.invoice_items import invoice_items_list
+from waldur_api_client.api.maintenance_announcements import (
+    maintenance_announcements_list,
+)
 from waldur_api_client.api.marketplace_component_usages import (
     marketplace_component_usages_list,
 )
 from waldur_api_client.api.marketplace_component_user_usages import (
     marketplace_component_user_usages_list,
+)
+from waldur_api_client.api.marketplace_offering_terms_of_service import (
+    marketplace_offering_terms_of_service_list,
 )
 from waldur_api_client.api.marketplace_offering_users import (
     marketplace_offering_users_list,
@@ -43,9 +51,16 @@ from waldur_api_client.api.projects import (
 from waldur_api_client.api.remote_eduteams import (
     remote_eduteams as get_remote_eduteams_user,
 )
+from waldur_api_client.client import AuthenticatedClient
 from waldur_api_client.errors import UnexpectedStatus
 from waldur_api_client.models import ComponentUserUsage
 from waldur_api_client.models.base_public_plan import BasePublicPlan
+from waldur_api_client.models.maintenance_announcement import (
+    MaintenanceAnnouncement as RemoteMaintenanceAnnouncement,
+)
+from waldur_api_client.models.maintenance_announcements_list_state_item import (
+    MaintenanceAnnouncementsListStateItem,
+)
 from waldur_api_client.models.offering_component import OfferingComponent
 from waldur_api_client.models.project import Project
 from waldur_api_client.models.public_offering_details import PublicOfferingDetails
@@ -74,18 +89,20 @@ from waldur_mastermind.invoices.utils import get_previous_month
 from waldur_mastermind.marketplace import models
 from waldur_mastermind.marketplace.callbacks import sync_order_state
 from waldur_mastermind.marketplace.enums import (
+    REMOTE_OFFERING,
+    MaintenanceState,
     OfferingStates,
     OrderStates,
+    OrderTypes,
     ResourceStates,
     RobotAccountStates,
 )
 from waldur_mastermind.marketplace.utils import get_or_create_plan_period
+from waldur_mastermind.marketplace_remote import models as remote_models
 from waldur_mastermind.marketplace_remote import (
-    PLUGIN_NAME,
     utils,
     utils_sync_remote_offerings,
 )
-from waldur_mastermind.marketplace_remote import models as remote_models
 from waldur_mastermind.marketplace_remote.constants import (
     OFFERING_COMPONENT_FIELDS,
     OFFERING_FIELDS,
@@ -114,6 +131,8 @@ LOGICAL_LOCAL_ORDER_STATES_MAP = {
     "rejected": OrderStates.CANCELED,  # If a remote order is rejected, the local one should switch from "executing" to "canceled"
 }
 
+DEFAULT_TOVERSION = "1.0"
+
 
 class OfferingPullTask(BackgroundPullTask):
     def pull(self, local_offering: models.Offering):
@@ -127,6 +146,7 @@ class OfferingPullTask(BackgroundPullTask):
             self.sync_offering_components(local_offering, remote_offering.components)
             self.sync_plans(local_offering, remote_offering.plans)
             self.sync_access_endpoints(local_offering, remote_offering)
+            self.sync_terms_of_service(local_offering, remote_offering, client)
         except UnexpectedStatus as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 if local_offering.state == OfferingStates.ACTIVE:
@@ -137,6 +157,102 @@ class OfferingPullTask(BackgroundPullTask):
                     logger.debug("Offering %s is archived: ", local_offering)
             else:
                 logger.exception(exc)
+
+    def sync_terms_of_service(
+        self,
+        local_offering: models.Offering,
+        remote_offering_data: PublicOfferingDetails,
+        client: AuthenticatedClient,
+    ):
+        """Backwards compatibility for old-style ToS of remote offerings."""
+        terms_of_service = getattr(remote_offering_data, "terms_of_service", "") or ""
+        terms_of_service_link = (
+            getattr(remote_offering_data, "terms_of_service_link", "") or ""
+        )
+
+        # New API client will automatically move terms of service to additional_properties since they are not in the expected schema
+        if not terms_of_service and not terms_of_service_link:
+            additional_props = getattr(
+                remote_offering_data, "additional_properties", {}
+            )
+            terms_of_service = additional_props.get("terms_of_service", "") or ""
+            terms_of_service_link = (
+                additional_props.get("terms_of_service_link", "") or ""
+            )
+
+            # If still not found, check nested additional_properties
+            if not terms_of_service and not terms_of_service_link:
+                nested_props = additional_props.get("additional_properties", {})
+                terms_of_service = nested_props.get("terms_of_service", "") or ""
+                terms_of_service_link = (
+                    nested_props.get("terms_of_service_link", "") or ""
+                )
+
+        if terms_of_service or terms_of_service_link:
+            models.OfferingTermsOfService.objects.update_or_create(
+                offering=local_offering,
+                version=DEFAULT_TOVERSION,
+                defaults={
+                    "terms_of_service": terms_of_service,
+                    "terms_of_service_link": terms_of_service_link,
+                    "is_active": True,
+                },
+            )
+        else:
+            try:
+                remote_terms_of_service_list = (
+                    marketplace_offering_terms_of_service_list.sync(
+                        client=client,
+                        offering_uuid=remote_offering_data.uuid,
+                    )
+                )
+                if not remote_terms_of_service_list:
+                    logger.info(
+                        "No terms of service found for offering %s", local_offering
+                    )
+                    models.OfferingTermsOfService.objects.filter(
+                        offering=local_offering
+                    ).delete()
+                    return
+                remote_terms_of_service = remote_terms_of_service_list[0]
+                local_terms_of_service: models.OfferingTermsOfService | None = (
+                    models.OfferingTermsOfService.objects.filter(
+                        offering=local_offering,
+                        version=remote_terms_of_service.version or DEFAULT_TOVERSION,
+                    ).first()
+                )
+                fields = {
+                    "terms_of_service": remote_terms_of_service.terms_of_service or "",
+                    "terms_of_service_link": remote_terms_of_service.terms_of_service_link
+                    or "",
+                    "version": remote_terms_of_service.version or DEFAULT_TOVERSION,
+                    "is_active": remote_terms_of_service.is_active,
+                    "requires_reconsent": remote_terms_of_service.requires_reconsent,
+                }
+                if local_terms_of_service:
+                    for field, value in fields.items():
+                        setattr(local_terms_of_service, field, value)
+                    local_terms_of_service.save()
+                    logger.info(
+                        "Updated existing ToS for offering %s (version %s)",
+                        local_offering,
+                        remote_terms_of_service.version or DEFAULT_TOVERSION,
+                    )
+                else:
+                    models.OfferingTermsOfService.objects.create(
+                        offering=local_offering, **fields
+                    )
+                    logger.info(
+                        "Created new ToS for offering %s (version %s)",
+                        local_offering,
+                        remote_terms_of_service.version or DEFAULT_TOVERSION,
+                    )
+            except UnexpectedStatus as exc:
+                logger.warning(
+                    "Failed to sync terms of service for offering %s: %s",
+                    local_offering,
+                    exc,
+                )
 
     def sync_access_endpoints(
         self, local_offering: models.Offering, remote_offering: PublicOfferingDetails
@@ -340,7 +456,7 @@ class OfferingListPullTask(BackgroundListPullTask):
 
     def get_pulled_objects(self):
         return models.Offering.objects.filter(
-            type=PLUGIN_NAME, secret_options__has_keys=["api_url", "token"]
+            type=REMOTE_OFFERING, secret_options__has_keys=["api_url", "token"]
         )
 
 
@@ -350,7 +466,7 @@ class OfferingUserPullTask(BackgroundPullTask):
         remote_offering_users = {
             remote_offering_user.user_username: remote_offering_user.username
             for remote_offering_user in marketplace_offering_users_list.sync(
-                client=client, offering_uuid=local_offering.backend_id
+                client=client, offering_uuid=[UUID(local_offering.backend_id)]
             )
         }
         local_offering_users = {
@@ -432,7 +548,10 @@ class OfferingUserListPullTask(BackgroundListPullTask):
 
     def get_pulled_objects(self):
         return models.Offering.objects.filter(
-            type=PLUGIN_NAME, secret_options__has_keys=["api_url", "token"]
+            type=REMOTE_OFFERING, secret_options__has_keys=["api_url", "token"]
+        ).filter(
+            Q(plugin_options__service_provider_can_create_offering_user__isnull=True)
+            | Q(plugin_options__service_provider_can_create_offering_user=False)
         )
 
 
@@ -467,7 +586,7 @@ class ResourceListPullTask(BackgroundListPullTask):
     pull_task = ResourcePullTask
 
     def get_pulled_objects(self):
-        return models.Resource.objects.filter(offering__type=PLUGIN_NAME).exclude(
+        return models.Resource.objects.filter(offering__type=REMOTE_OFFERING).exclude(
             backend_id=""
         )
 
@@ -549,7 +668,7 @@ class OrderListPullTask(BackgroundListPullTask):
 
     def get_pulled_objects(self):
         return (
-            models.Order.objects.filter(offering__type=PLUGIN_NAME)
+            models.Order.objects.filter(offering__type=REMOTE_OFFERING)
             .exclude(state__in=OrderStates.TERMINAL_STATES)
             .exclude(backend_id="")
         )
@@ -592,9 +711,9 @@ class ErredOrderPullTask(OrderPullTask):
             local_order.state = correct_local_order_state
             local_order.save(update_fields=["state"])
 
-            if local_order.type == models.Order.Types.UPDATE:
+            if local_order.type == OrderTypes.UPDATE:
                 local_resource.set_state_updating()
-            if local_order.type == models.Order.Types.TERMINATE:
+            if local_order.type == OrderTypes.TERMINATE:
                 local_resource.set_state_terminating()
 
             local_resource.save(update_fields=["state"])
@@ -621,11 +740,11 @@ class ErredOrderListPullTask(BackgroundListPullTask):
 
     def get_pulled_objects(self):
         return (
-            models.Order.objects.filter(offering__type=PLUGIN_NAME)
+            models.Order.objects.filter(offering__type=REMOTE_OFFERING)
             .exclude(backend_id="")
             .filter(
                 state=OrderStates.ERRED,
-                type__in=[models.Order.Types.UPDATE, models.Order.Types.TERMINATE],
+                type__in=[OrderTypes.UPDATE, OrderTypes.TERMINATE],
                 created__month=timezone.now().month,
             )
         )
@@ -747,7 +866,7 @@ class UsageListPullTask(BackgroundListPullTask):
 
     def get_pulled_objects(self):
         return models.Resource.objects.exclude(backend_id="").filter(
-            offering__type=PLUGIN_NAME
+            offering__type=REMOTE_OFFERING
         )
 
 
@@ -867,7 +986,7 @@ class ResourceInvoiceListPullTask(BackgroundListPullTask):
 
     def get_pulled_objects(self):
         return (
-            models.Resource.objects.filter(offering__type=PLUGIN_NAME)
+            models.Resource.objects.filter(offering__type=REMOTE_OFFERING)
             .exclude(state=ResourceStates.TERMINATED)
             .exclude(backend_id="")
         )
@@ -943,7 +1062,7 @@ class ResourceRobotAccountListPullTask(BackgroundListPullTask):
 
     def get_pulled_objects(self):
         return (
-            models.Resource.objects.filter(offering__type=PLUGIN_NAME)
+            models.Resource.objects.filter(offering__type=REMOTE_OFFERING)
             .exclude(state=ResourceStates.TERMINATED)
             .exclude(backend_id="")
         )
@@ -1007,14 +1126,18 @@ def update_remote_project_permissions(
         grant: Whether to grant (True) or revoke (False) the permission
         expiration_time: Optional expiration time for the permission
     """
-    project = deserialize_instance(serialized_project)
-    user = deserialize_instance(serialized_user)
+    try:
+        project = deserialize_instance(serialized_project)
+        user = deserialize_instance(serialized_user)
+    except ObjectDoesNotExist:
+        utils.log_permission_sync_skip_reason(serialized_project, serialized_user)
+        return
+
     new_expiration_time = (
         dateparse.parse_datetime(expiration_time)
         if expiration_time
         else expiration_time
     )
-
     sync_project_permission(grant, project, role_name, user, new_expiration_time)
 
 
@@ -1049,7 +1172,7 @@ def update_remote_customer_permissions(
         else expiration_time
     )
 
-    for project in customer.projects.all():
+    for project in structure_models.Project.available_objects.filter(customer=customer):
         sync_project_permission(grant, project, role_name, user, new_expiration_time)
 
 
@@ -1264,7 +1387,7 @@ def delete_remote_project(serialized_project):
     offering_ids = (
         models.Resource.objects.filter(
             project=local_project,
-            offering__type=PLUGIN_NAME,
+            offering__type=REMOTE_OFFERING,
         )
         .values_list("offering_id", flat=True)
         .distinct()
@@ -1327,7 +1450,7 @@ def clean_remote_projects():
     )
 
     for offering in models.Offering.objects.filter(
-        type=PLUGIN_NAME,
+        type=REMOTE_OFFERING,
         state__in=(OfferingStates.ACTIVE, OfferingStates.PAUSED),
     ):
         if (
@@ -1498,7 +1621,7 @@ class RemoteProjectDataListPushTask(BackgroundListPullTask):
     pull_task = RemoteProjectDataPushTask
 
     def get_pulled_objects(self):
-        return models.Offering.objects.filter(type=PLUGIN_NAME)
+        return models.Offering.objects.filter(type=REMOTE_OFFERING)
 
 
 class RemoteResourcePermissionsPushTask(BackgroundPullTask):
@@ -1518,3 +1641,190 @@ def remote_offerings_sync() -> None:
         is_active=True,
     ).exclude(state=remote_models.RemoteSynchronisation.States.PROCESSING):
         utils_sync_remote_offerings.RemoteSynchronisationRunner(sync).run()
+
+
+class MaintenanceAnnouncementPullTask(BackgroundPullTask):
+    """Pull and synchronize remote maintenance announcements for a service provider.
+
+    This task synchronizes maintenance announcements from remote Waldur instances,
+    updating local maintenance data including affected offerings and impact levels.
+    """
+
+    def pull(self, service_provider: models.ServiceProvider):
+        try:
+            offering = models.Offering.objects.filter(
+                customer=service_provider.customer,
+                type=REMOTE_OFFERING,
+                secret_options__has_keys=["api_url", "token"],
+            ).first()
+            if not offering:
+                logger.info(
+                    "No remote offerings found for service provider %s",
+                    service_provider.customer.name,
+                )
+                return
+
+            client = get_client_for_offering(offering)
+
+            remote_maintenance_list: list[RemoteMaintenanceAnnouncement] = (
+                maintenance_announcements_list.sync(
+                    client=client,
+                    state=[
+                        MaintenanceAnnouncementsListStateItem.SCHEDULED,
+                        MaintenanceAnnouncementsListStateItem.IN_PROGRESS,
+                    ],
+                )
+            )
+
+            local_maintenance_list = models.MaintenanceAnnouncement.objects.filter(
+                service_provider=service_provider
+            )
+
+            local_maintenance_map = {
+                item.backend_id: item
+                for item in local_maintenance_list
+                if item.backend_id
+            }
+
+            remote_maintenance_map = {
+                item.uuid.hex: item for item in remote_maintenance_list
+            }
+
+            local_maintenance_keys = set(local_maintenance_map.keys())
+            remote_maintenance_keys = set(remote_maintenance_map.keys())
+
+            new_maintenance_keys = remote_maintenance_keys - local_maintenance_keys
+            stale_maintenance_keys = local_maintenance_keys - remote_maintenance_keys
+            existing_maintenance_keys = local_maintenance_keys & remote_maintenance_keys
+            announcements_to_update_or_create = (
+                new_maintenance_keys | existing_maintenance_keys
+            )
+            if stale_maintenance_keys:
+                stale_maintenances = [
+                    local_maintenance_map[key] for key in stale_maintenance_keys
+                ]
+                ids = [m.id for m in stale_maintenances]
+                models.MaintenanceAnnouncement.objects.filter(id__in=ids).delete()
+                logger.info(
+                    "Deleted stale maintenance announcements %s for service provider %s",
+                    len(stale_maintenances),
+                    service_provider.customer.name,
+                )
+
+            for maintenance_key in announcements_to_update_or_create:
+                remote_maintenance = remote_maintenance_map[maintenance_key]
+                self.update_or_create_local_maintenance(
+                    service_provider, remote_maintenance
+                )
+
+        except UnexpectedStatus as exc:
+            logger.exception(
+                "Failed to sync maintenance announcements for service provider %s: %s",
+                service_provider.customer.name,
+                exc,
+            )
+            raise
+
+    def update_or_create_local_maintenance(
+        self, service_provider, remote_maintenance: RemoteMaintenanceAnnouncement
+    ):
+        """Create or update local maintenance announcement from remote data."""
+        maintenance_state_map = {
+            label: value for value, label in MaintenanceState.CHOICES
+        }
+        defaults = {
+            "name": remote_maintenance.name,
+            "message": remote_maintenance.message,
+            "maintenance_type": remote_maintenance.maintenance_type.value
+            if remote_maintenance.maintenance_type
+            else None,
+            "scheduled_start": remote_maintenance.scheduled_start,
+            "scheduled_end": remote_maintenance.scheduled_end,
+            "actual_start": remote_maintenance.actual_start,
+            "actual_end": remote_maintenance.actual_end,
+            "external_reference_url": remote_maintenance.external_reference_url,
+            "state": maintenance_state_map.get(remote_maintenance.state.value),
+        }
+
+        local_maintenance, created = (
+            models.MaintenanceAnnouncement.objects.update_or_create(
+                service_provider=service_provider,
+                backend_id=remote_maintenance.uuid.hex,
+                defaults=defaults,
+            )
+        )
+
+        self.sync_affected_maintenance_offerings(
+            local_maintenance, remote_maintenance.affected_offerings
+        )
+        action = "Created" if created else "Updated"
+        logger.info(
+            "%s maintenance announcement '%s' for service provider %s",
+            action,
+            local_maintenance.name,
+            service_provider.customer.name,
+        )
+        return local_maintenance
+
+    def sync_affected_maintenance_offerings(
+        self, local_maintenance, remote_affected_offerings
+    ):
+        """Sync affected offerings for a maintenance announcement."""
+        if not remote_affected_offerings:
+            return
+        local_maintenance.affected_offerings.all().delete()
+
+        for remote_affected in remote_affected_offerings:
+            try:
+                if (
+                    hasattr(remote_affected, "offering_name")
+                    and remote_affected.offering_name
+                ):
+                    local_offering = models.Offering.objects.get(
+                        customer=local_maintenance.service_provider.customer,
+                        name=remote_affected.offering_name,
+                    )
+                else:
+                    logger.warning(
+                        "Cannot identify remote offering for maintenance '%s': no offering_name",
+                        local_maintenance.name,
+                    )
+                    continue
+
+                models.MaintenanceAnnouncementOffering.objects.create(
+                    maintenance=local_maintenance,
+                    offering=local_offering,
+                    impact_level=getattr(remote_affected, "impact_level", 2),
+                    impact_description=getattr(
+                        remote_affected, "impact_description", ""
+                    ),
+                )
+
+            except ObjectDoesNotExist:
+                logger.warning(
+                    "Cannot sync affected offering for maintenance '%s': offering not found locally",
+                    local_maintenance.name,
+                )
+
+
+class MaintenanceAnnouncementListPullTask(BackgroundListPullTask):
+    pull_task = MaintenanceAnnouncementPullTask
+
+    def get_pulled_objects(self):
+        """Get service providers that have remote offerings to sync maintenance from."""
+        remote_offering_customers = models.Offering.objects.filter(
+            type=REMOTE_OFFERING, secret_options__has_keys=["api_url", "token"]
+        ).values_list("customer_id", flat=True)
+        return models.ServiceProvider.objects.filter(
+            customer_id__in=remote_offering_customers
+        ).distinct()
+
+
+@shared_task(name="waldur_mastermind.marketplace_remote.pull_maintenance_announcements")
+def pull_maintenance_announcements():
+    """Pull and synchronize remote maintenance announcements.
+
+    This task synchronizes maintenance announcements from remote Waldur instances,
+    Runs every 60 minutes via celery beat.
+    """
+    MaintenanceAnnouncementListPullTask().run()

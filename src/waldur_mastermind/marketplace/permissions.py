@@ -1,10 +1,11 @@
+from constance import config
 from django.utils.translation import gettext_lazy as _
 from rest_framework import exceptions
 
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.utils import has_permission, permission_factory
 from waldur_core.structure import permissions as structure_permissions
-from waldur_mastermind.marketplace.enums import OfferingStates
+from waldur_mastermind.marketplace.enums import OfferingStates, OrderTypes
 
 from . import models
 
@@ -49,7 +50,8 @@ def order_should_not_be_reviewed_by_consumer(order: models.Order):
 
     # Service provider is not required to approve termination order
     if (
-        order.type == models.Order.Types.TERMINATE
+        order.type == OrderTypes.TERMINATE
+        and order.offering.customer
         and structure_permissions._has_owner_access(user, order.offering.customer)
     ):
         return True
@@ -178,3 +180,38 @@ def can_see_secret_options(request, instance):
             )
         )
     )
+
+
+def check_tos_consent_permission(request, view, obj=None):
+    """
+    Check if user has consented to Terms of Service for the resource's offering.
+    """
+    if not obj:
+        return
+
+    if not config.ENFORCE_USER_CONSENT_FOR_OFFERINGS:
+        return
+
+    user = request.user
+    offering = obj.offering
+    if user.is_staff or user.is_support:
+        return
+
+    if not offering.plugin_options.get(
+        "service_provider_can_create_offering_user", False
+    ):
+        return
+
+    if not offering.has_terms_of_service():
+        return
+
+    consent_exists = models.UserOfferingConsent.objects.filter(
+        user=user,
+        offering=offering,
+        revocation_date__isnull=True,
+    ).exists()
+    if not consent_exists:
+        raise exceptions.PermissionDenied(
+            f"Terms of Service consent required for offering '{offering.name}'. "
+            f"Please accept the Terms of Service before accessing this resource."
+        )

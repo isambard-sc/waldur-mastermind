@@ -7,12 +7,13 @@ from waldur_core.permissions.fixtures import (
 )
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
-from waldur_mastermind.marketplace import PLUGIN_NAME
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import (
+    BASIC_OFFERING,
     BillingTypes,
     OfferingStates,
     OrderStates,
+    OrderTypes,
 )
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
@@ -26,7 +27,7 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
     @cached_property
     def offering(self):
         return marketplace_factories.OfferingFactory(
-            type=PLUGIN_NAME,
+            type=BASIC_OFFERING,
             state=OfferingStates.ACTIVE,
             project=self.offering_project,
             customer=self.offering_customer,
@@ -94,7 +95,7 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
             resource=self.resource,
             plan=self.plan,
             state=OrderStates.EXECUTING,
-            type=marketplace_models.Order.Types.UPDATE,
+            type=OrderTypes.UPDATE,
         )
 
     @cached_property
@@ -188,4 +189,13 @@ class MarketplaceFixture(structure_fixtures.ProjectFixture):
         return marketplace_factories.MaintenanceAnnouncementOfferingTemplateFactory(
             maintenance_template=self.maintenance_announcement_template,
             offering=self.offering,
+        )
+
+    @cached_property
+    def user_offering_consent(self):
+        """Create consent for admin user so they're visible to service providers"""
+        return marketplace_models.UserOfferingConsent.objects.create(
+            user=self.admin,
+            offering=self.offering,
+            version="1.0",
         )

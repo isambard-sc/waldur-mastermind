@@ -4,13 +4,16 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import textwrap
 import traceback
 import unicodedata
 import uuid
 from collections import defaultdict
+from decimal import Decimal
 from enum import Enum
+from functools import lru_cache
 from io import BytesIO
 from typing import cast
 
@@ -25,6 +28,7 @@ from django.db import transaction
 from django.db.models import F, Q, Sum
 from django.db.models.fields import FloatField
 from django.db.models.functions.math import Ceil
+from django.urls import get_resolver
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from PIL import Image
@@ -59,22 +63,25 @@ from waldur_freeipa import models as freeipa_models
 from waldur_mastermind.common.utils import create_request, mb_to_gb
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices import registrators
+from waldur_mastermind.invoices.structures import InvoiceResourceLimitPeriodDict
 from waldur_mastermind.invoices.utils import get_full_days
 from waldur_mastermind.marketplace import attribute_types
+from waldur_mastermind.marketplace.enums import REMOTE_OFFERING as REMOTE_PLUGIN_NAME
+from waldur_mastermind.marketplace.enums import (
+    SITE_AGENT_OFFERING as SITE_AGENT_PLUGIN_NAME,
+)
 from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     LimitPeriods,
+    OfferingUserStates,
     OrderStates,
     ResourceStates,
     RobotAccountStates,
 )
-from waldur_mastermind.marketplace_remote import PLUGIN_NAME as REMOTE_PLUGIN_NAME
-from waldur_mastermind.marketplace_site_agent import (
-    PLUGIN_NAME as SITE_AGENT_PLUGIN_NAME,
-)
 
-from . import PLUGIN_NAME as BASIC_PLUGIN_NAME
 from . import models, plugins
+from .enums import BASIC_OFFERING as BASIC_PLUGIN_NAME
+from .enums import OrderTypes
 
 logger = logging.getLogger(__name__)
 USERNAME_ANONYMIZED_POSTFIX_LENGTH = 5
@@ -96,13 +103,13 @@ class UsernameGenerationPolicy(Enum):
 def get_order_processor(order: models.Order):
     offering = order.resource.offering
 
-    if order.type == models.RequestTypeMixin.Types.CREATE:
+    if order.type == OrderTypes.CREATE:
         return plugins.manager.get_processor(offering.type, "create_resource_processor")
 
-    elif order.type == models.RequestTypeMixin.Types.UPDATE:
+    elif order.type == OrderTypes.UPDATE:
         return plugins.manager.get_processor(offering.type, "update_resource_processor")
 
-    elif order.type == models.RequestTypeMixin.Types.TERMINATE:
+    elif order.type == OrderTypes.TERMINATE:
         return plugins.manager.get_processor(offering.type, "delete_resource_processor")
 
 
@@ -130,7 +137,7 @@ def process_order(order: models.Order, user):
 
         if (
             order.attributes.get("action") == "force_destroy"
-            and order.type == models.RequestTypeMixin.Types.TERMINATE
+            and order.type == OrderTypes.TERMINATE
             and user.is_staff
         ):
             order.resource.set_state_terminated()
@@ -192,7 +199,7 @@ def create_screenshot_thumbnail(screenshot):
     temp_thumb.close()
 
 
-def import_resource_metadata(resource):
+def import_resource_metadata(resource: models.Resource):
     instance = resource.scope
     fields = {"action", "action_details", "state", "runtime_state"}
 
@@ -295,6 +302,26 @@ def validate_limit_amount(value, component):
         if current + value > component.limit_amount:
             raise serializers.ValidationError(
                 _("Monthly limit exceeds threshold %s.") % component.limit_amount
+            )
+
+    elif component.limit_period == LimitPeriods.QUARTERLY:
+        quarter_start = core_utils.get_current_quarter_start()
+        quarter_end = core_utils.get_current_quarter_end()
+        current = (
+            (
+                models.ComponentQuota.objects.filter(
+                    component=component,
+                    modified__gte=quarter_start,
+                    modified__lte=quarter_end,
+                )
+                .exclude(limit=-1)
+                .aggregate(sum=Sum("limit"))["sum"]
+            )
+            or 0
+        )
+        if current + value > component.limit_amount:
+            raise serializers.ValidationError(
+                _("Quarterly limit exceeds threshold %s.") % component.limit_amount
             )
 
     elif component.limit_period == LimitPeriods.ANNUAL:
@@ -737,7 +764,7 @@ def move_resource(resource: models.Resource, project):
         target_invoice.update_cache()
 
 
-def get_invoice_item_for_component_usage(component_usage):
+def get_invoice_item_for_component_usage(component_usage: models.ComponentUsage):
     if not component_usage.plan_period:
         # Field plan_period is optional if component_usage is not connected with billing
         return
@@ -766,14 +793,16 @@ def get_invoice_item_for_component_usage(component_usage):
         pass
 
 
-def serialize_resource_limit_period(period):
-    billing_periods = get_full_days(period["start"], period["end"])
+def serialize_resource_limit_period(
+    start: datetime.datetime, end: datetime.datetime, quantity: int
+) -> InvoiceResourceLimitPeriodDict:
+    billing_periods = get_full_days(start, end)
     return {
-        "start": period["start"].isoformat(),
-        "end": period["end"].isoformat(),
-        "quantity": period["quantity"],
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "quantity": quantity,
         "billing_periods": billing_periods,
-        "total": str(period["quantity"] * billing_periods),
+        "total": str(quantity * billing_periods),
     }
 
 
@@ -861,7 +890,9 @@ def get_service_provider_project_ids(service_provider):
 def get_service_provider_user_ids(user, service_provider, customer=None):
     project_ids = get_service_provider_project_ids(service_provider)
     if customer:
-        customer_projects = customer.projects.all().values_list("id", flat=True)
+        customer_projects = structure_models.Project.available_objects.filter(
+            customer=customer
+        ).values_list("id", flat=True)
         project_ids = set(project_ids) & set(customer_projects)
     content_type = ContentType.objects.get_for_model(structure_models.Project)
     qs = UserRole.objects.filter(
@@ -1002,7 +1033,7 @@ def count_customers_number_change(service_provider):
     for customer_id in (
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
-            type=models.Order.Types.CREATE,
+            type=OrderTypes.CREATE,
             state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
@@ -1024,7 +1055,7 @@ def count_customers_number_change(service_provider):
     for customer_id in (
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
-            type=models.Order.Types.TERMINATE,
+            type=OrderTypes.TERMINATE,
             state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
@@ -1051,7 +1082,7 @@ def count_resources_number_change(service_provider):
     created = (
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
-            type=models.Order.Types.CREATE,
+            type=OrderTypes.CREATE,
             state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
@@ -1064,7 +1095,7 @@ def count_resources_number_change(service_provider):
     terminated = (
         models.Order.objects.filter(
             offering__customer=service_provider.customer,
-            type=models.Order.Types.TERMINATE,
+            type=OrderTypes.TERMINATE,
             state=OrderStates.DONE,
             created__gte=core_utils.month_start(to_day),
         )
@@ -1351,17 +1382,33 @@ def user_offerings_mapping(offerings):
 
         for user in users:
             for offering in project_offerings:
-                user_offerings_set.add((user, offering))
+                if (
+                    config.ENFORCE_USER_CONSENT_FOR_OFFERINGS
+                    and offering.has_terms_of_service()
+                ):
+                    if models.UserOfferingConsent.objects.filter(
+                        user=user,
+                        offering=offering,
+                        revocation_date__isnull=True,
+                    ).exists():
+                        user_offerings_set.add((user, offering))
+                else:
+                    user_offerings_set.add((user, offering))
 
     for user, offering in user_offerings_set:
         if not models.OfferingUser.objects.filter(
             user=user, offering=offering
         ).exists():
             username = generate_username(user, offering)
-            offering_user = models.OfferingUser.objects.create(
-                user=user, offering=offering, username=username
+            # Set state to OK when username is known at creation time
+            state = (
+                OfferingUserStates.OK
+                if username
+                else OfferingUserStates.CREATION_REQUESTED
             )
-            offering_user.save()
+            models.OfferingUser.objects.create(
+                user=user, offering=offering, username=username, state=state
+            )
             logger.info("Offering user %s has been created.")
 
 
@@ -1799,11 +1846,44 @@ def generate_mock_service_account_update_response(service_account) -> dict:
     }
 
 
-def get_service_account_api_token():
-    token_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_URL"]
-    client_id = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_CLIENT_ID"]
-    client_secret = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_SECRET"]
+# Mock data generators for course accounts
+def generate_mock_course_account_response(username: str) -> dict:
+    """Generate a mock course account response that matches the course account request schema."""
+    now = datetime.datetime.now()
+    return {
+        "tempAccount": {
+            "createdAt": now.isoformat(),
+            "updatedAt": now.isoformat(),
+            "type": "user",
+            "status": "active",
+            "lifecyclePhase": "available",
+            "purpose": "course",
+            "disabledDate": (now + datetime.timedelta(weeks=1)).isoformat(),
+            "username": username,
+            "email": "mock@example.com",
+            "description": "Mock course account for testing",
+            "unixUid": 5000 + hash(username) % 1000,  # Generate consistent UID
+            "homeDir": f"/home/{username}",
+            "shell": "/bin/bash",
+            "targetType": "project",
+            "targetIdentifier": f"mock-course-{username[:8]}",
+            "owner": None,
+            "project": None,
+        }
+    }
 
+
+def generate_mock_course_account_creation_response(
+    course_account: dict, username: str
+) -> dict:
+    """Generate a mock course account creation response that matches course account schema."""
+    del course_account, username
+    mock_username = f"course_{random.randint(1000, 9999)}"
+
+    return generate_mock_course_account_response(mock_username)
+
+
+def get_account_api_token(token_url, client_id, client_secret):
     token_url = token_url.rstrip("/")
 
     token_request_headers = {
@@ -1832,6 +1912,20 @@ def get_service_account_api_token():
     except httpx.HTTPError as e:
         logger.error("Error obtaining token: %s", e)
         raise
+
+
+def get_service_account_api_token():
+    token_url = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_URL"]
+    client_id = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_CLIENT_ID"]
+    client_secret = settings.WALDUR_CORE["SERVICE_ACCOUNT_TOKEN_SECRET"]
+    return get_account_api_token(token_url, client_id, client_secret)
+
+
+def get_course_account_api_token():
+    token_url = settings.WALDUR_CORE["COURSE_ACCOUNT_TOKEN_URL"]
+    client_id = settings.WALDUR_CORE["COURSE_ACCOUNT_TOKEN_CLIENT_ID"]
+    client_secret = settings.WALDUR_CORE["COURSE_ACCOUNT_TOKEN_SECRET"]
+    return get_account_api_token(token_url, client_id, client_secret)
 
 
 def rotate_service_account_api_key(service_account: models.ScopedServiceAccount):
@@ -1943,7 +2037,7 @@ def create_service_account(service_account: dict, username: str, scope_type: str
         raise
 
 
-def delete_service_account(service_account: models.ScopedServiceAccount):
+def close_service_account(service_account: models.ScopedServiceAccount):
     """
     Makes a synchronous call to the webhook URL to remove a service account.
     Raises exceptions on failure which should be handled by the viewset.
@@ -1956,7 +2050,8 @@ def delete_service_account(service_account: models.ScopedServiceAccount):
         response = generate_mock_service_account_response(service_account.username)
         response["serviceAccount"]["status"] = "closed"
         response["serviceAccount"]["disabledDate"] = datetime.datetime.now().isoformat()
-        service_account.delete()
+        service_account.set_state_closed()
+        service_account.save(update_fields=["state"])
         return response
 
     if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
@@ -1976,7 +2071,8 @@ def delete_service_account(service_account: models.ScopedServiceAccount):
                 "Service account %s not found at backend, deleting locally",
                 service_account.username,
             )
-            service_account.delete()
+            service_account.set_state_closed()
+            service_account.save(update_fields=["state"])
             return
 
         url = f"{service_account_url}/{service_account.username}/close"
@@ -1987,9 +2083,11 @@ def delete_service_account(service_account: models.ScopedServiceAccount):
         )
         response.raise_for_status()
         if response.status_code == 200:
-            service_account.delete()
+            service_account.set_state_closed()
+            service_account.save(update_fields=["state"])
     except (httpx.HTTPError, ValueError) as exc:
         logger.error(exc)
+        service_account.set_state_erred()
         service_account.error_message = str(exc)
         service_account.error_traceback = traceback.format_exc()
         service_account.save(update_fields=["error_message", "error_traceback"])
@@ -2036,6 +2134,39 @@ def get_service_account(service_account: models.ScopedServiceAccount):
         raise
 
 
+def get_course_account(
+    course_account: models.CourseAccount, api_access_token: str | None = None
+):
+    if not settings.WALDUR_CORE.get("COURSE_ACCOUNT_USE_API"):
+        return
+
+    course_account_url = settings.WALDUR_CORE["COURSE_ACCOUNT_URL"]
+    if not course_account_url:
+        raise ValidationError("URL for course accounts is not configured")
+
+    course_account_url = course_account_url.rstrip("/")
+    username = course_account.user.username
+    try:
+        if api_access_token is None:
+            api_access_token = get_course_account_api_token()
+        url = f"{course_account_url}/{username}"
+        response = httpx.get(
+            url,
+            headers={"Authorization": f"Bearer {api_access_token}"},
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            logger.warning("Course account %s not found", username)
+            return None
+        raise
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(exc)
+        raise
+
+
 def update_service_account(service_account: models.ScopedServiceAccount):
     """
     Makes a synchronous call to the webhook URL to update a service account email or/and description fields.
@@ -2069,8 +2200,15 @@ def update_service_account(service_account: models.ScopedServiceAccount):
                 "description": service_account.description,
             },
         )
+        response.raise_for_status()
         return response.json()
     except (httpx.HTTPError, ValueError) as exc:
+        service_account.set_state_erred()
+        service_account.error_message = str(exc)
+        service_account.error_traceback = traceback.format_exc()
+        service_account.save(
+            update_fields=["state", "error_message", "error_traceback"]
+        )
         logger.error(exc)
         raise
 
@@ -2097,7 +2235,9 @@ def move_offering(
 
     if not preserve_permissions:
         for permission in get_permissions(offering):
-            permission.revoke(current_user)
+            permission.revoke(
+                current_user, reason="Offering moved to different provider"
+            )
             logger.info(f"Permission {permission} has been revoked")
 
     logger.info("Offering %s has been moved to provider %s", offering, target_customer)
@@ -2194,3 +2334,272 @@ def publish_backend_resource_request(request: models.BackendResourceRequest):
     )
     if messages:
         logging_tasks.publish_messages.delay(messages)
+
+
+def convert_slurm_usage(usage: int | float | Decimal, component_type: str) -> int:
+    # This is temporarily uplifted to marketplace in order to avoid circular dependency
+    minutes_in_hour = 60
+    usage_float = float(usage)
+    if component_type in ["ram", "mem"]:
+        mb_in_gb = 1024
+        quantity = int(math.ceil(usage_float / mb_in_gb / minutes_in_hour))
+    else:
+        quantity = int(math.ceil(usage_float / minutes_in_hour))
+    return quantity
+
+
+def post_course_account_to_url(
+    url: str,
+    course_account: dict,
+    owner_username: str = "",
+    api_access_token: str | None = None,
+):
+    try:
+        if api_access_token is None:
+            api_access_token = get_course_account_api_token()
+        project: structure_models.Project = course_account["project"]
+        offering_slugs = list(
+            set(
+                project.resource_set.exclude(
+                    state=ResourceStates.TERMINATED
+                ).values_list("offering__slug", flat=True)
+            )
+        )
+
+        payload = {
+            "ownerUsername": owner_username,
+            "email": course_account["email"],
+            "description": course_account.get("description", ""),
+            "scopeType": "project",
+            "scopeName": project.name,
+            "scopeSlug": project.slug,
+            "scopeOfferingSlugs": offering_slugs,
+            "scopeValidTo": project.end_date.isoformat(),
+            "scopeValidFrom": project.start_date.isoformat()
+            if project.start_date
+            else project.created.date().isoformat(),
+        }
+
+        headers = {"Authorization": f"Bearer {api_access_token}"}
+        response = httpx.post(url, json=payload, headers=headers, follow_redirects=True)
+        response.raise_for_status()
+        logger.info("Service account has been successfully updated at %s", url)
+        return response
+    except (httpx.HTTPError, ValueError, KeyError) as e:
+        logger.error("Request to %s failed: %s", url, e)
+        raise
+
+
+def create_course_account(
+    course_account: dict, owner_username: str, api_access_token: str | None = None
+):
+    if config.ENABLE_MOCK_COURSE_ACCOUNT_BACKEND:
+        logger.info("Mock mode enabled for create_course_account")
+        return generate_mock_course_account_creation_response(
+            course_account, owner_username
+        )
+
+    if not settings.WALDUR_CORE.get("COURSE_ACCOUNT_USE_API"):
+        return
+
+    course_account_url = settings.WALDUR_CORE["COURSE_ACCOUNT_URL"]
+    if not course_account_url:
+        raise ValidationError("URL for course accounts is not configured")
+
+    course_account_url = course_account_url.rstrip("/")
+
+    try:
+        response = post_course_account_to_url(
+            course_account_url, course_account, owner_username, api_access_token
+        )
+        return response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(exc)
+        raise
+
+
+def create_multiple_course_accounts(
+    course_accounts_data: list[dict], owner_username: str
+):
+    if config.ENABLE_MOCK_COURSE_ACCOUNT_BACKEND:
+        logger.info("Mock mode enabled for create_multiple_course_accounts")
+        course_accounts_created = []
+        for course_account_data in course_accounts_data:
+            response_data = generate_mock_course_account_creation_response(
+                course_account_data, owner_username
+            )
+            # Add email from request to the mock response for consistency
+            response_data["email"] = course_account_data["email"]
+            response_data["project_uuid"] = str(course_account_data["project"].uuid)
+            response_data["project_name"] = course_account_data["project"].name
+            course_accounts_created.append(response_data)
+        return course_accounts_created
+
+    if not settings.WALDUR_CORE.get("COURSE_ACCOUNT_USE_API"):
+        return
+
+    course_account_url = settings.WALDUR_CORE["COURSE_ACCOUNT_URL"]
+    if not course_account_url:
+        raise ValidationError("URL for course accounts is not configured")
+
+    course_account_url = course_account_url.rstrip("/")
+    course_accounts_created = []
+
+    try:
+        api_access_token = get_course_account_api_token()
+    except (httpx.HTTPError, ValueError, KeyError) as e:
+        logger.error("Request to %s failed: %s", course_account_url, e)
+
+    for course_account_data in course_accounts_data:
+        try:
+            response = post_course_account_to_url(
+                course_account_url,
+                course_account_data,
+                owner_username,
+                api_access_token,
+            )
+            response_data = response.json()
+            user = core_models.User.objects.create(
+                username=response_data["tempAccount"]["username"],
+                email=response_data["tempAccount"]["email"],
+                description="Course Account",
+            )
+            course_account = models.CourseAccount.objects.create(
+                user=user,
+                email=course_account_data["email"],
+                project=course_account_data["project"],
+            )
+            course_accounts_created.append(course_account)
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.error(exc)
+
+    return course_accounts_created
+
+
+def close_course_account(
+    course_account: models.CourseAccount, api_access_token: str | None = None
+):
+    if config.ENABLE_MOCK_COURSE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for delete_course_account: {course_account.user.username}"
+        )
+        # Generate a response showing the account as closed before deleting
+        response = generate_mock_course_account_response(course_account.user.username)
+        response["tempAccount"]["status"] = "closed"
+        response["tempAccount"]["disabledDate"] = datetime.datetime.now().isoformat()
+        course_account.set_state_closed()
+        course_account.save(update_fields=["state"])
+        return response
+
+    if not settings.WALDUR_CORE.get("COURSE_ACCOUNT_USE_API"):
+        return
+
+    course_account_url = settings.WALDUR_CORE["COURSE_ACCOUNT_URL"]
+    if not course_account_url:
+        raise ValidationError("URL for course accounts is not configured")
+
+    course_account_url = course_account_url.rstrip("/")
+    username = course_account.user.username
+    user = course_account.user
+
+    try:
+        if api_access_token is None:
+            api_access_token = get_course_account_api_token()
+        existing_course_account = get_course_account(course_account, api_access_token)
+        if existing_course_account is None:
+            logger.warning(
+                "Service account %s not found at backend, deleting locally",
+                username,
+            )
+            course_account.set_state_closed()
+            course_account.save(update_fields=["state"])
+            if user:
+                user.is_active = False
+                user.save(update_fields=["is_active"])
+            return
+
+        url = f"{course_account_url}/{username}/close"
+        response = httpx.put(
+            url,
+            headers={"Authorization": f"Bearer {api_access_token}"},
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        if response.status_code == 200:
+            course_account.set_state_closed()
+            course_account.save(update_fields=["state"])
+            if user:
+                user.is_active = False
+                user.save(update_fields=["is_active"])
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(exc)
+        course_account.set_state_erred()
+        course_account.error_message = str(exc)
+        course_account.error_traceback = traceback.format_exc()
+        course_account.save(update_fields=["error_message", "error_traceback"])
+        raise
+
+
+def get_viewset_from_basename(basename):
+    """
+    Resolve a router basename to its viewset class
+    """
+    resolver = get_resolver()
+
+    # DRF router creates URLs with basename + action suffix
+    # We'll look for the list action
+    url_name = f"{basename}-list"
+
+    # Get the URL pattern
+    for pattern in resolver.url_patterns:
+        if hasattr(pattern, "name") and pattern.name == url_name:
+            return pattern.callback.cls
+
+    # If not found directly, search in included patterns
+    for pattern in resolver.url_patterns:
+        if hasattr(pattern, "url_patterns"):
+            for sub_pattern in pattern.url_patterns:
+                if hasattr(sub_pattern, "name") and sub_pattern.name == url_name:
+                    return sub_pattern.callback.cls
+
+    return None
+
+
+@lru_cache(maxsize=1)
+def get_model_serializer(model: type):
+    """
+    Retrieve the serializer class associated with a model's viewset.
+
+    This function resolves a model's URL basename to its corresponding DRF viewset
+    and returns the serializer class used by that viewset.
+
+    Args:
+        model (Type): A model class that implements `get_url_name()` method,
+                     which returns the DRF router basename for the model.
+
+    Returns:
+        Type[serializers.Serializer] | None: The serializer class associated with
+                                             the model's viewset, or None if:
+                                             - The model doesn't have get_url_name()
+                                             - No viewset is registered for the basename
+                                             - The viewset doesn't have serializer_class
+
+    Example:
+        >>> from waldur_openstack.models import Instance
+        >>> serializer = get_model_serializer(Instance)
+        >>> print(serializer)
+        <class 'waldur_openstack.serializers.OpenStackInstanceSerializer'>
+
+    Note:
+        This function only retrieves the static `serializer_class` attribute.
+        If the viewset uses dynamic serializer selection via `get_serializer_class()`,
+        this function will return the default serializer class or None.
+    """
+
+    try:
+        base_url = model.get_url_name()
+        view = get_viewset_from_basename(base_url)
+        return getattr(view, "serializer_class", None)
+    except (AttributeError, KeyError, TypeError):
+        logger.debug("Unable to resolve model serializer %s", model)
+        return None

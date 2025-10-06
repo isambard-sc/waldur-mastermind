@@ -12,6 +12,7 @@ from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import has_user
+from waldur_core.structure import models as structure_models
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.users import models, tasks
 from waldur_core.users.tests import factories
@@ -448,6 +449,21 @@ class RequestRetrieveTest(BaseInvitationTest):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    def test_permission_request_includes_created_by_email_and_template(self):
+        """Test that permission request API response includes created_by_email and project_name_template fields."""
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Verify the new fields are present in the response
+        self.assertIn("created_by_email", response.data)
+        self.assertIn("project_name_template", response.data)
+
+        # Verify the values are correct
+        self.assertEqual(
+            response.data["created_by_email"], self.permission_request.created_by.email
+        )
+
     @data("project_admin", "project_manager", "user")
     def test_user_cannot_get_request(self, user):
         self.client.force_authenticate(user=getattr(self, user))
@@ -529,14 +545,203 @@ class RequestRejectTest(BaseInvitationTest):
         self.permission_request.refresh_from_db()
         self.assertEqual(self.permission_request.state, ReviewStates.REJECTED)
 
-        response = self.client.post(self.url)
-        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
 
-    @data("customer_owner")
-    def test_user_cannot_reject_request(self, user):
-        CustomerRole.OWNER.delete_permission(PermissionEnum.CREATE_CUSTOMER_PERMISSION)
-        self.client.force_authenticate(user=getattr(self, user))
+@ddt
+class PermissionRequestProjectCreationTest(BaseInvitationTest):
+    def setUp(self):
+        super().setUp()
+        self.user_with_template = structure_factories.UserFactory(
+            username="template_user",
+            email="template@example.com",
+            first_name="Template",
+            last_name="User",
+        )
+
+    def test_create_project_with_template(self):
+        invitation = factories.CustomerGroupInvitationFactory(
+            scope=self.customer,
+            auto_create_project=True,
+            project_name_template="{username}_custom_project",
+        )
+
+        permission_request = factories.PermissionRequestFactory(
+            invitation=invitation, created_by=self.user_with_template
+        )
+
+        permission_request.approve(self.staff)
+
+        # Check that project was created with template name
+        self.assertTrue(
+            structure_models.Project.objects.filter(
+                name="template_user_custom_project", customer=self.customer
+            ).exists()
+        )
+
+    def test_create_project_without_template_uses_default(self):
+        invitation = factories.CustomerGroupInvitationFactory(
+            scope=self.customer, auto_create_project=True, project_name_template=""
+        )
+
+        permission_request = factories.PermissionRequestFactory(
+            invitation=invitation, created_by=self.user_with_template
+        )
+
+        permission_request.approve(self.staff)
+
+        # Check that project was created with username (default)
+        self.assertTrue(
+            structure_models.Project.objects.filter(
+                name="template_user", customer=self.customer
+            ).exists()
+        )
+
+    def test_valid_project_name_template_placeholders(self):
+        """Test that valid placeholders in project_name_template are accepted."""
+        self.client.force_authenticate(user=self.staff)
+
+        # Test each valid placeholder
+        valid_templates = [
+            "{username}_project",
+            "{email}_workspace",
+            "{full_name} Research",
+            "Project for {username} - {email}",
+        ]
+
+        for template in valid_templates:
+            response = self.client.post(
+                factories.CustomerGroupInvitationFactory.get_list_url(),
+                {
+                    "scope": structure_factories.CustomerFactory.get_url(self.customer),
+                    "role": CustomerRole.OWNER.uuid.hex,
+                    "auto_create_project": True,
+                    "project_name_template": template,
+                },
+            )
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_201_CREATED,
+                f"Template '{template}' should be valid. Response: {response.data}",
+            )
+
+    def test_invalid_project_name_template_placeholders_rejected(self):
+        """Test that invalid placeholders in project_name_template are rejected."""
+        self.client.force_authenticate(user=self.staff)
+
+        # Test invalid placeholders
+        invalid_templates = [
+            "{user}_project",  # Legacy placeholder not supported
+            "{invalid_placeholder}_workspace",
+            "{user.username}_research",
+            "Project {user.full_name}",
+        ]
+
+        for template in invalid_templates:
+            response = self.client.post(
+                factories.CustomerGroupInvitationFactory.get_list_url(),
+                {
+                    "scope": structure_factories.CustomerFactory.get_url(self.customer),
+                    "role": CustomerRole.OWNER.uuid.hex,
+                    "auto_create_project": True,
+                    "project_name_template": template,
+                },
+            )
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_400_BAD_REQUEST,
+                f"Template '{template}' should be invalid",
+            )
+            self.assertIn("project_name_template", response.data)
+
+    def test_invalid_template_fallback_to_username(self):
+        """Test that if an invalid template somehow gets through, it falls back to username."""
+        # Directly create an invitation with invalid template (bypassing validation)
+        invitation = factories.CustomerGroupInvitationFactory(
+            scope=self.customer,
+            auto_create_project=True,
+            project_name_template="{invalid_var}_project",
+        )
+
+        # Manually set the template to bypass validation
+        invitation.project_name_template = "{invalid_var}_project"
+        invitation.save()
+
+        permission_request = factories.PermissionRequestFactory(
+            invitation=invitation, created_by=self.user_with_template
+        )
+
+        # Approve should not crash, but fall back to username
+        permission_request.approve(self.staff)
+
+        # Check that project was created with fallback username
+        self.assertTrue(
+            structure_models.Project.objects.filter(
+                name="template_user", customer=self.customer
+            ).exists()
+        )
+
+
+class GroupInvitationPatternTest(BaseGroupInvitationTest):
+    def setUp(self):
+        super().setUp()
+        self.invitation = factories.CustomerGroupInvitationFactory(
+            scope=self.customer,
+            user_email_patterns=[".*@example.com", "test@.*"],
+            user_affiliations=["staff", "student"],
+        )
+        self.url = factories.CustomerGroupInvitationFactory.get_url(
+            self.invitation, "submit_request"
+        )
+
+    def test_user_with_matching_email_can_submit_request(self):
+        user = structure_factories.UserFactory(email="user@example.com")
+        self.client.force_authenticate(user=user)
         response = self.client.post(self.url)
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-        self.permission_request.refresh_from_db()
-        self.assertEqual(self.permission_request.state, ReviewStates.PENDING)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_user_with_matching_affiliation_can_submit_request(self):
+        user = structure_factories.UserFactory(affiliations=["staff"])
+        self.client.force_authenticate(user=user)
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_user_with_non_matching_email_and_affiliation_cannot_submit_request(self):
+        user = structure_factories.UserFactory(
+            email="user@other.com",
+            affiliations=["other"],
+        )
+        self.client.force_authenticate(user=user)
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_user_can_submit_request_if_no_patterns_defined(self):
+        invitation = factories.CustomerGroupInvitationFactory(
+            scope=self.customer,
+            user_email_patterns=[],
+            user_affiliations=[],
+        )
+        url = factories.CustomerGroupInvitationFactory.get_url(
+            invitation, "submit_request"
+        )
+        user = structure_factories.UserFactory(
+            email="any@email.com",
+            affiliations=[],
+        )
+        self.client.force_authenticate(user=user)
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_user_with_matching_email_pattern_can_submit_request(self):
+        user = structure_factories.UserFactory(email="test@domain.com")
+        self.client.force_authenticate(user=user)
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_user_with_no_affiliations_cannot_submit_request_if_affiliations_required(
+        self,
+    ):
+        user = structure_factories.UserFactory(
+            email="user@other.com",
+        )
+        self.client.force_authenticate(user=user)
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

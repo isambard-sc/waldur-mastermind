@@ -1,3 +1,9 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "child_pipeline"'
+      when: always
+    - when: always
+
 include:
   - project: "waldur/waldur-pipelines"
     file: "/templates/stages.yml"
@@ -37,10 +43,11 @@ before_script:
   - git config --global user.name "$GITLAB_USER_NAME"
   - git config --global user.email "$GITLAB_USER_EMAIL"
 
-Run linters:
-  image: registry.hpc.ut.ee/mirror/library/python:3.11-bullseye
-  stage: test
-  interruptible: true
+# Define a common set of rules using a YAML anchor ---
+# This anchor ensures that any job using it will have the exact same
+# conditions for being included in a pipeline. This is the key to solving
+# the 'needs' validation error from before, in a clean, maintainable way.
+.unit_test_rules: &unit_test_rules
   rules:
     # Skip tests if said so
     - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
@@ -48,8 +55,20 @@ Run linters:
     - if: '$CI_COMMIT_BRANCH == "develop"'
     # If tagged release
     - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
-    # If event is related to a created merge request
+    # If event is related to a created merge request with relevant code changes
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - src/**/*
+        - pyproject.toml
+        - uv.lock
+        - tests/**/* # Include the tests directory in changes
+        - .gitlab-ci.yml # A change to the CI file itself should trigger tests
+
+Run linters:
+  image: registry.hpc.ut.ee/mirror/library/python:3.11-bullseye
+  stage: test
+  interruptible: true
+  <<: *unit_test_rules
   script:
     - pip install pre-commit
     - pre-commit run --all
@@ -58,20 +77,70 @@ Run linters:
   image: registry.hpc.ut.ee/mirror/$WALDUR_MASTERMIND_TEST_IMAGE
   stage: test
   interruptible: true
+  <<: *unit_test_rules
+  before_script:
+    - |
+      echo "[+] Installing project dependencies..."
+      pip install uv
+      uv sync --extra dev
+
+  variables:
+    UV_CACHE_DIR: .uv-cache
+    UV_SYSTEM_PYTHON: 1
+    UV_LINK_MODE: copy
+
+  cache:
+    - key:
+        files:
+          - uv.lock
+      paths:
+        - $UV_CACHE_DIR
+
+Run openapi export test:
+  extends: .Unit test runner
+  script:
+    - uv run waldur spectacular --file waldur-openapi-schema.yaml --fail-on-warn
+    - uv run waldur makemigrations --check --dry-run
+  variables:
+    DJANGO_SETTINGS_MODULE: waldur_core.server.base_settings
+
+Run migration tests:
+  extends: .Unit test runner
   rules:
     # Skip tests if said so
     - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
       when: never
+    # Always run on develop branch to ensure it's clean
     - if: '$CI_COMMIT_BRANCH == "develop"'
-    # If tagged release
+    # Always run on tagged releases
     - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
-    # If event is related to a created merge request
+    # For merge requests, only run if migration files have changed
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
-        - src/**/*
-        - pyproject.toml
-        - poetry.lock
-        - gitlab-ci-test/**/*
+        - src/**/migrations/*.py
+  script:
+    - |
+      echo "[+] Setting up test database configuration..."
+      cat > src/waldur_mastermind/test_settings.py <<-EOF
+      from waldur_core.server.test_settings import *
+      from django.db.backends.base.schema import BaseDatabaseSchemaEditor
+
+      # Using UNLOGGED tables in PostgreSQL is a significant performance boost for
+      # tests, as it reduces disk I/O by not writing to the WAL.
+      BaseDatabaseSchemaEditor.sql_create_table = "CREATE UNLOGGED TABLE %(table)s (%(definition)s)"
+
+      DATABASES = {
+          'default': {
+              'ENGINE': 'django.db.backends.postgresql',
+              'NAME': 'test_waldur',
+              'USER': 'runner',
+              'HOST': 'postgres',
+              'PORT': 5432,
+              'PASSWORD': 'waldur',
+          }
+      }
+      EOF
+      uv run waldur migrate --noinput
   services:
     - name: "registry.hpc.ut.ee/mirror/library/postgres:15-alpine"
       alias: postgres
@@ -92,53 +161,88 @@ Run linters:
     POSTGRES_DB: test_waldur
     POSTGRES_USER: runner
     POSTGRES_PASSWORD: waldur
+    DJANGO_SETTINGS_MODULE: waldur_mastermind.test_settings
 
-Run unit tests:
+# This is the "preparation" job. It's not parallelized.
+# Its only responsibilities are to check for merge conflicts and generate the dynamic
+# child pipeline configuration based on the code changes.
+Generate test pipeline:
+  stage: test
   extends: .Unit test runner
   script:
     - |
-      # Check merge compatibility only it is not a tagged release
+      # STEP 1: Perform the merge check to fail fast.
       if [ "$CI_PIPELINE_SOURCE" == "merge_request_event" ]; then
+        echo "[+] Checking merge compatibility..."
         echo "[+] Add dummy user $GIT_USER_NAME ($GIT_USER_EMAIL)"
         git config user.name $GIT_USER_NAME
         git config user.email $GIT_USER_EMAIL
-        echo "[+] Merging branches $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME and origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-        git merge --no-ff origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+        git merge --no-ff "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" || exit 1
+        echo "[+] Merge successful."
       fi
-    - gitlab-ci-test/waldur-test
-    - coverage xml
-    - coverage report
-  coverage: "/TOTAL.+ ([0-9]{1,3}%)/"
-  artifacts:
-    when: always
-    reports:
-      junit: report.xml
-      coverage_report:
-        coverage_format: cobertura
-        path: coverage.xml
-  parallel: 10
 
-Run management command test:
-  extends: .Unit test runner
-  script:
-    - gitlab-ci-test/waldur-test MANAGEMENT
+      # STEP 2: Run the generator script.
+      # This script will create two files:
+      # 1. generated-pipeline.yml (the definition of the child pipeline)
+      # 2. generated_vars.env (a dotenv file with the TEST_PATHS variable)
+      echo "[+] Generating dynamic test pipeline configuration..."
+      tests/generate-pipeline.sh
+  artifacts:
+    # We need to save both generated files as artifacts.
+    paths:
+      - generated-pipeline.yml
+    reports:
+      # This makes the variables in generated_vars.env available to this job
+      # and any downstream jobs that depend on it (like our trigger job).
+      dotenv: generated_vars.env
+
+# This is the "trigger" job. It has no script.
+# Its only purpose is to start the child pipeline defined in the artifact
+# from the previous job.
+Run tests dynamically:
+  stage: test
+  # Use the same rules anchor to ensure it's always included/excluded
+  # with the 'generate_test_pipeline' job.
+  <<: *unit_test_rules
+  # This job must run after the 'Generate test pipeline' job has successfully completed.
+  needs:
+    - job: Generate test pipeline
+      # 'artifacts: true' is crucial. It tells this job to download the artifacts
+      # from the 'Generate test pipeline' job before it runs.
+      artifacts: true
+  trigger:
+    # This tells GitLab to start a new pipeline.
+    include:
+      # Specify which artifact to use as the CI configuration for the new pipeline.
+      - artifact: generated-pipeline.yml
+        job: Generate test pipeline
+    # 'strategy: depend' makes this trigger job wait for the child pipeline to finish.
+    strategy: depend
+    # This block explicitly tells GitLab to pass variables to the child pipeline.
+    forward:
+      # This is the crucial line. It forwards variables created by 'dotenv'
+      # reports from the 'needs' dependencies, as well as variables defined
+      # in the parent job's 'variables' block.
+      yaml_variables: true
+      # It's also good practice to forward the standard CI variables like
+      # CI_COMMIT_REF_NAME, CI_MERGE_REQUEST_ID, etc.
+      pipeline_variables: true
 
 Run type checkings:
   extends: .Unit test runner
   script:
     - |
-      pip3 install poetry==2.1.2
-      pip3 install --upgrade setuptools==78.1.0
-      poetry install -vvv
-      pyright src/waldur_core/structure/models.py \
-             src/waldur_mastermind/marketplace_remote/processors.py \
-             src/waldur_mastermind/marketplace_rancher/ \
-             src/waldur_mastermind/proposal/utils.py \
-             src/waldur_mastermind/proposal/tasks.py \
-             src/waldur_rancher/utils.py \
-             src/waldur_rancher/tasks.py \
-             src/waldur_rancher/backend.py \
-             src/waldur_rancher/serializers.py
+      uv run pyright \
+        src/waldur_core/structure/models.py \
+        src/waldur_mastermind/marketplace_remote/processors.py \
+        src/waldur_mastermind/marketplace_rancher/ \
+        src/waldur_mastermind/proposal/utils.py \
+        src/waldur_mastermind/proposal/tasks.py \
+        src/waldur_rancher/handlers.py \
+        src/waldur_rancher/utils.py \
+        src/waldur_rancher/tasks.py \
+        src/waldur_rancher/backend.py \
+        src/waldur_rancher/serializers.py
 
 Try building docker image:
   image:
@@ -182,7 +286,7 @@ Build docker image for tests:
   interruptible: true
   image:
     name: "gcr.io/kaniko-project/executor:debug"
-    entrypoint: [ "" ]
+    entrypoint: [""]
   rules:
     # If scheduled pipeline for 'develop' branch is set up
     - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
@@ -204,7 +308,7 @@ Build docker image for tests:
       EOF
     - /kaniko/executor
       --context "${CI_PROJECT_DIR}"
-      --dockerfile "${CI_PROJECT_DIR}/gitlab-ci-test/Dockerfile"
+      --dockerfile "${CI_PROJECT_DIR}/tests/Dockerfile"
       --build-arg DOCKER_REGISTRY=$DOCKER_REGISTRY
       --destination "$WALDUR_MASTERMIND_TEST_IMAGE"
 
@@ -212,7 +316,10 @@ Publish the latest multiarch docker image:
   extends: .Publish multiarch latest docker image template
   before_script:
     # Merge the before_script from the template
-    - !reference [.Publish multiarch latest docker image template, before_script]
+    - !reference [
+        .Publish multiarch latest docker image template,
+        before_script,
+      ]
     - echo '[+] Build and publish latest docker image'
     - echo $CI_COMMIT_SHA > docker/rootfs/COMMIT_SHA
 
@@ -224,7 +331,10 @@ Publish multiarch docker image with specific version:
       alias: docker
   before_script:
     # Merge the before_script from the template
-    - !reference [.Publish multiarch docker image with specific version template, before_script]
+    - !reference [
+        .Publish multiarch docker image with specific version template,
+        before_script,
+      ]
     - echo "[+] Build and publish $CI_COMMIT_TAG docker image"
     - echo $CI_COMMIT_TAG > docker/rootfs/COMMIT_TAG
     - sed -i "s/version = \"0.0.0\"/version = \"$CI_COMMIT_TAG\"/" pyproject.toml
@@ -305,37 +415,81 @@ Upload configuration guide:
     - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
   image: registry.hpc.ut.ee/mirror/$WALDUR_MASTERMIND_TEST_IMAGE
   variables:
-    CONF_GUIDE_PATH: docs/admin-guide/mastermind-configuration/configuration-guide.md
-    CLI_GUIDE_PATH: docs/admin-guide/mastermind-configuration/cli-guide.md
-    FEATURES_GUIDE_PATH: docs/admin-guide/mastermind-configuration/features.md
-    NOTIFICATIONS_GUIDE_PATH: docs/admin-guide/mastermind-configuration/notifications.md
-    TEMPLATES_LIST_PATH: docs/admin-guide/mastermind-configuration/templates.md
-    SCHEDULED_JOB_LIST_PATH: docs/admin-guide/mastermind-configuration/scheduled.md
-    MIXINS_LIST_PATH: docs/developer-guide/mixins.md
-    HANDLERS_LIST_PATH: docs/developer-guide/handlers.md
-    DEVELOPER_DOCS_PATH: docs/developer-guide
     DJANGO_SETTINGS_MODULE: waldur_core.server.doc_settings
+
   script:
-    - poetry install
+    # 1. Install dependencies in the main project
+    - pip install uv
+    - uv sync --extra dev
+
+    # 2. Generate ALL required documentation files and store them in /tmp
+    - echo "Generating documentation files..."
+    - uv run waldur print_settings > /tmp/configuration-guide.md
+    - uv run waldur print_features_docs > /tmp/features.md
+    - uv run waldur print_notifications > /tmp/notifications.md
+    - uv run waldur print_commands > /tmp/cli-guide.md
+    - uv run waldur print_events > /tmp/events.md
+    - uv run waldur print_templates > /tmp/templates.md
+    - uv run waldur print_scheduled_jobs > /tmp/scheduled.md
+    - uv run waldur print_mixins > /tmp/mixins.md
+    - uv run waldur print_registered_handlers > /tmp/handlers.md
+
+    # Generate Mermaid diagrams, outputting them to /tmp
+    - >
+      uv run waldur generate_mermaid structure
+      -i "Customer,Project,OrganizationGroup,ProjectType,User"
+      --exclude-field-types="TranslationCharField,TranslationTextField"
+      -o /tmp/core_structure.mmd
+    - >
+      uv run waldur generate_mermaid permissions
+      -i "User,Role,UserRole,RolePermission"
+      --exclude-field-types="TranslationCharField,TranslationTextField"
+      -o /tmp/core_permissions.mmd
+    - >
+      uv run waldur generate_mermaid marketplace
+      -i "CategoryGroup,Category,CategoryColumn,CategoryComponent,CategoryComponentUsage"
+      --exclude-field-types="TranslationCharField,TranslationTextField"
+      -o /tmp/marketplace_category.mmd
+    - >
+      uv run waldur generate_mermaid marketplace
+      -i "Section,Attribute,AttributeOption,Offering,OfferingComponent"
+      --exclude-field-types="TranslationCharField,TranslationTextField"
+      -o /tmp/marketplace_catalog.mmd
+    - >
+      uv run waldur generate_mermaid marketplace
+      -i "Plan,PlanComponent,Resource,Order"
+      --exclude-field-types="TranslationCharField,TranslationTextField"
+      -o /tmp/marketplace_provision.mmd
+    - echo "Generation complete. All files are in /tmp."
+
+    # 3. Clone the waldur-docs repository
     - cd /tmp/
     - git clone "https://gitlab-ci-token:$GITLAB_TOKEN@$CI_SERVER_HOST/waldur/waldur-docs.git"
+    - cd waldur-docs
     - git config --global user.name "$GITLAB_USER_NAME"
     - git config --global user.email "$GITLAB_USER_EMAIL"
-    - cd waldur-docs
-    - waldur print_settings > $CONF_GUIDE_PATH
-    - waldur print_features_docs > $FEATURES_GUIDE_PATH
-    - waldur print_notifications > $NOTIFICATIONS_GUIDE_PATH
-    - waldur print_commands > $CLI_GUIDE_PATH
-    - waldur print_events > $CI_PROJECT_DIR/docs/events.md
-    - waldur print_templates > $TEMPLATES_LIST_PATH
-    - waldur print_scheduled_jobs > $SCHEDULED_JOB_LIST_PATH
-    - waldur print_mixins > $MIXINS_LIST_PATH
-    - waldur print_registered_handlers > $HANDLERS_LIST_PATH
-    - waldur graph_models structure -I Customer,Project,OrganizationGroup,ProjectType,User -o $DEVELOPER_DOCS_PATH/core_structure.png
-    - waldur graph_models permissions -I User,Role,UserRole,RolePermission -o $DEVELOPER_DOCS_PATH/core_permissions.png
-    - waldur graph_models marketplace -I CategoryGroup,Category,CategoryColumn,Section,Attribute,AttributeOption,CategoryComponent,CategoryComponentUsage,Offering,OfferingComponent,Plan,PlanComponent,Resource,Order -o $DEVELOPER_DOCS_PATH/marketplace.png
-    - cp -rv $CI_PROJECT_DIR/docs/* $DEVELOPER_DOCS_PATH
-    - git add $CONF_GUIDE_PATH $FEATURES_GUIDE_PATH $CLI_GUIDE_PATH $DEVELOPER_DOCS_PATH $TEMPLATES_LIST_PATH $NOTIFICATIONS_GUIDE_PATH $SCHEDULED_JOB_LIST_PATH $MIXINS_LIST_PATH $HANDLERS_LIST_PATH
+
+    # 4. Move the pre-generated files into place
+    - mv /tmp/configuration-guide.md docs/admin-guide/mastermind-configuration/configuration-guide.md
+    - mv /tmp/features.md docs/admin-guide/mastermind-configuration/features.md
+    - mv /tmp/notifications.md docs/admin-guide/mastermind-configuration/notifications.md
+    - mv /tmp/cli-guide.md docs/admin-guide/mastermind-configuration/cli-guide.md
+    - mv /tmp/templates.md docs/admin-guide/mastermind-configuration/templates.md
+    - mv /tmp/scheduled.md docs/admin-guide/mastermind-configuration/scheduled.md
+    - mv /tmp/mixins.md docs/developer-guide/mixins.md
+    - mv /tmp/handlers.md docs/developer-guide/handlers.md
+    - mv /tmp/core_structure.mmd docs/developer-guide/core_structure.mmd
+    - mv /tmp/core_permissions.mmd docs/developer-guide/core_permissions.mmd
+    - mv /tmp/marketplace_category.mmd docs/developer-guide/marketplace_category.mmd
+    - mv /tmp/marketplace_catalog.mmd docs/developer-guide/marketplace_catalog.mmd
+    - mv /tmp/marketplace_provision.mmd docs/developer-guide/marketplace_provision.mmd
+
+    # 5. Copy over static documentation files and move the generated events.md
+    - cp -rv $CI_PROJECT_DIR/docs/* docs/developer-guide/
+    - mv /tmp/events.md docs/developer-guide/events.md
+
+    # 6. Commit and push the changes
+    - git add docs/
     - git commit -m "Update configuration, CLI and developer guide" || exit 0
     - git branch new-configuration-guide
     - git push --set-upstream origin new-configuration-guide:master
@@ -350,23 +504,39 @@ Upload HomePort enums:
   variables:
     DJANGO_SETTINGS_MODULE: waldur_core.server.doc_settings
   script:
-    - poetry install
-    - cd src/waldur_core/permissions
-    - python print_permission_enums.py > /tmp/permission_enums.ts
+    # 1. Install dependencies in the main project
+    - pip install uv
+    - uv sync --extra dev
+
+    # 2. Generate ALL required files from the main project context and store them in /tmp
+    # This is the most robust approach, as we are in the correct directory with the virtual env.
+    - echo "Generating enums and descriptions..."
+    - python src/waldur_core/permissions/print_permission_enums.py > /tmp/permission_enums.ts
+    - uv run waldur print_events_enums > /tmp/EventsEnums.ts
+    - uv run waldur print_features_enums > /tmp/FeaturesEnums.ts
+    - uv run waldur print_features_description > /tmp/FeaturesDescription.ts
+    - uv run waldur print_settings_description > /tmp/SettingsDescription.ts
+    - uv run waldur print_permissions_description > /tmp/PermissionOptions.tsx
+
+    # 3. Clone the HomePort repository and move the generated files into it
     - cd /tmp/
     - git clone "https://homeport-updates:$HOMEPORT_ACCESS_TOKEN@$CI_SERVER_HOST/waldur/waldur-homeport.git"
+    - cd waldur-homeport
     - git config --global user.name "$GITLAB_USER_NAME"
     - git config --global user.email "$GITLAB_USER_EMAIL"
-    - cd waldur-homeport
     - git checkout develop
+
+    # 4. Move the pre-generated files to their final destinations
     - mv /tmp/permission_enums.ts src/permissions/enums.ts
-    - waldur print_events_enums > src/EventsEnums.ts
-    - waldur print_features_enums > src/FeaturesEnums.ts
-    - waldur print_features_description > src/features/FeaturesDescription.ts
-    - waldur print_settings_description > src/SettingsDescription.ts
-    - waldur print_permissions_description > src/administration/roles/PermissionOptions.tsx
+    - mv /tmp/EventsEnums.ts src/EventsEnums.ts
+    - mv /tmp/FeaturesEnums.ts src/FeaturesEnums.ts
+    - mv /tmp/FeaturesDescription.ts src/features/FeaturesDescription.ts
+    - mv /tmp/SettingsDescription.ts src/SettingsDescription.ts
+    - mv /tmp/PermissionOptions.tsx src/administration/roles/PermissionOptions.tsx
+
+    # 5. Commit and push the changes
     - git add src/
-    - git commit -m "Update enums" || exit 0
+    - git commit -m "Update enums and descriptions from Waldur Mastermind" || exit 0
     - git branch new-enums
     - git push --set-upstream origin new-enums:develop
   before_script: []
@@ -380,8 +550,9 @@ Upload MCP metadata:
   variables:
     DJANGO_SETTINGS_MODULE: waldur_core.server.doc_settings
   script:
-    - poetry install
-    - waldur export_model_metadata > /tmp/meta.yaml
+    - pip install uv
+    - uv sync --extra dev
+    - uv run waldur export_model_metadata > /tmp/meta.yaml
     - cd /tmp/
     - git clone "https://mastermind:$MCP_ACCESS_TOKEN@$CI_SERVER_HOST/waldur/waldur-mcp-server.git"
     - git config --global user.name "$GITLAB_USER_NAME"
@@ -395,29 +566,45 @@ Upload MCP metadata:
     - git push --set-upstream origin new-metadata:main
   before_script: []
 
-Lint MD links:
-  before_script:
-    - touch docs/core_structure.png
-    - touch docs/core_permissions.png
-    - touch docs/marketplace.png
-
 Generate OpenAPI schema:
   stage: deploy
   interruptible: true
   rules:
-      - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
-      - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
   image: registry.hpc.ut.ee/mirror/$WALDUR_MASTERMIND_TEST_IMAGE
   variables:
     DJANGO_SETTINGS_MODULE: waldur_core.server.doc_settings
+  before_script:
+    # Ensure the CI runner has all tags from the remote repository
+    - git fetch --tags
   script:
-    - poetry install
-    - waldur spectacular --file waldur-openapi-schema.yaml --fail-on-warn
+    - pip install uv
+    - uv sync --extra dev
+
+    # Determine the release version based on the trigger
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        # This is a stable, tagged release. The version is the tag itself.
+        RELEASE_VERSION="$CI_COMMIT_TAG"
+        echo "Building OpenAPI schema for stable release version: $RELEASE_VERSION"
+      else
+        # This is a dev release from a schedule.
+        # Find the latest tag to use as a base for the pre-release version.
+        LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+        TIMESTAMP=$(date +%Y%m%d%H%M%S)
+        RELEASE_VERSION="${LATEST_TAG}-dev.${TIMESTAMP}"
+        echo "Latest stable tag found: $LATEST_TAG"
+        echo "Building OpenAPI schema for development release version: $RELEASE_VERSION"
+      fi
+
+    # Generate the schema, injecting the dynamic version
+    - uv run waldur spectacular --api-version "$RELEASE_VERSION" --file waldur-openapi-schema.yaml --fail-on-warn
+    - echo "Successfully generated OpenAPI schema with version $RELEASE_VERSION"
   artifacts:
     paths:
       - waldur-openapi-schema.yaml
     expire_in: 1 day
-  before_script: []
 
 Generate TypeScript SDK:
   stage: deploy
@@ -446,8 +633,8 @@ Generate Python SDK:
   needs:
     - Generate OpenAPI schema
   script: |
-      pip install git+https://github.com/waldur/openapi-python-client.git
-      openapi-python-client generate --path waldur-openapi-schema.yaml --output-path py-client --overwrite --meta poetry
+    pip install git+https://github.com/waldur/openapi-python-client.git
+    openapi-python-client generate --path waldur-openapi-schema.yaml --output-path py-client --overwrite --meta poetry
   artifacts:
     paths:
       - py-client/
@@ -658,3 +845,175 @@ Upload TypeScript SDK:
     - git commit -m "Update Waldur TypeScript SDK" || exit 0
     - git push
   before_script: *build_before_script
+
+Generate Ansible modules:
+  stage: deploy
+  interruptible: true
+  rules:
+    # Run for both tagged releases and scheduled dev releases
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+  image: registry.hpc.ut.ee/mirror/library/python:3.11-bullseye
+  needs:
+    - Generate OpenAPI schema
+  before_script:
+    - apt-get update && apt-get install -y jq
+    # Ensure the CI runner has all tags from the remote repository
+    - git fetch --tags
+  script: |
+    # Install necessary tools
+    pip install yq git+https://github.com/waldur/ansible-waldur-generator.git
+    # Determine the release version based on the trigger
+    if [ -n "$CI_COMMIT_TAG" ]; then
+      # This is a stable, tagged release. The version is the tag itself.
+      RELEASE_VERSION="$CI_COMMIT_TAG"
+      echo "Building stable release version: $RELEASE_VERSION"
+    else
+      # This is a dev release from a schedule.
+      # Find the latest tag to use as a base for the pre-release version.
+      LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+      TIMESTAMP=$(date +%Y%m%d%H%M%S)
+      RELEASE_VERSION="${LATEST_TAG}-dev.${TIMESTAMP}"
+      echo "Latest stable tag found: $LATEST_TAG"
+      echo "Building development release version: $RELEASE_VERSION"
+    fi
+
+    # Update the version for EVERY collection in the generator config file
+    echo "Updating ansible-generator-config.yaml to version $RELEASE_VERSION"
+    yq -iy '.collections[].version = "'$RELEASE_VERSION'"' ansible-generator-config.yaml
+
+    echo "--- Updated ansible-generator-config.yaml ---"
+    cat ansible-generator-config.yaml
+    echo "-------------------------------------------"
+
+    # Generate the Ansible modules using the updated config
+    ansible-waldur-generator --config ansible-generator-config.yaml --api-spec waldur-openapi-schema.yaml --output-dir ansible_waldur_module
+  artifacts:
+    paths:
+      - ansible_waldur_module/
+    expire_in: 1 day
+
+Upload Ansible module:
+  stage: postdeploy
+  interruptible: true
+  rules:
+    # Run for both tagged releases and scheduled dev releases
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+  image:
+    name: registry.hpc.ut.ee/mirror/alpine/git:latest
+    entrypoint: [""]
+  needs:
+    - Generate Ansible modules
+  script: |
+    cd /tmp/
+    git clone --branch main git@github.com:waldur/ansible-waldur-module-next.git
+    cd ansible-waldur-module-next
+    git pull
+    rm -rf ansible_waldur_module && cp -a "$CI_PROJECT_DIR/ansible_waldur_module/" ansible_waldur_module
+    git add ansible_waldur_module
+    if [ -n "$CI_COMMIT_TAG" ]; then
+      # Stable release: commit, push code, create and push tag
+      echo "Committing and tagging stable release $CI_COMMIT_TAG"
+      git commit -m "Release: update modules for version $CI_COMMIT_TAG"
+      git push origin main
+      git tag -a $CI_COMMIT_TAG -m "Release $CI_COMMIT_TAG"
+      git push origin $CI_COMMIT_TAG
+    else
+      # Dev release: just commit and push code, no tag
+      echo "Committing development update"
+      git commit -m "Update Ansible Waldur modules from develop branch"
+      git push origin main
+    fi
+  before_script: *build_before_script
+
+Publish Ansible Galaxy collection:
+  stage: postdeploy
+  interruptible: true
+  rules:
+    # Run for both tagged releases and scheduled dev releases
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+  image:
+    name: registry.hpc.ut.ee/mirror/library/python:3.11-bullseye
+  needs:
+    - Generate Ansible modules
+  before_script:
+    - apt-get update && apt-get install -y jq
+    - pip install yq ansible
+  script:
+    - echo "--- Discovering and Publishing Ansible Collections ---"
+
+    # The root directory where collections are located, from the artifacts.
+    - COLLECTIONS_ROOT="ansible_waldur_module/ansible_collections"
+
+    # Verify that the root directory exists.
+    - |
+      if [ ! -d "$COLLECTIONS_ROOT" ]; then
+        echo "ERROR: Collections root '$COLLECTIONS_ROOT' not found in artifacts."
+        exit 1
+      fi
+
+    # 1. Discover all collections by finding all 'galaxy.yml' files.
+    - |
+      find "$COLLECTIONS_ROOT" -name "galaxy.yml" | while read GALAXY_FILE; do
+        # For each galaxy.yml found, get its parent directory, which is the collection path.
+        COLLECTION_PATH=$(dirname "${GALAXY_FILE}")
+
+        echo "=========================================================="
+        echo "Processing Collection at: ${COLLECTION_PATH}"
+        echo "=========================================================="
+
+        # 2. Dynamically determine the collection details from its galaxy.yml
+        NAMESPACE=$(yq '.namespace' "${GALAXY_FILE}" | tr -d '"')
+        NAME=$(yq '.name' "${GALAXY_FILE}" | tr -d '"')
+        VERSION=$(yq '.version' "${GALAXY_FILE}" | tr -d '"')
+
+        echo "Found Collection: ${NAMESPACE}.${NAME} version ${VERSION}"
+
+        # Validate that the details were parsed correctly.
+        if [ -z "$NAMESPACE" ] || [ -z "$NAME" ] || [ -z "$VERSION" ]; then
+          echo "ERROR: Could not parse details from ${GALAXY_FILE}. Skipping."
+          continue # Skip to the next collection in the loop
+        fi
+
+        # 3. Build the collection by changing into its directory.
+        echo "--- Building collection: ${NAMESPACE}.${NAME} ---"
+        ( # Start a subshell to isolate the 'cd' command
+          cd "${COLLECTION_PATH}"
+          ansible-galaxy collection build --force
+        ) # The subshell exits, and we are back in the original directory.
+
+        # 4. Publish the dynamically named archive file.
+        #    The built archive will be located in the collection directory itself (not parent).
+        ARCHIVE_FILE_NAME="${NAMESPACE}-${NAME}-${VERSION}.tar.gz"
+        ARCHIVE_FILE_PATH="${COLLECTION_PATH}/${ARCHIVE_FILE_NAME}"
+
+        echo "--- Publishing archive: ${ARCHIVE_FILE_PATH} ---"
+
+        # Verify the archive file exists before trying to publish.
+        if [ ! -f "${ARCHIVE_FILE_PATH}" ]; then
+          echo "ERROR: Expected archive file not found at ${ARCHIVE_FILE_PATH}. Checking parent directory..."
+          # Try parent directory as fallback
+          ARCHIVE_FILE_PATH_PARENT="$(dirname "${COLLECTION_PATH}")/${ARCHIVE_FILE_NAME}"
+          if [ -f "${ARCHIVE_FILE_PATH_PARENT}" ]; then
+            ARCHIVE_FILE_PATH="${ARCHIVE_FILE_PATH_PARENT}"
+            echo "Found archive at: ${ARCHIVE_FILE_PATH}"
+          else
+            echo "ERROR: Archive file not found in collection or parent directory. Skipping."
+            echo "Looking for: ${ARCHIVE_FILE_NAME}"
+            echo "In collection dir:"
+            ls -la "${COLLECTION_PATH}/" || true
+            echo "In parent dir:"
+            ls -la "$(dirname "${COLLECTION_PATH}")/" || true
+            continue # Skip to the next collection
+          fi
+        fi
+
+        ansible-galaxy collection publish --api-key "$ANSIBLE_GALAXY_TOKEN" "${ARCHIVE_FILE_PATH}"
+
+        echo "Successfully published ${ARCHIVE_FILE_NAME} to Ansible Galaxy."
+        echo "" # Add a blank line for readability
+      done
+
+    - echo "--- All collections processed ---"

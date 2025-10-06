@@ -1,4 +1,5 @@
 import logging
+from typing import cast
 
 from django.db import transaction
 from django.db.models import OuterRef
@@ -8,6 +9,7 @@ from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.proposal import models as proposal_models
+from waldur_mastermind.proposal import tasks
 from waldur_mastermind.proposal.enums import ProposalStates, RequestedOfferingStates
 
 logger = logging.getLogger(__name__)
@@ -38,8 +40,15 @@ def process_proposals_pending_reviewers(proposal: proposal_models.Proposal):
     for reviewer in get_available_reviewer(proposal):
         proposal_models.Review.objects.create(reviewer=reviewer, proposal=proposal)
 
-    proposal.state = ProposalStates.IN_REVIEW
-    return proposal.save()
+    # Only update state and send notification if the state is actually changing
+    if proposal.state != ProposalStates.IN_REVIEW:
+        old_state = proposal.state
+        proposal.state = ProposalStates.IN_REVIEW
+        tasks.notify_user_about_proposal_state_update.delay(
+            proposal.uuid, old_state, proposal.state
+        )
+        return proposal.save()
+    return proposal
 
 
 def allocate_proposal(proposal: proposal_models.Proposal):
@@ -72,6 +81,7 @@ def allocate_proposal(proposal: proposal_models.Proposal):
         start_date=start_date,
         short_name=short_name,
     )
+    project = cast(structure_models.Project, project)
 
     if start_date:
         logger.info(
@@ -138,3 +148,28 @@ def create_reviews_of_round(call_round: proposal_models.Round):
         )
     ):
         process_proposals_pending_reviewers(proposal)
+
+
+def get_proposal_review_counts(proposal: proposal_models.Proposal) -> dict:
+    base_queryset = proposal_models.Review.objects.filter(proposal=proposal)
+
+    submitted_reviews = base_queryset.filter(
+        state=proposal_models.Review.States.SUBMITTED
+    ).count()
+
+    rejected_reviews = base_queryset.filter(
+        state=proposal_models.Review.States.REJECTED
+    ).count()
+
+    pending_reviews = base_queryset.filter(
+        state__in=[
+            proposal_models.Review.States.CREATED,
+            proposal_models.Review.States.IN_REVIEW,
+        ]
+    ).count()
+
+    return {
+        "submitted_reviews": submitted_reviews,
+        "rejected_reviews": rejected_reviews,
+        "pending_reviews": pending_reviews,
+    }

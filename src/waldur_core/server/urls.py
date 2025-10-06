@@ -4,6 +4,7 @@ from django.conf.urls import include
 from django.contrib import admin
 from django.urls import path, re_path
 
+from waldur_core.checklist import urls as checklist_urls
 from waldur_core.core import WaldurExtension
 from waldur_core.core import views as core_views
 from waldur_core.core.logos import DEFAULT_LOGOS, LOGO_MAP
@@ -12,13 +13,24 @@ from waldur_core.core.routers import SortedDefaultRouter as DefaultRouter
 from waldur_core.logging import urls as logging_urls
 from waldur_core.permissions import urls as permissions_urls
 from waldur_core.structure import urls as structure_urls
+from waldur_core.structure.views import (
+    CustomerProjectMetadataComplianceDetailsViewSet,
+    CustomerProjectMetadataComplianceOverviewViewSet,
+    CustomerProjectMetadataComplianceProjectsViewSet,
+    CustomerProjectMetadataQuestionAnswersViewSet,
+    CustomerUsersViewSet,
+    ProjectOtherUsersViewSet,
+)
 from waldur_core.users import urls as users_urls
 from waldur_mastermind.marketplace.views import (
+    ServiceProviderComplianceViewSet,
+    ServiceProviderCourseAccountsViewSet,
     ServiceProviderCustomerProjectsViewSet,
     ServiceProviderCustomersViewSet,
     ServiceProviderKeysViewSet,
     ServiceProviderOfferingsViewSet,
     ServiceProviderProjectPermissionsViewSet,
+    ServiceProviderProjectServiceAccountsViewSet,
     ServiceProviderProjectsViewSet,
     ServiceProviderUserCustomersViewSet,
     ServiceProviderUsersViewSet,
@@ -29,6 +41,7 @@ logging_urls.register_in(router)
 permissions_urls.register_in(router)
 structure_urls.register_in(router)
 users_urls.register_in(router)
+checklist_urls.register_in(router)
 
 urlpatterns = [
     re_path(r"^admin/", admin.site.urls),
@@ -38,6 +51,7 @@ urlpatterns = [
     re_path(r"^api/database-stats/", core_views.DatabaseStatsViewSet.as_view()),
     re_path(r"^api/query/", core_views.QueryViewSet.as_view()),
 ]
+
 
 if settings.WALDUR_CORE.get("EXTENSIONS_AUTOREGISTER"):
     for ext in WaldurExtension.get_extensions():
@@ -82,17 +96,74 @@ service_provider_router.register(
     basename="service-provider-user-customers",
 )
 service_provider_router.register(
+    r"project_service_accounts",
+    ServiceProviderProjectServiceAccountsViewSet,
+    basename="service-provider-project-service-accounts",
+)
+service_provider_router.register(
+    r"course_accounts",
+    ServiceProviderCourseAccountsViewSet,
+    basename="service-provider-course-accounts",
+)
+service_provider_router.register(
     r"offerings",
     ServiceProviderOfferingsViewSet,
     basename="service-provider-offerings",
 )
+service_provider_router.register(
+    r"compliance",
+    ServiceProviderComplianceViewSet,
+    basename="service-provider-compliance",
+)
+
+customer_router = NestedSimpleRouter(router, r"customers", lookup="customer")
+customer_router.register(
+    r"users",
+    CustomerUsersViewSet,
+    basename="customer-users",
+)
+customer_router.register(
+    r"project-metadata-compliance-overview",
+    CustomerProjectMetadataComplianceOverviewViewSet,
+    basename="customer-project-metadata-compliance-overview",
+)
+customer_router.register(
+    r"project-metadata-compliance-details",
+    CustomerProjectMetadataComplianceDetailsViewSet,
+    basename="customer-project-metadata-compliance-details",
+)
+customer_router.register(
+    r"project-metadata-compliance-projects",
+    CustomerProjectMetadataComplianceProjectsViewSet,
+    basename="customer-project-metadata-compliance-projects",
+)
+customer_router.register(
+    r"project-metadata-question-answers",
+    CustomerProjectMetadataQuestionAnswersViewSet,
+    basename="customer-project-metadata-question-answers",
+)
+
+project_router = NestedSimpleRouter(router, r"projects", lookup="project")
+project_router.register(
+    r"other_users",
+    ProjectOtherUsersViewSet,
+    basename="project-other-users",
+)
+
 
 urlpatterns += [
     re_path(r"^api/", include(router.urls)),
     re_path(r"^api/", include(service_provider_router.urls)),
+    re_path(r"^api/", include(customer_router.urls)),
+    re_path(r"^api/", include(project_router.urls)),
     re_path(r"^api/", include("waldur_core.logging.urls")),
     re_path(r"^api/", include("waldur_core.media.urls")),
     re_path(r"^api/", include("waldur_core.structure.urls")),
+    re_path(r"^api/", include("waldur_core.checklist.urls")),
+]
+
+
+urlpatterns += [
     re_path(r"^api/configuration/", core_views.configuration_detail),
     re_path(r"^api/override-settings/", core_views.override_db_settings),
     re_path(r"^api/version/", core_views.version_detail),
@@ -107,7 +178,7 @@ urlpatterns += [
         r"^$",
         core_views.ExtraContextTemplateView.as_view(
             template_name="landing/index.html",
-            extra_context={"site_name": config.SITE_NAME},
+            extra_context={"site_name": lambda: config.SITE_NAME},
         ),
     ),
 ]
@@ -131,8 +202,10 @@ if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 
     # enable login/logout for web UI in debug mode
+    # Using different path to avoid conflict with custom logout at /api-auth/logout/
     urlpatterns += (
         re_path(
-            r"^api-auth/", include("rest_framework.urls", namespace="rest_framework")
+            r"^api-auth-browsable/",
+            include("rest_framework.urls", namespace="rest_framework"),
         ),
     )

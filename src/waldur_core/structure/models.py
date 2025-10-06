@@ -1,9 +1,8 @@
-import datetime
+import re
 from decimal import Decimal
 from functools import lru_cache
 from typing import cast
 
-import pyvat
 from django.apps import apps
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey
@@ -28,10 +27,12 @@ from model_utils.tracker import FieldInstanceTracker
 from netfields import CidrAddressField, NetManager
 from reversion import revisions as reversion
 
+from waldur_core.checklist import models as checklist_models
+from waldur_core.checklist.enums import ChecklistTypes
 from waldur_core.core import fields as core_fields
 from waldur_core.core import models as core_models
 from waldur_core.core.fields import COUNTRIES_DICT, JSONField
-from waldur_core.core.models import AbstractFieldTracker, User
+from waldur_core.core.models import User
 from waldur_core.core.validators import (
     validate_cidr_list,
     validate_name,
@@ -39,11 +40,15 @@ from waldur_core.core.validators import (
 )
 from waldur_core.logging.mixins import LoggableMixin
 from waldur_core.media.mixins import ImageModelMixin
-from waldur_core.media.validators import CertificateValidator
+from waldur_core.media.validators import (
+    CertificateValidator,
+    validate_notification_emails,
+)
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.mixins import PermissionMixin
 from waldur_core.quotas import fields as quotas_fields
 from waldur_core.quotas import models as quotas_models
+from waldur_core.structure.enums import ProjectKind
 from waldur_core.structure.managers import (
     PrivateServiceSettingsManager,
     ServiceSettingsManager,
@@ -102,8 +107,8 @@ class VATException(Exception):
 
 class VATMixin(models.Model):
     """
-    Add country, VAT number fields and check results from EU VAT Information Exchange System.
-    Allows to compute VAT charge rate.
+    Add country and VAT number fields for tax compliance and record keeping.
+    VAT validation is optional and can be done manually or through external services.
     """
 
     class Meta:
@@ -113,12 +118,12 @@ class VATMixin(models.Model):
     vat_name = models.CharField(
         max_length=255,
         blank=True,
-        help_text=_("Optional business name retrieved for the VAT number."),
+        help_text=_("Optional business name for the VAT number."),
     )
     vat_address = models.CharField(
         max_length=255,
         blank=True,
-        help_text=_("Optional business address retrieved for the VAT number."),
+        help_text=_("Optional business address for the VAT number."),
     )
 
     country = models.CharField(max_length=2, blank=True)
@@ -126,35 +131,80 @@ class VATMixin(models.Model):
     def get_country_display(self) -> str | None:
         return COUNTRIES_DICT.get(self.country)
 
-    def get_vat_rate(self) -> Decimal | None:
-        charge = self.get_vat_charge()
-        if charge.action == pyvat.VatChargeAction.charge:
-            return charge.rate
+    @staticmethod
+    def validate_vat_format(vat_code: str, country: str | None = None) -> bool:
+        """
+        Basic VAT number format validation using regex patterns.
+        Returns True if format appears valid, False otherwise.
+        Note: This only checks format, not validity with tax authorities.
+        """
+        if not vat_code:
+            return False
 
-        # Return None, if reverse_charge or no_charge action is applied
+        # Remove spaces and convert to uppercase
+        vat_code = vat_code.replace(" ", "").upper()
 
-    def get_vat_charge(self) -> pyvat.VatCharge:
-        if not self.country:
-            raise VATException(
-                _(
-                    "Unable to get VAT charge because buyer country code is not specified."
-                )
-            )
+        # European VAT number patterns extracted from regex documentation
+        vat_patterns = {
+            # EU Countries
+            "AT": r"^ATU\d{8}$",  # Austria
+            "BE": r"^BE[01]\d{9}$",  # Belgium - updated format
+            "BG": r"^BG\d{9,10}$",  # Bulgaria
+            "HR": r"^HR\d{11}$",  # Croatia
+            "CY": r"^CY\d{8}L$",  # Cyprus
+            "CZ": r"^CZ\d{8,10}$",  # Czech Republic
+            "DK": r"^DK\d{8}$",  # Denmark
+            "EE": r"^EE\d{9}$",  # Estonia
+            "FI": r"^FI\d{8}$",  # Finland
+            "FR": r"^FR[A-HJ-NP-Z0-9]{2}\d{9}$",  # France - updated format
+            "DE": r"^DE\d{9}$",  # Germany
+            "EL": r"^EL\d{9}$",  # Greece
+            "HU": r"^HU\d{8}$",  # Hungary
+            "IE": r"^IE\d{7}[A-WY][A-I]?$|^IE[0-9+][A-Z+][0-9]{5}[A-WY]$",  # Ireland
+            "IT": r"^IT\d{11}$",  # Italy
+            "LV": r"^LV\d{11}$",  # Latvia
+            "LT": r"^LT\d{9,12}$",  # Lithuania
+            "LU": r"^LU\d{8}$",  # Luxembourg
+            "MT": r"^MT\d{8}$",  # Malta
+            "NL": r"^NL\d{9}B\d{2}$",  # Netherlands
+            "PL": r"^PL\d{10}$",  # Poland
+            "PT": r"^PT\d{9}$",  # Portugal
+            "RO": r"^RO\d{2,10}$",  # Romania
+            "SK": r"^SK\d{10}$",  # Slovakia
+            "SI": r"^SI\d{8}$",  # Slovenia
+            "ES": r"^ES[A-Z]\d{7}[A-Z]$|^ES[A-Z][0-9]{7}[0-9A-Z]$|^ES[0-9]{8}[A-Z]$",  # Spain
+            "SE": r"^SE\d{12}$",  # Sweden
+            # Post-Brexit UK
+            "GB": r"^GB\d{9}$|^GB\d{12}$|^GBGD\d{3}$|^GBHA\d{3}$",  # United Kingdom
+            # Non-EU European Countries
+            "AL": r"^ALJ\d{8}[A-Z]$",  # Albania
+            "BY": r"^BY\d{9}$",  # Belarus
+            "CH": r"^CHE\d{9}(?:MWST|TVA|IVA)$",  # Switzerland
+            "FO": r"^FO\d{6}$",  # Faroe Islands
+            "IS": r"^IS\d{5,6}$",  # Iceland
+            "LI": r"^LI\d{5}$",  # Liechtenstein
+            "MD": r"^MD\d{8}$",  # Moldova
+            "ME": r"^ME\d{8}$",  # Montenegro
+            "MK": r"^MK\d{13}$",  # North Macedonia
+            "NO": r"^NO\d{9}MVA$",  # Norway
+            "RS": r"^RS\d{9}$",  # Serbia
+            "SM": r"^SM\d{5}$",  # San Marino
+            "UA": r"^UA\d{12}$",  # Ukraine
+            "XK": r"^XK\d{8}[A-Z]$",  # Kosovo
+        }
 
-        seller_country = settings.WALDUR_CORE.get("SELLER_COUNTRY_CODE")
-        if not seller_country:
-            raise VATException(
-                _(
-                    "Unable to get VAT charge because seller country code is not specified."
-                )
-            )
+        # If country is provided, check specific pattern
+        if country and country in vat_patterns:
+            pattern = vat_patterns[country]
+            return bool(re.match(pattern, vat_code))
 
-        return pyvat.get_sale_vat_charge(
-            datetime.date.today(),
-            pyvat.ItemType.generic_electronic_service,
-            pyvat.Party(self.country, bool(self.vat_code)),
-            pyvat.Party(seller_country, True),
-        )
+        # If no country or country not in list, check if it starts with any known prefix
+        for country_code, pattern in vat_patterns.items():
+            if vat_code.startswith(country_code) and re.match(pattern, vat_code):
+                return True
+
+        # Generic fallback - at least 2 letter country code and some digits
+        return bool(re.match(r"^[A-Z]{2}[A-Z0-9]{6,}$", vat_code))
 
 
 class BasePermission(models.Model):
@@ -239,6 +289,7 @@ CUSTOMER_DETAILS_FIELDS = (
     "slug",
     "native_name",
     "abbreviation",
+    "description",
     "contact_details",
     "agreement_number",
     "email",
@@ -255,6 +306,7 @@ CUSTOMER_DETAILS_FIELDS = (
     "longitude",
     "bank_account",
     "country",
+    "notification_emails",
 )
 
 
@@ -351,6 +403,13 @@ class CustomerDetailsMixin(core_models.NameMixin, VATMixin, CoordinatesMixin):
     postal = models.CharField(blank=True, max_length=20)
     bank_name = models.CharField(blank=True, max_length=150)
     bank_account = models.CharField(blank=True, max_length=50)
+    notification_emails = models.CharField(
+        blank=True,
+        default="",
+        help_text=_("Comma-separated list of notification email addresses"),
+        max_length=640,
+        validators=[validate_notification_emails],
+    )
 
 
 class ServiceAccountMixin(models.Model):
@@ -399,6 +458,7 @@ def filter_customers(user):
 class Customer(
     CustomerDetailsMixin,
     core_models.UuidMixin,
+    core_models.DescribableMixin,
     core_models.DescendantMixin,
     core_models.SlugMixin,
     quotas_models.ExtendableQuotaModelMixin,
@@ -433,16 +493,25 @@ class Customer(
     )
     default_tax_percent = models.DecimalField(
         default=Decimal(0),
-        max_digits=4,
+        max_digits=5,
         decimal_places=2,
-        validators=[MinValueValidator(0), MaxValueValidator(200)],
+        validators=[MinValueValidator(Decimal(0)), MaxValueValidator(Decimal(200))],
     )
     blocked = models.BooleanField(default=False)
     archived = models.BooleanField(default=False)
     organization_groups = models.ManyToManyField(
-        OrganizationGroup, related_name="customers", blank=True
+        to=OrganizationGroup, related_name="customers", blank=True
     )
-    tracker = cast(FieldInstanceTracker, FieldTracker())
+    project_metadata_checklist = models.ForeignKey(
+        checklist_models.Checklist,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text=_("Checklist used for project metadata collection"),
+    )
+    tracker = cast(
+        FieldInstanceTracker, FieldTracker(fields=["project_metadata_checklist"])
+    )
     objects = NetManager()
 
     class Meta:
@@ -462,7 +531,23 @@ class Customer(
         )
 
     def get_log_fields(self):
-        return ("uuid", "name", "abbreviation", "contact_details")
+        return ("uuid", "name", "abbreviation", "description", "contact_details")
+
+    def clean(self):
+        """Validate that the project metadata checklist is of PROJECT_METADATA type."""
+        super().clean()
+        if self.project_metadata_checklist:
+            if (
+                self.project_metadata_checklist.checklist_type
+                != ChecklistTypes.PROJECT_METADATA
+            ):
+                raise ValidationError(
+                    {
+                        "project_metadata_checklist": _(
+                            "Checklist must be of type PROJECT_METADATA"
+                        )
+                    }
+                )
 
     def get_owner_mails(self):
         return (
@@ -726,6 +811,13 @@ class Project(
         related_name="projects",
         on_delete=models.CASCADE,
     )
+
+    kind = models.CharField(
+        max_length=255,
+        default=ProjectKind.DEFAULT,
+        choices=ProjectKind.choices,
+        verbose_name=_("project type"),
+    )
     tracker = cast(FieldInstanceTracker, FieldTracker())
     # Entities returned in manager available_objects are limited to not-deleted instances.
     # Entities returned in manager objects include deleted objects.
@@ -748,6 +840,9 @@ class Project(
     @transaction.atomic()
     def _soft_delete(self, using=None):
         """Method for project soft delete. It doesn't delete a project, only mark as 'removed', but it sends signals"""
+        # Set flag to indicate this object is being deleted to skip quota aggregation
+        self._deleting = True
+
         signals.pre_delete.send(sender=self.__class__, instance=self, using=using)
 
         self.is_removed = True
@@ -766,6 +861,8 @@ class Project(
         if soft:
             self._soft_delete(using)
         else:
+            # Set flag for hard delete as well
+            self._deleting = True
             return super(SoftDeletableModel, self).delete(using=using, *args, **kwargs)
 
     def __str__(self):
@@ -775,20 +872,51 @@ class Project(
         return ("uuid", "customer", "name", "end_date")
 
     def get_parents(self):
-        return [self.customer]
+        try:
+            # Check if customer relationship exists and return it
+            if hasattr(self, "customer") and self.customer:
+                return [self.customer]
+            return []
+        except (AttributeError, KeyError):
+            # Handle case where customer relationship is missing during deletion
+            return []
 
     class Meta:
         base_manager_name = "objects"
         ordering = ["name"]
 
 
-class CustomerPermissionReview(core_models.UuidMixin):
+class PermissionReview(core_models.UuidMixin, LoggableMixin):
     """
-    Model for tracking customer permission reviews.
+    Abstract base class for permission reviews.
 
     Tracks permission review processes with pending status,
     creation/closure dates, and reviewer information.
-    Used for auditing and managing customer access permissions.
+    Used for auditing and managing access permissions.
+    """
+
+    class Meta:
+        abstract = True
+
+    is_pending = models.BooleanField(default=True)
+    created = AutoCreatedField()
+    closed = models.DateTimeField(null=True, blank=True)
+    reviewer = models.ForeignKey[User](
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
+    )
+
+    def close(self, user):
+        self.is_pending = False
+        self.closed = timezone.now()
+        self.reviewer = user
+        self.save()
+
+
+class CustomerPermissionReview(PermissionReview):
+    """
+    Model for tracking customer permission reviews.
+
+    Inherits from PermissionReview and adds customer-specific fields.
     """
 
     class Permissions:
@@ -801,22 +929,30 @@ class CustomerPermissionReview(core_models.UuidMixin):
         related_name="reviews",
         on_delete=models.CASCADE,
     )
-    is_pending = models.BooleanField(default=True)
-    created = AutoCreatedField()
-    closed = models.DateTimeField(null=True, blank=True)
-    reviewer = models.ForeignKey[User](
-        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
-    )
 
     @classmethod
     def get_url_name(cls):
         return "customer_permission_review"
 
-    def close(self, user):
-        self.is_pending = False
-        self.closed = timezone.now()
-        self.reviewer = user
-        self.save()
+
+class ProjectPermissionReview(PermissionReview):
+    """
+    Model for tracking project permission reviews.
+
+    Inherits from PermissionReview and adds project-specific fields.
+    """
+
+    class Permissions:
+        customer_path = "project__customer"
+        project_path = "project"
+        list_permission = PermissionEnum.REVIEW_PROJECT_MEMBERSHIP
+
+    project = models.ForeignKey(
+        Project,
+        verbose_name=_("project"),
+        related_name="reviews",
+        on_delete=models.CASCADE,
+    )
 
 
 def build_service_settings_query(user):
@@ -1144,9 +1280,8 @@ class VirtualMachine(IPCoordinatesMixin, core_models.RuntimeStateMixin, BaseReso
     for all VM implementations across different cloud providers.
     """
 
-    def __init__(self, *args, **kwargs):
-        AbstractFieldTracker().finalize_class(self.__class__, "tracker")
-        super().__init__(*args, **kwargs)
+    class Meta:
+        abstract = True
 
     cores = models.PositiveSmallIntegerField(
         default=0, help_text=_("Number of cores in a VM")
@@ -1170,9 +1305,6 @@ class VirtualMachine(IPCoordinatesMixin, core_models.RuntimeStateMixin, BaseReso
         help_text=_("Additional data that will be added to instance on provisioning"),
     )
     start_time = models.DateTimeField(blank=True, null=True)
-
-    class Meta:
-        abstract = True
 
     def get_access_url(self):
         if self.external_ips:
@@ -1255,3 +1387,25 @@ class UserAgreement(core_models.UuidMixin, LoggableMixin, TimeStampedModel):
 
 
 reversion.register(Customer)
+
+
+class ExternalLink(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    core_models.DescribableMixin,
+    ImageModelMixin,
+    TimeStampedModel,
+):
+    """
+    Model for external links associated with waldur.
+
+    Provides a way to store URLs with names and descriptions for
+    external systems.
+    """
+
+    class Meta:
+        verbose_name = _("External link")
+        verbose_name_plural = _("External links")
+        ordering = ("name",)
+
+    link = models.URLField(max_length=500)

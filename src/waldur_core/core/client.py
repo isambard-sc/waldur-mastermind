@@ -39,9 +39,4 @@ def check_url(url):
 
 def get_waldur_client(api_url, token):
     check_url(api_url)
-    return AuthenticatedClient(
-        base_url=api_url.rstrip("/api"),
-        token=token,
-        prefix="Token",
-        raise_on_unexpected_status=True,
-    )
+    return AuthenticatedClient(base_url=api_url.rstrip("/api"), token=token)

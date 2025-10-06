@@ -1,6 +1,8 @@
 from django.apps import AppConfig
 from django.db.models import signals
 
+from waldur_mastermind.marketplace.enums import SITE_AGENT_OFFERING
+
 
 class MarketplaceSlurmConfig(AppConfig):
     name = "waldur_mastermind.marketplace_site_agent"
@@ -12,7 +14,7 @@ class MarketplaceSlurmConfig(AppConfig):
         from waldur_mastermind.marketplace import models as marketplace_models
         from waldur_mastermind.marketplace.plugins import manager
         from waldur_mastermind.marketplace_site_agent import (
-            PLUGIN_NAME,
+            executors,
             handlers,
             processor,
         )
@@ -23,12 +25,13 @@ class MarketplaceSlurmConfig(AppConfig):
         slurm_registrators.RemoteSlurmRegistrator.connect()
 
         manager.register(
-            PLUGIN_NAME,
+            SITE_AGENT_OFFERING,
             create_resource_processor=processor.CreateAllocationProcessor,
             update_resource_processor=processor.UpdateAllocationLimitsProcessor,
             delete_resource_processor=processor.DeleteAllocationProcessor,
             can_update_limits=True,
             enable_remote_support=True,
+            pull_resource_executor=executors.AgentResourcePullExecutor,
         )
 
         signals.post_save.connect(
@@ -50,17 +53,41 @@ class MarketplaceSlurmConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.send_resource_update_message_to_mqtt,
+            handlers.send_resource_update_message_to_queue,
             sender=marketplace_models.Resource,
-            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_resource_status_changed_message_to_mqtt",
+            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_resource_update_message_to_queue",
         )
 
         permission_signals.role_granted.connect(
-            handlers.send_role_granted_message_to_mqtt,
-            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_role_granted_message_to_mqtt",
+            handlers.send_role_granted_message_to_queue,
+            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_role_granted_message_to_queue",
         )
 
         permission_signals.role_revoked.connect(
-            handlers.send_role_revoked_message_to_mqtt,
-            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_role_revoked_message_to_mqtt",
+            handlers.send_role_revoked_message_to_queue,
+            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_role_revoked_message_to_queue",
+        )
+
+        signals.post_save.connect(
+            handlers.send_project_service_account_info,
+            sender=marketplace_models.ProjectServiceAccount,
+            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_project_service_account_info",
+        )
+
+        signals.post_save.connect(
+            handlers.send_project_service_account_deletion_info,
+            sender=marketplace_models.ProjectServiceAccount,
+            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_project_service_account_deletion_info",
+        )
+
+        signals.post_save.connect(
+            handlers.send_course_account_info,
+            sender=marketplace_models.CourseAccount,
+            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_course_account_info",
+        )
+
+        signals.post_save.connect(
+            handlers.send_course_account_deletion_info,
+            sender=marketplace_models.CourseAccount,
+            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_course_account_deletion_info",
         )

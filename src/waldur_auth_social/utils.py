@@ -3,6 +3,7 @@ import uuid
 from typing import cast
 
 import requests
+from constance import config
 from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
@@ -19,6 +20,8 @@ from waldur_auth_social.exceptions import OAuthException
 from waldur_auth_social.models import IdentityProvider
 from waldur_core.core.models import SshPublicKey, User
 from waldur_core.core.validators import validate_ssh_public_key
+from waldur_core.users.enums import InvitationState
+from waldur_core.users.models import Invitation
 
 logger = logging.getLogger(__name__)
 
@@ -82,9 +85,6 @@ def create_or_update_oauth_user(
     payload = get_user_payload(identity_provider, backend_user)
     lookup_params = get_lookup_params(identity_provider, backend_user)
 
-    if "username" not in payload and "username" not in lookup_params:
-        payload["username"] = uuid.uuid4().hex[:30]
-
     try:
         created = False
         # Use all_objects to reactivate a user who might have been deactivated
@@ -107,7 +107,25 @@ def create_or_update_oauth_user(
             user.save(update_fields=update_fields)
 
     except User.DoesNotExist:
+        if config.OIDC_BLOCK_CREATION_OF_UNINVITED_USERS:
+            if "email" not in payload or not payload["email"]:
+                raise OAuthException(
+                    identity_provider.provider,
+                    "User email is not provided. Account creation is blocked.",
+                )
+
+            if not Invitation.objects.filter(
+                email__iexact=payload["email"], state=InvitationState.PENDING
+            ).exists():
+                raise OAuthException(
+                    identity_provider.provider,
+                    "Account creation is blocked for uninvited users.",
+                )
         created = True
+
+        if "username" not in payload and "username" not in lookup_params:
+            payload["username"] = uuid.uuid4().hex[:30]
+
         merged_dict = {**lookup_params, **payload}
         registration_method = identity_provider.provider
         if identity_provider.provider == ProviderChoices.REMOTE_EDUTEAMS:
@@ -122,6 +140,10 @@ def create_or_update_oauth_user(
         user.set_unusable_password()
         user.save()
 
+    return user, created
+
+
+def sync_eduteams_ssh_keys(user, backend_user, identity_provider):
     if identity_provider.provider in [
         ProviderChoices.EDUTEAMS,
         ProviderChoices.REMOTE_EDUTEAMS,
@@ -129,11 +151,6 @@ def create_or_update_oauth_user(
         eduteams_keys = backend_user.get("ssh_public_key", [])
         lookup_value = get_lookup_value(identity_provider, backend_user)
         sync_user_ssh_keys(user, eduteams_keys, lookup_value)
-        if user.notifications_enabled:
-            user.notifications_enabled = False
-            user.save(update_fields=["notifications_enabled"])
-
-    return user, created
 
 
 def sync_user_ssh_keys(user, eduteams_keys, username):
@@ -182,12 +199,12 @@ def pull_remote_eduteams_user(username):
             # check across active users with default manager
             user = User.objects.get(username=username)
         except User.DoesNotExist:
-            return
+            return None, False
         else:
             user.is_active = False
             user.last_sync = timezone.now()
             user.save(update_fields=["is_active", "last_sync"])
-            return user
+            return user, False
     else:
         try:
             config = IdentityProvider.objects.get(
@@ -198,8 +215,9 @@ def pull_remote_eduteams_user(username):
                 provider=ProviderChoices.REMOTE_EDUTEAMS,
                 **PROVIDER_DEFAULTS[ProviderChoices.REMOTE_EDUTEAMS],
             )
-        user, _ = create_or_update_oauth_user(config, user_info)
-    return user
+        user, created = create_or_update_oauth_user(config, user_info)
+        sync_eduteams_ssh_keys(user, user_info, config)
+    return user, created
 
 
 def get_remote_eduteams_user_info(username):

@@ -26,6 +26,8 @@ class EventType(str, Enum):
     CUSTOMER_CREATION_SUCCEEDED = "customer_creation_succeeded"
     CUSTOMER_DELETION_SUCCEEDED = "customer_deletion_succeeded"
     CUSTOMER_UPDATE_SUCCEEDED = "customer_update_succeeded"
+    CUSTOMER_PERMISSION_REVIEW_CREATED = "customer_permission_review_created"
+    CUSTOMER_PERMISSION_REVIEW_CLOSED = "customer_permission_review_closed"
     DROPLET_RESIZE_SCHEDULED = "droplet_resize_scheduled"
     DROPLET_RESIZE_SUCCEEDED = "droplet_resize_succeeded"
     FREEIPA_PROFILE_CREATED = "freeipa_profile_created"
@@ -50,6 +52,7 @@ class EventType(str, Enum):
     MARKETPLACE_OFFERING_ROLE_UPDATED = "marketplace_offering_role_updated"
     MARKETPLACE_OFFERING_UPDATED = "marketplace_offering_updated"
     MARKETPLACE_OFFERING_USER_CREATED = "marketplace_offering_user_created"
+    MARKETPLACE_OFFERING_USER_UPDATED = "marketplace_offering_user_updated"
     MARKETPLACE_OFFERING_USER_DELETED = "marketplace_offering_user_deleted"
     MARKETPLACE_OFFERING_USER_RESTRICTION_UPDATED = (
         "marketplace_offering_user_restriction_updated"
@@ -170,6 +173,8 @@ class EventType(str, Enum):
     PROJECT_UPDATE_REQUEST_CREATED = "project_update_request_created"
     PROJECT_UPDATE_REQUEST_REJECTED = "project_update_request_rejected"
     PROJECT_UPDATE_SUCCEEDED = "project_update_succeeded"
+    PROJECT_PERMISSION_REVIEW_CREATED = "project_permission_review_created"
+    PROJECT_PERMISSION_REVIEW_CLOSED = "project_permission_review_closed"
     PROPOSAL_CANCELED = "proposal_canceled"
     PROPOSAL_DOCUMENT_ADDED = "proposal_document_added"
     PROPOSAL_DOCUMENT_REMOVED = "proposal_document_removed"
@@ -296,6 +301,8 @@ class EventType(str, Enum):
     USER_PASSWORD_UPDATED = "user_password_updated"
     USER_PASSWORD_UPDATED_BY_STAFF = "user_password_updated_by_staff"
     USER_UPDATE_SUCCEEDED = "user_update_succeeded"
+    TERMS_OF_SERVICE_CONSENT_GRANTED = "terms_of_service_consent_granted"
+    TERMS_OF_SERVICE_CONSENT_REVOKED = "terms_of_service_consent_revoked"
 
 
 class EventGroup(str, Enum):
@@ -315,6 +322,7 @@ class EventGroup(str, Enum):
     SSH = "ssh"
     SUPPORT = "support"
     USERS = "users"
+    TERMS_OF_SERVICE = "terms_of_service"
 
 
 EVENT_GROUP_MAPPING = {
@@ -366,6 +374,8 @@ EVENT_GROUP_MAPPING = {
         EventType.ROLL_BACK_PROJECT_CREDIT,
         EventType.SET_TO_ZERO_OVERDUE_CREDIT,
         EventType.UPDATE_OF_CREDIT_BY_STAFF,
+        EventType.CUSTOMER_PERMISSION_REVIEW_CREATED,
+        EventType.CUSTOMER_PERMISSION_REVIEW_CLOSED,
     ],
     EventGroup.INVOICES: [
         EventType.ALLOWED_OFFERINGS_HAVE_BEEN_UPDATED,
@@ -414,6 +424,8 @@ EVENT_GROUP_MAPPING = {
         EventType.PROJECT_UPDATE_REQUEST_CREATED,
         EventType.PROJECT_UPDATE_REQUEST_REJECTED,
         EventType.PROJECT_UPDATE_SUCCEEDED,
+        EventType.PROJECT_PERMISSION_REVIEW_CREATED,
+        EventType.PROJECT_PERMISSION_REVIEW_CLOSED,
     ],
     EventGroup.PROPOSAL: [
         EventType.PROPOSAL_CANCELED,
@@ -602,6 +614,10 @@ EVENT_GROUP_MAPPING = {
         EventType.USER_PASSWORD_UPDATED,
         EventType.USER_PASSWORD_UPDATED_BY_STAFF,
         EventType.USER_UPDATE_SUCCEEDED,
+    ],
+    EventGroup.TERMS_OF_SERVICE: [
+        EventType.TERMS_OF_SERVICE_CONSENT_GRANTED,
+        EventType.TERMS_OF_SERVICE_CONSENT_REVOKED,
     ],
 }
 

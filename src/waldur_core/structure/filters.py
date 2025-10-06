@@ -6,8 +6,11 @@ from django.contrib.contenttypes.models import ContentType
 from django.core import exceptions
 from django.db.models import OuterRef, Q, Subquery
 from django.db.models.functions import Concat
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django_filters.widgets import BooleanWidget
+from drf_spectacular.plumbing import build_parameter_type
+from drf_spectacular.utils import OpenApiParameter
 from rest_framework.filters import BaseFilterBackend
 
 from waldur_core.core import filters as core_filters
@@ -18,7 +21,12 @@ from waldur_core.core.filters import (
     get_generic_field_filter,
 )
 from waldur_core.core.utils import get_ordering, is_uuid_like, order_with_nulls
-from waldur_core.permissions.enums import RoleEnum
+from waldur_core.permissions.enums import (
+    SYSTEM_CUSTOMER_ROLES,
+    SYSTEM_PROJECT_ROLES,
+    RoleEnum,
+)
+from waldur_core.permissions.models import UserRole
 from waldur_core.structure import models
 from waldur_core.structure.managers import (
     filter_queryset_by_user_ip,
@@ -41,8 +49,106 @@ class NameFilterSet(django_filters.FilterSet):
 
 class GenericRoleFilter(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
-        queryset = filter_queryset_for_user(queryset, request.user)
+        # Use optimized customer filtering for customer queries when needed
+        if (
+            hasattr(queryset, "model")
+            and queryset.model.__name__ == "Customer"
+            and request.user.is_authenticated
+            and not request.user.is_staff
+            and not request.user.is_support
+        ):
+            queryset = self._filter_customers_optimized(queryset, request.user)
+        else:
+            queryset = filter_queryset_for_user(queryset, request.user)
         return filter_queryset_by_user_ip(queryset, request)
+
+    def _filter_customers_optimized(self, queryset, user):
+        """Optimized customer filtering to avoid complex permission queries."""
+        # Use a single query to get all customer IDs this user has access to
+        from django.contrib.contenttypes.models import ContentType
+        from django.db.models import Q
+
+        accessible_customer_ids = set()
+
+        # Get all content types we need
+        customer_ct = ContentType.objects.get_for_model(queryset.model)
+        project_ct = ContentType.objects.get_for_model(models.Project)
+
+        # Single query to get all user roles for this user across all relevant content types
+        content_type_conditions = Q(content_type=customer_ct) | Q(
+            content_type=project_ct
+        )
+
+        # Check for call management content types (import locally to avoid module dependency)
+        try:
+            from waldur_mastermind.proposal.models import Call, CallManagingOrganisation
+
+            call_manager_ct = ContentType.objects.get_for_model(
+                CallManagingOrganisation
+            )
+            call_ct = ContentType.objects.get_for_model(Call)
+            content_type_conditions |= Q(content_type=call_manager_ct) | Q(
+                content_type=call_ct
+            )
+        except ImportError:
+            call_manager_ct = None
+            call_ct = None
+
+        # Single query to get all relevant user roles
+        user_roles = (
+            UserRole.objects.filter(user=user, is_active=True)
+            .filter(content_type_conditions)
+            .select_related("content_type")
+            .values("content_type__model", "object_id")
+        )
+
+        # Process results to get customer IDs
+        project_ids = []
+        call_manager_ids = []
+        call_ids = []
+
+        for role in user_roles:
+            model_name = role["content_type__model"]
+            object_id = role["object_id"]
+
+            if model_name == "customer":
+                accessible_customer_ids.add(object_id)
+            elif model_name == "project":
+                project_ids.append(object_id)
+            elif model_name == "callmanagingorganisation":
+                call_manager_ids.append(object_id)
+            elif model_name == "call":
+                call_ids.append(object_id)
+
+        # Handle project-level access (customers via projects)
+        if project_ids:
+            project_customer_ids = models.Project.objects.filter(
+                id__in=project_ids
+            ).values_list("customer_id", flat=True)
+            accessible_customer_ids.update(project_customer_ids)
+
+        # Handle call management permissions using the data we already collected
+        if call_manager_ids and call_manager_ct:
+            from waldur_mastermind.proposal.models import CallManagingOrganisation
+
+            call_manager_customer_ids = CallManagingOrganisation.objects.filter(
+                id__in=call_manager_ids
+            ).values_list("customer_id", flat=True)
+            accessible_customer_ids.update(call_manager_customer_ids)
+
+        if call_ids and call_ct:
+            from waldur_mastermind.proposal.models import Call
+
+            call_customer_ids = Call.objects.filter(id__in=call_ids).values_list(
+                "manager__customer_id", flat=True
+            )
+            accessible_customer_ids.update(call_customer_ids)
+            pass
+
+        if accessible_customer_ids:
+            return queryset.filter(id__in=accessible_customer_ids)
+        else:
+            return queryset.none()
 
 
 class GenericUserFilter(BaseFilterBackend):
@@ -63,7 +169,10 @@ class GenericUserFilter(BaseFilterBackend):
 
 
 class CustomerFilter(NameFilterSet):
-    query = django_filters.CharFilter(method="filter_query")
+    query = django_filters.CharFilter(
+        method="filter_query",
+        label="Filter by name, native name, abbreviation, domain, UUID, registration code or agreement number",
+    )
     native_name = django_filters.CharFilter(lookup_expr="icontains")
     abbreviation = django_filters.CharFilter(lookup_expr="icontains")
     contact_details = django_filters.CharFilter(lookup_expr="icontains")
@@ -192,7 +301,10 @@ class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
         label="Conceal finished projects",
     )
 
-    query = django_filters.CharFilter(method="filter_query")
+    query = django_filters.CharFilter(
+        method="filter_query",
+        label="Filter by name, UUID, backend ID or resource effective ID",
+    )
 
     can_manage = django_filters.BooleanFilter(
         widget=BooleanWidget,
@@ -362,8 +474,12 @@ class BaseUserFilter(django_filters.FilterSet):
 
 
 class UserFilter(BaseUserFilter):
-    is_staff = django_filters.BooleanFilter(widget=BooleanWidget)
-    is_support = django_filters.BooleanFilter(widget=BooleanWidget)
+    is_staff = django_filters.BooleanFilter(
+        widget=BooleanWidget, method="filter_is_staff"
+    )
+    is_support = django_filters.BooleanFilter(
+        widget=BooleanWidget, method="filter_is_support"
+    )
     username = django_filters.CharFilter(field_name="username", lookup_expr="exact")
     organization_roles = django_filters.CharFilter(
         method="filter_organization_roles", label="Organization roles"
@@ -371,7 +487,10 @@ class UserFilter(BaseUserFilter):
     project_roles = django_filters.CharFilter(
         method="filter_project_roles", label="Project roles"
     )
-    query = django_filters.CharFilter(method="filter_query")
+    query = django_filters.CharFilter(
+        method="filter_query",
+        label="Filter by first name, last name, civil number, username or email",
+    )
     customer_uuid = django_filters.UUIDFilter(method="filter_by_customer")
     project_uuid = django_filters.UUIDFilter(method="filter_by_project")
     username_list = django_filters.CharFilter(
@@ -394,6 +513,16 @@ class UserFilter(BaseUserFilter):
             "is_support",
         )
     )
+
+    def filter_is_staff(self, queryset, name, value):
+        if self.request.user.is_staff or self.request.user.is_support:
+            return queryset.filter(is_staff=value)
+        return queryset.none()
+
+    def filter_is_support(self, queryset, name, value):
+        if self.request.user.is_staff or self.request.user.is_support:
+            return queryset.filter(is_support=value)
+        return queryset.none()
 
     def filter_by_customer(self, queryset, name, value):
         try:
@@ -449,38 +578,76 @@ class UserFilter(BaseUserFilter):
         return queryset.filter(username__in=usernames).distinct()
 
 
-class UserConcatenatedNameOrderingBackend(BaseFilterBackend):
-    """Filter user by concatenated first_name + last_name + username with ?o=concatenated_name"""
+class ConcatenatedNameOrderingBackend(BaseFilterBackend):
+    """
+    Provides ordering by a concatenated field of first_name, last_name, and username.
+    Use the query parameter `o=concatenated_name` or `o=-concatenated_name`.
+    """
 
     def filter_queryset(self, request, queryset, view):
-        queryset = self._filter_queryset(request, queryset, view)
-        return BaseUserFilter(
-            request.query_params, queryset=queryset, request=request
-        ).qs
+        order_param = request.query_params.get("o")
 
-    def _filter_queryset(self, request, queryset, view):
-        if "o" not in request.query_params:
-            return queryset
-        if request.query_params["o"] == "concatenated_name":
-            order_by = "concatenated_name"
-        elif request.query_params["o"] == "-concatenated_name":
-            order_by = "-concatenated_name"
-        else:
-            return queryset
-        return queryset.annotate(
-            concatenated_name=Concat("first_name", "last_name", "username")
-        ).order_by(order_by)
+        if order_param in ("concatenated_name", "-concatenated_name"):
+            return queryset.annotate(
+                concatenated_name=Concat("first_name", "last_name", "username")
+            ).order_by(order_param)
+
+        return queryset
+
+    def get_schema_operation_parameters(self, view):
+        """Declare the 'o' parameter for OpenAPI schema."""
+        return [
+            build_parameter_type(
+                name="o",
+                schema={
+                    "type": "string",
+                    "enum": ["concatenated_name", "-concatenated_name"],
+                },
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Ordering. Sort by a combination of first name, last name, and username.",
+            )
+        ]
 
 
-class CustomerPermissionReviewFilter(django_filters.FilterSet):
-    customer_uuid = django_filters.UUIDFilter(field_name="customer__uuid")
-    reviewer_uuid = django_filters.UUIDFilter(field_name="reviewer__uuid")
+class PermissionReviewFilter(django_filters.FilterSet):
+    reviewer_uuid = django_filters.UUIDFilter(
+        field_name="reviewer__uuid", label="Reviewer UUID"
+    )
+    is_pending = django_filters.BooleanFilter(
+        field_name="is_pending", label="Is pending"
+    )
     o = django_filters.OrderingFilter(fields=("created", "closed"))
 
     class Meta:
-        model = models.CustomerPermissionReview
         fields = [
+            "reviewer_uuid",
             "is_pending",
+            "closed",
+        ]
+
+
+class CustomerPermissionReviewFilter(PermissionReviewFilter):
+    customer_uuid = django_filters.UUIDFilter(
+        field_name="customer__uuid", label="Customer UUID"
+    )
+
+    class Meta:
+        model = models.CustomerPermissionReview
+        fields = PermissionReviewFilter.Meta.fields + [
+            "customer_uuid",
+        ]
+
+
+class ProjectPermissionReviewFilter(PermissionReviewFilter):
+    project_uuid = django_filters.UUIDFilter(
+        field_name="project__uuid", label="Project UUID"
+    )
+
+    class Meta:
+        model = models.ProjectPermissionReview
+        fields = PermissionReviewFilter.Meta.fields + [
+            "project_uuid",
         ]
 
 
@@ -683,7 +850,12 @@ class UserAgreementsFilter(django_filters.FilterSet):
 
 class UserRolesFilter(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
-        customer = view.get_object()
+        customer_uuid = view.kwargs.get("customer_uuid")
+        if not customer_uuid:
+            return queryset
+
+        customer = get_object_or_404(models.Customer, uuid=customer_uuid)
+
         project_roles = request.query_params.getlist("project_role")
         organization_roles = request.query_params.getlist("organization_role")
 
@@ -691,7 +863,9 @@ class UserRolesFilter(BaseFilterBackend):
 
         if project_roles:
             # Filter project permissions by current customer
-            projects = customer.projects.values_list("id", flat=True)
+            projects = models.Project.available_objects.filter(
+                customer=customer
+            ).values_list("id", flat=True)
             project_users = get_project_users(projects, project_roles)
             query = query | Q(id__in=project_users)
 
@@ -701,6 +875,61 @@ class UserRolesFilter(BaseFilterBackend):
             query = query | Q(id__in=customer_users)
 
         return queryset.filter(query)
+
+    def get_schema_operation_parameters(self, view):
+        """
+        Declare role parameters for OpenAPI schema.
+        """
+        return [
+            build_parameter_type(
+                name="project_role",
+                schema={
+                    "type": "array",
+                    "items": {
+                        # Use anyOf to allow enum OR a generic string
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "enum": [role.value for role in SYSTEM_PROJECT_ROLES],
+                            },
+                            {
+                                # This second schema allows any other string value
+                                "type": "string"
+                            },
+                        ],
+                    },
+                },
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by one or more project roles. "
+                "Select a standard role or provide a custom role string. "
+                "Can be specified multiple times.",
+            ),
+            build_parameter_type(
+                name="organization_role",
+                schema={
+                    "type": "array",
+                    "items": {
+                        # Use anyOf to allow enum OR a generic string
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "enum": [role.value for role in SYSTEM_CUSTOMER_ROLES],
+                            },
+                            {
+                                # This second schema allows any other string value
+                                "type": "string"
+                            },
+                        ],
+                    },
+                },
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by one or more organization roles. "
+                "Select a standard role or provide a custom role string. "
+                "Can be specified multiple times.",
+            ),
+        ]
 
 
 class ProjectEstimatedCostFilter(BaseFilterBackend):
@@ -737,7 +966,9 @@ class NotificationTemplateFilter(NameFilterSet):
 
 
 class NotificationFilter(NameFilterSet):
-    query = django_filters.CharFilter(method="filter_query")
+    query = django_filters.CharFilter(
+        method="filter_query", label="Filter by key or description"
+    )
     is_overridden = django_filters.BooleanFilter(method="filter_is_overridden")
 
     class Meta:
@@ -777,3 +1008,22 @@ class AccessSubnetFilter(django_filters.FilterSet):
             "inet",
             "description",
         ]
+
+
+class ExternalLinkFilter(django_filters.FilterSet):
+    query = django_filters.CharFilter(
+        method="filter_query", label="Filter by name, link or description"
+    )
+
+    class Meta:
+        model = models.ExternalLink
+        fields = ()
+
+    def filter_query(self, queryset, name, value):
+        if value:
+            return queryset.filter(
+                Q(name__icontains=value)
+                | Q(link__icontains=value)
+                | Q(description__icontains=value)
+            ).distinct()
+        return queryset

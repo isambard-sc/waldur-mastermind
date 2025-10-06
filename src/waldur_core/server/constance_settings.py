@@ -373,6 +373,11 @@ CONSTANCE_CONFIG = {
         False,
         "Enable mock returns for the service account service",
     ),
+    # Course accounts
+    "ENABLE_MOCK_COURSE_ACCOUNT_BACKEND": (
+        False,
+        "Enable mock returns for the course account service",
+    ),
     # Proposal settings
     "PROPOSAL_REVIEW_DURATION": (7, "Review duration in days."),
     "USER_TABLE_COLUMNS": ("", "Comma-separated list of columns for users table."),
@@ -490,6 +495,14 @@ CONSTANCE_CONFIG = {
         300,
         "Number of seconds to cache token introspection results.",
     ),
+    "OIDC_ACCESS_TOKEN_ENABLED": (
+        False,
+        "If true, OIDC complete view returns access token instead of Waldur token",
+    ),
+    "OIDC_BLOCK_CREATION_OF_UNINVITED_USERS": (
+        False,
+        "If true, block creation of an account on OIDC login if user email is not provided or provided and is not in the list of one of the active invitations.",
+    ),
     "DEACTIVATE_USER_IF_NO_ROLES": (
         False,
         "Deactivate user if all roles are revoked (except staff/support)",
@@ -502,6 +515,10 @@ CONSTANCE_CONFIG = {
         ["AdminAnnouncement"],
         "How maintenance notifications are delivered. Choices: AdminAnnouncement or BroadcastMessage.",
         "list_field",
+    ),
+    "ENFORCE_USER_CONSENT_FOR_OFFERINGS": (
+        False,
+        "If True, users must have active consent to access offerings that have active Terms of Service.",
     ),
 }
 
@@ -531,6 +548,8 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "DISABLE_SENDING_NOTIFICATIONS_ABOUT_RESOURCE_UPDATE",
         "ENABLE_STALE_RESOURCE_NOTIFICATIONS",
         "ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND",
+        "ENABLE_MOCK_COURSE_ACCOUNT_BACKEND",
+        "ENFORCE_USER_CONSENT_FOR_OFFERINGS",
     ),
     "Telemetry": (
         "TELEMETRY_URL",
@@ -650,6 +669,8 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "INVITATION_DISABLE_MULTIPLE_ROLES",
         "DEFAULT_IDP",
         "DEACTIVATE_USER_IF_NO_ROLES",
+        "OIDC_BLOCK_CREATION_OF_UNINVITED_USERS",
+        "OIDC_ACCESS_TOKEN_ENABLED",
     ),
     "FreeIPA settings": (
         "FREEIPA_ENABLED",
@@ -709,9 +730,6 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "WALDUR_SUPPORT_ENABLED",
     "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE",
     "WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE",
-    # Proposal
-    "PROPOSAL_REVIEW_DURATION",
-    # Tables
     "USER_TABLE_COLUMNS",
     # FreeIPA
     "FREEIPA_ENABLED",
@@ -720,9 +738,6 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "HOMEPORT_URL",
     "KEYCLOAK_ICON",
     "RANCHER_USERNAME_INPUT_LABEL",
-    # Service accounts
-    "ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND",
-    # OIDC
-    "OIDC_AUTH_URL",
-    "OIDC_CLIENT_ID",
+    "ENFORCE_USER_CONSENT_FOR_OFFERINGS",
+    "OIDC_ACCESS_TOKEN_ENABLED",
 )

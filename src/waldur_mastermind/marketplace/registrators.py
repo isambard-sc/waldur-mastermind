@@ -12,21 +12,23 @@ from waldur_mastermind.common.utils import parse_datetime
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices import registrators
 from waldur_mastermind.invoices.registrators import RegistrationManager
-from waldur_mastermind.invoices.utils import get_current_month_end, get_full_days
-from waldur_mastermind.marketplace import PLUGIN_NAME, utils
+from waldur_mastermind.invoices.utils import (
+    get_current_month_end,
+    get_full_days,
+)
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import utils
 from waldur_mastermind.marketplace.enums import (
+    BASIC_OFFERING,
     BillingTypes,
     LimitPeriods,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.models import ComponentUsage
 from waldur_mastermind.promotions import models as promotions_models
 
 logger = logging.getLogger(__name__)
-
-LimitPeriods = LimitPeriods
-OrderTypes = marketplace_models.Order.Types
 
 
 class MarketplaceRegistrator(registrators.BaseRegistrator):
@@ -51,11 +53,12 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
 
     Billing behavior varies by limit period for limit-based components:
     - MONTH: Billed monthly based on limits
+    - QUARTERLY: Billed quarterly based on limits
     - ANNUAL: Billed annually based on limits
     - TOTAL: One-time billing for total limit amount
     """
 
-    plugin_name = PLUGIN_NAME
+    plugin_name = BASIC_OFFERING
 
     def _find_item(self, source: marketplace_models.Resource, now):
         """
@@ -136,7 +139,7 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
         2. ONE_TIME billing: Creates one-time charges during resource creation
         3. ON_PLAN_SWITCH billing: Creates charges when switching between plans
         4. LIMIT billing: Creates charges based on user-specified limits with
-           different behaviors for MONTH/ANNUAL/TOTAL limit periods
+           different behaviors for MONTH/QUARTERLY/ANNUAL/TOTAL limit periods
         5. USAGE billing: Handled separately in update_invoice_when_usage_is_reported
 
         For LIMIT billing with TOTAL period, charges are only created during
@@ -189,6 +192,22 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
                         continue
                     else:
                         continue
+
+                # For quarterly components, only process billing in quarterly months
+                if offering_component.limit_period == LimitPeriods.QUARTERLY:
+                    if not self.should_process_quarterly_billing(start):
+                        # Skip quarterly billing in non-quarterly months
+                        continue
+                    # Use quarterly billing period instead of monthly
+                    quarterly_start, quarterly_end = self.get_quarterly_billing_period(
+                        start
+                    )
+                    self.create_component_item(
+                        source, plan_component, invoice, quarterly_start, quarterly_end
+                    )
+                    continue
+
+                # Process monthly, annual, and other limit periods normally
                 self.create_component_item(source, plan_component, invoice, start, end)
                 continue
 
@@ -333,7 +352,7 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
         Create invoice item for limit-based components.
 
         Creates invoice items for components with LIMIT billing type based on
-        resource limits. Handles different limit periods (MONTH, ANNUAL, TOTAL)
+        resource limits. Handles different limit periods (MONTH, QUARTERLY, ANNUAL, TOTAL)
         and calculates appropriate quantities and units.
 
         For TOTAL limit period, uses QUANTITY unit instead of plan unit.
@@ -354,15 +373,33 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
                 source,
             )
             return
+
+        # Additional safeguard: TOTAL period components should only be billed once
+        # This prevents the bug where TOTAL components get billed multiple times
+        if (
+            offering_component.billing_type == BillingTypes.LIMIT
+            and offering_component.limit_period == LimitPeriods.TOTAL
+        ):
+            # Check if this component has already been billed for this resource
+            existing_items = invoice_models.InvoiceItem.objects.filter(
+                resource=source,
+                details__offering_component_type=offering_component.type,
+            )
+            if existing_items.exists():
+                logger.warning(
+                    "Prevented duplicate billing: TOTAL period component %s on resource %s "
+                    "already has existing invoice items. TOTAL components should only be billed once.",
+                    offering_component.type,
+                    source.id,
+                )
+                return
         limit = source.limits.get(offering_component.type, 0)
         if not limit or limit == -1:
             return
         details = cls.get_component_details(source, plan_component)
         quantity = cls.convert_quantity(limit, offering_component.type)
         details["resource_limit_periods"] = [
-            utils.serialize_resource_limit_period(
-                {"start": start, "end": end, "quantity": quantity}
-            )
+            utils.serialize_resource_limit_period(start, end, quantity)
         ]
         total_quantity = cls.get_total_quantity(
             plan_component.plan.unit, quantity, start, end
@@ -407,9 +444,13 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
             invoice: Invoice containing the item to update
             new_quantity: New limit quantity
         """
+        if not source.plan:
+            return
+
         invoice_item = invoice_models.InvoiceItem.objects.get(
             resource=source,
             details__offering_component_type=component_type,
+            details__plan_uuid=str(source.plan.uuid),
             invoice=invoice,
             unit_price__gte=0,  # exclude compensation items
         )
@@ -429,14 +470,16 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
             new_start = today.replace(hour=0, minute=0, second=0)
             old_end = new_start - timedelta(seconds=1)
         old_period = utils.serialize_resource_limit_period(
-            {"start": old_start, "end": old_end, "quantity": old_quantity}
+            old_start, old_end, old_quantity
         )
+        # Get the offering component to determine appropriate period end
+        offering_component = source.offering.components.get(type=component_type)
+        period_end = cls.get_period_end_for_limit_period(
+            offering_component.limit_period
+        )
+
         new_period = utils.serialize_resource_limit_period(
-            {
-                "start": new_start,
-                "end": get_current_month_end(),
-                "quantity": new_quantity,
-            }
+            new_start, period_end, new_quantity
         )
         resource_limit_periods.extend([old_period, new_period])
         plan_component = source.plan.components.get(component__type=component_type)
@@ -488,11 +531,25 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
             cls.update_component_item(source, component_type, invoice, quantity)
         else:
             start = timezone.now()
-            end = get_current_month_end()
             try:
                 plan_component = source.plan.components.get(
                     component__type=component_type
                 )
+                # Get the offering component to determine appropriate period end
+                offering_component = plan_component.component
+
+                # Handle quarterly components with proper billing periods
+                if offering_component.limit_period == LimitPeriods.QUARTERLY:
+                    quarterly_start, quarterly_end = cls.get_quarterly_billing_period(
+                        start
+                    )
+                    end = quarterly_end
+                    start = quarterly_start
+                else:
+                    end = cls.get_period_end_for_limit_period(
+                        offering_component.limit_period
+                    )
+
             except ObjectDoesNotExist:
                 logger.warning(
                     "Skipping processing of invoice item %s because "
@@ -566,7 +623,7 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
 
         For limit changes, handles different limit periods:
         - TOTAL: Creates one-time charges for total limit increases
-        - MONTH/ANNUAL: Updates recurring charges for limit changes
+        - MONTH/QUARTERLY/ANNUAL: Updates recurring charges for limit changes
 
         Args:
             sender: Signal sender (model class)
@@ -669,14 +726,24 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
         """
         if resource.state != ResourceStates.OK:
             return
+        if not resource.plan:
+            return
         related_invoice_items = invoice_models.InvoiceItem.objects.filter(
             resource=resource,
             details__offering_component_type=component_type,
         )
         if not related_invoice_items.exists():
-            cls.create_or_update_component_item(
-                resource, invoice, component_type, new_quantity
+            # For TOTAL period components, if no previous billing exists,
+            # this is likely due to missing CREATE order billing.
+            # In this case, bill the full amount to recover proper billing state.
+            logger.info(
+                "No existing invoice items found for TOTAL period component %s "
+                "on resource %s. Billing full amount (%s) to recover from missing CREATE billing.",
+                component_type,
+                resource.id,
+                new_quantity,
             )
+            total = 0  # Start from 0 since no previous billing exists
         else:
             total = 0
             for invoice_item in related_invoice_items:
@@ -684,30 +751,28 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
                     total -= invoice_item.quantity
                 else:
                     total += invoice_item.quantity
-            diff = new_quantity - total
-            if diff == 0:
-                return
-            plan_component = resource.plan.components.get(
-                component__type=component_type
-            )
-            details = cls.get_component_details(resource, plan_component)
-            start = timezone.now()
-            end = get_current_month_end()
-            invoice_models.InvoiceItem.objects.create(
-                name=f"{RegistrationManager.get_name(resource)} / {cls.get_component_name(plan_component)}",
-                resource=resource,
-                project=resource.project,
-                unit_price=plan_component.price if diff > 0 else -plan_component.price,
-                unit=invoice_models.Units.QUANTITY,
-                quantity=diff if diff > 0 else -diff,
-                article_code=offering_component.article_code
-                or resource.plan.article_code,
-                invoice=invoice,
-                start=start,
-                end=end,
-                details=details,
-                measured_unit=offering_component.measured_unit,
-            )
+
+        diff = new_quantity - total
+        if diff == 0:
+            return
+        plan_component = resource.plan.components.get(component__type=component_type)
+        details = cls.get_component_details(resource, plan_component)
+        start = timezone.now()
+        end = cls.get_period_end_for_limit_period(offering_component.limit_period)
+        invoice_models.InvoiceItem.objects.create(
+            name=f"{RegistrationManager.get_name(resource)} / {cls.get_component_name(plan_component)}",
+            resource=resource,
+            project=resource.project,
+            unit_price=plan_component.price if diff > 0 else -plan_component.price,
+            unit=invoice_models.Units.QUANTITY,
+            quantity=diff if diff > 0 else -diff,
+            article_code=offering_component.article_code or resource.plan.article_code,
+            invoice=invoice,
+            start=start,
+            end=end,
+            details=details,
+            measured_unit=offering_component.measured_unit,
+        )
 
     @classmethod
     def update_invoice_when_usage_is_reported(
@@ -831,6 +896,56 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
                 component_usage,
                 invoice_item.quantity,
             )
+
+    @classmethod
+    def get_period_end_for_limit_period(cls, limit_period):
+        """
+        Get appropriate period end based on limit period.
+
+        Args:
+            limit_period: The limit period (MONTH, QUARTERLY, ANNUAL, TOTAL)
+
+        Returns:
+            Period end datetime for the given limit period
+        """
+        if limit_period == LimitPeriods.QUARTERLY:
+            return core_utils.get_current_quarter_end()
+        else:
+            # Default to monthly for MONTH, ANNUAL, and TOTAL
+            # ANNUAL and TOTAL periods still use monthly billing boundaries
+            # but track usage over longer periods
+            return get_current_month_end()
+
+    @classmethod
+    def should_process_quarterly_billing(cls, date):
+        """
+        Check if quarterly billing should be processed for the given date.
+
+        Quarterly billing should only happen in the first month of each quarter:
+        - January (Q1), April (Q2), July (Q3), October (Q4)
+
+        Args:
+            date: Date to check (datetime object)
+
+        Returns:
+            bool: True if quarterly billing should be processed
+        """
+        return date.month in [1, 4, 7, 10]
+
+    @classmethod
+    def get_quarterly_billing_period(cls, date):
+        """
+        Get the quarterly billing period for the given date.
+
+        Args:
+            date: Date within the quarter (datetime object)
+
+        Returns:
+            tuple: (quarter_start, quarter_end) datetime objects
+        """
+        quarter_start = core_utils.get_quarter_start(date)
+        quarter_end = core_utils.get_quarter_end(date)
+        return quarter_start, quarter_end
 
     @classmethod
     def convert_quantity(cls, usage, component_type: str):

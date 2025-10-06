@@ -1,8 +1,10 @@
 import datetime
+from decimal import Decimal
 from unittest import mock
 from urllib.parse import urlencode
 
 from ddt import data, ddt
+from django.core.exceptions import ValidationError
 from django.db import DEFAULT_DB_ALIAS, connections
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
@@ -10,6 +12,8 @@ from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
 
+from waldur_core.checklist.enums import ChecklistTypes
+from waldur_core.checklist.tests import factories as checklist_factories
 from waldur_core.core.pagination import RESULT_COUNT_HEADER
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.permissions.enums import PermissionEnum
@@ -236,9 +240,7 @@ class BaseCustomerMutationTest(CustomerBaseTest):
     def setUp(self):
         super().setUp()
         self.fixture = fixtures.ProjectFixture()
-        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_CUSTOMER)
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_CUSTOMER)
-        CustomerRole.OWNER.add_permission(PermissionEnum.DELETE_CUSTOMER)
 
     # Helper methods
     def _get_valid_payload(self, resource=None):
@@ -396,30 +398,152 @@ class CustomerUpdateTest(BaseCustomerMutationTest):
         self.fixture.customer.refresh_from_db()
         self.assertEqual(self.fixture.customer.domain, "")
 
-    @mock.patch("waldur_core.structure.serializers.pyvat")
-    def test_update_vat_code(self, mock_pyvat):
+    def test_update_vat_code_with_valid_format(self):
         self.client.force_authenticate(user=self.fixture.staff)
 
-        class CheckResult:
-            def __init__(self):
-                self.business_name = ""
-                self.business_address = ""
-                self.is_valid = True
-                self.log_lines = []
-
-        check_result = CheckResult()
-        mock_pyvat.check_vat_number.return_value = check_result
-
+        # Test with valid Austrian VAT number format
         response = self.client.patch(
-            self._get_customer_url(self.fixture.customer), {"vat_code": "ATU99999999"}
+            self._get_customer_url(self.fixture.customer),
+            {"vat_code": "ATU99999999", "country": "AT"},
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.fixture.customer.refresh_from_db()
         self.assertEqual(self.fixture.customer.vat_code, "ATU99999999")
-        mock_pyvat.is_vat_number_format_valid.assert_called_once_with(
-            "ATU99999999", None
+
+    def test_update_vat_code_with_invalid_format(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        # Test with invalid VAT number format
+        response = self.client.patch(
+            self._get_customer_url(self.fixture.customer),
+            {"vat_code": "INVALID123", "country": "AT"},
         )
-        mock_pyvat.check_vat_number.assert_called_once_with("ATU99999999", None)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("vat_code", response.data)
+
+    def test_update_vat_code_comprehensive_validation(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        # Test various European VAT formats
+        test_cases = [
+            # Valid cases
+            ("BE0123456789", "BE", True),
+            ("DE123456789", "DE", True),
+            ("FR1A123456789", "FR", True),
+            ("NO123456789MVA", "NO", True),
+            ("CHE123456789MWST", "CH", True),
+            # Invalid cases should fail
+            ("BE2123456789", "BE", False),  # Invalid first digit for Belgium
+            ("DE12345678", "DE", False),  # Too short for Germany
+            ("NO123456789", "NO", False),  # Missing MVA suffix for Norway
+        ]
+
+        for vat_code, country, should_succeed in test_cases:
+            response = self.client.patch(
+                self._get_customer_url(self.fixture.customer),
+                {"vat_code": vat_code, "country": country},
+            )
+
+            if should_succeed:
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_200_OK,
+                    f"VAT {vat_code} for {country} should be valid",
+                )
+                self.fixture.customer.refresh_from_db()
+                self.assertEqual(self.fixture.customer.vat_code, vat_code)
+            else:
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_400_BAD_REQUEST,
+                    f"VAT {vat_code} for {country} should be invalid",
+                )
+                self.assertIn("vat_code", response.data)
+
+    def test_staff_can_assign_project_metadata_checklist(self):
+        """Test that staff users can assign a project metadata checklist to a customer."""
+        # Create a PROJECT_METADATA checklist
+        checklist = checklist_factories.ChecklistFactory(
+            name="Project Metadata Checklist",
+            checklist_type=ChecklistTypes.PROJECT_METADATA,
+        )
+
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.patch(
+            self._get_customer_url(self.fixture.customer),
+            {"project_metadata_checklist": str(checklist.uuid)},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.fixture.customer.refresh_from_db()
+        self.assertEqual(self.fixture.customer.project_metadata_checklist, checklist)
+
+    def test_staff_can_unset_project_metadata_checklist(self):
+        """Test that staff users can unset a project metadata checklist."""
+        # Set up customer with a checklist
+        checklist = checklist_factories.ChecklistFactory(
+            checklist_type=ChecklistTypes.PROJECT_METADATA
+        )
+        self.fixture.customer.project_metadata_checklist = checklist
+        self.fixture.customer.save()
+
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.patch(
+            self._get_customer_url(self.fixture.customer),
+            {"project_metadata_checklist": None},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.fixture.customer.refresh_from_db()
+        self.assertIsNone(self.fixture.customer.project_metadata_checklist)
+
+    def test_non_staff_cannot_assign_project_metadata_checklist(self):
+        """Test that non-staff users cannot assign project metadata checklists."""
+        checklist = checklist_factories.ChecklistFactory(
+            checklist_type=ChecklistTypes.PROJECT_METADATA
+        )
+
+        self.client.force_authenticate(user=self.fixture.owner)
+        response = self.client.patch(
+            self._get_customer_url(self.fixture.customer),
+            {"project_metadata_checklist": str(checklist.uuid)},
+        )
+
+        # Should succeed but field should be read-only (ignored)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.fixture.customer.refresh_from_db()
+        self.assertIsNone(self.fixture.customer.project_metadata_checklist)
+
+    def test_invalid_checklist_type_rejected(self):
+        """Test that non-PROJECT_METADATA checklists are rejected."""
+        # Create a different type of checklist
+        wrong_checklist = checklist_factories.ChecklistFactory(
+            checklist_type=ChecklistTypes.PROPOSAL_COMPLIANCE
+        )
+
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.patch(
+            self._get_customer_url(self.fixture.customer),
+            {"project_metadata_checklist": str(wrong_checklist.uuid)},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("project_metadata_checklist", response.data)
+
+    def test_nonexistent_checklist_rejected(self):
+        """Test that invalid checklist UUIDs are rejected."""
+        import uuid
+
+        fake_uuid = str(uuid.uuid4())
+
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.patch(
+            self._get_customer_url(self.fixture.customer),
+            {"project_metadata_checklist": fake_uuid},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("project_metadata_checklist", response.data)
 
 
 class CustomerQuotasTest(test.APITransactionTestCase):
@@ -552,7 +676,7 @@ class CustomerUsersListTest(test.APITransactionTestCase):
     def test_user_can_not_list_project_users(self):
         self.client.force_authenticate(self.fixture.user)
         response = self.client.get(self.url)
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_users_ordering_by_concatenated_name(self):
         walter = factories.UserFactory(full_name="", username="walter")
@@ -781,10 +905,10 @@ class CustomerBlockedTest(CustomerBaseTest):
     def setUp(self):
         super().setUp()
         self.user = factories.UserFactory()
+        self.staff = factories.UserFactory(is_staff=True)
         self.customer = factories.CustomerFactory(blocked=True)
         self.customer.add_user(self.user, CustomerRole.OWNER)
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_CUSTOMER_PERMISSION)
-        CustomerRole.OWNER.add_permission(PermissionEnum.DELETE_CUSTOMER)
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_CUSTOMER)
 
     def test_blocked_organization_is_not_available_for_updating(self):
@@ -795,6 +919,11 @@ class CustomerBlockedTest(CustomerBaseTest):
 
     def test_blocked_organization_is_not_available_for_deleting(self):
         self.client.force_authenticate(user=self.user)
+        url = factories.CustomerFactory.get_url(customer=self.customer)
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(user=self.staff)
         url = factories.CustomerFactory.get_url(customer=self.customer)
         response = self.client.delete(url)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -1199,3 +1328,244 @@ class CustomerListHeadOptimizationTest(test.APITransactionTestCase):
 
         self.assertEqual(first_pass_queryset_size, 3)
         self.assertEqual(second_pass_queryset_size, 6)
+
+
+class CustomerDefaultTaxPercentValidationTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.customer = factories.CustomerFactory()
+        self.staff = factories.UserFactory(is_staff=True)
+
+    def test_valid_tax_percent_decimal_values(self):
+        """Test that valid Decimal values are accepted."""
+        valid_values = [
+            Decimal("0"),
+            Decimal("0.00"),
+            Decimal("10.50"),
+            Decimal("25.75"),
+            Decimal("100.00"),
+            Decimal("200.00"),
+        ]
+
+        for value in valid_values:
+            self.customer.default_tax_percent = value
+            try:
+                self.customer.full_clean()
+            except ValidationError:
+                self.fail(f"Valid value {value} should not raise ValidationError")
+
+    def test_tax_percent_minimum_value_validation(self):
+        """Test that values below 0 are rejected."""
+        invalid_values = [
+            Decimal("-0.01"),
+            Decimal("-1.00"),
+            Decimal("-10.50"),
+        ]
+
+        for value in invalid_values:
+            self.customer.default_tax_percent = value
+            with self.assertRaises(ValidationError) as context:
+                self.customer.full_clean()
+            self.assertIn("default_tax_percent", str(context.exception))
+
+    def test_tax_percent_maximum_value_validation(self):
+        """Test that values above 200 are rejected."""
+        invalid_values = [
+            Decimal("200.01"),
+            Decimal("250.00"),
+            Decimal("999.99"),
+        ]
+
+        for value in invalid_values:
+            self.customer.default_tax_percent = value
+            with self.assertRaises(ValidationError) as context:
+                self.customer.full_clean()
+            self.assertIn("default_tax_percent", str(context.exception))
+
+    def test_tax_percent_boundary_values(self):
+        """Test boundary values are handled correctly."""
+        # Test exact boundary values
+        boundary_values = [
+            Decimal("0.00"),  # Minimum allowed
+            Decimal("200.00"),  # Maximum allowed
+        ]
+
+        for value in boundary_values:
+            self.customer.default_tax_percent = value
+            try:
+                self.customer.full_clean()
+            except ValidationError:
+                self.fail(f"Boundary value {value} should not raise ValidationError")
+
+    def test_tax_percent_precision_validation(self):
+        """Test that the field handles decimal precision correctly."""
+        # Test with 2 decimal places (should work)
+        self.customer.default_tax_percent = Decimal("15.99")
+        try:
+            self.customer.full_clean()
+        except ValidationError:
+            self.fail("Value with 2 decimal places should be valid")
+
+    def test_tax_percent_api_validation(self):
+        """Test validation through the API."""
+        self.client.force_authenticate(user=self.staff)
+        url = factories.CustomerFactory.get_url(self.customer)
+
+        # Test valid value
+        response = self.client.patch(url, {"default_tax_percent": "15.50"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Test invalid value (below minimum)
+        response = self.client.patch(url, {"default_tax_percent": "-1.00"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("default_tax_percent", response.data)
+
+        # Test invalid value (above maximum)
+        response = self.client.patch(url, {"default_tax_percent": "250.00"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("default_tax_percent", response.data)
+
+    def test_tax_percent_default_value(self):
+        """Test that the default value is correctly set."""
+        new_customer = factories.CustomerFactory()
+        self.assertEqual(new_customer.default_tax_percent, Decimal("0"))
+
+    def test_tax_percent_string_conversion(self):
+        """Test that string values are properly converted to Decimal."""
+        self.customer.default_tax_percent = "25.50"
+        self.customer.save()
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.default_tax_percent, Decimal("25.50"))
+        self.assertIsInstance(self.customer.default_tax_percent, Decimal)
+
+
+class CustomerDescriptionTest(BaseCustomerMutationTest):
+    """Test cases for the Customer description field functionality."""
+
+    def test_customer_has_description_field(self):
+        """Test that Customer model has description field from DescribableMixin."""
+        customer = factories.CustomerFactory(description="Test description")
+        self.assertEqual(customer.description, "Test description")
+
+    def test_description_field_in_serializer(self):
+        """Test that description field is exposed in the serializer."""
+        customer = factories.CustomerFactory(
+            description="Test organization description"
+        )
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        url = self._get_customer_url(customer)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("description", response.data)
+        self.assertEqual(response.data["description"], "Test organization description")
+
+    def test_create_customer_with_description(self):
+        """Test creating a customer with description field."""
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        payload = self._get_valid_payload()
+        payload["description"] = "New customer with description"
+
+        response = self.client.post(factories.CustomerFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["description"], "New customer with description")
+
+        # Verify in database
+        customer = Customer.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(customer.description, "New customer with description")
+
+    def test_update_customer_description(self):
+        """Test updating a customer's description field."""
+        customer = factories.CustomerFactory(description="Original description")
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        url = self._get_customer_url(customer)
+        response = self.client.patch(url, {"description": "Updated description"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["description"], "Updated description")
+
+        # Verify in database
+        customer.refresh_from_db()
+        self.assertEqual(customer.description, "Updated description")
+
+    def test_description_field_ordering(self):
+        """Test that customers can be ordered by description field."""
+        # Create customers with distinct descriptions
+        customer_a = factories.CustomerFactory(
+            name="Customer A", description="Alpha description"
+        )
+        customer_b = factories.CustomerFactory(
+            name="Customer B", description="Beta description"
+        )
+        customer_c = factories.CustomerFactory(
+            name="Customer C", description="Charlie description"
+        )
+
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        # Test that ordering by description doesn't cause errors
+        response = self.client.get(
+            f"{factories.CustomerFactory.get_list_url()}?ordering=description"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Verify all customers have description field in response
+        test_customer_uuids = {
+            str(customer_a.uuid),
+            str(customer_b.uuid),
+            str(customer_c.uuid),
+        }
+        test_customers = [
+            customer
+            for customer in response.data
+            if customer["uuid"] in test_customer_uuids
+        ]
+
+        # Ensure all our test customers are present with description field
+        self.assertEqual(len(test_customers), 3)
+        for customer in test_customers:
+            self.assertIn("description", customer)
+            self.assertIn(
+                customer["description"],
+                ["Alpha description", "Beta description", "Charlie description"],
+            )
+
+        # Test descending order also works without error
+        response = self.client.get(
+            f"{factories.CustomerFactory.get_list_url()}?ordering=-description"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_description_field_blank_allowed(self):
+        """Test that description field can be blank."""
+        customer = factories.CustomerFactory(description="")
+        self.assertEqual(customer.description, "")
+
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        # Test creating customer with empty description
+        payload = self._get_valid_payload()
+        payload["description"] = ""
+
+        response = self.client.post(factories.CustomerFactory.get_list_url(), payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["description"], "")
+
+    def test_description_max_length(self):
+        """Test that description field respects maximum length from DescribableMixin."""
+        from waldur_core.core.models import DESCRIPTION_LENGTH
+
+        # Test within limit
+        valid_description = "A" * DESCRIPTION_LENGTH
+        customer = factories.CustomerFactory(description=valid_description)
+        customer.full_clean()  # Should not raise
+
+        # Test exceeding limit
+        invalid_description = "A" * (DESCRIPTION_LENGTH + 1)
+        customer = factories.CustomerFactory.build(description=invalid_description)
+
+        with self.assertRaises(ValidationError):
+            customer.full_clean()

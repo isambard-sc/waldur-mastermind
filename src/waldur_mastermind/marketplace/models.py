@@ -6,6 +6,7 @@ from typing import Any, Literal, cast
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models
+from django.db.models import Index
 from django.db.models.constraints import UniqueConstraint
 from django.utils import timezone
 from django.utils.functional import cached_property
@@ -26,7 +27,7 @@ from waldur_core.core import validators as core_validators
 from waldur_core.core.models import User
 from waldur_core.logging.mixins import LoggableMixin
 from waldur_core.media.mixins import get_upload_path
-from waldur_core.media.validators import ImageValidator
+from waldur_core.media.validators import FileTypeValidator, ImageValidator
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.mixins import PermissionMixin
 from waldur_core.permissions.utils import get_users
@@ -37,17 +38,21 @@ from waldur_core.structure.mixins import CoordinatesMixin
 from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     CategoryColumnWidget,
+    CourseAccountState,
     ImpactLevel,
     LimitPeriods,
     MaintenanceState,
     MaintenanceType,
     OfferingStates,
+    OfferingUserStates,
     OrderStates,
-    RequestTypes,
+    OrderTypes,
     ResourceStates,
     RobotAccountStates,
+    ServiceAccountState,
 )
 from waldur_mastermind.marketplace.exceptions import PolicyException
+from waldur_mastermind.notifications import models as notifications_models
 from waldur_pid import mixins as pid_mixins
 
 from ..common import mixins as common_mixins
@@ -514,6 +519,8 @@ class Offering(
     files: models.Manager["OfferingFile"]
     endpoints: models.Manager["OfferingAccessEndpoint"]
     roles: models.Manager["OfferingUserRole"]
+    user_consents: models.Manager["UserOfferingConsent"]
+    terms_of_service_configs: models.Manager["OfferingTermsOfService"]
     get_state_display: Callable[[], Literal["Draft", "Active", "Paused", "Archived"]]
 
     class States(OfferingStates):
@@ -532,6 +539,15 @@ class Offering(
     integration_guide = models.TextField(blank=True)
     category = models.ForeignKey(
         on_delete=models.CASCADE, to=Category, related_name="offerings"
+    )
+    compliance_checklist = models.ForeignKey(
+        to="checklist.Checklist",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="offerings",
+        limit_choices_to={"checklist_type": "offering_compliance"},
+        help_text=_("Checklist that offering users must complete for compliance"),
     )
     customer = models.ForeignKey(
         on_delete=models.CASCADE,
@@ -582,11 +598,8 @@ class Offering(
         ),
     )
 
-    terms_of_service = models.TextField(blank=True)
-    terms_of_service_link = models.URLField(blank=True)
     privacy_policy_link = models.URLField(blank=True)
     country = models.CharField(max_length=2, blank=True)
-
     type = models.CharField(max_length=100)
     state = FSMIntegerField(default=States.DRAFT, choices=States.CHOICES)
     paused_reason = models.TextField(blank=True)
@@ -622,6 +635,10 @@ class Offering(
     class Meta:
         verbose_name = _("Offering")
         ordering = ["name"]
+        indexes = [
+            Index(fields=["customer", "state"], name="mp_offering_customer_state_idx"),
+            Index(fields=["name"], name="mp_offering_name_idx"),
+        ]
 
     class Quotas(quotas_models.QuotaModelMixin.Quotas):
         order_count = quotas_fields.CounterQuotaField(
@@ -718,6 +735,107 @@ class Offering(
     def get_permitted_objects(cls, user):
         return cls.objects.all().filter_for_user(user)
 
+    def update_terms_of_service(
+        self, new_terms, new_version=None, requires_reconsent=False
+    ):
+        """Update terms of service for the offering."""
+        tos_config, created = self.terms_of_service_configs.update_or_create(
+            is_active=True,
+            defaults={
+                "terms_of_service": new_terms,
+                "version": new_version or "",
+                "requires_reconsent": requires_reconsent,
+            },
+        )
+
+    def has_terms_of_service(self):
+        """Check if the offering has terms of service."""
+        return self.terms_of_service_configs.filter(is_active=True).exists()
+
+    def get_active_consents(self):
+        """Get all active consents for this offering."""
+        return self.user_consents.filter(revocation_date__isnull=True)
+
+    def check_user_consent(self, user):
+        """Check if a user has active consent for this offering."""
+        try:
+            consent = self.user_consents.get(user=user, revocation_date__isnull=True)
+            return consent
+        except UserOfferingConsent.DoesNotExist:
+            return None
+
+
+class UserOfferingConsent(TimeStampedModel, core_models.UuidMixin, LoggableMixin):
+    """
+    User consent to Terms of Service for specific offerings
+
+    Tracks user consent to offering terms of service. Provides
+    comprehensive consent tracking for legal compliance and user transparency.
+    """
+
+    user = models.ForeignKey(
+        core_models.User, on_delete=models.CASCADE, related_name="offering_consents"
+    )
+    offering = models.ForeignKey(
+        Offering, on_delete=models.CASCADE, related_name="user_consents"
+    )
+    agreement_date = models.DateTimeField(auto_now_add=True)
+    version = models.CharField(max_length=50, blank=True)
+    revocation_date = models.DateTimeField(null=True, blank=True)
+    tracker = cast(
+        FieldInstanceTracker, FieldTracker(fields=["revocation_date", "version"])
+    )
+
+    class Meta:
+        unique_together = (
+            "user",
+            "offering",
+        )
+        verbose_name = _("User offering consent")
+
+    def get_log_fields(self):
+        return ("uuid", "version", "agreement_date", "revocation_date")
+
+    def __str__(self):
+        return f"{self.user.username} - {self.offering.name}"
+
+    @classmethod
+    def get_url_name(cls):
+        return "marketplace-user-offering-consent"
+
+    def revoke(self):
+        self.revocation_date = timezone.now()
+        self.save()
+
+    @property
+    def is_revoked(self):
+        """Check if the consent has been revoked."""
+        return self.revocation_date is not None
+
+
+class OfferingTermsOfService(TimeStampedModel, core_models.UuidMixin):
+    offering = models.ForeignKey(
+        Offering, on_delete=models.CASCADE, related_name="terms_of_service_configs"
+    )
+    terms_of_service = models.TextField(blank=True)
+    terms_of_service_link = models.URLField(blank=True)
+    version = models.CharField(max_length=50, blank=True)
+    is_active = models.BooleanField(default=False)
+    requires_reconsent = models.BooleanField(
+        default=False,
+        help_text="If True, user will be asked to re-consent to the terms of service when the terms of service are updated.",
+    )
+
+    class Meta:
+        ordering = ["-created"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["offering"],
+                condition=models.Q(is_active=True),
+                name="unique_active_terms_per_offering",
+            )
+        ]
+
 
 class OfferingComponent(
     core_models.UuidMixin,
@@ -752,7 +870,7 @@ class OfferingComponent(
     )
     # limit_period and limit_amount fields are used if billing_type is USAGE or LIMIT
     limit_period = models.CharField(
-        choices=LimitPeriods.CHOICES, blank=True, null=True, max_length=6
+        choices=LimitPeriods.CHOICES, blank=True, null=True, max_length=10
     )
     limit_amount = models.IntegerField(blank=True, null=True)
     # unit_factor is for metadata only and is not involved in any computations in Mastermind
@@ -778,6 +896,21 @@ class OfferingComponent(
 
         if self.limit_period == LimitPeriods.MONTH:
             usages = usages.filter(date=core_utils.month_start(date))
+        elif self.limit_period == LimitPeriods.QUARTERLY:
+            # Convert date to datetime for quarter calculations
+            if isinstance(date, timezone.datetime):
+                datetime_obj = date
+            else:
+                datetime_obj = timezone.datetime.combine(
+                    date, timezone.datetime.min.time()
+                )
+                datetime_obj = timezone.make_aware(datetime_obj)
+
+            quarter_start = core_utils.get_quarter_start(datetime_obj)
+            quarter_end = core_utils.get_quarter_end(datetime_obj)
+            usages = usages.filter(
+                date__gte=quarter_start.date(), date__lte=quarter_end.date()
+            )
         elif self.limit_period == LimitPeriods.ANNUAL:
             usages = usages.filter(date__year=date.year)
 
@@ -1042,46 +1175,6 @@ class CostEstimateMixin(models.Model):
             self.error_message = "Policy is violated."
 
 
-class RequestTypeMixin(CostEstimateMixin):
-    """
-    Mixin for request type handling.
-
-    Extends CostEstimateMixin with request type-specific cost calculation
-    for different operation types (CREATE, UPDATE, etc.). Provides
-    pricing logic based on request type and plan switching.
-    """
-
-    class Types(RequestTypes):
-        pass
-
-    type = models.PositiveSmallIntegerField(choices=Types.CHOICES, default=Types.CREATE)
-
-    class Meta:
-        abstract = True
-
-    def init_cost(self):
-        super().init_cost()
-        if self.plan:
-            if self.type == RequestTypeMixin.Types.CREATE:
-                self.cost += self.plan.init_price
-            elif self.type == RequestTypeMixin.Types.UPDATE:
-                self.cost += self.plan.switch_price
-
-    @property
-    def fixed_price(self) -> float:
-        if self.type == RequestTypeMixin.Types.CREATE:
-            return self.plan.fixed_price
-        return 0
-
-    @property
-    def activation_price(self) -> float:
-        if self.type == RequestTypeMixin.Types.CREATE:
-            return self.plan.init_price
-        elif self.type == RequestTypeMixin.Types.UPDATE:
-            return self.plan.switch_price
-        return 0
-
-
 class SafeAttributesMixin(models.Model):
     """
     Mixin for safe attribute handling.
@@ -1178,6 +1271,7 @@ class Resource(
     marketplace resource model as a primary mean.
     """
 
+    id: int
     children: models.Manager["Resource"]
     quotas: models.Manager["ComponentQuota"]
     usages: models.Manager["ComponentUsage"]
@@ -1196,6 +1290,10 @@ class Resource(
     class Meta:
         ordering = ["created"]
         unique_together = ("content_type", "object_id")
+        indexes = [
+            Index(fields=["offering", "state"], name="mp_resource_offering_state_idx"),
+            Index(fields=["project", "state"], name="mp_resource_project_state_idx"),
+        ]
 
     state = FSMIntegerField(default=States.CREATING, choices=States.CHOICES)
     project = models.ForeignKey(structure_models.Project, on_delete=models.CASCADE)
@@ -1325,7 +1423,7 @@ class Resource(
 
     @property
     def creation_order(self) -> "Order | None":
-        return Order.objects.filter(resource=self, type=Order.Types.CREATE).first()
+        return Order.objects.filter(resource=self, type=OrderTypes.CREATE).first()
 
     @property
     def order_in_progress(self):
@@ -1373,7 +1471,7 @@ class Order(
     core_models.UuidMixin,
     core_models.BackendMixin,
     core_models.ErrorMessageMixin,
-    RequestTypeMixin,
+    CostEstimateMixin,
     structure_models.StructureLoggableMixin,
     SafeAttributesMixin,
     TimeStampedModel,
@@ -1385,6 +1483,10 @@ class Order(
     and review tracking by consumers and providers. Supports different
     order types and comprehensive order management.
     """
+
+    type = models.PositiveSmallIntegerField(
+        choices=OrderTypes.CHOICES, default=OrderTypes.CREATE
+    )
 
     old_plan = models.ForeignKey(
         on_delete=models.CASCADE, to=Plan, related_name="+", null=True, blank=True
@@ -1423,6 +1525,14 @@ class Order(
     completed_at = models.DateTimeField(
         _("completion time"), null=True, blank=True, editable=False
     )
+
+    request_comment = models.CharField(blank=True, null=True, max_length=255)
+    attachment = models.FileField(
+        upload_to="marketplace_order_attachments",
+        blank=True,
+        null=True,
+        validators=[FileTypeValidator(allowed_types=["application/pdf"])],
+    )
     get_type_display: Callable[[], str]
 
     class Permissions:
@@ -1433,6 +1543,31 @@ class Order(
     class Meta:
         verbose_name = _("Order")
         ordering = ("created",)
+        indexes = [
+            Index(fields=["state", "-created"], name="mp_order_state_created_idx"),
+        ]
+
+    def init_cost(self):
+        super().init_cost()
+        if self.plan:
+            if self.type == OrderTypes.CREATE:
+                self.cost += self.plan.init_price
+            elif self.type == OrderTypes.UPDATE:
+                self.cost += self.plan.switch_price
+
+    @property
+    def fixed_price(self) -> float:
+        if self.type == OrderTypes.CREATE:
+            return self.plan.fixed_price
+        return 0
+
+    @property
+    def activation_price(self) -> float:
+        if self.type == OrderTypes.CREATE:
+            return self.plan.init_price
+        elif self.type == OrderTypes.UPDATE:
+            return self.plan.switch_price
+        return 0
 
     @classmethod
     def get_url_name(cls):
@@ -1593,6 +1728,9 @@ class ComponentUsage(
                 name="unique_without_optional",
             ),
         ]
+        indexes = [
+            Index(fields=["resource", "-date"], name="mp_compusage_resource_date_idx"),
+        ]
 
     def __str__(self):
         return f"resource: {self.resource.name}, component: {self.component.name}"
@@ -1711,14 +1849,177 @@ class OfferingUser(
         default=False,
         help_text=_("Signal to service if the user account is restricted or not"),
     )
-    tracker = cast(FieldInstanceTracker, FieldTracker())
+    state = FSMIntegerField(
+        default=OfferingUserStates.CREATION_REQUESTED,
+        choices=OfferingUserStates.CHOICES,
+    )
+    service_provider_comment = models.TextField(
+        blank=True,
+        help_text=_(
+            "Additional comment for pending states like validation or account linking"
+        ),
+    )
+    service_provider_comment_url = models.URLField(
+        blank=True,
+        help_text=_(
+            "URL link for additional information or actions related to service provider comment"
+        ),
+    )
+    tracker = cast(
+        FieldInstanceTracker,
+        FieldTracker(
+            fields=[
+                "username",
+                "state",
+                "is_restricted",
+                "service_provider_comment",
+                "service_provider_comment_url",
+            ]
+        ),
+    )
 
     class Meta:
         unique_together = ("offering", "user")
         ordering = ["username"]
+        indexes = [
+            Index(fields=["offering", "user"], name="mp_offeringuser_offer_user_idx"),
+        ]
+
+    @transition(
+        field=state,
+        source=[
+            OfferingUserStates.CREATION_REQUESTED,
+            OfferingUserStates.ERROR_CREATING,
+        ],
+        target=OfferingUserStates.CREATING,
+    )
+    def begin_creating(self):
+        pass
+
+    @transition(
+        field=state,
+        source=[
+            OfferingUserStates.CREATION_REQUESTED,
+            OfferingUserStates.CREATING,
+            OfferingUserStates.PENDING_ADDITIONAL_VALIDATION,
+            OfferingUserStates.PENDING_ACCOUNT_LINKING,
+            OfferingUserStates.ERROR_CREATING,
+            OfferingUserStates.ERROR_DELETING,
+        ],
+        target=OfferingUserStates.OK,
+    )
+    def set_ok(self):
+        pass
+
+    @transition(
+        field=state,
+        source=[OfferingUserStates.CREATING, OfferingUserStates.ERROR_CREATING],
+        target=OfferingUserStates.PENDING_ADDITIONAL_VALIDATION,
+    )
+    def set_pending_additional_validation(self, comment=None, comment_url=None):
+        if comment:
+            self.service_provider_comment = comment
+        if comment_url:
+            self.service_provider_comment_url = comment_url
+
+    @transition(
+        field=state,
+        source=[OfferingUserStates.CREATING, OfferingUserStates.ERROR_CREATING],
+        target=OfferingUserStates.PENDING_ACCOUNT_LINKING,
+    )
+    def set_pending_account_linking(self, comment=None, comment_url=None):
+        if comment:
+            self.service_provider_comment = comment
+        if comment_url:
+            self.service_provider_comment_url = comment_url
+
+    @transition(
+        field=state,
+        source=[
+            OfferingUserStates.PENDING_ADDITIONAL_VALIDATION,
+            OfferingUserStates.PENDING_ACCOUNT_LINKING,
+        ],
+        target=OfferingUserStates.OK,
+    )
+    def set_validation_complete(self):
+        self.service_provider_comment = ""  # Clear comment when validation is complete
+        self.service_provider_comment_url = (
+            ""  # Clear comment URL when validation is complete
+        )
+
+    @transition(
+        field=state,
+        source=OfferingUserStates.OK,
+        target=OfferingUserStates.DELETION_REQUESTED,
+    )
+    def request_deletion(self):
+        pass
+
+    @transition(
+        field=state,
+        source=[
+            OfferingUserStates.DELETION_REQUESTED,
+            OfferingUserStates.ERROR_DELETING,
+        ],
+        target=OfferingUserStates.DELETING,
+    )
+    def set_deleting(self):
+        pass
+
+    @transition(
+        field=state,
+        source=OfferingUserStates.DELETING,
+        target=OfferingUserStates.DELETED,
+    )
+    def set_deleted(self):
+        pass
+
+    @transition(
+        field=state,
+        source=[
+            OfferingUserStates.CREATION_REQUESTED,
+            OfferingUserStates.CREATING,
+            OfferingUserStates.PENDING_ACCOUNT_LINKING,
+            OfferingUserStates.PENDING_ADDITIONAL_VALIDATION,
+        ],
+        target=OfferingUserStates.ERROR_CREATING,
+    )
+    def set_error_creating(self):
+        pass
+
+    @transition(
+        field=state,
+        source=[OfferingUserStates.DELETION_REQUESTED, OfferingUserStates.DELETING],
+        target=OfferingUserStates.ERROR_DELETING,
+    )
+    def set_error_deleting(self):
+        pass
+
+    @transition(field=state, source="*", target=OfferingUserStates.ERROR_CREATING)
+    def set_error(self):
+        """Legacy method for backward compatibility - defaults to creation error."""
+        pass
+
+    def save(self, *args, **kwargs):
+        # Set state to OK when username is known at creation time or when changed
+        if (
+            self.username
+            and self.state != OfferingUserStates.OK
+            and (self.tracker.has_changed("username") or not self.pk)
+        ):
+            self.set_ok()
+        super().save(*args, **kwargs)
 
     def get_log_fields(self):
-        return ("offering", "user", "username", "is_restricted")
+        return (
+            "offering",
+            "user",
+            "username",
+            "is_restricted",
+            "get_state_display",
+            "service_provider_comment",
+            "service_provider_comment_url",
+        )
 
     def __str__(self) -> str:
         return f"{self.offering.name}: {self.username}"
@@ -1773,6 +2074,11 @@ class BaseServiceAccount(
 
     username = models.CharField(max_length=32, blank=True)
     description = models.TextField(blank=True)
+    state = FSMIntegerField(
+        default=ServiceAccountState.OK,
+        choices=ServiceAccountState.CHOICES,
+    )
+    get_state_display: Callable[[], Literal["OK", "Closed", "Erred"]]
 
     class Meta:
         abstract = True
@@ -1780,6 +2086,24 @@ class BaseServiceAccount(
 
     def get_log_fields(self):
         return ("username",)
+
+    @transition(
+        field=state, source=ServiceAccountState.ERRED, target=ServiceAccountState.OK
+    )
+    def set_state_ok(self):
+        pass
+
+    @transition(
+        field=state,
+        source=[ServiceAccountState.OK, ServiceAccountState.ERRED],
+        target=ServiceAccountState.CLOSED,
+    )
+    def set_state_closed(self):
+        pass
+
+    @transition(field=state, source="*", target=ServiceAccountState.ERRED)
+    def set_state_erred(self):
+        pass
 
 
 class ScopedServiceAccount(BaseServiceAccount):
@@ -1801,13 +2125,6 @@ class ScopedServiceAccount(BaseServiceAccount):
     def __str__(self):
         return f"Service account {self.username} for {self.scope}"
 
-    tracker = cast(
-        FieldInstanceTracker,
-        FieldTracker(
-            fields=["username", "email", "description", "preferred_identifier"]
-        ),
-    )
-
 
 class ProjectServiceAccount(ScopedServiceAccount):
     """
@@ -1822,6 +2139,13 @@ class ProjectServiceAccount(ScopedServiceAccount):
         to=structure_models.Project,
         null=True,
         blank=True,
+    )
+
+    tracker = cast(
+        FieldInstanceTracker,
+        FieldTracker(
+            fields=["username", "email", "description", "preferred_identifier", "state"]
+        ),
     )
 
     class Meta:
@@ -1844,6 +2168,13 @@ class CustomerServiceAccount(ScopedServiceAccount):
         to=structure_models.Customer,
         null=True,
         blank=True,
+    )
+
+    tracker = cast(
+        FieldInstanceTracker,
+        FieldTracker(
+            fields=["username", "email", "description", "preferred_identifier", "state"]
+        ),
     )
 
     class Meta:
@@ -2160,7 +2491,11 @@ reversion.register(Offering, follow=("components", "plans", "screenshots"))
 
 
 class MaintenanceAnnouncement(
-    core_models.UuidMixin, core_models.NameMixin, TimeStampedModel, LoggableMixin
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    TimeStampedModel,
+    LoggableMixin,
+    core_models.BackendMixin,
 ):
     message = models.CharField(_("message"), max_length=2000, blank=True)
     maintenance_type = models.PositiveSmallIntegerField(
@@ -2200,6 +2535,17 @@ class MaintenanceAnnouncement(
         related_name="created_maintenance_announcements",
     )
 
+    external_reference_url = models.URLField(
+        blank=True, help_text="Optional reference to an external maintenance tracker"
+    )
+    admin_announcement = models.OneToOneField(
+        notifications_models.AdminAnnouncement,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="maintenance_announcement",
+        help_text="Associated admin announcement for this maintenance",
+    )
     tracker = FieldTracker()
 
     class Meta:
@@ -2220,6 +2566,13 @@ class MaintenanceAnnouncement(
     )
     def schedule(self):
         """Publish the maintenance announcement"""
+        pass
+
+    @transition(
+        field=state, source=MaintenanceState.SCHEDULED, target=MaintenanceState.DRAFT
+    )
+    def unschedule(self):
+        """Unpublish the maintenance announcement"""
         pass
 
     @transition(
@@ -2256,7 +2609,6 @@ class MaintenanceAnnouncement(
             "uuid",
             "title",
             "maintenance_type",
-            "severity",
             "state",
             "scheduled_start",
             "scheduled_end",
@@ -2265,7 +2617,7 @@ class MaintenanceAnnouncement(
         )
 
     def __str__(self):
-        return f"{self.name} - {self.get_state_display()}"
+        return f"{self.name} - {self.state}"
 
 
 class MaintenanceAnnouncementOffering(core_models.UuidMixin, TimeStampedModel):
@@ -2327,7 +2679,7 @@ class MaintenanceAnnouncementTemplate(
         customer_path = "service_provider__customer"
 
     def __str__(self):
-        return f"{self.name} - {self.get_state_display()}"
+        return f"{self.name} - {self.get_maintenance_type_display()}"
 
 
 class MaintenanceAnnouncementOfferingTemplate(core_models.UuidMixin, TimeStampedModel):
@@ -2357,3 +2709,58 @@ class MaintenanceAnnouncementOfferingTemplate(core_models.UuidMixin, TimeStamped
 
     def __str__(self):
         return f"{self.maintenance_template.name} affects {self.offering.name}"
+
+
+class CourseAccount(
+    core_models.UuidMixin,
+    TimeStampedModel,
+    LoggableMixin,
+    core_models.ErrorMessageMixin,
+    core_models.DescribableMixin,
+):
+    project = models.ForeignKey(
+        to=structure_models.Project,
+        on_delete=models.CASCADE,
+    )
+    user = models.ForeignKey(
+        to=core_models.User,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+    )
+    state = FSMIntegerField(
+        default=CourseAccountState.OK,
+        choices=CourseAccountState.choices,
+    )
+    email = models.EmailField(max_length=320, default="")
+    tracker = cast(
+        FieldInstanceTracker,
+        FieldTracker(fields=["email", "description", "state", "user"]),
+    )
+    get_state_display: Callable[[], Literal["OK", "Closed", "Erred"]]
+
+    class Meta:
+        verbose_name = _("Course account")
+        ordering = ["created"]
+
+    def __str__(self):
+        user_name = self.user.username if self.user else "unknown"
+        return f"Course account for {user_name} in {self.project}"
+
+    @transition(
+        field=state, source=CourseAccountState.ERRED, target=CourseAccountState.OK
+    )
+    def set_state_ok(self):
+        pass
+
+    @transition(
+        field=state,
+        source=[CourseAccountState.OK, CourseAccountState.ERRED],
+        target=CourseAccountState.CLOSED,
+    )
+    def set_state_closed(self):
+        pass
+
+    @transition(field=state, source="*", target=CourseAccountState.ERRED)
+    def set_state_erred(self):
+        pass

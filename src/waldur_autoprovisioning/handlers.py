@@ -1,11 +1,11 @@
 import logging
-import re
+from typing import cast
 
 from django.db import transaction
 
 from waldur_autoprovisioning.models import Rule
 from waldur_core.core.models import User
-from waldur_core.permissions.models import Role
+from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure.models import Project
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
@@ -15,44 +15,26 @@ from waldur_mastermind.marketplace.tasks import process_order_on_commit
 logger = logging.getLogger(__name__)
 
 
-def get_rules(user):
-    rules = []
-    for rule in Rule.objects.all():
-        if set(user.affiliations or []) & set(rule.user_affiliations) or any(
-            _is_pattern_match(pattern, user.email)
-            for pattern in rule.user_email_patterns
-        ):
-            rules.append(rule)
-
-    return rules
-
-
-def _is_pattern_match(pattern, email):
-    """Safely check if email matches pattern, handling invalid regex patterns."""
-    if not pattern or not isinstance(pattern, str):
-        return False
-    try:
-        return bool(re.match(pattern, email))
-    except re.error as e:
-        logger.warning("Invalid regex pattern '%s': %s", pattern, e)
-        return False
-
-
-def get_or_create_project(customer, user, project_role) -> Project | None:
+def get_or_create_project(rule: Rule, user: User) -> Project | None:
     project = None
-    project_role = project_role or Role.project_admin()
+    project_role = rule.project_role or ProjectRole.ADMIN
 
+    project_name = rule.resolve_project_name(user)
     try:
-        project = Project.available_objects.get(name=user.username, customer=customer)
+        project = cast(
+            Project,
+            Project.available_objects.get(name=project_name, customer=rule.customer),
+        )
 
         if not project.has_user(user, project_role):
             project.add_user(user, project_role)
 
     except Project.MultipleObjectsReturned:
-        logger.warning("Multiple projects with the same name %s exist.", user.username)
+        logger.warning("Multiple projects with the same name %s exist.", project_name)
     except Project.DoesNotExist:
-        project = Project.available_objects.create(
-            customer=customer, name=user.username
+        project = cast(
+            Project,
+            Project.available_objects.create(customer=rule.customer, name=project_name),
         )
         project.add_user(user, project_role)
 
@@ -60,14 +42,14 @@ def get_or_create_project(customer, user, project_role) -> Project | None:
 
 
 def get_or_create_order(
-    project: Project, user, offering, plan, limits=None, attributes=None
+    project: Project, user, offering, plan, limits=None, attributes: dict | None = None
 ):
     limits = limits or {}
     attributes = attributes or {}
 
     order_ids = Order.objects.filter(offering=offering).values_list("id", flat=True)
 
-    order: Order = (
+    order = (
         Order.objects.filter(
             project=project,
             created_by=user,
@@ -97,7 +79,7 @@ def get_or_create_order(
     attributes.update({"name": name})
 
     with transaction.atomic():
-        resource: Resource = Resource(
+        resource = Resource(
             project=project,
             offering=offering,
             plan=plan,
@@ -109,7 +91,7 @@ def get_or_create_order(
         resource.init_cost()
         resource.save()
 
-        order: Order = Order(
+        order = Order(
             resource=resource,
             project=project,
             created_by=user,
@@ -130,15 +112,13 @@ def handle_new_user(sender, instance: User, created=False, **kwargs):
     """Create project and order for new user based on autoprovisioning rules."""
     user = instance
 
-    rules: list = get_rules(user)
+    rules = cast(list[Rule], Rule.get_objects_by_user_patterns(user))
 
     if not rules:
         return
 
     for rule in rules:
-        project: Project | None = get_or_create_project(
-            rule.customer, user, rule.project_role
-        )
+        project = get_or_create_project(rule, user)
 
         if not project:
             continue

@@ -23,16 +23,17 @@ from waldur_mastermind.invoices.tests import factories as invoices_factories
 from waldur_mastermind.marketplace import callbacks, models, plugins
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import (
+    SUPPORT_OFFERING,
     BillingTypes,
     LimitPeriods,
     OfferingStates,
     OrderStates,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests import utils as test_utils
 from waldur_mastermind.marketplace.tests.fixtures import MarketplaceFixture
-from waldur_mastermind.marketplace_support import PLUGIN_NAME
 from waldur_openstack.tests import factories as openstack_factories
 
 
@@ -266,7 +267,7 @@ class ResourceSwitchPlanTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertTrue(
             models.Order.objects.filter(
-                type=models.Order.Types.UPDATE,
+                type=OrderTypes.UPDATE,
                 plan=self.plan2,
                 resource=self.resource1,
             ).exists()
@@ -587,7 +588,7 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
     def test_when_order_is_processed_cost_estimate_is_initialized(self):
         # Arrange
         fixture = fixtures.ProjectFixture()
-        offering = factories.OfferingFactory(type=PLUGIN_NAME)
+        offering = factories.OfferingFactory(type=SUPPORT_OFFERING)
         plan = factories.PlanFactory(unit_price=10)
 
         order = factories.OrderFactory(
@@ -606,7 +607,7 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
 
     def test_initialization_cost_is_added_to_cost_estimate_for_creation_request(self):
         # Arrange
-        offering = factories.OfferingFactory(type=PLUGIN_NAME)
+        offering = factories.OfferingFactory(type=SUPPORT_OFFERING)
         one_time_offering_component = factories.OfferingComponentFactory(
             offering=offering,
             billing_type=BillingTypes.ONE_TIME,
@@ -641,7 +642,7 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
 
         factories.OrderFactory(
             state=OrderStates.EXECUTING,
-            type=models.Order.Types.UPDATE,
+            type=OrderTypes.UPDATE,
             resource=resource,
             plan=new_plan,
         )
@@ -655,7 +656,7 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
 
     def test_plan_switch_cost_is_added_to_cost_estimate_for_order(self):
         # Arrange
-        offering = factories.OfferingFactory(type=PLUGIN_NAME)
+        offering = factories.OfferingFactory(type=SUPPORT_OFFERING)
         switch_offering_component = factories.OfferingComponentFactory(
             offering=offering,
             billing_type=BillingTypes.ON_PLAN_SWITCH,
@@ -678,7 +679,7 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
         order = factories.OrderFactory(
             offering=offering,
             plan=plan,
-            type=models.Order.Types.UPDATE,
+            type=OrderTypes.UPDATE,
         )
         order.init_cost()
         self.assertEqual(order.cost, 50)
@@ -1043,7 +1044,7 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertTrue(
             models.Order.objects.filter(
-                type=models.Order.Types.UPDATE,
+                type=OrderTypes.UPDATE,
                 resource=self.resource,
             ).exists()
         )
@@ -1105,7 +1106,7 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         response = self.update_limits(self.fixture.staff, self.resource)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         order = models.Order.objects.get(
-            type=models.Order.Types.UPDATE,
+            type=OrderTypes.UPDATE,
             state=OrderStates.EXECUTING,
             resource=self.resource,
         )

@@ -1,0 +1,105 @@
+#!/usr/bin/env sh
+# This script is the final executor for running pytest in a CI environment.
+# It is designed to be a "dumb" executor, receiving all its instructions
+# via command-line arguments and environment variables. The "intelligent"
+# decision-making (e.g., selecting tests, deciding to parallelize) happens
+# in a preceding CI job that triggers the pipeline this script runs in.
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+# --- ARGUMENT PARSING ---
+# This script expects the following arguments to be passed from the GitLab CI job.
+
+# Argument 1: Splitting flag. Default to "false" if not provided.
+ENABLE_SPLITTING="${1:-false}"
+
+# Only shift if we actually have arguments to shift.
+# We check if the second argument ($2) exists. If it does, it means we have
+# test targets to process, so we can safely shift away the first argument.
+if [ -n "$2" ]; then
+  shift 1
+  # `$@` now contains all remaining arguments (the test paths).
+  TEST_TARGETS="$@"
+else
+  # If there is no second argument, it means we were called without dynamic targets.
+  TEST_TARGETS=""
+fi
+
+
+# --- SCRIPT EXECUTION ---
+
+echo "--- Waldur Test Runner ---"
+echo "  Targets:           ${TEST_TARGETS}"
+echo "  Splitting Enabled: ${ENABLE_SPLITTING}"
+echo "--------------------------"
+
+
+# --- STEP 1: DYNAMIC PYTEST COMMAND CONSTRUCTION ---
+# We build the final pytest command as a string, adding flags conditionally.
+cat > src/waldur_mastermind/test_settings.py <<-EOF
+from waldur_core.server.test_settings import *
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
+
+# Using UNLOGGED tables in PostgreSQL is a significant performance boost for
+# tests, as it reduces disk I/O by not writing to the WAL.
+BaseDatabaseSchemaEditor.sql_create_table = "CREATE UNLOGGED TABLE %(table)s (%(definition)s)"
+
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'test_waldur',
+        'USER': 'runner',
+        'HOST': 'postgres',
+        'PORT': 5432,
+        'PASSWORD': 'waldur',
+    }
+}
+EOF
+
+# Base command with flags that are always used for unit tests.
+PYTEST_BASE_CMD="uv run pytest \
+    --reuse-db \
+    --junitxml=report.xml \
+    --cov=src/ \
+    --no-migrations \
+    -ra \
+    --ds=waldur_mastermind.test_settings"
+
+# This is the core logic for parallelization.
+# The command will only be split if the parent job decided it was necessary
+# AND if we are actually in a parallel GitLab CI environment (i.e., $CI_NODE_TOTAL is set).
+SPLITTING_ARGS=""
+if [ "$ENABLE_SPLITTING" = "true" ] && [ -n "$CI_NODE_TOTAL" ]; then
+  echo "[+] Splitting is enabled and CI parallel variables are present. Adding group flags."
+  SPLITTING_ARGS="--test-group-count $CI_NODE_TOTAL \
+    --test-group=$CI_NODE_INDEX \
+    --test-group-random-seed=12345"
+else
+  echo "[+] Splitting is disabled or not in a parallel environment. Running as a single group."
+fi
+
+# Combine the base command, splitting arguments, and test targets.
+FINAL_PYTEST_CMD="${PYTEST_BASE_CMD} ${SPLITTING_ARGS} ${TEST_TARGETS}"
+
+
+# --- STEP 2: EXECUTION & REPORTING ---
+echo "[+] Final pytest command to be executed:"
+echo "----------------------------------------------------"
+echo "$FINAL_PYTEST_CMD"
+echo "----------------------------------------------------"
+
+pip install uv
+uv sync --extra dev
+uv cache prune --ci
+
+# Use `eval` to execute the command string. This is necessary to ensure that
+# all the arguments, quotes, and flags are interpreted correctly by the shell.
+eval $FINAL_PYTEST_CMD
+
+# These final steps will only be reached if the `eval` command (pytest)
+# exits with a status code of 0.
+echo "[+] Tests completed. Generating coverage reports..."
+uv run coverage xml
+
+echo "[+] Test runner finished successfully."

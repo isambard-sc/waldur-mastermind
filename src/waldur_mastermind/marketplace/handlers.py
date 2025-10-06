@@ -1,15 +1,22 @@
 import logging
 from decimal import Decimal
+from typing import Any
 
 import httpx
 from constance import config
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import signals
 from django.template import Context, Template
+from django.utils import timezone
 from django.utils.timezone import now
+from drf_spectacular.openapi import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
+from rest_framework import serializers
 
+from waldur_core.checklist import models as checklist_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core.models import User
 from waldur_core.logging import event_logger
@@ -21,9 +28,20 @@ from waldur_core.users.enums import InvitationState
 from waldur_core.users.tasks import process_invitation
 from waldur_freeipa.models import Profile
 from waldur_mastermind.marketplace.enums import (
+    BASIC_OFFERING,
+    MaintenanceState,
     OfferingStates,
+    OfferingUserStates,
     OrderStates,
+    OrderTypes,
     ResourceStates,
+)
+from waldur_mastermind.marketplace.enums import SCRIPT_OFFERING as SCRIPT_PLUGIN_NAME
+from waldur_mastermind.marketplace.enums import (
+    SITE_AGENT_OFFERING as SITE_AGENT_PLUGIN_NAME,
+)
+from waldur_mastermind.marketplace.maintenance_utils import (
+    MaintenanceAnnouncementTemplate,
 )
 from waldur_mastermind.marketplace.models import (
     Offering,
@@ -41,17 +59,14 @@ from waldur_mastermind.marketplace.models import (
 from waldur_mastermind.marketplace.permissions import (
     order_should_not_be_reviewed_by_consumer,
 )
-from waldur_mastermind.marketplace_script import PLUGIN_NAME as SCRIPT_PLUGIN_NAME
-from waldur_mastermind.marketplace_site_agent import (
-    PLUGIN_NAME as SITE_AGENT_PLUGIN_NAME,
-)
+from waldur_mastermind.notifications.models import AdminAnnouncement
 
-from . import PLUGIN_NAME, callbacks, log, models, tasks, utils
+from . import callbacks, log, models, tasks, utils
 
 logger = logging.getLogger(__name__)
 
 OFFERING_USER_ALLOWED_OFFERING_TYPES = [
-    PLUGIN_NAME,
+    BASIC_OFFERING,
     SITE_AGENT_PLUGIN_NAME,
     SCRIPT_PLUGIN_NAME,
 ]
@@ -118,11 +133,11 @@ ORDER_STATE_HANDLERS = {
 }
 
 RESOURCE_TYPE_HANDLERS = {
-    models.Order.Types.TERMINATE: (
+    OrderTypes.TERMINATE: (
         EventType.MARKETPLACE_RESOURCE_TERMINATE_REQUESTED,
         "Resource {resource_name} deletion has been requested.",
     ),
-    models.Order.Types.UPDATE: (
+    OrderTypes.UPDATE: (
         EventType.MARKETPLACE_RESOURCE_UPDATE_REQUESTED,
         "Resource {resource_name} update has been requested.",
     ),
@@ -255,7 +270,8 @@ def close_service_accounts_on_project_deletion(sender, instance: Project, **kwar
 
     for service_account in service_accounts:
         try:
-            utils.delete_service_account(service_account)
+            utils.close_service_account(service_account)
+            service_account.delete()
         except (httpx.HTTPError, ValueError) as exc:
             logger.error(
                 "Failed to request deletion of service account %s for project %s: %s",
@@ -276,7 +292,8 @@ def close_customer_service_accounts_on_customer_deletion(
         return
     for service_account in service_accounts:
         try:
-            utils.delete_service_account(service_account)
+            utils.close_service_account(service_account)
+            service_account.delete()
         except (httpx.HTTPError, ValueError) as exc:
             logger.error(
                 "Failed to request deletion of service account %s for customer %s: %s",
@@ -347,7 +364,7 @@ def update_resource_when_order_is_rejected_or_erred(
         return
     resource = order.resource
     if order.state == OrderStates.REJECTED:
-        if order.type == models.Order.Types.CREATE:
+        if order.type == OrderTypes.CREATE:
             resource.set_state_terminated()
             resource.save(update_fields=["state"])
         elif resource.state != ResourceStates.OK:
@@ -368,8 +385,8 @@ def update_resource_when_order_is_rejected_or_erred(
 
 def sync_resource_limit_when_order(sender, instance: Order, created=False, **kwargs):
     """Synchronize resource limits when an order is created."""
-    order: models.Order = instance
-    if order.type != models.Order.Types.CREATE:
+    order = instance
+    if order.type != OrderTypes.CREATE:
         return
     if order.resource.state != ResourceStates.CREATING:
         return
@@ -1093,7 +1110,16 @@ def delete_expired_project_if_every_resource_has_been_terminated(
     if instance.state != ResourceStates.TERMINATED:
         return
 
+    # Ensure customer relationship is loaded to avoid KeyError during quota cleanup
     project = instance.project
+    try:
+        # Test if customer relationship is accessible
+        _ = project.customer
+    except (AttributeError, KeyError):
+        # Reload project with customer relationship if not accessible
+        project = project.__class__.objects.select_related("customer").get(
+            pk=project.pk
+        )
 
     if project.is_expired:
         resources = (
@@ -1136,6 +1162,71 @@ def log_offering_user_deleted(sender, instance: OfferingUser, **kwargs):
         event_context={"offering_user": instance},
         scopes=get_offering_role_scopes(instance),
     )
+
+
+def create_offering_user_checklist_completions(
+    sender, instance: OfferingUser, created=False, **kwargs
+):
+    """Create checklist completions for OfferingUser when created."""
+    if not created:
+        return
+
+    offering_user = instance
+    offering = offering_user.offering
+
+    # Get compliance checklist associated with the offering
+    checklist = offering.compliance_checklist
+
+    if not checklist:
+        logger.debug(
+            "No compliance checklist configured for offering %s",
+            offering.name,
+        )
+        return
+
+    # Get content type for OfferingUser
+    offering_user_content_type = ContentType.objects.get_for_model(OfferingUser)
+
+    # Create a ChecklistCompletion for the checklist
+    try:
+        checklist_models.ChecklistCompletion.objects.create(
+            scope_content_type=offering_user_content_type,
+            scope_object_id=offering_user.id,
+            checklist=checklist,
+        )
+        logger.info(
+            "Created checklist completion for %s, checklist: %s",
+            offering_user,
+            checklist.name,
+        )
+    except Exception as e:
+        logger.error(
+            "Failed to create checklist completion for %s, checklist: %s. Error: %s",
+            offering_user,
+            checklist.name,
+            e,
+        )
+
+
+def delete_offering_user_checklist_completions(
+    sender, instance: OfferingUser, **kwargs
+):
+    """Delete related checklist completions when OfferingUser is deleted."""
+    offering_user = instance
+    offering_user_content_type = ContentType.objects.get_for_model(OfferingUser)
+
+    # Delete all related checklist completions
+    deleted_count = checklist_models.ChecklistCompletion.objects.filter(
+        scope_content_type=offering_user_content_type,
+        scope_object_id=offering_user.id,
+    ).delete()[0]
+
+    if deleted_count > 0:
+        logger.info(
+            "Deleted %d checklist completion(s) for %s",
+            deleted_count,
+            offering_user,
+        )
 
 
 def generate_changes_string(changed_dict, instance, account_type):
@@ -1238,7 +1329,6 @@ def create_offering_users_when_project_role_granted(sender, instance, **kwargs):
     )
     offering_ids = set(resources.values_list("offering_id", flat=True))
     offerings = models.Offering.objects.filter(id__in=offering_ids)
-
     for offering in offerings:
         if not offering.plugin_options.get("service_provider_can_create_offering_user"):
             logger.info(
@@ -1252,13 +1342,16 @@ def create_offering_users_when_project_role_granted(sender, instance, **kwargs):
         ).exists():
             logger.info("An offering user for %s in %s already exists", user, offering)
             continue
-
         username = utils.generate_username(user, offering)
-
+        # Set state to OK when username is known at creation time
+        state = (
+            OfferingUserStates.OK if username else OfferingUserStates.CREATION_REQUESTED
+        )
         offering_user = models.OfferingUser.objects.create(
             offering=offering,
             user=user,
             username=username,
+            state=state,
         )
         utils.setup_linux_related_data(offering_user, offering)
         offering_user.save(update_fields=["backend_metadata"])
@@ -1268,7 +1361,6 @@ def create_offering_user_for_new_resource(sender, instance: Resource, **kwargs):
     """Create an offering user for a new resource."""
     resource = instance
     project = resource.project
-    users = project.get_users()
     offering = resource.offering
     if offering.type not in OFFERING_USER_ALLOWED_OFFERING_TYPES:
         logger.info(
@@ -1282,6 +1374,8 @@ def create_offering_user_for_new_resource(sender, instance: Resource, **kwargs):
         )
         return
 
+    users = project.get_users()
+
     for user in users:
         if models.OfferingUser.objects.filter(
             offering=offering,
@@ -1291,14 +1385,19 @@ def create_offering_user_for_new_resource(sender, instance: Resource, **kwargs):
             continue
 
         username = utils.generate_username(user, offering)
-
+        # Set state to OK when username is known at creation time
+        state = (
+            OfferingUserStates.OK if username else OfferingUserStates.CREATION_REQUESTED
+        )
         offering_user = models.OfferingUser.objects.create(
             offering=offering,
             user=user,
             username=username,
+            state=state,
         )
 
         utils.setup_linux_related_data(offering_user, offering)
+
         offering_user.save(update_fields=["backend_metadata"])
 
         logger.info("The offering user %s has been created", offering_user)
@@ -1462,4 +1561,450 @@ def log_resource_user_deleted(sender, instance: models.ResourceUser, **kwargs):
             "resource_user": instance,
         },
         scopes=[instance.resource.offering, instance.resource.offering.customer],
+    )
+
+
+def manage_maintenance_admin_announcements(sender, instance, created, **kwargs):
+    """
+    Manage AdminAnnouncement lifecycle based on MaintenanceAnnouncement state changes.
+
+    Handles:
+    - Creation when DRAFT → SCHEDULED
+    - Cleanup when SCHEDULED → DRAFT (unschedule)
+    - Cleanup when → CANCELLED
+    - Update content when maintenance or affected offerings change
+    """
+
+    # Get previous state to detect transitions
+    if not created and instance.tracker.has_changed("state"):
+        old_state = instance.tracker.previous("state")
+        new_state = instance.state
+
+        # DRAFT → SCHEDULED: Create AdminAnnouncement
+        if (
+            old_state == MaintenanceState.DRAFT
+            and new_state == MaintenanceState.SCHEDULED
+        ):
+            _create_maintenance_announcement(instance)
+
+        # SCHEDULED → DRAFT: Remove AdminAnnouncement (unscheduled)
+        elif (
+            old_state == MaintenanceState.SCHEDULED
+            and new_state == MaintenanceState.DRAFT
+        ):
+            _cleanup_maintenance_announcement(instance)
+
+        # → CANCELLED: Remove AdminAnnouncement
+        elif new_state == MaintenanceState.CANCELLED:
+            _cleanup_maintenance_announcement(instance)
+
+    # Handle content updates for scheduled maintenance
+    elif (
+        not created
+        and instance.state == MaintenanceState.SCHEDULED
+        and _has_content_changes(instance)
+        and _check_and_handle_missing_admin_announcement(instance)
+    ):
+        _update_maintenance_announcement_content(instance)
+
+
+def _create_maintenance_announcement(maintenance):
+    """Create AdminAnnouncement with rich markdown content."""
+
+    notify_before_minutes = config.MAINTENANCE_ANNOUNCEMENT_NOTIFY_BEFORE_MINUTES
+
+    # Delete any existing announcement first (defensive)
+    if maintenance.admin_announcement:
+        maintenance.admin_announcement.delete()
+
+    # Generate content
+    content = MaintenanceAnnouncementTemplate.generate_announcement_content(maintenance)
+    announcement_type = MaintenanceAnnouncementTemplate.get_announcement_priority(
+        maintenance
+    )
+
+    # Create announcement
+    admin_announcement = AdminAnnouncement.objects.create(
+        description=content,
+        type=announcement_type,
+        active_from=maintenance.scheduled_start
+        - timezone.timedelta(minutes=notify_before_minutes),
+        active_to=maintenance.scheduled_end
+        + timezone.timedelta(hours=1),  # Keep visible 1 hour after
+    )
+
+    _update_admin_announcement_reference(maintenance, admin_announcement)
+
+
+def _cleanup_maintenance_announcement(maintenance):
+    """Remove associated AdminAnnouncement."""
+    if maintenance.admin_announcement:
+        maintenance.admin_announcement.delete()
+        _update_admin_announcement_reference(maintenance, None)
+
+
+def _update_maintenance_announcement_content(maintenance):
+    """Update AdminAnnouncement content when maintenance details change."""
+
+    if not maintenance.admin_announcement:
+        return
+
+    try:
+        # Regenerate content
+        content = MaintenanceAnnouncementTemplate.generate_announcement_content(
+            maintenance
+        )
+        announcement_type = MaintenanceAnnouncementTemplate.get_announcement_priority(
+            maintenance
+        )
+
+        # Update announcement
+        maintenance.admin_announcement.description = content
+        maintenance.admin_announcement.type = announcement_type
+
+        # Update timing if changed
+        if maintenance.tracker.has_changed(
+            "scheduled_start"
+        ) or maintenance.tracker.has_changed("scheduled_end"):
+            notify_before_minutes = (
+                config.MAINTENANCE_ANNOUNCEMENT_NOTIFY_BEFORE_MINUTES
+            )
+            maintenance.admin_announcement.active_from = (
+                maintenance.scheduled_start
+                - timezone.timedelta(minutes=notify_before_minutes)
+            )
+            maintenance.admin_announcement.active_to = (
+                maintenance.scheduled_end + timezone.timedelta(hours=1)
+            )
+
+        maintenance.admin_announcement.save()
+
+    except AdminAnnouncement.DoesNotExist:
+        # AdminAnnouncement was manually deleted
+        _clear_admin_announcement_reference(maintenance)
+
+
+def _has_content_changes(maintenance):
+    """Check if maintenance has changes that affect announcement content."""
+    content_fields = [
+        "name",
+        "message",
+        "scheduled_start",
+        "scheduled_end",
+        "maintenance_type",
+    ]
+    return any(maintenance.tracker.has_changed(field) for field in content_fields)
+
+
+def _update_admin_announcement_reference(maintenance, admin_announcement=None):
+    """
+    Update the AdminAnnouncement reference without triggering signals.
+
+    Args:
+        maintenance: MaintenanceAnnouncement instance
+        admin_announcement: AdminAnnouncement instance or None to clear
+    """
+    # Update using direct SQL to avoid triggering signals and potential recursion
+    maintenance.__class__.objects.filter(pk=maintenance.pk).update(
+        admin_announcement=admin_announcement
+    )
+    maintenance.admin_announcement = admin_announcement
+
+
+def _clear_admin_announcement_reference(maintenance, reason="was manually deleted"):
+    """
+    Clear the AdminAnnouncement reference from maintenance.
+
+    Args:
+        maintenance: MaintenanceAnnouncement instance
+        reason: Reason for clearing (used in log message)
+    """
+    logger.warning(
+        f"AdminAnnouncement for maintenance {maintenance.uuid} {reason}. "
+        f"Clearing reference and not regenerating."
+    )
+    _update_admin_announcement_reference(maintenance, None)
+
+
+def _check_and_handle_missing_admin_announcement(maintenance, action="update"):
+    """
+    Check if AdminAnnouncement still exists and handle if missing.
+
+    Args:
+        maintenance: MaintenanceAnnouncement instance
+        action: Action being performed (used in log message)
+
+    Returns:
+        bool: True if AdminAnnouncement exists, False if it was cleared
+    """
+    if not maintenance.admin_announcement_id:
+        return False
+
+    if not AdminAnnouncement.objects.filter(
+        id=maintenance.admin_announcement_id
+    ).exists():
+        reason_msg = (
+            "was manually deleted. Not regenerating unless maintenance is updated"
+        )
+        if action == "offering_change":
+            reason_msg = (
+                "was manually deleted. Not regenerating unless maintenance is updated"
+            )
+
+        _clear_admin_announcement_reference(maintenance, reason_msg)
+        return False
+
+    return True
+
+
+def update_maintenance_announcement_on_offering_change(sender, instance, **kwargs):
+    """Update AdminAnnouncement when affected offerings change."""
+
+    maintenance = instance.maintenance
+    if (
+        maintenance.state == MaintenanceState.SCHEDULED
+        and _check_and_handle_missing_admin_announcement(maintenance, "offering_change")
+    ):
+        _update_maintenance_announcement_content(maintenance)
+
+
+def cleanup_admin_announcement_on_maintenance_deletion(sender, instance, **kwargs):
+    """Ensure AdminAnnouncement is cleaned up when MaintenanceAnnouncement is deleted."""
+    if instance.admin_announcement:
+        try:
+            instance.admin_announcement.delete()
+        except (ObjectDoesNotExist, AdminAnnouncement.DoesNotExist):
+            # AdminAnnouncement was already deleted - this is fine
+            logger.debug(
+                f"AdminAnnouncement for maintenance {instance.uuid} was already deleted"
+            )
+        except Exception as e:
+            # Log other unexpected exceptions but don't break the deletion process
+            logger.warning(
+                f"Failed to delete AdminAnnouncement for maintenance {instance.uuid}: {e}"
+            )
+
+
+def add_maintenance_fields_to_admin_announcement_serializer(sender, fields, **kwargs):
+    """Add maintenance-related fields to AdminAnnouncementSerializer when maintenance is scheduled."""
+    # Add maintenance fields if the AdminAnnouncement has a related MaintenanceAnnouncement
+    fields["maintenance_uuid"] = serializers.SerializerMethodField()
+    fields["maintenance_name"] = serializers.SerializerMethodField()
+    fields["maintenance_type"] = serializers.SerializerMethodField()
+    fields["maintenance_state"] = serializers.SerializerMethodField()
+    fields["maintenance_scheduled_start"] = serializers.SerializerMethodField()
+    fields["maintenance_scheduled_end"] = serializers.SerializerMethodField()
+    fields["maintenance_service_provider"] = serializers.SerializerMethodField()
+    fields["maintenance_affected_offerings"] = serializers.SerializerMethodField()
+
+    # Add methods to the sender class (AdminAnnouncementSerializer)
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_maintenance_uuid(self, obj) -> str | None:
+        try:
+            return (
+                str(obj.maintenance_announcement.uuid)
+                if hasattr(obj, "maintenance_announcement")
+                and obj.maintenance_announcement
+                else None
+            )
+        except AttributeError:
+            return None
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_maintenance_name(self, obj) -> str | None:
+        try:
+            return (
+                obj.maintenance_announcement.name
+                if hasattr(obj, "maintenance_announcement")
+                and obj.maintenance_announcement
+                else None
+            )
+        except AttributeError:
+            return None
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_maintenance_type(self, obj) -> str | None:
+        try:
+            return (
+                obj.maintenance_announcement.maintenance_type
+                if hasattr(obj, "maintenance_announcement")
+                and obj.maintenance_announcement
+                else None
+            )
+        except AttributeError:
+            return None
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_maintenance_state(self, obj) -> str | None:
+        try:
+            return (
+                obj.maintenance_announcement.state
+                if hasattr(obj, "maintenance_announcement")
+                and obj.maintenance_announcement
+                else None
+            )
+        except AttributeError:
+            return None
+
+    @extend_schema_field(OpenApiTypes.DATETIME)
+    def get_maintenance_scheduled_start(self, obj) -> str | None:
+        try:
+            return (
+                obj.maintenance_announcement.scheduled_start
+                if hasattr(obj, "maintenance_announcement")
+                and obj.maintenance_announcement
+                else None
+            )
+        except AttributeError:
+            return None
+
+    @extend_schema_field(OpenApiTypes.DATETIME)
+    def get_maintenance_scheduled_end(self, obj) -> str | None:
+        try:
+            return (
+                obj.maintenance_announcement.scheduled_end
+                if hasattr(obj, "maintenance_announcement")
+                and obj.maintenance_announcement
+                else None
+            )
+        except AttributeError:
+            return None
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_maintenance_service_provider(self, obj) -> str | None:
+        try:
+            return (
+                obj.maintenance_announcement.service_provider.name
+                if hasattr(obj, "maintenance_announcement")
+                and obj.maintenance_announcement
+                and obj.maintenance_announcement.service_provider
+                else None
+            )
+        except AttributeError:
+            return None
+
+    @extend_schema_field(
+        {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "uuid": {"type": "string", "format": "uuid"},
+                    "name": {"type": "string"},
+                    "impact_level": {"type": "string"},
+                    "impact_level_display": {"type": "string"},
+                    "impact_description": {"type": "string"},
+                },
+            },
+        }
+    )
+    def get_maintenance_affected_offerings(self, obj) -> list[dict[str, Any]]:
+        try:
+            if (
+                not hasattr(obj, "maintenance_announcement")
+                or not obj.maintenance_announcement
+            ):
+                return []
+
+            affected_offerings = []
+            for (
+                affected_offering
+            ) in obj.maintenance_announcement.affected_offerings.all():
+                offering_info = {
+                    "uuid": str(affected_offering.offering.uuid),
+                    "name": affected_offering.offering.name,
+                    "impact_level": affected_offering.impact_level,
+                    "impact_level_display": affected_offering.get_impact_level_display(),
+                    "impact_description": affected_offering.impact_description,
+                }
+                affected_offerings.append(offering_info)
+
+            return affected_offerings
+        except AttributeError:
+            return []
+
+    # Add the methods to the serializer class
+    sender.get_maintenance_uuid = get_maintenance_uuid
+    sender.get_maintenance_name = get_maintenance_name
+    sender.get_maintenance_type = get_maintenance_type
+    sender.get_maintenance_state = get_maintenance_state
+    sender.get_maintenance_scheduled_start = get_maintenance_scheduled_start
+    sender.get_maintenance_scheduled_end = get_maintenance_scheduled_end
+    sender.get_maintenance_service_provider = get_maintenance_service_provider
+    sender.get_maintenance_affected_offerings = get_maintenance_affected_offerings
+
+
+def close_course_accounts_after_project_removal(
+    sender, instance: structure_models.Project, **kwargs
+):
+    if not settings.WALDUR_CORE.get("COURSE_ACCOUNT_USE_API"):
+        return
+
+    course_accounts = models.CourseAccount.objects.filter(project=instance)
+    if not course_accounts.exists():
+        return
+    try:
+        api_access_token = utils.get_course_account_api_token()
+    except httpx.HTTPError:
+        logger.error(
+            "Unable to get course account API token, skipping accounts removal for project %s",
+            instance,
+        )
+        return
+
+    for course_account in course_accounts:
+        try:
+            utils.close_course_account(course_account, api_access_token)
+        except httpx.HTTPError:
+            logger.error(
+                "Unable to close course account %s from project %s",
+                course_account.user.username,
+                instance,
+            )
+
+
+def log_terms_of_service_consent_granted(
+    sender, instance: models.UserOfferingConsent, created=False, **kwargs
+):
+    """Log when a user grants consent to Terms of Service."""
+    if not created:
+        return
+    event_logger.emit(
+        "User {user_name} has accepted Terms of Service for offering {offering_name}.",
+        event_type=EventType.TERMS_OF_SERVICE_CONSENT_GRANTED,
+        event_context={
+            "user": instance.user,
+            "offering": instance.offering,
+            "consent": instance,
+            "version": instance.version,
+            "user_name": instance.user.full_name or instance.user.username,
+            "offering_name": instance.offering.name,
+        },
+        scopes=[instance.offering, instance.offering.customer],
+    )
+
+
+def log_terms_of_service_consent_revoked(
+    sender, instance: models.UserOfferingConsent, created=False, **kwargs
+):
+    """Log when a user revokes consent to Terms of Service."""
+    if created or not instance.tracker.has_changed("revocation_date"):
+        return
+
+    if instance.revocation_date is None:
+        return
+
+    event_logger.emit(
+        "User {user_name} has revoked Terms of Service consent for offering {offering_name}.",
+        event_type=EventType.TERMS_OF_SERVICE_CONSENT_REVOKED,
+        event_context={
+            "user": instance.user,
+            "offering": instance.offering,
+            "consent": instance,
+            "version": instance.version,
+            "user_name": instance.user.full_name or instance.user.username,
+            "offering_name": instance.offering.name,
+            "revocation_date": instance.revocation_date,
+        },
+        scopes=[instance.offering, instance.offering.customer],
     )

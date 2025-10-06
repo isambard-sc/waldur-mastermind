@@ -5,16 +5,19 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 
-from waldur_azure.models import VirtualMachine
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.quotas.models import QuotaUsage
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import (
+    OPENSTACK_INSTANCE_OFFERING,
+    OPENSTACK_TENANT_OFFERING,
+    OPENSTACK_VOLUME_OFFERING,
     BillingTypes,
     LimitPeriods,
     OfferingStates,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.models import Offering, Resource
@@ -32,10 +35,7 @@ from waldur_openstack.models import (
 from waldur_openstack.utils import volume_type_name_to_quota_name
 
 from . import (
-    INSTANCE_TYPE,
     STORAGE_MODE_FIXED,
-    TENANT_TYPE,
-    VOLUME_TYPE,
     tasks,
     utils,
 )
@@ -289,13 +289,13 @@ def create_resource_of_volume_if_instance_created(
     if not resource.scope or not getattr(resource.offering, "scope", None):
         return
 
-    if resource.offering.type != INSTANCE_TYPE:
+    if resource.offering.type != OPENSTACK_INSTANCE_OFFERING:
         return
 
     vm = cast(Instance, resource.scope)
 
     volume_offering = utils.get_offering(
-        VOLUME_TYPE, getattr(resource.offering, "scope", None)
+        OPENSTACK_VOLUME_OFFERING, getattr(resource.offering, "scope", None)
     )
     if not volume_offering:
         return
@@ -318,7 +318,7 @@ def create_resource_of_volume_if_instance_created(
 
 
 def create_marketplace_resource_for_imported_resources(
-    sender, instance: VirtualMachine, offering=None, plan=None, **kwargs
+    sender, instance: Instance, offering=None, plan=None, **kwargs
 ):
     utils.create_marketplace_resource_for_imported_resources(instance, offering, plan)
 
@@ -425,7 +425,7 @@ def synchronize_limits_when_storage_mode_is_switched(
     if created:
         return
 
-    if offering.type != TENANT_TYPE:
+    if offering.type != OPENSTACK_TENANT_OFFERING:
         return
 
     if not offering.tracker.has_changed("plugin_options"):
@@ -501,11 +501,11 @@ def synchronize_tenant_name(
         object_id=tenant.id, content_type=ContentType.objects.get_for_model(tenant)
     )
 
-    for offering in offerings.filter(type=INSTANCE_TYPE):
+    for offering in offerings.filter(type=OPENSTACK_INSTANCE_OFFERING):
         offering.name = utils.get_offering_name_for_instance(tenant)
         offering.save(update_fields=["name"])
 
-    for offering in offerings.filter(type=VOLUME_TYPE):
+    for offering in offerings.filter(type=OPENSTACK_VOLUME_OFFERING):
         offering.name = utils.get_offering_name_for_volume(tenant)
         offering.save(update_fields=["name"])
 
@@ -580,7 +580,8 @@ def set_mtu_when_network_has_been_created(
 def update_floating_ip_external_addresses(
     sender, instance: FloatingIP, created=False, **kwargs
 ):
-    if not instance.tracker.has_changed("address"):
+    # Process if address changed OR if this is a newly created IP with an address
+    if not (instance.tracker.has_changed("address") or (created and instance.address)):
         return
 
     utils.update_external_addresses_of_floating_ip(instance)
@@ -591,7 +592,7 @@ def update_instances_ip_external_addresses(
 ):
     offering = instance
 
-    if offering.type != TENANT_TYPE:
+    if offering.type != OPENSTACK_TENANT_OFFERING:
         return
 
     if not created and not offering.tracker.has_changed("secret_options"):
@@ -620,8 +621,8 @@ def handle_openstack_tenant_order_creation(
 
     if (
         created
-        and order.type == marketplace_models.Order.Types.CREATE
-        and order.offering.type == INSTANCE_TYPE
+        and order.type == OrderTypes.CREATE
+        and order.offering.type == OPENSTACK_INSTANCE_OFFERING
     ):
         utils.set_ports_status_for_order(order, "BOOKED")
 
@@ -635,7 +636,7 @@ def handle_openstack_tenant_order_termination(
         return
 
     if (
-        order.offering.type == INSTANCE_TYPE
+        order.offering.type == OPENSTACK_INSTANCE_OFFERING
         and order.tracker.has_changed("state")
         and order.state
         in (

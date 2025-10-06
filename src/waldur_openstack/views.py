@@ -37,6 +37,7 @@ from waldur_core.structure import views as structure_views
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.serializers import ConsoleUrlSerializer
 from waldur_core.structure.signals import resource_imported
+from waldur_mastermind.marketplace_openstack.utils import delete_instance
 from waldur_openstack.apps import OpenStackConfig
 from waldur_openstack.backend import OpenStackBackend
 from waldur_openstack.exceptions import OpenStackBackendError
@@ -502,12 +503,36 @@ class TenantViewSet(structure_views.ResourceViewSet):
     create_network_serializer_class = serializers.OpenStackNetworkSerializer
 
     def external_network_is_defined(tenant):
-        if not tenant.external_network_id:
+        external_network_id = utils.get_external_network_id(tenant)
+        if not external_network_id:
             raise core_exceptions.IncorrectStateException(
                 _(
                     "Cannot create floating IP if tenant external network is not defined."
                 )
             )
+
+        # If we have external_network_id from settings but not on tenant, attempt recovery
+        if external_network_id and not tenant.external_network_id:
+            logger.info(
+                "Attempting to recover external network for tenant %s before floating IP creation",
+                tenant,
+            )
+            try:
+                backend = OpenStackBackend(tenant.service_settings)
+                backend.detect_external_network(tenant)
+                tenant.refresh_from_db()
+                # Check if recovery succeeded
+                if not tenant.external_network_id:
+                    logger.warning(
+                        "External network recovery failed for tenant %s - network not set after recovery attempt",
+                        tenant,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to recover external network for tenant %s: %s",
+                    tenant,
+                    e,
+                )
 
     @extend_schema(
         description="Create floating IP for tenant",
@@ -1104,6 +1129,9 @@ class NetworkViewSet(structure_views.ResourceViewSet):
     set_mtu_validators = [core_validators.StateValidator(CoreStates.OK)]
     set_mtu_serializer_class = serializers.SetMtuSerializer
 
+    # RBAC policy create/delete moved to standalone ViewSet: NetworkRBACPolicyViewSet
+    # TODO: remove after 1.11.2025
+
     def _check_rbac_policy_permissions(self, user, network, target_tenant):
         if user.is_staff:
             return
@@ -1123,8 +1151,8 @@ class NetworkViewSet(structure_views.ResourceViewSet):
 
     @extend_schema(
         description="Create RBAC policy for the network",
-        request=serializers.NetworkRBACPolicySerializer,
-        responses=serializers.NetworkRBACPolicySerializer,
+        request=serializers.DeprecatedNetworkRBACPolicySerializer,
+        responses=serializers.DeprecatedNetworkRBACPolicySerializer,
     )
     @decorators.action(detail=True, methods=["post"])
     def rbac_policy_create(self, request, uuid=None):
@@ -1162,7 +1190,9 @@ class NetworkViewSet(structure_views.ResourceViewSet):
         return response.Response(result_serializer.data, status=status.HTTP_201_CREATED)
 
     rbac_policy_create_validators = [core_validators.StateValidator(CoreStates.OK)]
-    rbac_policy_create_serializer_class = serializers.NetworkRBACPolicySerializer
+    rbac_policy_create_serializer_class = (
+        serializers.DeprecatedNetworkRBACPolicySerializer
+    )
 
     @extend_schema(
         description="Delete RBAC policy for the network",
@@ -1483,25 +1513,6 @@ class InstanceViewSet(structure_views.ResourceViewSet):
                     _("Cannot delete instance that has snapshots.")
                 )
 
-    def _can_destroy_instance(instance):
-        if instance.state == CoreStates.ERRED:
-            return
-        if (
-            instance.state == CoreStates.OK
-            and instance.runtime_state == models.Instance.RuntimeStates.SHUTOFF
-        ):
-            return
-        if (
-            instance.state == CoreStates.OK
-            and instance.runtime_state == models.Instance.RuntimeStates.ACTIVE
-        ):
-            raise core_exceptions.IncorrectStateException(
-                _("Please stop the instance before its removal.")
-            )
-        raise core_exceptions.IncorrectStateException(
-            _("Instance should be shutoff and OK or erred. Please contact support.")
-        )
-
     @extend_schema(
         description="Change flavor of the instance",
         request=serializers.InstanceFlavorChangeSerializer,
@@ -1779,7 +1790,6 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         instance: models.Instance = self.get_object()
         serializer = serializers.OpenStackNestedFloatingIPSerializer(
             instance=instance.floating_ips.all(),
-            queryset=models.FloatingIP.objects.all(),
             many=True,
             context=self.get_serializer_context(),
         )
@@ -1846,65 +1856,10 @@ class InstanceViewSet(structure_views.ResourceViewSet):
 
 class MarketplaceInstanceViewSet(structure_views.ResourceViewSet):
     queryset = models.Instance.objects.all()
-    serializer_class = serializers.OpenStackInstanceSerializer
+    serializer_class = serializers.OpenStackInstanceCreateSerializer
     filter_backends = structure_views.ResourceViewSet.filter_backends + (
         structure_filters.StartTimeFilter,
     )
-
-    def destroy(self, request, uuid=None):
-        """
-        Deletion of an instance is done through sending a DELETE request to the instance URI.
-        Valid request example (token is user specific):
-
-        .. code-block:: http
-
-            DELETE /api/openstack-instances/abceed63b8e844afacd63daeac855474/ HTTP/1.1
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-        Only stopped instances or instances in ERRED state can be deleted.
-
-        By default when instance is destroyed, all data volumes
-        attached to it are destroyed too. In order to preserve data
-        volumes use query parameter ?delete_volumes=false
-        In this case data volumes are detached from the instance and
-        then instance is destroyed. Note that system volume is deleted anyway.
-        For example:
-
-        .. code-block:: http
-
-            DELETE /api/openstack-instances/abceed63b8e844afacd63daeac855474/?delete_volumes=false HTTP/1.1
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-        """
-        serializer = self.get_serializer(
-            data=request.query_params, instance=self.get_object()
-        )
-        serializer.is_valid(raise_exception=True)
-        delete_volumes = serializer.validated_data["delete_volumes"]
-        release_floating_ips = serializer.validated_data["release_floating_ips"]
-
-        resource: models.Instance = self.get_object()
-        force = resource.state == CoreStates.ERRED
-        executors.InstanceDeleteExecutor.execute(
-            resource,
-            force=force,
-            delete_volumes=delete_volumes,
-            release_floating_ips=release_floating_ips,
-            is_async=self.async_executor,
-        )
-
-        return response.Response(
-            {"status": _("destroy was scheduled")}, status=status.HTTP_202_ACCEPTED
-        )
-
-    destroy_validators = [
-        InstanceViewSet._can_destroy_instance,
-        InstanceViewSet._has_backups,
-        InstanceViewSet._has_snapshots,
-    ]
-    destroy_serializer_class = serializers.OpenStackInstanceDeleteSerializer
 
     @decorators.action(detail=True, methods=["delete"])
     def force_destroy(self, request, uuid=None):
@@ -1912,7 +1867,9 @@ class MarketplaceInstanceViewSet(structure_views.ResourceViewSet):
         Destroy's validators require stopped VM. This requirement has expired.
         But for compatibility with old documentation, it must be left.
         """
-        return self.destroy(request, uuid)
+        instance = self.get_object()
+        delete_instance(instance, request.query_params)
+        return response.Response(status=status.HTTP_202_ACCEPTED)
 
     force_destroy_validators = [
         InstanceViewSet._has_backups,
@@ -1922,7 +1879,6 @@ class MarketplaceInstanceViewSet(structure_views.ResourceViewSet):
             CoreStates.ERRED,
         ),
     ]
-    force_destroy_serializer_class = destroy_serializer_class
 
     def perform_create(self, serializer):
         instance: models.Instance = serializer.save()
@@ -1981,7 +1937,7 @@ class BackupViewSet(structure_views.ResourceViewSet):
 
     @extend_schema(
         description="Restore instance from backup",
-        request=serializers.OpenStackBackupRestorationSerializer,
+        request=serializers.OpenStackBackupRestorationCreateSerializer,
         responses=serializers.OpenStackInstanceSerializer,
     )
     @decorators.action(detail=True, methods=["post"])
@@ -2013,7 +1969,7 @@ class BackupViewSet(structure_views.ResourceViewSet):
         )
 
     restore_validators = [core_validators.StateValidator(CoreStates.OK)]
-    restore_serializer_class = serializers.OpenStackBackupRestorationSerializer
+    restore_serializer_class = serializers.OpenStackBackupRestorationCreateSerializer
 
 
 class SharedSettingsBaseView(generics.GenericAPIView):
@@ -2050,12 +2006,85 @@ class VolumeAvailabilityZoneViewSet(structure_views.BaseServicePropertyViewSet):
     filterset_class = filters.VolumeAvailabilityZoneFilter
 
 
-class NetworkRBACPolicyViewSet(core_views.ReadOnlyActionsViewSet):
+class NetworkRBACPolicyViewSet(core_views.ActionsViewSet):
+    lookup_field = "uuid"
     queryset = models.NetworkRBACPolicy.objects.all().order_by("-created")
     serializer_class = serializers.NetworkRBACPolicySerializer
-    lookup_field = "uuid"
     filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
     filterset_class = filters.NetworkRBACPolicyFilter
 
     def get_queryset(self):
         return filter_queryset_for_user(self.queryset, self.request.user)
+
+    def _check_rbac_policy_permissions(self, user, network, target_tenant):
+        if user.is_staff:
+            return
+
+        if (
+            network.project.has_user(user, ProjectRole.ADMIN)
+            or network.project.has_user(user, ProjectRole.MANAGER)
+            or network.project.customer.has_user(user, CustomerRole.OWNER)
+        ) and (
+            target_tenant.project.has_user(user, ProjectRole.ADMIN)
+            or target_tenant.project.has_user(user, ProjectRole.MANAGER)
+            or target_tenant.project.customer.has_user(user, CustomerRole.OWNER)
+        ):
+            return
+
+        raise exceptions.PermissionDenied()
+
+    @extend_schema(
+        description="Create RBAC policy for the network",
+        request=serializers.NetworkRBACPolicySerializer,
+        responses=serializers.NetworkRBACPolicySerializer,
+    )
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        network = serializer.validated_data["network"]
+        target_tenant = serializer.validated_data["target_tenant"]
+        policy_type = serializer.validated_data["policy_type"]
+
+        self._check_rbac_policy_permissions(request.user, network, target_tenant)
+
+        backend = network.tenant.get_backend()
+
+        backend_id = backend.create_network_rbac_policy(
+            network,
+            target_tenant=target_tenant,
+            policy_type=policy_type,
+        )
+
+        logger.info("RBAC policy created in backend with ID: %s", backend_id)
+
+        policy = models.NetworkRBACPolicy.objects.create(
+            network=network,
+            target_tenant=target_tenant,
+            backend_id=backend_id,
+            policy_type=policy_type,
+        )
+
+        logger.info("RBAC policy record created in database with UUID: %s", policy.uuid)
+
+        result_serializer = self.get_serializer(policy, context={"request": request})
+        return response.Response(result_serializer.data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        description="Delete RBAC policy for the network",
+        request=None,
+        responses={204: None},
+    )
+    def destroy(self, request, *args, **kwargs):
+        policy: models.NetworkRBACPolicy = self.get_object()
+
+        self._check_rbac_policy_permissions(
+            request.user, policy.network, policy.target_tenant
+        )
+
+        backend = policy.network.tenant.get_backend()
+        backend.delete_network_rbac_policy(rbac_id=policy.backend_id)
+        policy.delete()
+        return response.Response(status=status.HTTP_204_NO_CONTENT)

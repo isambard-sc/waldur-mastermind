@@ -3,15 +3,19 @@ import json
 import django_filters
 from constance import config
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import Q, QuerySet
+from django.db.models import F, Q, QuerySet
 from django.utils.translation import gettext_lazy as _
+from django_filters import DateFromToRangeFilter
 from django_filters.widgets import BooleanWidget
 from rest_framework import exceptions as rf_exceptions
 from rest_framework.filters import BaseFilterBackend
 
+from waldur_core.checklist import models as checklist_models
 from waldur_core.core import filters as core_filters
 from waldur_core.core.filters import (
+    CharInFilter,
     LooseMultipleChoiceFilter,
+    UUIDInFilter,
     get_generic_field_filter,
 )
 from waldur_core.core.models import User
@@ -31,10 +35,14 @@ from waldur_core.structure.managers import (
 from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.marketplace import plugins
 from waldur_mastermind.marketplace.enums import (
+    CourseAccountState,
     OfferingStates,
+    OfferingUserStates,
     OrderStates,
+    OrderTypes,
     ResourceStates,
     RobotAccountStates,
+    ServiceAccountState,
 )
 from waldur_mastermind.marketplace.managers import (
     ResourceQuerySet,
@@ -119,6 +127,21 @@ class OfferingFilter(
     uuid_list = django_filters.CharFilter(
         method="filter_uuid_list",
         label="Comma-separated offering UUIDs",
+    )
+    has_terms_of_service = django_filters.BooleanFilter(
+        method="filter_has_terms_of_service",
+        label="Has Terms of Service",
+        widget=BooleanWidget,
+    )
+    has_active_terms_of_service = django_filters.BooleanFilter(
+        method="filter_has_active_terms_of_service",
+        label="Has Active Terms of Service",
+        widget=BooleanWidget,
+    )
+    user_has_consent = django_filters.BooleanFilter(
+        method="filter_user_has_consent",
+        label="User Has Consent",
+        widget=BooleanWidget,
     )
 
     o = django_filters.OrderingFilter(
@@ -232,6 +255,42 @@ class OfferingFilter(
 
         return queryset.filter(uuid__in=uuids).distinct()
 
+    def filter_has_active_terms_of_service(self, queryset, name, value):
+        if value is None:
+            return queryset
+
+        if value:
+            return queryset.filter(terms_of_service_configs__is_active=True).distinct()
+        else:
+            return queryset.exclude(terms_of_service_configs__is_active=True).distinct()
+
+    def filter_has_terms_of_service(self, queryset, name, value):
+        if value is None:
+            return queryset
+
+        if value:
+            return queryset.filter(terms_of_service_configs__isnull=False).distinct()
+        else:
+            return queryset.filter(terms_of_service_configs__isnull=True).distinct()
+
+    def filter_user_has_consent(self, queryset, name, value):
+        if value is None:
+            return queryset
+
+        request = self.request
+        if not request or not request.user:
+            return queryset.none() if value else queryset
+
+        user = request.user
+        if value:
+            return queryset.filter(
+                user_consents__user=user, user_consents__revocation_date__isnull=True
+            ).distinct()
+        else:
+            return queryset.exclude(
+                user_consents__user=user, user_consents__revocation_date__isnull=True
+            ).distinct()
+
 
 class OfferingCustomersFilterBackend(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
@@ -271,7 +330,8 @@ class OfferingFilterMixin(django_filters.FilterSet):
         view_name="marketplace-provider-offering-detail",
         field_name="offering__uuid",
     )
-    offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
+    offering_uuid = UUIDInFilter(field_name="offering__uuid")
+    offering_slug = CharInFilter(field_name="offering__slug")
     parent_offering_uuid = django_filters.UUIDFilter(
         field_name="offering__parent__uuid"
     )
@@ -326,7 +386,10 @@ class ScreenshotFilter(OfferingFilterMixin, django_filters.FilterSet):
 class OrderFilter(
     core_filters.CreatedModifiedFilter, OfferingFilterMixin, django_filters.FilterSet
 ):
-    query = django_filters.CharFilter(method="filter_query")
+    query = django_filters.CharFilter(
+        method="filter_query",
+        label="Search by order UUID, project name or resource name",
+    )
     project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
     offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
     offering_type = core_filters.LooseMultipleChoiceFilter(
@@ -337,7 +400,7 @@ class OrderFilter(
     customer_uuid = django_filters.UUIDFilter(field_name="project__customer__uuid")
     service_manager_uuid = django_filters.UUIDFilter(method="filter_service_manager")
     state = core_filters.MappedMultipleChoiceFilter(OrderStates.CHOICES)
-    type = core_filters.MappedMultipleChoiceFilter(models.Order.Types.CHOICES)
+    type = core_filters.MappedMultipleChoiceFilter(OrderTypes.CHOICES)
     resource = core_filters.URLFilter(
         view_name="marketplace-resource-detail", field_name="resource__uuid"
     )
@@ -405,9 +468,14 @@ class ResourceFilter(
     structure_filters.NameFilterSet,
     core_filters.CreatedModifiedFilter,
 ):
-    query = django_filters.CharFilter(method="filter_query", label="Query")
+    query = django_filters.CharFilter(
+        method="filter_query",
+        label="Search by resource UUID, name, backend ID, effective ID, IPs or hypervisor",
+    )
+
     offering_type = django_filters.CharFilter(field_name="offering__type")
-    offering_billable = django_filters.UUIDFilter(field_name="offering__billable")
+    offering_billable = django_filters.BooleanFilter(field_name="offering__billable")
+    plan_uuid = django_filters.UUIDFilter(field_name="plan__uuid")
     project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
     project_name = django_filters.CharFilter(field_name="project__name")
     customer_uuid = django_filters.UUIDFilter(field_name="project__customer__uuid")
@@ -532,6 +600,7 @@ class ResourceScopeFilterBackend(core_filters.GenericKeyFilterBackend):
 class BaseScopedServiceAccountFilter(django_filters.FilterSet):
     username = django_filters.CharFilter(field_name="username")
     email = django_filters.CharFilter(lookup_expr="icontains")
+    state = core_filters.MappedMultipleChoiceFilter(ServiceAccountState.CHOICES)
 
     class Meta:
         model = models.ScopedServiceAccount
@@ -799,8 +868,17 @@ class OfferingUserFilter(OfferingFilterMixin, core_filters.CreatedModifiedFilter
     )
     provider_uuid = django_filters.UUIDFilter(field_name="offering__customer__uuid")
     is_restricted = django_filters.BooleanFilter(field_name="is_restricted")
+    state = core_filters.MappedMultipleChoiceFilter(OfferingUserStates.CHOICES)
+    has_consent = django_filters.BooleanFilter(
+        method="filter_has_consent",
+        label="User Has Consent",
+        widget=BooleanWidget,
+    )
+
     o = django_filters.OrderingFilter(fields=("created", "modified", "username"))
-    query = django_filters.CharFilter(method="filter_query")
+    query = django_filters.CharFilter(
+        method="filter_query", label="Search by offering name, username or user name"
+    )
 
     class Meta:
         model = models.OfferingUser
@@ -812,6 +890,73 @@ class OfferingUserFilter(OfferingFilterMixin, core_filters.CreatedModifiedFilter
             | Q(username__icontains=value)
             | Q(user__first_name__icontains=value)
             | Q(user__last_name__icontains=value)
+        )
+
+    def filter_has_consent(self, queryset, name, value):
+        if value is None:
+            return queryset
+        if value:
+            return queryset.filter(
+                user__offering_consents__offering=F("offering"),
+                user__offering_consents__revocation_date__isnull=True,
+            ).distinct()
+        else:
+            return queryset.exclude(
+                user__offering_consents__offering=F("offering"),
+                user__offering_consents__revocation_date__isnull=True,
+            ).distinct()
+
+
+class OfferingUserChecklistCompletionsFilter(core_filters.CreatedModifiedFilter):
+    """Filter for checklist completions related to offering users."""
+
+    user_uuid = django_filters.UUIDFilter(
+        field_name="scope_object_id",
+        method="filter_user_uuid",
+        label="Filter by user UUID",
+    )
+    offering_uuid = django_filters.UUIDFilter(
+        method="filter_offering_uuid", label="Filter by offering UUID"
+    )
+    is_completed = django_filters.BooleanFilter(field_name="is_completed")
+    o = django_filters.OrderingFilter(fields=("modified", "is_completed"))
+
+    class Meta:
+        model = checklist_models.ChecklistCompletion
+        fields = []
+
+    def filter_user_uuid(self, queryset, name, value):
+        """Filter completions by the UUID of the OfferingUser's user."""
+        if not value:
+            return queryset
+
+        # Get content type for OfferingUser
+        content_type = ContentType.objects.get_for_model(models.OfferingUser)
+
+        # Get OfferingUser IDs that belong to the specified user
+        offering_user_ids = models.OfferingUser.objects.filter(
+            user__uuid=value
+        ).values_list("id", flat=True)
+
+        return queryset.filter(
+            scope_content_type=content_type, scope_object_id__in=offering_user_ids
+        )
+
+    def filter_offering_uuid(self, queryset, name, value):
+        """Filter completions by offering UUID."""
+        if not value:
+            return queryset
+
+        # Get content type for OfferingUser
+        content_type = ContentType.objects.get_for_model(models.OfferingUser)
+
+        # Get OfferingUser IDs that belong to the specified offering
+        offering_user_ids = models.OfferingUser.objects.filter(
+            offering__uuid=value
+        ).values_list("id", flat=True)
+
+        return queryset.filter(
+            scope_content_type=content_type, scope_object_id__in=offering_user_ids
         )
 
 
@@ -1034,6 +1179,61 @@ class BackendResourceRequestFilter(
         fields = []
 
 
+class MaintenanceAnnouncementTemplateFilter(django_filters.FilterSet):
+    service_provider_uuid = django_filters.UUIDFilter(
+        field_name="service_provider__uuid"
+    )
+    maintenance_type = django_filters.NumberFilter(field_name="maintenance_type")
+    o = django_filters.OrderingFilter(fields=("created", "name"))
+
+    class Meta:
+        model = models.MaintenanceAnnouncementTemplate
+        fields = []
+
+
+class MaintenanceAnnouncementFilter(django_filters.FilterSet):
+    service_provider_uuid = django_filters.UUIDFilter(
+        field_name="service_provider__uuid"
+    )
+    maintenance_type = django_filters.NumberFilter(field_name="maintenance_type")
+    state = core_filters.MappedMultipleChoiceFilter(models.MaintenanceState.CHOICES)
+    scheduled_start_after = django_filters.DateTimeFilter(
+        field_name="scheduled_start", lookup_expr="gte"
+    )
+    scheduled_start_before = django_filters.DateTimeFilter(
+        field_name="scheduled_start", lookup_expr="lte"
+    )
+    scheduled_end_after = django_filters.DateTimeFilter(
+        field_name="scheduled_end", lookup_expr="gte"
+    )
+    scheduled_end_before = django_filters.DateTimeFilter(
+        field_name="scheduled_end", lookup_expr="lte"
+    )
+    o = django_filters.OrderingFilter(
+        fields=("created", "name", "scheduled_start", "scheduled_end")
+    )
+
+    class Meta:
+        model = models.MaintenanceAnnouncement
+        fields = []
+
+
+class MaintenanceAnnouncementOfferingTemplateFilter(django_filters.FilterSet):
+    maintenance_template_uuid = django_filters.UUIDFilter(
+        field_name="maintenance_template__uuid"
+    )
+    service_provider_uuid = django_filters.UUIDFilter(
+        field_name="maintenance_template__service_provider__uuid"
+    )
+    offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
+    impact_level = django_filters.NumberFilter(field_name="impact_level")
+    o = django_filters.OrderingFilter(fields=("created",))
+
+    class Meta:
+        model = models.MaintenanceAnnouncementOfferingTemplate
+        fields = []
+
+
 def user_extra_query(user):
     customer_ids = get_connected_customers(
         user, (RoleEnum.CUSTOMER_OWNER, RoleEnum.CUSTOMER_MANAGER)
@@ -1064,3 +1264,111 @@ structure_filters.ExternalCustomerFilterBackend.register(
 )
 
 structure_filters.UserFilterBackend.register_extra_query(user_extra_query)
+
+
+class UserOfferingConsentFilter(django_filters.FilterSet):
+    user = core_filters.URLFilter(view_name="user-detail", field_name="user__uuid")
+    user_uuid = django_filters.UUIDFilter(field_name="user__uuid")
+    offering = core_filters.URLFilter(
+        view_name="marketplace-provider-offering-detail", field_name="offering__uuid"
+    )
+    offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
+    version = django_filters.CharFilter(field_name="version")
+    has_consent = django_filters.BooleanFilter(method="filter_has_consent")
+    requires_reconsent = django_filters.BooleanFilter(
+        method="filter_requires_reconsent"
+    )
+
+    def filter_has_consent(self, queryset, name, value):
+        if value:
+            return queryset.filter(revocation_date__isnull=True)
+        else:
+            return queryset.exclude(revocation_date__isnull=True)
+
+    def filter_requires_reconsent(self, queryset, name, value):
+        if value:
+            return queryset.filter(
+                revocation_date__isnull=True,
+                offering__terms_of_service_configs__is_active=True,
+                offering__terms_of_service_configs__requires_reconsent=True,
+            )
+        else:
+            return queryset.exclude(
+                revocation_date__isnull=True,
+                offering__terms_of_service_configs__is_active=True,
+                offering__terms_of_service_configs__requires_reconsent=True,
+            )
+
+    o = django_filters.OrderingFilter(
+        fields=(
+            "agreement_date",
+            "revocation_date",
+            "created",
+            "modified",
+        )
+    )
+
+    class Meta:
+        model = models.UserOfferingConsent
+        fields = []
+
+
+class OfferingTermsOfServiceFilter(django_filters.FilterSet):
+    offering = core_filters.URLFilter(
+        view_name="marketplace-provider-offering-detail", field_name="offering__uuid"
+    )
+    offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
+    is_active = django_filters.BooleanFilter(field_name="is_active")
+    version = django_filters.CharFilter(field_name="version")
+    requires_reconsent = django_filters.BooleanFilter(field_name="requires_reconsent")
+
+    o = django_filters.OrderingFilter(
+        fields=(
+            "created",
+            "modified",
+            "version",
+        )
+    )
+
+    class Meta:
+        model = models.OfferingTermsOfService
+        fields = [
+            "offering",
+            "offering_uuid",
+            "is_active",
+            "version",
+            "requires_reconsent",
+        ]
+
+
+class CourseAccountFilter(django_filters.FilterSet):
+    username = django_filters.CharFilter(field_name="user__username")
+    email = django_filters.CharFilter(lookup_expr="icontains")
+    state = core_filters.MappedMultipleChoiceFilter(CourseAccountState.choices)
+    project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
+    project_start_date = DateFromToRangeFilter(field_name="project__start_date")
+    project_end_date = DateFromToRangeFilter(field_name="project__end_date")
+    o = django_filters.OrderingFilter(
+        fields=(
+            "created",
+            "modified",
+            "state",
+            "email",
+            ("user__username", "username"),
+            ("project__name", "project_name"),
+            ("project__start_date", "project_start_date"),
+            ("project__end_date", "project_end_date"),
+        )
+    )
+
+    class Meta:
+        model = models.CourseAccount
+        fields = [
+            "username",
+            "email",
+            "state",
+            "project_uuid",
+            "project_start_date",
+            "project_end_date",
+            "o",
+        ]

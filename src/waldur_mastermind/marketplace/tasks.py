@@ -29,6 +29,7 @@ from waldur_mastermind.marketplace import exceptions, models, plugins, utils
 from waldur_mastermind.marketplace.enums import (
     OfferingStates,
     OrderStates,
+    OrderTypes,
     ResourceStates,
     RobotAccountStates,
 )
@@ -208,7 +209,9 @@ def calculate_usage_for_current_month():
 
     for customer in structure_models.Customer.objects.all():
         scopes.append(customer)
-        for project in customer.projects.all():
+        for project in structure_models.Project.available_objects.filter(
+            customer=customer
+        ):
             scopes.append(project)
 
     for scope in scopes:
@@ -247,7 +250,7 @@ def terminate_resources_if_project_end_date_has_been_reached():
                 scopes=[project, project.customer],
             )
             project.delete()
-            return
+            continue
 
         # We expect that resources with parents will be removed when parents are removed
         terminatable_resources = project_resources.filter(
@@ -279,7 +282,7 @@ def terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_o
     failed_creation_resources = (
         models.Order.objects.filter(
             resource__in=resources,
-            type=models.Order.Types.CREATE,
+            type=OrderTypes.CREATE,
             state=OrderStates.ERRED,
         )
         .order_by("-created")
@@ -290,7 +293,7 @@ def terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_o
     resources_with_last_termination_order_erred = (
         models.Order.objects.filter(
             resource__in=resources,
-            type=models.Order.Types.TERMINATE,
+            type=OrderTypes.TERMINATE,
             state=OrderStates.ERRED,
         )
         .order_by("-created")
@@ -471,6 +474,10 @@ def notification_about_resource_ending():
 def send_metrics():
     """Send anonymous usage metrics and telemetry data to the Waldur team."""
     if not core_models.Feature.objects.filter(key="telemetry.send_metrics").exists():
+        return
+
+    # skip sending if setting is unset
+    if not config.TELEMETRY_URL:
         return
 
     site_name = config.HOMEPORT_URL

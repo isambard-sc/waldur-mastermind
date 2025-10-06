@@ -57,7 +57,7 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
         return proposal_factories.CallFactory(
             manager=self.manager,
             state=CallStates.ACTIVE,
-            created_by=self.owner,
+            created_by=self.call_organizer_user,
         )
 
     @property
@@ -136,6 +136,7 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
     @cached_property
     def proposal(self):
         return proposal_factories.ProposalFactory(
+            name="New Proposal",
             round=self.round,
             project=self.proposal_project,
         )
@@ -147,6 +148,7 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
     @cached_property
     def proposal_submitted(self):
         return proposal_factories.ProposalFactory(
+            name="Proposal submitted",
             round=self.round,
             state=ProposalStates.SUBMITTED,
             project=self.proposal_project,
@@ -195,5 +197,4 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
         user = structure_factories.UserFactory()
         role = CallRole.MANAGER
         self.call.add_user(user, role)
-        self.manager.add_user(user, role)
         return user

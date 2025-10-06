@@ -476,7 +476,7 @@ class RequestType(
         return self.name
 
 
-class IssueStatus(models.Model):
+class IssueStatus(core_models.UuidMixin, models.Model):
     """This model is needed in order to understand whether the issue has been solved or not.
 
     The field of resolution does not give an exact answer since may be the same in both cases.
@@ -495,6 +495,9 @@ class IssueStatus(models.Model):
         max_length=255, help_text="Status name in Jira.", unique=True
     )
     type = FSMIntegerField(default=Types.RESOLVED, choices=TYPE_CHOICES)
+
+    def __str__(self):
+        return f"{self.name} / {self.type}"
 
     @classmethod
     def check_success_status(cls, status):

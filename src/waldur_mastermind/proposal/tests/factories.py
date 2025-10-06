@@ -1,8 +1,13 @@
 import datetime
 
 import factory
+from django.contrib.contenttypes.models import ContentType
 from rest_framework.reverse import reverse
 
+from waldur_core.checklist import models as checklist_models
+from waldur_core.checklist.tests import (
+    factories as checklist_factories,
+)
 from waldur_core.core.tests.types import BaseMetaFactory
 from waldur_core.permissions import fixtures as permissions_fixtures
 from waldur_core.structure.tests import factories as structure_factories
@@ -325,4 +330,34 @@ class ProposalProjectRoleMappingFactory(
             kwargs={"uuid": mapping.uuid.hex},
         )
 
+        return url if action is None else url + action + "/"
+
+
+# Checklist Integration Factories
+
+
+class ProposalChecklistCompletionFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[checklist_models.ChecklistCompletion],
+):
+    class Meta:
+        model = checklist_models.ChecklistCompletion
+
+    checklist = factory.SubFactory(checklist_factories.ChecklistFactory)
+    scope_content_type = factory.LazyAttribute(
+        lambda obj: ContentType.objects.get_for_model(models.Proposal)
+    )
+    scope_object_id = factory.SelfAttribute("proposal.id")
+
+    # Helper field to create the proposal - not part of the model
+    proposal = factory.SubFactory(ProposalFactory)
+
+    @classmethod
+    def get_url(cls, completion=None, action=None):
+        if completion is None:
+            completion = ProposalChecklistCompletionFactory()
+        url = "http://testserver" + reverse(
+            "proposal-checklist-completion-detail",
+            kwargs={"uuid": completion.uuid.hex},
+        )
         return url if action is None else url + action + "/"

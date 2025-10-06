@@ -158,6 +158,12 @@ class InvoiceItemUpdateSerializer(serializers.HyperlinkedModelSerializer):
 
     def get_fields(self):
         fields = super().get_fields()
+
+        # Check if this is schema generation context (drf-spectacular)
+        # When generating schema, we want to include all fields
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
+            return fields
+
         if self.instance:
             plan_component = self.instance.get_plan_component()
             if plan_component:
@@ -857,19 +863,34 @@ class ReferenceNumberSerializer(serializers.ModelSerializer):
 @extend_schema_field(PaymentProfileSerializer(many=True))
 def get_payment_profiles(serializer, customer: structure_models.Customer):
     user = serializer.context["request"].user
-    if user.is_staff or user.is_support:
-        return PaymentProfileSerializer(
-            customer.paymentprofile_set.all(),
-            many=True,
-            context={"request": serializer.context["request"]},
-        ).data
 
-    if structure_permissions._has_owner_access(user, customer):
-        return PaymentProfileSerializer(
-            customer.paymentprofile_set.filter(is_active=True),
-            many=True,
-            context={"request": serializer.context["request"]},
-        ).data
+    # Use prefetched data if available to avoid N+1 queries
+    if (
+        hasattr(customer, "_prefetched_objects_cache")
+        and "paymentprofile_set" in customer._prefetched_objects_cache
+    ):
+        profiles = list(customer._prefetched_objects_cache["paymentprofile_set"])
+
+        # Filter in Python if needed
+        if not (user.is_staff or user.is_support):
+            if structure_permissions._has_owner_access(user, customer):
+                profiles = [p for p in profiles if p.is_active]
+            else:
+                return None
+    else:
+        # Fallback to original query behavior
+        if user.is_staff or user.is_support:
+            profiles = customer.paymentprofile_set.all()
+        elif structure_permissions._has_owner_access(user, customer):
+            profiles = customer.paymentprofile_set.filter(is_active=True)
+        else:
+            return None
+
+    return PaymentProfileSerializer(
+        profiles,
+        many=True,
+        context={"request": serializer.context["request"]},
+    ).data
 
 
 def add_payment_profile(sender, fields, **kwargs):
@@ -1129,10 +1150,22 @@ core_signals.pre_serializer_fields.connect(
 
 
 def get_customer_credit(serializer, customer) -> float | None:
-    try:
-        return models.CustomerCredit.objects.get(customer=customer).value
-    except models.CustomerCredit.DoesNotExist:
+    # Use prefetched data if available to avoid N+1 queries
+    if (
+        hasattr(customer, "_prefetched_objects_cache")
+        and "customercredit" in customer._prefetched_objects_cache
+    ):
+        # For OneToOneField, Django stores the related object directly, not as a list
+        credit = customer._prefetched_objects_cache.get("customercredit")
+        if credit:
+            return credit.value
         return None
+    else:
+        # Fallback to original query behavior
+        try:
+            return models.CustomerCredit.objects.get(customer=customer).value
+        except models.CustomerCredit.DoesNotExist:
+            return None
 
 
 def add_customer_credit(sender, fields, **kwargs):
@@ -1140,20 +1173,70 @@ def add_customer_credit(sender, fields, **kwargs):
     fields["customer_credit"] = serializers.SerializerMethodField()
     setattr(sender, "get_customer_credit", get_customer_credit)
 
+    # Also optimize eager loading for CustomerSerializer
+    if sender.__name__ == "CustomerSerializer":
+        _optimize_customer_serializer_eager_load_for_credit(sender)
+
+
+def _optimize_customer_serializer_eager_load_for_credit(sender):
+    """Optimize eager loading for CustomerSerializer to prefetch customer credits."""
+    # Check if we already have an optimized eager_load method
+    if hasattr(sender.eager_load, "_credit_optimized"):
+        return
+
+    # Store the original eager_load method
+    original_eager_load = sender.eager_load
+
+    @staticmethod
+    def optimized_eager_load(queryset, request=None):
+        # Call the original eager_load first
+        queryset = original_eager_load(queryset, request)
+
+        # Add optimizations for customer_credit if requested
+        if request:
+            fields = request.query_params.getlist("field")
+
+            # Prefetch customer credit if requested
+            if "customer_credit" in fields:
+                queryset = queryset.select_related("customercredit")
+
+        return queryset
+
+    # Mark as optimized to avoid double optimization
+    optimized_eager_load._credit_optimized = True
+
+    # Replace the eager_load method
+    sender.eager_load = optimized_eager_load
+
 
 def get_customer_unallocated_credit(serializer, customer) -> float | None:
-    try:
-        customer_credit = models.CustomerCredit.objects.get(customer=customer).value
-        project_credits_sum = (
-            models.ProjectCredit.objects.filter(project__customer=customer).aggregate(
-                sum=Sum("value")
-            )["sum"]
-            or 0
-        )
+    # Use prefetched data if available to avoid N+1 queries for customer credit
+    if (
+        hasattr(customer, "_prefetched_objects_cache")
+        and "customercredit" in customer._prefetched_objects_cache
+    ):
+        # For OneToOneField, Django stores the related object directly, not as a list
+        credit = customer._prefetched_objects_cache.get("customercredit")
+        if not credit:
+            return None
+        customer_credit = credit.value
+    else:
+        # Fallback to original query behavior
+        try:
+            customer_credit = models.CustomerCredit.objects.get(customer=customer).value
+        except models.CustomerCredit.DoesNotExist:
+            return None
 
-        return customer_credit - project_credits_sum
-    except models.CustomerCredit.DoesNotExist:
-        return None
+    # Calculate project credits sum
+    # TODO: This could be further optimized with bulk prefetching
+    project_credits_sum = (
+        models.ProjectCredit.objects.filter(project__customer=customer).aggregate(
+            sum=Sum("value")
+        )["sum"]
+        or 0
+    )
+
+    return customer_credit - project_credits_sum
 
 
 def add_customer_unallocated_credit(sender, fields, **kwargs):

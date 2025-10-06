@@ -53,7 +53,7 @@ from waldur_openstack.session import (
     get_neutron_client,
     get_nova_client,
 )
-from waldur_openstack.utils import is_valid_volume_type_name
+from waldur_openstack.utils import get_external_network_id, is_valid_volume_type_name
 
 from . import models, signals
 
@@ -2349,27 +2349,63 @@ class OpenStackBackend(ServiceBackend):
 
     @log_backend_action()
     def detect_external_network(self, tenant: models.Tenant):
+        """
+        Detect and recover external network configuration for tenant.
+        If no external network is found but one is configured in settings, attempt auto-recovery.
+        """
         session = get_tenant_session(tenant)
         neutron = get_neutron_client(session)
         try:
             routers = neutron.list_routers(tenant_id=tenant.backend_id)["routers"]
         except neutron_exceptions.NeutronClientException as e:
             raise OpenStackBackendError(e)
+
+        # Check if router exists with external gateway
         if bool(routers):
             router = routers[0]
-        else:
-            logger.warning(
-                "Tenant %s (PK: %s) does not have connected routers.", tenant, tenant.pk
-            )
-            return
+            ext_gw = router.get("external_gateway_info", {})
+            if ext_gw and "network_id" in ext_gw:
+                tenant.external_network_id = ext_gw["network_id"]
+                tenant.save()
+                logger.info(
+                    "Found and set external network with id %s for tenant %s (PK: %s)",
+                    ext_gw["network_id"],
+                    tenant,
+                    tenant.pk,
+                )
+                return
 
-        ext_gw = router.get("external_gateway_info", {})
-        if ext_gw and "network_id" in ext_gw:
-            tenant.external_network_id = ext_gw["network_id"]
-            tenant.save()
+        # Auto-recovery: Check if external network is configured but not connected
+        expected_external_network_id = get_external_network_id(tenant)
+        if expected_external_network_id and not tenant.external_network_id:
             logger.info(
-                "Found and set external network with id %s for tenant %s (PK: %s)",
-                ext_gw["network_id"],
+                "Attempting auto-recovery: connecting tenant %s (PK: %s) to external network %s",
+                tenant,
+                tenant.pk,
+                expected_external_network_id,
+            )
+            try:
+                # Try to connect to external network
+                self.connect_tenant_to_external_network(
+                    tenant, expected_external_network_id
+                )
+                logger.info(
+                    "Auto-recovery successful: connected tenant %s (PK: %s) to external network %s",
+                    tenant,
+                    tenant.pk,
+                    expected_external_network_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Auto-recovery failed for tenant %s (PK: %s): %s. "
+                    "Manual intervention may be required.",
+                    tenant,
+                    tenant.pk,
+                    e,
+                )
+        elif not routers:
+            logger.warning(
+                "Tenant %s (PK: %s) does not have connected routers and no external network configured.",
                 tenant,
                 tenant.pk,
             )
@@ -2784,13 +2820,38 @@ class OpenStackBackend(ServiceBackend):
 
     @log_backend_action("create floating ip")
     def create_floating_ip(self, floating_ip: models.FloatingIP):
+        external_network_id = get_external_network_id(floating_ip.tenant)
+
+        # If external_network_id from settings but not on tenant, attempt recovery
+        if external_network_id and not floating_ip.tenant.external_network_id:
+            logger.info(
+                "Attempting to recover external network for tenant %s before floating IP creation",
+                floating_ip.tenant,
+            )
+            try:
+                self.detect_external_network(floating_ip.tenant)
+                floating_ip.tenant.refresh_from_db()
+                # Re-check after recovery attempt
+                external_network_id = get_external_network_id(floating_ip.tenant)
+            except Exception as e:
+                logger.warning(
+                    "Failed to recover external network for tenant %s: %s. Proceeding with settings value.",
+                    floating_ip.tenant,
+                    e,
+                )
+
+        if not external_network_id:
+            raise OpenStackBackendError(
+                "Cannot create floating IP: external network ID is not defined for tenant."
+            )
+
         session = get_tenant_session(floating_ip.tenant)
         neutron = get_neutron_client(session)
         try:
             backend_floating_ip = neutron.create_floatingip(
                 {
                     "floatingip": {
-                        "floating_network_id": floating_ip.tenant.external_network_id,
+                        "floating_network_id": external_network_id,
                         "tenant_id": floating_ip.tenant.backend_id,
                     }
                 }
@@ -3025,7 +3086,7 @@ class OpenStackBackend(ServiceBackend):
             "tenant_id": port.tenant.backend_id,
         }
         if port.fixed_ips:
-            port_payload["fixed_ips"]: port.fixed_ips
+            port_payload["fixed_ips"] = port.fixed_ips
 
         if port.mac_address:
             port_payload["mac_address"] = port.mac_address
@@ -3351,35 +3412,22 @@ class OpenStackBackend(ServiceBackend):
                 handle_resource_update_success(snapshot)
 
     def pull_tenant_instances(self, tenant: models.Tenant):
-        backend_instances = self.get_instances(tenant)
         instances = models.Instance.objects.filter(
             tenant=tenant,
             state__in=[CoreStates.OK, CoreStates.ERRED],
         )
-        backend_instances_map = {
-            backend_instance.backend_id: backend_instance
-            for backend_instance in backend_instances
-        }
         for instance in instances:
             try:
-                backend_instance = backend_instances_map[instance.backend_id]
-            except KeyError:
-                handle_resource_not_found(instance)
-            else:
-                self.update_instance_fields(instance, backend_instance)
+                # Use pull_instance which has all the enhanced logic including image detection
+                self.pull_instance(instance)
                 # XXX: can be optimized after https://goo.gl/BZKo8Y will be resolved.
                 self.pull_instance_security_groups(instance)
                 handle_resource_update_success(instance)
-
-    def update_instance_fields(self, instance: models.Instance, backend_instance):
-        # Preserve flavor fields in Waldur database if flavor is deleted in OpenStack
-        fields = set(models.Instance.get_backend_fields())
-        flavor_fields = {"flavor_name", "flavor_disk", "ram", "cores", "disk"}
-        if not backend_instance.flavor_name:
-            fields = fields - flavor_fields
-        fields = list(fields)
-
-        update_pulled_fields(instance, backend_instance, fields)
+            except nova_exceptions.NotFound:
+                handle_resource_not_found(instance)
+            except nova_exceptions.ClientException:
+                # Log the error but continue with other instances
+                handle_resource_update_success(instance)
 
     def pull_instance_server_group(self, instance: models.Instance):
         session = get_tenant_session(instance.tenant)
@@ -4207,6 +4255,32 @@ class OpenStackBackend(ServiceBackend):
             ]
             flavor_id = backend_instance.flavor["id"]
             image_id = backend_instance.image and backend_instance.image.get("id")
+
+            # If no image_id from instance metadata, try to get it from bootable volumes
+            detected_image_name = None
+            if not image_id:
+                detected_image_id, detected_image_name = (
+                    self._detect_image_from_bootable_volumes(
+                        tenant, attached_volume_ids, backend_instance
+                    )
+                )
+                # First try to use detected_image_id if it corresponds to an existing Image in Waldur
+                if detected_image_id:
+                    try:
+                        models.Image.objects.get(
+                            settings=tenant.service_settings,
+                            backend_id=detected_image_id,
+                        )
+                        image_id = detected_image_id
+                        detected_image_name = (
+                            None  # Clear image name since we're using image_id
+                        )
+                    except models.Image.DoesNotExist:
+                        # If image_id doesn't exist in Waldur, use image_name directly
+                        # Don't try to convert image_name back to image_id
+                        pass
+        except nova_exceptions.NotFound:
+            raise
         except nova_exceptions.ClientException as e:
             raise OpenStackBackendError(e)
 
@@ -4216,6 +4290,7 @@ class OpenStackBackend(ServiceBackend):
             flavor_id,
             connected_internal_network_names,
             image_id,
+            detected_image_name,
         )
         with transaction.atomic():
             instance.tenant = tenant
@@ -4250,6 +4325,95 @@ class OpenStackBackend(ServiceBackend):
                 )
         return volumes
 
+    def _detect_image_from_bootable_volumes(
+        self, tenant: models.Tenant, attached_volume_ids, backend_instance=None
+    ):
+        """
+        Detect image ID or image name from bootable volumes when instance metadata doesn't contain image info.
+        This is useful for instances booted from volumes where the original image reference is lost.
+
+        Uses existing Volume records in Waldur database that already have image_metadata populated.
+
+        Prioritizes volumes in this order:
+        1. Boot volume (attached to root device like /dev/vda)
+        2. First bootable volume in attachment order
+        3. Any bootable volume with image metadata
+
+        Returns:
+            tuple: (image_id, image_name) where image_id can be None if not found,
+                   but image_name might still be available for fallback lookup
+        """
+        bootable_volumes = []
+        root_device_name = None
+
+        # Get root device name if backend_instance is provided
+        if backend_instance:
+            # OpenStack uses underscored attribute names in the client
+            root_device_name = getattr(
+                backend_instance, "OS-EXT-SRV-ATTR:root_device_name", None
+            )
+            # If that doesn't work, try accessing via dict-like interface
+            if not root_device_name and hasattr(backend_instance, "to_dict"):
+                instance_dict = backend_instance.to_dict()
+                root_device_name = instance_dict.get("OS-EXT-SRV-ATTR:root_device_name")
+
+        # Look up volumes in Waldur database by their backend_id
+        # Process volumes in the order they appear in attached_volume_ids (attachment order)
+        for order_index, backend_volume_id in enumerate(attached_volume_ids):
+            try:
+                # Find the volume in Waldur database
+                volume = models.Volume.objects.get(
+                    tenant=tenant, backend_id=backend_volume_id
+                )
+
+                # Check if volume is bootable and has image_metadata
+                if volume.bootable and volume.image_metadata:
+                    image_id = volume.image_metadata.get("image_id")
+                    image_name = volume.image_metadata.get("image_name")
+
+                    # Include volume if it has either image_id or image_name
+                    if image_id or image_name:
+                        # Check if this volume is attached to the root device
+                        is_root_volume = (
+                            (volume.device == root_device_name)
+                            if root_device_name
+                            else False
+                        )
+
+                        bootable_volumes.append(
+                            {
+                                "volume_id": backend_volume_id,
+                                "image_id": image_id,
+                                "image_name": image_name,
+                                "is_root": is_root_volume,
+                                "device": volume.device,
+                                "order": order_index,
+                                "has_image_id": bool(image_id),
+                            }
+                        )
+            except models.Volume.DoesNotExist:
+                # Volume not yet imported in Waldur, skip it
+                continue
+
+        if not bootable_volumes:
+            return None, None
+
+        # Sort bootable volumes by priority:
+        # 1. Root volumes first (identified by root_device_name)
+        # 2. Volumes with image_id over volumes with only image_name
+        # 3. Then by attachment order (first attached volume)
+        # 4. Then by device name (vda comes before vdb, etc.)
+        def volume_priority(vol):
+            if vol["is_root"]:
+                return (0, not vol["has_image_id"], vol["order"], vol["device"])
+            return (1, not vol["has_image_id"], vol["order"], vol["device"])
+
+        bootable_volumes.sort(key=volume_priority)
+
+        # Return both image_id and image_name from the highest priority bootable volume
+        best_volume = bootable_volumes[0]
+        return best_volume["image_id"], best_volume["image_name"]
+
     def _backend_instance_to_instance(
         self,
         tenant: models.Tenant,
@@ -4257,6 +4421,7 @@ class OpenStackBackend(ServiceBackend):
         backend_flavor_id=None,
         connected_internal_network_names=None,
         backend_image_id=None,
+        backend_image_name=None,
     ):
         # parse launch time
         try:
@@ -4343,7 +4508,12 @@ class OpenStackBackend(ServiceBackend):
                 backend_image = self._get_image(tenant, backend_image_id)
                 # If image has been removed in OpenStack cloud, we should skip update
                 if backend_image:
-                    instance.image_name = backend_image.name
+                    instance.image_name = str(
+                        backend_image.name
+                    )  # Ensure string conversion
+        elif backend_image_name:
+            # Use the provided image name directly (from volume metadata fallback)
+            instance.image_name = str(backend_image_name)  # Ensure string conversion
 
         attached_volumes = backend_instance.to_dict().get(
             "os-extended-volumes:volumes_attached", []
@@ -4397,7 +4567,7 @@ class OpenStackBackend(ServiceBackend):
             image_id = backend_instance.image and backend_instance.image.get("id")
             instances.append(
                 self._backend_instance_to_instance(
-                    tenant, backend_instance, flavor_id, backend_image_id=image_id
+                    tenant, backend_instance, flavor_id, None, image_id, None
                 )
             )
         return instances
@@ -4466,6 +4636,7 @@ class OpenStackBackend(ServiceBackend):
         Therefore we do not pull default zone at all. Please note, however, that default zone
         name could be changed in Nova and Cinder config. We don't support this use case either.
 
+
         All availability zones are split into 3 subsets: stale, missing and common.
         Stale zone are removed, missing zones are created.
         If zone state has been changed, it is synchronized.
@@ -4482,10 +4653,11 @@ class OpenStackBackend(ServiceBackend):
 
         missing_zones = set(back_zones_map.keys()) - set(front_zones_map.keys())
         for zone in missing_zones:
-            frontend_model.objects.create(
+            frontend_model.objects.get_or_create(
                 settings=self.settings,
                 tenant=tenant,
                 name=zone,
+                defaults={"available": back_zones_map[zone]},
             )
 
         stale_zones = set(front_zones_map.keys()) - set(back_zones_map.keys())
@@ -4832,9 +5004,24 @@ class OpenStackBackend(ServiceBackend):
         session = get_tenant_session(instance.tenant)
         nova = get_nova_client(session)
         server_id = instance.backend_id
+
+        logger.info(
+            f"Starting security group sync for instance {instance.name} "
+            f"(UUID: {instance.uuid}, backend_id: {server_id}) "
+            f"in tenant {instance.tenant.name}"
+        )
+
         try:
             remote_groups = nova.servers.list_security_group(server_id)
+            logger.info(
+                f"Nova API returned {len(remote_groups)} security groups for server {server_id}: "
+                f"{[{'id': g.id, 'name': getattr(g, 'name', 'unknown')} for g in remote_groups]}"
+            )
         except nova_exceptions.ClientException as e:
+            logger.error(
+                f"Failed to fetch security groups from Nova API for server {server_id} "
+                f"in tenant {instance.tenant.name}: {e}"
+            )
             raise OpenStackBackendError(e)
         tenant_groups = models.SecurityGroup.objects.filter(tenant=instance.tenant)
 
@@ -4845,8 +5032,24 @@ class OpenStackBackend(ServiceBackend):
             .values_list("backend_id", flat=True)
         )
 
+        logger.info(
+            f"Security group sync comparison for instance {instance.name}: "
+            f"remote_ids={remote_ids}, local_ids={local_ids}, "
+            f"to_remove={local_ids - remote_ids}, to_add={remote_ids - local_ids}"
+        )
+
         # remove stale groups
         stale_groups = tenant_groups.filter(backend_id__in=(local_ids - remote_ids))
+        if stale_groups.exists():
+            stale_group_info = [
+                {"name": sg.name, "uuid": str(sg.uuid), "backend_id": sg.backend_id}
+                for sg in stale_groups
+            ]
+            logger.info(
+                f"Removing {stale_groups.count()} stale security groups from instance {instance.name}: "
+                f"{stale_group_info}. Remote groups returned by Nova: "
+                f"{[{'id': g.id, 'name': getattr(g, 'name', 'unknown')} for g in remote_groups]}"
+            )
         instance.security_groups.remove(*stale_groups)
         for security_group in stale_groups:
             event_logger.emit(
@@ -5102,104 +5305,171 @@ class OpenStackBackend(ServiceBackend):
 
         self._pull_zones(tenant, backend_zones, models.VolumeAvailabilityZone)
 
+    @reraise_exceptions
     @log_backend_action()
     def pull_tenant_network_rbac_policies(self, tenant: models.Tenant):
         """Pull network RBAC policies from OpenStack for a tenant."""
         # Use admin session to get full access to all RBAC policies
         neutron = get_neutron_client(self.admin_session)
 
-        try:
-            # Get all networks that belong to this tenant
-            tenant_networks = models.Network.objects.filter(tenant=tenant)
-            if not tenant_networks.exists():
-                return
+        # Get all network RBAC policies from OpenStack
+        backend_policies = neutron.list_rbac_policies(object_type="network")[
+            "rbac_policies"
+        ]
 
-            # Get network backend IDs for filtering
-            network_backend_ids = list(
-                tenant_networks.values_list("backend_id", flat=True)
+        # Process INCOMING network sharing policies - networks shared TO this tenant by other tenants
+        # This should always run, even if tenant has no networks
+
+        incoming_policies = [
+            p for p in backend_policies if p["target_tenant"] == tenant.backend_id
+        ]
+
+        processed_incoming_policy_ids = []
+
+        for backend_policy in incoming_policies:
+            network = models.Network.objects.filter(
+                backend_id=backend_policy["object_id"]
+            ).first()
+
+            if not network:
+                continue
+
+            if network.tenant.service_settings != tenant.service_settings:
+                # Skip policies whose source tenant exists in other service
+                logger.debug(
+                    "Skipping RBAC policy %s because source tenant exists in the other service %s",
+                    str(network.tenant.service_settings),
+                )
+                event_logger.emit(
+                    "RBAC policy %s skipped: source tenant %s from different service %s",
+                    event_type=EventType.OPENSTACK_NETWORK_PULLED,
+                    event_context={
+                        "rbac_policy_id": backend_policy["id"],
+                        "source_tenant": network.tenant,
+                        "target_tenant": tenant,
+                        "network": network,
+                    },
+                    scopes=[tenant, network.tenant],
+                )
+                continue
+
+            # Create or update the RBAC policy
+            policy, created = models.NetworkRBACPolicy.objects.update_or_create(
+                backend_id=backend_policy["id"],
+                defaults={
+                    "network": network,
+                    "target_tenant": tenant,
+                    "policy_type": backend_policy["action"],
+                },
             )
 
-            # Get all network RBAC policies from OpenStack
-            backend_policies = neutron.list_rbac_policies(object_type="network")[
-                "rbac_policies"
-            ]
-
-            # Filter policies that are:
-            # 2. For networks belonging to this tenant
-            relevant_policies = [
-                p for p in backend_policies if p["object_id"] in network_backend_ids
-            ]
-
-            # Create a mapping of network backend_ids to model instances for faster lookup
-            networks_map = {network.backend_id: network for network in tenant_networks}
-
-            # Track processed policies for cleanup
-            processed_policy_ids = []
-
-            # Process each policy
-            for backend_policy in relevant_policies:
-                network = networks_map.get(backend_policy["object_id"])
-                if not network:
-                    # Skip if network doesn't exist (should not happen given our filtering)
-                    continue
-
-                try:
-                    target_tenant = models.Tenant.objects.get(
-                        backend_id=backend_policy["target_tenant"],
-                        service_settings=tenant.service_settings,
-                    )
-                except models.Tenant.DoesNotExist:
-                    # Skip policies whose target tenant doesn't exist in Waldur
-                    logger.debug(
-                        "Skipping RBAC policy %s because target tenant %s doesn't exist in Waldur",
-                        backend_policy["id"],
-                        backend_policy["target_tenant"],
-                    )
-                    continue
-
-                # Create or update the RBAC policy
-                policy, created = models.NetworkRBACPolicy.objects.update_or_create(
-                    backend_id=backend_policy["id"],
-                    defaults={
-                        "network": network,
-                        "target_tenant": target_tenant,
-                        "policy_type": backend_policy["action"],
-                    },
-                )
-
-                if created:
-                    logger.info(
-                        "Created NetworkRBACPolicy from backend: %s (network: %s, target: %s)",
-                        backend_policy["id"],
-                        network.name,
-                        target_tenant.name,
-                    )
-
-                processed_policy_ids.append(backend_policy["id"])
-
-            # Clean up stale policies
-            stale_policies = models.NetworkRBACPolicy.objects.filter(
-                network__in=tenant_networks
-            ).exclude(backend_id__in=processed_policy_ids)
-
-            # Log and delete stale policies
-            for policy in stale_policies:
+            if created:
                 logger.info(
-                    "Deleting stale NetworkRBACPolicy: %s (network: %s, target: %s)",
-                    policy.backend_id,
-                    policy.network.name,
-                    policy.target_tenant.name,
+                    "Created NetworkRBACPolicy from backend: %s (network: %s, source tenant: %s)",
+                    backend_policy["id"],
+                    network.name,
+                    network.tenant.name,
                 )
 
-            stale_count = stale_policies.count()
-            stale_policies.delete()
+            processed_incoming_policy_ids.append(backend_policy["id"])
 
-            if stale_count:
-                logger.info("Deleted %d stale NetworkRBACPolicy objects", stale_count)
+        # Clean up stale policies
+        stale_incoming_policies = models.NetworkRBACPolicy.objects.filter(
+            target_tenant=tenant
+        ).exclude(backend_id__in=processed_incoming_policy_ids)
 
-        except neutron_exceptions.NeutronClientException as e:
-            logger.error("Error pulling network RBAC policies: %s", e)
-            raise OpenStackBackendError(e)
+        # Log and delete stale policies
+        for policy in stale_incoming_policies:
+            logger.info(
+                "Deleting stale NetworkRBACPolicy: %s (network: %s, target: %s)",
+                policy.backend_id,
+                policy.network.name,
+                policy.target_tenant.name,
+            )
+
+        stale_count = stale_incoming_policies.count()
+        stale_incoming_policies.delete()
+
+        if stale_count:
+            logger.info("Deleted %d stale NetworkRBACPolicy objects", stale_count)
+
+        # Process OUTGOING policies only if tenant has networks
+        tenant_networks = tenant.networks.all()
+        processed_policy_ids = []
+
+        if not tenant_networks.exists():
+            return
+
+        # Get network backend IDs for filtering
+        network_backend_ids = list(tenant_networks.values_list("backend_id", flat=True))
+
+        # Filter policies that are for networks belonging to this tenant
+        outgoing_policies = [
+            p for p in backend_policies if p["object_id"] in network_backend_ids
+        ]
+
+        # Process each outgoing policy
+        for backend_policy in outgoing_policies:
+            network = tenant_networks.filter(
+                backend_id=backend_policy["object_id"]
+            ).first()
+
+            if not network:
+                continue
+
+            try:
+                target_tenant = models.Tenant.objects.get(
+                    backend_id=backend_policy["target_tenant"],
+                    service_settings=tenant.service_settings,
+                )
+            except models.Tenant.DoesNotExist:
+                # Skip policies whose target tenant doesn't exist in Waldur
+                logger.debug(
+                    "Skipping RBAC policy %s because target tenant %s doesn't exist in Waldur",
+                    backend_policy["id"],
+                    backend_policy["target_tenant"],
+                )
+                continue
+
+            # Create or update the RBAC policy
+            policy, created = models.NetworkRBACPolicy.objects.update_or_create(
+                backend_id=backend_policy["id"],
+                defaults={
+                    "network": network,
+                    "target_tenant": target_tenant,
+                    "policy_type": backend_policy["action"],
+                },
+            )
+
+            if created:
+                logger.info(
+                    "Created NetworkRBACPolicy from backend: %s (network: %s, target: %s)",
+                    backend_policy["id"],
+                    network.name,
+                    target_tenant.name,
+                )
+
+            processed_policy_ids.append(backend_policy["id"])
+
+        # Clean up stale outgoing policies
+        stale_policies = models.NetworkRBACPolicy.objects.filter(
+            network__in=tenant_networks
+        ).exclude(backend_id__in=processed_policy_ids)
+
+        # Log and delete stale policies
+        for policy in stale_policies:
+            logger.info(
+                "Deleting stale NetworkRBACPolicy: %s (network: %s, target: %s)",
+                policy.backend_id,
+                policy.network.name,
+                policy.target_tenant.name,
+            )
+
+        stale_count = stale_policies.count()
+        stale_policies.delete()
+
+        if stale_count:
+            logger.info("Deleted %d stale NetworkRBACPolicy objects", stale_count)
 
     @reraise_exceptions
     def create_network_rbac_policy(

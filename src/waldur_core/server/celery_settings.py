@@ -1,17 +1,23 @@
 import warnings
 from datetime import timedelta
 
+from celery.schedules import crontab
+from kombu import Queue
+
 from waldur_core.core import WaldurExtension
 
-CELERY_TASK_QUEUES = {
-    "tasks": {"exchange": "tasks"},
-    "heavy": {"exchange": "heavy"},
-    "background": {"exchange": "background"},
-}
+CELERY_TASK_QUEUES = [
+    Queue("tasks", exchange="tasks"),
+    Queue("heavy", exchange="heavy"),
+    Queue("background", exchange="background"),
+]
 CELERY_TASK_DEFAULT_QUEUE = "tasks"
 CELERY_TASK_ROUTES = ("waldur_core.server.celeryconf.PriorityRouter",)
 CELERY_TRACK_STARTED = True
 CELERY_SEND_EVENTS = True
+
+# Fix for Celery 6.0 deprecation warning
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 
 # Regular tasks
 CELERY_BEAT_SCHEDULE = {
@@ -22,7 +28,8 @@ CELERY_BEAT_SCHEDULE = {
     },
     "pull-service-resources": {
         "task": "waldur_core.structure.ServiceResourcesListPullTask",
-        "schedule": timedelta(hours=1),
+        # Pull resources strictly at the beginning of an hour
+        "schedule": crontab(minute=0),
         "args": (),
     },
     "check-expired-permissions": {
@@ -65,6 +72,11 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": timedelta(hours=24),
         "args": (),
     },
+    "create_project_permission_reviews": {
+        "task": "waldur_core.structure.create_project_permission_reviews",
+        "schedule": timedelta(hours=24),
+        "args": (),
+    },
     "update-custom-quotas": {
         "task": "waldur_core.quotas.update_custom_quotas",
         "schedule": timedelta(hours=1),
@@ -72,6 +84,11 @@ CELERY_BEAT_SCHEDULE = {
     },
     "update-standard-quotas": {
         "task": "waldur_core.quotas.update_standard_quotas",
+        "schedule": timedelta(hours=24),
+        "args": (),
+    },
+    "cleanup-orphaned-answers": {
+        "task": "waldur_core.checklist.cleanup_orphaned_answers",
         "schedule": timedelta(hours=24),
         "args": (),
     },

@@ -3,13 +3,14 @@ from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures
-from waldur_mastermind.booking import PLUGIN_NAME
 from waldur_mastermind.booking import models as booking_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import (
+    BOOKING_OFFERING,
     OfferingStates,
     OrderStates,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
@@ -18,7 +19,7 @@ from waldur_mastermind.marketplace.tests import factories as marketplace_factori
 class OrderProcessedTest(test.APITransactionTestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.ProjectFixture()
-        self.offering = marketplace_factories.OfferingFactory(type=PLUGIN_NAME)
+        self.offering = marketplace_factories.OfferingFactory(type=BOOKING_OFFERING)
 
     def test_resource_is_created_when_order_is_processed(self):
         order = marketplace_factories.OrderFactory(
@@ -48,7 +49,7 @@ class OrderProcessedTest(test.APITransactionTestCase):
 
         order = marketplace_factories.OrderFactory(
             offering=self.offering,
-            type=marketplace_models.Order.Types.TERMINATE,
+            type=OrderTypes.TERMINATE,
             resource=resource,
             state=OrderStates.EXECUTING,
         )
@@ -66,7 +67,7 @@ class OrderCreateTest(test.APITransactionTestCase):
         self.project = self.fixture.project
         self.user = self.fixture.admin
         self.offering = marketplace_factories.OfferingFactory(
-            type=PLUGIN_NAME,
+            type=BOOKING_OFFERING,
             attributes={
                 "schedules": [
                     {

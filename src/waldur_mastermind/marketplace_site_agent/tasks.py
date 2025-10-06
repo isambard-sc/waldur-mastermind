@@ -3,13 +3,18 @@ import datetime
 from celery import shared_task
 from django.utils import timezone
 
+from waldur_core.core import utils as core_utils
 from waldur_core.logging import models as logging_models
 from waldur_core.logging import tasks as logging_tasks
 from waldur_core.logging import utils as logging_utils
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
-from waldur_mastermind.marketplace.enums import OfferingStates, OrderStates
-from waldur_mastermind.marketplace_site_agent import PLUGIN_NAME, utils
+from waldur_mastermind.marketplace.enums import (
+    SITE_AGENT_OFFERING,
+    OfferingStates,
+    OrderStates,
+)
+from waldur_mastermind.marketplace_site_agent import utils
 
 
 def get_offering_ids_for_active_subscriptions(observable_object_type: str):
@@ -26,7 +31,7 @@ def get_offering_ids_for_active_subscriptions(observable_object_type: str):
         user_offerings = (
             marketplace_models.Offering.objects.all()
             .filter_for_user(subscription.user)
-            .filter(type=PLUGIN_NAME)
+            .filter(type=SITE_AGENT_OFFERING)
             .values_list("id", flat=True)
         )
         offering_ids.update(user_offerings)
@@ -37,7 +42,7 @@ def get_offering_ids_for_active_subscriptions(observable_object_type: str):
 @shared_task(name="waldur_mastermind.marketplace_site_agent.sync_offering_users")
 def sync_offering_users():
     offerings = marketplace_models.Offering.objects.filter(
-        type=PLUGIN_NAME,
+        type=SITE_AGENT_OFFERING,
         state__in=[
             OfferingStates.ACTIVE,
             OfferingStates.PAUSED,
@@ -57,7 +62,7 @@ def mark_offering_backend_as_disconnected_after_timeout():
     one_hour_ago = timezone.now() - datetime.timedelta(hours=1)
     integration_statuses = marketplace_models.IntegrationStatus.objects.filter(
         status=marketplace_models.IntegrationStatus.States.ACTIVE,
-        offering__type=PLUGIN_NAME,
+        offering__type=SITE_AGENT_OFFERING,
         last_request_timestamp__lt=one_hour_ago,
     )
     for integration_status in integration_statuses:
@@ -69,7 +74,7 @@ def mark_offering_backend_as_disconnected_after_timeout():
 def sync_resources():
     """
     Sync resources that haven't been updated in the last hour.
-    Only processes resources that users have subscribed to receive updates for.
+    Processes only resources that users have subscribed to receive updates for.
     """
     offering_ids = get_offering_ids_for_active_subscriptions(
         logging_utils.ObservableObjectType.RESOURCE.value
@@ -84,6 +89,17 @@ def sync_resources():
     # Push updates in bulk
     for resource in resources:
         utils.push_resource_update_message(resource)
+
+
+@shared_task(name="waldur_mastermind.marketplace_site_agent.sync_resource")
+def sync_resource(serialized_instance):
+    """
+    Send a message to Waldur Site Agent for the resource sync.
+    Processes only resources that users have subscribed to receive updates for.
+    """
+    resource = core_utils.deserialize_instance(serialized_instance)
+    # Push update message to Waldur Site Agent
+    utils.push_resource_update_message(resource)
 
 
 @shared_task(
@@ -103,7 +119,10 @@ def send_messages_about_pending_orders():
     )
 
     for order in pending_orders:
-        payload = {"order_uuid": order.uuid.hex}
+        payload = {
+            "order_uuid": order.uuid.hex,
+            "order_state": order.get_state_display(),
+        }
         offering = order.offering
         messages = marketplace_utils.prepare_messages(
             offering, payload, logging_utils.ObservableObjectType.ORDER
