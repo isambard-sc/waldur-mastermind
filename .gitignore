@@ -29,3 +29,6 @@ pytest.ini
 __pycache__/
 
 .vscode/
+
+waldur-openapi-schema.yaml
+waldur-typescript-sdk/

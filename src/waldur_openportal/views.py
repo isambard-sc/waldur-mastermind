@@ -660,6 +660,11 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     serializer_class = serializers.ManagedProjectSerializer
     attach_serializer_class = serializers.ProjectAttachSerializer
     detach_serializer_class = None
+    approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
+
+    approve_validators = reject_validators = [
+        StateValidator(ReviewStates.PENDING, state_enum=ReviewStates)
+    ]
 
     filter_backends = [GenericRoleFilter, DjangoFilterBackend]
     filterset_class = filters.ManagedProjectFilter
@@ -671,6 +676,15 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     lookup_url_kwarg = None
 
     def get_serializer_class(self):
+        if self.action == "attach":
+            return self.attach_serializer_class
+        elif self.action == "detach":
+            return self.detach_serializer_class
+        elif self.action == "approve":
+            return self.approve_serializer_class
+        elif self.action == "reject":
+            return self.reject_serializer_class
+
         return serializers.ManagedProjectSerializer
 
     def get_object(self):
@@ -840,15 +854,13 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     def reject(self, request, identifier=None, destination=None, **kwargs):
         project: models.ManagedProject = self.get_object()
         serializer = self.get_serializer(data=request.data)
+
+        logger.info(f"Serializer = {serializer} {type(serializer)}")
+
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
         project.reject(request.user, comment)
         return Response(status=status.HTTP_200_OK)
-
-    approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
-    approve_validators = reject_validators = [
-        StateValidator(ReviewStates.PENDING, state_enum=ReviewStates)
-    ]
 
     @extend_schema(
         parameters=[
