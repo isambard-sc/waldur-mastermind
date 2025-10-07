@@ -3,7 +3,8 @@ import logging
 from django.http import Http404
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
+from drf_spectacular.types import OpenApiTypes
 from rest_framework import permissions, response, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -638,6 +639,11 @@ class IsStaffOrServiceProviderOwnerOrManager(BasePermission):
             raise PermissionDenied()
 
 
+@extend_schema_view(
+    list=extend_schema(
+        description="List all managed projects",
+    ),
+)
 class ManagedProjectViewSet(core_views.ActionsViewSet):
     queryset = models.ManagedProject.objects.all().order_by("created")
     permission_classes = (
@@ -658,11 +664,14 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     filter_backends = [GenericRoleFilter, DjangoFilterBackend]
     filterset_class = filters.ManagedProjectFilter
 
-    disabled_actions = ["create", "update", "partial_update"]
+    disabled_actions = ["create", "update", "partial_update", "retrieve", "destroy"]
 
     # Remove single lookup configuration
     lookup_field = None
     lookup_url_kwarg = None
+
+    def get_serializer_class(self):
+        return serializers.ManagedProjectSerializer
 
     def get_object(self):
         """
@@ -712,12 +721,87 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         return [permission() for permission in permission_classes]
 
     @extend_schema(
+        methods=["GET"],
+        operation_id="openportal_managed_projects_retrieve_get",  # Add unique operation_id
+        parameters=[
+            OpenApiParameter(
+                name="identifier",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The identifier of the managed project",
+            ),
+            OpenApiParameter(
+                name="destination",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The destination of the managed project",
+            ),
+        ],
+        responses=serializers.ManagedProjectSerializer,
+        description="Retrieve a managed project",
+    )
+    @extend_schema(
+        methods=["HEAD"],
+        operation_id="openportal_managed_projects_retrieve_head",
+        parameters=[
+            OpenApiParameter(
+                name="identifier",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The identifier of the managed project",
+            ),
+            OpenApiParameter(
+                name="destination",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The destination of the managed project",
+            ),
+        ],
+        responses=serializers.ManagedProjectSerializer,
+        description="Check if a managed project exists",
+    )
+    @action(
+        detail=False,
+        methods=["get", "head"],
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)",
+    )
+    def retrieve_custom(self, request, identifier=None, destination=None, **kwargs):
+        """Custom retrieve action with composite key"""
+        obj = self.get_object()
+
+        if request.method == "HEAD":
+            # For HEAD requests, just return empty response with proper status
+            return Response(status=status.HTTP_200_OK)
+
+        # For GET requests, return the serialized data
+        serializer = self.get_serializer(obj)
+        return Response(serializer.data)
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="identifier",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The identifier of the managed project",
+            ),
+            OpenApiParameter(
+                name="destination",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The destination of the managed project",
+            ),
+        ],
         request=ReviewCommentSerializer,
         responses=None,
         description="Approve managed project request",
     )
-    @action(detail=True, methods=["post"])
-    def approve(self, request, **kwargs):
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/approve",
+    )
+    def approve(self, request, identifier=None, destination=None, **kwargs):
         project: models.ManagedProject = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -730,12 +814,30 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         return Response(status=status.HTTP_200_OK)
 
     @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="identifier",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The identifier of the managed project",
+            ),
+            OpenApiParameter(
+                name="destination",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The destination of the managed project",
+            ),
+        ],
         request=ReviewCommentSerializer,
         responses=None,
         description="Reject managed project request",
     )
-    @action(detail=True, methods=["post"])
-    def reject(self, request, **kwargs):
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/reject",
+    )
+    def reject(self, request, identifier=None, destination=None, **kwargs):
         project: models.ManagedProject = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -749,11 +851,29 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     ]
 
     @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="identifier",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The identifier of the managed project",
+            ),
+            OpenApiParameter(
+                name="destination",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The destination of the managed project",
+            ),
+        ],
         responses=None,
         description="Delete ManagedProject object",
     )
-    @action(detail=True, methods=["delete"])
-    def delete(self, request, **kwargs):
+    @action(
+        detail=False,
+        methods=["delete"],
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/delete",
+    )
+    def delete(self, request, identifier=None, destination=None, **kwargs):
         project: models.ManagedProject = self.get_object()
 
         logger.info(f"Deleting {project} by user {request.user}")
@@ -762,12 +882,30 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         return Response(status=status.HTTP_200_OK)
 
     @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="identifier",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The identifier of the managed project",
+            ),
+            OpenApiParameter(
+                name="destination",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The destination of the managed project",
+            ),
+        ],
         request=serializers.ProjectAttachSerializer,
         responses=None,
         description="Attach a project to this managed project",
     )
-    @action(detail=True, methods=["post"])
-    def attach(self, request, **kwargs):
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/attach",
+    )
+    def attach(self, request, identifier=None, destination=None, **kwargs):
         managed_project: models.ManagedProject = self.get_object()
         serializer = serializers.ProjectAttachSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -810,11 +948,29 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
             )
 
     @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="identifier",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The identifier of the managed project",
+            ),
+            OpenApiParameter(
+                name="destination",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The destination of the managed project",
+            ),
+        ],
         responses=None,
         description="Detach the project from this managed project",
     )
-    @action(detail=True, methods=["post"])
-    def detach(self, request, **kwargs):
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/detach",
+    )
+    def detach(self, request, identifier=None, destination=None, **kwargs):
         managed_project: models.ManagedProject = self.get_object()
 
         if not managed_project.project:

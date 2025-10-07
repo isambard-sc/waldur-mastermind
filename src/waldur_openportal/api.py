@@ -6,6 +6,7 @@ import httpx
 from django.contrib import auth
 from django.utils.translation import gettext_lazy as _
 from django.http import JsonResponse
+from drf_spectacular.utils import extend_schema
 from waldur_core.core import models
 from django.core.cache import cache
 from waldur_core.core.authentication import refresh_token
@@ -150,6 +151,7 @@ def _get_project_spend_info_by_project_id(request, user, project_id):
     return JsonResponse(None)
 
 
+@extend_schema(exclude=True)
 @api_view(["GET"])
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
@@ -224,6 +226,7 @@ def project_spend_info(request):
         return JsonResponse(None)
 
 
+@extend_schema(exclude=True)
 @api_view(["GET"])
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
@@ -530,6 +533,7 @@ def access_for_email(request):
     return response
 
 
+@extend_schema(exclude=True)
 @api_view(["GET"])
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
@@ -801,6 +805,7 @@ def customer_spend_info(request):
     return response
 
 
+@extend_schema(exclude=True)
 @api_view(["GET"])
 @authentication_classes([])
 @permission_classes([])
@@ -898,6 +903,7 @@ def fetch_job(request):
     return response
 
 
+@extend_schema(exclude=True)
 @api_view(["GET"])
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
@@ -925,6 +931,7 @@ def whoami(request):
     return response
 
 
+@extend_schema(exclude=True)
 @api_view(["GET"])
 @authentication_classes([])
 @permission_classes([])
