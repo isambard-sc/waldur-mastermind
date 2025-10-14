@@ -2,13 +2,14 @@ import logging
 from datetime import datetime
 
 from constance import config
+from dbtemplates import models as dbtemplate_models
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core import exceptions as django_exceptions
 from django.db import models as django_models
 from django.db import transaction
 from django.db.models import Q
-from django.template.loader import get_template
+from django.template import Template, TemplateSyntaxError
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import extend_schema_field
@@ -219,6 +220,8 @@ class ProjectSerializer(
         source="get_oecd_fos_2007_code_display"
     )
     description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    start_date = serializers.DateField(required=False, allow_null=True)
+    end_date = serializers.DateField(required=False, allow_null=True)
 
     class Meta:
         model = models.Project
@@ -235,6 +238,7 @@ class ProjectSerializer(
             "customer_native_name",
             "customer_abbreviation",
             "description",
+            "customer_display_billing_info_in_projects",
             "created",
             "type",
             "type_name",
@@ -262,7 +266,14 @@ class ProjectSerializer(
             },
         }
         related_paths = {
-            "customer": ("uuid", "name", "native_name", "abbreviation", "slug"),
+            "customer": (
+                "uuid",
+                "name",
+                "native_name",
+                "abbreviation",
+                "slug",
+                "display_billing_info_in_projects",
+            ),
             "type": ("name", "uuid"),
         }
 
@@ -274,7 +285,7 @@ class ProjectSerializer(
             "start_date" in fields
             and isinstance(self.instance, models.Project)
             and self.instance.start_date
-            and self.instance.start_date < timezone.now().date()
+            and self.instance.start_date <= timezone.now().date()
         ):
             fields["start_date"].read_only = True
 
@@ -287,14 +298,24 @@ class ProjectSerializer(
         return fields
 
     def validate_start_date(self, start_date):
-        if start_date and start_date < timezone.datetime.today().date():
+        # Allow None to clear the field
+        if start_date is None:
+            return start_date
+
+        # Only validate non-None values
+        if start_date < timezone.datetime.today().date():
             raise serializers.ValidationError(
                 {"start_date": _("Cannot be earlier than the current date.")}
             )
         return start_date
 
     def validate_end_date(self, end_date):
-        if end_date and end_date < timezone.datetime.today().date():
+        # Allow None to clear the field
+        if end_date is None:
+            return end_date
+
+        # Only validate non-None values
+        if end_date < timezone.datetime.today().date():
             raise serializers.ValidationError(
                 {"end_date": _("Cannot be earlier than the current date.")}
             )
@@ -313,6 +334,7 @@ class ProjectSerializer(
             "customer__slug",
             "customer__native_name",
             "customer__abbreviation",
+            "customer__display_billing_info_in_projects",
         )
         return queryset.select_related("customer").only(*related_fields)
 
@@ -482,6 +504,7 @@ class CustomerSerializer(
             "image",
             "blocked",
             "archived",
+            "display_billing_info_in_projects",
             "default_tax_percent",
             "accounting_start_date",
             "projects_count",
@@ -500,6 +523,7 @@ class CustomerSerializer(
             "organization_groups",
             "blocked",
             "archived",
+            "display_billing_info_in_projects",
             "sponsor_number",
             "max_service_accounts",
             "project_metadata_checklist",
@@ -1583,8 +1607,11 @@ class NotificationTemplateDetailSerializers(serializers.ModelSerializer):
             },
         }
 
-    def get_content(self, obj) -> str:
-        return get_template(obj.path).template.source
+    def get_content(self, obj: core_models.NotificationTemplate) -> str | None:
+        try:
+            return dbtemplate_models.Template.objects.get(name=obj.path).content
+        except dbtemplate_models.Template.DoesNotExist:
+            return None
 
     def get_original_content(self, obj) -> str | None:
         from django.template.engine import Engine
@@ -1605,7 +1632,7 @@ class NotificationTemplateDetailSerializers(serializers.ModelSerializer):
 
 class NotificationSerializer(serializers.HyperlinkedModelSerializer):
     templates = NotificationTemplateDetailSerializers(many=True, read_only=True)
-    context_fields = serializers.SerializerMethodField()
+    context_schema = serializers.SerializerMethodField()
 
     class Meta:
         model = core_models.Notification
@@ -1617,7 +1644,7 @@ class NotificationSerializer(serializers.HyperlinkedModelSerializer):
             "enabled",
             "created",
             "templates",
-            "context_fields",
+            "context_schema",
         )
         read_only_fields = ("created", "enabled")
         extra_kwargs = {
@@ -1627,10 +1654,10 @@ class NotificationSerializer(serializers.HyperlinkedModelSerializer):
             },
         }
 
-    def get_context_fields(self, obj) -> dict:
+    def get_context_schema(self, obj) -> dict:
         """
         Finds the notification definition in the global NOTIFICATIONS
-        dictionary and returns its 'context' fields.
+        dictionary and returns its 'context' schema.
         """
         try:
             section_key, notification_key = obj.key.split(".", 1)
@@ -1644,8 +1671,8 @@ class NotificationSerializer(serializers.HyperlinkedModelSerializer):
         # Find the specific notification by its full key ('path')
         for definition in notification_definitions:
             if definition.get("path") == notification_key:
-                # Return the context if it exists, otherwise an empty dict
-                return definition.get("context", {})
+                # Return the context schema if it exists, otherwise an empty dict
+                return definition.get("context_schema", {})
 
         # Return an empty dict if no matching notification was found
         return {}
@@ -1653,6 +1680,13 @@ class NotificationSerializer(serializers.HyperlinkedModelSerializer):
 
 class NotificationTemplateUpdateSerializers(serializers.Serializer):
     content = serializers.CharField()
+
+    def validate_content(self, content):
+        try:
+            Template(content)
+        except TemplateSyntaxError as e:
+            raise serializers.ValidationError(f"Invalid template syntax: {str(e)}")
+        return content
 
 
 class AuthTokenSerializer(serializers.HyperlinkedModelSerializer):

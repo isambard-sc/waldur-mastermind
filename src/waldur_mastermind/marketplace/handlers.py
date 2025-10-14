@@ -277,7 +277,7 @@ def close_service_accounts_on_project_deletion(sender, instance: Project, **kwar
                 "Failed to request deletion of service account %s for project %s: %s",
                 service_account,
                 project,
-                exc,
+                exc.response.text if isinstance(exc, httpx.HTTPStatusError) else exc,
             )
             continue
 
@@ -299,7 +299,7 @@ def close_customer_service_accounts_on_customer_deletion(
                 "Failed to request deletion of service account %s for customer %s: %s",
                 service_account,
                 customer,
-                exc,
+                exc.response.text if isinstance(exc, httpx.HTTPStatusError) else exc,
             )
             continue
 
@@ -1002,6 +1002,9 @@ def resource_has_been_changed(sender, instance: Resource, created=False, **kwarg
             return ""
 
     for field, old_value in sorted(changed_fields.items()):
+        if field in ["last_sync"]:
+            continue
+
         if field == "state":
             old_value_display = models.Resource(state=old_value).get_state_display()
             new_value_display = instance.get_state_display()

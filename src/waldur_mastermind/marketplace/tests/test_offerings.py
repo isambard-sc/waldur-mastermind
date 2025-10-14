@@ -22,7 +22,6 @@ from waldur_core.checklist import enums as checklist_enums
 from waldur_core.core import utils as core_utils
 from waldur_core.core.pagination import RESULT_COUNT_HEADER
 from waldur_core.core.tests.helpers import load_json_resource
-from waldur_core.logging import models as event_models
 from waldur_core.media.utils import dummy_image, dummy_svg
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
@@ -890,6 +889,38 @@ class OfferingCreateTest(test.APITransactionTestCase):
             response.status_code, status.HTTP_400_BAD_REQUEST, response.data
         )
 
+    def test_update_offering_plugin_options_with_heappe_new_fields(self):
+        """Test that offering plugin options can be updated with new Heappe fields"""
+        offering = factories.OfferingFactory(customer=self.customer)
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        plugin_options = {
+            "heappe_url": "https://heappe.example.com",
+            "heappe_username": "test_user",
+            "heappe_cluster_id": "1",
+            "heappe_local_base_path": "~/",
+            "scratch_project_directory": "/scratch/projects",
+            "project_permanent_directory": "/permanent/projects",
+        }
+
+        response = self.client.post(url, {"plugin_options": plugin_options})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertEqual(
+            offering.plugin_options["scratch_project_directory"], "/scratch/projects"
+        )
+        self.assertEqual(
+            offering.plugin_options["project_permanent_directory"],
+            "/permanent/projects",
+        )
+
+        self.assertEqual(
+            offering.plugin_options["heappe_url"], "https://heappe.example.com"
+        )
+        self.assertEqual(offering.plugin_options["heappe_username"], "test_user")
+
     def test_create_offering_with_minimal_information_in_draft_state(self):
         user = self.fixture.staff
         self.client.force_authenticate(user)
@@ -1077,188 +1108,6 @@ class OfferingUpdateAttributesTest(BaseOfferingUpdateTest):
         response = self.update_attributes({"key": "value"}, role)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-
-class OfferingComponentRemoveTest(BaseOfferingUpdateTest):
-    def setUp(self):
-        super().setUp()
-        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_COMPONENTS)
-
-    def remove_offering_component(self, component, role):
-        url = factories.OfferingFactory.get_url(
-            self.offering, "remove_offering_component"
-        )
-        self.client.force_authenticate(getattr(self.fixture, role))
-        return self.client.post(url, {"uuid": component.uuid.hex})
-
-    def test_it_should_not_be_possible_to_remove_builtin_components(self):
-        # Arrange
-        self.offering.type = VMWARE_VM_OFFERING
-        self.offering.save()
-
-        cpu_component = factories.OfferingComponentFactory(
-            offering=self.offering, type="cpu"
-        )
-
-        # Act
-        response = self.remove_offering_component(cpu_component, "owner")
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        cpu_component.refresh_from_db()
-
-    def test_it_should_not_be_possible_to_remove_components_if_they_are_used(self):
-        # Arrange
-        component = factories.OfferingComponentFactory(offering=self.offering)
-        factories.ResourceFactory(offering=self.offering)
-
-        # Act
-        response = self.remove_offering_component(component, "owner")
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_it_should_be_possible_to_remove_components_if_they_are_not_used(self):
-        # Arrange
-        component = factories.OfferingComponentFactory(offering=self.offering)
-
-        # Act
-        response = self.remove_offering_component(component, "owner")
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.offering.refresh_from_db()
-        self.assertEqual(0, self.offering.components.count())
-
-
-class OfferingComponentCreateTest(BaseOfferingUpdateTest):
-    def setUp(self):
-        super().setUp()
-        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_COMPONENTS)
-
-    def create_offering_component(self, role, payload):
-        url = factories.OfferingFactory.get_url(
-            self.offering, "create_offering_component"
-        )
-        self.client.force_authenticate(getattr(self.fixture, role))
-        return self.client.post(url, payload)
-
-    def test_validation_of_offering_and_type(self):
-        # Act
-        response = self.create_offering_component(
-            "owner",
-            {
-                "type": "cores",
-                "name": "Cores",
-                "measured_unit": "hours",
-                "billing_type": "fixed",
-            },
-        )
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-
-        # Act
-        response = self.create_offering_component(
-            "owner",
-            {
-                "type": "cores",
-                "name": "Cores",
-                "measured_unit": "hours",
-                "billing_type": "fixed",
-            },
-        )
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_it_should_be_possible_to_create_new_components(self):
-        # Act
-        response = self.create_offering_component(
-            "owner",
-            {
-                "type": "cores",
-                "name": "Cores",
-                "measured_unit": "hours",
-                "billing_type": "fixed",
-            },
-        )
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        component = self.offering.components.get()
-        self.assertEqual("cores", component.type)
-        self.assertEqual("hours", component.measured_unit)
-        self.assertEqual(BillingTypes.FIXED, component.billing_type)
-
-
-class OfferingComponentUpdateTest(BaseOfferingUpdateTest):
-    def setUp(self):
-        super().setUp()
-        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_COMPONENTS)
-
-    def update_offering_component(self, payload, role):
-        url = factories.OfferingFactory.get_url(
-            self.offering, "update_offering_component"
-        )
-        self.client.force_authenticate(getattr(self.fixture, role))
-        return self.client.post(url, payload)
-
-    def test_it_should_be_possible_to_update_existing_components(self):
-        component = factories.OfferingComponentFactory(
-            offering=self.offering,
-            type="cores",
-            name="CPU",
-            measured_unit="H",
-        )
-        # Act
-        response = self.update_offering_component(
-            {
-                "type": "cores",
-                "name": "Cores",
-                "measured_unit": "hours",
-                "billing_type": "fixed",
-                "uuid": component.uuid.hex,
-            },
-            "owner",
-        )
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        component = self.offering.components.get()
-        self.assertEqual("Cores", component.name)
-        self.assertEqual("hours", component.measured_unit)
-        self.assertEqual(BillingTypes.FIXED, component.billing_type)
-
-    def test_update_event_includes_changes(self):
-        """
-        Test that the update event for offering component includes the changes in message.
-        """
-        # Arrange
-        component = factories.OfferingComponentFactory(
-            offering=self.offering,
-            type="cores",
-            name="CPU",
-        )
-
-        # Act
-        self.update_offering_component(
-            {
-                "type": "cores",
-                "name": "NewName",
-                "measured_unit": "hours",
-                "billing_type": "fixed",
-                "uuid": component.uuid.hex,
-            },
-            "owner",
-        )
-
-        # Assert
-        event = event_models.Event.objects.filter(
-            event_type="marketplace_offering_component_updated"
-        ).first()
-        self.assertIn("name: CPU -> NewName", event.message)
-        self.assertIn("measured_unit:  -> hours", event.message)
 
 
 @ddt

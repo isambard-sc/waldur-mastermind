@@ -105,6 +105,7 @@ from waldur_core.structure.managers import (
 )
 from waldur_core.structure.registry import SupportedServices
 from waldur_core.structure.signals import resource_imported
+from waldur_mastermind.analytics import models as analytics_models
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices import serializers as invoice_serializers
 from waldur_mastermind.marketplace import callbacks
@@ -2846,6 +2847,77 @@ class ProviderOfferingViewSet(
     move_offering_serializer_class = serializers.MoveOfferingSerializer
     move_offering_permissions = [structure_permissions.is_staff]
 
+    @extend_schema(
+        description="Return comprehensive ToS consent statistics for this offering.",
+        responses={200: serializers.ToSConsentDashboardSerializer},
+        filters=False,
+    )
+    @action(detail=True, methods=["get"])
+    def tos_stats(self, request, uuid=None):
+        """Return comprehensive ToS consent statistics for this offering."""
+
+        offering = self.get_object()
+
+        active_users_count = offering.get_quota_usage("active_users_count")
+        total_users_count = offering.get_quota_usage("total_users_count")
+        accepted_consents_count = offering.get_quota_usage("accepted_consents_count")
+        revoked_consents_count = offering.get_quota_usage("revoked_consents_count")
+        total_consents_count = offering.get_quota_usage("total_consents_count")
+
+        active_users_percentage = 0.0
+        if total_users_count > 0:
+            active_users_percentage = round(
+                (active_users_count / total_users_count) * 100, 2
+            )
+
+        revoked_consents_over_time = list(
+            analytics_models.DailyQuotaHistory.objects.filter(
+                scope=offering, name="revoked_consents_today"
+            )
+            .values("date", "usage")
+            .order_by("date")
+        )
+
+        tos_version_adoption = list(
+            models.UserOfferingConsent.objects.filter(offering=offering)
+            .values("version")
+            .annotate(users_count=Count("user", distinct=True))
+            .order_by("-users_count")
+        )
+        active_users_over_time = list(
+            analytics_models.DailyQuotaHistory.objects.filter(
+                scope=offering, name="active_users_count"
+            )
+            .values("date", "usage")
+            .order_by("date")
+        )
+        dashboard_data = {
+            "active_users_count": active_users_count,
+            "total_users_count": total_users_count,
+            "active_users_percentage": active_users_percentage,
+            "accepted_consents_count": accepted_consents_count,
+            "revoked_consents_count": revoked_consents_count,
+            "total_consents_count": total_consents_count,
+            "revoked_consents_over_time": [
+                {"date": record["date"].isoformat(), "count": record["usage"]}
+                for record in revoked_consents_over_time
+            ],
+            "tos_version_adoption": [
+                {
+                    "version": stat["version"] or "Unknown",
+                    "users_count": stat["users_count"],
+                }
+                for stat in tos_version_adoption
+            ],
+            "active_users_over_time": [
+                {"date": record["date"].isoformat(), "count": record["usage"]}
+                for record in active_users_over_time
+            ],
+        }
+
+        serializer = serializers.ToSConsentDashboardSerializer(dashboard_data)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
 
 class PublicOfferingViewSet(rf_viewsets.ReadOnlyModelViewSet):
     queryset = models.Offering.objects.filter()
@@ -3759,7 +3831,13 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
 
     unlink_permissions = [structure_permissions.is_staff]
 
-    def create_resource_order(self, request, resource, **kwargs):
+    def create_resource_order(
+        self,
+        request,
+        resource: models.Resource,
+        switch_price=None,
+        **kwargs,
+    ):
         with transaction.atomic():
             order = models.Order(
                 project=resource.project,
@@ -3770,6 +3848,14 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
             )
             serializers.validate_order(order, request)
             order.init_cost()
+
+            # If a one-time charge (like a renewal fee) is provided,
+            # it should be the primary cost for an UPDATE order.
+            if order.type == OrderTypes.UPDATE and switch_price is not None:
+                # For renewals, the cost is *only* the switch price.
+                # For plan switches, it might be the plan's switch_price + estimate.
+                order.cost = switch_price
+
             order.save()
 
         return Response({"order_uuid": order.uuid.hex}, status=status.HTTP_200_OK)
@@ -4080,6 +4166,30 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
         structure_views.check_resource_backend_id,
     ]
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.ResourceResponseStatusSerializer},
+        description="Update resource options.",
+    )
+    @action(detail=True, methods=["post"])
+    def update_options(self, request, uuid=None):
+        resource = cast(models.Resource, self.get_object())
+        serializer = self.get_serializer(data=request.data, instance=resource)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        return Response(
+            {"status": _("Resource options are submitted")}, status=status.HTTP_200_OK
+        )
+
+    update_options_permissions = [
+        permissions.check_tos_consent_permission,
+        permission_factory(
+            PermissionEnum.UPDATE_RESOURCE_OPTIONS,
+            ["project", "project.customer", "offering.customer"],
+        ),
+    ]
+    update_options_serializer_class = serializers.ResourceOptionsSerializer
+
 
 class ConsumerResourceViewSet(BaseResourceViewSet):
     def get_queryset(self):
@@ -4169,28 +4279,76 @@ class ConsumerResourceViewSet(BaseResourceViewSet):
     ]
 
     @extend_schema(
-        responses={status.HTTP_200_OK: serializers.ResourceResponseStatusSerializer},
-        description="Update resource options.",
+        request=serializers.ResourceRenewSerializer,
+        responses={200: serializers.OrderUUIDSerializer},
+        description="Create a renewal order for a prepaid resource.",
     )
     @action(detail=True, methods=["post"])
-    def update_options(self, request, uuid=None):
+    def renew(self, request, uuid=None):
         resource = cast(models.Resource, self.get_object())
-        serializer = self.get_serializer(data=request.data, instance=resource)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
 
-        return Response(
-            {"status": _("Resource options are submitted")}, status=status.HTTP_200_OK
+        serializer = self.get_serializer(
+            data=request.data,
+            context={"resource": resource},  # Pass resource to serializer context
+        )
+        serializer.is_valid(raise_exception=True)
+
+        extension_months = serializer.validated_data["extension_months"]
+        new_limits = serializer.validated_data.get("limits")  # This can be None
+
+        # If new limits are not provided, use the resource's current limits for the new period.
+        final_limits = new_limits or resource.limits
+
+        # Calculate the new end_date for the resource.
+        # It's safest to calculate from the current end_date, or from today if expired.
+        current_end_date = resource.end_date or timezone.now().date()
+        if current_end_date < timezone.now().date():
+            current_end_date = timezone.now().date()
+
+        new_end_date = current_end_date + relativedelta(months=extension_months)
+
+        # Calculate the renewal cost using the new model method.
+        renewal_cost = resource.get_renewal_cost(extension_months, new_limits)
+
+        # Create an 'UPDATE' order to handle the renewal.
+        # The order processor will be responsible for updating the resource's
+        # end_date and limits upon successful payment/approval.
+        order_attributes = {
+            "action": "renew",
+            "old_limits": resource.limits,
+            "old_end_date": resource.end_date.isoformat()
+            if resource.end_date
+            else None,
+            "new_end_date": new_end_date.isoformat(),
+            "extension_months": extension_months,
+            "renewal_cost": float(renewal_cost),  # Store for auditing
+        }
+
+        # The renewal cost is passed as 'switch_price' to the order,
+        # which is the mechanism for one-time charges on UPDATE orders.
+        return self.create_resource_order(
+            request=request,
+            resource=resource,
+            plan=resource.plan,
+            type=OrderTypes.UPDATE,
+            limits=final_limits,
+            attributes=order_attributes,
+            switch_price=renewal_cost,
         )
 
-    update_options_permissions = [
+    renew_serializer_class = serializers.ResourceRenewSerializer
+
+    renew_permissions = [
         permissions.check_tos_consent_permission,
         permission_factory(
-            PermissionEnum.UPDATE_RESOURCE_OPTIONS,
+            PermissionEnum.UPDATE_RESOURCE_LIMITS,  # Re-use existing permission
             ["project", "project.customer"],
         ),
     ]
-    update_options_serializer_class = serializers.ResourceOptionsSerializer
+
+    renew_validators = [
+        core_validators.StateValidator(ResourceStates.OK, ResourceStates.ERRED),
+    ]
 
 
 class ProviderResourceViewSet(BaseResourceViewSet):
@@ -6122,15 +6280,20 @@ class BaseServiceAccountViewSet(core_views.ActionsViewSet):
                         "detail": "Service account creation is disabled or returned no token."
                     }
                 )
-        except httpx.HTTPError as e:
+        except httpx.HTTPError as exc:
+            error_details = (
+                exc.response.json()
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
+                else str(exc)
+            )
             if "instance" in locals():
                 instance.set_state_erred()
-                instance.error_message = str(e)
+                instance.error_message = str(error_details)
                 instance.error_traceback = traceback.format_exc()
                 instance.save(
                     update_fields=["state", "error_message", "error_traceback"]
                 )
-            raise ValidationError({"detail": str(e)})
+            raise ValidationError({"detail": error_details})
 
     def perform_update(self, serializer):
         instance: models.ScopedServiceAccount = serializer.instance
@@ -6147,8 +6310,13 @@ class BaseServiceAccountViewSet(core_views.ActionsViewSet):
                 instance.error_traceback = ""
             # Update the DB object only if the API call is successful
             super().perform_update(serializer)
-        except httpx.HTTPError as e:
-            raise ValidationError({"detail": str(e)})
+        except httpx.HTTPError as exc:
+            error_details = (
+                exc.response.json()
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
+                else str(exc)
+            )
+            raise ValidationError({"detail": error_details})
 
     update_validators = destroy_validators = [
         core_validators.StateValidator(
@@ -6159,8 +6327,14 @@ class BaseServiceAccountViewSet(core_views.ActionsViewSet):
     def perform_destroy(self, instance):
         try:
             utils.close_service_account(instance)
-        except httpx.HTTPError as e:
-            raise ValidationError({"detail": str(e)})
+        except httpx.HTTPError as exc:
+            raise ValidationError(
+                {
+                    "detail": exc.response.json()
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
+                    else str(exc)
+                }
+            )
 
 
 class ProjectServiceAccountViewSet(BaseServiceAccountViewSet):
@@ -6224,8 +6398,13 @@ class ProjectServiceAccountViewSet(BaseServiceAccountViewSet):
                 raise ValidationError(
                     {"detail": "API key rotation failed - no token returned"}
                 )
-        except httpx.HTTPError as e:
-            raise ValidationError({"detail": str(e)})
+        except httpx.HTTPError as exc:
+            error_details = (
+                exc.response.json()
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
+                else str(exc)
+            )
+            raise ValidationError({"detail": error_details})
 
     rotate_api_key_permissions = [
         permission_factory(
@@ -6293,8 +6472,13 @@ class CustomerServiceAccountViewSet(BaseServiceAccountViewSet):
                 raise ValidationError(
                     {"detail": "API key rotation failed - no token returned"}
                 )
-        except httpx.HTTPError as e:
-            raise ValidationError({"detail": str(e)})
+        except httpx.HTTPError as exc:
+            error_details = (
+                exc.response.json()
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
+                else str(exc)
+            )
+            raise ValidationError({"detail": error_details})
 
     rotate_api_key_permissions = [
         permission_factory(
@@ -7167,21 +7351,31 @@ class CourseAccountViewSet(core_views.ActionsViewSet):
             instance = serializer.save()
             instance.user = user
             instance.save(update_fields=["user"])
-        except httpx.HTTPError as e:
+        except httpx.HTTPError as exc:
+            error_details = (
+                exc.response.json()
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
+                else str(exc)
+            )
             if "instance" in locals():
                 instance.set_state_erred()
-                instance.error_message = str(e)
+                instance.error_message = str(error_details)
                 instance.error_traceback = traceback.format_exc()
                 instance.save(
                     update_fields=["state", "error_message", "error_traceback"]
                 )
-            raise ValidationError({"detail": str(e)})
+            raise ValidationError({"detail": str(error_details)})
 
     def perform_destroy(self, instance):
         try:
             utils.close_course_account(instance)
-        except httpx.HTTPError as e:
-            raise ValidationError({"detail": str(e)})
+        except httpx.HTTPError as exc:
+            error_details = (
+                exc.response.json()
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
+                else str(exc)
+            )
+            raise ValidationError({"detail": error_details})
 
     destroy_validators = [
         core_validators.StateValidator(

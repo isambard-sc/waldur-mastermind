@@ -496,9 +496,6 @@ class IssueStatus(core_models.UuidMixin, models.Model):
     )
     type = FSMIntegerField(default=Types.RESOLVED, choices=TYPE_CHOICES)
 
-    def __str__(self):
-        return f"{self.name} / {self.type}"
-
     @classmethod
     def check_success_status(cls, status):
         """Check an issue has been resolved.
@@ -529,6 +526,9 @@ class IssueStatus(core_models.UuidMixin, models.Model):
     class Meta:
         verbose_name = _("Issue status")
         verbose_name_plural = _("Issue statuses")
+
+    def __str__(self):
+        return f"{self.name} / {self.type}"
 
 
 class TemplateConfirmationComment(models.Model):
