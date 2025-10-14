@@ -112,7 +112,7 @@ class Migration(migrations.Migration):
         ("invoices", "0016_alter_invoiceitem_unit"),
         (
             "structure",
-            "0061_customer_notification_emails",
+            "0062_customer_display_billing_info_in_projects",
         ),  # Cannot generate invoices unless Project is fully migrated
     ]
 
