@@ -38,7 +38,7 @@ dependencies = [
   "iptools==0.7.0",
   "jira==2.0.0",
   "lxml>=4.6.5,<5.0.0",
-  "openportal>=0.18.0",
+  "openportal>=0.19.1",
   "pbr==4.0.4",
   "Pillow>=11.0.0,<12.0.0",
   "pycountry @ git+https://github.com/pycountry/pycountry.git@main",
