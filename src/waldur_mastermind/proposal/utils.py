@@ -1,5 +1,6 @@
 import logging
 from typing import cast
+from datetime import datetime, timedelta
 
 from django.db import transaction
 from django.db.models import OuterRef
@@ -10,7 +11,10 @@ from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal import tasks
-from waldur_mastermind.proposal.enums import ProposalStates, RequestedOfferingStates
+from waldur_mastermind.proposal.enums import (
+    ProposalStates,
+    RequestedOfferingStates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +59,7 @@ def allocate_proposal(proposal: proposal_models.Proposal):
     proposal_round = proposal.round
     name = proposal.name
     start_date = None
+    end_date = None
     call_prefix = proposal_round.call.backend_id or proposal_round.call.slug
     project_name = " - ".join(
         [call_prefix, proposal_round.start_time.strftime("%Y-%m-%d"), name]
@@ -65,27 +70,54 @@ def allocate_proposal(proposal: proposal_models.Proposal):
         == proposal_models.Round.AllocationTimes.FIXED_DATE
     ):
         start_date = proposal.round.allocation_date
+    else:
+        # today is the start date
+        start_date = datetime.today().date()
+
+    # Calculate end_date based on duration_in_days and start_date
+    # Priority: call.fixed_duration_in_days > proposal.duration_in_days
+    duration_in_days = None
+    if proposal_round.call.fixed_duration_in_days:
+        duration_in_days = proposal_round.call.fixed_duration_in_days
+    elif proposal.duration_in_days:
+        duration_in_days = proposal.duration_in_days
+
+    if duration_in_days and start_date:
+        end_date = start_date + timedelta(days=duration_in_days)
 
     # need to create a unique short name for the project
     short_name = f"{call_prefix}_{proposal.uuid}".replace(" ", "").lower()
 
-    # remove everything except lower-case letters, digits, underscores and hyphens
+    # Remove everything except lower-case letters, digits, underscores, hyphens
     short_name = "".join(c for c in short_name if c.isalnum() or c in ("_", "-"))
 
     if len(short_name) > 50:
         short_name = short_name[:50]
 
+    logger.info(f"Start date for project {project_name} is {start_date}.")
+    logger.info(f"End date for project {project_name} is {end_date}.")
+    logger.info(f"Duration in days is {duration_in_days}.")
+
     project = structure_models.Project.objects.create(
         customer=proposal_round.call.manager.customer,
         name=project_name,
+        description=proposal.project_summary,
         start_date=start_date,
+        end_date=end_date,
         short_name=short_name,
     )
     project = cast(structure_models.Project, project)
 
     if start_date:
         logger.info(
-            f"Field start_date of {project} has been changed to {proposal.round.allocation_date}."
+            f"Field start_date of {project} has been changed to "
+            f"{proposal.round.allocation_date}."
+        )
+
+    if end_date:
+        logger.info(
+            f"Field end_date of {project} has been set to {end_date} "
+            f"based on duration of {duration_in_days} days."
         )
 
     proposal.project = project
