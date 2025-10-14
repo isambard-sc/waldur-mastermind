@@ -931,6 +931,59 @@ class ProposalViewSet(
         serializers.ProposalApproveSerializer
     )
 
+    @extend_schema(
+        description="Return proposal to applicant for revision.",
+        request=serializers.ProposalApproveSerializer,
+        responses={status.HTTP_200_OK: None},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def return_to_applicant(self, request, uuid=None):
+        proposal = self.get_object()
+        previous_state = proposal.state
+        proposal.state = ProposalStates.DRAFT
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        proposal.allocation_comment = serializer.validated_data.get(
+            "allocation_comment", ""
+        )
+        proposal.save()
+
+        # Delete stale review requests that are no longer needed
+        stale_reviews = proposal.review_set.filter(
+            state__in=[models.Review.States.CREATED, models.Review.States.IN_REVIEW]
+        )
+        stale_count = stale_reviews.count()
+        if stale_count > 0:
+            logger.info(
+                f"Deleting {stale_count} stale review request(s) "
+                f"for returned proposal {proposal.uuid}"
+            )
+            stale_reviews.delete()
+
+        tasks.notify_user_about_proposal_state_update.delay(
+            proposal.uuid, previous_state, proposal.state
+        )
+        return response.Response(
+            "Proposal has been returned to applicant for revision.",
+            status=status.HTTP_200_OK,
+        )
+
+    return_to_applicant_validators = [
+        core_validators.StateValidator(
+            ProposalStates.SUBMITTED,
+            ProposalStates.IN_REVIEW,
+        )
+    ]
+    return_to_applicant_permissions = [
+        permission_factory(
+            PermissionEnum.APPROVE_AND_REJECT_PROPOSALS,
+            ["round.call", "round.call.manager"],
+        )
+    ]
+    return_to_applicant_serializer_class = (
+        serializers.ProposalApproveSerializer
+    )
+
     # Checklist Integration Endpoints
     # Checklist methods are now provided by ChecklistViewSetMixin
     # - checklist: Get checklist with questions and existing answers
