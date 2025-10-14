@@ -112,8 +112,8 @@ class Migration(migrations.Migration):
         ("invoices", "0016_alter_invoiceitem_unit"),
         (
             "structure",
-            "0056_customer_project_metadata_checklist",
-        ),  # Ensure checklist field exists
+            "0061_customer_notification_emails",
+        ),  # Cannot generate invoices unless Project is fully migrated
     ]
 
     operations = [migrations.RunPython(safe_create_monthly_invoices)]
