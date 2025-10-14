@@ -846,6 +846,19 @@ class ProposalViewSet(
             "allocation_comment", ""
         )
         proposal.save()
+
+        # Delete stale review requests that are no longer needed
+        stale_reviews = proposal.review_set.filter(
+            state__in=[models.Review.States.CREATED, models.Review.States.IN_REVIEW]
+        )
+        stale_count = stale_reviews.count()
+        if stale_count > 0:
+            logger.info(
+                f"Deleting {stale_count} stale review request(s) "
+                f"for approved proposal {proposal.uuid}"
+            )
+            stale_reviews.delete()
+
         tasks.notify_user_about_proposal_state_update.delay(
             proposal.uuid, previous_state, proposal.state
         )
@@ -880,6 +893,19 @@ class ProposalViewSet(
             "allocation_comment", ""
         )
         proposal.save()
+
+        # Delete stale review requests that are no longer needed
+        stale_reviews = proposal.review_set.filter(
+            state__in=[models.Review.States.CREATED, models.Review.States.IN_REVIEW]
+        )
+        stale_count = stale_reviews.count()
+        if stale_count > 0:
+            logger.info(
+                f"Deleting {stale_count} stale review request(s) "
+                f"for rejected proposal {proposal.uuid}"
+            )
+            stale_reviews.delete()
+
         tasks.notify_user_about_proposal_state_update.delay(
             proposal.uuid, previous_state, proposal.state
         )

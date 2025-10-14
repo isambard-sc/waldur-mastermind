@@ -259,3 +259,127 @@ class ProjectEndDateTest(test.APITransactionTestCase):
         project = self.proposal.project
         self.assertIsNotNone(project)
         self.assertEqual(project.description, test_summary)
+
+
+class StaleReviewDeletionTest(test.APITransactionTestCase):
+    """Tests for automatic deletion of stale review requests."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.proposal = self.fixture.proposal
+        self.proposal.state = ProposalStates.SUBMITTED
+        self.proposal.save()
+        self.approve_url = factories.ProposalFactory.get_url(
+            self.proposal, "approve"
+        )
+        self.reject_url = factories.ProposalFactory.get_url(
+            self.proposal, "reject"
+        )
+
+    def test_stale_reviews_deleted_when_proposal_approved(self):
+        """Test that pending reviews are deleted when proposal is approved."""
+        # Create reviews in different states
+        from waldur_mastermind.proposal.tests import factories as prop_factories
+
+        review_created = prop_factories.ReviewFactory(
+            proposal=self.proposal,
+            reviewer=self.fixture.reviewer_1,
+            state=models.Review.States.CREATED,
+        )
+        review_in_review = prop_factories.ReviewFactory(
+            proposal=self.proposal,
+            reviewer=self.fixture.reviewer_2,
+            state=models.Review.States.IN_REVIEW,
+        )
+        reviewer_3 = UserFactory()
+        self.fixture.call.add_user(reviewer_3, self.fixture.call_role)
+        review_submitted = prop_factories.ReviewFactory(
+            proposal=self.proposal,
+            reviewer=reviewer_3,
+            state=models.Review.States.SUBMITTED,
+        )
+
+        # Approve proposal
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.approve_url, {"allocation_comment": "approved"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Verify stale reviews (CREATED, IN_REVIEW) are deleted
+        self.assertFalse(
+            models.Review.objects.filter(uuid=review_created.uuid).exists()
+        )
+        self.assertFalse(
+            models.Review.objects.filter(uuid=review_in_review.uuid).exists()
+        )
+
+        # Verify submitted review is kept
+        self.assertTrue(
+            models.Review.objects.filter(uuid=review_submitted.uuid).exists()
+        )
+
+    def test_stale_reviews_deleted_when_proposal_rejected(self):
+        """Test that pending reviews are deleted when proposal is rejected."""
+        # Create reviews in different states
+        from waldur_mastermind.proposal.tests import factories as prop_factories
+
+        review_created = prop_factories.ReviewFactory(
+            proposal=self.proposal,
+            reviewer=self.fixture.reviewer_1,
+            state=models.Review.States.CREATED,
+        )
+        review_in_review = prop_factories.ReviewFactory(
+            proposal=self.proposal,
+            reviewer=self.fixture.reviewer_2,
+            state=models.Review.States.IN_REVIEW,
+        )
+        reviewer_3 = UserFactory()
+        self.fixture.call.add_user(reviewer_3, self.fixture.call_role)
+        review_submitted = prop_factories.ReviewFactory(
+            proposal=self.proposal,
+            reviewer=reviewer_3,
+            state=models.Review.States.SUBMITTED,
+        )
+
+        # Reject proposal
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.reject_url, {"allocation_comment": "rejected"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Verify stale reviews (CREATED, IN_REVIEW) are deleted
+        self.assertFalse(
+            models.Review.objects.filter(uuid=review_created.uuid).exists()
+        )
+        self.assertFalse(
+            models.Review.objects.filter(uuid=review_in_review.uuid).exists()
+        )
+
+        # Verify submitted review is kept
+        self.assertTrue(
+            models.Review.objects.filter(uuid=review_submitted.uuid).exists()
+        )
+
+    def test_no_error_when_no_stale_reviews_exist(self):
+        """Test that approval/rejection works when no stale reviews exist."""
+        # Only create a submitted review
+        from waldur_mastermind.proposal.tests import factories as prop_factories
+
+        prop_factories.ReviewFactory(
+            proposal=self.proposal,
+            reviewer=self.fixture.reviewer_1,
+            state=models.Review.States.SUBMITTED,
+        )
+
+        # Approve proposal - should not error
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.approve_url, {"allocation_comment": "approved"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Verify proposal is approved
+        self.proposal.refresh_from_db()
+        self.assertEqual(self.proposal.state, ProposalStates.ACCEPTED)
