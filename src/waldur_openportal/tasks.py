@@ -435,15 +435,30 @@ def sync_usage():
     for project_credit in invoice_models.ProjectCredit.objects.all():
         project = project_credit.project
 
-        if project.is_expired or project.is_removed:
+        # Skip fully removed projects
+        if project.is_removed:
             continue
 
-        credits_available = project_credit.value
-
-        if credits_available is None or credits_available <= 0:
+        # For projects in grace period or past grace period, set limits to zero
+        if project.is_in_grace_period:
+            logger.info(
+                f"Project {project} is in grace period (until {project.end_date_with_grace}) - setting limits to zero"
+            )
+            credits_available = 0
+        elif project.is_expired:
+            # Project is expired and past grace period
+            logger.info(
+                f"Project {project} is expired (past grace period) - setting limits to zero"
+            )
             credits_available = 0
         else:
-            credits_available = float(credits_available)
+            # Project is active, use normal credit logic
+            credits_available = project_credit.value
+
+            if credits_available is None or credits_available <= 0:
+                credits_available = 0
+            else:
+                credits_available = float(credits_available)
 
         # find any openportal allocations associated with the project
         allocations = models.Allocation.objects.filter(project=project, is_active=True)
@@ -545,9 +560,10 @@ def sync_remote():
                 )
             continue
 
-        if project.is_expired or project.is_removed:
+        # Skip removed projects or projects past grace period
+        if project.is_removed:
             logger.info(
-                f"Remote allocation {remote_allocation} is for an expired or removed project - deleting"
+                f"Remote allocation {remote_allocation} is for a removed project - deleting"
             )
             try:
                 remote_allocation.delete()
@@ -556,6 +572,21 @@ def sync_remote():
                     f"Failed to delete remote allocation {remote_allocation}: {e}"
                 )
             continue
+
+        # Delete allocations for projects past grace period (fully expired)
+        if project.is_expired and not project.is_in_grace_period:
+            logger.info(
+                f"Remote allocation {remote_allocation} is for a project past grace period - deleting"
+            )
+            try:
+                remote_allocation.delete()
+            except Exception as e:
+                logger.error(
+                    f"Failed to delete remote allocation {remote_allocation}: {e}"
+                )
+            continue
+
+        # Projects in grace period are kept but will have limits set to zero by sync_usage
 
         if remote_allocation.state not in [
             CoreStates.CREATION_SCHEDULED,
@@ -719,13 +750,19 @@ def send_notifications():
 
         project = project_credit.project
 
-        if project.is_expired or project.is_removed:
+        # Skip removed projects
+        if project.is_removed:
+            continue
+
+        # Skip projects that are expired (including grace period)
+        # We don't send notifications for expired projects
+        if project.is_expired:
             continue
 
         # get the end date for this project
         end_date = project.end_date
 
-        # check that the project is not expired (sometimes expired hasn't worked?)
+        # Double-check that the project is not expired
         if end_date is not None and end_date < today:
             # project is expired - no need to send notifications
             continue
@@ -987,13 +1024,24 @@ def create_default_resources(serialized_managed_project):
             f"OpenPortal - ManagedProject {managed_project} has no associated project"
         )
 
-    if project.is_expired or project.is_removed:
+    if project.is_removed:
         logger.info(
-            f"OpenPortal - ManagedProject {managed_project} is an expired project"
+            f"OpenPortal - ManagedProject {managed_project} is for a removed project"
         )
         raise ValueError(
-            f"OpenPortal - ManagedProject {managed_project} is an expired project"
+            f"OpenPortal - ManagedProject {managed_project} is for a removed project"
         )
+
+    # Prevent creating resources for projects past grace period
+    if project.is_expired and not project.is_in_grace_period:
+        logger.info(
+            f"OpenPortal - ManagedProject {managed_project} is for a project past grace period"
+        )
+        raise ValueError(
+            f"OpenPortal - ManagedProject {managed_project} is for a project past grace period"
+        )
+
+    # Projects in grace period can keep their resources but with zero limits
 
     offerings = managed_project.get_default_offerings()
 

@@ -222,6 +222,10 @@ class ProjectSerializer(
     description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
     start_date = serializers.DateField(required=False, allow_null=True)
     end_date = serializers.DateField(required=False, allow_null=True)
+    grace_period_days = serializers.ReadOnlyField()
+    end_date_with_grace = serializers.ReadOnlyField()
+    is_in_grace_period = serializers.ReadOnlyField()
+    is_expired = serializers.ReadOnlyField()
 
     class Meta:
         model = models.Project
@@ -247,6 +251,10 @@ class ProjectSerializer(
             "start_date",
             "end_date",
             "end_date_requested_by",
+            "grace_period_days",
+            "end_date_with_grace",
+            "is_in_grace_period",
+            "is_expired",
             "oecd_fos_2007_code",
             "oecd_fos_2007_label",
             "is_industry",
