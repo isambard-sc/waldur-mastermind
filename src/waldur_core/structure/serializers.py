@@ -337,6 +337,7 @@ class ProjectSerializer(
             "short_name",
             "created",
             "description",
+            "end_date",
             "customer__uuid",
             "customer__name",
             "customer__slug",
