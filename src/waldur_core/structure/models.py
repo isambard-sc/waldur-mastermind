@@ -827,7 +827,45 @@ class Project(
     id: int
 
     @property
+    def grace_period_days(self):
+        """Number of days grace period after project end date.
+
+        During grace period, the project remains active but credits are set to zero.
+        This allows for a transition period before full termination.
+        """
+        return 30  # Default grace period of 30 days
+
+    @property
+    def end_date_with_grace(self):
+        """Calculate the actual termination date including grace period.
+
+        Returns:
+            date: The end_date plus grace_period_days, or None if no end_date is set
+        """
+        if not self.end_date:
+            return None
+        return self.end_date + timezone.timedelta(days=self.grace_period_days)
+
+    @property
+    def is_in_grace_period(self):
+        """Check if project is currently in the grace period.
+
+        Returns:
+            bool: True if current date is after end_date but before end_date_with_grace
+        """
+        if not self.end_date:
+            return False
+        today = timezone.now().date()
+        return self.end_date < today <= self.end_date_with_grace
+
+    @property
     def is_expired(self):
+        """Check if project end date has been reached (not including grace period).
+
+        Note: This property indicates the project has reached its end_date,
+        but resources may still be active during the grace period.
+        For termination logic, use end_date_with_grace instead.
+        """
         return self.end_date and self.end_date <= timezone.now().date()
 
     @property

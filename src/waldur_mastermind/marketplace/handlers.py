@@ -1103,7 +1103,12 @@ def resource_state_has_been_changed(
 def delete_expired_project_if_every_resource_has_been_terminated(
     sender, instance: Resource, created=False, **kwargs
 ):
-    """Delete an expired project if all its resources have been terminated."""
+    """Delete an expired project if all its resources have been terminated.
+
+    Note: This only deletes projects that have passed their grace period.
+    Projects in grace period (after end_date but before end_date_with_grace)
+    are kept alive with their resources.
+    """
     if created:
         return
 
@@ -1124,6 +1129,15 @@ def delete_expired_project_if_every_resource_has_been_terminated(
             pk=project.pk
         )
 
+    # Check if project has passed grace period (not just is_expired)
+    if not project.end_date:
+        return
+
+    today = timezone.now().date()
+    if project.end_date_with_grace and today <= project.end_date_with_grace:
+        # Project is still within grace period, don't delete
+        return
+
     if project.is_expired:
         resources = (
             models.Resource.objects.filter(project=project)
@@ -1137,7 +1151,7 @@ def delete_expired_project_if_every_resource_has_been_terminated(
         )
         if not resources:
             event_logger.emit(
-                "Project {project_name} is going to be deleted because end date has been reached and there are no active resources.",
+                "Project {project_name} is going to be deleted because end date (including grace period) has been reached and there are no active resources.",
                 event_type=EventType.PROJECT_DELETION_TRIGGERED,
                 event_context={"project": project},
                 scopes=[project, project.customer],

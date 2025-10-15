@@ -235,18 +235,36 @@ def terminate_resource(serialized_resource, serialized_user):
     name="waldur_mastermind.marketplace.terminate_resources_if_project_end_date_has_been_reached"
 )
 def terminate_resources_if_project_end_date_has_been_reached():
-    """Terminate resources when their project has reached its end date."""
-    expired_projects = structure_models.Project.available_objects.exclude(
+    """
+    Terminate resources when their project has reached its end date
+    plus grace period.
+
+    Note: Projects have a grace period (default 30 days) after the end_date
+    during which resources remain active but credits are set to zero.
+    Resources are only terminated after end_date + grace_period_days.
+    """
+    # Find projects where end_date + grace_period has been reached
+    projects_past_grace = structure_models.Project.available_objects.exclude(
         end_date__isnull=True
     ).filter(end_date__lte=timezone.datetime.today())
 
-    for project in expired_projects:
+    for project in projects_past_grace:
+        # Check if grace period has expired
+        if project.end_date_with_grace > timezone.datetime.today().date():
+            logger.info(
+                "Project %s (uuid=%s) is in grace period until %s, skipping termination",
+                project.name,
+                project.uuid,
+                project.end_date_with_grace,
+            )
+            continue
+
         project_resources = models.Resource.objects.filter(project=project)
         active_resources = project_resources.exclude(state=ResourceStates.TERMINATED)
 
         if not active_resources:
             event_logger.emit(
-                "Project {project_name} is going to be deleted because end date has been reached and there are no active resources.",
+                "Project {project_name} is going to be deleted because end date (including grace period) has been reached and there are no active resources.",
                 event_type=EventType.PROJECT_DELETION_TRIGGERED,
                 event_context={"project": project},
                 scopes=[project, project.customer],
@@ -260,12 +278,15 @@ def terminate_resources_if_project_end_date_has_been_reached():
             offering__parent=None,
         )
         logger.info(
-            "About to terminate resources from expired project: %s",
+            "About to terminate resources from project %s past grace period (end_date=%s, grace_until=%s): %s",
+            project.name,
+            project.end_date,
+            project.end_date_with_grace,
             ",".join([f"{r.uuid}, {r.name}" for r in terminatable_resources]),
         )
         utils.schedule_resources_termination(
             terminatable_resources,
-            termination_comment=f"Project end date has been reached on {timezone.datetime.today()}",
+            termination_comment=f"Project end date (including grace period) has been reached on {timezone.datetime.today()}",
         )
 
 
