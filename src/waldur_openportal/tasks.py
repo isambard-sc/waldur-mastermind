@@ -407,30 +407,72 @@ def sync_remote_usage():
                 return
 
 
-@shared_task(name="waldur_openportal.sync_usage")
-@run_once_task(takeover_timeout=60 * 60)
-def sync_usage():
+@shared_task(name="waldur_openportal.sync_customer_allocations")
+def sync_customer_allocations(customer_id):
     """
-    This task is called to synchronise the usage for all allocations
+    This task synchronises the usage for all allocations belonging to a single customer.
+    Allocations are processed serially within each customer to avoid race conditions.
     """
-    logger.info("OpenPortal task.sync_usage")
-    now = datetime.datetime.now()
+    try:
+        customer = structure_models.Customer.objects.get(id=customer_id)
+    except structure_models.Customer.DoesNotExist:
+        logger.error(f"Customer with id {customer_id} does not exist")
+        return
 
-    # loop through, using a different order each time to ensure every
-    # project is updated even if this individual task fails
-    for allocation in models.Allocation.objects.filter(is_active=True).order_by("?"):
+    logger.info(f"OpenPortal task.sync_customer_allocations for customer {customer.name}")
+
+    # Get all active allocations for this customer
+    allocations = models.Allocation.objects.filter(
+        is_active=True, project__customer=customer
+    )
+
+    for allocation in allocations:
         try:
             sync_allocation_usage(allocation)
         except Exception as e:
             logger.error(f"Failed to sync usage for {allocation}: {e}")
 
-        # make sure we will finish within an hour
-        if (datetime.datetime.now() - now).seconds > 3600:
-            logger.error("sync_usage took too long - aborting")
-            return
 
-    # Now update any limits that will be changed by the above usage
-    logger.info("OpenPortal task.sync_usage [limits]")
+@shared_task(name="waldur_openportal.sync_usage")
+@run_once_task(takeover_timeout=60 * 60)
+def sync_usage():
+    """
+    This task is called to synchronise the usage for all allocations.
+    It processes allocations by customer in parallel, but serially within each customer.
+
+    Note: This task schedules parallel subtasks and returns immediately.
+    The sync_allocation_limits task should be scheduled separately (e.g., via cron)
+    to run after this task typically completes to update resource limits.
+    """
+    logger.info("OpenPortal task.sync_usage")
+
+    # Group allocations by customer to enable parallel processing
+    # Use distinct() to get unique customer IDs
+    customer_ids = list(
+        models.Allocation.objects.filter(is_active=True)
+        .values_list("project__customer_id", flat=True)
+        .distinct()
+    )
+
+    logger.info(f"OpenPortal task.sync_usage: Processing {len(customer_ids)} customers")
+
+    # Schedule a task for each customer to process their allocations in parallel
+    for customer_id in customer_ids:
+        try:
+            sync_customer_allocations.delay(customer_id)
+        except Exception as e:
+            logger.error(f"Failed to schedule sync for customer {customer_id}: {e}")
+
+
+@shared_task(name="waldur_openportal.sync_allocation_limits")
+@run_once_task(takeover_timeout=60 * 60)
+def sync_allocation_limits():
+    """
+    This task updates the resource limits for all allocations based on project credits
+    and current usage. This should be run after sync_usage to ensure all usage data is current.
+    """
+    logger.info("OpenPortal task.sync_allocation_limits")
+    now = datetime.datetime.now()
 
     for project_credit in invoice_models.ProjectCredit.objects.all():
         project = project_credit.project
@@ -528,7 +570,7 @@ def sync_usage():
                 logger.error(f"Failed to sync limits for {allocation}: {e}")
 
             if (datetime.datetime.now() - now).seconds > 3600:
-                logger.error("sync_usage took too long - aborting")
+                logger.error("sync_allocation_limits took too long - aborting")
                 return
 
 
