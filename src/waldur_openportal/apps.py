@@ -129,5 +129,17 @@ class OpenPortalConfig(AppConfig):
         signals.post_save.connect(
             handlers.update_quotas_on_remote_allocation_usage_update,
             sender=models.RemoteAllocation,
-            dispatch_uid="waldur_openportal.handlers.update_quotas_on_remote_allocation_usage_update",
+            dispatch_uid=(
+                "waldur_openportal.handlers."
+                "update_quotas_on_remote_allocation_usage_update"
+            ),
+        )
+
+        signals.post_save.connect(
+            handlers.sync_project_credits_on_remote_allocation_change,
+            sender=models.RemoteAllocation,
+            dispatch_uid=(
+                "waldur_openportal.handlers."
+                "sync_project_credits_on_remote_allocation_change"
+            ),
         )

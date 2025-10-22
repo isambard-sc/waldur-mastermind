@@ -109,6 +109,9 @@ def update_allocation_credits(sender, instance, force_update=False, **kwargs):
 
         logger.info(f"OpenPortal - checking remote allocations for resource {uuid}")
 
+        # Track projects that need credit sync
+        projects_to_sync = set()
+
         for remote_allocation in models.RemoteAllocation.objects.filter(is_active=True):
             if remote_allocation.marketplace_uuid == uuid:
                 project = remote_allocation.project
@@ -123,6 +126,13 @@ def update_allocation_credits(sender, instance, force_update=False, **kwargs):
                             core_utils.serialize_instance(project)
                         )
                     )
+
+                    # Mark this project for credit sync
+                    projects_to_sync.add(project)
+
+        # Sync project credits for all affected projects
+        for project in projects_to_sync:
+            _sync_project_credits_for_project(project, created=False)
 
 
 @if_plugin_enabled
@@ -356,6 +366,98 @@ def update_quotas_on_remote_allocation_usage_update(
     update_remote_quotas(
         project.customer, models.RemoteAllocation.Permissions.customer_path
     )
+
+
+def _sync_project_credits_for_project(project, created=False):
+    """
+    Helper function to synchronize ProjectCredit for a given project.
+    Calculates the sum of all RemoteAllocation allocations and updates
+    the project's credits accordingly.
+    """
+    if project is None:
+        logger.warning("Project is None - cannot sync credits")
+        return
+
+    if project.is_expired or project.is_removed:
+        logger.info(f"Project {project} is expired or removed - skipping credit sync")
+        return
+
+    action = "creation" if created else "update"
+    logger.info(
+        f"OpenPortal - syncing project credits for project {project} "
+        f"due to allocation {action}"
+    )
+
+    # Calculate total allocation from all active RemoteAllocations
+    try:
+        from decimal import Decimal
+
+        total_allocation = Decimal(0)
+
+        remote_allocations = models.RemoteAllocation.objects.filter(
+            project=project, is_active=True
+        )
+
+        for allocation in remote_allocations:
+            # Get the allocation value from the marketplace resource options
+            try:
+                (
+                    allocation_value,
+                    allocation_unit,
+                ) = allocation._get_requested_allocation()
+                if allocation_value is not None:
+                    total_allocation += Decimal(str(allocation_value))
+                    logger.debug(
+                        f"RemoteAllocation {allocation}: "
+                        f"{allocation_value} {allocation_unit}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to get allocation for RemoteAllocation {allocation}: {e}"
+                )
+                continue
+
+        logger.info(
+            f"Total allocation for project {project}: {total_allocation} "
+            f"(from {remote_allocations.count()} RemoteAllocations)"
+        )
+
+        # Set the project credits to match the total allocation
+        if total_allocation > Decimal(0):
+            utils.set_project_credits(project, total_allocation)
+            logger.info(f"Set project credits for {project} to {total_allocation}")
+        else:
+            logger.info(
+                f"No positive allocation found for project {project} - "
+                "skipping credit update"
+            )
+
+    except Exception as e:
+        logger.error(
+            f"Failed to sync project credits for project {project}: {e}",
+            exc_info=True,
+        )
+
+
+@if_plugin_enabled
+def sync_project_credits_on_remote_allocation_change(
+    sender, instance, created=False, **kwargs
+):
+    """
+    Synchronize ProjectCredit when a RemoteAllocation is created or updated.
+    This ensures that the local project's credits match the sum of all
+    RemoteAllocation resources' allocations.
+    """
+    remote_allocation = instance
+    project = remote_allocation.project
+
+    if project is None:
+        logger.warning(
+            f"RemoteAllocation {remote_allocation} has no project - cannot sync credits"
+        )
+        return
+
+    _sync_project_credits_for_project(project, created=created)
 
 
 def update_quotas(scope, path):
