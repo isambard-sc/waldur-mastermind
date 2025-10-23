@@ -44,7 +44,9 @@ class SharedTenantFilterSet(django_filters.FilterSet):
 
 
 class SecurityGroupFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
-    query = django_filters.CharFilter(method="filter_query")
+    query = django_filters.CharFilter(
+        method="filter_query", label="Search by name or description"
+    )
 
     class Meta(structure_filters.BaseResourceFilter.Meta):
         model = models.SecurityGroup
@@ -117,7 +119,9 @@ class RouterFilter(TenantFilterSet, structure_filters.NameFilterSet):
 
 class PortFilter(TenantFilterSet, structure_filters.NameFilterSet):
     o = django_filters.OrderingFilter(fields=(("network__name", "network_name"),))
-    query = django_filters.CharFilter(method="filter_query", label="Query")
+    query = django_filters.CharFilter(
+        method="filter_query", label="Search by name, MAC address or backend ID"
+    )
     has_device_owner = django_filters.BooleanFilter(
         method="filter_has_device_owner", label="Has device owner"
     )
@@ -344,7 +348,9 @@ class InstanceFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
         field_name="availability_zone__name"
     )
     attach_volume_uuid = django_filters.UUIDFilter(method="filter_attach_volume")
-    query = django_filters.CharFilter(method="filter_query")
+    query = django_filters.CharFilter(
+        method="filter_query", label="Search by name, internal IP, or external IP"
+    )
 
     def filter_attach_volume(self, queryset, name, value):
         """
@@ -414,6 +420,11 @@ class VolumeAvailabilityZoneFilter(
 
 
 class NetworkRBACPolicyFilter(django_filters.FilterSet):
+    tenant_uuid = django_filters.UUIDFilter(field_name="network__tenant__uuid")
+    tenant = core_filters.URLFilter(
+        view_name="openstack-tenant-detail", field_name="network__tenant__uuid"
+    )
+
     network_uuid = django_filters.UUIDFilter(field_name="network__uuid")
     network = core_filters.URLFilter(
         view_name="openstack-network-detail", field_name="network__uuid"

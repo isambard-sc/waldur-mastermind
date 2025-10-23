@@ -6,11 +6,19 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import MultipleObjectsReturned, ObjectDoesNotExist
 from django.db import transaction
-from rest_framework import exceptions
+from django.utils.translation import gettext_lazy as _
+from rest_framework import exceptions, serializers
 
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure.backend import ServiceBackend
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import plugins
+from waldur_mastermind.marketplace.enums import (
+    OPENSTACK_INSTANCE_OFFERING,
+    OPENSTACK_TENANT_OFFERING,
+    OPENSTACK_VOLUME_OFFERING,
+    OrderTypes,
+)
 from waldur_mastermind.marketplace.utils import (
     get_resource_state,
     import_current_usages,
@@ -18,15 +26,17 @@ from waldur_mastermind.marketplace.utils import (
 )
 from waldur_mastermind.marketplace_openstack import (
     CORES_TYPE,
-    INSTANCE_TYPE,
     RAM_TYPE,
     STORAGE_MODE_DYNAMIC,
     STORAGE_MODE_FIXED,
     STORAGE_TYPE,
-    TENANT_TYPE,
-    VOLUME_TYPE,
 )
-from waldur_openstack import models as openstack_models
+from waldur_openstack import (
+    executors as openstack_executors,
+)
+from waldur_openstack import (
+    models as openstack_models,
+)
 from waldur_openstack.backend import OpenStackBackend
 from waldur_openstack.utils import (
     is_valid_volume_type_name,
@@ -54,18 +64,18 @@ def get_offering_category_for_volume():
 
 
 def get_category_and_name_for_offering_type(offering_type, tenant):
-    if offering_type == INSTANCE_TYPE:
+    if offering_type == OPENSTACK_INSTANCE_OFFERING:
         category = get_offering_category_for_instance()
         name = get_offering_name_for_instance(tenant)
         return category, name
-    elif offering_type == VOLUME_TYPE:
+    elif offering_type == OPENSTACK_VOLUME_OFFERING:
         category = get_offering_category_for_volume()
         name = get_offering_name_for_volume(tenant)
         return category, name
 
 
 def create_offering_components(offering):
-    fixed_components = plugins.manager.get_components(TENANT_TYPE)
+    fixed_components = plugins.manager.get_components(OPENSTACK_TENANT_OFFERING)
 
     for component_data in fixed_components:
         marketplace_models.OfferingComponent.objects.create(
@@ -121,7 +131,7 @@ def get_offering(offering_type, scope):
         )
 
 
-def import_quotas(offering, source_values):
+def import_quotas(offering: marketplace_models.Offering, source_values):
     storage_mode = offering.plugin_options.get("storage_mode") or STORAGE_MODE_FIXED
 
     result_values = {
@@ -145,8 +155,8 @@ def _apply_quotas(target: openstack_models.Tenant, quotas: dict[str, int]):
         target.set_quota_limit(name, limit)
 
 
-def import_usage(resource):
-    tenant = resource.scope
+def import_usage(resource: marketplace_models.Resource):
+    tenant = cast(openstack_models.Tenant, resource.scope)
 
     if not tenant:
         return
@@ -161,7 +171,7 @@ def import_limits(resource: marketplace_models.Resource):
     Import resource quotas as marketplace limits.
     :param resource: Marketplace resource
     """
-    tenant = resource.scope
+    tenant = cast(openstack_models.Tenant, resource.scope)
 
     if not tenant:
         return
@@ -170,7 +180,7 @@ def import_limits(resource: marketplace_models.Resource):
     resource.save(update_fields=["limits"])
 
 
-def tenant_limits_validator(limits):
+def tenant_limits_validator(limits: dict):
     cores = limits.get(CORES_TYPE) or 0
     if not cores:
         raise exceptions.ValidationError("CPU limit is mandatory.")
@@ -230,13 +240,11 @@ def map_limits_to_quotas(limits, offering: marketplace_models.Offering, is_creat
         quotas["storage"] = ServiceBackend.gb2mb(sum(list(volume_type_quotas.values())))
 
     # Convert quota value from float to integer because OpenStack API fails otherwise
-    quotas = {k: isinstance(v, float) and int(v) or v for k, v in quotas.items()}
-
-    return quotas
+    return {k: int(v) for k, v in quotas.items() if v is not None}
 
 
-def update_limits(order):
-    tenant = order.resource.scope
+def update_limits(order: marketplace_models.Order):
+    tenant = cast(openstack_models.Tenant, order.resource.scope)
     backend = tenant.get_backend()
     quotas = map_limits_to_quotas(order.limits, order.offering, is_create=False)
     backend.push_tenant_quotas(tenant, quotas)
@@ -274,8 +282,8 @@ def import_limits_when_storage_mode_is_switched(resource: marketplace_models.Res
     resource.save(update_fields=["limits"])
 
 
-def push_tenant_limits(resource):
-    tenant = resource.scope
+def push_tenant_limits(resource: marketplace_models.Resource):
+    tenant = cast(openstack_models.Tenant, resource.scope)
     backend = tenant.get_backend()
     quotas = map_limits_to_quotas(resource.limits, resource.offering, is_create=False)
     backend.push_tenant_quotas(tenant, quotas)
@@ -283,13 +291,13 @@ def push_tenant_limits(resource):
         _apply_quotas(tenant, quotas)
 
 
-def restore_limits(resource):
+def restore_limits(resource: marketplace_models.Resource):
     order = (
         marketplace_models.Order.objects.filter(
             resource=resource,
             type__in=[
-                marketplace_models.Order.Types.CREATE,
-                marketplace_models.Order.Types.UPDATE,
+                OrderTypes.CREATE,
+                OrderTypes.UPDATE,
             ],
         )
         .order_by("-created")
@@ -364,7 +372,7 @@ def create_offerings_for_volume_and_instance(tenant: openstack_models.Tenant):
         return
 
     parent_offering = resource.offering
-    for offering_type in (INSTANCE_TYPE, VOLUME_TYPE):
+    for offering_type in (OPENSTACK_INSTANCE_OFFERING, OPENSTACK_VOLUME_OFFERING):
         try:
             category, offering_name = get_category_and_name_for_offering_type(
                 offering_type, tenant
@@ -435,7 +443,9 @@ def create_marketplace_resource_for_imported_resources(
     )
 
     if isinstance(instance, openstack_models.Instance):
-        offering = offering or get_offering(INSTANCE_TYPE, instance.tenant)
+        offering = offering or get_offering(
+            OPENSTACK_INSTANCE_OFFERING, instance.tenant
+        )
 
         if not offering:
             return
@@ -448,7 +458,7 @@ def create_marketplace_resource_for_imported_resources(
         update_external_addresses_of_resource(resource)
 
     if isinstance(instance, openstack_models.Volume):
-        offering = offering or get_offering(VOLUME_TYPE, instance.tenant)
+        offering = offering or get_offering(OPENSTACK_VOLUME_OFFERING, instance.tenant)
 
         if not offering:
             return
@@ -460,7 +470,9 @@ def create_marketplace_resource_for_imported_resources(
         import_volume_metadata(resource)
 
     if isinstance(instance, openstack_models.Tenant):
-        offering = offering or get_offering(TENANT_TYPE, instance.service_settings)
+        offering = offering or get_offering(
+            OPENSTACK_TENANT_OFFERING, instance.service_settings
+        )
 
         if not offering:
             return
@@ -498,7 +510,7 @@ def get_external_ip(offering, floating_ip_address):
 
 
 def update_external_addresses_of_resource(resource: marketplace_models.Resource):
-    instance = resource.scope
+    instance = cast(openstack_models.Instance, resource.scope)
 
     if not instance:
         return
@@ -546,7 +558,7 @@ def update_external_addresses_of_offering_floating_ips(
     parent_offering: marketplace_models.Offering,
 ):
     offerings = marketplace_models.Offering.objects.filter(
-        parent=parent_offering, type=INSTANCE_TYPE
+        parent=parent_offering, type=OPENSTACK_INSTANCE_OFFERING
     )
 
     if not offerings:
@@ -570,3 +582,32 @@ def set_ports_status_for_order(order, status):
             if port:
                 port.status = status
                 port.save()
+
+
+def delete_instance(instance, attributes=None, is_async=True):
+    if not attributes:
+        attributes = {}
+
+    delete_volumes = attributes.get("delete_volumes", True)
+    release_floating_ips = attributes.get("release_floating_ips", True)
+
+    if (
+        delete_volumes
+        and openstack_models.Snapshot.objects.filter(
+            source_volume__instance=instance
+        ).exists()
+    ):
+        raise serializers.ValidationError(
+            _("Cannot delete instance. One of its volumes has attached snapshot.")
+        )
+
+    force = instance.state == CoreStates.ERRED
+    transaction.on_commit(
+        lambda: openstack_executors.InstanceDeleteExecutor.execute(
+            instance,
+            force=force,
+            delete_volumes=delete_volumes,
+            release_floating_ips=release_floating_ips,
+            is_async=is_async,
+        )
+    )

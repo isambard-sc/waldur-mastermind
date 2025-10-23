@@ -41,7 +41,7 @@ class CustomerSection(FeatureSection):
         "Make payments menu visible for staff users only."
     )
     show_permission_reviews = Feature(
-        "Allows to show permission reviews tab and popups."
+        "Allows to show permission reviews tab and popups for organisations."
     )
 
 
@@ -79,6 +79,12 @@ class ProjectSection(FeatureSection):
     mandatory_start_date = Feature("Make the project start date mandatory.")
 
     mandatory_end_date = Feature("Make the project end date mandatory.")
+
+    show_permission_reviews = Feature(
+        "Allows to show permission reviews tab and popups for projects."
+    )
+
+    show_kind_in_create_dialog = Feature("Show kind field in project create dialog.")
 
 
 class UserSection(FeatureSection):
@@ -130,6 +136,11 @@ class MarketplaceSection(FeatureSection):
         "Show resource end date as a non optional column in resources list."
     )
 
+    allow_display_of_images_in_markdown = Feature(
+        "Allow display of images in markdown format."
+    )
+    display_user_tos = Feature("Enable display of user terms of service in UI.")
+
 
 class SupportSection(FeatureSection):
     class Meta:
@@ -159,6 +170,7 @@ class InvitationsSection(FeatureSection):
         "Make civil number field mandatory in invitation creation form."
     )
     show_service_accounts = Feature("Show service accounts of the scopes.")
+    show_course_accounts = Feature("Show course accounts of the scopes.")
 
 
 class RancherSection(FeatureSection):

@@ -1,6 +1,7 @@
 import uuid
 from unittest import mock
 
+import factory
 from celery import Signature
 from cinderclient import exceptions as cinder_exceptions
 from ddt import data, ddt
@@ -12,6 +13,9 @@ from waldur_core.core.enums import CoreStates
 from waldur_core.core.utils import serialize_instance
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.common import utils as common_utils
+from waldur_mastermind.marketplace_openstack.utils import (
+    delete_instance,
+)
 from waldur_openstack import executors, models, views
 from waldur_openstack.exceptions import OpenStackBackendError
 from waldur_openstack.models import Port
@@ -227,7 +231,7 @@ class InstanceCreateTest(test.APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         instance = models.Instance.objects.get(uuid=response.data["uuid"])
-        self.assertIn(floating_ip, instance.floating_ips)
+        self.assertIn(floating_ip, instance.floating_ips.all())
 
     def test_service_settings_should_have_external_network_id(self):
         self.openstack_settings.options = {"external_network_id": "invalid"}
@@ -294,6 +298,75 @@ class InstanceCreateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("floating_ips", response.data)
 
+    def test_user_can_assign_floating_ip_by_address(self):
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        floating_ip = factories.FloatingIPFactory(
+            tenant=self.tenant, state=CoreStates.OK, runtime_state="DOWN"
+        )
+        data = self.get_valid_data(
+            floating_ips=[
+                {"subnet": subnet_url, "ip_address": floating_ip.address},
+            ],
+        )
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        self.assertIn(floating_ip, instance.floating_ips.all())
+
+    def test_user_cannot_assign_floating_ip_by_invalid_address(self):
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        data = self.get_valid_data(
+            floating_ips=[
+                {"subnet": subnet_url, "ip_address": "not a valid ip"},
+            ],
+        )
+        response = self.create_instance(data)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("ip_address", response.data["floating_ips"][0])
+
+    def test_user_cannot_assign_floating_ip_by_address_and_url(self):
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        floating_ip = factories.FloatingIPFactory(tenant=self.tenant)
+        data = self.get_valid_data(
+            floating_ips=[
+                {
+                    "subnet": subnet_url,
+                    "url": factories.FloatingIPFactory.get_url(floating_ip),
+                    "ip_address": floating_ip.address,
+                }
+            ],
+        )
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("non_field_errors", response.data["floating_ips"][0])
+        self.assertIn(
+            "Please specify floating IP URL or IP address, not both",
+            str(response.data),
+        )
+
+    def test_user_cannot_use_floating_ip_in_use_by_address(self):
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        port = factories.PortFactory(subnet=self.subnet)
+        floating_ip = factories.FloatingIPFactory(
+            tenant=self.tenant,
+            runtime_state="ACTIVE",
+            port=port,
+        )
+        data = self.get_valid_data(
+            floating_ips=[
+                {"subnet": subnet_url, "ip_address": floating_ip.address},
+            ],
+        )
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("floating_ips", response.data)
+
     def test_user_can_assign_active_floating_ip(self):
         subnet_url = factories.SubNetFactory.get_url(self.subnet)
         floating_ip = factories.FloatingIPFactory(
@@ -352,6 +425,30 @@ class InstanceCreateTest(test.APITransactionTestCase):
         response = self.create_instance(data)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_can_create_instance_with_multiple_ports(self):
+        data = self.get_valid_data()
+        second_subnet = factories.SubNetFactory(
+            network=self.fixture.network,
+            tenant=self.fixture.tenant,
+            service_settings=self.fixture.settings,
+            project=self.fixture.project,
+            state=CoreStates.OK,
+            backend_id=factory.Sequence(lambda n: "subnet_%s" % n),
+        )
+        data["ports"].append({"subnet": factories.SubNetFactory.get_url(second_subnet)})
+
+        response = self.create_instance(data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(instance.ports.count(), 2)
+        self.assertTrue(
+            instance.ports.filter(subnet=self.fixture.subnet, backend_id=None).exists(),
+        )
+        self.assertTrue(
+            instance.ports.filter(subnet=second_subnet, backend_id=None).exists(),
+        )
 
     def test_show_volume_type_in_instance_serializer(self):
         instance = factories.InstanceFactory()
@@ -499,12 +596,7 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
         )
         self.instance.increase_backend_quotas_usage()
         self.mocked_nova.servers.get.side_effect = nova_exceptions.NotFound(code=404)
-        views.MarketplaceInstanceViewSet.async_executor = False
         self.tenant = self.instance.tenant
-
-    def tearDown(self):
-        super().tearDown()
-        views.MarketplaceInstanceViewSet.async_executor = True
 
     def mock_volumes(self, delete_data_volume=True):
         self.data_volume = self.instance.volumes.get(bootable=False)
@@ -528,20 +620,8 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
 
         self.mocked_cinder.volumes.get.side_effect = get_volume
 
-    def delete_instance(self, query_params=None, check_status_code=True):
-        user = structure_factories.UserFactory(is_staff=True)
-        view = views.MarketplaceInstanceViewSet.as_view({"delete": "destroy"})
-
-        response = common_utils.delete_request(
-            view, user, uuid=self.instance.uuid.hex, query_params=query_params
-        )
-
-        if check_status_code:
-            self.assertEqual(
-                response.status_code, status.HTTP_202_ACCEPTED, response.data
-            )
-
-        return response
+    def delete_instance(self, query_params=None):
+        delete_instance(self.instance, query_params, is_async=False)
 
     def assert_quota_usage(self, scope, name, value):
         self.assertEqual(scope.get_quota_usage(name), value)
@@ -615,16 +695,6 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
 
         self.assert_quota_usage(tenant, "volumes", 1)
         self.assert_quota_usage(tenant, "storage", self.data_volume.size)
-
-    def test_instance_cannot_be_deleted_if_it_has_backups(self):
-        self.instance = factories.InstanceFactory(
-            state=CoreStates.OK,
-            runtime_state=models.Instance.RuntimeStates.SHUTOFF,
-            backend_id="VALID_ID",
-        )
-        factories.BackupFactory(instance=self.instance, state=CoreStates.OK)
-        response = self.delete_instance(check_status_code=False)
-        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT, response.data)
 
     def test_neutron_methods_are_called_if_instance_is_deleted_with_floating_ips(self):
         self.mock_volumes(False)

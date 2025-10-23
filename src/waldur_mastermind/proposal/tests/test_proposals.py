@@ -1,8 +1,12 @@
 import datetime
+from unittest import mock
 
 from ddt import data, ddt
+from django.core import mail
+from django.test import override_settings
 from rest_framework import status, test
 
+from waldur_core.core import utils as core_utils
 from waldur_core.media.utils import dummy_image
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
 from waldur_core.permissions.utils import has_user
@@ -216,19 +220,75 @@ class ActionTest(test.APITransactionTestCase):
         self.proposal = self.fixture.proposal
         self.proposal.state = ProposalStates.DRAFT
         self.proposal.save()
-        self.url = factories.ProposalFactory.get_url(self.proposal, "submit")
+        self.submit_url = factories.ProposalFactory.get_url(self.proposal, "submit")
+        self.approve_url = factories.ProposalFactory.get_url(self.proposal, "approve")
+        self.reject_url = factories.ProposalFactory.get_url(self.proposal, "reject")
+        structure_factories.NotificationFactory(
+            key="proposal.proposal_state_changed",
+        )
+        structure_factories.NotificationFactory(
+            key="proposal.new_proposal_submitted",
+        )
+        structure_factories.NotificationFactory(
+            key="proposal.proposal_decision_for_reviewer",
+        )
 
+    @mock.patch(
+        "waldur_mastermind.proposal.views.tasks.notify_user_about_proposal_state_update.delay"
+    )
     @data(
         "staff",
         "proposal_creator",
     )
-    def test_force_approval_of_proposal_creates_project(self, user):
+    def test_user_can_submit_proposal(self, user, mock_notify):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
-        response = self.client.post(self.url)
+        response = self.client.post(self.submit_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.proposal.refresh_from_db()
         self.assertTrue(self.proposal.state, ProposalStates.SUBMITTED)
+
+        # Verify that notification task has been called
+        mock_notify.assert_called_once()
+
+    @override_settings(task_always_eager=True)
+    @data("proposal_creator")
+    def test_notifications_are_sent_after_submission(self, user):
+        user = getattr(self.fixture, user)
+        call_manager = self.fixture.call_manager
+        self.proposal.round.call.add_user(call_manager, CallRole.MANAGER)
+        self.client.force_authenticate(user)
+        self.client.post(self.submit_url)
+        # Verify that notification email has been sent to proposal creator
+        self.assertEqual(len(mail.outbox), 2)
+        self.assertEqual(mail.outbox[0].to, [user.email])
+        # Verify notification content
+        proposal_url = core_utils.format_homeport_link(
+            "proposals/{proposal_uuid}/",
+            proposal_uuid=self.proposal.uuid,
+        )
+        body = mail.outbox[0].body
+        self.assertIn("Your proposal has been successfully submitted", body)
+        self.assertIn(f"Dear {user.full_name}", body)
+        self.assertIn(self.proposal.name, body)
+        self.assertIn(f"Previous state: {ProposalStates.DRAFT}", body)
+        self.assertIn(f"New state: {ProposalStates.SUBMITTED}", body)
+        self.assertIn(f"View Proposal: {proposal_url}", body)
+
+        # Verify that notification email has been sent to call manager
+        self.assertEqual(mail.outbox[1].to, [call_manager.email])
+        proposal_url = core_utils.format_homeport_link(
+            "call-management/{customer_uuid}/proposals/{proposal_uuid}/",
+            customer_uuid=self.proposal.round.call.manager.customer.uuid,
+            proposal_uuid=self.proposal.uuid,
+        )
+        body = mail.outbox[1].body
+        self.assertIn("A new proposal has been submitted to the call", body)
+        self.assertIn(self.proposal.name, body)
+        self.assertIn(proposal_url, body)
+        self.assertIn(self.proposal.created_by.full_name, body)
+        self.assertIn(self.proposal.round.name, body)
+        self.assertIn(self.proposal.round.call.name, body)
 
     @data(
         "owner",
@@ -237,22 +297,38 @@ class ActionTest(test.APITransactionTestCase):
     def test_user_can_not_submit_proposal(self, user):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
-        response = self.client.post(self.url)
+        response = self.client.post(self.submit_url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_set_project_start_date_if_proposal_has_been_approved(self):
+    @override_settings(task_always_eager=True)
+    def test_force_approval_of_proposal_creates_project(self):
         self.proposal.state = ProposalStates.IN_REVIEW
         self.proposal.save()
 
         self.client.force_authenticate(self.fixture.staff)
 
-        url_approve = factories.ProposalFactory.get_url(self.proposal, "approve")
-        response = self.client.post(url_approve)
+        response = self.client.post(self.approve_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.proposal.refresh_from_db()
         self.assertTrue(self.proposal.project)
-        self.assertEqual(self.proposal.project.start_date, None)
 
+        # Verify proposal creator has been notified
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, [self.proposal.created_by.email])
+        project_url = core_utils.format_homeport_link(
+            "projects/{project_uuid}/",
+            project_uuid=self.proposal.project.uuid,
+        )
+        body = mail.outbox[0].body
+        self.assertIn("Your proposal has been accepted.", body)
+        self.assertIn(f"Previous state: {ProposalStates.IN_REVIEW}", body)
+        self.assertIn(f"New state: {ProposalStates.ACCEPTED}", body)
+        self.assertIn(f"View Project: {project_url}", body)
+        for requested_resource in self.proposal.requestedresource_set.all():
+            self.assertIn(requested_resource.resource.name, body)
+
+    def test_set_project_start_date_if_proposal_has_been_approved(self):
+        self.client.force_authenticate(self.fixture.staff)
         new_proposal = factories.ProposalFactory(
             round=self.fixture.round,
             state=ProposalStates.IN_REVIEW,
@@ -267,6 +343,73 @@ class ActionTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         new_proposal.refresh_from_db()
         self.assertEqual(new_proposal.project.start_date, allocation_date.date())
+
+    @override_settings(task_always_eager=True)
+    def test_reviewer_notification_triggered_on_reject(self):
+        factories.ReviewFactory(
+            proposal=self.proposal,
+            reviewer=self.fixture.reviewer_1,
+            state=models.Review.States.SUBMITTED,
+        )
+
+        self.proposal.state = ProposalStates.IN_REVIEW
+        self.proposal.save()
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.reject_url, {"allocation_comment": "Not suitable"}
+        )
+
+        self.proposal.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Should have 2 emails: 1 for proposal creator + 1 for reviewer
+        self.assertEqual(len(mail.outbox), 2)
+
+        reviewer_email = next(
+            email
+            for email in mail.outbox
+            if email.to[0] == self.fixture.reviewer_1.email
+        )
+
+        body = reviewer_email.body
+        self.assertIn("A decision has been made on the proposal", body)
+        self.assertIn(self.proposal.name, body)
+        self.assertIn(self.proposal.round.call.name, body)
+        self.assertIn(self.proposal.state, body)
+        self.assertIn("Not suitable", body)
+        self.assertIn(self.fixture.reviewer_1.full_name, body)
+
+    @data(
+        "call_manager",
+        "call_organizer_user",
+    )
+    def test_user_can_approve_or_reject(self, user):
+        accept_response, reject_response = self._approve_reject_proposal(user)
+        self.assertEqual(accept_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(reject_response.status_code, status.HTTP_200_OK)
+
+    @data(
+        "proposal_creator",
+    )
+    def test_user_can_not_approve_or_reject(self, user):
+        accept_response, reject_response = self._approve_reject_proposal(user)
+        self.assertEqual(accept_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(reject_response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def _approve_reject_proposal(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        self.proposal.state = ProposalStates.SUBMITTED
+        self.proposal.save()
+        accept_response = self.client.post(self.approve_url)
+
+        self.proposal.state = ProposalStates.SUBMITTED
+        self.proposal.save()
+
+        reject_response = self.client.post(self.reject_url)
+        return accept_response, reject_response
 
 
 @ddt
@@ -484,3 +627,41 @@ class TaskTest(test.APITransactionTestCase):
         from waldur_core.logging.models import Event
 
         self.assertTrue(Event.objects.filter(event_type="proposal_canceled").exists())
+
+    @override_settings(task_always_eager=True)
+    def test_notifications_for_cancelled_proposals(self):
+        structure_factories.NotificationFactory(
+            key="proposal.proposal_cancelled",
+        )
+        self.round.cutoff_time = datetime.datetime.now() - datetime.timedelta(days=1)
+        self.round.save()
+        tasks.proposals_for_ended_rounds_should_be_cancelled()
+        self.proposal.refresh_from_db()
+
+        # Verify that notification email has been sent to proposal creator
+        # in fixtures.py there are two proposals belong to this round; therefore, there are two emails in the mail outbox
+        self.assertEqual(len(mail.outbox), 2)
+
+        # Check that both expected email recipients are present (order doesn't matter)
+        email_recipients = [mail.to for mail in mail.outbox]
+        expected_recipients = [
+            [self.proposal.created_by.email],
+            [self.fixture.proposal_submitted.created_by.email],
+        ]
+
+        self.assertEqual(sorted(email_recipients), sorted(expected_recipients))
+
+        # Find the email for self.proposal and verify its content
+        proposal_email = None
+        for email in mail.outbox:
+            if email.to == [self.proposal.created_by.email]:
+                proposal_email = email
+                break
+
+        self.assertIsNotNone(proposal_email, "Email for self.proposal not found")
+        body = proposal_email.body
+        self.assertIn(
+            f'Your proposal "{self.proposal.name}" in call "{self.proposal.round.call.name}" has been canceled',
+            body,
+        )
+        self.assertIn("Cancellation details:", body)

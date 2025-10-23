@@ -3,11 +3,13 @@ import io
 import logging
 import uuid
 from collections import defaultdict
+from collections.abc import Iterable
 from decimal import Decimal
 
 import httpx
 from django.core.files.base import ContentFile
 from django.db.models import Q
+from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from httpx import TimeoutException
 from rest_framework.exceptions import ValidationError
@@ -15,14 +17,12 @@ from waldur_api_client.api.marketplace_orders import (
     marketplace_orders_list,
     marketplace_orders_retrieve,
 )
-from waldur_api_client.api.marketplace_provider_resources import (
-    marketplace_provider_resources_team_list,
-)
 from waldur_api_client.api.marketplace_public_offerings import (
     marketplace_public_offerings_list,
 )
 from waldur_api_client.api.marketplace_resources import (
     marketplace_resources_retrieve,
+    marketplace_resources_team_list,
     marketplace_resources_update_options,
 )
 from waldur_api_client.api.marketplace_screenshots import marketplace_screenshots_list
@@ -75,16 +75,20 @@ from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import plugins
 from waldur_mastermind.marketplace.enums import (
+    REMOTE_OFFERING,
     OfferingStates,
     OrderStates,
+    OrderTypes,
+    RemoteResourceSyncStatus,
     ResourceStates,
 )
-from waldur_mastermind.marketplace_remote import PLUGIN_NAME, models
+from waldur_mastermind.marketplace_remote import models
 from waldur_mastermind.marketplace_remote.constants import (
     OFFERING_COMPONENT_FIELDS,
     OFFERING_FIELDS,
     PLAN_FIELDS,
 )
+from waldur_mastermind.marketplace_remote.exceptions import RemoteStatusSyncFailed
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +124,7 @@ def extract_fields(fields: list[str], remote_dict: dict):
     return extracted_fields
 
 
-def pull_fields(fields: list[str], local_object, remote_dict):
+def pull_fields(fields: Iterable[str], local_object, remote_dict):
     changed_fields = set()
     for field in fields:
         if field not in remote_dict:
@@ -150,7 +154,7 @@ def get_remote_offerings_for_project(project: structure_models.Project):
     offering_ids = (
         marketplace_models.Resource.objects.filter(
             project=project,
-            offering__type=PLUGIN_NAME,
+            offering__type=REMOTE_OFFERING,
             offering__state=OfferingStates.ACTIVE,
         )
         .exclude(state__in=INVALID_RESOURCE_STATES)
@@ -163,7 +167,7 @@ def get_remote_offerings_for_project(project: structure_models.Project):
 def get_projects_with_remote_offerings():
     projects_with_offerings = defaultdict(set)
     resource_pairs = (
-        marketplace_models.Resource.objects.filter(offering__type=PLUGIN_NAME)
+        marketplace_models.Resource.objects.filter(offering__type=REMOTE_OFFERING)
         .exclude(state__in=INVALID_RESOURCE_STATES)
         .values("offering", "project")
         .distinct()
@@ -181,7 +185,7 @@ def get_projects_with_remote_offerings():
 
     order_pairs = (
         marketplace_models.Order.objects.filter(
-            offering__type=PLUGIN_NAME,
+            offering__type=REMOTE_OFFERING,
             state__in=(
                 OrderStates.PENDING_CONSUMER,
                 OrderStates.PENDING_PROVIDER,
@@ -290,8 +294,8 @@ def sync_resource_team(resource: marketplace_models.Resource):
     project: structure_models.Project = resource.project
     remote_project, _ = get_or_create_remote_project(offering, project, client)
 
-    remote_team = marketplace_provider_resources_team_list.sync(
-        client=client, uuid=resource.uuid.hex
+    remote_team = marketplace_resources_team_list.sync(
+        client=client, uuid=resource.backend_id
     )
     remote_permissions = {
         (record.username, record.role): record.uuid.hex for record in remote_team
@@ -501,7 +505,7 @@ def parse_order_state(serialized_state: str) -> int:
 
 
 def parse_order_type(serialized_state: str) -> int:
-    return {v: k for (k, v) in marketplace_models.Order.Types.CHOICES}[serialized_state]
+    return {v: k for (k, v) in OrderTypes.CHOICES}[serialized_state]
 
 
 def parse_offering_state(serialized_state: str) -> int:
@@ -729,7 +733,7 @@ def upsert_offering(
         local_offering.refresh_from_db()
     else:
         local_offering, _ = marketplace_models.Offering.objects.update_or_create(
-            type=PLUGIN_NAME,
+            type=REMOTE_OFFERING,
             backend_id=remote_offering.uuid.hex,
             customer=local_customer,
             defaults={
@@ -819,7 +823,7 @@ def import_offering_screenshots(local_offering: marketplace_models.Offering):
     try:
         remote_screenshots = marketplace_screenshots_list.sync(
             client=client,
-            offering_uuid=remote_offering_uuid,
+            offering_uuid=[uuid.UUID(remote_offering_uuid)],
         )
     except (UnexpectedStatus, TimeoutException) as e:
         logger.error(
@@ -924,3 +928,220 @@ def update_offering_related_data(
         local_components_map=local_components_map,
     )
     return local_offering
+
+
+def get_resource_sync_status(resource):
+    """
+    Get resource sync status. To show the resource state in local and remote instances.
+    """
+
+    try:
+        client = get_client_for_offering(resource.offering)
+        remote_resource = marketplace_resources_retrieve.sync(
+            client=client, uuid=resource.backend_id
+        )
+        if not remote_resource.state:
+            return {
+                "local_state": resource.get_state_display(),
+                "remote_state": None,
+                "sync_status": RemoteResourceSyncStatus.SYNC_FAILED,
+                "error": "Remote resource state is not available",
+                "last_sync": None,
+            }
+
+        status_data = {
+            "local_state": resource.get_state_display(),
+            "remote_state": remote_resource.state.value,
+            "sync_status": RemoteResourceSyncStatus.IN_SYNC
+            if resource.state == parse_resource_state(remote_resource.state.value)
+            else RemoteResourceSyncStatus.OUT_OF_SYNC,
+            "last_sync": timezone.now(),
+        }
+        return status_data
+    except UnexpectedStatus as exc:
+        message = f"Unable to fetch remote resource state for resource {resource.uuid}"
+        logger.exception(message)
+        raise RemoteStatusSyncFailed(error_message=message, error_description=str(exc))
+
+
+def get_resource_team(resource: marketplace_models.Resource):
+    """
+    Get remote resource team. To show the resource team in local and remote instances.
+    """
+
+    try:
+        client = get_client_for_offering(resource.offering)
+        remote_team = marketplace_resources_team_list.sync(
+            client=client, uuid=resource.backend_id
+        )
+
+        local_roles = UserRole.objects.filter(scope=resource.project, is_active=True)
+
+        team_data = []
+        local_roles_lookup = {
+            record.user.username: record.role.name for record in local_roles
+        }
+        # Extract all local usernames for efficient set operations
+        local_usernames = set(local_roles_lookup.keys())
+        processed_local_users = set()
+        for remote_record in remote_team:
+            full_name = remote_record.full_name
+            remote_role = remote_record.role
+            username = remote_record.username
+            local_role = local_roles_lookup.get(username)
+
+            if local_role:
+                sync_status = (
+                    RemoteResourceSyncStatus.IN_SYNC
+                    if local_role == remote_role
+                    else RemoteResourceSyncStatus.OUT_OF_SYNC
+                )
+                processed_local_users.add(username)
+            else:
+                local_role = "unknown"
+                sync_status = RemoteResourceSyncStatus.SYNC_FAILED
+
+            team_data.append(
+                {
+                    "full_name": full_name,
+                    "local_role": local_role,
+                    "remote_role": remote_role,
+                    "sync_status": sync_status,
+                }
+            )
+
+        # Find local users that weren't processed (don't exist in remote team)
+        unprocessed_local_users = local_usernames - processed_local_users
+
+        for username in unprocessed_local_users:
+            local_role_record = next(
+                record for record in local_roles if record.user.username == username
+            )
+            team_data.append(
+                {
+                    "full_name": local_role_record.user.full_name,
+                    "local_role": local_role_record.role.name,
+                    "remote_role": "Missing from remote",
+                    "sync_status": RemoteResourceSyncStatus.SYNC_FAILED,
+                }
+            )
+        return team_data
+    except UnexpectedStatus as exc:
+        message = f"Unable to fetch remote team data for resource {resource.uuid}"
+        logger.exception(message)
+        raise RemoteStatusSyncFailed(error_message=message, error_description=str(exc))
+
+
+def get_resource_order_sync_status(resource: marketplace_models.Resource):
+    """
+    Get remote resource order sync status. To show the resource order state in local and remote instances.
+    """
+
+    try:
+        client = get_client_for_offering(resource.offering)
+        remote_orders = marketplace_orders_list.sync(
+            client=client,
+            resource_uuid=resource.backend_id,
+        )
+        local_orders = marketplace_models.Order.objects.filter(
+            resource__backend_id=resource.backend_id
+        )
+        local_order_ids = {
+            local_order.backend_id: local_order for local_order in local_orders
+        }
+
+        order_data = []
+        for remote_order in remote_orders:
+            local_order = local_order_ids.get(remote_order.uuid.hex)
+            if not local_order:
+                order_data.append(
+                    {
+                        "order_uuid": remote_order.uuid.hex,
+                        "remote_state": remote_order.state.value,
+                        "local_state": None,
+                        "sync_status": RemoteResourceSyncStatus.SYNC_FAILED,
+                    }
+                )
+            else:
+                order_data.append(
+                    {
+                        "order_uuid": remote_order.uuid,
+                        "remote_state": remote_order.state.value,
+                        "local_state": local_order.get_state_display(),
+                        "sync_status": RemoteResourceSyncStatus.IN_SYNC
+                        if local_order.state == parse_order_state(remote_order.state)
+                        else RemoteResourceSyncStatus.OUT_OF_SYNC,
+                    }
+                )
+        return order_data
+
+    except UnexpectedStatus as exc:
+        message = f"Unable to fetch remote order data for resource {resource.uuid}"
+        logger.exception(message)
+        raise RemoteStatusSyncFailed(error_message=message, error_description=str(exc))
+
+
+class GenericOrderAttribute:
+    def __init__(self, attrs):
+        self.attrs = attrs
+
+    def to_dict(self):
+        return self.attrs
+
+
+def _check_object_status(serialized_instance, model_class, field, invert=False):
+    """
+    Check if a serialized object exists, this method is used to check if a project or user is soft-deleted or inactive.
+    """
+    try:
+        _, pk = serialized_instance.split(":")
+        obj = model_class.all_objects.get(pk=pk)
+        value = getattr(obj, field)
+        if invert:
+            value = not value
+        return {"found": True, "flagged": value, "pk": int(pk)}
+    except (ValueError, model_class.DoesNotExist):
+        return {"found": False, "flagged": False, "pk": None}
+
+
+def log_permission_sync_skip_reason(serialized_project, serialized_user):
+    """
+    Log helper function why permission sync is being skipped due to object status.
+
+    Checks if project/user objects exist but are soft-deleted/inactive and log the reason.
+    """
+    project_status = _check_object_status(
+        serialized_project, structure_models.Project, "is_removed"
+    )
+    user_status = _check_object_status(
+        serialized_user, structure_models.User, "is_active", invert=True
+    )
+    reasons = []
+
+    if project_status["found"]:
+        if project_status["flagged"]:
+            reasons.append("soft-deleted project")
+    else:
+        reasons.append("project not found")
+
+    if user_status["found"]:
+        if user_status["flagged"]:
+            reasons.append("inactive user")
+    else:
+        reasons.append("user not found")
+
+    if reasons:
+        message = "Skipping permission sync: %s" % ", ".join(reasons)
+    else:
+        message = "Skipping permission sync: project %s or user %s not found" % (
+            serialized_project,
+            serialized_user,
+        )
+    logger.warning(
+        "%s (project_id=%s, user_id=%s, project=%s, user=%s)",
+        message,
+        project_status["pk"],
+        user_status["pk"],
+        serialized_project,
+        serialized_user,
+    )

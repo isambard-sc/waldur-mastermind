@@ -1,75 +1,221 @@
-from dataclasses import dataclass
+from typing import Any, Generic, TypeVar
+
+from pydantic import BaseModel, Field, model_validator
 
 
-@dataclass
-class NotificationTemplate:
+class NotificationTemplate(BaseModel):
+    """Defines a single template file associated with a notification."""
+
     path: str
     name: str
 
 
-@dataclass
-class Notification:
+# A generic TypeVar that must be a Pydantic BaseModel.
+# This allows us to create a Notification class that is typed with its specific context model.
+ContextType = TypeVar("ContextType", bound=BaseModel)
+
+
+class Notification(BaseModel, Generic[ContextType]):
+    """
+    Represents a single notification type, including its key, description,
+    and a strongly-typed schema for its context variables.
+    """
+
     key: str
     description: str
-    templates: list | None = None
+    context_model: type[ContextType] = Field(
+        ...,
+        description="The Pydantic model that defines the schema for the notification's context.",
+    )
+    templates: list[NotificationTemplate] | None = None
 
-    def __post_init__(self):
+    @model_validator(mode="after")
+    def set_default_templates(self) -> "Notification":
         """
-        Most of the notifications have given templates :key + _subject.txt/_message.txt/_message.html
-        This method allows you to not specify those explicitly
-        however you must ensure that these files exist or provide :templates argument to override this action.
+        Most notifications have standard templates. This validator sets them by default
+        if they are not provided explicitly, correctly mapping keys to file paths.
+        Example: 'users.invitation_approved' -> 'users/invitation_approved_subject.txt'
         """
-        if not self.templates:
-            self.templates = [
-                NotificationTemplate(self.key + "_subject.txt", self.key),
-                NotificationTemplate(self.key + "_message.txt", self.key),
-                NotificationTemplate(self.key + "_message.html", self.key),
+        if self.templates is None:
+            # Replace the first dot with a slash to form the base path
+            path_base = self.key.replace(".", "/", 1)
+            paths = [
+                f"{path_base}_subject.txt",
+                f"{path_base}_message.txt",
+                f"{path_base}_message.html",
             ]
+            self.templates = [NotificationTemplate(path=p, name=p) for p in paths]
+        return self
 
 
 NOTIFICATIONS = dict()
 
 
 class NotificationSectionMetaclass(type):
-    def __new__(self, name, bases, attrs):
+    """
+    A metaclass that automatically discovers Notification instances within a class
+    and registers them in the global NOTIFICATIONS dictionary.
+    """
+
+    def __new__(cls, name, bases, attrs):
         if "Meta" in attrs:
-            section = {
-                attrs["Meta"].key: [],
-            }
-            NOTIFICATIONS.update(section)
+            section_key = attrs["Meta"].key
+            section_list = []
+            NOTIFICATIONS[section_key] = section_list
+
             for _, notification in attrs.items():
                 if isinstance(notification, Notification):
-                    section[attrs["Meta"].key].append(
+                    # For each notification, we store its essential info, including
+                    # a full JSON schema of its context model for introspection.
+                    section_list.append(
                         {
                             "path": notification.key,
                             "description": notification.description,
-                            "templates": notification.templates,
+                            "templates": [
+                                tpl.model_dump() for tpl in notification.templates
+                            ]
+                            if notification.templates
+                            else [],
+                            "context_schema": notification.context_model.model_json_schema(),
                         }
                     )
-        return type.__new__(self, name, bases, attrs)
+
+        return super().__new__(cls, name, bases, attrs)
 
 
 class NotificationSection(metaclass=NotificationSectionMetaclass):
+    """Base class for organizing notifications into sections."""
+
     pass
+
+
+class EmptyContext(BaseModel):
+    """A reusable context model for notifications that require no variables."""
+
+    pass
+
+
+class ProfileChangesOperatorContext(BaseModel):
+    user: Any = Field(
+        description="The User model instance whose profile has been updated. Provides access to fields like `user.full_name` and `user.id`."
+    )
+    fields: list[dict[str, str]] = Field(
+        description="A list of dictionaries, where each dictionary represents a changed field and contains string keys: `name`, `old_value`, and `new_value`."
+    )
+    organizations: Any = Field(
+        description="A queryset of Customer model instances where the user is an owner. Can be iterated over in the template to access `o.name` and `o.abbreviation`."
+    )
+
+
+class ChangeEmailRequestContext(BaseModel):
+    request: Any = Field(
+        description="The ChangeEmailRequest model instance. Provides access to `request.user.email` and the new `request.email`."
+    )
+    link: str = Field(
+        description="A string URL for the user to click to confirm the email change."
+    )
+
+
+class StructureRoleGrantedContext(BaseModel):
+    permission: Any = Field(
+        description="The Permission model instance (e.g., ProjectPermission). Provides `permission.role`."
+    )
+    structure: Any = Field(
+        description="The model instance where the role was granted (e.g., a Project or Customer object)."
+    )
 
 
 class StructureSection(NotificationSection):
     class Meta:
         key = "structure"
 
-    notifications_profile_changes_operator = Notification(
-        "notifications_profile_changes_operator",
-        "A notification sent out to notify about profile changes. The recipients are Waldur operators.",
+    change_email_request = Notification(
+        key="change_email_request",
+        description="A notification sent out when an email change is requested. Recipient is the old email address.",
+        context_model=ChangeEmailRequestContext,
     )
 
-    change_email_request = Notification(
-        "change_email_request",
-        "A notification sent out when an email change is requested. Recipient is the old email address.",
+    notifications_profile_changes_operator = Notification(
+        key="notifications_profile_changes_operator",
+        description="A notification sent to Waldur operators when a user's profile is updated.",
+        context_model=ProfileChangesOperatorContext,
     )
 
     structure_role_granted = Notification(
-        "structure_role_granted",
-        "A notification sent out when a role is granted. The recipient is the user who received the role.",
+        key="structure_role_granted",
+        description="A notification sent out when a role is granted. The recipient is the user who received the role.",
+        context_model=StructureRoleGrantedContext,
+    )
+
+
+class BaseInvitationContext(BaseModel):
+    name: str = Field(
+        description="The name of the structure (Project or Organization) the user is invited to."
+    )
+    type: str = Field(
+        description="The type of the structure, either 'project' or 'organization'."
+    )
+    role: str = Field(description="The name of the role being granted.")
+    sender: str = Field(
+        description="The full name of the user who created the invitation."
+    )
+
+
+class InvitationCreatedContext(BaseInvitationContext):
+    link: str = Field(
+        description="The unique URL for the user to accept the invitation."
+    )
+    extra_invitation_text: str = Field(
+        description="Any additional text provided by the inviter."
+    )
+    reminder: bool = Field(
+        description="A boolean flag, set to `True` if this is a reminder for a pending invitation."
+    )
+    invitation: Any = Field(
+        description="The GroupInvitation instance. Used to access `invitation.get_expiration_time`."
+    )
+
+
+class InvitationRequestedContext(BaseInvitationContext):
+    invitation: Any = Field(
+        description="The GroupInvitation instance. Used to access details like `invitation.civil_number`, `invitation.email`, etc."
+    )
+    approve_link: str = Field(
+        description="A unique URL for staff to approve the invitation."
+    )
+    reject_link: str = Field(
+        description="A unique URL for staff to reject the invitation."
+    )
+
+
+class InvitationApprovedContext(BaseInvitationContext):
+    username: str = Field(description="The generated username for the new user.")
+    password: str = Field(
+        description="The generated temporary password for the new user."
+    )
+    link: str = Field(
+        description="The unique URL for the new user to access their account."
+    )
+
+
+class InvitationRejectedContext(BaseInvitationContext):
+    invitation: Any = Field(
+        description="The GroupInvitation instance. Used to access `invitation.full_name`."
+    )
+
+
+class InvitationExpiredContext(BaseModel):
+    invitation: Any = Field(
+        description="The GroupInvitation instance. Used to access `invitation.email` and `invitation.get_expiration_time`."
+    )
+
+
+class PermissionRequestSubmittedContext(BaseModel):
+    permission_request: Any = Field(
+        description="The PermissionRequest model instance. Provides `permission_request.created_by` and `permission_request.invitation`."
+    )
+    requests_link: str = Field(
+        description="A URL to the page for reviewing permission requests."
     )
 
 
@@ -77,34 +223,41 @@ class UserSection(NotificationSection):
     class Meta:
         key = "users"
 
-    invitation_created = Notification(
-        "invitation_created",
-        "A notification sent to the user so that he can accept it and receive permissions. The recipient is the user who's being invited.",
-    )
-
-    invitation_requested = Notification(
-        "invitation_requested",
-        "A notification sent to staff users so that they can approve or reject invitation. The recipients are active staff users.",
-    )
-
-    invitation_rejected = Notification(
-        "invitation_rejected",
-        "A notification sent to notify the user that his invitation has been rejected. The recipient is the user who's being invited.",
-    )
-
     invitation_approved = Notification(
-        "invitation_approved",
-        "A notification sent to notify the user that his invitation has been approved. The recipient is the user who's being invited.",
+        key="invitation_approved",
+        description="Sent to a new user after their invitation is approved and a new account is created for them.",
+        context_model=InvitationApprovedContext,
     )
-
+    invitation_created = Notification(
+        key="invitation_created",
+        description="Sent to an invited user so they can accept the invitation.",
+        context_model=InvitationCreatedContext,
+    )
     invitation_expired = Notification(
-        "invitation_expired",
-        "A notification sent out to notify the user that his invitation has expired. The recipient is the user who's being invited.",
+        key="invitation_expired",
+        description="Sent to the invitation creator to inform them that an invitation has expired.",
+        context_model=InvitationExpiredContext,
+    )
+    invitation_rejected = Notification(
+        key="invitation_rejected",
+        description="Sent to the invitation creator to inform them that their invitation has been rejected.",
+        context_model=InvitationRejectedContext,
+    )
+    invitation_requested = Notification(
+        key="invitation_requested",
+        description="Sent to staff users so they can approve or reject a pending invitation.",
+        context_model=InvitationRequestedContext,
+    )
+    permission_request_submitted = Notification(
+        key="permission_request_submitted",
+        description="Sent to staff or customer owners about a submitted permission request.",
+        context_model=PermissionRequestSubmittedContext,
     )
 
-    permission_request_submitted = Notification(
-        "permission_request_submitted",
-        "A notification sent out to notify about submitted permission request. The recipients are active staff users or customer owners.",
+
+class BookingNotificationContext(BaseModel):
+    resources: list[Any] = Field(
+        description="A list of upcoming Booking objects for the user. Each object provides a `name` attribute."
     )
 
 
@@ -113,111 +266,295 @@ class BookingSection(NotificationSection):
         key = "booking"
 
     notification = Notification(
-        "notification",
-        "A notification sent out to notify about upcoming bookings. The recipients are users who have upcoming bookings.",
+        key="notification",
+        description="Sent to users to notify them about their upcoming bookings.",
+        context_model=BookingNotificationContext,
     )
+
+
+class UpcomingEndsNotificationContext(BaseModel):
+    organization_name: str = Field(
+        description="The name of the organization whose contract is ending."
+    )
+    end: str = Field(description="The end date of the contract.")
+    contract_number: str | None = Field(
+        default=None, description="The contract number, if available."
+    )
+
+
+class InvoiceNotificationContext(BaseModel):
+    month: int = Field(description="The month of the invoice as an integer.")
+    year: int = Field(description="The year of the invoice as an integer.")
+    customer: str = Field(description="The name of the customer the invoice is for.")
+    link: str = Field(description="A URL to view the invoice in the portal.")
 
 
 class InvoiceSection(NotificationSection):
     class Meta:
         key = "invoices"
 
-    upcoming_ends_notification = Notification(
-        "upcoming_ends_notification",
-        "A notification about upcoming contract ending. The recipients are organization owners.",
-    )
     notification = Notification(
-        "notification",
-        "A notification of invoice. The recipients are organization owners.",
+        key="notification",
+        description="Sent to organization owners with a new invoice. Includes the invoice as an HTML attachment.",
+        context_model=InvoiceNotificationContext,
     )
+    upcoming_ends_notification = Notification(
+        key="upcoming_ends_notification",
+        description="Notifies organization owners about an upcoming fixed-price contract ending.",
+        context_model=UpcomingEndsNotificationContext,
+    )
+
+
+class ResourceNameContext(BaseModel):
+    resource_name: str = Field(description="The name of the affected resource.")
+
+
+class BaseOrderContext(BaseModel):
+    order: Any = Field(
+        description="The Order model instance. Provides access to `order.created_by`, `order.resource.name`, etc."
+    )
+    site_name: str = Field(description="The name of the site from settings.")
+
+
+class NotifyConsumerAboutPendingOrderContext(BaseOrderContext):
+    order_link: str = Field(description="A URL to the order details page.")
+
+
+class NotifyProviderAboutPendingOrderContext(BaseOrderContext):
+    order_url: str = Field(
+        description="A URL to the order details page for the provider."
+    )
+
+
+class OrderRejectedContext(BaseOrderContext):
+    link: str = Field(description="A URL to the rejected order's details page.")
+    order_type: str = Field(
+        description="The display name of the order type (e.g., 'create', 'update', 'terminate')."
+    )
+
+
+class ResourceUpdateSucceededContext(BaseModel):
+    resource_name: str = Field(description="The name of the updated resource.")
+    order_user: str = Field(
+        description="The full name of the user who initiated the update order."
+    )
+    resource_old_plan: str | None = Field(
+        default=None, description="The name of the resource's previous plan."
+    )
+    resource_plan: str | None = Field(
+        default=None, description="The name of the resource's new plan."
+    )
+    support_email: str | None = Field(
+        default=None, description="The site's support email address from settings."
+    )
+    support_phone: str | None = Field(
+        default=None, description="The site's support phone number from settings."
+    )
+
+
+class ResourceUpdateLimitsSucceededContext(BaseModel):
+    resource_name: str = Field(description="The name of the updated resource.")
+    order_user: str = Field(
+        description="The full name of the user who initiated the update order."
+    )
+    resource_old_limits: str = Field(
+        description="A formatted, human-readable list of the resource's previous limits."
+    )
+    resource_limits: str = Field(
+        description="A formatted, human-readable list of the resource's new limits."
+    )
+    support_email: str | None = Field(
+        default=None, description="The site's support email address from settings."
+    )
+    support_phone: str | None = Field(
+        default=None, description="The site's support phone number from settings."
+    )
+
+
+class UsagesNotificationContext(BaseModel):
+    resources: list[Any] = Field(
+        description="A list of resource objects that are missing usage reports. The list is regrouped by offering in the template."
+    )
+    public_resources_url: str = Field(
+        description="A URL to the public resources page where usage can be submitted."
+    )
+
+
+class StaleResourcesContext(BaseModel):
+    resources: list[dict[str, Any]] = Field(
+        description="A list of dictionaries. Each dictionary contains `resource` (the Resource model instance) and `resource_url` (a string URL to its details page)."
+    )
+
+
+class ResourceTerminationScheduledContext(BaseModel):
+    resource: Any = Field(
+        description="The Resource model instance being terminated. Provides `resource.name` and `resource.end_date`."
+    )
+    user: Any = Field(
+        description="The User model instance who scheduled the termination. Provides `user.full_name`."
+    )
+    resource_url: str = Field(description="A URL to the resource details page.")
+
+
+class ProjectEndingContext(BaseModel):
+    projects: list[Any] = Field(
+        description="A list of Project model instances that are ending. Each project is annotated with a `.url` attribute."
+    )
+    user: Any = Field(
+        description="The User model instance receiving the notification. Provides `user.full_name`."
+    )
+    end_date: Any = Field(description="The date when the projects will end.")
+    count_projects: int = Field(
+        description="The number of projects in the `projects` list."
+    )
+    delta: int = Field(description="The number of days until the project ends.")
+
+
+class ResourceEndingContext(BaseModel):
+    resource: Any = Field(
+        description="The Resource model instance. Provides `resource.name`."
+    )
+    user: Any = Field(
+        description="The User model instance receiving the notification. Provides `user.full_name`."
+    )
+    resource_url: str = Field(description="A URL to the resource details page.")
+    delta: int = Field(description="The number of days until the resource's end date.")
 
 
 class MarketplaceSection(NotificationSection):
     class Meta:
         key = "marketplace"
 
-    notify_consumer_about_pending_order = Notification(
-        "notify_consumer_about_pending_order",
-        "A notification for consumer about pending order. The recipients are users that have permissions to approve the order.",
-    )
-
-    notify_provider_about_pending_order = Notification(
-        "notify_provider_about_pending_order",
-        "A notification for provider about pending order. The recipients are users that have permissions to approve the order.",
-    )
-
-    notification_usages = Notification(
-        "notification_usages",
-        "A notification about usages. The recipients are organization owners.",
-    )
-
-    notification_about_stale_resources = Notification(
-        "notification_about_stale_resources",
-        "A notification about stale resources. The recipients are organization owners.",
-    )
-
-    marketplace_resource_termination_scheduled_staff = Notification(
-        "marketplace_resource_termination_scheduled_staff",
-        "A notification of a resource termination. The recipients are project administrators and managers.",
-    )
-
-    marketplace_resource_update_succeeded = Notification(
-        "marketplace_resource_update_succeeded",
-        "A notification of a successful resource update. The recipients are all the users in the project.",
-    )
-
-    marketplace_resource_update_limits_succeeded = Notification(
-        "marketplace_resource_update_limits_succeeded",
-        "A notification of a successful resource limit update. The recipients are all the users in the project.",
-    )
-
-    marketplace_resource_create_succeeded = Notification(
-        "marketplace_resource_create_succeeded",
-        "A notification of a successful resource creation",
-    )
-
-    marketplace_resource_termination_scheduled = Notification(
-        "marketplace_resource_termination_scheduled",
-        "A notification of a scheduled resource termination. The recipients are project administrators and managers",
-    )
-
-    notification_about_project_ending = Notification(
-        "notification_about_project_ending",
-        "A notification about project ending. The recipients are project managers and customer owners.",
-    )
-
-    notification_about_resource_ending = Notification(
-        "notification_about_resource_ending",
-        "A notification about resource ending. The recipients are project managers and customer owners.",
-    )
-
-    marketplace_resource_update_limits_failed = Notification(
-        "marketplace_resource_update_limits_failed",
-        "A notification of failed resource limits update",
-    )
-
-    marketplace_resource_update_failed = Notification(
-        "marketplace_resource_update_failed", "A notification of failed resource update"
-    )
-
     marketplace_resource_create_failed = Notification(
-        "marketplace_resource_create_failed",
-        "A notification of a failed resource creation",
+        key="marketplace_resource_create_failed",
+        description="A notification of a failed resource creation",
+        context_model=ResourceNameContext,
+    )
+    marketplace_resource_create_succeeded = Notification(
+        key="marketplace_resource_create_succeeded",
+        description="A notification of a successful resource creation",
+        context_model=ResourceNameContext,
+    )
+    marketplace_resource_terminate_failed = Notification(
+        key="marketplace_resource_terminate_failed",
+        description="A notification of a failed resource termination",
+        context_model=ResourceNameContext,
     )
     marketplace_resource_terminate_succeeded = Notification(
-        "marketplace_resource_terminate_succeeded",
-        "A notification of a successful resource termination",
+        key="marketplace_resource_terminate_succeeded",
+        description="A notification of a successful resource termination",
+        context_model=ResourceNameContext,
     )
-
-    marketplace_resource_terminate_failed = Notification(
-        "marketplace_resource_terminate_failed",
-        "A notification of a failed resource termination",
+    marketplace_resource_termination_scheduled = Notification(
+        key="marketplace_resource_termination_scheduled",
+        description="Notifies project admins/managers that a resource termination was scheduled.",
+        context_model=ResourceTerminationScheduledContext,
     )
-
+    marketplace_resource_termination_scheduled_staff = Notification(
+        key="marketplace_resource_termination_scheduled_staff",
+        description="A notification of a resource termination. The recipients are project administrators and managers.",
+        context_model=ResourceTerminationScheduledContext,
+    )
+    marketplace_resource_update_failed = Notification(
+        key="marketplace_resource_update_failed",
+        description="A notification of failed resource update",
+        context_model=ResourceNameContext,
+    )
+    marketplace_resource_update_limits_failed = Notification(
+        key="marketplace_resource_update_limits_failed",
+        description="A notification of failed resource limits update",
+        context_model=ResourceNameContext,
+    )
+    marketplace_resource_update_limits_succeeded = Notification(
+        key="marketplace_resource_update_limits_succeeded",
+        description="A notification of a successful resource limit update. The recipients are all the users in the project.",
+        context_model=ResourceUpdateLimitsSucceededContext,
+    )
+    marketplace_resource_update_succeeded = Notification(
+        key="marketplace_resource_update_succeeded",
+        description="A notification of a successful resource plan update. The recipients are all the users in the project.",
+        context_model=ResourceUpdateSucceededContext,
+    )
+    notification_about_project_ending = Notification(
+        key="notification_about_project_ending",
+        description="Notifies project users about a resource that is nearing its end date.",
+        context_model=ProjectEndingContext,
+    )
+    notification_about_resource_ending = Notification(
+        key="notification_about_resource_ending",
+        description="A notification about resource ending. The recipients are project managers and customer owners.",
+        context_model=ResourceEndingContext,
+    )
+    notification_about_stale_resources = Notification(
+        key="notification_about_stale_resources",
+        description="Notifies organization owners about active resources that have not generated costs recently.",
+        context_model=StaleResourcesContext,
+    )
     notification_to_user_that_order_been_rejected = Notification(
-        "notification_to_user_that_order_been_rejected",
-        "Notification to user whose order been rejected.",
+        key="notification_to_user_that_order_been_rejected",
+        description="Notification to user whose order been rejected.",
+        context_model=OrderRejectedContext,
     )
+    notification_usages = Notification(
+        key="notification_usages",
+        description="A notification about usages. The recipients are organization owners.",
+        context_model=UsagesNotificationContext,
+    )
+    notify_consumer_about_pending_order = Notification(
+        key="notify_consumer_about_pending_order",
+        description="Notifies project members with approval permissions about a pending order.",
+        context_model=NotifyConsumerAboutPendingOrderContext,
+    )
+    notify_provider_about_pending_order = Notification(
+        key="notify_provider_about_pending_order",
+        description="Notifies service provider owners about a pending order for their offering.",
+        context_model=NotifyProviderAboutPendingOrderContext,
+    )
+
+
+class PendingProjectUpdatesContext(BaseModel):
+    project_update_request: Any = Field(
+        description="The ProjectUpdateRequest model instance that is pending. Provides `project_update_request.project.name`."
+    )
+    project_url: str = Field(description="A URL to the project's page.")
+
+
+class ProjectDetailsUpdateContext(BaseModel):
+    project_url: str = Field(description="A URL to the project's page.")
+    new_name: str | None = Field(
+        default=None, description="The new project name string."
+    )
+    old_name: str | None = Field(
+        default=None, description="The old project name string."
+    )
+    new_description: str | None = Field(
+        default=None, description="The new project description string."
+    )
+    old_description: str | None = Field(
+        default=None, description="The old project description string."
+    )
+    new_end_date: Any | None = Field(
+        default=None, description="The new project end date."
+    )
+    old_end_date: Any | None = Field(
+        default=None, description="The old project end date."
+    )
+    new_oecd_fos_2007_code: str | None = Field(default=None)
+    old_oecd_fos_2007_code: str | None = Field(default=None)
+    new_is_industry: bool | None = Field(default=None)
+    old_is_industry: bool | None = Field(default=None)
+    reviewed_by: Any = Field(description="The User object who reviewed the request.")
+
+
+class ProjectCostLimitContext(BaseModel):
+    scope_class: str = Field(
+        description="The class name of the scope, e.g., 'Project'."
+    )
+    scope_name: str = Field(
+        description="The name of the scope instance (e.g., the project's name)."
+    )
+    scope_url: str = Field(description="A URL to the scope's page in the portal.")
+    limit: float = Field(description="The cost limit that was exceeded.")
 
 
 class MarketplaceRemoteSection(NotificationSection):
@@ -225,13 +562,14 @@ class MarketplaceRemoteSection(NotificationSection):
         key = "marketplace_remote"
 
     notification_about_pending_project_updates = Notification(
-        "notification_about_pending_project_updates",
-        "A notification about pending project updates. The recipients are customer owners",
+        key="notification_about_pending_project_updates",
+        description="A notification about pending project updates. The recipients are customer owners",
+        context_model=PendingProjectUpdatesContext,
     )
-
     notification_about_project_details_update = Notification(
-        "notification_about_project_details_update",
-        "A notification about project details update. The recipients the user who requested project details update and the user that reviewed it.",
+        key="notification_about_project_details_update",
+        description="Notifies users about a completed project update request, detailing the changes.",
+        context_model=ProjectDetailsUpdateContext,
     )
 
 
@@ -239,9 +577,60 @@ class PolicySection(NotificationSection):
     class Meta:
         key = "marketplace_policy"
 
-    notification_project_cost_limit = Notification(
-        "notification_about_project_cost_exceeded_limit",
-        "Notification about project cost exceeded limit. The recipients are all customer owners of the project.",
+    notification_about_project_cost_exceeded_limit = Notification(
+        key="notification_about_project_cost_exceeded_limit",
+        description="Notification about project cost exceeded limit. The recipients are all customer owners of the project.",
+        context_model=ProjectCostLimitContext,
+    )
+
+
+class IssueGenerationContext(BaseModel):
+    issue: Any = Field(
+        description="The Issue model instance being created. Provides access to all its fields like `issue.customer`, `issue.project`, `issue.resource`, etc."
+    )
+    settings: Any = Field(description="Global settings object.")
+    config: Any = Field(description="Global config object.")
+
+
+class BaseIssueContext(BaseModel):
+    issue: Any = Field(description="The Issue model instance.")
+    issue_url: str = Field(description="A direct URL to the issue's page.")
+
+
+class CommentAddedContext(BaseIssueContext):
+    comment: Any = Field(
+        description="The newly created Comment model instance. Provides access to `comment.author.name`."
+    )
+    description: str = Field(description="The content/text of the new comment.")
+    is_system_comment: bool = Field(
+        description="A boolean indicating if the comment was auto-generated by an integration rather than a human user."
+    )
+
+
+class CommentUpdatedContext(BaseIssueContext):
+    comment: Any = Field(
+        description="The Comment model instance that was updated. Provides `comment.author.name`."
+    )
+    description: str = Field(description="The new, current content of the comment.")
+    old_description: str = Field(
+        description="The previous content of the comment before it was edited."
+    )
+
+
+class IssueFeedbackContext(BaseIssueContext):
+    feedback_links: list[dict[str, str]] = Field(
+        description="A list of dictionaries for creating a rating scale. Each dictionary contains a `label` and a unique `link`."
+    )
+
+
+class IssueUpdatedContext(BaseIssueContext):
+    site_name: str = Field(description="The name of the platform.")
+    changed: dict[str, Any] = Field(
+        description="A dictionary containing the fields that were updated, with their old values."
+    )
+    description: str = Field(description="The new, current description of the issue.")
+    old_description: str = Field(
+        description="The previous description of the issue before the update."
     )
 
 
@@ -249,80 +638,284 @@ class SupportSection(NotificationSection):
     class Meta:
         key = "support"
 
+    description = Notification(
+        key="description",
+        description="A template used for generating the issue description field during issue creation.",
+        templates=[NotificationTemplate(path="description.txt", name="description")],
+        context_model=IssueGenerationContext,
+    )
     notification_comment_added = Notification(
-        "notification_comment_added",
-        "Notification about a new comment in the issue. The recipient is issue caller.",
-        templates=[
-            NotificationTemplate(
-                "notification_comment_added.txt", "notification_comment_added"
-            ),
-            NotificationTemplate(
-                "notification_comment_added.html", "notification_comment_added"
-            ),
-            NotificationTemplate(
-                "notification_comment_added_subject.txt", "notification_comment_added"
-            ),
-        ],
+        key="notification_comment_added",
+        description="Notification about a new comment in the issue. The recipient is issue caller.",
+        context_model=CommentAddedContext,
     )
     notification_comment_updated = Notification(
-        "notification_comment_updated",
-        "Notification about an update in the issue comment. The recipient is issue caller.",
-        templates=[
-            NotificationTemplate(
-                "notification_comment_updated.txt", "notification_comment_added"
-            ),
-            NotificationTemplate(
-                "notification_comment_updated.html", "notification_comment_added"
-            ),
-            NotificationTemplate(
-                "notification_comment_updated_subject.txt", "notification_comment_added"
-            ),
-        ],
+        key="notification_comment_updated",
+        description="Notification about an update in the issue comment. The recipient is issue caller.",
+        context_model=CommentUpdatedContext,
     )
     notification_issue_feedback = Notification(
-        "notification_issue_feedback",
-        "Notification about a feedback related to the issue. The recipient is issue caller.",
-        templates=[
-            NotificationTemplate(
-                "notification_issue_feedback.txt", "notification_issue_feedback"
-            ),
-            NotificationTemplate(
-                "notification_issue_feedback.html", "notification_issue_feedback"
-            ),
-            NotificationTemplate(
-                "notification_issue_feedback_subject.txt", "notification_issue_feedback"
-            ),
-        ],
+        key="notification_issue_feedback",
+        description="Notification about a feedback related to the issue. The recipient is issue caller.",
+        context_model=IssueFeedbackContext,
     )
-
     notification_issue_updated = Notification(
-        "notification_issue_updated",
-        "Notification about an update in the issue. The recipient is issue caller.",
-        templates=[
-            NotificationTemplate(
-                "notification_issue_updated.txt", "notification_issue_updated"
-            ),
-            NotificationTemplate(
-                "notification_issue_updated.html", "notification_issue_updated"
-            ),
-            NotificationTemplate(
-                "notification_issue_updated_subject.txt", "notification_issue_updated"
-            ),
-        ],
+        key="notification_issue_updated",
+        description="Notification about an update in the issue. The recipient is issue caller.",
+        context_model=IssueUpdatedContext,
     )
-
-    description = Notification(
-        "description",
-        "A notification used for issue creation.",
-        templates=[
-            NotificationTemplate("description.txt", "description"),
-        ],
-    )
-
     summary = Notification(
-        "summary",
-        "A notification used for issue creation.",
-        templates=[
-            NotificationTemplate("summary.txt", "summary"),
-        ],
+        key="summary",
+        description="A template used for generating the issue summary field during issue creation.",
+        templates=[NotificationTemplate(path="summary.txt", name="summary")],
+        context_model=IssueGenerationContext,
+    )
+
+
+class ProposalStateChangedContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    new_state: str = Field(
+        description="The new state of the proposal (e.g., 'accepted')."
+    )
+    previous_state: str = Field(description="The previous state of the proposal.")
+    update_date: Any = Field(description="The timestamp of the state change.")
+    proposal_url: str = Field(description="URL to the proposal details page.")
+    project_url: str | None = Field(
+        default=None,
+        description="URL to the created project if the proposal was accepted.",
+    )
+    project_name: str | None = Field(
+        default=None, description="Name of the created project."
+    )
+    allocation_date: Any | None = Field(default=None)
+    duration: int | None = Field(default=None)
+    proposal_name: str = Field(description="Name of the proposal.")
+    proposal_creator_name: str = Field(
+        description="Full name of the proposal's creator."
+    )
+    call_name: str = Field(description="Name of the call for proposals.")
+    rejection_feedback: str | None = Field(
+        default=None,
+        description="Comments from the manager if the proposal was rejected.",
+    )
+    allocated_resources: list[dict[str, str]] | None = Field(
+        default=None,
+        description="A list of dictionaries for created resources if accepted.",
+    )
+    review_period: int | None = Field(
+        default=None,
+        description="The expected number of days for the review process.",
+    )
+
+
+class NewProposalSubmittedContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_url: str = Field(
+        description="URL for the call manager to view the proposal."
+    )
+    proposal_name: str = Field(description="Name of the submitted proposal.")
+    proposal_creator_name: str = Field(
+        description="Full name of the proposal's creator."
+    )
+    call_name: str = Field(description="Name of the call.")
+    round_name: str = Field(description="Name of the round.")
+    submission_date: Any = Field(description="The date and time of submission.")
+
+
+class NewReviewSubmittedContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    review_url: str = Field(description="URL for the call manager to view the review.")
+    proposal_name: str = Field(description="Name of the proposal being reviewed.")
+    call_name: str = Field(description="Name of the call.")
+    reviewer_name: str = Field(description="Full name of the reviewer.")
+    submission_date: Any = Field(
+        description="The timestamp when the review was submitted."
+    )
+    review_date: Any = Field(description="The timestamp when the review was submitted.")
+    score: float = Field(description="The summary score given by the reviewer.")
+    max_score: str = Field(description="The maximum possible score (string '5').")
+    submitted_reviews: int = Field(description="Number of reviews already submitted.")
+    pending_reviews: int = Field(description="Number of reviews still pending.")
+    rejected_reviews: int = Field(description="Number of rejected/cancelled reviews.")
+
+
+class ReviewRejectedContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_name: str = Field(
+        description="Name of the proposal for the rejected review."
+    )
+    call_name: str = Field(description="Name of the call.")
+    reviewer_name: str = Field(description="Full name of the reviewer who rejected.")
+    assign_date: Any = Field(description="The timestamp when the review was assigned.")
+    rejection_date: Any = Field(
+        description="The timestamp when the review was rejected."
+    )
+    create_review_link: str = Field(
+        description="A URL for the manager to assign a new review."
+    )
+    submitted_reviews: int = Field(description="Number of reviews already submitted.")
+    pending_reviews: int = Field(description="Number of reviews still pending.")
+    rejected_reviews: int = Field(description="Number of rejected/cancelled reviews.")
+
+
+class ProposalCancelledContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_name: str = Field(description="Name of the cancelled proposal.")
+    call_name: str = Field(description="Name of the call.")
+    cancellation_date: Any = Field(description="The date and time of cancellation.")
+    proposal_url: str = Field(description="A URL to the cancelled proposal.")
+    proposal_creator_name: str = Field(description="Full name of the proposal creator.")
+
+
+class ReviewAssignedContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    reviewer_name: str = Field(description="Full name of the assigned reviewer.")
+    call_name: str = Field(description="Name of the call.")
+    proposal_name: str = Field(description="Name of the proposal to be reviewed.")
+    proposal_creator_name: str = Field(
+        description="Full name of the proposal's creator."
+    )
+    submission_date: Any = Field(description="The date the proposal was submitted.")
+    review_deadline: Any = Field(description="The deadline for submitting the review.")
+    link_to_reviews_list: str = Field(
+        description="A URL to the reviewer's list of assigned reviews."
+    )
+
+
+class ProposalDecisionForReviewerContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_state: str = Field(
+        description="The final state of the proposal (e.g., 'approved', 'rejected')."
+    )
+    proposal_url: str = Field(description="A URL to the proposal.")
+    proposal_name: str = Field(description="Name of the proposal.")
+    call_name: str = Field(description="Name of the call.")
+    decision_date: Any = Field(description="The date the decision was made.")
+    rejection_reason: str | None = Field(
+        default=None, description="The reason for rejection, if applicable."
+    )
+    reviewer_name: str = Field(
+        description="Full name of the reviewer receiving the notification."
+    )
+
+
+class RequestedOfferingDecisionContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    offering_name: str = Field(description="Name of the offering.")
+    call_name: str = Field(description="Name of the call.")
+    provider_name: str = Field(description="Name of the offering's provider.")
+    decision: str = Field(description="The state of the request (e.g., 'accepted').")
+    decision_date: Any = Field(description="The date the decision was made.")
+    call_url: str = Field(description="A URL to the call management page.")
+
+
+class RoundOpeningForReviewersContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    call_name: str = Field(description="Name of the call.")
+    round_name: str = Field(description="Name of the round that is opening.")
+    start_date: Any = Field(description="The start date and time of the round.")
+    end_date: Any = Field(description="The end date and time of the round.")
+    call_url: str = Field(description="A URL to the call page.")
+    reviewer_name: str = Field(
+        description="Full name of the reviewer receiving the notification."
+    )
+
+
+class RoundClosingForManagersContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    call_name: str = Field(description="Name of the call.")
+    round_name: str = Field(description="Name of the round that has closed.")
+    total_proposals: int = Field(
+        description="The total number of proposals submitted in this round."
+    )
+    start_date: Any = Field(description="The round start date.")
+    close_date: Any = Field(description="The round close date.")
+    total_reviews: int = Field(
+        description="The total number of review assignments created for this round."
+    )
+    review_strategy: str = Field(
+        description="The display name of the review strategy (e.g., 'After round')."
+    )
+    round_url: str = Field(description="A URL to the round management page.")
+
+
+class ReviewsCompleteContext(BaseModel):
+    site_name: str = Field(description="The name of the site from settings.")
+    proposal_name: str = Field(
+        description="The name of the proposal whose reviews are complete."
+    )
+    submitter_name: str = Field(
+        description="The full name of the user who submitted the proposal."
+    )
+    call_name: str = Field(description="The name of the call for proposals.")
+    reviews_count: int = Field(description="The integer count of completed reviews.")
+    average_score: float = Field(
+        description="The average summary score calculated from all completed reviews (a float or decimal number)."
+    )
+    reviews: list[dict[str, Any]] = Field(
+        description="A list of dictionaries representing completed reviews, each containing `reviewer_name`, `score`, and `submitted_at`."
+    )
+    proposal_url: str = Field(
+        description="A direct URL for the call manager to view the proposal and its completed reviews."
+    )
+
+
+class ProposalSection(NotificationSection):
+    class Meta:
+        key = "proposal"
+
+    new_proposal_submitted = Notification(
+        key="new_proposal_submitted",
+        description="Notifies call managers about a new proposal submission.",
+        context_model=NewProposalSubmittedContext,
+    )
+    new_review_submitted = Notification(
+        key="new_review_submitted",
+        description="A notification to the call manager about a new review submission.",
+        context_model=NewReviewSubmittedContext,
+    )
+    proposal_cancelled = Notification(
+        key="proposal_cancelled",
+        description="A notification to proposal creator about the proposal cancellation.",
+        context_model=ProposalCancelledContext,
+    )
+    proposal_decision_for_reviewer = Notification(
+        key="proposal_decision_for_reviewer",
+        description="A notification to the reviewer about the proposal decision (approved/rejected) which they reviewed.",
+        context_model=ProposalDecisionForReviewerContext,
+    )
+    proposal_state_changed = Notification(
+        key="proposal_state_changed",
+        description="A notification about the proposal state changes (submitted → in review → accepted/rejected).",
+        context_model=ProposalStateChangedContext,
+    )
+    requested_offering_decision = Notification(
+        key="requested_offering_decision",
+        description="A notification to call manager about the decision on requested offering (accepted/rejected).",
+        context_model=RequestedOfferingDecisionContext,
+    )
+    review_assigned = Notification(
+        key="review_assigned",
+        description="A notification to a reviewer about a new review assignment.",
+        context_model=ReviewAssignedContext,
+    )
+    review_rejected = Notification(
+        key="review_rejected",
+        description="A notification to the call managers about a rejected review.",
+        context_model=ReviewRejectedContext,
+    )
+    round_closing_for_managers = Notification(
+        key="round_closing_for_managers",
+        description="Notifies call managers that a round has ended, with a summary of proposals and reviews.",
+        context_model=RoundClosingForManagersContext,
+    )
+    round_opening_for_reviewers = Notification(
+        key="round_opening_for_reviewers",
+        description="A notification to reviewers about a new call round opening.",
+        context_model=RoundOpeningForReviewersContext,
+    )
+    reviews_complete = Notification(
+        key="reviews_complete",
+        description="Notifies call managers when all required reviews for a proposal have been submitted, providing a summary.",
+        context_model=ReviewsCompleteContext,
     )

@@ -21,6 +21,7 @@ from modeltranslation.manager import get_translatable_fields_for_model
 from rest_framework import serializers
 from rest_framework import serializers as rf_serializers
 from rest_framework.fields import Field, ReadOnlyField
+from rest_framework.serializers import ListSerializer
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.clean_html import clean_html
@@ -341,7 +342,8 @@ class AugmentedSerializerMixin:
 
             if method in ("PUT", "PATCH"):
                 for field in protected_fields:
-                    fields[field].read_only = True
+                    if field in fields:
+                        fields[field].read_only = True
 
         return fields
 
@@ -409,15 +411,29 @@ class RestrictedSerializerMixin:
     """
     This mixin allows to specify list of fields to be rendered by serializer.
     It expects that request is available in serializer's context.
+
+    It is disabled for nested serializers (where parent is another serializer)
+    but remains active for list views (where parent is a ListSerializer).
     """
 
     FIELDS_PARAM_NAME = "field"
 
     def get_fields(self):
+        if self.parent is not None and not isinstance(self.parent, ListSerializer):
+            return super().get_fields()
+
         fields = super().get_fields()
         if "request" not in self.context:
             return fields
-        query_params = self.context["request"].query_params
+
+        # Check if this is schema generation context (drf-spectacular)
+        # When generating schema, we want to include all fields
+        request = self.context["request"]
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
+            return fields
+
+        query_params = request.query_params
+
         keys = query_params.getlist(self.FIELDS_PARAM_NAME)
         keys = set(key for key in keys if key in fields.keys())
         optional_fields = set(self.get_optional_fields()) - keys
@@ -436,42 +452,6 @@ class RestrictedSerializerMixin:
 
     def get_optional_fields(self):
         return []
-
-
-class HyperlinkedRelatedModelSerializer(serializers.HyperlinkedModelSerializer):
-    def __init__(self, **kwargs):
-        self.queryset = kwargs.pop("queryset", None)
-        assert self.queryset is not None or kwargs.get("read_only", None), (
-            "Relational field must provide a `queryset` argument, "
-            "or set read_only=`True`."
-        )
-        assert not (self.queryset is not None and kwargs.get("read_only", None)), (
-            "Relational fields should not provide a `queryset` argument, "
-            "when setting read_only=`True`."
-        )
-        super().__init__(**kwargs)
-
-    def to_internal_value(self, data):
-        if "url" not in data:
-            raise serializers.ValidationError(
-                _("URL has to be defined for related object.")
-            )
-        url_field = self.fields["url"]
-
-        # This is tricky: self.fields['url'] is the one generated
-        # based on Meta.fields.
-        # By default ModelSerializer generates it as HyperlinkedIdentityField,
-        # which is read-only, thus it doesn't get deserialized from POST body.
-        # So, we "borrow" its view_name and lookup_field to create
-        # a HyperlinkedRelatedField which can turn url into a proper model
-        # instance.
-        url = serializers.HyperlinkedRelatedField(
-            queryset=self.queryset.all(),
-            view_name=url_field.view_name,
-            lookup_field=url_field.lookup_field,
-        )
-
-        return url.to_internal_value(data["url"])
 
 
 class UnicodeIntegerField(serializers.IntegerField):
@@ -618,11 +598,44 @@ class SlugSerializerMixin(serializers.Serializer):
         except (KeyError, AttributeError):
             return fields
 
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
+            return fields
+
         if not user.is_staff:
             if "slug" in fields:
                 fields["slug"].read_only = True
 
         return fields
+
+    def validate_slug(self, value):
+        """
+        Validates that the slug is unique for the model.
+
+        Staff can edit slug values, but they must be unique.
+        """
+        if not value:
+            return value
+
+        # Get the model class
+        model_class = self.Meta.model
+
+        # Check if this is an update or create operation
+        instance = getattr(self, "instance", None)
+
+        # Build the query to check for existing slugs
+        queryset = model_class.objects.filter(slug=value)
+
+        # If updating, exclude the current instance
+        if instance:
+            queryset = queryset.exclude(pk=instance.pk)
+
+        # Check if slug already exists
+        if queryset.exists():
+            raise serializers.ValidationError(
+                _("An object with this slug already exists.")
+            )
+
+        return value
 
     def create(self, validated_data):
         if "slug" not in validated_data:

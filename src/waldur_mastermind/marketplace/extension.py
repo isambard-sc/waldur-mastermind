@@ -36,7 +36,9 @@ class MarketplaceExtension(WaldurExtension):
             },
             "terminate_resources_if_project_end_date_has_been_reached": {
                 "task": "waldur_mastermind.marketplace.terminate_resources_if_project_end_date_has_been_reached",
-                "schedule": timedelta(days=1),
+                # Set specific time 1:40 to avoid conflicts with regular pulls
+                # and with the task terminate_expired_resources
+                "schedule": crontab(minute=40, hour=1),
                 "args": (),
             },
             "terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_order": {
@@ -66,7 +68,9 @@ class MarketplaceExtension(WaldurExtension):
             },
             "terminate_expired_resources": {
                 "task": "waldur_mastermind.marketplace.terminate_expired_resources",
-                "schedule": timedelta(days=1),
+                # Set specific time 1:20 to avoid conflicts with regular pulls
+                # and with the task terminate_resources_if_project_end_date_has_been_reached
+                "schedule": crontab(minute=20, hour=1),
                 "args": (),
             },
             "send_telemetry": {
@@ -81,6 +85,11 @@ class MarketplaceExtension(WaldurExtension):
             },
             "remove_deleted_robot_accounts": {
                 "task": "waldur_mastermind.marketplace.remove_deleted_robot_accounts",
+                "schedule": timedelta(days=1),
+                "args": (),
+            },
+            "update_daily_consent_history": {
+                "task": "waldur_mastermind.marketplace.update_daily_consent_history",
                 "schedule": timedelta(days=1),
                 "args": (),
             },

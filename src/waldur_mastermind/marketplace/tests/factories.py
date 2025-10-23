@@ -9,16 +9,17 @@ from rest_framework.reverse import reverse
 from waldur_core.core import utils as core_utils
 from waldur_core.core.tests.types import BaseMetaFactory
 from waldur_core.permissions.fixtures import ProjectRole
+from waldur_core.structure.enums import ProjectKind
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.marketplace import models
 from waldur_mastermind.marketplace.enums import (
+    SUPPORT_OFFERING,
     BillingTypes,
     ImpactLevel,
     OfferingStates,
     ResourceStates,
 )
-from waldur_mastermind.marketplace_support import PLUGIN_NAME
 from waldur_pid import models as pid_models
 
 OFFERING_OPTIONS = {
@@ -75,6 +76,14 @@ class ServiceProviderFactory(
     def get_list_url(cls, action=None):
         url = "http://testserver" + reverse("marketplace-service-provider-list")
         return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_compliance_url(cls, service_provider, action):
+        """Get service provider compliance URL."""
+        url_name = f"service-provider-compliance-{action}"
+        return reverse(
+            url_name, kwargs={"service_provider_uuid": service_provider.uuid.hex}
+        )
 
 
 class CategoryFactory(
@@ -173,7 +182,7 @@ class OfferingFactory(
     options = factory.LazyAttribute(lambda _: {"order": [], "options": {}})
     category = factory.SubFactory(CategoryFactory)
     customer = factory.SubFactory(structure_factories.CustomerFactory)
-    type = PLUGIN_NAME
+    type = SUPPORT_OFFERING
     state = OfferingStates.ACTIVE
 
     @classmethod
@@ -628,19 +637,26 @@ class OfferingUserFactory(
         model = models.OfferingUser
 
     @classmethod
-    def get_url(cls, offering_user=None, action=None):
-        if offering_user is None:
-            offering_user = OfferingUserFactory()
-        url = "http://testserver" + reverse(
-            "marketplace-offering-user-detail",
-            kwargs={"uuid": offering_user.uuid.hex},
-        )
-        return url if action is None else url + action + "/"
+    def get_list_url(cls):
+        """Get the offering user list URL."""
+        return reverse("marketplace-offering-user-list")
 
     @classmethod
-    def get_list_url(cls, action=None):
-        url = "http://testserver" + reverse("marketplace-offering-user-list")
-        return url if action is None else url + action + "/"
+    def get_url(cls, offering_user=None, action=None):
+        """Get offering user detail or action URL."""
+        if offering_user is None:
+            offering_user = OfferingUserFactory()
+
+        base_name = "marketplace-offering-user"
+        if action:
+            # For specific actions, use the action-specific URL name
+            url_name = f"{base_name}-{action}"
+        else:
+            url_name = f"{base_name}-detail"
+
+        return "http://testserver" + reverse(
+            url_name, kwargs={"uuid": offering_user.uuid.hex}
+        )
 
 
 class ComponentUserUsageLimitFactory(
@@ -751,14 +767,14 @@ class MaintenanceAnnouncementFactory(factory.django.DjangoModelFactory):
         if announcement is None:
             announcement = MaintenanceAnnouncementFactory()
         url = "http://testserver" + reverse(
-            "marketplace-maintenance-announcement-detail",
+            "maintenance-announcement-detail",
             kwargs={"uuid": announcement.uuid.hex},
         )
         return url if action is None else url + action + "/"
 
     @classmethod
     def get_list_url(cls, action=None):
-        url = "http://testserver" + reverse("marketplace-maintenance-announcement-list")
+        url = "http://testserver" + reverse("maintenance-announcement-list")
         return url if action is None else url + action + "/"
 
 
@@ -776,16 +792,14 @@ class MaintenanceAnnouncementOfferingFactory(factory.django.DjangoModelFactory):
         if obj is None:
             obj = MaintenanceAnnouncementOfferingFactory()
         url = "http://testserver" + reverse(
-            "marketplace-maintenance-announcement-offering-detail",
+            "maintenance-announcement-offering-detail",
             kwargs={"uuid": obj.uuid.hex},
         )
         return url if action is None else url + action + "/"
 
     @classmethod
     def get_list_url(cls, action=None):
-        url = "http://testserver" + reverse(
-            "marketplace-maintenance-announcement-offering-list"
-        )
+        url = "http://testserver" + reverse("maintenance-announcement-offering-list")
         return url if action is None else url + action + "/"
 
 
@@ -802,16 +816,14 @@ class MaintenanceAnnouncementTemplateFactory(factory.django.DjangoModelFactory):
         if template is None:
             template = MaintenanceAnnouncementTemplateFactory()
         url = "http://testserver" + reverse(
-            "marketplace-maintenance-announcement-template-detail",
+            "maintenance-announcement-template-detail",
             kwargs={"uuid": template.uuid.hex},
         )
         return url if action is None else url + action + "/"
 
     @classmethod
     def get_list_url(cls, action=None):
-        url = "http://testserver" + reverse(
-            "marketplace-maintenance-announcement-template-list"
-        )
+        url = "http://testserver" + reverse("maintenance-announcement-template-list")
         return url if action is None else url + action + "/"
 
 
@@ -829,7 +841,7 @@ class MaintenanceAnnouncementOfferingTemplateFactory(factory.django.DjangoModelF
         if obj is None:
             obj = MaintenanceAnnouncementOfferingTemplateFactory()
         url = "http://testserver" + reverse(
-            "marketplace-maintenance-announcement-template-offering-detail",
+            "maintenance-announcement-template-offering-detail",
             kwargs={"uuid": obj.uuid.hex},
         )
         return url if action is None else url + action + "/"
@@ -837,6 +849,34 @@ class MaintenanceAnnouncementOfferingTemplateFactory(factory.django.DjangoModelF
     @classmethod
     def get_list_url(cls, action=None):
         url = "http://testserver" + reverse(
-            "marketplace-maintenance-announcement-template-offering-list"
+            "maintenance-announcement-template-offering-list"
         )
         return url if action is None else url + action + "/"
+
+
+class CourseAccountFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.CourseAccount],
+):
+    class Meta:
+        model = models.CourseAccount
+
+    project = factory.SubFactory(
+        structure_factories.ProjectFactory, kind=ProjectKind.COURSE
+    )
+    user = factory.SubFactory(structure_factories.UserFactory)
+    email = factory.LazyAttribute(lambda obj: f"{obj.user.username}@example.com")
+    description = factory.Sequence(lambda n: f"Course account {n}")
+
+    @classmethod
+    def get_url(cls, account=None):
+        if account is None:
+            account = CourseAccountFactory()
+        return "http://testserver" + reverse(
+            "marketplace-course-account-detail",
+            kwargs={"uuid": account.uuid.hex},
+        )
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse("marketplace-course-account-list")

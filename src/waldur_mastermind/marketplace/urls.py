@@ -113,6 +113,11 @@ def register_in(router):
         basename="marketplace-offering-user",
     )
     router.register(
+        r"marketplace-offering-user-checklist-completions",
+        views.OfferingUserChecklistCompletionsViewSet,
+        basename="marketplace-offering-user-checklist-completion",
+    )
+    router.register(
         r"marketplace-stats",
         views.StatsViewSet,
         basename="marketplace-stats",
@@ -178,24 +183,44 @@ def register_in(router):
         basename="backend-resource-request",
     )
     router.register(
-        r"marketplace-maintenance-announcements",
+        r"maintenance-announcements",
         views.MaintenanceAnnouncementViewSet,
-        basename="marketplace-maintenance-announcement",
+        basename="maintenance-announcement",
     )
     router.register(
-        r"marketplace-maintenance-announcement-offerings",
+        r"public-maintenance-announcements",
+        views.PublicMaintenanceAnnouncementViewSet,
+        basename="public-maintenance-announcement",
+    )
+    router.register(
+        r"maintenance-announcement-offerings",
         views.MaintenanceAnnouncementOfferingViewSet,
-        basename="marketplace-maintenance-announcement-offering",
+        basename="maintenance-announcement-offering",
     )
     router.register(
-        r"marketplace-maintenance-announcements-template",
+        r"maintenance-announcements-template",
         views.MaintenanceAnnouncementTemplateViewSet,
-        basename="marketplace-maintenance-announcement-template",
+        basename="maintenance-announcement-template",
     )
     router.register(
-        r"marketplace-maintenance-announcement-template-offerings",
+        r"maintenance-announcement-template-offerings",
         views.MaintenanceAnnouncementOfferingTemplateViewSet,
-        basename="marketplace-maintenance-announcement-template-offering",
+        basename="maintenance-announcement-template-offering",
+    )
+    router.register(
+        r"marketplace-user-offering-consents",
+        views.UserOfferingConsentViewSet,
+        basename="marketplace-user-offering-consent",
+    )
+    router.register(
+        r"marketplace-offering-terms-of-service",
+        views.ProviderOfferingToSManagementViewset,
+        basename="marketplace-offering-terms-of-service",
+    )
+    router.register(
+        r"marketplace-course-accounts",
+        views.CourseAccountViewSet,
+        basename="marketplace-course-account",
     )
 
 

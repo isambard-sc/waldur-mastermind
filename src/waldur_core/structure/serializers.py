@@ -1,22 +1,23 @@
 import logging
 from datetime import datetime
-from functools import lru_cache
 
-import pyvat
 from constance import config
+from dbtemplates import models as dbtemplate_models
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core import exceptions as django_exceptions
 from django.db import models as django_models
 from django.db import transaction
 from django.db.models import Q
-from django.template.loader import get_template
+from django.template import Template, TemplateSyntaxError
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import exceptions, serializers
 from rest_framework.authtoken import models as authtoken_models
 
+from waldur_core.checklist.enums import ChecklistTypes
+from waldur_core.checklist.models import Checklist
 from waldur_core.core import fields as core_fields
 from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
@@ -28,12 +29,14 @@ from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.serializers import PermissionSerializer
 from waldur_core.permissions.utils import has_permission
 from waldur_core.structure import models, utils
+from waldur_core.structure.enums import ProjectKind
 from waldur_core.structure.filters import filter_visible_users
 from waldur_core.structure.managers import (
     count_customer_users,
     filter_queryset_for_user,
 )
 from waldur_core.structure.models import CUSTOMER_DETAILS_FIELDS
+from waldur_core.structure.notifications import NOTIFICATIONS
 from waldur_core.structure.registry import get_resource_type, get_service_type
 from waldur_mastermind.marketplace.enums import ResourceStates
 
@@ -46,19 +49,6 @@ def get_options_serializer_class(service_type):
         for cls in ServiceOptionsSerializer.get_subclasses()
         if get_service_type(cls) == service_type
     )
-
-
-@lru_cache
-def get_resource_serializer_class(resource_type):
-    try:
-        return next(
-            cls
-            for cls in BaseResourceSerializer.get_subclasses()
-            if get_resource_type(cls.Meta.model) == resource_type
-            and get_service_type(cls) is not None
-        )
-    except StopIteration:
-        return None
 
 
 class PermissionFieldFilteringMixin:
@@ -115,6 +105,10 @@ class FieldFilteringMixin:
             request = self.context["request"]
             user = request.user
         except (KeyError, AttributeError):
+            return fields
+
+        # Skip field filtering during schema generation
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
             return fields
 
         for field_name, check_access in self.get_filtered_field():
@@ -226,6 +220,8 @@ class ProjectSerializer(
         source="get_oecd_fos_2007_code_display"
     )
     description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    start_date = serializers.DateField(required=False, allow_null=True)
+    end_date = serializers.DateField(required=False, allow_null=True)
 
     class Meta:
         model = models.Project
@@ -241,6 +237,7 @@ class ProjectSerializer(
             "customer_native_name",
             "customer_abbreviation",
             "description",
+            "customer_display_billing_info_in_projects",
             "created",
             "type",
             "type_name",
@@ -255,8 +252,9 @@ class ProjectSerializer(
             "image",
             "resources_count",
             "max_service_accounts",
+            "kind",
         )
-        protected_fields = ("end_date_requested_by",)
+        read_only_fields = ("end_date_requested_by",)
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
             "customer": {"lookup_field": "uuid"},
@@ -267,7 +265,14 @@ class ProjectSerializer(
             },
         }
         related_paths = {
-            "customer": ("uuid", "name", "native_name", "abbreviation", "slug"),
+            "customer": (
+                "uuid",
+                "name",
+                "native_name",
+                "abbreviation",
+                "slug",
+                "display_billing_info_in_projects",
+            ),
             "type": ("name", "uuid"),
         }
 
@@ -279,7 +284,7 @@ class ProjectSerializer(
             "start_date" in fields
             and isinstance(self.instance, models.Project)
             and self.instance.start_date
-            and self.instance.start_date < timezone.now().date()
+            and self.instance.start_date <= timezone.now().date()
         ):
             fields["start_date"].read_only = True
 
@@ -292,14 +297,24 @@ class ProjectSerializer(
         return fields
 
     def validate_start_date(self, start_date):
-        if start_date and start_date < timezone.datetime.today().date():
+        # Allow None to clear the field
+        if start_date is None:
+            return start_date
+
+        # Only validate non-None values
+        if start_date < timezone.datetime.today().date():
             raise serializers.ValidationError(
                 {"start_date": _("Cannot be earlier than the current date.")}
             )
         return start_date
 
     def validate_end_date(self, end_date):
-        if end_date and end_date < timezone.datetime.today().date():
+        # Allow None to clear the field
+        if end_date is None:
+            return end_date
+
+        # Only validate non-None values
+        if end_date < timezone.datetime.today().date():
             raise serializers.ValidationError(
                 {"end_date": _("Cannot be earlier than the current date.")}
             )
@@ -317,6 +332,7 @@ class ProjectSerializer(
             "customer__slug",
             "customer__native_name",
             "customer__abbreviation",
+            "customer__display_billing_info_in_projects",
         )
         return queryset.select_related("customer").only(*related_fields)
 
@@ -346,6 +362,24 @@ class ProjectSerializer(
                     {"oecd_fos_2007_code": _("This field is required.")}
                 )
 
+        if attrs.get("kind") == ProjectKind.COURSE.value:
+            if not settings.WALDUR_CORE.get("ENABLE_PROJECT_KIND_COURSE", False):
+                raise serializers.ValidationError(
+                    'Unable to set project kind to "COURSE": ENABLE_PROJECT_KIND_COURSE feature is disabled.'
+                )
+
+            if isinstance(self.instance, models.Project):
+                # Check the existing end date
+                if self.instance.end_date is None:
+                    raise serializers.ValidationError(
+                        'Unable to set project kind to "COURSE": end_date is not set.'
+                    )
+            # Check the end date from attrs
+            elif attrs.get("end_date") is None:
+                raise serializers.ValidationError(
+                    "Unable to create a course project kind: end_date is required."
+                )
+
         return attrs
 
     def get_resources_count(self, project) -> int:
@@ -372,16 +406,27 @@ class CountrySerializerMixin(serializers.Serializer):
                 return [
                     item for item in core_fields.COUNTRIES if item[0] in country_codes
                 ]
-        except (RuntimeError, AttributeError):
+        except Exception:
             logger.exception(
                 "Failed to get country choices, using complete list of countries as fallback."
             )
             return core_fields.COUNTRIES
 
     country = serializers.ChoiceField(
-        required=False, choices=get_country_choices(), allow_blank=True
+        required=False, choices=core_fields.COUNTRIES, allow_blank=True
     )
     country_name = serializers.CharField(read_only=True, source="get_country_display")
+
+    def get_fields(self):
+        fields = super().get_fields()
+
+        # Check if this is schema generation context (drf-spectacular)
+        # When generating schema, we want to include all fields
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
+            return fields
+        if "country" in fields:
+            fields["country"].choices = self.get_country_choices()
+        return fields
 
 
 class OrganizationGroupSerializer(serializers.HyperlinkedModelSerializer):
@@ -435,6 +480,14 @@ class CustomerSerializer(
     organization_groups = OrganizationGroupSerializer(many=True, read_only=True)
     projects_count = serializers.SerializerMethodField()
     users_count = serializers.SerializerMethodField()
+    project_metadata_checklist = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=Checklist.objects.filter(
+            checklist_type=ChecklistTypes.PROJECT_METADATA
+        ),
+        required=False,
+        allow_null=True,
+    )
 
     class Meta:
         model = models.Customer
@@ -449,6 +502,7 @@ class CustomerSerializer(
             "image",
             "blocked",
             "archived",
+            "display_billing_info_in_projects",
             "default_tax_percent",
             "accounting_start_date",
             "projects_count",
@@ -456,6 +510,7 @@ class CustomerSerializer(
             "sponsor_number",
             "country_name",
             "max_service_accounts",
+            "project_metadata_checklist",
         ) + CUSTOMER_DETAILS_FIELDS
         staff_only_fields = (
             "access_subnets",
@@ -466,16 +521,22 @@ class CustomerSerializer(
             "organization_groups",
             "blocked",
             "archived",
+            "display_billing_info_in_projects",
             "sponsor_number",
             "max_service_accounts",
+            "project_metadata_checklist",
         )
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
         }
 
     def get_optional_fields(self):
-        # Make 'projects' field optional, only rendered if requested via ?field=projects
-        return super().get_optional_fields() + ["projects"]
+        # Make expensive fields optional, only rendered if requested via ?field=
+        return super().get_optional_fields() + [
+            "projects",
+            "users_count",
+            "organization_groups",
+        ]
 
     def get_fields(self):
         fields = super().get_fields()
@@ -503,71 +564,95 @@ class CustomerSerializer(
 
     @staticmethod
     def eager_load(queryset, request=None):
-        return queryset.prefetch_related("projects")
+        # Only prefetch fields that are actually requested
+        prefetch_relations = []
+
+        if request:
+            requested_fields = request.query_params.getlist("field")
+            # If no field parameter specified, prefetch all (default behavior)
+            # Otherwise only prefetch fields that are explicitly requested
+            if not requested_fields or "projects" in requested_fields:
+                prefetch_relations.append("projects")
+            if not requested_fields or "organization_groups" in requested_fields:
+                prefetch_relations.append("organization_groups")
+        else:
+            # No request context, prefetch all (fallback)
+            prefetch_relations = ["projects", "organization_groups"]
+
+        if prefetch_relations:
+            queryset = queryset.prefetch_related(*prefetch_relations)
+        return queryset
 
     def validate(self, attrs):
         country = attrs.get("country")
         vat_code = attrs.get("vat_code")
 
         if vat_code:
-            # Check VAT format
-            if not pyvat.is_vat_number_format_valid(vat_code, country):
+            # Check VAT format using the validate_vat_format method from VATMixin
+            from waldur_core.structure.models import VATMixin
+
+            if not VATMixin.validate_vat_format(vat_code, country):
                 raise serializers.ValidationError(
                     {"vat_code": _("VAT number has invalid format.")}
                 )
 
-            # Check VAT number in EU VAT Information Exchange System
-            # if customer is new or either VAT number or country of the customer has changed
-            if (
-                not self.instance
-                or self.instance.vat_code != vat_code
-                or self.instance.country != country
-            ):
-                check_result = pyvat.check_vat_number(vat_code, country)
-                if check_result.is_valid:
-                    attrs["vat_name"] = check_result.business_name
-                    attrs["vat_address"] = check_result.business_address
-                    if not attrs.get("contact_details"):
-                        attrs["contact_details"] = attrs["vat_address"]
-                elif check_result.is_valid is False:
-                    raise serializers.ValidationError(
-                        {"vat_code": _("VAT number is invalid.")}
-                    )
-                else:
-                    logger.debug(
-                        "Unable to check VAT number %s for country %s. Error message: %s",
-                        vat_code,
-                        country,
-                        check_result.log_lines,
-                    )
-                    raise serializers.ValidationError(
-                        {"vat_code": _("Unable to check VAT number.")}
-                    )
+            # Note: VIES validation (EU VAT Information Exchange System) has been removed.
+            # If needed, it can be implemented separately using external services.
+            # The vat_name and vat_address fields can now be manually entered if required.
+            logger.debug(
+                "VAT number %s format validated for country %s. "
+                "VIES validation not performed - manual verification may be required.",
+                vat_code,
+                country,
+            )
         return attrs
+
+    def validate_project_metadata_checklist(self, checklist):
+        """Validate that the checklist is of PROJECT_METADATA type."""
+        if checklist and checklist.checklist_type != ChecklistTypes.PROJECT_METADATA:
+            raise serializers.ValidationError(
+                _("Checklist must be of type PROJECT_METADATA")
+            )
+        return checklist
 
     def get_display_name(self, customer) -> str:
         return customer.get_display_name()
 
     def get_projects_count(self, customer) -> int:
+        # Use annotated value from queryset if available, otherwise fallback to query
+        if hasattr(customer, "projects_count"):
+            return customer.projects_count
         return models.Project.available_objects.filter(customer=customer).count()
 
     @extend_schema_field(PermissionProjectSerializer(many=True))
     def get_projects(self, customer):
-        projects = models.Project.available_objects.filter(customer=customer)
+        # Use prefetched projects if available to avoid N+1 queries
+        if hasattr(customer, "_prefetched_projects"):
+            projects = customer._prefetched_projects
+        else:
+            projects = models.Project.available_objects.filter(customer=customer)
+
         show_all_projects = self.context["request"].query_params.get(
             "show_all_projects"
         )
         if show_all_projects not in ["true", "True"]:
             query = self.context["request"].query_params.get("query")
-
             if query:
-                projects = projects.filter(name__icontains=query)
+                # If we have prefetched data, filter in Python; otherwise use DB filter
+                if hasattr(customer, "_prefetched_projects"):
+                    projects = [p for p in projects if query.lower() in p.name.lower()]
+                else:
+                    projects = projects.filter(name__icontains=query)
 
         return PermissionProjectSerializer(
             projects, many=True, context=self.context
         ).data
 
     def get_users_count(self, customer) -> int:
+        # Use cached/optimized calculation if available
+        if hasattr(customer, "_cached_users_count"):
+            return customer._cached_users_count
+        # Fallback to the original calculation
         return count_customer_users(customer)
 
 
@@ -611,13 +696,13 @@ class BasicCustomerSerializer(serializers.ModelSerializer):
 
 class NestedProjectSerializer(
     core_serializers.AugmentedSerializerMixin,
-    core_serializers.HyperlinkedRelatedModelSerializer,
+    serializers.HyperlinkedModelSerializer,
 ):
     class Meta:
         model = models.Project
         fields = ("uuid", "url")
         extra_kwargs = {
-            "url": {"lookup_field": "uuid"},
+            "url": {"lookup_field": "uuid", "view_name": "project-detail"},
         }
 
 
@@ -683,7 +768,9 @@ class CustomerUserSerializer(
     @extend_schema_field(NestedProjectPermissionSerializer(many=True))
     def get_projects(self, user):
         customer = self.context["customer"]
-        project_ids = customer.projects.values_list("id", flat=True)
+        project_ids = models.Project.available_objects.filter(
+            customer=customer
+        ).values_list("id", flat=True)
         projects = UserRole.objects.filter(
             content_type=ContentType.objects.get_for_model(models.Project),
             object_id__in=project_ids,
@@ -716,19 +803,17 @@ class BasePermissionSerializer(
         }
 
 
-class CustomerPermissionReviewSerializer(
+class BasePermissionReviewSerializer(
     core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
+    """Common base serializer for permission review models."""
+
     class Meta:
-        model = models.CustomerPermissionReview
-        view_name = "customer_permission_review-detail"
-        fields = (
+        fields_common = (
             "url",
             "uuid",
             "reviewer_full_name",
             "reviewer_uuid",
-            "customer_uuid",
-            "customer_name",
             "is_pending",
             "created",
             "closed",
@@ -737,13 +822,50 @@ class CustomerPermissionReviewSerializer(
             "is_pending",
             "closed",
         )
-        related_paths = {
-            "reviewer": ("full_name", "uuid"),
-            "customer": ("name", "uuid"),
-        }
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
         }
+        related_paths_common = {
+            "reviewer": ("full_name", "uuid"),
+        }
+
+
+class CustomerPermissionReviewSerializer(BasePermissionReviewSerializer):
+    customer_uuid = serializers.UUIDField(read_only=True, source="customer.uuid")
+    customer_name = serializers.CharField(read_only=True, source="customer.name")
+
+    class Meta(BasePermissionReviewSerializer.Meta):
+        model = models.CustomerPermissionReview
+        view_name = "customer_permission_review-detail"
+        fields = BasePermissionReviewSerializer.Meta.fields_common + (
+            "customer_uuid",
+            "customer_name",
+        )
+        related_paths = dict(
+            BasePermissionReviewSerializer.Meta.related_paths_common,
+            customer=("name", "uuid"),
+        )
+        read_only_fields = BasePermissionReviewSerializer.Meta.read_only_fields
+        extra_kwargs = BasePermissionReviewSerializer.Meta.extra_kwargs
+
+
+class ProjectPermissionReviewSerializer(BasePermissionReviewSerializer):
+    project_uuid = serializers.UUIDField(read_only=True, source="project.uuid")
+    project_name = serializers.CharField(read_only=True, source="project.name")
+
+    class Meta(BasePermissionReviewSerializer.Meta):
+        model = models.ProjectPermissionReview
+        view_name = "project-permissions-review-detail"
+        fields = BasePermissionReviewSerializer.Meta.fields_common + (
+            "project_uuid",
+            "project_name",
+        )
+        related_paths = dict(
+            BasePermissionReviewSerializer.Meta.related_paths_common,
+            project=("name", "uuid"),
+        )
+        read_only_fields = BasePermissionReviewSerializer.Meta.read_only_fields
+        extra_kwargs = BasePermissionReviewSerializer.Meta.extra_kwargs
 
 
 class ProjectPermissionLogSerializer(
@@ -928,6 +1050,11 @@ class UserSerializer(
             return fields
 
         if user.is_anonymous:
+            return fields
+
+        # Check if this is schema generation context (drf-spectacular)
+        # When generating schema, we want to include all fields
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
             return fields
 
         if not user.is_staff:
@@ -1477,8 +1604,11 @@ class NotificationTemplateDetailSerializers(serializers.ModelSerializer):
             },
         }
 
-    def get_content(self, obj) -> str:
-        return get_template(obj.path).template.source
+    def get_content(self, obj: core_models.NotificationTemplate) -> str | None:
+        try:
+            return dbtemplate_models.Template.objects.get(name=obj.path).content
+        except dbtemplate_models.Template.DoesNotExist:
+            return None
 
     def get_original_content(self, obj) -> str | None:
         from django.template.engine import Engine
@@ -1499,6 +1629,7 @@ class NotificationTemplateDetailSerializers(serializers.ModelSerializer):
 
 class NotificationSerializer(serializers.HyperlinkedModelSerializer):
     templates = NotificationTemplateDetailSerializers(many=True, read_only=True)
+    context_schema = serializers.SerializerMethodField()
 
     class Meta:
         model = core_models.Notification
@@ -1510,6 +1641,7 @@ class NotificationSerializer(serializers.HyperlinkedModelSerializer):
             "enabled",
             "created",
             "templates",
+            "context_schema",
         )
         read_only_fields = ("created", "enabled")
         extra_kwargs = {
@@ -1519,9 +1651,39 @@ class NotificationSerializer(serializers.HyperlinkedModelSerializer):
             },
         }
 
+    def get_context_schema(self, obj) -> dict:
+        """
+        Finds the notification definition in the global NOTIFICATIONS
+        dictionary and returns its 'context' schema.
+        """
+        try:
+            section_key, notification_key = obj.key.split(".", 1)
+        except ValueError:
+            # Handle cases where the key might not have a dot
+            return {}
+
+        # Safely get the list of notifications for the section
+        notification_definitions = NOTIFICATIONS.get(section_key, [])
+
+        # Find the specific notification by its full key ('path')
+        for definition in notification_definitions:
+            if definition.get("path") == notification_key:
+                # Return the context schema if it exists, otherwise an empty dict
+                return definition.get("context_schema", {})
+
+        # Return an empty dict if no matching notification was found
+        return {}
+
 
 class NotificationTemplateUpdateSerializers(serializers.Serializer):
     content = serializers.CharField()
+
+    def validate_content(self, content):
+        try:
+            Template(content)
+        except TemplateSyntaxError as e:
+            raise serializers.ValidationError(f"Invalid template syntax: {str(e)}")
+        return content
 
 
 class AuthTokenSerializer(serializers.HyperlinkedModelSerializer):
@@ -1600,3 +1762,388 @@ class CountrySerializer(serializers.Serializer):
 
 class ConsoleUrlSerializer(serializers.Serializer):
     url = serializers.URLField(read_only=True)
+
+
+class ExternalLinkSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.ExternalLink
+        fields = (
+            "url",
+            "uuid",
+            "name",
+            "description",
+            "link",
+            "image",
+            "created",
+            "modified",
+        )
+
+        extra_kwargs = {
+            "url": {"lookup_field": "uuid", "view_name": "external-links-detail"},
+        }
+
+
+class ChecklistInfoSerializer(serializers.Serializer):
+    """Serializer for checklist basic information."""
+
+    uuid = serializers.UUIDField(read_only=True)
+    name = serializers.CharField(read_only=True)
+    checklist_type = serializers.CharField(read_only=True)
+
+
+class ComplianceOverviewSerializer(serializers.Serializer):
+    """Serializer for project metadata compliance overview response."""
+
+    total_projects = serializers.IntegerField(read_only=True)
+    projects_with_completions = serializers.IntegerField(read_only=True)
+    fully_completed_projects = serializers.IntegerField(read_only=True)
+    projects_requiring_review = serializers.IntegerField(read_only=True)
+    average_completion_percentage = serializers.FloatField(read_only=True)
+
+
+class ProjectDetailSerializer(serializers.Serializer):
+    """Serializer for individual project compliance details."""
+
+    project_uuid = serializers.UUIDField(read_only=True)
+    project_name = serializers.CharField(read_only=True)
+    completion_uuid = serializers.UUIDField(
+        read_only=True, required=False, allow_null=True
+    )
+    completion_percentage = serializers.FloatField(read_only=True)
+    is_completed = serializers.BooleanField(read_only=True)
+    requires_review = serializers.BooleanField(read_only=True)
+    answers = serializers.ListField(read_only=True, required=False)
+    unanswered_required_questions = serializers.ListField(
+        read_only=True, required=False
+    )
+
+
+class ProjectDetailsResponseSerializer(serializers.Serializer):
+    """Serializer for project details response."""
+
+    checklist = ChecklistInfoSerializer(read_only=True)
+    total_projects = serializers.IntegerField(read_only=True)
+    projects_with_completions = serializers.IntegerField(read_only=True)
+    fully_completed_projects = serializers.IntegerField(read_only=True)
+    projects_requiring_review = serializers.IntegerField(read_only=True)
+    project_details = ProjectDetailSerializer(many=True, read_only=True)
+
+
+class ProjectAnswerSerializer(serializers.ModelSerializer):
+    """Serializer for project checklist answer details."""
+
+    project_uuid = serializers.UUIDField(source="uuid", read_only=True)
+    project_name = serializers.CharField(source="name", read_only=True)
+    completion_uuid = serializers.SerializerMethodField()
+    completion_percentage = serializers.SerializerMethodField()
+    is_completed = serializers.SerializerMethodField()
+    requires_review = serializers.SerializerMethodField()
+    answers_count = serializers.SerializerMethodField()
+    unanswered_required_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.Project
+        fields = [
+            "project_uuid",
+            "project_name",
+            "completion_uuid",
+            "completion_percentage",
+            "is_completed",
+            "requires_review",
+            "answers_count",
+            "unanswered_required_count",
+        ]
+
+    def _get_completion_data(self, project):
+        """Get or calculate completion data for project."""
+        # Use bulk-loaded completion data if available (most efficient)
+        serializer_class = self.__class__
+        if hasattr(serializer_class, "_bulk_completion_data"):
+            return serializer_class._bulk_completion_data.get(project.id)
+
+        # Fallback to individual queries (less efficient)
+        if not hasattr(self, "_completion_cache"):
+            self._completion_cache = {}
+
+        if project.id not in self._completion_cache:
+            checklist = self.context.get("checklist")
+            if not checklist:
+                self._completion_cache[project.id] = None
+                return None
+
+            # Import here to avoid circular imports
+            from django.contrib.contenttypes.models import ContentType
+
+            from waldur_core.checklist import models as checklist_models
+
+            content_type = ContentType.objects.get_for_model(models.Project)
+            try:
+                completion = checklist_models.ChecklistCompletion.objects.get(
+                    checklist=checklist,
+                    scope_content_type=content_type,
+                    scope_object_id=project.id,
+                )
+                self._completion_cache[project.id] = completion
+            except checklist_models.ChecklistCompletion.DoesNotExist:
+                self._completion_cache[project.id] = None
+
+        return self._completion_cache[project.id]
+
+    def get_completion_uuid(self, project) -> str | None:
+        """Get completion UUID."""
+        completion = self._get_completion_data(project)
+        return completion.uuid.hex if completion else None
+
+    def get_completion_percentage(self, project) -> float:
+        """Get completion percentage."""
+        completion = self._get_completion_data(project)
+        return completion.get_completion_percentage() if completion else 0.0
+
+    def get_is_completed(self, project) -> bool:
+        """Get completion status."""
+        completion = self._get_completion_data(project)
+        return completion.is_completed if completion else False
+
+    def get_requires_review(self, project) -> bool:
+        """Get review requirement status."""
+        completion = self._get_completion_data(project)
+        return completion.requires_review if completion else False
+
+    def get_answers_count(self, project) -> int:
+        """Get count of answers."""
+        completion = self._get_completion_data(project)
+        if completion:
+            return completion.answers.count()
+        return 0
+
+    def get_unanswered_required_count(self, project) -> int:
+        """Get count of unanswered required questions."""
+        checklist = self.context.get("checklist")
+        if not checklist:
+            return 0
+
+        completion = self._get_completion_data(project)
+        total_required = checklist.questions.filter(required=True).count()
+
+        if completion:
+            answered_required = completion.answers.filter(
+                question__required=True
+            ).count()
+            return max(0, total_required - answered_required)
+        else:
+            return total_required
+
+
+class ProjectAnswerDetailSerializer(serializers.Serializer):
+    """Serializer for individual project answers within a question."""
+
+    project_uuid = serializers.UUIDField(read_only=True)
+    project_name = serializers.CharField(read_only=True)
+    answer_uuid = serializers.UUIDField(read_only=True, allow_null=True)
+    answer_data = serializers.JSONField(read_only=True, allow_null=True)
+    answered_by = serializers.CharField(read_only=True, allow_null=True)
+    answered_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    requires_review = serializers.BooleanField(read_only=True)
+
+
+class QuestionAnswerSerializer(serializers.ModelSerializer):
+    """Serializer for question with all project answers."""
+
+    question_uuid = serializers.UUIDField(source="uuid", read_only=True)
+    question_description = serializers.CharField(source="description", read_only=True)
+    question_type = serializers.CharField(read_only=True)
+    required = serializers.BooleanField(read_only=True)
+    order = serializers.IntegerField(read_only=True)
+    total_projects = serializers.SerializerMethodField()
+    answered_projects_count = serializers.SerializerMethodField()
+    project_answers = serializers.SerializerMethodField()
+    question_options = serializers.SerializerMethodField()
+    min_value = serializers.DecimalField(
+        max_digits=20, decimal_places=4, read_only=True, allow_null=True
+    )
+    max_value = serializers.DecimalField(
+        max_digits=20, decimal_places=4, read_only=True, allow_null=True
+    )
+
+    class Meta:
+        # Import here to avoid circular imports
+        from waldur_core.checklist.models import Question
+
+        model = Question
+        fields = [
+            "question_uuid",
+            "question_description",
+            "question_type",
+            "required",
+            "order",
+            "min_value",
+            "max_value",
+            "total_projects",
+            "answered_projects_count",
+            "project_answers",
+            "question_options",
+        ]
+
+    def _get_projects_and_answers_data(self, question):
+        """Get or calculate project and answer data for this question."""
+        # Use bulk-loaded data if available (most efficient)
+        serializer_class = self.__class__
+        if hasattr(serializer_class, "_bulk_question_data"):
+            return serializer_class._bulk_question_data.get(
+                question.id,
+                {
+                    "projects": [],
+                    "answers_by_project": {},
+                    "total_projects": 0,
+                    "answered_projects_count": 0,
+                },
+            )
+
+        # Fallback to individual queries (less efficient)
+        customer = self.context.get("customer")
+        if not customer:
+            return {
+                "projects": [],
+                "answers_by_project": {},
+                "total_projects": 0,
+                "answered_projects_count": 0,
+            }
+
+        from django.contrib.contenttypes.models import ContentType
+
+        from waldur_core.checklist.models import Answer
+        from waldur_core.structure import models
+
+        # Get all projects for the customer
+        projects = list(
+            models.Project.objects.filter(customer=customer).order_by("name")
+        )
+        project_ct = ContentType.objects.get_for_model(models.Project)
+
+        # Get answers for this question across all projects
+        answers = Answer.objects.filter(
+            question=question,
+            completion__scope_content_type=project_ct,
+            completion__scope_object_id__in=[p.id for p in projects],
+        ).select_related("user", "completion")
+
+        # Create mapping of project_id -> answer
+        answers_by_project = {
+            answer.completion.scope_object_id: answer for answer in answers
+        }
+
+        return {
+            "projects": projects,
+            "answers_by_project": answers_by_project,
+            "total_projects": len(projects),
+            "answered_projects_count": len(answers_by_project),
+        }
+
+    def get_total_projects(self, question) -> int:
+        """Get total projects count."""
+        data = self._get_projects_and_answers_data(question)
+        return data["total_projects"]
+
+    def get_answered_projects_count(self, question) -> int:
+        """Get count of projects that answered this question."""
+        data = self._get_projects_and_answers_data(question)
+        return data["answered_projects_count"]
+
+    def get_project_answers(self, question) -> list[dict]:
+        """Get all project answers for this question."""
+        data = self._get_projects_and_answers_data(question)
+        projects = data["projects"]
+        answers_by_project = data["answers_by_project"]
+
+        project_answers = []
+
+        for project in projects:
+            answer = answers_by_project.get(project.id)
+            if answer:
+                project_answers.append(
+                    {
+                        "project_uuid": project.uuid.hex,
+                        "project_name": project.name,
+                        "answer_uuid": answer.uuid.hex,
+                        "answer_data": answer.answer_data,
+                        "answer_labels": self._get_answer_labels(
+                            question, answer.answer_data
+                        ),
+                        "answered_by": answer.user.full_name if answer.user else None,
+                        "answered_at": answer.created,
+                        "requires_review": answer.requires_review,
+                    }
+                )
+            else:
+                # No answer for this project
+                project_answers.append(
+                    {
+                        "project_uuid": project.uuid.hex,
+                        "project_name": project.name,
+                        "answer_uuid": None,
+                        "answer_data": None,
+                        "answer_labels": None,
+                        "answered_by": None,
+                        "answered_at": None,
+                        "requires_review": False,
+                    }
+                )
+
+        return project_answers
+
+    def get_question_options(self, question) -> list[dict]:
+        """Get question options for select-type questions."""
+        if question.question_type in ["single_select", "multi_select"]:
+            # Use prefetched data if available, otherwise fall back to querying
+            options = question.question_options.all()
+            # Sort in Python to avoid overriding prefetch_related
+            sorted_options = sorted(options, key=lambda opt: opt.order)
+            return [
+                {
+                    "uuid": str(option.uuid),
+                    "label": option.label,
+                    "order": option.order,
+                }
+                for option in sorted_options
+            ]
+        return []
+
+    def _get_answer_labels(self, question, answer_data) -> list[str] | str | None:
+        """Convert answer data UUIDs to human-readable labels for select-type questions."""
+        if not answer_data or question.question_type not in [
+            "single_select",
+            "multi_select",
+        ]:
+            return answer_data
+
+        # Use pre-computed options map if available (most efficient)
+        serializer_class = self.__class__
+        if hasattr(serializer_class, "_bulk_question_data"):
+            question_data = serializer_class._bulk_question_data.get(question.id, {})
+            options_map = question_data.get("options_map", {})
+        else:
+            # Fallback to querying (less efficient)
+            options_map = {
+                str(option.uuid): option.label
+                for option in question.question_options.all()
+            }
+
+        if question.question_type == "single_select":
+            # answer_data is a single UUID string (for single_select questions stored as list of one item)
+            if isinstance(answer_data, list) and len(answer_data) == 1:
+                uuid_str = str(answer_data[0])
+                return options_map.get(uuid_str, answer_data)
+            elif isinstance(answer_data, str):
+                return options_map.get(answer_data, answer_data)
+            return answer_data
+
+        elif question.question_type == "multi_select":
+            # answer_data is a list of UUID strings
+            if isinstance(answer_data, list):
+                return [
+                    options_map.get(str(uuid_val), str(uuid_val))
+                    for uuid_val in answer_data
+                ]
+            return answer_data
+
+        return answer_data

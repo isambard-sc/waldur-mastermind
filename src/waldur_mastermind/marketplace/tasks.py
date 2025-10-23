@@ -2,6 +2,7 @@ import collections
 import datetime
 import hashlib
 import logging
+from datetime import timedelta
 from typing import cast
 
 import requests
@@ -10,7 +11,7 @@ from constance import config
 from dateutil.relativedelta import relativedelta
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
-from django.db.models import F, Q, Sum
+from django.db.models import Count, F, Q, Sum
 from django.utils import timezone
 from rest_framework import status
 
@@ -23,12 +24,14 @@ from waldur_core.logging import models as logging_models
 from waldur_core.logging.enums import EventType
 from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure import models as structure_models
+from waldur_mastermind.analytics import models as analytics_models
 from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices import utils as invoice_utils
 from waldur_mastermind.marketplace import exceptions, models, plugins, utils
 from waldur_mastermind.marketplace.enums import (
     OfferingStates,
     OrderStates,
+    OrderTypes,
     ResourceStates,
     RobotAccountStates,
 )
@@ -208,7 +211,9 @@ def calculate_usage_for_current_month():
 
     for customer in structure_models.Customer.objects.all():
         scopes.append(customer)
-        for project in customer.projects.all():
+        for project in structure_models.Project.available_objects.filter(
+            customer=customer
+        ):
             scopes.append(project)
 
     for scope in scopes:
@@ -247,7 +252,7 @@ def terminate_resources_if_project_end_date_has_been_reached():
                 scopes=[project, project.customer],
             )
             project.delete()
-            return
+            continue
 
         # We expect that resources with parents will be removed when parents are removed
         terminatable_resources = project_resources.filter(
@@ -279,7 +284,7 @@ def terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_o
     failed_creation_resources = (
         models.Order.objects.filter(
             resource__in=resources,
-            type=models.Order.Types.CREATE,
+            type=OrderTypes.CREATE,
             state=OrderStates.ERRED,
         )
         .order_by("-created")
@@ -290,7 +295,7 @@ def terminate_resources_in_state_erred_without_backend_id_and_failed_terminate_o
     resources_with_last_termination_order_erred = (
         models.Order.objects.filter(
             resource__in=resources,
-            type=models.Order.Types.TERMINATE,
+            type=OrderTypes.TERMINATE,
             state=OrderStates.ERRED,
         )
         .order_by("-created")
@@ -473,6 +478,10 @@ def send_metrics():
     if not core_models.Feature.objects.filter(key="telemetry.send_metrics").exists():
         return
 
+    # skip sending if setting is unset
+    if not config.TELEMETRY_URL:
+        return
+
     site_name = config.HOMEPORT_URL
     deployment_type = core_utils.get_deployment_type()
     first_event = logging_models.Event.objects.order_by("created").first()
@@ -630,3 +639,114 @@ def remove_deleted_robot_accounts():
 
     if count > 0:
         logger.info(f"Removed {count} robot accounts that were in DELETED state")
+
+
+@shared_task(name="waldur_mastermind.marketplace.update_daily_consent_history")
+def update_daily_consent_history():
+    """
+    Daily task to update consent history statistics for dashboard reporting.
+    Uses quota system + DailyQuotaHistory for historical tracking.
+    """
+    today = timezone.now().date()
+    yesterday = today - timedelta(days=1)
+
+    offerings_with_tos = (
+        models.Offering.objects.filter(terms_of_service_configs__is_active=True)
+        .distinct()
+        .annotate(
+            active_users_count=Count(
+                "offeringuser",
+                filter=Q(offeringuser__state=models.OfferingUserStates.OK),
+                distinct=True,
+            ),
+            total_users_count=Count("offeringuser", distinct=True),
+            accepted_consents_count=Count(
+                "user_consents",
+                filter=Q(user_consents__revocation_date__isnull=True),
+                distinct=True,
+            ),
+            revoked_consents_count=Count(
+                "user_consents",
+                filter=Q(user_consents__revocation_date__isnull=False),
+                distinct=True,
+            ),
+            revoked_consents_today=Count(
+                "user_consents",
+                filter=Q(user_consents__revocation_date__date=yesterday),
+                distinct=True,
+            ),
+        )
+    )
+
+    quota_records = []
+
+    for offering in offerings_with_tos:
+        total_consents_count = (
+            offering.accepted_consents_count + offering.revoked_consents_count
+        )
+
+        offering.set_quota_usage("active_users_count", offering.active_users_count)
+        offering.set_quota_usage("total_users_count", offering.total_users_count)
+        offering.set_quota_usage(
+            "accepted_consents_count", offering.accepted_consents_count
+        )
+        offering.set_quota_usage(
+            "revoked_consents_count", offering.revoked_consents_count
+        )
+        offering.set_quota_usage("total_consents_count", total_consents_count)
+        offering.set_quota_usage(
+            "revoked_consents_today", offering.revoked_consents_today
+        )
+
+        quota_records.extend(
+            [
+                analytics_models.DailyQuotaHistory(
+                    scope=offering,
+                    name="active_users_count",
+                    usage=offering.active_users_count,
+                    date=today,
+                ),
+                analytics_models.DailyQuotaHistory(
+                    scope=offering,
+                    name="total_users_count",
+                    usage=offering.total_users_count,
+                    date=today,
+                ),
+                analytics_models.DailyQuotaHistory(
+                    scope=offering,
+                    name="accepted_consents_count",
+                    usage=offering.accepted_consents_count,
+                    date=today,
+                ),
+                analytics_models.DailyQuotaHistory(
+                    scope=offering,
+                    name="revoked_consents_count",
+                    usage=offering.revoked_consents_count,
+                    date=today,
+                ),
+                analytics_models.DailyQuotaHistory(
+                    scope=offering,
+                    name="total_consents_count",
+                    usage=total_consents_count,
+                    date=today,
+                ),
+                analytics_models.DailyQuotaHistory(
+                    scope=offering,
+                    name="revoked_consents_today",
+                    usage=offering.revoked_consents_today,
+                    date=today,
+                ),
+            ]
+        )
+
+    # Bulk create all quota history records
+    analytics_models.DailyQuotaHistory.objects.bulk_create(
+        quota_records, ignore_conflicts=True
+    )
+
+    updated_count = offerings_with_tos.count()
+
+    if updated_count == 0:
+        logger.info("No offerings with ToS found")
+    else:
+        logger.info(f"Updated consent history for {updated_count} offerings")

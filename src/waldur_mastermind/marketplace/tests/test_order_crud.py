@@ -1,6 +1,7 @@
 import datetime
 from unittest import mock
 
+from constance.test.unittest import override_config as override_constance_config
 from ddt import data, ddt
 from freezegun import freeze_time
 from rest_framework import status, test
@@ -13,6 +14,7 @@ from waldur_core.structure.tests import fixtures
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.marketplace import models, plugins
 from waldur_mastermind.marketplace.enums import (
+    SUPPORT_OFFERING,
     BillingTypes,
     LimitPeriods,
     OfferingStates,
@@ -20,7 +22,6 @@ from waldur_mastermind.marketplace.enums import (
 from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
 from waldur_mastermind.marketplace.tests.utils import TestCreateProcessor
-from waldur_mastermind.marketplace_support import PLUGIN_NAME
 
 
 class BaseOrderCreateTest(test.APITransactionTestCase):
@@ -236,6 +237,66 @@ class OrderCreateTest(BaseOrderCreateTest):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
+    def test_creation_fails_if_maximal_resource_count_per_project_is_reached(self):
+        user = self.fixture.staff
+        offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            plugin_options={"maximal_resource_count_per_project": 1},
+        )
+        factories.ResourceFactory(project=self.project, offering=offering)
+
+        response = self.create_order(user, offering)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "the maximum number of resources", response.data["non_field_errors"][0]
+        )
+
+    def test_creation_succeeds_if_maximal_resource_count_per_project_is_not_reached(
+        self,
+    ):
+        user = self.fixture.staff
+        offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            plugin_options={"maximal_resource_count_per_project": 2},
+        )
+        factories.ResourceFactory(project=self.project, offering=offering)
+
+        response = self.create_order(user, offering)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_terminated_resources_are_not_counted_towards_limit(self):
+        user = self.fixture.staff
+        offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            plugin_options={"maximal_resource_count_per_project": 1},
+        )
+        factories.ResourceFactory(
+            project=self.project,
+            offering=offering,
+            state=models.Resource.States.TERMINATED,
+        )
+
+        response = self.create_order(user, offering)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_resources_in_other_projects_are_not_counted_towards_limit(self):
+        user = self.fixture.staff
+        offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            plugin_options={"maximal_resource_count_per_project": 1},
+        )
+        # Create resource in a different project
+        factories.ResourceFactory(
+            project=structure_factories.ProjectFactory(), offering=offering
+        )
+
+        response = self.create_order(user, offering)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
 
 @ddt
 @mock.patch(
@@ -413,7 +474,7 @@ class OrderLimitsCreateTest(BaseOrderCreateTest):
 
     def test_user_can_create_order_with_valid_limits(self):
         offering = factories.OfferingFactory(
-            state=OfferingStates.ACTIVE, type=PLUGIN_NAME
+            state=OfferingStates.ACTIVE, type=SUPPORT_OFFERING
         )
         plan = factories.PlanFactory(offering=offering)
 
@@ -465,6 +526,7 @@ class OrderLimitsCreateTest(BaseOrderCreateTest):
     @data(
         LimitPeriods.TOTAL,
         LimitPeriods.MONTH,
+        LimitPeriods.QUARTERLY,
         LimitPeriods.ANNUAL,
     )
     def test_offering_limit_is_valid(self, limit_period):
@@ -494,6 +556,7 @@ class OrderLimitsCreateTest(BaseOrderCreateTest):
     @data(
         LimitPeriods.TOTAL,
         LimitPeriods.MONTH,
+        LimitPeriods.QUARTERLY,
         LimitPeriods.ANNUAL,
     )
     def test_offering_limit_is_invalid(self, limit_period):
@@ -527,8 +590,12 @@ class OrderTermsOfServiceCreateTest(BaseOrderCreateTest):
     def test_user_can_create_order_if_terms_of_service_have_been_accepted(self):
         user = self.fixture.admin
         offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
-        offering.terms_of_service = "Terms of service"
-        offering.save()
+        models.OfferingTermsOfService.objects.create(
+            offering=offering,
+            terms_of_service="Terms of service",
+            version="1.0",
+            is_active=True,
+        )
         add_payload = {
             "offering": factories.OfferingFactory.get_public_url(offering),
             "attributes": {},
@@ -549,11 +616,16 @@ class OrderTermsOfServiceCreateTest(BaseOrderCreateTest):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertTrue(models.Order.objects.filter(created_by=user).exists())
 
+    @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
     def test_user_cannot_create_order_if_terms_of_service_have_been_not_accepted(self):
         user = self.fixture.admin
         offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
-        offering.terms_of_service = "Terms of service"
-        offering.save()
+        models.OfferingTermsOfService.objects.create(
+            offering=offering,
+            terms_of_service="Terms of service",
+            version="1.0",
+            is_active=True,
+        )
         add_payload = {
             "offering": factories.OfferingFactory.get_public_url(offering),
             "attributes": {},
@@ -566,145 +638,6 @@ class OrderTermsOfServiceCreateTest(BaseOrderCreateTest):
             % offering,
         )
         self.assertFalse(models.Order.objects.filter(created_by=user).exists())
-
-
-class OrderEndDateCreateTest(BaseOrderCreateTest):
-    @freeze_time("2024-01-01")
-    def test_set_end_date(self):
-        user = self.fixture.staff
-        response = self.create_order(
-            user, add_payload={"attributes": {"end_date": "2025-01-01"}}
-        )
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        order = models.Order.objects.get(uuid=response.data["uuid"])
-        resource = order.resource
-        self.assertTrue(resource.end_date)
-        self.assertEqual(resource.end_date_requested_by, user)
-
-    def test_resource_end_date_set_to_default_if_required_but_not_provided(self):
-        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
-        offering.plugin_options = {
-            "is_resource_termination_date_required": True,
-            "default_resource_termination_offset_in_days": 7,
-        }
-        offering.save()
-
-        response = self.create_order(self.fixture.owner, offering)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-
-        resource = models.Resource.objects.last()
-        end_date = resource.created + datetime.timedelta(days=7)
-        self.assertEqual(resource.end_date, end_date.date())
-
-    def test_missing_default_offset_configuration(self):
-        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
-        offering.plugin_options = {
-            "is_resource_termination_date_required": True,
-            # Missing default_resource_termination_offset_in_days
-        }
-        offering.save()
-
-        response = self.create_order(self.fixture.owner, offering)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("end_date", response.data)
-
-    @freeze_time("2022-01-01")
-    def test_resource_is_not_created_if_end_date_later_than_max_end_date(self):
-        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
-        offering.plugin_options = {
-            "is_resource_termination_date_required": True,
-            "default_resource_termination_offset_in_days": 7,
-            "max_resource_termination_offset_in_days": 30,
-        }
-        offering.save()
-        end_date = datetime.date(2025, 12, 25)
-
-        response = self.create_order(
-            self.fixture.owner,
-            offering,
-            {"attributes": {"name": "test", "end_date": end_date}},
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_resource_is_created_if_end_date_earlier_than_max_end_date(self):
-        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
-
-        offering.plugin_options = {
-            "is_resource_termination_date_required": True,
-            "default_resource_termination_offset_in_days": 7,
-            "max_resource_termination_offset_in_days": 30,
-        }
-        offering.save()
-        end_date = datetime.date.today() + datetime.timedelta(days=10)
-
-        response = self.create_order(
-            self.fixture.owner,
-            offering,
-            {"attributes": {"name": "test", "end_date": end_date}},
-        )
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
-        resource = models.Resource.objects.last()
-        self.assertEqual(resource.end_date, end_date)
-
-    @freeze_time("2022-01-01")
-    def test_resource_is_not_created_if_end_date_later_than_latest_date_for_resource_termination(
-        self,
-    ):
-        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
-        offering.plugin_options = {
-            "is_resource_termination_date_required": True,
-            "default_resource_termination_offset_in_days": 7,
-            "latest_date_for_resource_termination": "2030-01-01",
-        }
-        offering.save()
-        end_date = datetime.date(2031, 12, 25)
-
-        response = self.create_order(
-            self.fixture.owner,
-            offering,
-            {"attributes": {"name": "test", "end_date": end_date}},
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    @freeze_time("2022-01-01")
-    def test_default_date_truncated_by_global_limit(self):
-        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
-        offering.plugin_options = {
-            "is_resource_termination_date_required": True,
-            "default_resource_termination_offset_in_days": 3650,  # 10 years
-            "latest_date_for_resource_termination": "2025-01-01",
-        }
-        offering.save()
-
-        response = self.create_order(self.fixture.owner, offering)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-
-        resource = models.Resource.objects.last()
-        self.assertEqual(resource.end_date, datetime.date(2025, 1, 1))
-
-    def test_malformed_date_string(self):
-        response = self.create_order(
-            self.fixture.staff,
-            add_payload={"attributes": {"end_date": "2025/01/01"}},  # Wrong format
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("end_date", response.data)
-
-    @freeze_time("2022-01-01")
-    def test_end_date_before_creation_date(self):
-        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
-        offering.plugin_options = {
-            "is_resource_termination_date_required": True,
-        }
-        offering.save()
-        end_date = datetime.date(2021, 12, 31)  # Before creation date
-
-        response = self.create_order(
-            self.fixture.owner,
-            offering,
-            {"attributes": {"name": "test", "end_date": end_date}},
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
 class OrderNameValidationTest(BaseOrderCreateTest):

@@ -308,6 +308,12 @@ class RancherBaseNodeSerializer(
 
     def get_fields(self):
         fields = super().get_fields()
+
+        # Check if this is schema generation context (drf-spectacular)
+        # When generating schema, we want to include all fields
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
+            return fields
+
         if (
             settings.WALDUR_RANCHER["DISABLE_DATA_VOLUME_CREATION"]
             and "data_volumes" in fields
@@ -333,7 +339,7 @@ class RancherNestedNodeSerializer(RancherBaseNodeSerializer):
 
 
 class RancherNestedSecurityGroupSerializer(
-    core_serializers.HyperlinkedRelatedModelSerializer,
+    serializers.HyperlinkedModelSerializer,
 ):
     class Meta:
         model = openstack_models.SecurityGroup
@@ -343,9 +349,18 @@ class RancherNestedSecurityGroupSerializer(
         }
 
 
-class RancherNestedPublicIPSerializer(
-    core_serializers.HyperlinkedRelatedModelSerializer,
-):
+class RancherSecurityGroupRequestSerializer(serializers.Serializer):
+    url = serializers.HyperlinkedRelatedField(
+        queryset=openstack_models.SecurityGroup.objects.all(),
+        lookup_field="uuid",
+        view_name="openstack-sgp-detail",
+    )
+
+    def to_internal_value(self, data):
+        return super().to_internal_value(data)["url"]
+
+
+class RancherNestedPublicIPSerializer(serializers.HyperlinkedModelSerializer):
     ip_address = serializers.IPAddressField(
         source="floating_ip.address", read_only=True
     )
@@ -400,13 +415,6 @@ class RancherClusterSerializer(
         ),
     )
 
-    security_groups = RancherNestedSecurityGroupSerializer(
-        queryset=openstack_models.SecurityGroup.objects.all(),
-        many=True,
-        required=False,
-        write_only=True,
-    )
-
     management_security_group = serializers.HyperlinkedRelatedField(
         read_only=True, view_name="openstack-sgp-detail", lookup_field="uuid"
     )
@@ -425,7 +433,6 @@ class RancherClusterSerializer(
             "runtime_state",
             "ssh_public_key",
             "install_longhorn",
-            "security_groups",
             "management_security_group",
             "public_ips",
             "capacity",
@@ -456,6 +463,11 @@ class RancherClusterSerializer(
 
     def get_fields(self):
         fields = super().get_fields()
+
+        # Check if this is schema generation context (drf-spectacular)
+        # When generating schema, we want to include all fields
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
+            return fields
 
         if (
             settings.WALDUR_RANCHER["DISABLE_SSH_KEY_INJECTION"]
@@ -554,6 +566,13 @@ class RancherClusterSerializer(
             router_ips.extend(router.fixed_ips)
 
         return router_ips
+
+
+class RancherClusterCreateSerializer(RancherClusterSerializer):
+    security_groups = RancherSecurityGroupRequestSerializer(many=True, required=False)
+
+    class Meta(RancherClusterSerializer.Meta):
+        fields = RancherClusterSerializer.Meta.fields + ("security_groups",)
 
 
 class RancherNodeSerializer(serializers.HyperlinkedModelSerializer):
@@ -676,6 +695,9 @@ class RancherCreateNodeSerializer(
         }
 
     def validate(self, attrs):
+        # autoexpand_tenant is available for the Managed Rancher only
+        # because the feature is not implemented for the regular Rancher
+        autoexpand_tenant = attrs.pop("autoexpand_tenant", False)
         attrs = super().validate(attrs)
         cluster: models.Cluster = attrs["cluster"]
         ssh_public_key = attrs.pop("ssh_public_key", None)
@@ -695,8 +717,9 @@ class RancherCreateNodeSerializer(
             [node],
             cluster.vm_project,
             cluster.service_settings,
-            cluster.tenant,
+            node_tenant or cluster.tenant,
             ssh_public_key,
+            autoexpand_tenant=autoexpand_tenant,
         )
         return attrs
 
@@ -1206,7 +1229,7 @@ class RancherIngressSerializer(structure_serializers.BaseResourceSerializer):
 
 class RancherNestedWorkloadSerializer(
     core_serializers.AugmentedSerializerMixin,
-    core_serializers.HyperlinkedRelatedModelSerializer,
+    serializers.HyperlinkedModelSerializer,
 ):
     class Meta:
         model = models.Workload
@@ -1216,11 +1239,20 @@ class RancherNestedWorkloadSerializer(
         }
 
 
+class RancherWorkloadCreateSerializer(serializers.Serializer):
+    url = serializers.HyperlinkedRelatedField(
+        queryset=models.Workload.objects.all(),
+        lookup_field="uuid",
+        view_name="rancher-workload-detail",
+    )
+
+    def to_internal_value(self, data):
+        return super().to_internal_value(data)["url"]
+
+
 class RancherServiceSerializer(structure_serializers.BaseResourceSerializer):
     namespace_name = serializers.ReadOnlyField(source="namespace.name")
-    target_workloads = RancherNestedWorkloadSerializer(
-        queryset=models.Workload.objects.all(), many=True, required=False
-    )
+    target_workloads = RancherNestedWorkloadSerializer(many=True)
 
     class Meta:
         model = models.Service
@@ -1246,6 +1278,10 @@ class RancherServiceSerializer(structure_serializers.BaseResourceSerializer):
         namespace = validated_data["namespace"]
         validated_data["settings"] = namespace.settings
         return super().create(validated_data)
+
+
+class RancherServiceCreateSerializer(RancherServiceSerializer):
+    target_workloads = RancherWorkloadCreateSerializer(many=True, required=False)
 
 
 class RancherImportYamlSerializer(serializers.Serializer):

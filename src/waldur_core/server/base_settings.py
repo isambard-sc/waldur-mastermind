@@ -56,9 +56,11 @@ INSTALLED_APPS = (
     "waldur_core.permissions",
     "waldur_core.quotas",
     "waldur_core.structure",
+    "waldur_core.onboarding",
     "waldur_core.users",
     "waldur_core.media",
     "waldur_core.logging",
+    "waldur_core.checklist",
     "rest_framework",
     "rest_framework.authtoken",
     "django_filters",
@@ -196,8 +198,6 @@ TIME_ZONE = "UTC"
 
 USE_I18N = True
 
-USE_L10N = True
-
 USE_TZ = True
 
 # Static files (CSS, JavaScript, Images)
@@ -231,7 +231,15 @@ AXES_LOCKOUT_PARAMETERS = ["username"]
 AXES_COOLOFF_TIME = timedelta(minutes=10)
 AXES_FAILURE_LIMIT = 5
 
-DEFAULT_FILE_STORAGE = "waldur_core.media.storage.DatabaseStorage"
+
+STORAGES = {
+    "default": {
+        "BACKEND": "waldur_core.media.storage.DatabaseStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+    },
+}
 
 # Disable excessive xmlschema and django-axes logging
 import logging
@@ -256,6 +264,9 @@ LANGUAGES = (
     ("nb", "Norsk"),
     ("ar", "العربية"),
     ("cs", "Čeština"),
+    ("sl", "Slovenščina"),
+    ("el", "Ελληνικά"),
+    ("bg", "Български"),
 )
 
 # Disable SAML2 CSP warnings

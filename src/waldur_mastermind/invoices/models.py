@@ -8,6 +8,7 @@ from dateutil.parser import parse as parse_datetime
 from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db.models import Index
 from django.db.models.aggregates import Sum
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -22,15 +23,15 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.exceptions import IncorrectStateException
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.common import mixins as common_mixins
+from waldur_mastermind.common.enums import Units
 from waldur_mastermind.common.utils import quantize_price
+from waldur_mastermind.invoices.structures import InvoiceDetailsDict
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
 
 from . import utils
 
 logger = logging.getLogger(__name__)
-
-Units = common_mixins.UnitPriceMixin.Units
 
 
 def get_created_date():
@@ -53,6 +54,11 @@ class Invoice(
 
     class Meta:
         unique_together = ("customer", "month", "year")
+        indexes = [
+            Index(
+                fields=["year", "month", "customer"], name="inv_invoice_year_month_idx"
+            ),
+        ]
 
     class States:
         PENDING = "pending"
@@ -221,6 +227,8 @@ def get_quantity(unit, start, end) -> decimal.Decimal:
         return utils.get_full_hours(start, end)
     elif unit == Units.PER_DAY:
         return utils.get_full_days(start, end)
+    elif unit == Units.PER_QUARTER:
+        return core_utils.get_full_quarters(start, end)
     elif unit == Units.PER_HALF_MONTH:
         if (start.day == 1 and end.day == 15) or (
             start.day == 16 and end.day == month_days
@@ -290,9 +298,9 @@ class InvoiceItem(
         null=True,
     )
     name = models.TextField(default="")
-    details = models.JSONField(
+    details: "InvoiceDetailsDict" = models.JSONField(
         default=dict, blank=True, help_text=_("Stores data about scope")
-    )
+    )  # type: ignore
 
     start = models.DateTimeField(
         default=utils.get_current_month_start,
@@ -419,6 +427,8 @@ class InvoiceItem(
         plan_component = self.get_plan_component()
         if not plan_component:
             return
+        if not plan_component.component:
+            return
         if plan_component.component.billing_type == BillingTypes.FIXED or (
             plan_component.component.billing_type == BillingTypes.LIMIT
             and plan_component.component.limit_period != LimitPeriods.TOTAL
@@ -451,6 +461,11 @@ class InvoiceItem(
             )
             self.save(update_fields=["details", "quantity"])
 
+    class Meta:
+        indexes = [
+            Index(fields=["resource", "invoice"], name="inv_item_resource_invoice_idx"),
+        ]
+
     def __str__(self):
         return self.name or "<InvoiceItem %s>" % self.pk
 
@@ -466,7 +481,7 @@ class PaymentType(models.CharField):
     CHOICES = (
         (FIXED_PRICE, "Fixed-price contract"),
         (MONTHLY_INVOICES, "Monthly invoices"),
-        (PAYMENT_GW_MONTHLY, " Payment gateways (monthly)"),
+        (PAYMENT_GW_MONTHLY, "Payment gateways (monthly)"),
     )
 
     def __init__(self, *args, **kwargs):
@@ -660,6 +675,9 @@ class CustomerCredit(BaseCredit):
 
 class ProjectCredit(BaseCredit):
     project = models.OneToOneField(structure_models.Project, on_delete=models.CASCADE)
+    mark_unused_credit_as_spent_on_project_termination = models.BooleanField(
+        default=False
+    )
 
     @property
     def consumption_last_month(self) -> float:

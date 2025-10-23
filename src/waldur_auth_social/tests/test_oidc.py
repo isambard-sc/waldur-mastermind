@@ -2,6 +2,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 import responses
+from constance.test.unittest import override_config
 from rest_framework import status, test
 from rest_framework.authtoken.models import Token
 from rest_framework.reverse import reverse
@@ -11,6 +12,8 @@ from waldur_auth_social.const import PROVIDER_DEFAULTS, ProviderChoices
 from waldur_auth_social.views import OIDC_CODE_VERIFIER_KEY, OIDC_STATE_KEY
 from waldur_core.core.models import User
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_core.users.enums import InvitationState
+from waldur_core.users.tests import factories as user_factories
 
 
 class OAuthViewInitTest(test.APITransactionTestCase):
@@ -336,3 +339,146 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
         response = self.client.get(self.url, {"state": self.state, "code": self.code})
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
         self.assertIn("PKCE verification failed", str(response.content))
+
+    def test_tara_login_does_not_update_username_for_existing_user(self):
+        # Configure provider for TARA
+        tara_defaults = PROVIDER_DEFAULTS[ProviderChoices.TARA]
+        self.provider.provider = ProviderChoices.TARA
+        self.provider.user_field = tara_defaults["user_field"]
+        self.provider.user_claim = tara_defaults["user_claim"]
+        self.provider.attribute_mapping = tara_defaults["attribute_mapping"]
+        self.provider.save()
+
+        # Re-generate URL for TARA provider
+        self.url = reverse(f"auth_{self.provider.provider}_complete")
+
+        # Create existing user
+        civil_number = "EE12345678901"
+        original_username = "tara_user"
+        existing_user = structure_factories.UserFactory(
+            civil_number=civil_number,
+            username=original_username,
+            first_name="OldFirstName",
+            last_name="OldLastName",
+        )
+
+        # Mock OIDC responses
+        user_info = {
+            "sub": civil_number,
+            "given_name": "NewFirstName",
+            "family_name": "NewLastName",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        # Perform login
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        # Assertions
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        existing_user.refresh_from_db()
+
+        self.assertEqual(existing_user.username, original_username)
+        self.assertEqual(existing_user.first_name, user_info["given_name"])
+        self.assertEqual(existing_user.last_name, user_info["family_name"])
+        self.assertEqual(existing_user.civil_number, civil_number)
+
+    @override_config(OIDC_BLOCK_CREATION_OF_UNINVITED_USERS=True)
+    def test_new_user_creation_is_blocked_if_uninvited_and_toggle_is_on(self):
+        # Arrange: A new user with no invitation
+        user_info = {
+            "sub": "uninvited_user",
+            "given_name": "Uninvited",
+            "family_name": "User",
+            "email": "uninvited@example.com",
+        }
+        self.assertEqual(User.objects.count(), 0)
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        # Act
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertIn(
+            "Account creation is blocked for uninvited users.", str(response.content)
+        )
+        self.assertEqual(User.objects.count(), 0)
+
+    @override_config(OIDC_BLOCK_CREATION_OF_UNINVITED_USERS=True)
+    def test_new_user_creation_is_allowed_if_invited_and_toggle_is_on(self):
+        # Arrange: A new user with a valid invitation
+        user_info = {
+            "sub": "invited_user",
+            "given_name": "Invited",
+            "family_name": "User",
+            "email": "invited@example.com",
+        }
+        project = structure_factories.ProjectFactory()
+        user_factories.ProjectInvitationFactory(
+            email=user_info["email"],
+            scope=project,
+            state=InvitationState.PENDING,
+        )
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        # Act
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertTrue(User.objects.filter(username=user_info["sub"]).exists())
+
+    @override_config(OIDC_BLOCK_CREATION_OF_UNINVITED_USERS=True)
+    def test_new_user_creation_is_blocked_for_inactive_invitation(self):
+        # Arrange: A new user with an expired invitation
+        user_info = {
+            "sub": "expired_invite_user",
+            "given_name": "Expired",
+            "family_name": "Invite",
+            "email": "expired@example.com",
+        }
+        project = structure_factories.ProjectFactory()
+        user_factories.ProjectInvitationFactory(
+            email=user_info["email"],
+            scope=project,
+            state=InvitationState.EXPIRED,
+        )
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        # Act
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertIn(
+            "Account creation is blocked for uninvited users.", str(response.content)
+        )
+        self.assertFalse(User.objects.filter(username=user_info["sub"]).exists())
+
+    @override_config(OIDC_BLOCK_CREATION_OF_UNINVITED_USERS=True)
+    def test_new_user_creation_is_blocked_if_email_is_missing(self):
+        # Arrange: User info from provider lacks an email address
+        user_info = {
+            "sub": "no_email_user",
+            "given_name": "No",
+            "family_name": "Email",
+            # "email" is missing
+        }
+        self.assertEqual(User.objects.count(), 0)
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        # Act
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertIn(
+            "User email is not provided. Account creation is blocked.",
+            str(response.content),
+        )
+        self.assertEqual(User.objects.count(), 0)

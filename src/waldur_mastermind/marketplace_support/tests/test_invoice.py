@@ -1,5 +1,6 @@
 import datetime
 from decimal import Decimal
+from typing import cast
 
 import pytest
 from ddt import data, ddt
@@ -16,7 +17,7 @@ from waldur_mastermind.invoices.tasks import create_monthly_invoices
 from waldur_mastermind.marketplace import callbacks
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
-from waldur_mastermind.marketplace.enums import BillingTypes, OrderStates
+from waldur_mastermind.marketplace.enums import BillingTypes, OrderStates, OrderTypes
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.support import models as support_models
 from waldur_mastermind.support.tests import factories as support_factories
@@ -46,7 +47,8 @@ class InvoicesBaseTest(test.APITransactionTestCase):
         marketplace_utils.process_order(order, self.fixture.staff)
 
         order.refresh_from_db()
-        self.issue = order.resource.scope
+        self.assertIsNotNone(order.resource.scope, order.error_message)
+        self.issue = cast(support_models.Issue, order.resource.scope)
         self.issue.set_resolved()
         order.resource.refresh_from_db()
 
@@ -296,7 +298,7 @@ class UsagesTest(InvoicesBaseTest):
     def _switch_plan(self):
         marketplace_factories.OrderFactory(
             resource=self.resource,
-            type=marketplace_models.RequestTypeMixin.Types.UPDATE,
+            type=OrderTypes.UPDATE,
             state=OrderStates.EXECUTING,
             plan=self.fixture.new_plan,
         )
@@ -380,8 +382,8 @@ class OnPlanSwitchTest(InvoicesBaseTest):
     def test_calculate_on_plan_switch_component_if_plan_has_been_switched_in_current_period(
         self,
     ):
-        order: marketplace_models.Order = marketplace_factories.OrderFactory(
-            type=marketplace_models.Order.Types.UPDATE,
+        order = marketplace_factories.OrderFactory(
+            type=OrderTypes.UPDATE,
             resource=self.resource,
             plan=self.fixture.plan,
         )
@@ -391,7 +393,7 @@ class OnPlanSwitchTest(InvoicesBaseTest):
         registrators.RegistrationManager.register(
             self.resource,
             timezone.now(),
-            order_type=marketplace_models.Order.Types.UPDATE,
+            order_type=OrderTypes.UPDATE,
         )
         self.invoice = self.get_invoice()
         expected = (

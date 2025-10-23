@@ -1,3 +1,4 @@
+import logging
 from functools import wraps
 
 from django.conf import settings
@@ -159,11 +160,21 @@ class ReviewMixin(ReviewStateMixin, TimeStampedModel):
         null=True,
         blank=True,
         related_name="+",
+        help_text="User who performed the review",
     )
 
-    reviewed_at = django_models.DateTimeField(editable=False, null=True, blank=True)
+    reviewed_at = django_models.DateTimeField(
+        editable=False,
+        null=True,
+        blank=True,
+        help_text="Timestamp when the review was completed",
+    )
 
-    review_comment = django_models.TextField(null=True, blank=True)
+    review_comment = django_models.TextField(
+        null=True,
+        blank=True,
+        help_text="Optional comment provided during review",
+    )
 
     @transaction.atomic
     def approve(self, user, comment=None):
@@ -195,3 +206,45 @@ class GetValueMixin:
 
     def get_from_attrs_or_instance(self, attrs, field_name, default=None):
         return attrs.get(field_name, getattr(self.instance, field_name, default))
+
+
+class ProjectNameTemplateMixin(django_models.Model):
+    """Mixin for models that need to generate project names from templates."""
+
+    class Meta:
+        abstract = True
+
+    project_name_template = django_models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text="Template for project name. Supports {username}, {email}, {full_name} variables",
+    )
+
+    def resolve_project_name(self, user):
+        """
+        Resolve project name using template or default to username.
+
+        Args:
+            user: User instance for template variable substitution
+
+        Returns:
+            str: Resolved project name
+        """
+        if self.project_name_template:
+            try:
+                return self.project_name_template.format(
+                    username=user.username,
+                    email=user.email,
+                    full_name=user.get_full_name() or user.username,
+                )
+            except (KeyError, AttributeError) as e:
+                logger = logging.getLogger(__name__)
+                logger.error(
+                    f"Failed to format project name template '{self.project_name_template}' "
+                    f"for user {user.username}: {e}. Falling back to username. "
+                    f"Valid placeholders are: username, email, full_name"
+                )
+                # Fall back to username if template evaluation fails
+                return user.username
+        return user.username

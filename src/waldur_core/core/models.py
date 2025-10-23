@@ -17,6 +17,7 @@ from model_utils import FieldTracker
 from model_utils.fields import AutoLastModifiedField
 from model_utils.models import TimeStampedModel
 from model_utils.tracker import FieldInstanceTracker
+from rest_framework import serializers
 from rest_framework.authtoken.models import Token
 from reversion import revisions as reversion
 
@@ -73,7 +74,7 @@ class NameMixin(models.Model):
     )
 
 
-SLUG_NAME_LIMIT = 8
+SLUG_NAME_LIMIT = 10
 
 
 class SlugMixin(models.Model):
@@ -116,7 +117,7 @@ def generate_slug(name, klass):
     Returns:
         A unique slug string
     """
-    base_slug = slugify(name)[:SLUG_NAME_LIMIT]
+    base_slug = clean_slug_hyphens(slugify(name)[:SLUG_NAME_LIMIT])
 
     existing_slugs = klass.objects.filter(slug__startswith=base_slug).values_list(
         "slug", flat=True
@@ -133,6 +134,26 @@ def generate_slug(name, klass):
             pass
 
     return f"{base_slug}-{max_num + 1}"
+
+
+def clean_slug_hyphens(slug: str) -> str:
+    """
+    Clean duplicate hyphens from a slug.
+
+    Replaces multiple consecutive hyphens with a single hyphen
+    and removes leading/trailing hyphens.
+
+    Args:
+        slug: The slug string to clean
+
+    Returns:
+        A cleaned slug string with no duplicate hyphens
+    """
+    # Replace multiple consecutive hyphens with single hyphen
+    cleaned = re.sub(r"-+", "-", slug)
+    # Remove leading and trailing hyphens
+    cleaned = cleaned.strip("-")
+    return cleaned
 
 
 class UiDescribableMixin(DescribableMixin):
@@ -254,6 +275,8 @@ class User(
     Inherits from multiple mixins to provide UUID identification,
     logging capabilities, slug generation, and user detail fields.
     """
+
+    id: int
 
     username = models.CharField(
         _("username"),
@@ -689,7 +712,8 @@ class StateMixin(ErrorMessageMixin, ConcurrentTransitionMixin):
         field=state, source=CoreStates.UPDATE_SCHEDULED, target=CoreStates.UPDATING
     )
     def begin_updating(self):
-        pass
+        if hasattr(self, "update_triggered"):
+            self.update_triggered = django_timezone.now()
 
     @transition(
         field=state, source=CoreStates.DELETION_SCHEDULED, target=CoreStates.DELETING
@@ -743,21 +767,6 @@ class DescendantMixin:
     def get_parents(self):
         """Return list instance parents."""
         return []
-
-
-class AbstractFieldTracker(FieldTracker):
-    """
-    Workaround for abstract models field tracking.
-
-    Extends FieldTracker to work properly with abstract models.
-    See: https://gist.github.com/sbnoemi/7618916
-    """
-
-    def finalize_class(self, sender, name, **kwargs):
-        self.name = name
-        self.attname = "_%s" % name
-        if not hasattr(sender, name):
-            super().finalize_class(sender, **kwargs)
 
 
 class BackendModelMixin:
@@ -865,3 +874,64 @@ class ActionMixin(StateMixin):
     @lru_cache(maxsize=1)
     def get_all_models(cls):
         return [model for model in apps.get_models() if issubclass(model, cls)]
+
+
+class UserDetailsMatchMixin(models.Model):
+    class Meta:
+        abstract = True
+
+    user_affiliations = models.JSONField(
+        default=list,
+        blank=True,
+    )
+    user_email_patterns = models.JSONField(
+        default=list,
+        blank=True,
+    )
+
+    @classmethod
+    def get_objects_by_user_patterns(cls, user: User, required=True):
+        items = []
+        for item in cls.objects.all():
+            if (
+                not required
+                and not item.user_email_patterns
+                and not item.user_affiliations
+            ):
+                items.append(item)
+
+            if set(user.affiliations or []) & set(item.user_affiliations) or any(
+                cls._is_pattern_match(pattern, user.email)
+                for pattern in item.user_email_patterns
+            ):
+                items.append(item)
+
+        return items
+
+    def _is_pattern_match(pattern, email):
+        """Safely check if email matches pattern, handling invalid regex patterns."""
+        if not pattern or not isinstance(pattern, str):
+            return False
+        try:
+            return bool(re.match(pattern, email))
+        except re.error as e:
+            logger.warning("Invalid regex pattern '%s': %s", pattern, e)
+            return False
+
+    @staticmethod
+    def validate_user_email_patterns(patterns: list) -> None:
+        invalid_patterns = []
+
+        for pattern in patterns:
+            if not pattern or not isinstance(pattern, str):
+                invalid_patterns.append(pattern)
+                continue
+            try:
+                re.compile(pattern)
+            except re.error:
+                invalid_patterns.append(pattern)
+
+        if invalid_patterns:
+            raise serializers.ValidationError(
+                f"Invalid regex patterns: {invalid_patterns}"
+            )

@@ -1,6 +1,7 @@
 import datetime
 
 from ddt import data, ddt
+from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
 from freezegun import freeze_time
@@ -17,6 +18,7 @@ from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     LimitPeriods,
     OrderStates,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.tests import factories
@@ -99,7 +101,7 @@ class SubmitUsageTest(test.APITransactionTestCase):
 
         factories.OrderFactory(
             resource=self.resource,
-            type=models.RequestTypeMixin.Types.CREATE,
+            type=OrderTypes.CREATE,
             state=OrderStates.EXECUTING,
             plan=self.plan,
         )
@@ -458,6 +460,40 @@ class SubmitUsageTest(test.APITransactionTestCase):
         response = self.submit_usage()
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
+    @freeze_time("2019-06-19")  # Q2
+    def test_total_amount_exceeds_quarterly_limit(self):
+        self.offering_component.limit_period = LimitPeriods.QUARTERLY
+        self.offering_component.limit_amount = 100
+        self.offering_component.save()
+
+        models.ComponentUsage.objects.create(
+            resource=self.resource,
+            component=self.offering_component,
+            usage=99,
+            date=parse_datetime("2019-05-11"),  # Same quarter (Q2)
+            billing_period=parse_datetime("2019-05-01"),
+        )
+
+        response = self.submit_usage()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @freeze_time("2019-06-19")  # Q2
+    def test_total_amount_does_not_exceed_quarterly_limit(self):
+        self.offering_component.limit_period = LimitPeriods.QUARTERLY
+        self.offering_component.limit_amount = 100
+        self.offering_component.save()
+
+        models.ComponentUsage.objects.create(
+            resource=self.resource,
+            component=self.offering_component,
+            usage=50,
+            date=parse_datetime("2019-04-11"),  # Same quarter (Q2)
+            billing_period=parse_datetime("2019-04-01"),
+        )
+
+        response = self.submit_usage()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
     @freeze_time("2019-06-19")
     def test_total_amount_exceeds_annual_limit(self):
         self.offering_component.limit_period = LimitPeriods.ANNUAL
@@ -539,6 +575,33 @@ class SubmitUsageTest(test.APITransactionTestCase):
         response = self.submit_usage()
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    @freeze_time("2025-07-31T21:25:00Z")
+    @override_settings(TIME_ZONE="Europe/Tallinn")
+    def test_usage_timezone_billing_period_calculation(self):
+        """
+        Test that usage sent at July 31st 21:25 UTC is recorded for August billing period
+        when timezone is Europe/Tallinn (UTC+3).
+
+        This simulates the scenario where:
+        - Agent sends usage at 2025-08-01 00:25 in their UTC+3 timezone (Europe/Tallinn)
+        - Waldur receives it at 2025-07-31T21:25:00Z (UTC)
+        - Billing period should be calculated for August, not July
+        """
+
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.post(
+            "/api/marketplace-component-usages/set_usage/", self.get_usage_data()
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        usage = models.ComponentUsage.objects.get(
+            resource=self.resource,
+            component=self.offering_component,
+        )
+
+        expected_billing_period = datetime.date(2025, 8, 1)
+        self.assertEqual(usage.billing_period, expected_billing_period)
+
     def submit_usage(self, **extra):
         payload = self.get_valid_payload()
         payload.update(extra)
@@ -568,3 +631,30 @@ class SubmitUsageTest(test.APITransactionTestCase):
                 },
             ],
         }
+
+    def test_resource_without_plan_validation_error(self):
+        """Test that providing a resource without a plan raises validation error."""
+        resource_without_plan = models.Resource.objects.create(
+            offering=self.offering,
+            project=self.fixture.project,
+        )
+
+        usage_data = {
+            "resource": resource_without_plan.uuid.hex,
+            "usages": [
+                {
+                    "type": "cpu",
+                    "amount": 5,
+                    "description": "Test usage",
+                }
+            ],
+        }
+
+        payload = {
+            "customer": self.service_provider.customer.uuid.hex,
+            "data": core_utils.encode_jwt_token(usage_data, self.secret_code),
+        }
+
+        response = self.client.post("/api/marketplace-public-api/set_usage/", payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Resource must have a plan to report usage", str(response.data))

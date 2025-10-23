@@ -17,12 +17,13 @@ from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices.tests import factories as invoices_factories
 from waldur_mastermind.marketplace import models, tasks
 from waldur_mastermind.marketplace.enums import (
+    OPENSTACK_INSTANCE_OFFERING,
     BillingTypes,
     OrderStates,
+    OrderTypes,
     ResourceStates,
     RobotAccountStates,
 )
-from waldur_mastermind.marketplace_openstack import INSTANCE_TYPE
 from waldur_openstack.tests.fixtures import OpenStackFixture
 
 from . import factories, fixtures
@@ -64,32 +65,6 @@ class CalculateUsageForCurrentMonthTest(test.APITransactionTestCase):
 
 
 class NotificationTest(test.APITransactionTestCase):
-    def test_notify_about_resource_change(self):
-        project_fixture = structure_fixtures.ProjectFixture()
-        admin = project_fixture.admin
-        project = project_fixture.project
-        resource = factories.ResourceFactory(project=project, name="Test resource")
-        event_type = "marketplace_resource_create_succeeded"
-        structure_factories.NotificationFactory(key=f"marketplace.{event_type}")
-
-        tasks.notify_about_resource_change(
-            event_type,
-            {"resource_name": resource.name},
-            resource.uuid,
-        )
-        self.assertEqual(len(mail.outbox), 1)
-        subject_template_name = "{}/{}_subject.txt".format(
-            "marketplace",
-            "marketplace_resource_create_succeeded",
-        )
-        subject = core_utils.format_text(
-            subject_template_name, {"resource_name": resource.name}
-        )
-        self.assertEqual(mail.outbox[0].subject, subject)
-        self.assertEqual(mail.outbox[0].to[0], admin.email)
-        self.assertTrue(resource.name in mail.outbox[0].body)
-        self.assertTrue(resource.name in mail.outbox[0].subject)
-
     @patch("waldur_mastermind.marketplace.tasks.core_utils.broadcast_mail")
     def test_notify_user_that_order_been_rejected(self, mock_broadcast_mail):
         """
@@ -191,7 +166,7 @@ class TerminateResource(test.APITransactionTestCase):
         self.resource = factories.ResourceFactory(offering=offering)
         factories.OrderFactory(
             resource=self.resource,
-            type=models.Order.Types.TERMINATE,
+            type=OrderTypes.TERMINATE,
             state=OrderStates.EXECUTING,
         )
 
@@ -226,11 +201,11 @@ class ProjectEndDateTest(test.APITransactionTestCase):
             self.assertTrue(
                 models.Order.objects.filter(
                     resource=self.fixture.resource,
-                    type=models.Order.Types.TERMINATE,
+                    type=OrderTypes.TERMINATE,
                 ).count()
             )
             order = models.Order.objects.get(
-                resource=self.fixture.resource, type=models.Order.Types.TERMINATE
+                resource=self.fixture.resource, type=OrderTypes.TERMINATE
             )
             self.assertTrue(order.state, OrderStates.EXECUTING)
 
@@ -392,11 +367,11 @@ class ResourceEndDateTest(test.APITransactionTestCase):
             self.assertTrue(
                 models.Order.objects.filter(
                     resource=self.fixture.resource,
-                    type=models.Order.Types.TERMINATE,
+                    type=OrderTypes.TERMINATE,
                 ).count()
             )
             order = models.Order.objects.get(
-                resource=self.fixture.resource, type=models.Order.Types.TERMINATE
+                resource=self.fixture.resource, type=OrderTypes.TERMINATE
             )
             self.assertTrue(order.state, OrderStates.EXECUTING)
             self.assertEqual(order.created_by, self.system_robot)
@@ -414,11 +389,11 @@ class ResourceEndDateTest(test.APITransactionTestCase):
             self.assertTrue(
                 models.Order.objects.filter(
                     resource=self.fixture.resource,
-                    type=models.Order.Types.TERMINATE,
+                    type=OrderTypes.TERMINATE,
                 ).count()
             )
             order = models.Order.objects.get(
-                resource=self.fixture.resource, type=models.Order.Types.TERMINATE
+                resource=self.fixture.resource, type=OrderTypes.TERMINATE
             )
             self.assertTrue(order.state, OrderStates.EXECUTING)
             self.assertEqual(order.created_by, user)
@@ -444,7 +419,7 @@ class MarkResourcesAsErredAfterTimeoutTest(test.APITransactionTestCase):
         super().setUp()
         self.fixture = OpenStackFixture()
         self.offering = factories.OfferingFactory(
-            scope=self.fixture.tenant, type=INSTANCE_TYPE
+            scope=self.fixture.tenant, type=OPENSTACK_INSTANCE_OFFERING
         )
         self.order = factories.OrderFactory(
             offering=self.offering,

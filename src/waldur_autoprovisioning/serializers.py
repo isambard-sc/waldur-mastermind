@@ -1,15 +1,15 @@
-import re
-
+from django.contrib.contenttypes.models import ContentType
 from rest_framework import serializers
 
 from waldur_autoprovisioning import models
 from waldur_core.permissions.models import Role
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.fields import PublicPlanField
 
 
 class RuleSerializer(serializers.HyperlinkedModelSerializer):
     project_role = serializers.HyperlinkedRelatedField(
-        queryset=Role.project_roles(),
+        queryset=Role.objects.all(),
         view_name="role-detail",
         lookup_field="uuid",
         required=False,
@@ -24,12 +24,13 @@ class RuleSerializer(serializers.HyperlinkedModelSerializer):
     project_role_name = serializers.CharField(
         required=False, allow_null=True, write_only=True
     )
-    project_role_dispay_name = serializers.CharField(
+    project_role_display_name = serializers.CharField(
         source="project_role.name", read_only=True
     )
-    plan = serializers.HyperlinkedRelatedField(
-        view_name="marketplace-plan-detail",
+    plan = PublicPlanField(
         lookup_field="uuid",
+        lookup_url_kwarg="plan_uuid",
+        view_name="marketplace-public-offering-plan-detail",
         queryset=marketplace_models.Plan.objects.all(),
         required=False,
         allow_null=True,
@@ -52,6 +53,24 @@ class RuleSerializer(serializers.HyperlinkedModelSerializer):
         required=False,
         default=list,
     )
+    plan_name = serializers.CharField(
+        source="plan.name", required=False, read_only=True
+    )
+    offering_name = serializers.CharField(
+        source="plan.offering.name", required=False, read_only=True
+    )
+    offering_uuid = serializers.UUIDField(
+        source="plan.offering.uuid", required=False, read_only=True
+    )
+    category_title = serializers.CharField(
+        source="plan.offering.category.title", required=False, read_only=True
+    )
+    category_url = serializers.HyperlinkedRelatedField(
+        source="plan.offering.category",
+        view_name="marketplace-category-detail",
+        lookup_field="uuid",
+        read_only=True,
+    )
 
     class Meta:
         model = models.Rule
@@ -66,11 +85,16 @@ class RuleSerializer(serializers.HyperlinkedModelSerializer):
             "customer_uuid",
             "project_role",
             "project_role_name",  # used for accepting role name to set
-            "project_role_dispay_name",  # used for displaying the role name
+            "project_role_display_name",  # used for displaying the role name
             "project_role_description",
             "plan",
             "plan_attributes",
             "plan_limits",
+            "plan_name",
+            "offering_name",
+            "offering_uuid",
+            "category_title",
+            "category_url",
         )
         extra_kwargs = {
             "url": {
@@ -89,24 +113,7 @@ class RuleSerializer(serializers.HyperlinkedModelSerializer):
 
     def validate_user_email_patterns(self, value):
         """Validate that all email patterns are valid regex patterns."""
-        if not value:
-            return value
-
-        invalid_patterns = []
-        for pattern in value:
-            if not pattern or not isinstance(pattern, str):
-                invalid_patterns.append(pattern)
-                continue
-            try:
-                re.compile(pattern)
-            except re.error:
-                invalid_patterns.append(pattern)
-
-        if invalid_patterns:
-            raise serializers.ValidationError(
-                f"Invalid regex patterns: {invalid_patterns}"
-            )
-
+        models.Rule.validate_user_email_patterns(value)
         return value
 
     def validate(self, attrs):
@@ -130,10 +137,19 @@ class RuleSerializer(serializers.HyperlinkedModelSerializer):
                 "Either project_role or project_role_name must be provided."
             )
 
+        if (
+            project_role
+            and project_role.content_type
+            != ContentType.objects.get_by_natural_key("structure", "project")
+        ):
+            raise serializers.ValidationError(
+                "The specified role is not a valid project role."
+            )
+
         # If project_role_name is provided, look up the role by name
         if project_role_name:
             try:
-                role = Role.project_roles().get(name=project_role_name)
+                role = Role.objects.get(name=project_role_name)
                 attrs["project_role"] = role
             except Role.DoesNotExist:
                 raise serializers.ValidationError(

@@ -13,6 +13,8 @@ from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import (
+    OPENSTACK_INSTANCE_OFFERING,
+    OPENSTACK_TENANT_OFFERING,
     BillingTypes,
     OfferingStates,
 )
@@ -34,7 +36,7 @@ from waldur_openstack.tests.fixtures import OpenStackFixture
 from waldur_openstack.tests.unittests.test_backend import BaseBackendTestCase
 from waldur_openstack.utils import volume_type_name_to_quota_name
 
-from .. import INSTANCE_TYPE, TENANT_TYPE, VOLUME_TYPE
+from ...marketplace.enums import OPENSTACK_VOLUME_OFFERING
 from .utils import BaseOpenStackTest, override_plugin_settings
 
 
@@ -76,7 +78,7 @@ class PlanComponentsTest(test.APITransactionTestCase):
             "name": "offering",
             "category": marketplace_factories.CategoryFactory.get_url(self.category),
             "customer": structure_factories.CustomerFactory.get_url(fixture.customer),
-            "type": TENANT_TYPE,
+            "type": OPENSTACK_TENANT_OFFERING,
             "service_attributes": {
                 "backend_url": "http://example.com/",
                 "username": "root",
@@ -101,7 +103,7 @@ class PlanComponentsTest(test.APITransactionTestCase):
 
 @ddt
 class OpenStackResourceOfferingTest(BaseOpenStackTest):
-    @data(INSTANCE_TYPE, VOLUME_TYPE)
+    @data(OPENSTACK_INSTANCE_OFFERING, OPENSTACK_VOLUME_OFFERING)
     def test_offering_is_created_when_tenant_creation_is_completed(self, offering_type):
         tenant = self.trigger_offering_creation()
 
@@ -110,7 +112,7 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
         self.assertEqual(offering.scope, tenant)
         self.assertEqual(offering.customer, tenant.project.customer)
 
-    @data(INSTANCE_TYPE, VOLUME_TYPE)
+    @data(OPENSTACK_INSTANCE_OFFERING, OPENSTACK_VOLUME_OFFERING)
     @override_plugin_settings(AUTOMATICALLY_CREATE_PRIVATE_OFFERING=False)
     def test_offering_is_not_created_if_feature_is_disabled(self, offering_type):
         self.trigger_offering_creation()
@@ -120,7 +122,7 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
             lambda: marketplace_models.Offering.objects.get(type=offering_type),
         )
 
-    @data(INSTANCE_TYPE, VOLUME_TYPE)
+    @data(OPENSTACK_INSTANCE_OFFERING, OPENSTACK_VOLUME_OFFERING)
     def test_offering_is_not_created_if_tenant_is_not_created_via_marketplace(
         self, offering_type
     ):
@@ -140,7 +142,7 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
             type=offering_type,
         )
 
-    @data(INSTANCE_TYPE, VOLUME_TYPE)
+    @data(OPENSTACK_INSTANCE_OFFERING, OPENSTACK_VOLUME_OFFERING)
     def test_offering_is_archived_when_tenant_is_deleted(self, offering_type):
         tenant = self.trigger_offering_creation()
         tenant.delete()
@@ -166,7 +168,7 @@ class OfferingComponentForVolumeTypeTest(test.APITransactionTestCase):
     def setUp(self) -> None:
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
-            type=TENANT_TYPE,
+            type=OPENSTACK_TENANT_OFFERING,
             scope=self.fixture.settings,
             plugin_options={"storage_mode": STORAGE_MODE_DYNAMIC},
         )
@@ -292,7 +294,7 @@ class OfferingCreateTest(BaseBackendTestCase):
             "name": "TEST",
             "category": self.category_url,
             "customer": self.customer_url,
-            "type": TENANT_TYPE,
+            "type": OPENSTACK_TENANT_OFFERING,
             "service_attributes": {
                 "backend_url": "https://193.0.0.1:5000/v3/",
                 "username": "admin",
@@ -374,7 +376,7 @@ class OfferingUpdateTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
-            type=TENANT_TYPE, scope=self.fixture.settings
+            type=OPENSTACK_TENANT_OFFERING, scope=self.fixture.settings
         )
         self.component = marketplace_factories.OfferingComponentFactory(
             offering=self.offering,
@@ -420,7 +422,7 @@ class OfferingDetailsTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
-            type=TENANT_TYPE, scope=self.fixture.settings
+            type=OPENSTACK_TENANT_OFFERING, scope=self.fixture.settings
         )
         marketplace_factories.OfferingComponentFactory(
             offering=self.offering, type="cores"
@@ -462,7 +464,7 @@ class OfferingNameTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = OpenStackFixture()
 
-    @data(INSTANCE_TYPE, VOLUME_TYPE)
+    @data(OPENSTACK_INSTANCE_OFFERING, OPENSTACK_VOLUME_OFFERING)
     def test_renaming_openstack_tenant_should_also_rename_linked_private_offerings(
         self, offering_type
     ):
@@ -487,7 +489,7 @@ class RouterExternalIPTest(test.APITransactionTestCase):
             }
         ]
         self.offering = marketplace_factories.OfferingFactory(
-            type=TENANT_TYPE,
+            type=OPENSTACK_TENANT_OFFERING,
             secret_options={"ipv4_external_ip_mapping": self.external_ips},
         )
         self.resource = marketplace_factories.ResourceFactory(
@@ -520,11 +522,11 @@ class InstanceExternalIPTest(test.APITransactionTestCase):
             }
         ]
         self.parent_offering = marketplace_factories.OfferingFactory(
-            type=TENANT_TYPE,
+            type=OPENSTACK_TENANT_OFFERING,
             secret_options={"ipv4_external_ip_mapping": self.external_ips},
         )
         self.offering = marketplace_factories.OfferingFactory(
-            type=INSTANCE_TYPE,
+            type=OPENSTACK_INSTANCE_OFFERING,
             parent=self.parent_offering,
         )
         self.resource = marketplace_factories.ResourceFactory(offering=self.offering)
@@ -600,6 +602,87 @@ class InstanceExternalIPTest(test.APITransactionTestCase):
         self.assertEqual(len(response.data), 1)
 
 
+class ImportedFloatingIPExternalMappingTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = openstack_fixtures.OpenStackFixture()
+        self.parent_offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_TENANT_OFFERING,
+            secret_options={
+                "ipv4_external_ip_mapping": [
+                    {
+                        "floating_ip": "100.100.100.0/24",
+                        "external_ip": "200.200.200.0/24",
+                    }
+                ]
+            },
+        )
+        self.offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_INSTANCE_OFFERING,
+            parent=self.parent_offering,
+        )
+        self.resource = marketplace_factories.ResourceFactory(offering=self.offering)
+
+    def test_imported_floating_ip_gets_external_address_on_creation(self):
+        # Simulate creating a floating IP via import (created=True signal)
+        floating_ip = openstack_factories.FloatingIPFactory(
+            port=self.fixture.port,
+            address="100.100.100.50",
+            service_settings=self.fixture.settings,
+            project=self.fixture.project,
+            tenant=self.fixture.tenant,
+            state=CoreStates.OK,
+        )
+
+        # Create marketplace resource for the instance
+        marketplace_factories.ResourceFactory(
+            offering=self.offering,
+            scope=self.fixture.instance,
+        )
+
+        # Trigger the signal manually as if the floating IP was just imported
+        from waldur_mastermind.marketplace_openstack.handlers import (
+            update_floating_ip_external_addresses,
+        )
+
+        update_floating_ip_external_addresses(
+            sender=floating_ip.__class__, instance=floating_ip, created=True
+        )
+
+        floating_ip.refresh_from_db()
+        self.assertEqual(floating_ip.external_address, "200.200.200.50")
+
+    def test_imported_floating_ip_without_matching_network_gets_no_external_address(
+        self,
+    ):
+        # Simulate creating a floating IP via import with non-matching IP
+        floating_ip = openstack_factories.FloatingIPFactory(
+            port=self.fixture.port,
+            address="192.168.1.50",  # Different network
+            service_settings=self.fixture.settings,
+            project=self.fixture.project,
+            tenant=self.fixture.tenant,
+            state=CoreStates.OK,
+        )
+
+        # Create marketplace resource for the instance
+        marketplace_factories.ResourceFactory(
+            offering=self.offering,
+            scope=self.fixture.instance,
+        )
+
+        # Trigger the signal manually as if the floating IP was just imported
+        from waldur_mastermind.marketplace_openstack.handlers import (
+            update_floating_ip_external_addresses,
+        )
+
+        update_floating_ip_external_addresses(
+            sender=floating_ip.__class__, instance=floating_ip, created=True
+        )
+
+        floating_ip.refresh_from_db()
+        self.assertEqual(floating_ip.external_address, None)
+
+
 class UpdateSecretOptionsTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = structure_fixtures.UserFixture()
@@ -612,7 +695,7 @@ class UpdateSecretOptionsTest(test.APITransactionTestCase):
             ]
         }
         self.offering = marketplace_factories.OfferingFactory(
-            type=TENANT_TYPE,
+            type=OPENSTACK_TENANT_OFFERING,
         )
         self.url = marketplace_factories.OfferingFactory.get_url(
             self.offering, "update_integration"

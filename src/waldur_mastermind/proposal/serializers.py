@@ -11,9 +11,13 @@ from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.reverse import reverse
 
+from waldur_core.checklist import enums as checklist_enums
+from waldur_core.checklist import models as checklist_models
+from waldur_core.checklist import serializers as checklist_serializers
 from waldur_core.core import serializers as core_serializers
 from waldur_core.permissions import enums as permissions_enums
 from waldur_core.permissions import utils as permissions_utils
+from waldur_core.permissions.fixtures import CallRole
 from waldur_core.permissions.models import Role
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import permissions as marketplace_permissions
@@ -26,11 +30,35 @@ from waldur_mastermind.proposal.enums import (
     CallStates,
     ProposalStates,
     RequestedOfferingStates,
+    RoundStatuses,
 )
 
 from . import models
 
 logger = logging.getLogger(__name__)
+
+
+class NestedCallActionHyperlinkedRelatedField(serializers.HyperlinkedRelatedField):
+    """
+    HyperlinkedRelatedField for nested call actions that require two lookup fields:
+    - uuid: the call's UUID (parent)
+    - obj_uuid: the nested object's UUID (child)
+    """
+
+    def get_url(self, obj, view_name, request, format):
+        if hasattr(obj, "pk") and obj.pk in (None, ""):
+            return None
+
+        kwargs = {
+            "uuid": obj.call.uuid.hex,
+            "obj_uuid": obj.uuid.hex,
+        }
+        return self.reverse(view_name, kwargs=kwargs, request=request, format=format)
+
+    def get_object(self, view_name, view_args, view_kwargs):
+        lookup_value = view_kwargs.get("obj_uuid")
+        lookup_kwargs = {self.lookup_field: lookup_value}
+        return self.get_queryset().get(**lookup_kwargs)
 
 
 class CallManagingOrganisationSerializer(
@@ -204,14 +232,20 @@ class ProposalReviewSerializer(
     round_cutoff_time = serializers.ReadOnlyField(source="proposal.round.cutoff_time")
     round_start_time = serializers.ReadOnlyField(source="proposal.round.start_time")
     round_name = serializers.ReadOnlyField(source="proposal.round.name")
+    round_slug = serializers.ReadOnlyField(source="proposal.round.slug")
     call_uuid = serializers.UUIDField(source="proposal.round.call.uuid", read_only=True)
     call_name = serializers.ReadOnlyField(source="proposal.round.call.name")
+    call_slug = serializers.ReadOnlyField(source="proposal.round.call.slug")
+    call_managing_organisation_uuid = serializers.ReadOnlyField(
+        source="proposal.round.call.manager.uuid"
+    )
     reviewer_full_name = serializers.ReadOnlyField(source="reviewer.full_name")
     reviewer_uuid = serializers.UUIDField(read_only=True, source="reviewer.uuid")
     anonymous_reviewer_name = serializers.SerializerMethodField()
 
     proposal_name = serializers.ReadOnlyField(source="proposal.name")
     proposal_uuid = serializers.UUIDField(read_only=True, source="proposal.uuid")
+    proposal_slug = serializers.ReadOnlyField(source="proposal.slug")
 
     class Meta:
         model = models.Review
@@ -221,6 +255,7 @@ class ProposalReviewSerializer(
             "proposal",
             "proposal_name",
             "proposal_uuid",
+            "proposal_slug",
             "reviewer",
             "reviewer_full_name",
             "reviewer_uuid",
@@ -232,10 +267,13 @@ class ProposalReviewSerializer(
             "summary_private_comment",
             "round_uuid",
             "round_name",
+            "round_slug",
             "round_cutoff_time",
             "round_start_time",
             "call_name",
             "call_uuid",
+            "call_slug",
+            "call_managing_organisation_uuid",
             "comment_project_title",
             "comment_project_summary",
             "comment_project_is_confidential",
@@ -245,6 +283,8 @@ class ProposalReviewSerializer(
             "comment_project_supporting_documentation",
             "comment_resource_requests",
             "comment_team",
+            "created",
+            "modified",
         )
         protected_fields = ("proposal", "reviewer")
         extra_kwargs = {
@@ -312,6 +352,7 @@ class ProposalReviewSerializer(
             user.is_staff
             or review.reviewer == user
             or review.proposal.round.call.manager.customer.has_user(user)
+            or review.proposal.round.call.has_user(user, CallRole.MANAGER)
         ):
             fields.pop("anonymous_reviewer_name", None)
             return fields
@@ -379,6 +420,7 @@ class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
         model = models.Proposal
         fields = [
             "uuid",
+            "slug",
             "name",
             "state",
             "reviews",
@@ -436,6 +478,7 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
         model = models.Round
         fields = [
             "uuid",
+            "slug",
             "name",
             "start_time",
             "cutoff_time",
@@ -448,6 +491,9 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
             "review_duration_in_days",
             "minimum_number_of_reviewers",
         ]
+        extra_kwargs = {
+            "slug": {"required": False},
+        }
 
 
 class CallDocumentSerializer(serializers.ModelSerializer):
@@ -466,11 +512,19 @@ class CallResourceTemplateSerializer(
     requested_offering_name = serializers.ReadOnlyField(
         source="requested_offering.offering.name"
     )
+    requested_offering_plan = BasePublicPlanSerializer(
+        read_only=True, source="requested_offering.plan"
+    )
     requested_offering_uuid = serializers.UUIDField(
         source="requested_offering.uuid", read_only=True
     )
     created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
     url = serializers.SerializerMethodField()
+    requested_offering = NestedCallActionHyperlinkedRelatedField(
+        queryset=models.RequestedOffering.objects.all(),
+        view_name="proposal-call-offering-detail",
+        lookup_field="uuid",
+    )
 
     class Meta:
         model = models.CallResourceTemplate
@@ -485,16 +539,13 @@ class CallResourceTemplateSerializer(
             "requested_offering",
             "requested_offering_name",
             "requested_offering_uuid",
+            "requested_offering_plan",
             "created_by",
             "created_by_name",
             "created",
         ]
         read_only_fields = ("created_by",)
         extra_kwargs = {
-            "requested_offering": {
-                "lookup_field": "uuid",
-                "view_name": "proposal-requested-offering-detail",
-            },
             "created_by": {"lookup_field": "uuid", "view_name": "user-detail"},
         }
 
@@ -547,6 +598,7 @@ class PublicCallSerializer(
     customer_uuid = serializers.UUIDField(
         read_only=True, source="manager.customer.uuid"
     )
+    manager_uuid = serializers.UUIDField(read_only=True, source="manager.uuid")
     offerings = serializers.SerializerMethodField(method_name="get_offerings")
     rounds = serializers.SerializerMethodField()
     start_date = serializers.SerializerMethodField()
@@ -569,6 +621,7 @@ class PublicCallSerializer(
             "description",
             "state",
             "manager",
+            "manager_uuid",
             "customer_name",
             "customer_uuid",
             "offerings",
@@ -912,11 +965,25 @@ class ProtectedCallSerializer(PublicCallSerializer):
         help_text="Whether proposal submitters can see review comments and scores",
         required=False,
     )
+    compliance_checklist = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=checklist_models.Checklist.objects.filter(
+            checklist_type=checklist_enums.ChecklistTypes.PROPOSAL_COMPLIANCE
+        ),
+        required=False,
+        allow_null=True,
+        help_text="Compliance checklist that proposals must complete before submission",
+    )
+    compliance_checklist_name = serializers.CharField(
+        source="compliance_checklist.name", read_only=True
+    )
 
     class Meta(PublicCallSerializer.Meta):
         fields = PublicCallSerializer.Meta.fields + (
             "created_by",
             "reference_code",
+            "compliance_checklist",
+            "compliance_checklist_name",
         )
         view_name = "proposal-protected-call-detail"
         protected_fields = ("manager",)
@@ -937,13 +1004,23 @@ class ProtectedCallSerializer(PublicCallSerializer):
 
         return manager
 
+    def validate_compliance_checklist(self, value):
+        """Prevent changing compliance checklist if proposals exist."""
+        call: models.Call = self.instance
+        if call and models.Proposal.objects.filter(round__call=call).exists():
+            if value != call.compliance_checklist:
+                raise serializers.ValidationError(
+                    "Cannot change compliance checklist when proposals exist"
+                )
+        return value
+
     def create(self, validated_data):
         request = self.context["request"]
         customer = validated_data.get("manager", None).customer
         if not permissions_utils.has_permission(
             request,
             permissions_enums.PermissionEnum.CREATE_CALL,
-            customer,
+            customer.callmanagingorganisation,
         ):
             raise PermissionDenied()
 
@@ -971,12 +1048,21 @@ class ProtectedRoundSerializer(
     proposals = ProtectedProposalListSerializer(
         many=True, read_only=True, source="proposal_set"
     )
-    review_duration_in_days = serializers.IntegerField(
-        default=config.PROPOSAL_REVIEW_DURATION
-    )
+    review_duration_in_days = serializers.IntegerField(required=False)
 
     class Meta(NestedRoundSerializer.Meta):
         fields = NestedRoundSerializer.Meta.fields + ["url", "proposals"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        request = self.context.get("request")
+
+        # Only allow staff to edit slug field
+        if request and not (request.user and request.user.is_staff):
+            if "slug" in fields:
+                fields["slug"].read_only = True
+
+        return fields
 
     def get_url(self, call_round) -> str:
         return self.context["request"].build_absolute_uri(
@@ -988,6 +1074,13 @@ class ProtectedRoundSerializer(
                 },
             )
         )
+
+    def create(self, validated_data):
+        # Set a default value if not provided by the user
+        if "review_duration_in_days" not in validated_data:
+            validated_data["review_duration_in_days"] = config.PROPOSAL_REVIEW_DURATION
+
+        return super().create(validated_data)
 
     def validate(self, attrs):
         start_time = attrs.get("start_time")
@@ -1046,6 +1139,9 @@ class ProposalSerializer(
     round_uuid = serializers.UUIDField(write_only=True, required=True)
     call_uuid = serializers.UUIDField(source="round.call.uuid", read_only=True)
     call_name = serializers.ReadOnlyField(source="round.call.name", read_only=True)
+    call_managing_organisation_uuid = serializers.ReadOnlyField(
+        source="round.call.manager.uuid"
+    )
     supporting_documentation = ProposalDocumentationSerializer(
         many=True, read_only=True, source="proposaldocumentation_set"
     )
@@ -1057,11 +1153,16 @@ class ProposalSerializer(
     project_name = serializers.ReadOnlyField(source="project.name")
     description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
 
+    # Compliance fields
+    compliance_status = serializers.SerializerMethodField()
+    can_submit = serializers.SerializerMethodField()
+
     class Meta:
         model = models.Proposal
         fields = [
             "uuid",
             "url",
+            "slug",
             "name",
             "description",
             "project_name",
@@ -1080,10 +1181,13 @@ class ProposalSerializer(
             "round_uuid",
             "call_uuid",
             "call_name",
+            "call_managing_organisation_uuid",
             "oecd_fos_2007_code",
             "oecd_fos_2007_label",
             "allocation_comment",
             "created",
+            "compliance_status",
+            "can_submit",
         ]
         read_only_fields = (
             "created_by",
@@ -1094,6 +1198,7 @@ class ProposalSerializer(
         protected_fields = ("round_uuid",)
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
+            "slug": {"required": False},
             "created_by": {"lookup_field": "uuid", "view_name": "user-detail"},
             "approved_by": {"lookup_field": "uuid", "view_name": "user-detail"},
             "project": {"lookup_field": "uuid", "view_name": "project-detail"},
@@ -1114,8 +1219,8 @@ class ProposalSerializer(
             raise serializers.ValidationError(_("Call is not active."))
 
         if call_round.status not in (
-            models.Round.Statuses.SCHEDULED,
-            models.Round.Statuses.OPEN,
+            RoundStatuses.SCHEDULED,
+            RoundStatuses.OPEN,
         ):
             raise serializers.ValidationError(_("Round is not active."))
 
@@ -1135,6 +1240,12 @@ class ProposalSerializer(
 
     def get_fields(self):
         fields = super().get_fields()
+        request = self.context.get("request")
+
+        # Only allow staff to edit slug field
+        if request and not (request.user and request.user.is_staff):
+            if "slug" in fields:
+                fields["slug"].read_only = True
 
         # Make duration_in_days read-only if call has fixed duration
         def is_fixed_duration(instance):
@@ -1166,6 +1277,41 @@ class ProposalSerializer(
 
         return fields
 
+    @extend_schema_field(serializers.DictField(allow_null=True))
+    def get_compliance_status(self, obj):
+        """Get compliance checklist status."""
+        if not obj.round.call.compliance_checklist:
+            return None
+
+        if not hasattr(obj, "checklist_completion"):
+            return {
+                "error": "Compliance checklist not initialized",
+                "has_checklist": True,
+                "is_completed": False,
+                "requires_review": False,
+                "completion_percentage": 0,
+            }
+
+        completion = obj.checklist_completion
+        return {
+            "has_checklist": True,
+            "is_completed": completion.is_completed,
+            "requires_review": completion.requires_review,
+            "completion_percentage": completion.get_completion_percentage(),
+            "reviewed_by": completion.reviewed_by.full_name
+            if completion.reviewed_by
+            else None,
+            "reviewed_at": completion.reviewed_at,
+            "checklist_name": completion.checklist.name,
+            "unanswered_required_count": completion.get_unanswered_required_questions().count(),
+        }
+
+    @extend_schema_field(serializers.DictField())
+    def get_can_submit(self, obj):
+        """Get whether proposal can be submitted."""
+        can_submit, error = obj.can_submit()
+        return {"can_submit": can_submit, "error": error}
+
 
 class RoundReviewerSerializer(serializers.Serializer):
     full_name = serializers.SerializerMethodField()
@@ -1191,23 +1337,24 @@ class CallRoundSerializer(serializers.HyperlinkedModelSerializer):
         fields = [
             "url",
             "uuid",
+            "slug",
             "start_time",
             "cutoff_time",
             "call_uuid",
             "call_name",
             "status",
         ]
-
-    extra_kwargs = {
-        "url": {
-            "lookup_field": "uuid",
-            "view_name": "call-round-detail",
-        },
-        "call": {
-            "lookup_field": "uuid",
-            "view_name": "proposal-public-call-detail",
-        },
-    }
+        extra_kwargs = {
+            "slug": {"required": False},
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "call-round-detail",
+            },
+            "call": {
+                "lookup_field": "uuid",
+                "view_name": "proposal-public-call-detail",
+            },
+        }
 
 
 class CallManagingOrganisationStatSerializer(serializers.Serializer):
@@ -1290,3 +1437,106 @@ class ProposalProjectRoleMappingSerializer(serializers.HyperlinkedModelSerialize
             fields["proposal_role"].read_only = True
             fields["call"].read_only = True
         return fields
+
+
+# Checklist Integration Serializers
+# Backward compatibility aliases - use generic serializers from checklist app
+ProposalChecklistCompletionSerializer = (
+    checklist_serializers.ChecklistCompletionSerializer
+)
+ProposalChecklistAnswerSubmitSerializer = checklist_serializers.AnswerSubmitSerializer
+ProposalChecklistAnswerSubmitResponseSerializer = (
+    checklist_serializers.AnswerSubmitResponseSerializer
+)
+
+# Response serializer is now handled generically by ChecklistResponseSerializer
+# Keep this for backward compatibility in call manager views
+ProposalComplianceChecklistResponseSerializer = (
+    checklist_serializers.ChecklistResponseSerializer
+)
+
+
+class CallComplianceOverviewSerializer(serializers.Serializer):
+    """Serializer for call manager compliance overview."""
+
+    checklist = serializers.SerializerMethodField()
+    proposals = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.DictField(allow_null=True))
+    def get_checklist(self, call):
+        """Get checklist information."""
+        if not call.compliance_checklist:
+            return None
+
+        return {
+            "uuid": str(call.compliance_checklist.uuid),
+            "name": call.compliance_checklist.name,
+            "description": call.compliance_checklist.description,
+            "total_questions": call.compliance_checklist.questions.count(),
+            "required_questions": call.compliance_checklist.questions.filter(
+                required=True
+            ).count(),
+        }
+
+    @extend_schema_field(serializers.ListField())
+    def get_proposals(self, call):
+        """Get proposal compliance status."""
+        proposals_data = []
+
+        for proposal in models.Proposal.objects.filter(round__call=call):
+            proposal_data = {
+                "uuid": str(proposal.uuid),
+                "name": proposal.name,
+                "state": proposal.state,
+                "created_by": proposal.created_by.full_name
+                if proposal.created_by
+                else None,
+                "created_by_uuid": str(proposal.created_by.uuid)
+                if proposal.created_by
+                else None,
+                "compliance": None,
+            }
+
+            # Add compliance information if exists
+            if hasattr(proposal, "checklist_completion"):
+                completion = proposal.checklist_completion
+                proposal_data["compliance"] = {
+                    "is_completed": completion.is_completed,
+                    "requires_review": completion.requires_review,
+                    "completion_percentage": completion.get_completion_percentage(),
+                    "reviewed_by": completion.reviewed_by.full_name
+                    if completion.reviewed_by
+                    else None,
+                    "reviewed_at": completion.reviewed_at,
+                    "review_triggers": completion.get_review_trigger_summary(),
+                    "unanswered_required_count": completion.get_unanswered_required_questions().count(),
+                }
+
+            proposals_data.append(proposal_data)
+
+        return proposals_data
+
+
+class CallComplianceReviewSerializer(serializers.Serializer):
+    """Serializer for call manager to review proposal compliance."""
+
+    proposal_uuid = serializers.UUIDField()
+    review_notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_proposal_uuid(self, value):
+        """Validate that proposal belongs to the call."""
+        call = self.context.get("call")
+        if not call:
+            raise serializers.ValidationError("Call context is required")
+
+        try:
+            proposal: models.Proposal = models.Proposal.objects.get(
+                round__call=call, uuid=value
+            )
+            if not hasattr(proposal, "checklist_completion"):
+                raise serializers.ValidationError(
+                    "Proposal has no compliance checklist"
+                )
+            return value
+        except models.Proposal.DoesNotExist:
+            raise serializers.ValidationError("Proposal not found in this call")

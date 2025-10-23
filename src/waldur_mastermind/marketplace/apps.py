@@ -1,6 +1,8 @@
 from django.apps import AppConfig
 from django.db.models import signals
 
+from .enums import BASIC_OFFERING
+
 
 class MarketplaceConfig(AppConfig):
     name = "waldur_mastermind.marketplace"
@@ -16,7 +18,7 @@ class MarketplaceConfig(AppConfig):
         from waldur_core.structure.serializers import BaseResourceSerializer
         from waldur_freeipa import models as freeipa_models
 
-        from . import PLUGIN_NAME, handlers, models, processors, utils
+        from . import handlers, models, processors, utils
         from . import registrators as marketplace_registrators
         from . import signals as marketplace_signals
         from .plugins import manager
@@ -203,7 +205,7 @@ class MarketplaceConfig(AppConfig):
         )
 
         manager.register(
-            offering_type=PLUGIN_NAME,
+            offering_type=BASIC_OFFERING,
             create_resource_processor=processors.BasicCreateResourceProcessor,
             update_resource_processor=processors.BasicUpdateResourceProcessor,
             delete_resource_processor=processors.BasicDeleteResourceProcessor,
@@ -259,6 +261,18 @@ class MarketplaceConfig(AppConfig):
         )
 
         signals.post_save.connect(
+            handlers.create_offering_user_checklist_completions,
+            sender=models.OfferingUser,
+            dispatch_uid="waldur_mastermind.marketplace.create_offering_user_checklist_completions",
+        )
+
+        signals.pre_delete.connect(
+            handlers.delete_offering_user_checklist_completions,
+            sender=models.OfferingUser,
+            dispatch_uid="waldur_mastermind.marketplace.delete_offering_user_checklist_completions",
+        )
+
+        signals.post_save.connect(
             handlers.log_resource_robot_account_created_or_updated,
             sender=models.RobotAccount,
             dispatch_uid="waldur_core.marketplace.handlers.log_resource_robot_account_created_or_updated",
@@ -285,6 +299,31 @@ class MarketplaceConfig(AppConfig):
         permission_signals.role_granted.connect(
             handlers.create_offering_users_when_project_role_granted,
             dispatch_uid="waldur_mastermind.marketplace.create_offering_user_when_project_role_created",
+        )
+
+        # MaintenanceAnnouncement -> AdminAnnouncement handlers
+        signals.post_save.connect(
+            handlers.manage_maintenance_admin_announcements,
+            sender=models.MaintenanceAnnouncement,
+            dispatch_uid="waldur_mastermind.marketplace.manage_maintenance_admin_announcements",
+        )
+
+        signals.post_save.connect(
+            handlers.update_maintenance_announcement_on_offering_change,
+            sender=models.MaintenanceAnnouncementOffering,
+            dispatch_uid="waldur_mastermind.marketplace.update_maintenance_announcement_on_offering_change",
+        )
+
+        signals.post_delete.connect(
+            handlers.update_maintenance_announcement_on_offering_change,
+            sender=models.MaintenanceAnnouncementOffering,
+            dispatch_uid="waldur_mastermind.marketplace.update_maintenance_announcement_on_offering_delete",
+        )
+
+        signals.pre_delete.connect(
+            handlers.cleanup_admin_announcement_on_maintenance_deletion,
+            sender=models.MaintenanceAnnouncement,
+            dispatch_uid="waldur_mastermind.marketplace.cleanup_admin_announcement_on_maintenance_deletion",
         )
 
         marketplace_signals.resource_creation_succeeded.connect(
@@ -333,4 +372,31 @@ class MarketplaceConfig(AppConfig):
             handlers.update_offering_user_username_after_user_change,
             sender=core_models.User,
             dispatch_uid="waldur_mastermind.marketplace.update_offering_user_username_after_user_change",
+        )
+
+        # Add maintenance fields to AdminAnnouncementSerializer
+        from waldur_mastermind.notifications.serializers import (
+            AdminAnnouncementSerializer,
+        )
+
+        core_signals.pre_serializer_fields.connect(
+            handlers.add_maintenance_fields_to_admin_announcement_serializer,
+            sender=AdminAnnouncementSerializer,
+            dispatch_uid="waldur_mastermind.marketplace.add_maintenance_fields_to_admin_announcement_serializer",
+        )
+
+        signals.pre_delete.connect(
+            handlers.close_course_accounts_after_project_removal,
+            sender=structure_models.Project,
+            dispatch_uid="waldur_mastermind.marketplace.close_course_accounts_after_project_removal",
+        )
+        signals.post_save.connect(
+            handlers.log_terms_of_service_consent_granted,
+            sender=models.UserOfferingConsent,
+            dispatch_uid="waldur_mastermind.marketplace.log_terms_of_service_consent_granted",
+        )
+        signals.post_save.connect(
+            handlers.log_terms_of_service_consent_revoked,
+            sender=models.UserOfferingConsent,
+            dispatch_uid="waldur_mastermind.marketplace.log_terms_of_service_consent_revoked",
         )

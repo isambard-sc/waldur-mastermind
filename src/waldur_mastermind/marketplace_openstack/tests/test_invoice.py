@@ -9,8 +9,10 @@ from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.marketplace import callbacks
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import (
+    OPENSTACK_TENANT_OFFERING,
     BillingTypes,
     OrderStates,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.signals import resource_limit_update_succeeded
@@ -26,13 +28,13 @@ from waldur_openstack.tests.fixtures import (
     OpenStackFixture,
 )
 
-from .. import TENANT_TYPE
-
 
 @freeze_time("2019-09-10")
 class BaseTenantInvoiceTest(test.APITransactionTestCase):
     def setUp(self):
-        self.offering = marketplace_factories.OfferingFactory(type=TENANT_TYPE)
+        self.offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_TENANT_OFFERING
+        )
         self.limits = {
             RAM_TYPE: 1 * 1024,
             CORES_TYPE: 2,
@@ -78,7 +80,7 @@ class BaseTenantInvoiceTest(test.APITransactionTestCase):
             project=resource.project,
             offering=self.offering,
             resource=resource,
-            type=marketplace_models.Order.Types.UPDATE,
+            type=OrderTypes.UPDATE,
             state=OrderStates.EXECUTING,
             limits=new_limits,
         )

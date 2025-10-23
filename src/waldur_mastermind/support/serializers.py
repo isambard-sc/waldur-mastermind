@@ -92,13 +92,7 @@ class IssueSerializer(
     )
     resource_type = serializers.SerializerMethodField()
     resource_name = serializers.CharField(read_only=True, source="resource.name")
-    type = serializers.ChoiceField(
-        choices=[
-            (t.strip(), t.strip()) for t in config.ATLASSIAN_ISSUE_TYPES.split(",")
-        ],
-        initial=utils.get_atlassian_issue_type(),
-        default=utils.get_atlassian_issue_type(),
-    )
+    type = serializers.CharField()
     is_reported_manually = serializers.BooleanField(
         initial=False,
         default=False,
@@ -208,36 +202,58 @@ class IssueSerializer(
     def get_fields(self):
         fields = super().get_fields()
 
-        if (
-            "view" not in self.context
-        ):  # On docs generation context does not contain "view".
+        # Check if this is schema generation context (drf-spectacular)
+        # When generating schema, we want to include all fields
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
             return fields
 
-        user = self.context["view"].request.user
+        user = self.context["request"].user
         if user.is_authenticated and not user.is_staff and not user.is_support:
             del fields["link"]
 
+        if "type" in fields:
+            fields["type"] = serializers.ChoiceField(
+                choices=[
+                    (t.strip(), t.strip())
+                    for t in config.ATLASSIAN_ISSUE_TYPES.split(",")
+                ],
+                initial=utils.get_atlassian_issue_type(),
+                default=utils.get_atlassian_issue_type(),
+            )
+
         return fields
 
-    def get_resource_type(self, obj) -> str:
-        try:
-            if isinstance(obj.resource, structure_models.BaseResource):
-                return get_resource_type(obj.resource_content_type.model_class())
-            if isinstance(obj.resource, marketplace_models.Resource):
-                return "Marketplace.Resource"
-        except AttributeError:
-            return ""
+    def validate_type(self, issue_type: str):
+        allowed_types = [t.strip() for t in config.ATLASSIAN_ISSUE_TYPES.split(",")]
+        if issue_type not in allowed_types:
+            raise serializers.ValidationError(
+                _("Issue type must be one of the following: %s.")
+                % config.ATLASSIAN_ISSUE_TYPES
+            )
+        if not issue_type:
+            issue_type = allowed_types[0]
+        return issue_type
 
-    def get_update_is_available(self, obj) -> bool:
+    def get_resource_type(self, obj: models.Issue) -> str:
+        if (
+            isinstance(obj.resource, structure_models.BaseResource)
+            and obj.resource_content_type
+        ):
+            return get_resource_type(obj.resource_content_type.model_class())
+        if isinstance(obj.resource, marketplace_models.Resource):
+            return "Marketplace.Resource"
+        return ""
+
+    def get_update_is_available(self, obj: models.Issue) -> bool:
         return backend.get_active_backend().update_is_available(obj)
 
-    def get_destroy_is_available(self, obj) -> bool:
+    def get_destroy_is_available(self, obj: models.Issue) -> bool:
         return backend.get_active_backend().destroy_is_available(obj)
 
-    def get_add_comment_is_available(self, obj) -> bool:
+    def get_add_comment_is_available(self, obj: models.Issue) -> bool:
         return backend.get_active_backend().comment_create_is_available(obj)
 
-    def get_add_attachment_is_available(self, obj) -> bool:
+    def get_add_attachment_is_available(self, obj: models.Issue) -> bool:
         return backend.get_active_backend().attachment_create_is_available(obj)
 
     def validate(self, attrs):
@@ -825,6 +841,20 @@ class SupportStatsSerializer(serializers.Serializer):
 
 class DeleteAttachmentsSerializer(serializers.Serializer):
     attachment_ids = serializers.ListField(child=serializers.UUIDField())
+
+
+class IssueStatusSerializer(serializers.HyperlinkedModelSerializer):
+    type_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.IssueStatus
+        fields = ("url", "uuid", "name", "type", "type_display")
+        extra_kwargs = {
+            "url": {"lookup_field": "uuid", "view_name": "support-issue-status-detail"},
+        }
+
+    def get_type_display(self, obj) -> str:
+        return obj.get_type_display()
 
 
 class SmaxWebHookReceiverSerializer(serializers.Serializer):

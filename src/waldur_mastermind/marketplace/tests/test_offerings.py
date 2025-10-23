@@ -18,11 +18,11 @@ from django.core.exceptions import ObjectDoesNotExist
 from rest_framework import exceptions as rest_exceptions
 from rest_framework import status, test
 
+from waldur_core.checklist import enums as checklist_enums
 from waldur_core.core import utils as core_utils
 from waldur_core.core.pagination import RESULT_COUNT_HEADER
 from waldur_core.core.tests.helpers import load_json_resource
-from waldur_core.logging import models as event_models
-from waldur_core.media.utils import dummy_image
+from waldur_core.media.utils import dummy_image, dummy_svg
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
     CustomerRole,
@@ -37,6 +37,8 @@ from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.invoices.tests import factories as invoices_factories
 from waldur_mastermind.marketplace import models, serializers, utils
 from waldur_mastermind.marketplace.enums import (
+    SUPPORT_OFFERING,
+    VMWARE_VM_OFFERING,
     BillingTypes,
     OfferingStates,
     OrderStates,
@@ -52,8 +54,6 @@ from waldur_mastermind.marketplace.management.commands.import_offering import (
 from waldur_mastermind.marketplace.plugins import manager
 from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
-from waldur_mastermind.marketplace_support import PLUGIN_NAME
-from waldur_mastermind.marketplace_vmware import VIRTUAL_MACHINE_TYPE
 
 from . import fixtures as marketplace_fixtures
 
@@ -800,7 +800,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
             "name": "offering",
             "category": factories.CategoryFactory.get_url(category),
             "customer": structure_factories.CustomerFactory.get_url(self.customer),
-            "type": PLUGIN_NAME,
+            "type": SUPPORT_OFFERING,
             "attributes": {"vendorType": "reseller"},
         }
 
@@ -858,7 +858,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
             "name": "offering",
             "category": factories.CategoryFactory.get_url(),
             "customer": structure_factories.CustomerFactory.get_url(self.customer),
-            "type": PLUGIN_NAME,
+            "type": SUPPORT_OFFERING,
             "plans": [
                 {
                     "name": "Small",
@@ -888,6 +888,38 @@ class OfferingCreateTest(test.APITransactionTestCase):
         self.assertEqual(
             response.status_code, status.HTTP_400_BAD_REQUEST, response.data
         )
+
+    def test_update_offering_plugin_options_with_heappe_new_fields(self):
+        """Test that offering plugin options can be updated with new Heappe fields"""
+        offering = factories.OfferingFactory(customer=self.customer)
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        plugin_options = {
+            "heappe_url": "https://heappe.example.com",
+            "heappe_username": "test_user",
+            "heappe_cluster_id": "1",
+            "heappe_local_base_path": "~/",
+            "scratch_project_directory": "/scratch/projects",
+            "project_permanent_directory": "/permanent/projects",
+        }
+
+        response = self.client.post(url, {"plugin_options": plugin_options})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertEqual(
+            offering.plugin_options["scratch_project_directory"], "/scratch/projects"
+        )
+        self.assertEqual(
+            offering.plugin_options["project_permanent_directory"],
+            "/permanent/projects",
+        )
+
+        self.assertEqual(
+            offering.plugin_options["heappe_url"], "https://heappe.example.com"
+        )
+        self.assertEqual(offering.plugin_options["heappe_username"], "test_user")
 
     def test_create_offering_with_minimal_information_in_draft_state(self):
         user = self.fixture.staff
@@ -1076,188 +1108,6 @@ class OfferingUpdateAttributesTest(BaseOfferingUpdateTest):
         response = self.update_attributes({"key": "value"}, role)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-
-class OfferingComponentRemoveTest(BaseOfferingUpdateTest):
-    def setUp(self):
-        super().setUp()
-        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_COMPONENTS)
-
-    def remove_offering_component(self, component, role):
-        url = factories.OfferingFactory.get_url(
-            self.offering, "remove_offering_component"
-        )
-        self.client.force_authenticate(getattr(self.fixture, role))
-        return self.client.post(url, {"uuid": component.uuid.hex})
-
-    def test_it_should_not_be_possible_to_remove_builtin_components(self):
-        # Arrange
-        self.offering.type = VIRTUAL_MACHINE_TYPE
-        self.offering.save()
-
-        cpu_component = factories.OfferingComponentFactory(
-            offering=self.offering, type="cpu"
-        )
-
-        # Act
-        response = self.remove_offering_component(cpu_component, "owner")
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        cpu_component.refresh_from_db()
-
-    def test_it_should_not_be_possible_to_remove_components_if_they_are_used(self):
-        # Arrange
-        component = factories.OfferingComponentFactory(offering=self.offering)
-        factories.ResourceFactory(offering=self.offering)
-
-        # Act
-        response = self.remove_offering_component(component, "owner")
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_it_should_be_possible_to_remove_components_if_they_are_not_used(self):
-        # Arrange
-        component = factories.OfferingComponentFactory(offering=self.offering)
-
-        # Act
-        response = self.remove_offering_component(component, "owner")
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.offering.refresh_from_db()
-        self.assertEqual(0, self.offering.components.count())
-
-
-class OfferingComponentCreateTest(BaseOfferingUpdateTest):
-    def setUp(self):
-        super().setUp()
-        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_COMPONENTS)
-
-    def create_offering_component(self, role, payload):
-        url = factories.OfferingFactory.get_url(
-            self.offering, "create_offering_component"
-        )
-        self.client.force_authenticate(getattr(self.fixture, role))
-        return self.client.post(url, payload)
-
-    def test_validation_of_offering_and_type(self):
-        # Act
-        response = self.create_offering_component(
-            "owner",
-            {
-                "type": "cores",
-                "name": "Cores",
-                "measured_unit": "hours",
-                "billing_type": "fixed",
-            },
-        )
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-
-        # Act
-        response = self.create_offering_component(
-            "owner",
-            {
-                "type": "cores",
-                "name": "Cores",
-                "measured_unit": "hours",
-                "billing_type": "fixed",
-            },
-        )
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_it_should_be_possible_to_create_new_components(self):
-        # Act
-        response = self.create_offering_component(
-            "owner",
-            {
-                "type": "cores",
-                "name": "Cores",
-                "measured_unit": "hours",
-                "billing_type": "fixed",
-            },
-        )
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        component = self.offering.components.get()
-        self.assertEqual("cores", component.type)
-        self.assertEqual("hours", component.measured_unit)
-        self.assertEqual(BillingTypes.FIXED, component.billing_type)
-
-
-class OfferingComponentUpdateTest(BaseOfferingUpdateTest):
-    def setUp(self):
-        super().setUp()
-        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_COMPONENTS)
-
-    def update_offering_component(self, payload, role):
-        url = factories.OfferingFactory.get_url(
-            self.offering, "update_offering_component"
-        )
-        self.client.force_authenticate(getattr(self.fixture, role))
-        return self.client.post(url, payload)
-
-    def test_it_should_be_possible_to_update_existing_components(self):
-        component = factories.OfferingComponentFactory(
-            offering=self.offering,
-            type="cores",
-            name="CPU",
-            measured_unit="H",
-        )
-        # Act
-        response = self.update_offering_component(
-            {
-                "type": "cores",
-                "name": "Cores",
-                "measured_unit": "hours",
-                "billing_type": "fixed",
-                "uuid": component.uuid.hex,
-            },
-            "owner",
-        )
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        component = self.offering.components.get()
-        self.assertEqual("Cores", component.name)
-        self.assertEqual("hours", component.measured_unit)
-        self.assertEqual(BillingTypes.FIXED, component.billing_type)
-
-    def test_update_event_includes_changes(self):
-        """
-        Test that the update event for offering component includes the changes in message.
-        """
-        # Arrange
-        component = factories.OfferingComponentFactory(
-            offering=self.offering,
-            type="cores",
-            name="CPU",
-        )
-
-        # Act
-        self.update_offering_component(
-            {
-                "type": "cores",
-                "name": "NewName",
-                "measured_unit": "hours",
-                "billing_type": "fixed",
-                "uuid": component.uuid.hex,
-            },
-            "owner",
-        )
-
-        # Assert
-        event = event_models.Event.objects.filter(
-            event_type="marketplace_offering_component_updated"
-        ).first()
-        self.assertIn("name: CPU -> NewName", event.message)
-        self.assertIn("measured_unit:  -> hours", event.message)
 
 
 @ddt
@@ -2151,6 +2001,12 @@ class OfferingThumbnailTest(test.APITransactionTestCase):
         )
         return self.client.post(url, {"thumbnail": dummy_image()}, format="multipart")
 
+    def update_thumbnail_svg(self):
+        url = factories.OfferingFactory.get_url(
+            offering=self.offering, action="update_thumbnail"
+        )
+        return self.client.post(url, {"thumbnail": dummy_svg()}, format="multipart")
+
     def delete_thumbnail(self):
         url_delete = factories.OfferingFactory.get_url(
             offering=self.offering, action="delete_thumbnail"
@@ -2169,6 +2025,10 @@ class OfferingThumbnailTest(test.APITransactionTestCase):
 
         self.offering.refresh_from_db()
         self.assertFalse(self.offering.thumbnail)
+        response = self.update_thumbnail_svg()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.thumbnail)
 
     def _test_negative(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
@@ -2179,6 +2039,15 @@ class OfferingThumbnailTest(test.APITransactionTestCase):
 
         response = self.delete_thumbnail()
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        response = self.update_thumbnail_svg()
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_can_upload_svg_thumbnail(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.update_thumbnail_svg()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.thumbnail)
 
 
 @ddt
@@ -2231,7 +2100,7 @@ class OfferingCreateComponentsTest(test.APITransactionTestCase):
     @data("offering_owner", "service_manager")
     def test_offering_components_create_to_builtin_type_failed(self, user):
         self.client.force_login(getattr(self.fixture, user))
-        self.offering.type = VIRTUAL_MACHINE_TYPE
+        self.offering.type = VMWARE_VM_OFFERING
         self.offering.save()
 
         payload = {
@@ -2319,7 +2188,7 @@ class OfferingUpdateComponentsTest(test.APITransactionTestCase):
     @data("offering_owner", "service_manager")
     def test_offering_components_update_to_builtin_type_failed(self, user):
         self.client.force_login(getattr(self.fixture, user))
-        self.offering.type = VIRTUAL_MACHINE_TYPE
+        self.offering.type = VMWARE_VM_OFFERING
         self.offering.save()
 
         payload = {
@@ -2481,6 +2350,12 @@ class ListCustomerUsersTest(test.APITransactionTestCase):
         self.fixture.resource.state = ResourceStates.OK
         self.fixture.resource.save()
         self.fixture.admin
+        # Create consent so user is visible on request
+        models.UserOfferingConsent.objects.create(
+            user=self.fixture.admin,
+            offering=self.fixture.offering,
+            version="1.0",
+        )
 
     @data("staff", "offering_owner")
     def test_user_can_get_list_customer_users(self, user):
@@ -2509,6 +2384,12 @@ class ListCustomerUsersTest(test.APITransactionTestCase):
         for i in range(15):
             user_obj = UserFactory()
             project.add_user(user_obj, ProjectRole.ADMIN)
+            # Create consent so user is visible
+            models.UserOfferingConsent.objects.create(
+                user=user_obj,
+                offering=self.fixture.offering,
+                version="1.0",
+            )
         response = self.get_list_customer_users(user)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         data = response.data
@@ -2519,6 +2400,42 @@ class ListCustomerUsersTest(test.APITransactionTestCase):
         self.assertIn("X-Result-Count", headers)
         self.assertGreaterEqual(int(headers["X-Result-Count"]), 15)
         self.assertIn("Link", headers)
+
+    @data("staff", "offering_owner")
+    def test_users_with_requires_reconsent_are_still_visible_to_sp(self, user):
+        """Test that users are still visible to SPs when ToS is updated with requires_reconsent=True."""
+
+        initial_tos = models.OfferingTermsOfService.objects.create(
+            offering=self.fixture.offering,
+            terms_of_service="Initial Terms of Service",
+            version="1.0",
+            requires_reconsent=False,
+            is_active=True,
+        )
+
+        # Step 2: User consents to the  ToS
+        test_user = UserFactory()
+        self.fixture.project.add_user(test_user, ProjectRole.ADMIN)
+        models.UserOfferingConsent.objects.create(
+            user=test_user,
+            offering=self.fixture.offering,
+            version="1.0",
+        )
+
+        # Step 3: Admin updates ToS and sets requires_reconsent=True
+        initial_tos.terms_of_service = "Updated Terms requiring re-acceptance"
+        initial_tos.version = "2.0"
+        initial_tos.requires_reconsent = True
+        initial_tos.save()
+
+        # Step 4: User should still be visible to SP despite requires_reconsent=True
+        response = self.get_list_customer_users(user)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        user_uuids = [user_data["uuid"] for user_data in response.data]
+        self.assertIn(test_user.uuid.hex, user_uuids)
+
+        self.assertGreaterEqual(len(response.data), 2)
 
 
 class ResourceOfferingsViewSetTest(test.APITransactionTestCase):
@@ -2881,3 +2798,132 @@ class OfferingMoveTest(test.APITransactionTestCase):
         response = self._move_offering(self.invalid_customer)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(self.offering.customer, self.fixture.customer)
+
+
+class OfferingComplianceChecklistSerializerTest(test.APITransactionTestCase):
+    """Test that ProviderOfferingDetailsSerializer exposes compliance_checklist field."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+        factories.ServiceProviderFactory(customer=self.customer)
+        self.offering = factories.OfferingFactory(
+            customer=self.customer, shared=True, state=OfferingStates.ACTIVE
+        )
+
+    def test_offering_without_compliance_checklist_shows_null(self):
+        """Test that offering without compliance checklist shows null in serializer."""
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.OfferingFactory.get_url(self.offering)
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("compliance_checklist", response.data)
+        self.assertIsNone(response.data["compliance_checklist"])
+        self.assertIn("has_compliance_requirements", response.data)
+        self.assertFalse(response.data["has_compliance_requirements"])
+
+    def test_offering_with_compliance_checklist_shows_checklist_info(self):
+        """Test that offering with compliance checklist shows checklist information."""
+        from waldur_core.checklist.tests import factories as checklist_factories
+
+        # Create checklist and assign to offering
+        checklist = checklist_factories.ChecklistFactory(
+            name="Test Compliance Checklist",
+            checklist_type=checklist_enums.ChecklistTypes.OFFERING_COMPLIANCE,
+        )
+        self.offering.compliance_checklist = checklist
+        self.offering.save()
+
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.OfferingFactory.get_url(self.offering)
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("compliance_checklist", response.data)
+        self.assertIsNotNone(response.data["compliance_checklist"])
+
+        # The compliance_checklist field returns a URL string according to HyperlinkedRelatedField
+        # Check that it contains the expected URL pattern
+        compliance_checklist_url = response.data["compliance_checklist"]
+        expected_url_pattern = f"/api/checklists-admin/{checklist.uuid}/"
+        self.assertIn(expected_url_pattern, compliance_checklist_url)
+
+        # Check has_compliance_requirements field
+        self.assertIn("has_compliance_requirements", response.data)
+        self.assertTrue(response.data["has_compliance_requirements"])
+
+    def test_offering_compliance_checklist_url_structure(self):
+        """Test that compliance_checklist field follows proper URL structure."""
+        from waldur_core.checklist.tests import factories as checklist_factories
+
+        checklist = checklist_factories.ChecklistFactory(
+            checklist_type=checklist_enums.ChecklistTypes.OFFERING_COMPLIANCE
+        )
+        self.offering.compliance_checklist = checklist
+        self.offering.save()
+
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.OfferingFactory.get_url(self.offering)
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Check that the URL follows the expected pattern for checklists-admin-detail
+        expected_url_pattern = f"/api/checklists-admin/{checklist.uuid}/"
+        self.assertIn(expected_url_pattern, response.data["compliance_checklist"])
+
+    def test_offering_list_includes_compliance_checklist_field(self):
+        """Test that offering list endpoint includes compliance_checklist field."""
+        from waldur_core.checklist.tests import factories as checklist_factories
+
+        # Create offering with checklist
+        checklist = checklist_factories.ChecklistFactory(
+            name="List Test Checklist",
+            checklist_type=checklist_enums.ChecklistTypes.OFFERING_COMPLIANCE,
+        )
+        self.offering.compliance_checklist = checklist
+        self.offering.save()
+
+        # Create offering without checklist
+        offering_without_checklist = factories.OfferingFactory(
+            customer=self.customer, shared=True, state=OfferingStates.ACTIVE
+        )
+
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.OfferingFactory.get_list_url()
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(len(response.data), 2)
+
+        # Find our offerings in the response
+        offering_with_checklist_data = None
+        offering_without_checklist_data = None
+
+        for item in response.data:
+            if item["uuid"] == str(self.offering.uuid):
+                offering_with_checklist_data = item
+            elif item["uuid"] == str(offering_without_checklist.uuid):
+                offering_without_checklist_data = item
+
+        # Verify offering with checklist
+        self.assertIsNotNone(offering_with_checklist_data)
+        self.assertIn("compliance_checklist", offering_with_checklist_data)
+        self.assertIsNotNone(offering_with_checklist_data["compliance_checklist"])
+        # Check that URL contains the checklist UUID
+        expected_url_pattern = f"/api/checklists-admin/{checklist.uuid}/"
+        self.assertIn(
+            expected_url_pattern, offering_with_checklist_data["compliance_checklist"]
+        )
+        self.assertTrue(offering_with_checklist_data["has_compliance_requirements"])
+
+        # Verify offering without checklist
+        self.assertIsNotNone(offering_without_checklist_data)
+        self.assertIn("compliance_checklist", offering_without_checklist_data)
+        self.assertIsNone(offering_without_checklist_data["compliance_checklist"])
+        self.assertFalse(offering_without_checklist_data["has_compliance_requirements"])

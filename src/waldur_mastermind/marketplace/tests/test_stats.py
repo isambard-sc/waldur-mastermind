@@ -1,3 +1,4 @@
+from constance.test.unittest import override_config as override_constance_config
 from ddt import data, ddt
 from django.contrib.contenttypes.models import ContentType
 from django.utils import timezone
@@ -15,14 +16,15 @@ from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices import tasks as invoices_tasks
 from waldur_mastermind.marketplace import models, tasks, utils
 from waldur_mastermind.marketplace.enums import (
+    OPENSTACK_TENANT_OFFERING,
+    SUPPORT_OFFERING,
     BillingTypes,
     OfferingStates,
     OrderStates,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.tests import factories, fixtures
-from waldur_mastermind.marketplace_openstack import TENANT_TYPE
-from waldur_mastermind.marketplace_support import PLUGIN_NAME
 
 
 class StatsBaseTest(test.APITransactionTestCase):
@@ -38,7 +40,7 @@ class StatsBaseTest(test.APITransactionTestCase):
 
         self.offering = factories.OfferingFactory(
             category=self.category,
-            type=TENANT_TYPE,
+            type=OPENSTACK_TENANT_OFFERING,
             state=OfferingStates.ACTIVE,
         )
         self.offering_component = factories.OfferingComponentFactory(
@@ -284,7 +286,7 @@ class ComponentStatsTest(StatsBaseTest):
                 "service_provider_name": self.resource.offering.customer.name,
                 "service_provider_uuid": sp.uuid.hex,
                 "offering_name": self.offering.name,
-                "offering_type": TENANT_TYPE,
+                "offering_type": OPENSTACK_TENANT_OFFERING,
                 "offering_uuid": self.offering.uuid.hex,
                 "plan_name": self.resource.plan.name,
                 "plan_uuid": self.resource.plan.uuid.hex,
@@ -306,7 +308,7 @@ class ComponentStatsTest(StatsBaseTest):
     def test_component_stats_if_invoice_item_details_includes_plan_component_data(
         self,
     ):
-        self.resource.offering.type = PLUGIN_NAME
+        self.resource.offering.type = SUPPORT_OFFERING
         self.resource.offering.save()
         self.offering_component.billing_type = BillingTypes.FIXED
         self.offering_component.save()
@@ -331,7 +333,7 @@ class ComponentStatsTest(StatsBaseTest):
         )
 
     def test_handler(self):
-        self.resource.offering.type = PLUGIN_NAME
+        self.resource.offering.type = SUPPORT_OFFERING
         self.resource.offering.save()
 
         # add usage-based component to the offering and plan
@@ -526,6 +528,7 @@ class LimitsStatsTest(test.APITransactionTestCase):
 
 
 @ddt
+@override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
 class CountUsersOfServiceProviderTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
@@ -562,6 +565,82 @@ class CountUsersOfServiceProviderTest(test.APITransactionTestCase):
         self.client.force_authenticate(user)
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_count_filters_by_tos_consent(self):
+        """Test that user count is filtered by ToS consent. Test no consent, consent, and revoke consent."""
+        models.OfferingTermsOfService.objects.create(
+            offering=self.fixture.offering,
+            terms_of_service="Test ToS",
+            version="1.0",
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        for record in response.data:
+            if record["service_provider_uuid"] == self.service_provider.uuid.hex:
+                self.assertEqual(record["count"], 0)
+
+        models.UserOfferingConsent.objects.create(
+            user=self.fixture.admin,
+            offering=self.fixture.offering,
+            version="1.0",
+        )
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        for record in response.data:
+            if record["service_provider_uuid"] == self.service_provider.uuid.hex:
+                self.assertEqual(record["count"], 1)
+
+        consent = models.UserOfferingConsent.objects.get(
+            user=self.fixture.admin, offering=self.fixture.offering
+        )
+        consent.revoke()
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        for record in response.data:
+            if record["service_provider_uuid"] == self.service_provider.uuid.hex:
+                self.assertEqual(record["count"], 0)
+
+    @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=False)
+    def test_count_ignores_tos_consent_when_disabled(self):
+        """Test that user count ignores ToS consent when ENFORCE_USER_CONSENT_FOR_OFFERINGS is False."""
+        models.OfferingTermsOfService.objects.create(
+            offering=self.fixture.offering,
+            terms_of_service="Test ToS",
+            version="1.0",
+        )
+
+        user = structure_factories.UserFactory()
+        self.fixture.project.add_user(user, ProjectRole.MANAGER)
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Should count users regardless of consent status when enforcement is disabled
+        for record in response.data:
+            if record["service_provider_uuid"] == self.service_provider.uuid.hex:
+                self.assertEqual(record["count"], 1)
+
+        # Create consent - count should remain the same since enforcement is disabled
+        models.UserOfferingConsent.objects.create(
+            user=user,
+            offering=self.fixture.offering,
+            version="1.0",
+        )
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        for record in response.data:
+            if record["service_provider_uuid"] == self.service_provider.uuid.hex:
+                self.assertEqual(record["count"], 1)
 
 
 @ddt
@@ -691,7 +770,7 @@ class CountCustomersTest(test.APITransactionTestCase):
             offering=self.fixture.offering,
             project=project,
             resource=resource,
-            type=models.Order.Types.CREATE,
+            type=OrderTypes.CREATE,
             state=OrderStates.DONE,
         )
         return resource
@@ -701,7 +780,7 @@ class CountCustomersTest(test.APITransactionTestCase):
             offering=self.fixture.offering,
             state=OrderStates.DONE,
             resource=resource,
-            type=models.Order.Types.TERMINATE,
+            type=OrderTypes.TERMINATE,
         )
         resource.state = ResourceStates.TERMINATED
         return resource.save()

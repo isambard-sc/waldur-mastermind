@@ -9,9 +9,13 @@ from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
 from waldur_core.structure.models import Customer, Project
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
+from waldur_mastermind.marketplace.enums import (
+    OPENSTACK_INSTANCE_OFFERING,
+    OrderStates,
+    OrderTypes,
+    ResourceStates,
+)
 from waldur_mastermind.marketplace.exceptions import PolicyException
-from waldur_mastermind.marketplace_openstack import INSTANCE_TYPE
 from waldur_mastermind.policy import models, tasks
 
 from . import enums, structures
@@ -74,13 +78,13 @@ def terminate_resources(policy: models.Policy):
         with transaction.atomic():
             attributes = (
                 {"action": "force_destroy"}
-                if resource.offering.type == INSTANCE_TYPE
+                if resource.offering.type == OPENSTACK_INSTANCE_OFFERING
                 else {}
             )
             order = marketplace_models.Order.objects.create(
                 resource=resource,
                 offering=resource.offering,
-                type=marketplace_models.Order.Types.TERMINATE,
+                type=OrderTypes.TERMINATE,
                 state=OrderStates.EXECUTING,
                 attributes=attributes,
                 project=resource.project,

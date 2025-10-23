@@ -1,11 +1,8 @@
-from dataclasses import replace
-
 from django.apps import AppConfig
 from django.db.models import signals
 
-from waldur_mastermind.marketplace.enums import BillingTypes
-from waldur_mastermind.marketplace_openstack.const import TENANT_COMPONENTS
-from waldur_mastermind.marketplace_rancher import MANAGED_RANCHER_PLUGIN
+from waldur_mastermind.marketplace.enums import RANCHER_OFFERING
+from waldur_mastermind.marketplace_rancher.const import RANCHER_BILLING_COMPONENTS
 
 
 class MarketplaceRancherConfig(AppConfig):
@@ -17,31 +14,26 @@ class MarketplaceRancherConfig(AppConfig):
         from waldur_mastermind.marketplace import handlers as marketplace_handlers
         from waldur_mastermind.marketplace import models as marketplace_models
         from waldur_mastermind.marketplace.plugins import manager
+        from waldur_mastermind.marketplace_rancher import executors
         from waldur_openstack import models as openstack_models
+        from waldur_rancher import executors as rancher_executors
         from waldur_rancher import models as rancher_models
         from waldur_rancher.apps import RancherConfig
 
-        from . import PLUGIN_NAME, handlers, processors, registrators
+        from . import handlers, processors, registrators
 
         registrators.RancherRegistrator.connect()
 
         manager.register(
-            offering_type=PLUGIN_NAME,
+            offering_type=RANCHER_OFFERING,
             create_resource_processor=processors.RancherCreateProcessor,
             delete_resource_processor=processors.RancherDeleteProcessor,
             service_type=RancherConfig.service_name,
+            components=RANCHER_BILLING_COMPONENTS,
             get_importable_resources_backend_method="get_importable_clusters",
             import_resource_backend_method="import_cluster",
-        )
-
-        manager.register(
-            offering_type=MANAGED_RANCHER_PLUGIN,
-            create_resource_processor=processors.ManagedRancherCreateProcessor,
-            delete_resource_processor=processors.ManagedRancherDeleteProcessor,
-            components=[
-                replace(component, billing_type=BillingTypes.USAGE)
-                for component in TENANT_COMPONENTS
-            ],
+            pull_resource_executor=rancher_executors.ClusterPullExecutor,
+            import_resource_executor=executors.ManagedRancherImportExecutor,
         )
 
         marketplace_handlers.connect_resource_metadata_handlers(rancher_models.Cluster)
@@ -70,12 +62,6 @@ class MarketplaceRancherConfig(AppConfig):
             handlers.update_argocd_secret_when_resource_options_changed,
             sender=marketplace_models.Resource,
             dispatch_uid="waldur_mastermind.marketplace_rancher.update_argocd_secret_when_resource_options_changed",
-        )
-
-        signals.post_save.connect(
-            handlers.copy_invoice_items_when_cluster_is_provisioned,
-            sender=marketplace_models.Resource,
-            dispatch_uid="waldur_mastermind.marketplace_rancher.copy_invoice_items_when_cluster_is_provisioned",
         )
 
         signals.post_save.connect(

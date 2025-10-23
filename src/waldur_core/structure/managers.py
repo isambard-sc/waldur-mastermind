@@ -44,11 +44,14 @@ def filter_queryset_for_user(queryset: QuerySet[T], user: User) -> QuerySet[T]:
             connected_projects = get_connected_projects(user)
         return build_filter(path, connected_projects)
 
-    if user is None or not user.is_authenticated or user.is_staff or user.is_support:
+    if queryset is None:
         return queryset
 
-    if not user.is_active:
+    if user is None or not user.is_authenticated or not user.is_active:
         return queryset.none()
+
+    if user.is_staff or user.is_support:
+        return queryset
 
     try:
         permissions = queryset.model.Permissions
@@ -103,7 +106,13 @@ def filter_queryset_by_user_ip(queryset, request):
     user = request.user
     user_ip = core_utils.get_ip_address(request)
 
-    if user is None or user.is_staff or user.is_support or not user_ip:
+    if queryset is None:
+        return queryset
+
+    if user is None or not user.is_authenticated:
+        return queryset.none()
+
+    if user.is_staff or user.is_support or not user_ip:
         return queryset
 
     try:
@@ -209,7 +218,10 @@ def get_visible_users(user):
 
 def get_nested_customer_users(customer):
     customer_users = get_customer_users(customer.id)
-    project_users = get_project_users(customer.projects.values_list("id", flat=True))
+    project_ids = structure_models.Project.available_objects.filter(
+        customer=customer
+    ).values_list("id", flat=True)
+    project_users = get_project_users(project_ids)
     return customer_users.union(project_users)
 
 

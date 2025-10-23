@@ -7,10 +7,13 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone as timezone
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import decorators, exceptions, response, status, viewsets
 from rest_framework import permissions as rf_permissions
 
+from waldur_core.checklist import models as checklist_models
+from waldur_core.checklist import serializers as checklist_serializers
+from waldur_core.checklist.mixins import ReviewerChecklistMixin, UserChecklistMixin
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.exceptions import IncorrectStateException
@@ -25,7 +28,7 @@ from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
-from waldur_core.permissions.fixtures import ProposalRole
+from waldur_core.permissions.fixtures import CallRole, ProposalRole
 from waldur_core.permissions.utils import has_permission, permission_factory
 from waldur_core.permissions.views import UserRoleMixin
 from waldur_core.structure import filters as structure_filters
@@ -40,6 +43,7 @@ from waldur_mastermind.proposal import (
     filters,
     models,
     serializers,
+    tasks,
     utils,
 )
 from waldur_mastermind.proposal import permissions as proposal_permissions
@@ -49,7 +53,8 @@ from waldur_mastermind.proposal.enums import (
     RequestedOfferingStates,
 )
 
-from .managers import get_connected_call_organizers
+from .managers import get_connected_call_organizers, get_connected_calls
+from .models import Proposal
 from .serializers import ReviewSubmitSerializer
 
 logger = logging.getLogger(__name__)
@@ -179,6 +184,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         request=None,
         responses=serializers.RequestedOfferingSerializer(many=True),
         description="List offerings for a call.",
+        parameters=[
+            OpenApiParameter(
+                "state", str, OpenApiParameter.QUERY, description="Filter by state"
+            ),
+        ],
         filters=False,
     )
     @extend_schema(
@@ -190,6 +200,27 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     )
     @decorators.action(detail=True, methods=["get", "post"])
     def offerings(self, request, uuid=None):
+        if request.method == "GET":
+            call = self.get_object()
+            queryset = call.requestedoffering_set.all()
+
+            # Apply state filter if provided - only filter with valid states
+            state_filter = request.query_params.getlist("state")
+            if state_filter:
+                # Get valid state values from the enum
+                valid_states = {choice[0] for choice in RequestedOfferingStates.CHOICES}
+                # Filter to only include valid state values
+                valid_state_filter = [s for s in state_filter if s in valid_states]
+                if valid_state_filter:
+                    queryset = queryset.filter(state__in=valid_state_filter)
+
+            serializer = self.get_serializer(
+                queryset,
+                context=self.get_serializer_context(),
+                many=True,
+            )
+            return response.Response(serializer.data, status=status.HTTP_200_OK)
+
         return self.action_list_method("requestedoffering_set")(self, request, uuid)
 
     offerings_serializer_class = serializers.RequestedOfferingSerializer
@@ -210,7 +241,6 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     @extend_schema(
         description="Activate a call.",
         request=None,
-        responses={status.HTTP_200_OK: None},
     )
     @decorators.action(detail=True, methods=["post"])
     def activate(self, request, uuid=None):
@@ -233,7 +263,6 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     @extend_schema(
         description="Archive a call.",
         request=None,
-        responses={status.HTTP_200_OK: None},
     )
     @decorators.action(detail=True, methods=["post"])
     def archive(self, request, uuid=None):
@@ -472,8 +501,157 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         serializers.CallResourceTemplateSerializer
     )
 
+    # Call Manager Compliance Endpoints
+    compliance_overview_permissions = [permission_factory(PermissionEnum.UPDATE_CALL)]
 
-class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
+    @extend_schema(
+        description="Get compliance overview for call manager showing all proposals and their compliance status.",
+        responses=serializers.CallComplianceOverviewSerializer,
+    )
+    @decorators.action(detail=True, methods=["get"])
+    def compliance_overview(self, request, uuid=None):
+        """Get compliance overview for call manager."""
+        call = self.get_object()
+
+        if not call.compliance_checklist:
+            return response.Response(
+                {
+                    "detail": "No compliance checklist configured for this call",
+                    "checklist": None,
+                    "proposals": [],
+                }
+            )
+
+        # Serialize the compliance overview
+        overview_data = serializers.CallComplianceOverviewSerializer(
+            call, context={"request": request}
+        ).data
+
+        return response.Response(overview_data)
+
+    review_proposal_compliance_permissions = [
+        permission_factory(PermissionEnum.UPDATE_CALL)
+    ]
+
+    @extend_schema(
+        description="Mark proposal compliance as reviewed by call manager.",
+        request=serializers.CallComplianceReviewSerializer,
+        responses=dict[str, str],
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def review_proposal_compliance(self, request, uuid=None):
+        """Mark proposal compliance as reviewed by call manager."""
+        call = self.get_object()
+
+        # Validate input
+        serializer = serializers.CallComplianceReviewSerializer(
+            data=request.data, context={"call": call, "request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        proposal_uuid = serializer.validated_data["proposal_uuid"]
+        review_notes = serializer.validated_data.get("review_notes", "")
+
+        try:
+            proposal: Proposal = Proposal.objects.get(
+                round__call=call, uuid=proposal_uuid
+            )
+            completion = proposal.checklist_completion
+
+            completion.reviewed_by = request.user
+            completion.reviewed_at = timezone.now()
+            completion.review_notes = review_notes
+            completion.save()
+
+            return response.Response(
+                {
+                    "detail": "Compliance review completed successfully",
+                    "proposal_uuid": str(proposal_uuid),
+                    "reviewed_by": request.user.full_name,
+                    "reviewed_at": completion.reviewed_at,
+                }
+            )
+
+        except models.Proposal.DoesNotExist:
+            return response.Response(
+                {"detail": "Proposal not found"}, status=status.HTTP_404_NOT_FOUND
+            )
+        except checklist_models.ChecklistCompletion.DoesNotExist:
+            return response.Response(
+                {"detail": "Proposal has no compliance checklist"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    proposal_compliance_answers_permissions = [
+        permission_factory(PermissionEnum.UPDATE_CALL)
+    ]
+
+    @extend_schema(
+        description="Get detailed compliance answers for a specific proposal (call managers only).",
+        responses=checklist_serializers.AnswerSerializer(many=True),
+        parameters=[
+            OpenApiParameter(
+                name="proposal_uuid",
+                type=str,
+                location=OpenApiParameter.PATH,
+                description="UUID of the proposal",
+            )
+        ],
+    )
+    @decorators.action(
+        detail=True,
+        methods=["get"],
+        url_path="proposals/(?P<proposal_uuid>[^/.]+)/compliance-answers",
+    )
+    def proposal_compliance_answers(self, request, uuid=None, proposal_uuid=None):
+        """Get detailed compliance answers for a specific proposal."""
+        call: models.Call = self.get_object()
+
+        try:
+            proposal = models.Proposal.objects.get(uuid=proposal_uuid, round__call=call)
+
+            if not hasattr(proposal, "checklist_completion"):
+                return response.Response(
+                    {"detail": "Proposal has no compliance checklist"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            completion = proposal.checklist_completion
+            answers = completion.answers.all().select_related("question", "user")
+
+            answers_data = checklist_serializers.AnswerSerializer(
+                answers, many=True, context={"request": request}
+            ).data
+
+            return response.Response(
+                {
+                    "proposal": {
+                        "uuid": str(proposal.uuid),
+                        "name": proposal.name,
+                        "created_by": proposal.created_by.full_name
+                        if proposal.created_by
+                        else None,
+                    },
+                    "completion": checklist_serializers.ChecklistCompletionReviewerSerializer(
+                        completion, context={"request": request}
+                    ).data,
+                    "answers": answers_data,
+                }
+            )
+
+        except models.Proposal.DoesNotExist:
+            return response.Response(
+                {"detail": "Proposal not found"}, status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class ProposalViewSet(
+    UserChecklistMixin,
+    ReviewerChecklistMixin,
+    UserRoleMixin,
+    ActionsViewSet,
+    ActionMethodMixin,
+):
     lookup_field = "uuid"
     serializer_class = serializers.ProposalSerializer
     filterset_class = filters.ProposalFilter
@@ -484,6 +662,21 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         return filter_queryset_for_user(
             models.Proposal.objects.all(), self.request.user
         ).order_by("created")
+
+    # Both mixins use the default implementation (obj.checklist_completion)
+
+    # UserChecklistMixin permissions - for proposal managers
+    checklist_permissions = [permission_factory(PermissionEnum.MANAGE_PROPOSAL)]
+    completion_status_permissions = [permission_factory(PermissionEnum.MANAGE_PROPOSAL)]
+    submit_answers_permissions = [permission_factory(PermissionEnum.MANAGE_PROPOSAL)]
+
+    # ReviewerChecklistMixin permissions - for proposal reviewers
+    checklist_review_permissions = [
+        permission_factory(PermissionEnum.MANAGE_PROPOSAL_REVIEW, ["round.call"])
+    ]
+    completion_review_status_permissions = [
+        permission_factory(PermissionEnum.MANAGE_PROPOSAL_REVIEW, ["round.call"])
+    ]
 
     def is_creator(request, view, obj=None):
         if not obj:
@@ -534,8 +727,13 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     @decorators.action(detail=True, methods=["post"])
     def submit(self, request, uuid=None):
         proposal = self.get_object()
+        previous_state = proposal.state
         proposal.state = ProposalStates.SUBMITTED
         proposal.save()
+        tasks.notify_user_about_proposal_state_update.delay(
+            proposal.uuid, previous_state, proposal.state
+        )
+        tasks.notify_call_managers_about_new_proposal_submission.delay(proposal.uuid)
         return response.Response(
             "Proposal has been submitted.",
             status=status.HTTP_200_OK,
@@ -622,6 +820,7 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     @decorators.action(detail=True, methods=["post"])
     def approve(self, request, uuid=None):
         proposal = self.get_object()
+        previous_state = proposal.state
         utils.allocate_proposal(proposal)
         proposal.state = ProposalStates.ACCEPTED
         serializer = self.get_serializer(data=request.data)
@@ -630,6 +829,10 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             "allocation_comment", ""
         )
         proposal.save()
+        tasks.notify_user_about_proposal_state_update.delay(
+            proposal.uuid, previous_state, proposal.state
+        )
+        tasks.notify_reviewer_on_proposal_decision.delay(proposal.uuid)
         return response.Response(
             "Proposal has been approved.",
             status=status.HTTP_200_OK,
@@ -652,6 +855,7 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     @decorators.action(detail=True, methods=["post"])
     def reject(self, request, uuid=None):
         proposal = self.get_object()
+        previous_state = proposal.state
         proposal.state = ProposalStates.REJECTED
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -659,6 +863,10 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             "allocation_comment", ""
         )
         proposal.save()
+        tasks.notify_user_about_proposal_state_update.delay(
+            proposal.uuid, previous_state, proposal.state
+        )
+        tasks.notify_reviewer_on_proposal_decision.delay(proposal.uuid)
         return response.Response(
             "Proposal has been rejected.",
             status=status.HTTP_200_OK,
@@ -671,11 +879,20 @@ class ProposalViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         )
     ]
     reject_permissions = approve_permissions = [
-        permission_factory(PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, ["round.call"])
+        permission_factory(
+            PermissionEnum.APPROVE_AND_REJECT_PROPOSALS,
+            ["round.call", "round.call.manager"],
+        )
     ]
     reject_serializer_class = approve_serializer_class = (
         serializers.ProposalApproveSerializer
     )
+
+    # Checklist Integration Endpoints
+    # Checklist methods are now provided by ChecklistViewSetMixin
+    # - checklist: Get checklist with questions and existing answers
+    # - submit_answers: Submit checklist answers
+    # - completion_status: Get completion status
 
 
 class ReviewViewSet(ActionsViewSet):
@@ -696,10 +913,10 @@ class ReviewViewSet(ActionsViewSet):
         if user.is_staff:
             return models.Review.objects.all().order_by("created")
 
-        # Base queries for authorized users (call managers, reviewers)
+        # Base queries for authorized users (call organizers, call managers, reviewers)
         authorized_query = (
             Q(
-                proposal__round__call__manager__customer__in=get_connected_call_organizers(
+                proposal__round__call__manager__customer__callmanagingorganisation__in=get_connected_call_organizers(
                     user
                 )
             )
@@ -708,6 +925,7 @@ class ReviewViewSet(ActionsViewSet):
                     user
                 )
             )
+            | Q(proposal__round__call__in=get_connected_calls(user, CallRole.MANAGER))
             | Q(reviewer=user)
         )
 
@@ -734,21 +952,51 @@ class ReviewViewSet(ActionsViewSet):
 
     def perform_create(self, serializer):
         proposal = serializer.validated_data["proposal"]
+        if proposal.state not in [
+            ProposalStates.DRAFT,
+            ProposalStates.IN_REVIEW,
+            ProposalStates.SUBMITTED,
+        ]:
+            raise exceptions.ValidationError(
+                _("Valid states for proposals: Draft, In Review, Submitted.")
+            )
+        review: models.Review = serializer.save()
+        tasks.notify_reviewer_about_assignment.delay(review.uuid)
 
-        if not has_permission(
-            self.request, PermissionEnum.MANAGE_PROPOSAL_REVIEW, proposal.round.call
+    def check_create_permissions(request, view, obj=None):
+        """Check permissions for creating reviews."""
+        serializer = view.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        proposal = serializer.validated_data["proposal"]
+
+        user = request.user
+        permission = PermissionEnum.MANAGE_PROPOSAL_REVIEW
+        call = proposal.round.call
+
+        if not (
+            has_permission(user, permission, call)
+            or has_permission(user, permission, call.manager)
         ):
             raise exceptions.PermissionDenied()
-        return super().perform_create(serializer)
 
-    def perform_destroy(self, instance):
-        if not has_permission(
-            self.request,
-            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            instance.proposal.round.call,
+    def check_destroy_permissions(request, view, obj=None):
+        """Check permissions for destroying reviews."""
+        if obj and not (
+            has_permission(
+                request.user,
+                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+                obj.proposal.round.call,
+            )
+            or has_permission(
+                request.user,
+                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+                obj.proposal.round.call.manager,
+            )
         ):
             raise exceptions.PermissionDenied()
-        super().perform_destroy(instance)
+
+    create_permissions = [check_create_permissions]
+    destroy_permissions = [check_destroy_permissions]
 
     def action_permission_check(request, view, obj: models.Review | None = None):
         if not obj:
@@ -771,6 +1019,15 @@ class ReviewViewSet(ActionsViewSet):
         review: models.Review = self.get_object()
         review.state = models.Review.States.IN_REVIEW
         review.save()
+        proposal_old_state = review.proposal.state
+        review.proposal.state = ProposalStates.IN_REVIEW
+        review.proposal.save()
+        logger.info(
+            f"Review {review.uuid}, by {review.reviewer.full_name} for proposal {review.proposal.name} has been accepted. Proposal state changed to IN_REVIEW."
+        )
+        tasks.notify_user_about_proposal_state_update.delay(
+            review.proposal.uuid, proposal_old_state, review.proposal.state
+        )
         return response.Response(
             "Review has been accepted.",
             status=status.HTTP_200_OK,
@@ -790,6 +1047,7 @@ class ReviewViewSet(ActionsViewSet):
         review: models.Review = self.get_object()
         review.state = models.Review.States.REJECTED
         review.save()
+        tasks.notify_call_managers_about_rejected_review.delay(review.uuid)
         return response.Response(
             "Review has been rejected.",
             status=status.HTTP_200_OK,
@@ -814,6 +1072,8 @@ class ReviewViewSet(ActionsViewSet):
         )
         serializer.is_valid(raise_exception=True)
         serializer.save(state=models.Review.States.SUBMITTED)
+        tasks.notify_call_managers_about_new_review.delay(review.uuid)
+        tasks.notify_manager_when_reviews_are_completed.delay(review.proposal.uuid)
         return response.Response(
             "Review has been submitted.",
             status=status.HTTP_200_OK,
@@ -847,6 +1107,7 @@ class ProviderRequestedOfferingViewSet(ReadOnlyActionsViewSet):
         requested_offering.state = RequestedOfferingStates.ACCEPTED
         requested_offering.approved_by = self.request.user
         requested_offering.save()
+        tasks.notify_offering_request_decision.delay(requested_offering.uuid)
         return response.Response(
             "The request on offering has been accepted.",
             status=status.HTTP_200_OK,
@@ -867,6 +1128,7 @@ class ProviderRequestedOfferingViewSet(ReadOnlyActionsViewSet):
         requested_offering.state = RequestedOfferingStates.CANCELED
         requested_offering.approved_by = self.request.user
         requested_offering.save()
+        tasks.notify_offering_request_decision.delay(requested_offering.uuid)
         return response.Response(
             "The request on offering has been canceled.",
             status=status.HTTP_200_OK,
@@ -968,8 +1230,3 @@ class ProposalProjectRoleMappingViewSet(ActionsViewSet):
     filterset_class = filters.ProposalProjectRoleMappingFilter
     filter_backends = (DjangoFilterBackend,)
     permission_classes = [proposal_permissions.CanUpdateCallPermission]
-
-    def get_queryset(self):
-        return filter_queryset_for_user(
-            super().get_queryset(), self.request.user
-        ).order_by("call")

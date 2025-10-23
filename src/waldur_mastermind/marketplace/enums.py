@@ -1,5 +1,8 @@
 from typing import Literal
 
+from django.db import models
+from django.utils.translation import gettext_lazy as _
+
 
 class BillingTypes:
     FIXED = "fixed"
@@ -24,6 +27,7 @@ class BillingTypes:
 
 class LimitPeriods:
     MONTH = "month"
+    QUARTERLY = "quarterly"
     ANNUAL = "annual"
     TOTAL = "total"
 
@@ -31,6 +35,11 @@ class LimitPeriods:
         (
             MONTH,
             "Maximum monthly - every month service provider "
+            "can report up to the amount requested by user.",
+        ),
+        (
+            QUARTERLY,
+            "Maximum quarterly - every quarter service provider "
             "can report up to the amount requested by user.",
         ),
         (
@@ -82,7 +91,52 @@ class RobotAccountStates:
     VALUES = [val for (_, val) in CHOICES]
 
 
-class RequestTypes:
+class OfferingUserStates:
+    # creation flow
+    CREATION_REQUESTED = 1
+    CREATING = 2
+    PENDING_ACCOUNT_LINKING = 3
+    PENDING_ADDITIONAL_VALIDATION = 4
+    OK = 5
+    # removal flow
+    DELETION_REQUESTED = 6
+    DELETING = 7
+    DELETED = 8
+    # error states
+    ERROR_CREATING = 9
+    ERROR_DELETING = 10
+
+    CHOICES = (
+        (CREATION_REQUESTED, "Requested"),
+        (CREATING, "Creating"),
+        (PENDING_ACCOUNT_LINKING, "Pending account linking"),
+        (PENDING_ADDITIONAL_VALIDATION, "Pending additional validation"),
+        (OK, "OK"),
+        (DELETION_REQUESTED, "Requested deletion"),
+        (DELETING, "Deleting"),
+        (DELETED, "Deleted"),
+        (ERROR_CREATING, "Error creating"),
+        (ERROR_DELETING, "Error deleting"),
+    )
+
+    VALUES = [val for (_, val) in CHOICES]
+
+
+OfferingUserStatesType = Literal[
+    "Requested",
+    "Creating",
+    "Pending account linking",
+    "Pending additional validation",
+    "OK",
+    "Requested deletion",
+    "Deleting",
+    "Deleted",
+    "Error creating",
+    "Error deleting",
+]
+
+
+class OrderTypes:
     CREATE = 1
     UPDATE = 2
     TERMINATE = 3
@@ -214,3 +268,55 @@ class ImpactLevel:
         (PARTIAL_OUTAGE, "Partial outage"),
         (FULL_OUTAGE, "Full outage"),
     )
+
+
+class RemoteResourceSyncStatus:
+    IN_SYNC = "in_sync"
+    OUT_OF_SYNC = "out_of_sync"
+    SYNC_FAILED = "sync_failed"
+
+    CHOICES = (
+        (IN_SYNC, "In sync"),
+        (OUT_OF_SYNC, "Out of sync"),
+        (SYNC_FAILED, "Sync failed"),
+    )
+
+
+class ServiceAccountState:
+    OK = 1
+    CLOSED = 2
+    ERRED = 3
+    CHOICES = (
+        (OK, "OK"),
+        (CLOSED, "Closed"),
+        (ERRED, "Erred"),
+    )
+
+    VALUES = [val for (_, val) in CHOICES]
+
+
+ServiceAccountStatesType = Literal[
+    "OK",
+    "Closed",
+    "Erred",
+]
+
+
+class CourseAccountState(models.IntegerChoices):
+    OK = 1, _("OK")
+    CLOSED = 2, _("Closed")
+    ERRED = 3, _("Erred")
+
+
+SUPPORT_OFFERING = "Support.OfferingTemplate"
+BOOKING_OFFERING = "Marketplace.Booking"
+BASIC_OFFERING = "Marketplace.Basic"
+OPENSTACK_TENANT_OFFERING = "OpenStack.Tenant"
+OPENSTACK_INSTANCE_OFFERING = "OpenStack.Instance"
+OPENSTACK_VOLUME_OFFERING = "OpenStack.Volume"
+RANCHER_OFFERING = "Marketplace.Rancher"
+VMWARE_VM_OFFERING = "VMware.VirtualMachine"
+REMOTE_OFFERING = "Waldur.RemoteOffering"
+SCRIPT_OFFERING = "Marketplace.Script"
+SLURM_OFFERING = "SlurmInvoices.SlurmPackage"
+SITE_AGENT_OFFERING = "Marketplace.Slurm"

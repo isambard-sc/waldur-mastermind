@@ -1,6 +1,6 @@
 from django.apps import AppConfig
 
-from waldur_mastermind.marketplace.enums import BillingTypes
+from waldur_mastermind.marketplace.enums import VMWARE_VM_OFFERING, BillingTypes
 
 
 class MarketplaceVMwareConfig(AppConfig):
@@ -10,11 +10,12 @@ class MarketplaceVMwareConfig(AppConfig):
     def ready(self):
         from waldur_mastermind.marketplace import handlers as marketplace_handlers
         from waldur_mastermind.marketplace.plugins import Component, manager
+        from waldur_vmware import executors as vmware_executors
         from waldur_vmware import models as vmware_models
         from waldur_vmware import signals as vmware_signals
         from waldur_vmware.apps import VMwareConfig
 
-        from . import VIRTUAL_MACHINE_TYPE, handlers, processors
+        from . import handlers, processors
 
         resource_models = (vmware_models.VirtualMachine,)
 
@@ -22,7 +23,7 @@ class MarketplaceVMwareConfig(AppConfig):
         marketplace_handlers.connect_resource_metadata_handlers(*resource_models)
 
         manager.register(
-            offering_type=VIRTUAL_MACHINE_TYPE,
+            offering_type=VMWARE_VM_OFFERING,
             create_resource_processor=processors.VirtualMachineCreateProcessor,
             service_type=VMwareConfig.service_name,
             can_update_limits=True,
@@ -50,6 +51,7 @@ class MarketplaceVMwareConfig(AppConfig):
                     factor=1024,
                 ),
             ),
+            pull_resource_executor=vmware_executors.VirtualMachinePullExecutor,
         )
 
         vmware_signals.vm_updated.connect(

@@ -1,5 +1,6 @@
 import logging
 from datetime import timedelta
+from typing import cast
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
@@ -12,21 +13,22 @@ from waldur_mastermind.common.utils import parse_datetime
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices import registrators
 from waldur_mastermind.invoices.registrators import RegistrationManager
-from waldur_mastermind.invoices.utils import get_current_month_end, get_full_days
-from waldur_mastermind.marketplace import PLUGIN_NAME, utils
+from waldur_mastermind.invoices.utils import (
+    get_current_month_end,
+    get_full_days,
+)
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import utils
 from waldur_mastermind.marketplace.enums import (
+    BASIC_OFFERING,
     BillingTypes,
     LimitPeriods,
+    OrderTypes,
     ResourceStates,
 )
-from waldur_mastermind.marketplace.models import ComponentUsage
 from waldur_mastermind.promotions import models as promotions_models
 
 logger = logging.getLogger(__name__)
-
-LimitPeriods = LimitPeriods
-OrderTypes = marketplace_models.Order.Types
 
 
 class MarketplaceRegistrator(registrators.BaseRegistrator):
@@ -51,11 +53,12 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
 
     Billing behavior varies by limit period for limit-based components:
     - MONTH: Billed monthly based on limits
+    - QUARTERLY: Billed quarterly based on limits
     - ANNUAL: Billed annually based on limits
     - TOTAL: One-time billing for total limit amount
     """
 
-    plugin_name = PLUGIN_NAME
+    plugin_name = BASIC_OFFERING
 
     def _find_item(self, source: marketplace_models.Resource, now):
         """
@@ -136,7 +139,7 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
         2. ONE_TIME billing: Creates one-time charges during resource creation
         3. ON_PLAN_SWITCH billing: Creates charges when switching between plans
         4. LIMIT billing: Creates charges based on user-specified limits with
-           different behaviors for MONTH/ANNUAL/TOTAL limit periods
+           different behaviors for MONTH/QUARTERLY/ANNUAL/TOTAL limit periods
         5. USAGE billing: Handled separately in update_invoice_when_usage_is_reported
 
         For LIMIT billing with TOTAL period, charges are only created during
@@ -189,6 +192,22 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
                         continue
                     else:
                         continue
+
+                # For quarterly components, only process billing in quarterly months
+                if offering_component.limit_period == LimitPeriods.QUARTERLY:
+                    if not self.should_process_quarterly_billing(start):
+                        # Skip quarterly billing in non-quarterly months
+                        continue
+                    # Use quarterly billing period instead of monthly
+                    quarterly_start, quarterly_end = self.get_quarterly_billing_period(
+                        start
+                    )
+                    self.create_component_item(
+                        source, plan_component, invoice, quarterly_start, quarterly_end
+                    )
+                    continue
+
+                # Process monthly, annual, and other limit periods normally
                 self.create_component_item(source, plan_component, invoice, start, end)
                 continue
 
@@ -333,7 +352,7 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
         Create invoice item for limit-based components.
 
         Creates invoice items for components with LIMIT billing type based on
-        resource limits. Handles different limit periods (MONTH, ANNUAL, TOTAL)
+        resource limits. Handles different limit periods (MONTH, QUARTERLY, ANNUAL, TOTAL)
         and calculates appropriate quantities and units.
 
         For TOTAL limit period, uses QUANTITY unit instead of plan unit.
@@ -354,15 +373,33 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
                 source,
             )
             return
+
+        # Additional safeguard: TOTAL period components should only be billed once
+        # This prevents the bug where TOTAL components get billed multiple times
+        if (
+            offering_component.billing_type == BillingTypes.LIMIT
+            and offering_component.limit_period == LimitPeriods.TOTAL
+        ):
+            # Check if this component has already been billed for this resource
+            existing_items = invoice_models.InvoiceItem.objects.filter(
+                resource=source,
+                details__offering_component_type=offering_component.type,
+            )
+            if existing_items.exists():
+                logger.warning(
+                    "Prevented duplicate billing: TOTAL period component %s on resource %s "
+                    "already has existing invoice items. TOTAL components should only be billed once.",
+                    offering_component.type,
+                    source.id,
+                )
+                return
         limit = source.limits.get(offering_component.type, 0)
         if not limit or limit == -1:
             return
         details = cls.get_component_details(source, plan_component)
         quantity = cls.convert_quantity(limit, offering_component.type)
         details["resource_limit_periods"] = [
-            utils.serialize_resource_limit_period(
-                {"start": start, "end": end, "quantity": quantity}
-            )
+            utils.serialize_resource_limit_period(start, end, quantity)
         ]
         total_quantity = cls.get_total_quantity(
             plan_component.plan.unit, quantity, start, end
@@ -407,9 +444,13 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
             invoice: Invoice containing the item to update
             new_quantity: New limit quantity
         """
+        if not source.plan:
+            return
+
         invoice_item = invoice_models.InvoiceItem.objects.get(
             resource=source,
             details__offering_component_type=component_type,
+            details__plan_uuid=str(source.plan.uuid),
             invoice=invoice,
             unit_price__gte=0,  # exclude compensation items
         )
@@ -429,14 +470,16 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
             new_start = today.replace(hour=0, minute=0, second=0)
             old_end = new_start - timedelta(seconds=1)
         old_period = utils.serialize_resource_limit_period(
-            {"start": old_start, "end": old_end, "quantity": old_quantity}
+            old_start, old_end, old_quantity
         )
+        # Get the offering component to determine appropriate period end
+        offering_component = source.offering.components.get(type=component_type)
+        period_end = cls.get_period_end_for_limit_period(
+            offering_component.limit_period
+        )
+
         new_period = utils.serialize_resource_limit_period(
-            {
-                "start": new_start,
-                "end": get_current_month_end(),
-                "quantity": new_quantity,
-            }
+            new_start, period_end, new_quantity
         )
         resource_limit_periods.extend([old_period, new_period])
         plan_component = source.plan.components.get(component__type=component_type)
@@ -488,11 +531,25 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
             cls.update_component_item(source, component_type, invoice, quantity)
         else:
             start = timezone.now()
-            end = get_current_month_end()
             try:
                 plan_component = source.plan.components.get(
                     component__type=component_type
                 )
+                # Get the offering component to determine appropriate period end
+                offering_component = plan_component.component
+
+                # Handle quarterly components with proper billing periods
+                if offering_component.limit_period == LimitPeriods.QUARTERLY:
+                    quarterly_start, quarterly_end = cls.get_quarterly_billing_period(
+                        start
+                    )
+                    end = quarterly_end
+                    start = quarterly_start
+                else:
+                    end = cls.get_period_end_for_limit_period(
+                        offering_component.limit_period
+                    )
+
             except ObjectDoesNotExist:
                 logger.warning(
                     "Skipping processing of invoice item %s because "
@@ -566,7 +623,7 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
 
         For limit changes, handles different limit periods:
         - TOTAL: Creates one-time charges for total limit increases
-        - MONTH/ANNUAL: Updates recurring charges for limit changes
+        - MONTH/QUARTERLY/ANNUAL: Updates recurring charges for limit changes
 
         Args:
             sender: Signal sender (model class)
@@ -669,14 +726,24 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
         """
         if resource.state != ResourceStates.OK:
             return
+        if not resource.plan:
+            return
         related_invoice_items = invoice_models.InvoiceItem.objects.filter(
             resource=resource,
             details__offering_component_type=component_type,
         )
         if not related_invoice_items.exists():
-            cls.create_or_update_component_item(
-                resource, invoice, component_type, new_quantity
+            # For TOTAL period components, if no previous billing exists,
+            # this is likely due to missing CREATE order billing.
+            # In this case, bill the full amount to recover proper billing state.
+            logger.info(
+                "No existing invoice items found for TOTAL period component %s "
+                "on resource %s. Billing full amount (%s) to recover from missing CREATE billing.",
+                component_type,
+                resource.id,
+                new_quantity,
             )
+            total = 0  # Start from 0 since no previous billing exists
         else:
             total = 0
             for invoice_item in related_invoice_items:
@@ -684,46 +751,61 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
                     total -= invoice_item.quantity
                 else:
                     total += invoice_item.quantity
-            diff = new_quantity - total
-            if diff == 0:
-                return
-            plan_component = resource.plan.components.get(
-                component__type=component_type
-            )
-            details = cls.get_component_details(resource, plan_component)
-            start = timezone.now()
-            end = get_current_month_end()
-            invoice_models.InvoiceItem.objects.create(
-                name=f"{RegistrationManager.get_name(resource)} / {cls.get_component_name(plan_component)}",
-                resource=resource,
-                project=resource.project,
-                unit_price=plan_component.price if diff > 0 else -plan_component.price,
-                unit=invoice_models.Units.QUANTITY,
-                quantity=diff if diff > 0 else -diff,
-                article_code=offering_component.article_code
-                or resource.plan.article_code,
-                invoice=invoice,
-                start=start,
-                end=end,
-                details=details,
-                measured_unit=offering_component.measured_unit,
-            )
+
+        diff = new_quantity - total
+        if diff == 0:
+            return
+        plan_component = resource.plan.components.get(component__type=component_type)
+        details = cls.get_component_details(resource, plan_component)
+        start = timezone.now()
+        end = cls.get_period_end_for_limit_period(offering_component.limit_period)
+        invoice_models.InvoiceItem.objects.create(
+            name=f"{RegistrationManager.get_name(resource)} / {cls.get_component_name(plan_component)}",
+            resource=resource,
+            project=resource.project,
+            unit_price=plan_component.price if diff > 0 else -plan_component.price,
+            unit=invoice_models.Units.QUANTITY,
+            quantity=diff if diff > 0 else -diff,
+            article_code=offering_component.article_code or resource.plan.article_code,
+            invoice=invoice,
+            start=start,
+            end=end,
+            details=details,
+            measured_unit=offering_component.measured_unit,
+        )
 
     @classmethod
+    @transaction.atomic
     def update_invoice_when_usage_is_reported(
-        cls, sender, instance: ComponentUsage, created=False, **kwargs
+        cls,
+        sender,
+        instance: marketplace_models.ComponentUsage,
+        created=False,
+        **kwargs,
     ):
         """
-        Handle usage-based billing when component usage is reported.
+        Handles billing when component usage is reported, with integrated prepaid logic.
 
-        Processes usage reports for components with USAGE billing type.
-        Creates or updates invoice items based on reported usage quantities.
+        This method acts as a dispatcher based on the component's configuration:
 
-        Only processes usage for USAGE billing type components - limit-based
-        components can report usage but it's ignored for invoicing.
+        1.  **Prepaid Components (`is_prepaid=True`):**
+            - It checks the resource's prepaid balance for that component.
+            - If usage is within the balance, it is considered "free" and no
+              invoice item is generated. The usage is still recorded for tracking.
+            - If usage exceeds the balance, it is split:
+                a) The remaining balance is consumed at no cost.
+                b) The excess (overage) is billed using a linked "overage component"
+                   at a potentially different, premium rate.
 
-        Requires valid plan period for proper billing period calculation.
-        Creates invoice items with usage-based quantities and pricing.
+        2.  **Standard Usage Components (`billing_type=USAGE`):**
+            Processes usage reports for components with USAGE billing type.
+            Creates or updates invoice items based on reported usage quantities.
+
+            Only processes usage for USAGE billing type components - limit-based
+            components can report usage but it's ignored for invoicing.
+
+            Requires valid plan period for proper billing period calculation.
+            Creates invoice items with usage-based quantities and pricing.
 
         Args:
             sender: Signal sender (model class)
@@ -733,83 +815,156 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
         """
         component_usage = instance
         resource = component_usage.resource
-
-        if not created and not component_usage.tracker.has_changed("usage"):
-            return
+        offering_component = component_usage.component
 
         if resource.offering.type != cls.plugin_name:
             return
 
-        offering_component = component_usage.component
-        # It is allowed to report usage for limit-based components but they are ignored in invoicing
-        if offering_component.billing_type != BillingTypes.USAGE:
+        # Ignore signal if usage value has not changed
+        if not created and not component_usage.tracker.has_changed("usage"):
             return
-
-        logger.info(
-            "Processing component usage %s, amount: %s",
-            component_usage,
-            component_usage.usage,
-        )
 
         plan_period = component_usage.plan_period
         if not plan_period:
             logger.warning(
-                "Skipping processing of component usage %s (ID %s) because "
-                "plan period is not defined.",
-                component_usage,
-                component_usage.id,
+                f"Skipping invoice item creation for resource '{resource.uuid}' because plan_period is not defined."
             )
             return
-        plan = plan_period.plan
 
-        item = utils.get_invoice_item_for_component_usage(component_usage)
-        if item:
+        logger.info(
+            f"Processing usage report for resource '{resource.uuid}' and "
+            f"component '{offering_component.type}'. Reported usage: {component_usage.usage}"
+        )
+
+        if offering_component.is_prepaid:
+            cls._process_prepaid_usage(component_usage)
+        elif offering_component.billing_type == BillingTypes.USAGE:
+            cls._create_or_update_usage_invoice_item(
+                resource=resource,
+                offering_component=offering_component,
+                usage_to_bill=component_usage.usage,
+                date=component_usage.date,
+                plan_period=plan_period,
+            )
+
+    @classmethod
+    def _process_prepaid_usage(
+        cls,
+        component_usage: marketplace_models.ComponentUsage,
+    ):
+        resource = component_usage.resource
+        offering_component = component_usage.component
+        plan_period = cast(
+            marketplace_models.ResourcePlanPeriod, component_usage.plan_period
+        )
+        reported_usage = int(component_usage.usage)
+
+        prepaid_balance = resource.get_prepaid_balance(
+            offering_component, excluded_ids=[component_usage.pk]
+        )
+
+        if reported_usage <= prepaid_balance:
             logger.info(
-                "Invoice item %s already exists, updating quantity from %s",
-                item,
-                item.quantity,
+                f"Usage ({reported_usage}) is within prepaid balance ({prepaid_balance}) "
+                f"for resource '{resource.uuid}'. No overage charge."
             )
-            item.quantity = cls.convert_quantity(
-                component_usage.usage, offering_component.type
-            )
-            item.save()
-            logger.info("The %s quantity is set to %s", item, item.quantity)
+            # The usage is recorded, but no billable invoice item is created.
+            return
+
         else:
-            logger.info("No invoice item for the %s, creating one", component_usage)
-            try:
-                plan_component = plan.components.get(component=offering_component)
-            except ObjectDoesNotExist:
-                logger.warning(
-                    "Skipping processing of component usage %s (ID %s) because "
-                    "plan component is not defined.",
-                    component_usage,
-                    component_usage.id,
+            # Usage exceeds balance; split it.
+            overage_amount = reported_usage - prepaid_balance
+            prepaid_consumed = prepaid_balance
+
+            logger.info(
+                f"Usage split for resource '{resource.uuid}': "
+                f"{prepaid_consumed} consumed from prepaid balance. "
+                f"{overage_amount} billed as overage."
+            )
+
+            if not offering_component.overage_component:
+                logger.error(
+                    f"Overage of {overage_amount} occurred for resource '{resource.uuid}', "
+                    f"but no overage_component is configured on component '{offering_component.type}'. "
+                    "Overage will not be billed."
                 )
                 return
-            customer = resource.project.customer
-            invoice, _ = registrators.RegistrationManager.get_or_create_invoice(
-                customer, component_usage.date
+
+            # We need to bill the overage amount against the overage component.
+            cls._create_or_update_usage_invoice_item(
+                resource=resource,
+                offering_component=offering_component.overage_component,
+                usage_to_bill=overage_amount,
+                date=component_usage.date,
+                plan_period=plan_period,
+                is_overage=True,
             )
 
-            details = cls.get_component_details(resource, plan_component)
+    @classmethod
+    def _create_or_update_usage_invoice_item(
+        cls,
+        resource: marketplace_models.Resource,
+        offering_component: marketplace_models.OfferingComponent,
+        usage_to_bill,
+        date,
+        plan_period: marketplace_models.ResourcePlanPeriod,
+        is_overage=False,
+    ):
+        """
+        Helper method to create or update an invoice item for usage-based components.
+        Handles both standard usage and overage billing.
+        """
 
-            month_start = core_utils.month_start(component_usage.date)
-            month_end = core_utils.month_end(component_usage.date)
+        plan = plan_period.plan
+        customer = resource.project.customer
+        invoice, _ = registrators.RegistrationManager.get_or_create_invoice(
+            customer, date
+        )
+
+        # Try to find an existing invoice item for this component in the current period
+        item = invoice.items.filter(
+            resource=resource,
+            details__offering_component_type=offering_component.type,
+        ).first()
+
+        try:
+            plan_component = plan.components.get(component=offering_component)
+        except ObjectDoesNotExist:
+            logger.error(
+                f"PlanComponent for component '{offering_component.type}' not found "
+                f"in plan '{plan.name}' for resource '{resource.uuid}'. Cannot bill usage."
+            )
+            return
+
+        converted_usage = cls.convert_quantity(usage_to_bill, offering_component.type)
+
+        if item:
+            item.quantity = converted_usage
+            item.save(update_fields=["quantity"])
+            logger.info(
+                f"Updated invoice item {item.pk} for resource '{resource.uuid}'. New quantity: {item.quantity}"
+            )
+        else:
+            # Create a new invoice item
+            details = cls.get_component_details(resource, plan_component)
+            if is_overage:
+                details["is_overage"] = True  # Add a flag for reporting
+
+            month_start = core_utils.month_start(date)
+            month_end = core_utils.month_end(date)
 
             start = (
-                month_start
-                if not component_usage.plan_period.start
-                else max(component_usage.plan_period.start, month_start)
+                max(plan_period.start, month_start)
+                if plan_period.start
+                else month_start
             )
-            end = (
-                month_end
-                if not component_usage.plan_period.end
-                else min(component_usage.plan_period.end, month_end)
-            )
+            end = min(plan_period.end, month_end) if plan_period.end else month_end
 
-            logger.info("About to create an invoice item for the %s", component_usage)
+            item_name = f"{resource.name} / {offering_component.name}"
+            if is_overage:
+                item_name += " (Overage)"
 
-            invoice_item = invoice_models.InvoiceItem.objects.create(
+            invoice_models.InvoiceItem.objects.create(
                 resource=resource,
                 project=resource.project,
                 invoice=invoice,
@@ -817,20 +972,66 @@ class MarketplaceRegistrator(registrators.BaseRegistrator):
                 end=end,
                 details=details,
                 unit_price=plan_component.price,
-                quantity=cls.convert_quantity(
-                    component_usage.usage, offering_component.type
-                ),
+                quantity=converted_usage,
                 unit=common_mixins.UnitPriceMixin.Units.QUANTITY,
                 measured_unit=offering_component.measured_unit,
                 article_code=offering_component.article_code or plan.article_code,
-                name=resource.name + " / " + offering_component.name,
+                name=item_name,
+            )
+            logger.info(
+                f"Created new invoice item for resource '{resource.uuid}' and "
+                f"component '{offering_component.type}' with quantity {converted_usage}."
             )
 
-            logger.info(
-                "Invoice item has been successfully created for the %s, quantity %s",
-                component_usage,
-                invoice_item.quantity,
-            )
+    @classmethod
+    def get_period_end_for_limit_period(cls, limit_period):
+        """
+        Get appropriate period end based on limit period.
+
+        Args:
+            limit_period: The limit period (MONTH, QUARTERLY, ANNUAL, TOTAL)
+
+        Returns:
+            Period end datetime for the given limit period
+        """
+        if limit_period == LimitPeriods.QUARTERLY:
+            return core_utils.get_current_quarter_end()
+        else:
+            # Default to monthly for MONTH, ANNUAL, and TOTAL
+            # ANNUAL and TOTAL periods still use monthly billing boundaries
+            # but track usage over longer periods
+            return get_current_month_end()
+
+    @classmethod
+    def should_process_quarterly_billing(cls, date):
+        """
+        Check if quarterly billing should be processed for the given date.
+
+        Quarterly billing should only happen in the first month of each quarter:
+        - January (Q1), April (Q2), July (Q3), October (Q4)
+
+        Args:
+            date: Date to check (datetime object)
+
+        Returns:
+            bool: True if quarterly billing should be processed
+        """
+        return date.month in [1, 4, 7, 10]
+
+    @classmethod
+    def get_quarterly_billing_period(cls, date):
+        """
+        Get the quarterly billing period for the given date.
+
+        Args:
+            date: Date within the quarter (datetime object)
+
+        Returns:
+            tuple: (quarter_start, quarter_end) datetime objects
+        """
+        quarter_start = core_utils.get_quarter_start(date)
+        quarter_end = core_utils.get_quarter_end(date)
+        return quarter_start, quarter_end
 
     @classmethod
     def convert_quantity(cls, usage, component_type: str):

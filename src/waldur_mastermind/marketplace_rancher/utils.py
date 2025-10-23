@@ -1,3 +1,4 @@
+import logging
 import time
 from typing import cast
 
@@ -12,9 +13,16 @@ from waldur_core.structure.models import Project
 from waldur_mastermind.common.utils import create_request
 from waldur_mastermind.marketplace.enums import OrderStates
 from waldur_mastermind.marketplace.models import Offering, Order, Plan, Resource
-from waldur_mastermind.marketplace.views import BaseResourceViewSet, OrderViewSet
-from waldur_openstack.models import Tenant
+from waldur_mastermind.marketplace.views import (
+    BaseResourceViewSet,
+    ConsumerResourceViewSet,
+    OrderViewSet,
+)
+from waldur_openstack.models import Instance, Tenant
 from waldur_rancher.exceptions import RancherException
+from waldur_rancher.models import Cluster
+
+logger = logging.getLogger(__name__)
 
 
 def is_order_ready(uuid):
@@ -106,3 +114,70 @@ def submit_termination_order(resource: Resource):
     order_uuid = data["order_uuid"]
     wait_for_order(order_uuid)
     return order_uuid
+
+
+def submit_update_order(resource: Resource, new_limits: dict):
+    post_data = {"limits": new_limits}
+    view = ConsumerResourceViewSet.as_view({"post": "update_limits"})
+    response = create_request(
+        view, get_system_robot(), uuid=resource.uuid.hex, post_data=post_data
+    )
+    data = cast(dict, response.data)
+    if response.status_code != status.HTTP_200_OK:
+        raise ValidationError(data)
+    order_uuid = data["order_uuid"]
+    wait_for_order(order_uuid)
+    return order_uuid
+
+
+class UnifiedRancherUsageCollector:
+    def collect_usage(self, resource: Resource) -> dict[str, int]:
+        deployment_mode = resource.offering.plugin_options.get("deployment_mode")
+        cluster = cast(Cluster, resource.scope)
+
+        if deployment_mode == "managed":
+            return self._collect_managed_usage(cluster)
+        else:
+            return self._collect_self_managed_usage(cluster)
+
+    def _collect_managed_usage(self, cluster: Cluster) -> dict:
+        """Aggregate usage from all linked OpenStack tenants."""
+        total_cpu = 0
+        total_ram = 0
+        total_storage = 0
+
+        for tenant_id in cluster.linked_tenant_ids:
+            for instance in Instance.objects.filter(tenant_id=tenant_id, state="OK"):
+                total_cpu += instance.cores
+                total_ram += instance.ram / 1024
+                for volume in instance.volumes.filter(state="OK"):
+                    total_storage += volume.size / 1024
+
+        return {
+            "cpu_hours": total_cpu,
+            "ram_hours": total_ram,
+            "storage_hours": total_storage,
+        }
+
+    def _collect_self_managed_usage(self, cluster: Cluster) -> dict:
+        """Calculate usage from cluster nodes."""
+        total_cpu = 0
+        total_ram = 0
+        total_storage = 0
+
+        for node in cluster.node_set.filter(state="OK"):
+            instance = node.instance
+            if not instance:
+                continue
+            if instance.state != "OK":
+                continue
+            total_cpu += instance.cores
+            total_ram += instance.ram / 1024
+            for volume in instance.volumes.filter(state="OK"):
+                total_storage += volume.size / 1024
+
+        return {
+            "cpu_hours": total_cpu,
+            "ram_hours": total_ram,
+            "storage_hours": total_storage,
+        }

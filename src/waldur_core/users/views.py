@@ -251,6 +251,12 @@ class GroupInvitationViewSet(ProtectedViewSet):
     filterset_class = filters.GroupInvitationFilter
     lookup_field = "uuid"
 
+    def get_permissions(self):
+        """Allow unauthenticated access for list and retrieve of public invitations."""
+        if self.action in ("list", "retrieve"):
+            return []
+        return super().get_permissions()
+
     @extend_schema(
         request=None,
         responses=structure_serializers.NestedProjectSerializer(
@@ -267,7 +273,7 @@ class GroupInvitationViewSet(ProtectedViewSet):
             return Response(status=status.HTTP_404_NOT_FOUND)
 
         projects = structure_serializers.NestedProjectSerializer(
-            instance=invitation.customer.projects.all(),
+            instance=Project.available_objects.filter(customer=invitation.customer),
             read_only=True,
             context={"request": request},
             many=True,
@@ -295,22 +301,35 @@ class GroupInvitationViewSet(ProtectedViewSet):
             status=status.HTTP_200_OK,
         )
 
-    @extend_schema(request=None)
+    @extend_schema(request=None, responses=serializers.SubmitRequestResponseSerializer)
     @action(detail=True, methods=["post"], filter_backends=[])
     def submit_request(self, request, uuid=None):
         invitation: models.GroupInvitation = self.get_object()
+        user = request.user
 
         if not invitation.is_active:
             raise ValidationError(_("Only pending invitation can be requested."))
 
+        # Authentication is required for submitting requests (handled by permission classes)
+
         if (
             models.PermissionRequest.objects.filter(
-                invitation=invitation, created_by=request.user
+                invitation=invitation, created_by=user
             )
             .exclude(state=ReviewStates.REJECTED)
             .exists()
         ):
             raise ValidationError(_("Request has been created already."))
+
+        allowed = invitation in models.GroupInvitation.get_objects_by_user_patterns(
+            user, required=False
+        )
+
+        if not allowed:
+            raise ValidationError(
+                "You are not allowed to accept this invitation. "
+                "Your email or organization must match the invitation restrictions."
+            )
 
         permission_request = models.PermissionRequest.objects.create(
             invitation=invitation,
@@ -318,8 +337,26 @@ class GroupInvitationViewSet(ProtectedViewSet):
         )
 
         permission_request.submit()
+
+        # Get scope details safely
+        scope_name = ""
+        scope_uuid = ""
+        if invitation.scope:
+            scope_name = getattr(invitation.scope, "name", str(invitation.scope))
+            scope_uuid = str(invitation.scope.uuid)
+
+        # Use the serializer to validate and format the response
+        response_serializer = serializers.SubmitRequestResponseSerializer(
+            data={
+                "uuid": permission_request.uuid.hex,
+                "scope_name": scope_name,
+                "scope_uuid": scope_uuid,
+            }
+        )
+        response_serializer.is_valid(raise_exception=True)
+
         return Response(
-            {"uuid": permission_request.uuid.hex},
+            response_serializer.data,
             status=status.HTTP_200_OK,
         )
 
@@ -364,6 +401,47 @@ class PermissionRequestViewSet(ReadOnlyActionsViewSet):
     @action(detail=True, methods=["post"])
     def reject(self, request, uuid=None):
         return self.perform_action(request, uuid, "reject")
+
+    @extend_schema(request=None, responses=serializers.CancelRequestResponseSerializer)
+    @action(detail=True, methods=["post"])
+    def cancel_request(self, request, uuid=None):
+        """Cancel permission request. Users can cancel their own requests, staff can cancel any request."""
+        permission_request: models.PermissionRequest = self.get_object()
+
+        # Check that the user canceling is the same user who created the request OR is staff
+        if permission_request.created_by != request.user and not request.user.is_staff:
+            raise PermissionDenied(
+                _("You can only cancel your own permission requests.")
+            )
+
+        # Check that the request is in a state that can be canceled
+        if permission_request.state not in [ReviewStates.PENDING, ReviewStates.DRAFT]:
+            raise ValidationError(_("Only pending or draft requests can be canceled."))
+
+        permission_request.cancel()
+
+        # Get scope details safely
+        invitation = permission_request.invitation
+        scope_name = ""
+        scope_uuid = ""
+        if invitation.scope:
+            scope_name = getattr(invitation.scope, "name", str(invitation.scope))
+            scope_uuid = str(invitation.scope.uuid)
+
+        # Use the serializer to validate and format the response
+        response_serializer = serializers.CancelRequestResponseSerializer(
+            data={
+                "uuid": permission_request.uuid.hex,
+                "scope_name": scope_name,
+                "scope_uuid": scope_uuid,
+            }
+        )
+        response_serializer.is_valid(raise_exception=True)
+
+        return Response(
+            response_serializer.data,
+            status=status.HTTP_200_OK,
+        )
 
     approve_serializer_class = reject_serializer_class = (
         core_serializers.ReviewCommentSerializer

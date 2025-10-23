@@ -13,7 +13,7 @@ from waldur_auth_social.const import ProviderChoices
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.utils import format_text, serialize_instance
 from waldur_core.permissions.enums import RoleEnum
-from waldur_core.permissions.fixtures import CustomerRole
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure.tests.factories import (
     NotificationFactory,
     ProjectFactory,
@@ -21,11 +21,16 @@ from waldur_core.structure.tests.factories import (
 )
 from waldur_core.structure.tests.fixtures import ProjectFixture
 from waldur_mastermind.marketplace import models
-from waldur_mastermind.marketplace.enums import OfferingStates, ResourceStates
+from waldur_mastermind.marketplace.enums import (
+    REMOTE_OFFERING,
+    OfferingStates,
+    ResourceStates,
+)
 from waldur_mastermind.marketplace.tests import factories, fixtures
-from waldur_mastermind.marketplace_remote import PLUGIN_NAME, tasks, utils
+from waldur_mastermind.marketplace_remote import tasks, utils
 from waldur_mastermind.marketplace_remote.models import ProjectUpdateRequest
 from waldur_mastermind.marketplace_remote.tests.utils import get_request_data
+from waldur_mastermind.marketplace_remote.utils import INVALID_RESOURCE_STATES
 
 
 @override_settings(WALDUR_AUTH_SOCIAL={"ENABLE_EDUTEAMS_SYNC": True})
@@ -41,7 +46,7 @@ class SyncRemoteProjectPermissionsTest(testcases.TransactionTestCase):
         self.resource = self.fixture.resource
         self.resource.state = ResourceStates.OK
         self.resource.save()
-        self.resource.offering.type = PLUGIN_NAME
+        self.resource.offering.type = REMOTE_OFFERING
         self.api_url = "https://example.com"
         self.resource.offering.secret_options = {
             "api_url": self.api_url,
@@ -347,13 +352,227 @@ class SyncRemoteProjectPermissionsTest(testcases.TransactionTestCase):
         )
 
 
+class UpdateRemoteProjectPermissionsTest(testcases.TransactionTestCase):
+    """Test cases for update_remote_project_permissions task behavior."""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.project = self.fixture.project
+        self.user = self.fixture.manager
+
+        self.user.identity_source = ProviderChoices.EDUTEAMS
+        self.user.registration_method = ProviderChoices.EDUTEAMS
+        self.user.save()
+
+    @override_settings(WALDUR_AUTH_SOCIAL={"ENABLE_EDUTEAMS_SYNC": True})
+    def test_task_should_not_be_triggered_for_project_without_remote_resources(self):
+        """
+        Test that update_remote_project_permissions task is not triggered
+        for projects that have no remote offering resources.
+        """
+        self.fixture.resource.offering.type = "SomeOtherOffering"
+        self.fixture.resource.offering.save()
+
+        remote_resources = models.Resource.objects.filter(
+            project=self.project, offering__type=REMOTE_OFFERING
+        )
+        self.assertEqual(
+            remote_resources.count(), 0, "Project should have no remote resources"
+        )
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.tasks.update_remote_project_permissions.apply_async"
+        ) as mock_task:
+            self.project.add_user(self.user, ProjectRole.MANAGER)
+            mock_task.assert_not_called()
+
+    @override_settings(WALDUR_AUTH_SOCIAL={"ENABLE_EDUTEAMS_SYNC": True})
+    def test_task_should_not_be_triggered_for_project_with_terminated_remote_resources(
+        self,
+    ):
+        """
+        Test that update_remote_project_permissions task is not triggered
+        for projects that only have terminated remote offering resources.
+        """
+        # Ensure project has remote resources but they are terminated
+        self.fixture.resource.offering.type = REMOTE_OFFERING
+        self.fixture.resource.state = ResourceStates.TERMINATED
+        self.fixture.resource.offering.save()
+        self.fixture.resource.save()
+
+        # Verify only terminated remote resources exist
+        active_remote_resources = models.Resource.objects.filter(
+            project=self.project, offering__type=REMOTE_OFFERING
+        ).exclude(state__in=INVALID_RESOURCE_STATES)
+        self.assertEqual(
+            active_remote_resources.count(),
+            0,
+            "Project should have no active remote resources",
+        )
+
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.tasks.update_remote_project_permissions.apply_async"
+        ) as mock_task:
+            self.project.add_user(self.user, ProjectRole.MANAGER)
+            mock_task.assert_not_called()
+
+    @override_settings(WALDUR_AUTH_SOCIAL={"ENABLE_EDUTEAMS_SYNC": True})
+    def test_task_should_be_triggered_for_project_with_remote_resources(self):
+        """
+        Test that update_remote_project_permissions task IS triggered
+        for projects that have remote offering resources.
+        """
+        self.fixture.resource.offering.type = REMOTE_OFFERING
+        self.fixture.resource.state = ResourceStates.OK
+        self.fixture.resource.save()
+        self.fixture.resource.offering.save()
+
+        remote_resources = models.Resource.objects.filter(
+            project=self.project, offering__type=REMOTE_OFFERING
+        )
+        self.assertEqual(
+            remote_resources.count(), 1, "Project should have remote resources"
+        )
+
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.tasks.update_remote_project_permissions.apply_async"
+        ) as mock_task:
+            self.project.add_user(self.user, ProjectRole.MANAGER)
+
+            mock_task.assert_called_once()
+
+    def test_task_handles_soft_deleted_project_gracefully(self):
+        """
+        Test that update_remote_project_permissions task handles soft-deleted projects
+        without raising DoesNotExist exceptions.
+        """
+        self.project.delete(soft=True)
+        self.project.refresh_from_db()
+        self.assertTrue(self.project.is_removed, "Project should be soft-deleted")
+
+        serialized_project = serialize_instance(self.project)
+        serialized_user = serialize_instance(self.user)
+
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.sync_project_permission"
+        ) as mock_sync:
+            tasks.update_remote_project_permissions(
+                serialized_project=serialized_project,
+                serialized_user=serialized_user,
+                role_name=RoleEnum.PROJECT_MANAGER.value,
+                grant=True,
+                expiration_time=None,
+            )
+            mock_sync.assert_not_called()
+
+    def test_task_handles_hard_deleted_project_gracefully(self):
+        """
+        Test that update_remote_project_permissions task handles hard-deleted projects
+        without raising DoesNotExist exceptions.
+        """
+        serialized_project = serialize_instance(self.project)
+        serialized_user = serialize_instance(self.user)
+
+        self.project.delete(soft=False)
+
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.tasks.sync_project_permission"
+        ) as mock_sync:
+            tasks.update_remote_project_permissions(
+                serialized_project=serialized_project,
+                serialized_user=serialized_user,
+                role_name=RoleEnum.PROJECT_MANAGER.value,
+                grant=True,
+                expiration_time=None,
+            )
+            mock_sync.assert_not_called()
+
+    def test_task_calls_sync_project_permission_for_valid_project(self):
+        """
+        Test that update_remote_project_permissions task calls sync_project_permission
+        for valid (non-deleted) projects.
+        """
+        serialized_project = serialize_instance(self.project)
+        serialized_user = serialize_instance(self.user)
+
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.tasks.sync_project_permission"
+        ) as mock_sync:
+            tasks.update_remote_project_permissions(
+                serialized_project=serialized_project,
+                serialized_user=serialized_user,
+                role_name=RoleEnum.PROJECT_MANAGER.value,
+                grant=True,
+                expiration_time=None,
+            )
+            mock_sync.assert_called_once_with(
+                True, self.project, RoleEnum.PROJECT_MANAGER.value, self.user, None
+            )
+
+    def test_task_logs_soft_deleted_project_specifically(self):
+        """
+        Test that the task logs specifically when a project is soft-deleted
+        vs when it's completely missing.
+        """
+        self.project.is_removed = True
+        self.project.save()
+
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.logger"
+        ) as mock_logger:
+            tasks.update_remote_project_permissions(
+                serialized_project=serialize_instance(self.project),
+                serialized_user=serialize_instance(self.user),
+                role_name=ProjectRole.MANAGER,
+                grant=True,
+            )
+
+            mock_logger.warning.assert_called_once()
+            call_args = mock_logger.warning.call_args
+            fmt = call_args[0][0]
+            args = call_args[0][1:]
+            message = fmt % args
+
+            self.assertIn("soft-deleted project", message)
+            self.assertIn(f"project_id={self.project.pk}", message)
+            self.assertIn(f"user_id={self.user.pk}", message)
+
+    def test_task_logs_soft_deleted_user_specifically(self):
+        """
+        Test that the task logs specifically when a user is soft-deleted
+        vs when they're completely missing.
+        """
+        serialized_user = serialize_instance(self.user)
+
+        self.user.is_active = False
+        self.user.save()
+
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.logger"
+        ) as mock_logger:
+            tasks.update_remote_project_permissions(
+                serialized_project=serialize_instance(self.project),
+                serialized_user=serialized_user,
+                role_name=ProjectRole.MANAGER,
+                grant=True,
+            )
+
+            mock_logger.warning.assert_called_once()
+            call_args = mock_logger.warning.call_args
+            fmt = call_args[0][0]
+            args = call_args[0][1:]
+            message = fmt % args
+            self.assertIn("inactive user", message)
+            self.assertIn(f"project_id={self.project.pk}", message)
+            self.assertIn(f"user_id={self.user.pk}", message)
+
+
 class DeleteRemoteProjectsTest(testcases.TransactionTestCase):
     def setUp(self):
         self.project = ProjectFactory()
         self.backend_id = f"{self.project.customer.uuid}_{self.project.uuid}"
         self.api_url = "http://example.com"
         self.offering = factories.OfferingFactory(
-            type=PLUGIN_NAME,
+            type=REMOTE_OFFERING,
             state=OfferingStates.ACTIVE,
             secret_options={"api_url": self.api_url, "token": "token"},
         )
@@ -404,7 +623,8 @@ class OfferingUserPullTest(testcases.TransactionTestCase):
     def setUp(self):
         self.api_url = "http://example.com"
         self.offering = factories.OfferingFactory(
-            secret_options={"api_url": self.api_url, "token": "token"}
+            secret_options={"api_url": self.api_url, "token": "token"},
+            backend_id=uuid.uuid4().hex,
         )
         respx.start()
 
@@ -462,7 +682,7 @@ class ResourceOrderImportTest(testcases.TransactionTestCase):
         self.resource = self.fixture.resource
         self.resource.backend_id = uuid.uuid4().hex
         self.resource.save()
-        self.resource.offering.type = PLUGIN_NAME
+        self.resource.offering.type = REMOTE_OFFERING
         self.api_url = "https://example.com"
         self.resource.offering.secret_options = {
             "api_url": self.api_url,
@@ -557,7 +777,7 @@ class ResourceOrderImportTest(testcases.TransactionTestCase):
 
         respx.post(
             f"{self.api_url}/api/marketplace-resources/{resource_uuid}/update_options/"
-        ).respond(200, json={})
+        ).respond(200, json={"status": "ok"})
 
         self.mock_marketplace_resource(
             resource_uuid,
@@ -663,7 +883,7 @@ class OfferingListPullTaskTest(testcases.TransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
-        self.offering.type = PLUGIN_NAME
+        self.offering.type = REMOTE_OFFERING
         self.api_url = "https://example.com"
         self.offering.secret_options = {
             "api_url": self.api_url,
@@ -759,6 +979,61 @@ class OfferingListPullTaskTest(testcases.TransactionTestCase):
         )
 
 
+class OfferingUserListPullTaskTest(testcases.TransactionTestCase):
+    def setUp(self):
+        self.api_url = "http://example.com"
+        self.offering_with_option = factories.OfferingFactory(
+            type=REMOTE_OFFERING,
+            secret_options={"api_url": self.api_url, "token": "token"},
+            plugin_options={"service_provider_can_create_offering_user": True},
+            backend_id=uuid.uuid4().hex,
+        )
+        self.offering_without_option = factories.OfferingFactory(
+            type=REMOTE_OFFERING,
+            secret_options={"api_url": self.api_url, "token": "token"},
+            plugin_options={},  # Explicitly set empty dict to avoid JSONField issues
+            backend_id=uuid.uuid4().hex,
+        )
+
+    def test_offering_with_service_provider_option_is_excluded(self):
+        """
+        Test that offerings with service_provider_can_create_offering_user=True
+        are excluded from the pull task.
+        """
+        task = tasks.OfferingUserListPullTask()
+        pulled_objects = list(task.get_pulled_objects())
+
+        self.assertNotIn(
+            self.offering_with_option,
+            pulled_objects,
+            "Offering with service_provider_can_create_offering_user=True should be excluded",
+        )
+        self.assertIn(
+            self.offering_without_option,
+            pulled_objects,
+            "Offering without the option should be included",
+        )
+
+    def test_offering_with_false_option_is_included(self):
+        """
+        Test that offerings with service_provider_can_create_offering_user=False
+        are included in the pull task.
+        """
+        self.offering_with_option.plugin_options = {
+            "service_provider_can_create_offering_user": False
+        }
+        self.offering_with_option.save()
+
+        task = tasks.OfferingUserListPullTask()
+        pulled_objects = task.get_pulled_objects()
+
+        self.assertIn(
+            self.offering_with_option,
+            pulled_objects,
+            "Offering with service_provider_can_create_offering_user=False should be included",
+        )
+
+
 @override_settings(
     WALDUR_AUTH_SOCIAL={"ENABLE_EDUTEAMS_SYNC": True},
     task_always_eager=True,
@@ -768,8 +1043,8 @@ class OfferingUserPullTaskTest(testcases.TransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
-        self.offering.type = PLUGIN_NAME
-        self.offering.backend_id = "test-backend-id"
+        self.offering.type = REMOTE_OFFERING
+        self.offering.backend_id = uuid.uuid4().hex
         self.offering.secret_options = {
             "api_url": "https://example.com/",
             "token": "token",
@@ -832,7 +1107,7 @@ class UsagePullTest(testcases.TransactionTestCase):
         self.resource = self.fixture.resource
         self.resource.backend_id = uuid.uuid4().hex
         self.resource.save()
-        self.resource.offering.type = PLUGIN_NAME
+        self.resource.offering.type = REMOTE_OFFERING
         self.api_url = "https://example.com"
         self.resource.offering.secret_options = {
             "api_url": self.api_url,
