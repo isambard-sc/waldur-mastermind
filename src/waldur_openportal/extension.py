@@ -38,6 +38,12 @@ class OpenPortalExtension(WaldurExtension):
                 "schedule": timedelta(minutes=7),
                 "args": (),
             },
+            # This task updates the resource limits for all allocations
+            "waldur-openportal-sync-allocation-limits": {
+                "task": "waldur_openportal.sync_allocation_limits",
+                "schedule": timedelta(minutes=17),
+                "args": (),
+            },
             # This task checks if we need to email project members with
             # their fortnightly project consumption statistics email
             "waldur-openportal-send-notifications": {

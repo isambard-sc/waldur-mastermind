@@ -147,7 +147,7 @@ class AllocationSetLimitsSerializer(rf_serializers.ModelSerializer):
 
     class Meta:
         model = models.Allocation
-        fields = "node_limit"
+        fields = ["node_limit"]
 
 
 class RemoteAllocationSetLimitsSerializer(rf_serializers.ModelSerializer):
@@ -155,7 +155,7 @@ class RemoteAllocationSetLimitsSerializer(rf_serializers.ModelSerializer):
 
     class Meta:
         model = models.RemoteAllocation
-        fields = "node_limit"
+        fields = ["node_limit"]
 
 
 class AllocationUserUsageCreateSerializer(rf_serializers.HyperlinkedModelSerializer):
@@ -382,7 +382,7 @@ class ProjectTemplateSerializer(
 
     role_mapping_data = rf_serializers.SerializerMethodField()
 
-    def get_role_mapping_data(self, obj):
+    def get_role_mapping_data(self, obj) -> dict[str, dict[str, str]]:
         """
         Serialize the role mapping dictionary returned by get_role_mapping()
         """

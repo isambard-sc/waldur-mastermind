@@ -6,6 +6,7 @@ import django.db.models.deletion
 
 class Migration(migrations.Migration):
     dependencies = [
+        ("structure", "0054_merge_20250612_0633"),
         ("waldur_openportal", "0023_rename_projectclass_projecttemplate_and_more"),
     ]
 

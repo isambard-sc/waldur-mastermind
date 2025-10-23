@@ -6,6 +6,8 @@ from .api import (
     project_spend_info,
     customer_spend_info,
     fetch_job,
+    whoami,
+    get_api_token,
 )
 
 
@@ -83,6 +85,17 @@ urlpatterns = [
         fetch_job,
         name="fetch-job",
     ),
+    re_path(
+        r"^api/openportal/whoami/",
+        whoami,
+        name="whoami",
+    ),
+    re_path(
+        r"^api/openportal/get_api_token/",
+        get_api_token,
+        name="get_api_token",
+    ),
+    # Custom routes for ManagedProject with composite lookup
     re_path(
         r"^api/openportal-managed-projects/(?P<identifier>[\w.-]+)/(?P<destination>[\w.-]+)/$",
         views.ManagedProjectViewSet.as_view({"get": "retrieve"}),

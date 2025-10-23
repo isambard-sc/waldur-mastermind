@@ -16,6 +16,7 @@ import waldur_core.structure.models
 class Migration(migrations.Migration):
     dependencies = [
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
+        ("structure", "0053_alter_project_short_name"),
         ("waldur_openportal", "0015_oncetask"),
     ]
 

@@ -1,7 +1,6 @@
 import logging
 
 from django.core import exceptions as django_exceptions
-from django.core.exceptions import MultipleObjectsReturned, ObjectDoesNotExist
 from django.utils import timezone
 
 from waldur_core.core.utils import month_start
@@ -62,45 +61,48 @@ def update_component_quota(sender, instance, created=False, **kwargs):
                 component=offering_component,
                 defaults={"limit": limit, "usage": usage},
             )
-            try:
-                plan_period = marketplace_models.ResourcePlanPeriod.objects.get(
-                    resource=resource, end=None
-                )
-            except (ObjectDoesNotExist, MultipleObjectsReturned):
+
+            plan_period = marketplace_models.ResourcePlanPeriod.objects.filter(
+                resource=resource, end=None
+            )
+
+            if not plan_period.exists():
                 logger.warning(
-                    "Skipping component usage synchronization because valid"
-                    "ResourcePlanPeriod is not found."
-                    "Allocation ID: %s",
-                    allocation.id,
+                    "Skipping component usage synchronization because valid "
+                    "ResourcePlanPeriod is not found. "
+                    f"Allocation: {allocation}, Resource: {resource}",
                 )
-            else:
-                date = timezone.now()
-                marketplace_models.ComponentUsage.objects.update_or_create(
-                    resource=resource,
-                    component=offering_component,
-                    billing_period=month_start(date),
-                    plan_period=plan_period,
-                    defaults={"usage": usage, "date": date},
+                continue
+
+            if plan_period.count() > 1:
+                logger.warning(
+                    f"More than one active ResourcePlanPeriod found for Allocation: {allocation}, Resource: {resource}. "
+                    "Using the first plan only."
                 )
+
+            plan_period = plan_period.first()
+
+            date = timezone.now()
+            marketplace_models.ComponentUsage.objects.update_or_create(
+                resource=resource,
+                component=offering_component,
+                billing_period=month_start(date),
+                plan_period=plan_period,
+                defaults={"usage": usage, "date": date},
+            )
 
     logger.info(f"Old limits: {resource.limits}, new limits: {new_limits}")
 
     if resource.limits != new_limits:
         logger.debug(
-            "Syncing limits for OpenPortal. Allocation ID: %s. Old limits: %s. New limits: %s",
-            allocation.id,
-            resource.limits,
-            new_limits,
+            f"Syncing limits for OpenPortal. Allocation: {allocation}. Old limits: {resource.limits}. New limits: {new_limits}",
         )
         resource.limits = new_limits
         resource.save(update_fields=["limits"])
 
     if resource.current_usages != new_usages:
         logger.debug(
-            "Syncing usages for OpenPortal. Allocation ID: %s. Old usages: %s. New usages: %s",
-            allocation.id,
-            resource.current_usages,
-            new_usages,
+            f"Syncing usages for OpenPortal. Allocation: {allocation}. Old usages: {resource.current_usages}. New usages: {new_usages}",
         )
         resource.current_usages = new_usages
         resource.save(update_fields=["current_usages"])

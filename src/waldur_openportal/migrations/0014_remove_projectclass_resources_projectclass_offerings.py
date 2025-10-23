@@ -5,6 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
+        ("marketplace", "0163_remove_order_activated"),
         ("waldur_openportal", "0013_managedproject_local_identifier_and_more"),
     ]
 
