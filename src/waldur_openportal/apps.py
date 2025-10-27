@@ -8,6 +8,8 @@ class OpenPortalConfig(AppConfig):
     service_name = "OpenPortal"
 
     def ready(self):
+        # These need to be imported here to avoid circular imports
+        # This is the same as in waldur_slurm.apps.py
         from waldur_core.core import models as core_models
         from waldur_core.permissions import signals as permission_signals
         from waldur_core.quotas import models as quota_models
@@ -20,12 +22,6 @@ class OpenPortalConfig(AppConfig):
         from .backend import OpenPortalBackend
 
         SupportedServices.register_backend(OpenPortalBackend)
-
-        signals.pre_delete.connect(
-            handlers.schedule_deletion_sync,
-            sender=structure_models.Project,
-            dispatch_uid="waldur_openportal.handlers.schedule_sync_on_project_deletion",
-        )
 
         signals.post_save.connect(
             handlers.update_user,

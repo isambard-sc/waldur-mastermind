@@ -19,7 +19,7 @@ from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
 from waldur_core.core import views as core_views
 from waldur_core.core import models as core_models
-from waldur_core.core.serializers import ReviewCommentSerializer
+from waldur_core.core.serializers import ReviewCommentSerializer, EmptySerializer
 from waldur_core.structure.filters import GenericRoleFilter
 from waldur_core.core.validators import StateValidator
 
@@ -659,7 +659,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
 
     serializer_class = serializers.ManagedProjectSerializer
     attach_serializer_class = serializers.ProjectAttachSerializer
-    detach_serializer_class = None
+    detach_serializer_class = EmptySerializer
     approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
 
     approve_validators = reject_validators = [

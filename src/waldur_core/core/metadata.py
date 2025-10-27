@@ -657,8 +657,8 @@ class WaldurConfiguration(BaseModel):
     WALDUR_HPC: WaldurHPC = WaldurHPC()
     WALDUR_SLURM: WaldurSlurm = WaldurSlurm()
     WALDUR_PID: WaldurPID = WaldurPID()
-    WALDUR_OPENSTACK: WaldurOpenstack = WaldurOpenstack()
     WALDUR_OPENPORTAL: WaldurOpenPortal = WaldurOpenPortal()
+    WALDUR_OPENSTACK: WaldurOpenstack = WaldurOpenstack()
     WALDUR_AUTH_SAML2: WaldurAuthSAML2 = WaldurAuthSAML2()
     VERIFY_WEBHOOK_REQUESTS: bool = Field(
         True,

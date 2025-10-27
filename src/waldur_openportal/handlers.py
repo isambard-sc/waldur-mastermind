@@ -49,16 +49,6 @@ def schedule_sync(*args, **kwargs):
 
 
 @if_plugin_enabled
-def schedule_deletion_sync(*args, **kwargs):
-    """
-    Schedule a synchronization of OpenPortal data after a project or
-    customer is deleted. This will double-check that all users are correctly
-    associated with the project/customer, and will remove users as needed.
-    """
-    logger.info("[TODO] Scheduling OpenPortal synchronization after deletion.")
-
-
-@if_plugin_enabled
 def schedule_project_sync(project):
     """
     Schedule a synchronization of OpenPortal data for a specific project.

@@ -2,8 +2,6 @@ from django.apps import AppConfig
 from django.conf import settings as django_settings
 from django.db.models import signals
 
-from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
-
 
 class MarketplaceOpenPortalRemoteConfig(AppConfig):
     name = "waldur_mastermind.marketplace_openportal_remote"
@@ -11,7 +9,10 @@ class MarketplaceOpenPortalRemoteConfig(AppConfig):
     service_name = "OpenPortal Remote"
 
     def ready(self):
-        from waldur_core.permissions import signals as permission_signals
+        # These need to be imported here to avoid circular imports
+        # This is the same as in waldur_slurm.apps.py
+        from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
+
         from waldur_mastermind.marketplace import handlers as marketplace_handlers
         from waldur_mastermind.marketplace import models as marketplace_models
         from waldur_mastermind.marketplace.plugins import Component, manager
@@ -80,42 +81,8 @@ class MarketplaceOpenPortalRemoteConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.synch_offering_resource_options,
+            handlers.sync_offering_resource_options,
             sender=marketplace_models.Offering,
             dispatch_uid="waldur_mastermind.marketplace_openportal_remote."
-            "synch_offering_resource_options",
-        )
-
-        signals.post_save.connect(
-            handlers.send_done_order_to_message_queue,
-            sender=marketplace_models.Order,
-            dispatch_uid="waldur_mastermind.marketplace_openportal_remote.send_done_order_to_message_queue",
-        )
-
-        signals.post_save.connect(
-            handlers.send_pending_order_to_message_queue,
-            sender=marketplace_models.Order,
-            dispatch_uid="waldur_mastermind.marketplace_openportal_remote.send_pending_order_to_message_queue",
-        )
-
-        signals.post_save.connect(
-            handlers.send_offering_user_username_message,
-            sender=marketplace_models.OfferingUser,
-            dispatch_uid="waldur_mastermind.marketplace_openportal_remote.send_offering_user_username_message",
-        )
-
-        signals.post_save.connect(
-            handlers.send_resource_update_message_to_mqtt,
-            sender=marketplace_models.Resource,
-            dispatch_uid="waldur_mastermind.marketplace_openportal_remote.send_resource_status_changed_message_to_mqtt",
-        )
-
-        permission_signals.role_granted.connect(
-            handlers.send_role_granted_message_to_mqtt,
-            dispatch_uid="waldur_mastermind.marketplace_openportal_remote.send_role_granted_message_to_mqtt",
-        )
-
-        permission_signals.role_revoked.connect(
-            handlers.send_role_revoked_message_to_mqtt,
-            dispatch_uid="waldur_mastermind.marketplace_openportal_remote.send_role_revoked_message_to_mqtt",
+            "sync_offering_resource_options",
         )
