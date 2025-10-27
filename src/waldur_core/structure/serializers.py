@@ -222,10 +222,10 @@ class ProjectSerializer(
     description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
     start_date = serializers.DateField(required=False, allow_null=True)
     end_date = serializers.DateField(required=False, allow_null=True)
-    grace_period_days = serializers.ReadOnlyField()
-    end_date_with_grace = serializers.ReadOnlyField()
-    is_in_grace_period = serializers.ReadOnlyField()
-    is_expired = serializers.ReadOnlyField()
+    grace_period_days = serializers.SerializerMethodField()
+    end_date_with_grace = serializers.SerializerMethodField()
+    is_in_grace_period = serializers.SerializerMethodField()
+    is_expired = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Project
@@ -400,6 +400,83 @@ class ProjectSerializer(
             state__in=(ResourceStates.OK, ResourceStates.UPDATING),
             project=project,
         ).count()
+
+    @extend_schema_field(
+        serializers.IntegerField(
+            help_text="Number of days grace period after project end date. During the grace period, "
+            "the project remains active but will be unable to consume resource This allows for a transition "
+            "period before full termination."
+        )
+    )
+    def get_grace_period_days(self, project) -> int:
+        """
+        Number of days grace period after project end date.
+
+        During the grace period, the project remains active but will be unable to consume resources. This allows for a transition period before full termination.
+
+        :param project: Project instance
+        :return: Number of grace period days (integer)
+        """
+        return project.grace_period_days
+
+    @extend_schema_field(
+        serializers.DateField(
+            allow_null=True,
+            help_text="The actual termination date including grace period. This is calculated as "
+            "end_date plus grace_period_days. Returns null if no end_date is set.",
+        )
+    )
+    def get_end_date_with_grace(self, project):
+        """
+        Calculate the actual termination date including grace period.
+
+        This is the date when the project will be fully terminated, calculated as
+        end_date plus grace_period_days.
+
+        :param project: Project instance
+        :return: Date when project will be terminated, or None if no end_date is set
+        """
+        return project.end_date_with_grace
+
+    @extend_schema_field(
+        serializers.BooleanField(
+            help_text="True if project is currently in the grace period. A project is in grace period "
+            "when the current date is after end_date but before end_date_with_grace. During this time, "
+            "the project remains accessible but is unable to consume resources."
+        )
+    )
+    def get_is_in_grace_period(self, project) -> bool:
+        """
+        Check if project is currently in the grace period.
+
+        A project is in grace period when the current date is after the end_date
+        but before the end_date_with_grace. During this time, the project remains
+        accessible but is unable to consume resources.
+
+        :param project: Project instance
+        :return: True if project is in grace period, False otherwise
+        """
+        return project.is_in_grace_period
+
+    @extend_schema_field(
+        serializers.BooleanField(
+            help_text="True if project end_date has been reached (not including grace period). "
+            "Note: Resources may still be active during the grace period. For termination logic, "
+            "use end_date_with_grace instead."
+        )
+    )
+    def get_is_expired(self, project) -> bool:
+        """
+        Check if project end date has been reached.
+
+        Note: This indicates the project has reached its end_date, but resources
+        may still be active during the grace period. For termination logic,
+        use end_date_with_grace instead.
+
+        :param project: Project instance
+        :return: True if end_date has passed, False otherwise
+        """
+        return project.is_expired
 
 
 class CountrySerializerMixin(serializers.Serializer):
