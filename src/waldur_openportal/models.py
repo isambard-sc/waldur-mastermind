@@ -1171,10 +1171,10 @@ class ProjectInfo(models.Model):
 
         elif self.shortname is None:
             # automatically generate a shortname if this is not set
-            logger.warning(
-                f"No shortname set for project {self.project} - using slug: {e}"
-            )
             shortname = self.project.slug.strip()
+            logger.warning(
+                f"No shortname set for project {self.project} - using slug: {shortname}"
+            )
 
             if len(shortname) == 0:
                 raise ValueError(
