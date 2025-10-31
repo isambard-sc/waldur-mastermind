@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import cast
 
@@ -861,8 +862,6 @@ class ProposalViewSet(
         # - Full URL with domain
 
         # Try to extract UUID from the file identifier
-        import re
-
         uuid_pattern = re.compile(
             r"[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?"
             r"[0-9a-f]{4}-?[0-9a-f]{12}",
