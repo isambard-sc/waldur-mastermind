@@ -980,9 +980,7 @@ class ProposalViewSet(
             ["round.call", "round.call.manager"],
         )
     ]
-    return_to_applicant_serializer_class = (
-        serializers.ProposalApproveSerializer
-    )
+    return_to_applicant_serializer_class = serializers.ProposalApproveSerializer
 
     # Checklist Integration Endpoints
     # Checklist methods are now provided by ChecklistViewSetMixin
@@ -1326,3 +1324,42 @@ class ProposalProjectRoleMappingViewSet(ActionsViewSet):
     filterset_class = filters.ProposalProjectRoleMappingFilter
     filter_backends = (DjangoFilterBackend,)
     permission_classes = [proposal_permissions.CanUpdateCallPermission]
+
+
+class ProposalUserViewSet(viewsets.GenericViewSet):
+    """
+    ViewSet for creating or retrieving users for proposals.
+
+    POST /api/proposal-add-user/
+    - Accepts: email, first_name, last_name
+    - Returns: User object (existing or newly created)
+
+    This endpoint is used when building proposal teams to either find
+    existing users by email or create new user accounts on-the-fly.
+    """
+
+    serializer_class = serializers.ProposalUserSerializer
+    permission_classes = (rf_permissions.IsAuthenticated,)
+
+    @extend_schema(
+        request=serializers.ProposalUserSerializer,
+        responses={200: serializers.ProposalUserSerializer},
+        description="Create or retrieve a user for a proposal team. "
+        "If a user with the given email exists, returns that user. "
+        "Otherwise creates a new user account with the provided details.",
+    )
+    def create(self, request):
+        """
+        Get or create a user based on email, first_name, last_name.
+
+        Requires authentication. Any authenticated user can use this endpoint
+        to look up or create users for their proposal teams.
+        """
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user = serializer.save()
+
+        # Prepare response data with all user fields
+        response_serializer = self.serializer_class(user)
+        return response.Response(response_serializer.data, status=status.HTTP_200_OK)

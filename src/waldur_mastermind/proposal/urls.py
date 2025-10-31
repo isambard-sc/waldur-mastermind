@@ -49,6 +49,11 @@ def register_in(router):
         views.ProposalProjectRoleMappingViewSet,
         basename="call-proposal-project-role-mapping",
     )
+    router.register(
+        r"proposal-add-user",
+        views.ProposalUserViewSet,
+        basename="proposal-add-user",
+    )
 
 
 urlpatterns = [

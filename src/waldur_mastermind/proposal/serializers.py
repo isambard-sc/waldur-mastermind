@@ -14,6 +14,7 @@ from rest_framework.reverse import reverse
 from waldur_core.checklist import enums as checklist_enums
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist import serializers as checklist_serializers
+from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
 from waldur_core.permissions import enums as permissions_enums
 from waldur_core.permissions import utils as permissions_utils
@@ -1540,3 +1541,76 @@ class CallComplianceReviewSerializer(serializers.Serializer):
             return value
         except models.Proposal.DoesNotExist:
             raise serializers.ValidationError("Proposal not found in this call")
+
+
+class ProposalUserSerializer(serializers.Serializer):
+    """
+    Serializer for creating or retrieving users for proposals.
+
+    Accepts email, first_name, and last_name. If a user with the email
+    exists, returns that user. Otherwise creates a new user.
+    """
+
+    email = serializers.EmailField(required=True)
+    first_name = serializers.CharField(required=True, max_length=100)
+    last_name = serializers.CharField(required=True, max_length=100)
+
+    # Read-only fields for response
+    uuid = serializers.UUIDField(read_only=True)
+    username = serializers.CharField(read_only=True)
+    full_name = serializers.CharField(read_only=True)
+    is_active = serializers.BooleanField(read_only=True)
+    registration_method = serializers.CharField(read_only=True)
+
+    def validate_email(self, value):
+        """Validate email format."""
+        return value.lower().strip()
+
+    def validate_first_name(self, value):
+        """Validate and clean first name."""
+        return value.strip()
+
+    def validate_last_name(self, value):
+        """Validate and clean last name."""
+        return value.strip()
+
+    def create(self, validated_data):
+        """
+        Get or create a user based on email.
+
+        Returns existing user if found, otherwise creates new user.
+        """
+        email = validated_data["email"]
+        first_name = validated_data["first_name"]
+        last_name = validated_data["last_name"]
+
+        # Try to find existing user by email
+        user = core_models.User.objects.filter(email=email).first()
+
+        if user:
+            logger.info(f"Retrieved existing user {user.uuid} for email {email}")
+            return user
+
+        # Try to find existing user by email as username
+        user = core_models.User.objects.filter(username=email).first()
+
+        if user:
+            logger.info(f"Retrieved existing user {user.uuid} for username {email}")
+            return user
+
+        # Create new user - the username is the email
+        user = core_models.User.objects.create_user(
+            username=email,
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+            registration_method="proposal",
+        )
+        user.set_unusable_password()
+        user.save()
+
+        logger.info(
+            f"Created new user {user.uuid} with email {email} for proposal team"
+        )
+
+        return user
