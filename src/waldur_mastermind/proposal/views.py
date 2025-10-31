@@ -52,6 +52,8 @@ from waldur_mastermind.proposal.enums import (
     ProposalStates,
     RequestedOfferingStates,
 )
+from waldur_core.media import models as media_models
+from waldur_core.media import views as media_views
 
 from .managers import get_connected_call_organizers, get_connected_calls
 from .models import Proposal
@@ -828,6 +830,167 @@ class ProposalViewSet(
         return response.Response(status=status.HTTP_200_OK)
 
     attach_document_serializer_class = serializers.ProposalDocumentationSerializer
+
+    @extend_schema(
+        description="Detach document from proposal.",
+        request=serializers.ProposalDetachDocumentSerializer,
+        responses={
+            status.HTTP_200_OK: None,
+            status.HTTP_404_NOT_FOUND: None,
+            status.HTTP_403_FORBIDDEN: None,
+        },
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def detach_document(self, request, uuid=None):
+        """
+        Remove a document from a proposal.
+
+        Only allowed when proposal is in draft state.
+        Deletes both the database record and the physical file.
+        """
+        proposal = cast(models.Proposal, self.get_object())
+
+        # Get the file path/URL from request
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        file_identifier = serializer.validated_data["file"]
+
+        # The frontend can send:
+        # - UUID-based media URL: /api/media/{uuid}/
+        # - Direct file URL: /media/proposal_project.../file.pdf
+        # - Full URL with domain
+
+        # Try to extract UUID from the file identifier
+        import re
+
+        uuid_pattern = re.compile(
+            r"[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?"
+            r"[0-9a-f]{4}-?[0-9a-f]{12}",
+            re.IGNORECASE,
+        )
+        uuid_match = uuid_pattern.search(file_identifier)
+
+        document = None
+        file = None
+
+        # Try UUID-based lookup first (most common case)
+        if uuid_match:
+            uuid_str = uuid_match.group().replace("-", "")
+            # Format as proper UUID with dashes
+            formatted_uuid = (
+                f"{uuid_str[:8]}-{uuid_str[8:12]}-"
+                f"{uuid_str[12:16]}-{uuid_str[16:20]}-{uuid_str[20:]}"
+            )
+
+            try:
+                file = media_models.File.objects.get(uuid=formatted_uuid)
+            except media_models.File.DoesNotExist:
+                return response.Response(
+                    {"detail": "File not found"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            try:
+                media_views.check_file_permissions(file, request.user)
+            except exceptions.PermissionDenied:
+                logger.warning(
+                    f"User {request.user} tried to detach file {file.uuid} "
+                    f"without having permission to access it."
+                )
+                file = None
+
+            # Now find the ProposalDocumentation that matches this file (by UUID)
+            for doc in models.ProposalDocumentation.objects.filter(proposal=proposal):
+                if formatted_uuid in str(doc.file.url) or uuid_str in str(doc.file.url):
+                    document = doc
+                    logger.info(f"Found by UUID: {document.file.name}")
+                    break
+
+            if document is None:
+                logger.info(
+                    f"File with UUID {formatted_uuid} not found in proposal {proposal.uuid}"
+                )
+
+        # Fallback: try file path matching
+        if not document:
+            # Normalize file path
+            normalized_path = file_identifier
+            if "/media/" in file_identifier:
+                normalized_path = file_identifier.split("/media/", 1)[1]
+            elif file_identifier.startswith("http://") or file_identifier.startswith(
+                "https://"
+            ):
+                from urllib.parse import urlparse
+
+                parsed = urlparse(file_identifier)
+                if "/media/" in parsed.path:
+                    normalized_path = parsed.path.split("/media/", 1)[1]
+                else:
+                    normalized_path = parsed.path.lstrip("/")
+
+            # Remove trailing slashes
+            normalized_path = normalized_path.rstrip("/")
+
+            documents = models.ProposalDocumentation.objects.filter(proposal=proposal)
+
+            # Try exact path match
+            document = documents.filter(file=normalized_path).first()
+            if document:
+                logger.info(f"Found by exact path: {document.file.name}")
+
+            # Try matching by file.name
+            if not document:
+                for doc in documents:
+                    if doc.file.name == normalized_path:
+                        document = doc
+                        logger.info(f"Found by name: {doc.file.name}")
+                        break
+
+        if not document:
+            logger.warning(
+                f"Document '{file_identifier}' not found for proposal {proposal.uuid}"
+            )
+            return response.Response(
+                {"detail": "File not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Delete the document (file deleted via FileField behavior)
+        logger.info(
+            f"Removing document {document.uuid} "
+            f"(file: {document.file.name}) from proposal {proposal.name}"
+        )
+        document.delete()
+
+        if file:
+            if str(file.name) == str(document.file.name):
+                # this file is only used by this document
+                logger.info(
+                    f"Deleting file {file.uuid} with name {file.name} from storage"
+                )
+                file.delete()
+            else:
+                logger.info(
+                    f"File {file.uuid} with name {file.name} is used by other records, not deleting"
+                )
+
+        event_logger.emit(
+            f"Attachment for proposal {proposal.name} has been removed.",
+            event_type=EventType.PROPOSAL_DOCUMENT_REMOVED,
+            event_context={"proposal": proposal},
+            scopes=[_get_customer(proposal)],
+        )
+
+        return response.Response(
+            {"detail": "Document removed successfully"},
+            status=status.HTTP_200_OK,
+        )
+
+    detach_document_serializer_class = serializers.ProposalDetachDocumentSerializer
+
+    detach_document_validators = [core_validators.StateValidator(ProposalStates.DRAFT)]
+
+    detach_document_permissions = [is_creator]
 
     @extend_schema(
         description="Approve a proposal.",

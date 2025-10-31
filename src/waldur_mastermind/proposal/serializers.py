@@ -1378,6 +1378,15 @@ class CallDetachDocumentsSerializer(serializers.Serializer):
     documents = serializers.ListField(child=serializers.UUIDField())
 
 
+class ProposalDetachDocumentSerializer(serializers.Serializer):
+    """Serializer for detaching a single document from a proposal."""
+
+    file = serializers.CharField(
+        required=True,
+        help_text="File URL or path of the document to remove",
+    )
+
+
 class ProposalProjectRoleMappingSerializer(serializers.HyperlinkedModelSerializer):
     call_uuid = serializers.UUIDField(source="call.uuid", read_only=True)
     call_name = serializers.ReadOnlyField(source="call.name")
