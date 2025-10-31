@@ -1,10 +1,10 @@
 <html>
 <head lang="en">
     <meta charset="UTF-8">
-    <title>Projects will be deleted.</title>
+    <title>Projects will be ending.</title>
 </head>
 <body>
-<p>Hello {{ user.full_name }}!</p>
+<p>Dear {{ user.full_name }}</p>
 <p>The following projects are ending {% if delta == 1 %} tomorrow {% else %} in {{ delta }} days{% endif %}:</p>
 <ul>
 {% for project in projects %}
@@ -12,10 +12,14 @@
 {% endfor %}
 </ul>
 <p>
-    End of the project will lead to termination of all resources in the project. <br />
-    If you are aware of that, then no actions are needed from your side. <br />
-    If you need to update project end date, please update it in project details.
+    At this date, the project will go into a "grace period" of 30 days.<br />
+    You will be able to log in and copy your data, but not run any jobs. <br />
+    At the end of the grace period this project and all data will be deleted.
 </p>
-<p>Thank you!</p>
+<p>
+    BriCS do not award projects and do not have the power to issue extensions.<br />
+    Please contact the body that awarded your project if you wish to request
+    an extension or have any questions.
+</p>
 </body>
 </html>
