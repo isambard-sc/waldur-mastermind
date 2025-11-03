@@ -145,8 +145,17 @@ def _optimize_customer_serializer_eager_load(sender):
     if hasattr(sender.eager_load, "_billing_optimized"):
         return
 
-    # Store the original eager_load method
-    original_eager_load = sender.eager_load
+    # Get the original eager_load method, unwrapping if already optimized
+    current_eager_load = sender.eager_load
+
+    # If the current method is already optimized by credit module, store it
+    # so we can call it in our chain
+    if hasattr(current_eager_load, "_credit_optimized"):
+        # Already wrapped by credit optimizer - we'll chain with it
+        original_eager_load = current_eager_load
+    else:
+        # Not yet wrapped, use as-is
+        original_eager_load = current_eager_load
 
     @staticmethod
     def optimized_eager_load(queryset, request=None):
@@ -167,6 +176,10 @@ def _optimize_customer_serializer_eager_load(sender):
 
     # Mark as optimized to avoid double optimization
     optimized_eager_load._billing_optimized = True
+
+    # Preserve the credit optimization flag if it exists
+    if hasattr(original_eager_load, "_credit_optimized"):
+        optimized_eager_load._credit_optimized = True
 
     # Replace the eager_load method
     sender.eager_load = optimized_eager_load
