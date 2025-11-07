@@ -1588,6 +1588,7 @@ class ProposalUserSerializer(serializers.Serializer):
         Get or create a user based on email.
 
         Returns existing user if found, otherwise creates new user.
+        User creation can be disabled via the 'allow_user_creation' feature flag.
         """
         email = validated_data["email"]
         first_name = validated_data["first_name"]
@@ -1606,6 +1607,27 @@ class ProposalUserSerializer(serializers.Serializer):
         if user:
             logger.info(f"Retrieved existing user {user.uuid} for username {email}")
             return user
+
+        # Check if user creation is disabled by feature flag
+        try:
+            feature = core_models.Feature.objects.get(
+                key="user.allow_user_creation"
+            )
+            if not feature.value:
+                # Feature is explicitly disabled
+                logger.warning(
+                    f"User creation disabled for email {email} "
+                    "due to feature flag"
+                )
+                raise serializers.ValidationError(
+                    {
+                        "email": "User with this email does not exist. "
+                        "User creation is disabled."
+                    }
+                )
+        except core_models.Feature.DoesNotExist:
+            # Feature flag not set, allow creation (default behavior)
+            pass
 
         # Create new user - the username is the email
         user = core_models.User.objects.create_user(
