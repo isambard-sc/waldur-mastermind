@@ -37,3 +37,46 @@ class FeaturesTest(test.APITransactionTestCase):
             "/api/feature-values/", {"marketplace": {"foo": True}}
         )
         self.assertEqual(response.data, "0 features are updated.")
+
+    def test_allow_user_creation_feature_defaults_to_false(self):
+        user = UserFactory(is_staff=True)
+        self.client.force_login(user)
+
+        response = self.client.get("/api/configuration/")
+        self.assertFalse(response.data["FEATURES"]["user"]["allow_user_creation"])
+
+    def test_staff_can_enable_allow_user_creation_feature(self):
+        user = UserFactory(is_staff=True)
+        self.client.force_login(user)
+
+        response = self.client.post(
+            "/api/feature-values/", {"user": {"allow_user_creation": True}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response = self.client.get("/api/configuration/")
+        self.assertTrue(
+            models.Feature.objects.get(key="user.allow_user_creation").value
+        )
+        self.assertTrue(response.data["FEATURES"]["user"]["allow_user_creation"])
+
+    def test_staff_can_disable_allow_user_creation_feature(self):
+        user = UserFactory(is_staff=True)
+        self.client.force_login(user)
+
+        # Enable the feature first
+        self.client.post(
+            "/api/feature-values/", {"user": {"allow_user_creation": True}}
+        )
+
+        # Then disable it
+        response = self.client.post(
+            "/api/feature-values/", {"user": {"allow_user_creation": False}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response = self.client.get("/api/configuration/")
+        self.assertFalse(
+            models.Feature.objects.get(key="user.allow_user_creation").value
+        )
+        self.assertFalse(response.data["FEATURES"]["user"]["allow_user_creation"])
