@@ -9,6 +9,10 @@ definitions:
     project:
       base: "projects"
       check_filter_key: "project_uuid"
+      filter_by:
+        - source_param: "customer"
+          source_key: "uuid"
+          target_key: "customer"
 
   customer_context_resolver: &customer_context_resolver
     customer:
@@ -142,38 +146,36 @@ collections:
       - name: security_group_facts
         plugin: facts
         base_operation_id: "openstack_security_groups"
-        many: true
         resolvers:
           <<: *base_openstack_resolvers
 
       - name: subnet_facts
         plugin: facts
         base_operation_id: "openstack_subnets"
-        many: true
         resolvers:
           <<: *base_openstack_resolvers
 
       - name: network_facts
         plugin: facts
         base_operation_id: "openstack_networks"
-        many: true
         resolvers:
           <<: *base_openstack_resolvers
 
       - name: flavor_facts
         plugin: facts
         base_operation_id: "openstack_flavors"
-        many: true
 
       - name: image_facts
         plugin: facts
         base_operation_id: "openstack_images"
-        many: true
 
       - name: volume_type_facts
         plugin: facts
         base_operation_id: "openstack_volume_types"
-        many: true
+
+      - name: port_facts
+        plugin: facts
+        base_operation_id: "openstack_ports"
 
       # --- Order Modules (Marketplace Resources) ---
       - name: vpc
@@ -182,7 +184,7 @@ collections:
         base_operation_id: "openstack_tenants"
         has_limits: true
         resolvers:
-          <<: *project_context_resolver
+          <<: *project_customer_resolvers
 
       - name: volume
         plugin: order
@@ -191,7 +193,7 @@ collections:
         transformations:
           size: "gb_to_mb"
         resolvers:
-          <<: *project_context_resolver
+          <<: *project_customer_resolvers
           type: *volume_type_resolver
           image: *image_resolver
           availability_zone:
@@ -237,7 +239,7 @@ collections:
                 description: "If true, release associated floating IPs on termination."
         wait_config: *default_wait_config
         resolvers:
-          <<: *project_context_resolver
+          <<: *project_customer_resolvers
           flavor:
             base: "openstack_flavors"
             filter_by: *filter_by_offering_tenant
@@ -454,3 +456,38 @@ collections:
           - unlink
         resolvers:
           <<: *tenant_context_resolver
+
+      - name: volume_attachment
+        plugin: link
+        resource_type: "OpenStack volume attachment"
+        description: "Attach and detach OpenStack volumes from instances."
+        # --- Link Plugin Configuration ---
+        source:
+          # The resource on which the action is performed.
+          param: "volume"
+          resource_type: "volume"
+          # We need to fetch the full volume object to check its state.
+          retrieve_op: "openstack_volumes_retrieve"
+        target:
+          # The resource being linked TO the source.
+          param: "instance"
+          resource_type: "instance"
+        # API operations for linking and unlinking.
+        link_op: "openstack_volumes_attach"
+        unlink_op: "openstack_volumes_detach"
+        # The key in the source resource's data that holds the target link.
+        link_check_key: "instance"
+        # Parameters that are part of the link operation's payload.
+        link_params:
+          - name: "device"
+            type: "string"
+            description: "Device path on the instance (e.g., /dev/vdb). Defaults to auto-discovery by the backend."
+        # Define resolvers for all involved resources.
+        resolvers:
+          <<: [*base_openstack_resolvers]
+          instance:
+            base: "openstack_instances"
+            filter_by: *tenant_filter
+          volume:
+            base: "openstack_volumes"
+            filter_by: *tenant_filter

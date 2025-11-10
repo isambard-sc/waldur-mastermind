@@ -17,6 +17,7 @@ from rest_framework import (
 from waldur_core.core import filters as core_filters
 from waldur_core.core import models as core_models
 from waldur_core.core import permissions as core_permissions
+from waldur_core.core import utils as core_utils
 from waldur_core.core.managers import SummaryQuerySet
 from waldur_core.logging import backend, filters, models, serializers, utils
 from waldur_core.logging.event_logger import get_event_groups
@@ -211,7 +212,7 @@ class EventSubscriptionViewSet(
 
     def perform_create(self, serializer):
         user = self.request.user
-        source_ip = self.request.META.get("REMOTE_ADDR")
+        source_ip = core_utils.get_ip_address(self.request)
         serializer.save(user=user, source_ip=source_ip)
 
     def perform_destroy(self, instance):
@@ -243,6 +244,11 @@ class RabbitMQVhostStats(generics.GenericAPIView):
     serializer_class = serializers.RmqVHostStatsSerializer
     filter_backends = []
     pagination_class = None
+
+    def get_queryset(self):
+        # This view doesn't use a queryset, but we need this method
+        # for the browsable API to work
+        return models.EventSubscription.objects.none()
 
     def get(self, request, *args, **kwargs):
         rmq_backend = backend.RabbitMQManagementBackend()
@@ -284,6 +290,11 @@ class RabbitMQUserStats(generics.GenericAPIView):
     serializer_class = serializers.RmqUserStatsSerializer
     filter_backends = []
 
+    def get_queryset(self):
+        # This view doesn't use a queryset, but we need this method
+        # for the browsable API to work
+        return models.EventSubscription.objects.none()
+
     def get(self, request, *args, **kwargs):
         rmq_backend = backend.RabbitMQManagementBackend()
         users = rmq_backend.list_rabbitmq_users()
@@ -293,7 +304,7 @@ class RabbitMQUserStats(generics.GenericAPIView):
             connections = rmq_backend.get_user_connections(user)
             user_record = {"username": user, "connections": []}
             for connection in connections:
-                source_ip = connection["name"].split("->")[0]
+                source_ip = connection["name"].split(" ->")[0]
                 vhost = connection["vhost"]
                 user_record["connections"].append(
                     {"source_ip": source_ip, "vhost": vhost}

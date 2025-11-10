@@ -558,6 +558,32 @@ def copy_future_price_to_current_price():
         component.save(update_fields=["price"])
 
 
+@shared_task(name="waldur_mastermind.marketplace.process_pending_start_date_orders")
+def process_pending_start_date_orders():
+    """
+    Finds orders that are pending activation due to a future start date
+    and moves them to the EXECUTING state if the start date has been reached.
+    """
+    today = timezone.now().date()
+    orders_to_process = models.Order.objects.filter(
+        state=OrderStates.PENDING_START_DATE,
+        start_date__lte=today,
+    )
+
+    for order in orders_to_process:
+        logger.info(
+            "Processing order %s (%s) as its start date %s has been reached.",
+            order,
+            order.id,
+            order.start_date,
+        )
+        order.set_state_executing()
+        order.save(update_fields=["state"])
+        # Use transaction.on_commit to ensure the state change is saved
+        # before the processing task is queued.
+        transaction.on_commit(lambda: process_order_on_commit(order, order.created_by))
+
+
 @shared_task(name="waldur_mastermind.marketplace.process_pending_project_orders")
 def process_pending_project_orders():
     """Process orders for projects that have become active."""
@@ -568,20 +594,30 @@ def process_pending_project_orders():
         state=OrderStates.PENDING_PROJECT, project__in=active_project_ids
     )
     for order in orders:
-        # Setting the state to PENDING_PROVIDER because direct transition
-        # from PENDING_PROJECT to EXECUTING is not supported
-        order.state = OrderStates.PENDING_PROVIDER
-        order.save(update_fields=["state"])
-        if utils.order_should_not_be_reviewed_by_provider(order):
+        continue_order_processing(order)
+
+
+def continue_order_processing(order: models.Order):
+    """
+    Advances an order to the next logical state after consumer/project approval.
+    Checks for provider review and the order's own start_date.
+    """
+    if utils.order_should_not_be_reviewed_by_provider(order):
+        if order.start_date and order.start_date > timezone.now().date():
+            order.state = models.OrderStates.PENDING_START_DATE
+            order.save(update_fields=["state"])
+        else:
             order.set_state_executing()
             order.save(update_fields=["state"])
             transaction.on_commit(
                 lambda: process_order_on_commit(order, order.created_by)
             )
-        else:
-            transaction.on_commit(
-                lambda: notify_provider_about_pending_order.delay(order.uuid)
-            )
+    else:
+        order.state = models.OrderStates.PENDING_PROVIDER
+        order.save(update_fields=["state"])
+        transaction.on_commit(
+            lambda: notify_provider_about_pending_order.delay(order.uuid)
+        )
 
 
 @shared_task(name="waldur_mastermind.marketplace.mark_resources_as_erred_after_timeout")
@@ -771,3 +807,120 @@ def update_daily_consent_history():
         logger.info("No offerings with ToS found")
     else:
         logger.info(f"Updated consent history for {updated_count} offerings")
+
+
+@shared_task(name="waldur_mastermind.marketplace.send_tos_consent_notification")
+def send_tos_consent_notification(offering_uuid, user_uuid):
+    """Send notification to user about required ToS consent."""
+    try:
+        offering = models.Offering.objects.get(uuid=offering_uuid)
+        user = core_models.User.objects.get(uuid=user_uuid)
+    except (models.Offering.DoesNotExist, core_models.User.DoesNotExist):
+        logger.warning(
+            "Cannot send ToS consent notification. Offering %s or User %s not found.",
+            offering_uuid,
+            user_uuid,
+        )
+        return
+
+    if not offering.has_terms_of_service():
+        return
+
+    if offering.check_user_consent(user):
+        return
+
+    active_tos = offering.terms_of_service_configs.filter(is_active=True).first()
+    if not active_tos:
+        return
+
+    tos_management_url = core_utils.format_homeport_link("profile/tos-management/")
+
+    tos_link = active_tos.terms_of_service_link
+    if not tos_link:
+        tos_link = core_utils.format_homeport_link(
+            "marketplace-public-offering/{offering_uuid}/",
+            offering_uuid=offering.uuid.hex,
+        )
+
+    context = {
+        "user": user,
+        "offering": offering,
+        "terms_of_service_link": tos_link,
+        "tos_management_url": tos_management_url,
+        "version": active_tos.version,
+        "site_name": config.SITE_NAME,
+    }
+
+    logger.info(
+        "Sending ToS consent notification to %s for offering %s",
+        user.email,
+        offering.name,
+    )
+
+    core_utils.broadcast_mail(
+        "marketplace", "tos_consent_required", context, [user.email]
+    )
+
+
+@shared_task(name="waldur_mastermind.marketplace.send_tos_reconsent_notification")
+def send_tos_reconsent_notification(offering_uuid, old_version, new_version):
+    """Notify users about ToS update requiring re-consent."""
+    try:
+        offering = models.Offering.objects.get(uuid=offering_uuid)
+    except models.Offering.DoesNotExist:
+        logger.warning(
+            "Cannot notify about ToS update. Offering %s not found.", offering_uuid
+        )
+        return
+
+    active_tos = offering.terms_of_service_configs.filter(is_active=True).first()
+    if not active_tos or not active_tos.requires_reconsent:
+        return
+
+    offering_users = models.OfferingUser.objects.filter(
+        offering=offering
+    ).select_related("user")
+
+    tos_management_url = core_utils.format_homeport_link("profile/tos-management/")
+
+    tos_link = active_tos.terms_of_service_link
+    if not tos_link:
+        tos_link = core_utils.format_homeport_link(
+            "marketplace-public-offering/{offering_uuid}/",
+            offering_uuid=offering.uuid.hex,
+        )
+
+    for offering_user in offering_users:
+        user = offering_user.user
+
+        if user.is_staff or user.is_support:
+            continue
+
+        consent = models.UserOfferingConsent.objects.filter(
+            user=user, offering=offering, revocation_date__isnull=True
+        ).first()
+
+        if consent and consent.version == active_tos.version:
+            continue
+
+        context = {
+            "user": user,
+            "offering": offering,
+            "terms_of_service_link": tos_link,
+            "tos_management_url": tos_management_url,
+            "old_version": old_version,
+            "new_version": new_version,
+            "site_name": config.SITE_NAME,
+        }
+
+        logger.info(
+            "Sending ToS re-consent notification to %s for offering %s (v%s -> v%s)",
+            user.email,
+            offering.name,
+            old_version,
+            new_version,
+        )
+
+        core_utils.broadcast_mail(
+            "marketplace", "tos_reconsent_required", context, [user.email]
+        )

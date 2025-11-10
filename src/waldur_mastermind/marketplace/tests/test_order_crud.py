@@ -3,6 +3,7 @@ from unittest import mock
 
 from constance.test.unittest import override_config as override_constance_config
 from ddt import data, ddt
+from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
 
@@ -140,6 +141,47 @@ class OrderCreateTest(BaseOrderCreateTest):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["attributes"], attributes)
+
+    def test_resource_options_are_set_during_order_creation(self):
+        """Test that resource options are populated from offering resource_options during order creation."""
+        attributes = {
+            "cpu": 2,
+            "ram": 1024,
+            "storage": 500,  # This should not be in options
+        }
+        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        offering.resource_options = {
+            "options": {
+                "cpu": None,
+                "ram": None,
+            },  # Only cpu and ram are resource options
+            "order": [],
+        }
+        offering.save()
+
+        plan = factories.PlanFactory(offering=offering)
+        add_payload = {
+            "offering": factories.OfferingFactory.get_public_url(offering),
+            "plan": factories.PlanFactory.get_public_url(plan),
+            "attributes": attributes,
+        }
+
+        response = self.create_order(
+            self.fixture.staff, offering, add_payload=add_payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        # Check that the created resource has the correct options
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        resource = order.resource
+
+        # Verify resource options contain only the options defined in offering.resource_options
+        self.assertTrue(isinstance(resource.options, dict))
+        self.assertEqual(resource.options["cpu"], 2)
+        self.assertEqual(resource.options["ram"], 1024)
+        self.assertNotIn(
+            "storage", resource.options
+        )  # storage is not in resource_options
 
     def test_order_creating_is_not_available_for_blocked_organization(self):
         user = self.fixture.owner
@@ -707,6 +749,113 @@ class OrderNameValidationTest(BaseOrderCreateTest):
         self.assertIn("Name is too long", str(response.data))
 
 
+@override_constance_config(ENABLE_ORDER_START_DATE=True)
+class OrderStartDateCreateTest(BaseOrderCreateTest):
+    def test_order_creation_succeeds_with_valid_start_date(self):
+        # Arrange
+        future_date = (timezone.now() + datetime.timedelta(days=10)).date()
+        payload = {"start_date": future_date.isoformat()}
+
+        # Act
+        response = self.create_order(self.fixture.owner, add_payload=payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(order.start_date, future_date)
+
+    def test_order_creation_fails_with_past_start_date(self):
+        # Arrange
+        past_date = (timezone.now() - datetime.timedelta(days=1)).date()
+        payload = {"start_date": past_date.isoformat()}
+
+        # Act
+        response = self.create_order(self.fixture.owner, add_payload=payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Start date cannot be in the past", str(response.data))
+
+    def test_order_creation_fails_if_start_date_is_before_project_start_date(self):
+        # Arrange
+        self.project.start_date = (timezone.now() + datetime.timedelta(days=20)).date()
+        self.project.save()
+
+        order_start_date = (timezone.now() + datetime.timedelta(days=10)).date()
+        payload = {"start_date": order_start_date.isoformat()}
+
+        # Act
+        response = self.create_order(self.fixture.owner, add_payload=payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Order start date cannot be earlier than the project start date",
+            str(response.data),
+        )
+
+    def test_order_creation_fails_if_start_date_is_after_project_end_date(self):
+        # Arrange
+        self.project.end_date = (timezone.now() + datetime.timedelta(days=10)).date()
+        self.project.save()
+
+        order_start_date = (timezone.now() + datetime.timedelta(days=20)).date()
+        payload = {"start_date": order_start_date.isoformat()}
+
+        # Act
+        response = self.create_order(self.fixture.owner, add_payload=payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Order start date cannot be later than the project end date",
+            str(response.data),
+        )
+
+    def test_order_creation_succeeds_if_start_date_is_within_project_lifecycle(self):
+        # Arrange
+        self.project.start_date = (timezone.now() + datetime.timedelta(days=5)).date()
+        self.project.end_date = (timezone.now() + datetime.timedelta(days=20)).date()
+        self.project.save()
+
+        order_start_date = (timezone.now() + datetime.timedelta(days=10)).date()
+        payload = {"start_date": order_start_date.isoformat()}
+
+        # Act
+        response = self.create_order(self.fixture.owner, add_payload=payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(order.start_date, order_start_date)
+
+    def test_order_creation_fails_with_invalid_date_format(self):
+        # Arrange
+        payload = {"start_date": "2024/01/15"}  # Invalid format
+
+        # Act
+        response = self.create_order(self.fixture.owner, add_payload=payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Date has wrong format", str(response.data))
+
+    @override_constance_config(ENABLE_ORDER_START_DATE=False)
+    def test_start_date_is_ignored_when_feature_is_disabled(self):
+        # Arrange
+        future_date = (timezone.now() + datetime.timedelta(days=10)).date()
+        payload = {"start_date": future_date.isoformat()}
+
+        # Act
+        response = self.create_order(self.fixture.owner, add_payload=payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        # The serializer should have ignored the field, so it remains None in the model.
+        self.assertIsNone(order.start_date)
+
+
 @ddt
 class OrderDeleteTest(test.APITransactionTestCase):
     def setUp(self):
@@ -815,3 +964,137 @@ class OrderFilterTest(test.APITransactionTestCase):
         # Assert
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["uuid"], self.order.uuid.hex)
+
+
+@ddt
+class OrderSetBackendIdTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE, customer=self.fixture.customer
+        )
+        self.order = factories.OrderFactory(
+            project=self.fixture.project,
+            offering=self.offering,
+            created_by=self.fixture.manager,
+        )
+        self.url = factories.OrderFactory.get_url(self.order, "set_backend_id")
+
+        CustomerRole.OWNER.add_permission(PermissionEnum.SET_RESOURCE_BACKEND_ID)
+
+    def make_request(self, user, backend_id="new_backend_id"):
+        self.client.force_authenticate(user)
+        payload = {"backend_id": backend_id}
+        return self.client.post(self.url, payload)
+
+    @data("staff", "owner")
+    def test_authorized_user_can_set_backend_id(self, user):
+        """Test that service provider owners and staff can set backend_id."""
+        user_obj = getattr(self.fixture, user)
+        initial_backend_id = self.order.backend_id
+
+        response = self.make_request(user_obj)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("status", response.data)
+        self.assertEqual(response.data["status"], "Order backend_id has been changed.")
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.backend_id, "new_backend_id")
+        self.assertNotEqual(self.order.backend_id, initial_backend_id)
+
+    @data("admin", "manager")
+    def test_unauthorized_user_cannot_set_backend_id(self, user):
+        """Test that project-level users cannot set backend_id."""
+        user_obj = getattr(self.fixture, user)
+
+        response = self.make_request(user_obj)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_unauthenticated_user_cannot_set_backend_id(self):
+        """Test that unauthenticated users cannot set backend_id."""
+        payload = {"backend_id": "new_backend_id"}
+        response = self.client.post(self.url, payload)
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_setting_same_backend_id_returns_not_changed_message(self):
+        """Test that setting the same backend_id returns appropriate message."""
+        self.order.backend_id = "existing_backend_id"
+        self.order.save()
+
+        response = self.make_request(self.fixture.staff, "existing_backend_id")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], "Order backend_id is not changed.")
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.backend_id, "existing_backend_id")
+
+    def test_setting_backend_id_to_none_fails(self):
+        """Test that backend_id can be set to None."""
+        self.order.backend_id = "existing_backend_id"
+        self.order.save()
+
+        response = self.make_request(self.fixture.staff, None)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_setting_backend_id_to_empty_string_fails(self):
+        """Test that backend_id can be set to empty string."""
+        self.order.backend_id = "existing_backend_id"
+        self.order.save()
+
+        response = self.make_request(self.fixture.staff, "")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_invalid_payload_returns_bad_request(self):
+        """Test that invalid payload returns 400."""
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.post(self.url, {})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_order_not_found_returns_404(self):
+        """Test that accessing non-existent order returns 404."""
+        self.client.force_authenticate(self.fixture.staff)
+        non_existent_order = factories.OrderFactory()
+        url = factories.OrderFactory.get_url(non_existent_order, "set_backend_id")
+        non_existent_order.delete()
+
+        payload = {"backend_id": "new_backend_id"}
+        response = self.client.post(url, payload)
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_service_provider_owner_can_set_backend_id_for_different_customer_order(
+        self,
+    ):
+        """Test that service provider owner can set backend_id for orders
+        from different customers.
+        """
+        consumer_fixture = structure_fixtures.ProjectFixture()
+        order = factories.OrderFactory(
+            project=consumer_fixture.project,
+            offering=self.offering,
+            created_by=consumer_fixture.manager,
+        )
+        url = factories.OrderFactory.get_url(order, "set_backend_id")
+        self.client.force_authenticate(self.fixture.owner)
+
+        payload = {"backend_id": "cross_customer_backend_id"}
+        response = self.client.post(url, payload)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        order.refresh_from_db()
+        self.assertEqual(order.backend_id, "cross_customer_backend_id")
+
+    def test_blocked_organization_cannot_set_backend_id(self):
+        """Test that blocked organizations cannot set backend_id."""
+        self.fixture.customer.blocked = True
+        self.fixture.customer.save()
+
+        response = self.make_request(self.fixture.owner)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

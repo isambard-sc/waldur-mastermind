@@ -2,6 +2,7 @@ import logging
 from typing import cast
 
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
@@ -11,6 +12,8 @@ from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.permissions import _get_customer
 from waldur_mastermind.invoices.models import CustomerCredit, ProjectCredit
+from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import BillingTypes
 from waldur_mastermind.policy.policy_actions import POLICY_ACTIONS
 
 from . import models
@@ -44,6 +47,9 @@ class PolicySerializer(serializers.HyperlinkedModelSerializer):
         return value
 
     def validate_options(self, options):
+        if not options:
+            return {}
+
         for key, value in options.items():
             validator = getattr(POLICY_ACTIONS[key], "options_validator", None)
             if validator:
@@ -152,6 +158,12 @@ class ProjectEstimatedCostPolicySerializer(
     def validate_scope(self, scope):
         if not scope:
             return
+
+        # Check if scope is a terminated project
+        if scope._meta.model_name == "project" and getattr(scope, "is_removed", False):
+            raise serializers.ValidationError(
+                _("Cannot create policies for terminated projects.")
+            )
 
         user = self.context["request"].user
         customer = _get_customer(scope)
@@ -279,34 +291,116 @@ class OfferingUsagePolicySerializer(OfferingPolicySerializerMixin, PolicySeriali
         if component_limits is None:
             return
 
+        # Validate duplicates within payload: only one limit per component type
+        keys = [cl.get("component", {}).get("type") for cl in component_limits]
+        if len(keys) != len(set(keys)):
+            raise serializers.ValidationError(
+                _("Duplicate component limits for the same component.")
+            )
+
         offering = policy.scope
-        components = []
+        models.OfferingComponentLimit.objects.filter(policy=policy).delete()
 
         for component_limit in component_limits:
             component_type = component_limit["component"]["type"]
             limit = component_limit["limit"]
             component = offering.components.filter(type=component_type).first()
-            components.append(component)
 
             if not component:
                 raise ValidationError(
                     f"Offering has not component with type {component_type}."
                 )
 
-            models.OfferingComponentLimit.objects.update_or_create(
-                policy=policy, defaults={"component": component, "limit": limit}
+            models.OfferingComponentLimit.objects.create(
+                policy=policy, component=component, limit=limit
             )
 
-        models.OfferingComponentLimit.objects.filter(policy=policy).exclude(
-            component__in=components
-        ).delete()
-
+    @transaction.atomic
     def create(self, validated_data):
         component_limits = validated_data.pop("component_limits_set", None)
         policy = super().create(validated_data)
         self._create_or_update(policy, component_limits)
         return policy
 
+    @transaction.atomic
+    def update(self, policy, validated_data):
+        component_limits = validated_data.pop("component_limits_set", None)
+        self._create_or_update(policy, component_limits)
+        return super().update(policy, validated_data)
+
+
+class NestedCustomerUsagePolicyComponentSerializer(serializers.ModelSerializer):
+    type = serializers.CharField(source="component.type", read_only=True)
+    period_name = serializers.ReadOnlyField(source="get_period_display", read_only=True)
+    component = serializers.UUIDField(source="component.uuid")
+
+    class Meta:
+        model = models.CustomerUsagePolicyComponent
+        fields = ("type", "limit", "period", "period_name", "component")
+
+
+class CustomerComponentUsagePolicySerializer(PolicySerializer):
+    component_limits_set = NestedCustomerUsagePolicyComponentSerializer(many=True)
+
+    class Meta(PolicySerializer.Meta):
+        fields = PolicySerializer.Meta.fields + ("component_limits_set",)
+        model = models.CustomerComponentUsagePolicy
+        view_name = "marketplace-customer-component-usage-policy-detail"
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-customer-component-usage-policy-detail",
+            },
+            "scope": {"lookup_field": "uuid", "view_name": "customer-detail"},
+        }
+
+    def _create_or_update(self, policy, component_limits):
+        if component_limits is None:
+            return
+
+        # Validate duplicates within incoming payload before DB operations
+        keys = [
+            (cl.get("component", {}).get("uuid"), cl.get("period"))
+            for cl in component_limits
+        ]
+        if len(keys) != len(set(keys)):
+            raise serializers.ValidationError(
+                _("Duplicate component limits for the same component and period.")
+            )
+
+        models.CustomerUsagePolicyComponent.objects.filter(policy=policy).delete()
+
+        for component_limit in component_limits:
+            component_uuid = component_limit["component"]["uuid"]
+            limit = component_limit["limit"]
+            period = component_limit.get("period")
+
+            component = marketplace_models.OfferingComponent.objects.filter(
+                uuid=component_uuid
+            ).first()
+
+            if not component:
+                raise serializers.ValidationError(
+                    _(f"Component with UUID {component_uuid} not found.")
+                )
+
+            if component.billing_type not in (BillingTypes.LIMIT, BillingTypes.USAGE):
+                raise serializers.ValidationError(
+                    _("The selected component must be usage or limit billing type.")
+                )
+
+            models.CustomerUsagePolicyComponent.objects.create(
+                policy=policy, component=component, limit=limit, period=period
+            )
+
+    @transaction.atomic
+    def create(self, validated_data):
+        component_limits = validated_data.pop("component_limits_set", None)
+        policy = super().create(validated_data)
+        self._create_or_update(policy, component_limits)
+        return policy
+
+    @transaction.atomic
     def update(self, policy, validated_data):
         component_limits = validated_data.pop("component_limits_set", None)
         self._create_or_update(policy, component_limits)

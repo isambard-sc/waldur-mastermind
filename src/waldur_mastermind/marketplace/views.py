@@ -329,6 +329,7 @@ class ServiceProviderViewSet(UserRoleMixin, PublicViewsetMixin, BaseMarketplaceV
 
     @extend_schema(
         request=serializers.SetOfferingsUsernameSerializer,
+        responses={status.HTTP_201_CREATED: None},
     )
     @action(detail=True, methods=["POST"])
     def set_offerings_username(self, request, uuid=None):
@@ -2471,11 +2472,52 @@ class ProviderOfferingViewSet(
             ).first()
 
             if offering_component:
+                # Store original component type to detect changes
+                original_type = offering_component.type
+                new_type = request.data.get("type")
+
                 serializer = self.get_serializer(
                     instance=offering_component, data=request.data, partial=True
                 )
                 serializer.is_valid(raise_exception=True)
-                serializer.save()
+
+                # If component type is being changed, migrate connected objects
+                if new_type and new_type != original_type:
+                    logger.info(
+                        f"Component type change detected: {original_type} -> {new_type}"
+                    )
+
+                    try:
+                        with transaction.atomic():
+                            # Save the component with new type first
+                            serializer.save()
+
+                            # Migrate connected objects
+                            self._migrate_component_connected_objects(
+                                offering=offering,
+                                old_component_type=original_type,
+                                new_component_type=new_type,
+                                logger=logger,
+                            )
+
+                            logger.info(
+                                f"Successfully migrated component {original_type} -> {new_type}"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error during component migration: {e}")
+                        return Response(
+                            {
+                                "details": _(
+                                    "An error occurred during component migration."
+                                )
+                            },
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        )
+
+                else:
+                    # Normal update without type change
+                    serializer.save()
+
                 return Response(status=status.HTTP_200_OK)
             else:
                 return Response(status=status.HTTP_404_NOT_FOUND)
@@ -2485,7 +2527,49 @@ class ProviderOfferingViewSet(
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-    update_offering_component_serializer_class = serializers.OfferingComponentSerializer
+    def _migrate_component_connected_objects(
+        self, offering, old_component_type, new_component_type, logger
+    ):
+        """
+        Migrate connected objects when component type changes.
+        Updates Resource limits and InvoiceItem details.
+        """
+        from waldur_mastermind.invoices import models as invoice_models
+
+        # 1. Update Resource limits for resources of this offering
+        resources_updated = 0
+        for resource in models.Resource.objects.filter(offering=offering):
+            if old_component_type in resource.limits:
+                old_value = resource.limits[old_component_type]
+                resource.limits[new_component_type] = resource.limits.pop(
+                    old_component_type
+                )
+                resource.save(update_fields=["limits"])
+                resources_updated += 1
+                logger.info(
+                    f"Updated Resource {resource.uuid}: {old_component_type}={old_value} -> {new_component_type}={old_value}"
+                )
+
+        # 2. Update InvoiceItem details for historical billing data
+        invoice_items_updated = 0
+        invoice_items = invoice_models.InvoiceItem.objects.filter(
+            resource__offering=offering,
+            details__offering_component_type=old_component_type,
+        )
+
+        for item in invoice_items:
+            item.details["offering_component_type"] = new_component_type
+            item.save(update_fields=["details"])
+            invoice_items_updated += 1
+            logger.info(
+                f"Updated InvoiceItem {item.uuid}: offering_component_type {old_component_type} -> {new_component_type}"
+            )
+
+        logger.info(
+            f"Migration summary: Updated {resources_updated} resource limits, {invoice_items_updated} invoice items"
+        )
+
+    update_offering_component_serializer_class = serializers.UpdateOfferingComponent
     update_offering_component_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_COMPONENTS,
@@ -2558,7 +2642,7 @@ class ProviderOfferingViewSet(
 
     @extend_schema(
         request=serializers.OfferingComponentSerializer,
-        responses=None,
+        responses={status.HTTP_201_CREATED: None},
     )
     @action(detail=True, methods=["post"])
     def create_offering_component(self, request, uuid=None):
@@ -2918,6 +3002,214 @@ class ProviderOfferingViewSet(
         serializer = serializers.ToSConsentDashboardSerializer(dashboard_data)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        request=serializers.OfferingSoftwareCatalogSerializer,
+        responses={201: serializers.SoftwareCatalogUUIDSerializer},
+        description="Add software catalog to offering.",
+    )
+    @action(detail=True, methods=["post"])
+    def add_software_catalog(self, request, uuid=None):
+        offering: models.Offering = self.get_object()
+        data = request.data.copy()
+        data["offering"] = offering.uuid.hex
+        serializer = serializers.OfferingSoftwareCatalogSerializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        return Response(
+            {"uuid": serializer.instance.uuid},
+            status=status.HTTP_201_CREATED,
+        )
+
+    add_software_catalog_permissions = [
+        permission_factory(
+            PermissionEnum.UPDATE_OFFERING,
+            ["*", "customer", "customer.serviceprovider"],
+        )
+    ]
+    add_software_catalog_serializer_class = (
+        serializers.OfferingSoftwareCatalogSerializer
+    )
+
+    @extend_schema(
+        request=serializers.OfferingSoftwareCatalogUpdateSerializer,
+        responses={200: serializers.OfferingSoftwareCatalogSerializer},
+        description="Update software catalog configuration for offering.",
+    )
+    @action(
+        detail=True,
+        methods=["patch"],
+    )
+    def update_software_catalog(self, request, uuid=None):
+        offering = self.get_object()
+        offering_catalog_uuid = request.data.get("offering_catalog_uuid")
+        try:
+            offering_catalog = models.OfferingSoftwareCatalog.objects.get(
+                uuid=offering_catalog_uuid, offering=offering
+            )
+        except models.OfferingSoftwareCatalog.DoesNotExist:
+            return Response(
+                {"error": "Software catalog association not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = serializers.OfferingSoftwareCatalogUpdateSerializer(
+            offering_catalog, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        updated_catalog = serializer.save()
+
+        response_serializer = serializers.OfferingSoftwareCatalogSerializer(
+            updated_catalog, context=self.get_serializer_context()
+        )
+        return Response(response_serializer.data)
+
+    update_software_catalog_serializer_class = (
+        serializers.OfferingSoftwareCatalogUpdateSerializer
+    )
+
+    update_software_catalog_permissions = [
+        permission_factory(
+            PermissionEnum.UPDATE_OFFERING,
+            ["*", "customer", "customer.serviceprovider"],
+        )
+    ]
+
+    @extend_schema(
+        request=serializers.RemoveSoftwareCatalogSerializer,
+        responses=None,
+        description="Remove software catalog from offering.",
+    )
+    @action(
+        detail=True,
+        methods=["post"],
+    )
+    def remove_software_catalog(self, request, uuid=None):
+        self.get_object()
+        offering_catalog_uuid = request.data.get("offering_catalog_uuid")
+        try:
+            offering_catalog = models.OfferingSoftwareCatalog.objects.get(
+                uuid=offering_catalog_uuid
+            )
+        except models.OfferingSoftwareCatalog.DoesNotExist:
+            return Response(
+                {"error": "Software catalog association not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        offering_catalog.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    remove_software_catalog_serializer_class = (
+        serializers.RemoveSoftwareCatalogSerializer
+    )
+
+    remove_software_catalog_permissions = [
+        permission_factory(
+            PermissionEnum.UPDATE_OFFERING,
+            ["*", "customer", "customer.serviceprovider"],
+        )
+    ]
+
+    @extend_schema(
+        request=serializers.OfferingPartitionSerializer,
+        responses={201: serializers.OfferingPartitionSerializer},
+        description="Add SLURM partition configuration to offering.",
+    )
+    @action(detail=True, methods=["post"])
+    def add_partition(self, request, uuid=None):
+        offering: models.Offering = self.get_object()
+        data = request.data.copy()
+        data["offering"] = offering.uuid.hex
+        serializer = serializers.OfferingPartitionSerializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        return Response(
+            {"uuid": serializer.instance.uuid},
+            status=status.HTTP_201_CREATED,
+        )
+
+    add_partition_permissions = [
+        permission_factory(
+            PermissionEnum.UPDATE_OFFERING,
+            ["*", "customer", "customer.serviceprovider"],
+        )
+    ]
+    add_partition_serializer_class = serializers.OfferingPartitionSerializer
+
+    @extend_schema(
+        request=serializers.OfferingPartitionUpdateSerializer,
+        responses={200: serializers.OfferingPartitionSerializer},
+        description="Update partition configuration for offering.",
+    )
+    @action(
+        detail=True,
+        methods=["patch"],
+    )
+    def update_partition(self, request, uuid=None):
+        offering = self.get_object()
+        partition_uuid = request.data.get("partition_uuid")
+        try:
+            partition = models.OfferingPartition.objects.get(
+                uuid=partition_uuid, offering=offering
+            )
+        except models.OfferingPartition.DoesNotExist:
+            return Response(
+                {"error": "Partition not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        serializer = serializers.OfferingPartitionUpdateSerializer(
+            partition, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        updated_partition = serializer.save()
+        response_serializer = serializers.OfferingPartitionSerializer(
+            updated_partition, context=self.get_serializer_context()
+        )
+        return Response(response_serializer.data)
+
+    update_partition_serializer_class = serializers.OfferingPartitionUpdateSerializer
+
+    update_partition_permissions = [
+        permission_factory(
+            PermissionEnum.UPDATE_OFFERING,
+            ["*", "customer", "customer.serviceprovider"],
+        )
+    ]
+
+    @extend_schema(
+        request=serializers.RemovePartitionSerializer,
+        responses=None,
+        description="Remove partition from offering.",
+    )
+    @action(
+        detail=True,
+        methods=["post"],
+    )
+    def remove_partition(self, request, uuid=None):
+        self.get_object()
+        partition_uuid = request.data.get("partition_uuid")
+        try:
+            partition = models.OfferingPartition.objects.get(uuid=partition_uuid)
+        except models.OfferingPartition.DoesNotExist:
+            return Response(
+                {"error": "Partition not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        partition.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    remove_partition_serializer_class = serializers.RemovePartitionSerializer
+
+    remove_partition_permissions = [
+        permission_factory(
+            PermissionEnum.UPDATE_OFFERING,
+            ["*", "customer", "customer.serviceprovider"],
+        )
+    ]
+
 
 class PublicOfferingViewSet(rf_viewsets.ReadOnlyModelViewSet):
     queryset = models.Offering.objects.filter()
@@ -3183,6 +3475,42 @@ class ProviderPlanViewSet(core_views.UpdateReversionMixin, core_views.ActionsVie
     update_quotas_permissions = update_permissions
     update_quotas_validators = [can_manage_plan]
 
+    @extend_schema(
+        request=serializers.DiscountsUpdateSerializer,
+        responses=None,
+    )
+    @action(detail=True, methods=["post"])
+    def update_discounts(self, request, uuid):
+        """
+        Update volume discount configuration for plan components.
+
+        This endpoint allows updating discount thresholds and rates for multiple
+        plan components in a single request. Discounts are applied automatically
+        when limit quantities meet or exceed the threshold.
+
+        The discount configuration affects future billing:
+        - Creates separate invoice items showing the discount
+        - Can be enabled or disabled per component
+        """
+        plan: models.Plan = self.get_object()
+        serializer = serializers.DiscountsUpdateSerializer(
+            data=request.data, instance=plan
+        )
+        serializer.is_valid(raise_exception=True)
+        updated_components = serializer.save()
+
+        # Log the discount update
+        logger.info(
+            f"Discounts updated for plan {plan.name} (UUID: {plan.uuid}) "
+            f"by user {request.user.username}. "
+            f"Updated {len(updated_components)} component(s)."
+        )
+
+        return Response(status=status.HTTP_200_OK)
+
+    update_discounts_permissions = update_permissions
+    update_discounts_validators = [can_manage_plan]
+
     archive_permissions = [
         permission_factory(
             PermissionEnum.ARCHIVE_OFFERING_PLAN,
@@ -3408,31 +3736,72 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
     @action(detail=True, methods=["post"])
     def approve_by_consumer(self, request, uuid=None):
         order: models.Order = self.get_object()
+        if (
+            order.offering.plugin_options.get("require_purchase_order_upload")
+            and not order.attachment
+        ):
+            raise rf_exceptions.ValidationError(
+                _("Purchase order is required for approval.")
+            )
         order.review_by_consumer(request.user)
+
+        # 1. Check if project itself is pending activation
         if (
             order.project.start_date
             and order.project.start_date > timezone.now().date()
         ):
             order.state = OrderStates.PENDING_PROJECT
             order.save(update_fields=["state"])
-            return Response(status=status.HTTP_200_OK)
-        if utils.order_should_not_be_reviewed_by_provider(order):
-            order.set_state_executing()
-            order.save(update_fields=["state"])
-            logger.info(
-                "Processing order %s (%s) after consumer approval, resource %s",
-                order,
-                order.id,
-                order.resource,
+            return Response(
+                "Order is pending project activation.",
+                status=status.HTTP_200_OK,
             )
-            tasks.process_order_on_commit(order, request.user)
-        else:
+
+        # 2. Check if provider review is needed
+        if not utils.order_should_not_be_reviewed_by_provider(order):
             order.state = OrderStates.PENDING_PROVIDER
             order.save(update_fields=["state"])
             transaction.on_commit(
                 lambda: tasks.notify_provider_about_pending_order.delay(order.uuid)
             )
-        return Response(status=status.HTTP_200_OK)
+            return Response(
+                "Order is pending provider approval.",
+                status=status.HTTP_200_OK,
+            )
+
+        # 3. If no provider review, check for order's own start_date
+        if (
+            config.ENABLE_ORDER_START_DATE
+            and order.start_date
+            and order.start_date > timezone.now().date()
+        ):
+            order.state = OrderStates.PENDING_START_DATE
+            order.save(update_fields=["state"])
+            logger.info(
+                "Order %s (%s) is pending start date %s.",
+                order,
+                order.id,
+                order.start_date,
+            )
+            return Response(
+                "Order is pending start date.",
+                status=status.HTTP_200_OK,
+            )
+
+        # 4. If all checks pass, proceed to execution
+        order.set_state_executing()
+        order.save(update_fields=["state"])
+        logger.info(
+            "Processing order %s (%s) after consumer approval, resource %s",
+            order,
+            order.id,
+            order.resource,
+        )
+        tasks.process_order_on_commit(order, request.user)
+        return Response(
+            "Order has been approved and is being processed.",
+            status=status.HTTP_200_OK,
+        )
 
     approve_by_provider_validators = [
         structure_utils.check_customer_blocked_or_archived,
@@ -3456,6 +3825,26 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
     def approve_by_provider(self, request, uuid=None):
         order: models.Order = self.get_object()
         order.review_by_provider(request.user)
+
+        # After provider approval, check for the order's own start_date
+        if (
+            config.ENABLE_ORDER_START_DATE
+            and order.start_date
+            and order.start_date > timezone.now().date()
+        ):
+            order.state = OrderStates.PENDING_START_DATE
+            order.save(update_fields=["state"])
+            logger.info(
+                "Order %s (%s) is pending start date %s after provider approval.",
+                order,
+                order.id,
+                order.start_date,
+            )
+            return Response(
+                "Order is pending start date.",
+                status=status.HTTP_200_OK,
+            )
+
         order.set_state_executing()
         order.save(update_fields=["state"])
         logger.info(
@@ -3465,7 +3854,10 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
             order.resource,
         )
         tasks.process_order_on_commit(order, request.user)
-        return Response(status=status.HTTP_200_OK)
+        return Response(
+            "Order has been approved and is being processed.",
+            status=status.HTTP_200_OK,
+        )
 
     reject_by_consumer_validators = [
         structure_utils.check_customer_blocked_or_archived,
@@ -3533,6 +3925,7 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
         core_validators.StateValidator(
             OrderStates.PENDING_CONSUMER,
             OrderStates.PENDING_PROVIDER,
+            OrderStates.PENDING_START_DATE,
             OrderStates.EXECUTING,
             state_enum=OrderStates,
         ),
@@ -3742,6 +4135,47 @@ class OrderViewSet(ConnectedOfferingDetailsMixin, BaseMarketplaceView):
     update_attachment_validators = attachment_validators
     delete_attachment_validators = attachment_validators
 
+    @action(detail=True, methods=["POST"])
+    def set_backend_id(self, request, uuid=None):
+        order = cast(models.Order, self.get_object())
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        new_backend_id = serializer.validated_data["backend_id"]
+        old_backend_id = order.backend_id
+        if new_backend_id != old_backend_id:
+            order.backend_id = serializer.validated_data["backend_id"]
+            order.save()
+            logger.info(
+                "%s has changed order %s backend_id from %s to %s",
+                request.user.full_name,
+                order.uuid.hex,
+                old_backend_id,
+                new_backend_id,
+            )
+
+            return Response(
+                {"status": _("Order backend_id has been changed.")},
+                status=status.HTTP_200_OK,
+            )
+        else:
+            return Response(
+                {"status": _("Order backend_id is not changed.")},
+                status=status.HTTP_200_OK,
+            )
+
+    set_backend_id_permissions = [
+        permission_factory(
+            PermissionEnum.SET_RESOURCE_BACKEND_ID,
+            ["offering", "offering.customer"],
+        )
+    ]
+
+    set_backend_id_serializer_class = serializers.OrderBackendIDSerializer
+
+    set_backend_id_validators = [
+        structure_utils.check_customer_blocked_or_archived,
+    ]
+
 
 class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewSet):
     queryset = models.Resource.objects.all()
@@ -3753,6 +4187,12 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
     update_serializer_class = partial_update_serializer_class = (
         serializers.ResourceUpdateSerializer
     )
+    update_permissions = partial_update_permissions = [
+        permission_factory(
+            PermissionEnum.UPDATE_RESOURCE,
+            ["project", "project.customer", "offering", "offering.customer"],
+        )
+    ]
 
     def list(self, request, *args, **kwargs):
         utils.refresh_integration_agent_status(
@@ -3962,6 +4402,116 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
     set_slug_permissions = [structure_permissions.is_staff]
 
     set_slug_serializer_class = serializers.ResourceSlugSerializer
+
+    @extend_schema(
+        description="Set downscaled flag for resource.",
+        request=serializers.ResourceDownscaledSerializer,
+        responses={status.HTTP_200_OK: None},
+    )
+    @action(detail=True, methods=["post"])
+    def set_downscaled(self, request, uuid=None):
+        resource: models.Resource = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        new_downscaled = serializer.validated_data["downscaled"]
+        old_downscaled = resource.downscaled
+        if new_downscaled != old_downscaled:
+            resource.downscaled = new_downscaled
+            resource.save()
+            logger.info(
+                "%s has changed downscaled from %s to %s for resource %s",
+                request.user.full_name,
+                old_downscaled,
+                new_downscaled,
+                resource.uuid,
+            )
+            return Response(
+                {"status": _("Resource downscaled flag has been changed.")},
+                status=status.HTTP_200_OK,
+            )
+        else:
+            return Response(
+                {"status": _("Resource downscaled flag is not changed.")},
+                status=status.HTTP_200_OK,
+            )
+
+    set_downscaled_permissions = [structure_permissions.is_staff]
+
+    set_downscaled_serializer_class = serializers.ResourceDownscaledSerializer
+
+    @extend_schema(
+        description="Set paused flag for resource.",
+        request=serializers.ResourcePausedSerializer,
+        responses={status.HTTP_200_OK: None},
+    )
+    @action(detail=True, methods=["post"])
+    def set_paused(self, request, uuid=None):
+        resource: models.Resource = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        new_paused = serializer.validated_data["paused"]
+        old_paused = resource.paused
+        if new_paused != old_paused:
+            resource.paused = new_paused
+            resource.save()
+            logger.info(
+                "%s has changed paused from %s to %s for resource %s",
+                request.user.full_name,
+                old_paused,
+                new_paused,
+                resource.uuid,
+            )
+            return Response(
+                {"status": _("Resource paused flag has been changed.")},
+                status=status.HTTP_200_OK,
+            )
+        else:
+            return Response(
+                {"status": _("Resource paused flag is not changed.")},
+                status=status.HTTP_200_OK,
+            )
+
+    set_paused_permissions = [structure_permissions.is_staff]
+
+    set_paused_serializer_class = serializers.ResourcePausedSerializer
+
+    @extend_schema(
+        description="Set restrict_member_access flag for resource.",
+        request=serializers.ResourceRestrictMemberAccessSerializer,
+        responses={status.HTTP_200_OK: None},
+    )
+    @action(detail=True, methods=["post"])
+    def set_restrict_member_access(self, request, uuid=None):
+        resource: models.Resource = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        new_restrict = serializer.validated_data["restrict_member_access"]
+        old_restrict = resource.restrict_member_access
+        if new_restrict != old_restrict:
+            resource.restrict_member_access = new_restrict
+            resource.save()
+            logger.info(
+                "%s has changed restrict_member_access from %s to %s for resource %s",
+                request.user.full_name,
+                old_restrict,
+                new_restrict,
+                resource.uuid,
+            )
+            return Response(
+                {"status": _("Resource restrict_member_access flag has been changed.")},
+                status=status.HTTP_200_OK,
+            )
+        else:
+            return Response(
+                {"status": _("Resource restrict_member_access flag is not changed.")},
+                status=status.HTTP_200_OK,
+            )
+
+    set_restrict_member_access_permissions = [structure_permissions.is_staff]
+
+    set_restrict_member_access_serializer_class = (
+        serializers.ResourceRestrictMemberAccessSerializer
+    )
 
     def _set_end_date(self, request, is_staff_action):
         resource: models.Resource = self.get_object()
@@ -4175,11 +4725,30 @@ class BaseResourceViewSet(ConnectedOfferingDetailsMixin, core_views.ActionsViewS
         resource = cast(models.Resource, self.get_object())
         serializer = self.get_serializer(data=request.data, instance=resource)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
 
-        return Response(
-            {"status": _("Resource options are submitted")}, status=status.HTTP_200_OK
-        )
+        # Check if offering requires order creation for option changes
+        if resource.offering.plugin_options.get(
+            "create_orders_on_resource_option_change"
+        ):
+            # Store old options for comparison
+            old_options = resource.options or {}
+            new_options = serializer.validated_data.get("options", {})
+
+            # Create order for option change
+            return self.create_resource_order(
+                request=request,
+                resource=resource,
+                plan=resource.plan,
+                type=OrderTypes.UPDATE,
+                attributes={"old_options": old_options, "new_options": new_options},
+            )
+        else:
+            # Direct update without order
+            serializer.save()
+            return Response(
+                {"status": _("Resource options are submitted")},
+                status=status.HTTP_200_OK,
+            )
 
     update_options_permissions = [
         permissions.check_tos_consent_permission,
@@ -6229,7 +6798,7 @@ class BaseServiceAccountViewSet(core_views.ActionsViewSet):
     lookup_field = "uuid"
 
     def perform_create(self, serializer):
-        username = self.request.user.username
+        owner_username = self.request.user.username
         try:
             data = serializer.validated_data
             scope_type = (
@@ -6266,7 +6835,9 @@ class BaseServiceAccountViewSet(core_views.ActionsViewSet):
                             }
                         )
 
-            response_data = utils.create_service_account(data, username, scope_type)
+            response_data = utils.create_service_account(
+                data, owner_username, scope_type
+            )
             if response_data and "apiKey" in response_data:
                 instance = serializer.save()
                 instance._token = response_data["apiKey"]["apiKey"]
@@ -6839,7 +7410,7 @@ class BackendResourceViewSet(core_views.ActionsViewSet):
 
     @extend_schema(
         request=serializers.BackendResourceImportSerializer,
-        responses={status.HTTP_200_OK: serializers.ResourceSerializer},
+        responses={status.HTTP_201_CREATED: serializers.ResourceSerializer},
     )
     @action(detail=True, methods=["post"])
     def import_resource(self, request, uuid=None):
@@ -7179,15 +7750,30 @@ class ProviderOfferingToSManagementViewset(core_views.ActionsViewSet):
         user = self.request.user
         if user.is_staff or user.is_support:
             return self.queryset
-
+        consented_offerings = models.UserOfferingConsent.objects.filter(
+            user=user, revocation_date__isnull=True
+        ).values_list("offering_id", flat=True)
         customers = get_connected_customers(user)
-        if customers:
-            return self.queryset.filter(offering__customer__in=customers)
-        return self.queryset.filter(is_active=True, offering__shared=True)
+        return self.queryset.filter(
+            Q(offering__customer__in=customers)
+            | Q(offering__id__in=consented_offerings)
+            | Q(is_active=True, offering__shared=True)
+        )
 
-    create_permissions = update_permissions = partial_update_permissions = (
-        destroy_permissions
-    ) = [
+    def check_create_permissions(request, view, obj=None):
+        serializer = view.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        offering = serializer.validated_data.get("offering")
+        if not offering:
+            raise PermissionDenied()
+        if has_permission(
+            request, PermissionEnum.UPDATE_OFFERING, offering
+        ) or has_permission(request, PermissionEnum.UPDATE_OFFERING, offering.customer):
+            return
+        raise PermissionDenied()
+
+    create_permissions = [check_create_permissions]
+    update_permissions = partial_update_permissions = destroy_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING,
             ["offering.customer"],
@@ -7411,3 +7997,63 @@ class CourseAccountViewSet(core_views.ActionsViewSet):
 
     create_bulk_permissions = [check_create_permissions]
     create_bulk_serializer_class = serializers.CourseAccountsBulkCreateSerializer
+
+
+class SoftwareCatalogViewSet(
+    PublicViewsetMixin, EagerLoadMixin, core_views.ActionsViewSet
+):
+    """ViewSet for SoftwareCatalog model with standard DRF patterns."""
+
+    queryset = models.SoftwareCatalog.objects.all()
+    serializer_class = serializers.SoftwareCatalogSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.SoftwareCatalogFilter
+
+    unsafe_methods_permissions = [structure_permissions.is_staff]
+
+
+class SoftwarePackageViewSet(
+    PublicViewsetMixin, EagerLoadMixin, core_views.ActionsViewSet
+):
+    """ViewSet for SoftwarePackage model with standard DRF patterns."""
+
+    queryset = models.SoftwarePackage.objects.select_related(
+        "catalog"
+    ).prefetch_related("versions__targets")
+    serializer_class = serializers.SoftwarePackageSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.SoftwarePackageFilter
+
+    unsafe_methods_permissions = [structure_permissions.is_staff]
+
+
+class SoftwareVersionViewSet(
+    PublicViewsetMixin, EagerLoadMixin, core_views.ActionsViewSet
+):
+    """ViewSet for SoftwareVersion model with standard DRF patterns."""
+
+    queryset = models.SoftwareVersion.objects.select_related(
+        "package__catalog"
+    ).prefetch_related("targets")
+    serializer_class = serializers.SoftwareVersionSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.SoftwareVersionFilter
+
+    unsafe_methods_permissions = [structure_permissions.is_staff]
+
+
+class SoftwareTargetViewSet(
+    PublicViewsetMixin, EagerLoadMixin, core_views.ActionsViewSet
+):
+    """ViewSet for SoftwareTarget model with standard DRF patterns."""
+
+    queryset = models.SoftwareTarget.objects.select_related("version__package__catalog")
+    serializer_class = serializers.SoftwareTargetSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.SoftwareTargetFilter
+
+    unsafe_methods_permissions = [structure_permissions.is_staff]

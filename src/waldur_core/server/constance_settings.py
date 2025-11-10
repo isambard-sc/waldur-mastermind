@@ -146,6 +146,14 @@ CONSTANCE_CONFIG = {
         "Waldur | Cloud Service Management",
         "It is used as default page title if it's not specified explicitly.",
     ),
+    "PROJECT_END_DATE_MANDATORY": (
+        False,
+        "If true, project end date field becomes mandatory when creating or updating projects.",
+    ),
+    "ENABLE_ORDER_START_DATE": (
+        False,
+        "Allow setting start date to control when resource creation order is processed.",
+    ),
     "BRAND_COLOR": (
         "#307300",
         "Brand color is used for button background.",
@@ -238,23 +246,10 @@ CONSTANCE_CONFIG = {
         "Toggler for request type displaying",
     ),
     # Atlassian settings
-    "ATLASSIAN_USE_OLD_API": (
-        False,
-        "Toggler for legacy API usage.",
-    ),
-    "ATLASSIAN_USE_TEENAGE_API": (
-        False,
-        "Toggler for teenage API usage.",
-    ),
-    "ATLASSIAN_USE_AUTOMATIC_REQUEST_MAPPING": (
-        True,
-        "Toggler for automatic request mapping.",
-    ),
     "ATLASSIAN_MAP_WALDUR_USERS_TO_SERVICEDESK_AGENTS": (
         False,
         "Toggler for mapping between waldur user and service desk agents.",
     ),
-    "ATLASSIAN_STRANGE_SETTING": (1, "A constant in the API path, sometimes differs"),
     "ATLASSIAN_API_URL": (
         "https://example.com/",
         "Atlassian API server URL",
@@ -263,7 +258,19 @@ CONSTANCE_CONFIG = {
     "ATLASSIAN_USERNAME": ("USERNAME", "Username for access user"),
     "ATLASSIAN_PASSWORD": ("PASSWORD", "Password for access user", "secret_field"),
     "ATLASSIAN_EMAIL": ("", "Email for access user", "email_field"),
+    "ATLASSIAN_USE_OLD_API": (
+        False,
+        "Toggler for legacy API usage.",
+    ),
     "ATLASSIAN_TOKEN": ("", "Token for access user", "secret_field"),
+    "ATLASSIAN_PERSONAL_ACCESS_TOKEN": (
+        "",
+        "Personal Access Token for user",
+        "secret_field",
+    ),
+    "ATLASSIAN_OAUTH2_CLIENT_ID": ("", "OAuth 2.0 Client ID", "secret_field"),
+    "ATLASSIAN_OAUTH2_ACCESS_TOKEN": ("", "OAuth 2.0 Access Token", "secret_field"),
+    "ATLASSIAN_OAUTH2_TOKEN_TYPE": ("Bearer", "OAuth 2.0 Token Type"),
     "ATLASSIAN_VERIFY_SSL": (
         True,
         "Toggler for SSL verification",
@@ -285,13 +292,19 @@ CONSTANCE_CONFIG = {
         "",
         "Comma-separated list of file extenstions not allowed for attachment.",
     ),
-    "ATLASSIAN_PULL_PRIORITIES": (
-        True,
-        "Toggler for pulling priorities from backend",
-    ),
     "ATLASSIAN_ISSUE_TYPES": (
         "Informational, Service Request, Change Request, Incident",
         "Comma-separated list of enabled issue types. First type is the default one.",
+    ),
+    "ATLASSIAN_SUPPORT_TYPE_MAPPING": (
+        {
+            "Informational": "Get IT help",
+            "Service Request": "Request new software",
+            "Change Request": "Change Request",
+            "Incident": "Report a system problem",
+        },
+        "Mapping from frontend issue types to backend request types",
+        "dict_field",
     ),
     "ATLASSIAN_DESCRIPTION_TEMPLATE": ("", "Template for issue description"),
     "ATLASSIAN_SUMMARY_TEMPLATE": ("", "Template for issue summary"),
@@ -313,6 +326,10 @@ CONSTANCE_CONFIG = {
         "Request feedback field name",
     ),
     "ATLASSIAN_TEMPLATE_FIELD": ("", "Template field name"),
+    "ATLASSIAN_WALDUR_BACKEND_ID_FIELD": (
+        "customfield_10200",
+        "Waldur backend ID custom field ID (fallback when field lookup by name fails)",
+    ),
     # Zammad settings
     "ZAMMAD_API_URL": (
         "",
@@ -543,6 +560,12 @@ CONSTANCE_CONFIG = {
         30,
         "Timeout in seconds for Estonian Äriregister API requests.",
     ),
+    "ONBOARDING_WICO_API_URL": (
+        "https://api.wirtschaftscompass.at/",
+        "WirtschaftsCompass API server URL",
+        "url_field",
+    ),
+    "ONBOARDING_WICO_TOKEN": ("", "WirtschaftsCompass API token", "secret_field"),
 }
 
 CONSTANCE_CONFIG_FIELDSETS = {
@@ -573,7 +596,9 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND",
         "ENABLE_MOCK_COURSE_ACCOUNT_BACKEND",
         "ENFORCE_USER_CONSENT_FOR_OFFERINGS",
+        "ENABLE_ORDER_START_DATE",
     ),
+    "Project": ("PROJECT_END_DATE_MANDATORY",),
     "Telemetry": (
         "TELEMETRY_URL",
         "TELEMETRY_VERSION",
@@ -632,10 +657,15 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ATLASSIAN_PASSWORD",
         "ATLASSIAN_EMAIL",
         "ATLASSIAN_TOKEN",
+        "ATLASSIAN_PERSONAL_ACCESS_TOKEN",
+        "ATLASSIAN_OAUTH2_CLIENT_ID",
+        "ATLASSIAN_OAUTH2_ACCESS_TOKEN",
+        "ATLASSIAN_OAUTH2_TOKEN_TYPE",
         "ATLASSIAN_PROJECT_ID",
         "ATLASSIAN_DEFAULT_OFFERING_ISSUE_TYPE",
         "ATLASSIAN_EXCLUDED_ATTACHMENT_TYPES",
         "ATLASSIAN_ISSUE_TYPES",
+        "ATLASSIAN_SUPPORT_TYPE_MAPPING",
         "ATLASSIAN_AFFECTED_RESOURCE_FIELD",
         "ATLASSIAN_DESCRIPTION_TEMPLATE",
         "ATLASSIAN_SUMMARY_TEMPLATE",
@@ -650,15 +680,12 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ATLASSIAN_SATISFACTION_FIELD",
         "ATLASSIAN_REQUEST_FEEDBACK_FIELD",
         "ATLASSIAN_TEMPLATE_FIELD",
+        "ATLASSIAN_WALDUR_BACKEND_ID_FIELD",
         "ATLASSIAN_CUSTOM_ISSUE_FIELD_MAPPING_ENABLED",
         "ATLASSIAN_SHARED_USERNAME",
         "ATLASSIAN_VERIFY_SSL",
         "ATLASSIAN_USE_OLD_API",
-        "ATLASSIAN_USE_TEENAGE_API",
-        "ATLASSIAN_USE_AUTOMATIC_REQUEST_MAPPING",
         "ATLASSIAN_MAP_WALDUR_USERS_TO_SERVICEDESK_AGENTS",
-        "ATLASSIAN_STRANGE_SETTING",
-        "ATLASSIAN_PULL_PRIORITIES",
     ),
     "Zammad settings": (
         "ZAMMAD_API_URL",
@@ -720,6 +747,8 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ONBOARDING_ARIREGISTER_USERNAME",
         "ONBOARDING_ARIREGISTER_PASSWORD",
         "ONBOARDING_ARIREGISTER_TIMEOUT",
+        "ONBOARDING_WICO_API_URL",
+        "ONBOARDING_WICO_TOKEN",
     ),
 }
 
@@ -756,6 +785,7 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "LANGUAGE_CHOICES",
     "DISABLE_DARK_THEME",
     "MARKETPLACE_LANDING_PAGE",
+    "ENABLE_ORDER_START_DATE",
     # Support plugin
     "WALDUR_SUPPORT_ENABLED",
     "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE",

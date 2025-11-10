@@ -17,6 +17,12 @@ class MarketplaceSiteAgentExtension(WaldurExtension):
         return urlpatterns
 
     @staticmethod
+    def rest_urls():
+        from .urls import register_in
+
+        return register_in
+
+    @staticmethod
     def celery_tasks():
         from datetime import timedelta
 
@@ -38,6 +44,21 @@ class MarketplaceSiteAgentExtension(WaldurExtension):
             },
             "send-messages-about-pending-orders": {
                 "task": "waldur_mastermind.marketplace_site_agent.send_messages_about_pending_orders",
+                "schedule": timedelta(hours=1),
+                "args": (),
+            },
+            "mark_agent_services_as_inactive": {
+                "task": "waldur_mastermind.marketplace_site_agent.mark_agent_services_as_inactive",
+                "schedule": timedelta(minutes=5),
+                "args": (),
+            },
+            "delete-stale-event-subscriptions": {
+                "task": "waldur_core.logging.delete_stale_event_subscriptions",
+                "schedule": timedelta(hours=24),
+                "args": (),
+            },
+            "delete-dangling-event-subscriptions": {
+                "task": "waldur_core.logging.delete_dangling_event_subscriptions",
                 "schedule": timedelta(hours=1),
                 "args": (),
             },

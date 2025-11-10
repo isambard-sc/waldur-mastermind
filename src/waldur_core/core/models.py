@@ -38,7 +38,7 @@ from .shims import AbstractBaseUser
 logger = logging.getLogger(__name__)
 
 
-DESCRIPTION_LENGTH = 2000
+DESCRIPTION_LENGTH = 4096
 
 NAME_LENGTH = 150
 
@@ -93,10 +93,13 @@ class SlugMixin(models.Model):
 
     def save(self, *args, **kwargs):
         if not self.slug:
-            slug_source = getattr(self, self.get_slug_source_field())
-            self.slug = generate_slug(slug_source, self.__class__)
+            self.slug = self.generate_slug()
 
         super().save(*args, **kwargs)
+
+    def generate_slug(self):
+        slug_source = getattr(self, self.get_slug_source_field())
+        return generate_slug(slug_source, self.__class__)
 
     @classmethod
     def get_slug_source_field(cls):
@@ -123,9 +126,15 @@ def generate_slug(name, klass):
         "slug", flat=True
     )
 
-    # Find maximum suffix
-    max_num = 0
+    # If base slug is available, return it
+    if base_slug not in existing_slugs:
+        return base_slug
+
+    # Find maximum suffix for numbered slugs
+    max_num = 1  # Start from 1, so next available will be 2
     for slug in existing_slugs:
+        if slug == base_slug:
+            continue  # Skip the base slug itself
         try:
             num = int(slug.split("-")[-1])
             if num > max_num:
@@ -391,6 +400,7 @@ class User(
             validators.MaxLengthValidator(20),
         ],
     )
+    birth_date = models.DateField(_("birth date"), null=True, blank=True)
     query_field = models.CharField(max_length=300, blank=True)
     WHITELIST_FIELDS = [
         "is_superuser",

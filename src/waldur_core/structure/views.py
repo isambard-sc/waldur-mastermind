@@ -1,12 +1,15 @@
 import logging
+from datetime import datetime
 
 from dbtemplates.models import Template
 from dbtemplates.utils.cache import remove_cached_template
 from django.conf import settings as django_settings
+from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.core import exceptions as django_exceptions
 from django.db import transaction
 from django.db.models import Count, Q, QuerySet
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -39,12 +42,12 @@ from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.serializers import EmptySerializer
-from waldur_core.core.utils import is_uuid_like
+from waldur_core.core.utils import get_ip_address, is_uuid_like
 from waldur_core.core.views import ActionsViewSet
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
 from waldur_core.permissions.enums import PermissionEnum
-from waldur_core.permissions.models import UserRole
+from waldur_core.permissions.models import Role, UserRole
 from waldur_core.permissions.utils import (
     has_permission,
     permission_factory,
@@ -52,6 +55,7 @@ from waldur_core.permissions.utils import (
 from waldur_core.permissions.views import UserRoleMixin
 from waldur_core.structure import filters, models, permissions, serializers, utils
 from waldur_core.structure.managers import (
+    filter_queryset_by_user_ip,
     filter_queryset_for_user,
     get_active_tokens,
     get_connected_customers,
@@ -59,6 +63,9 @@ from waldur_core.structure.managers import (
     get_project_users,
 )
 from waldur_core.structure.utils import get_components_usage_data_from_resources
+from waldur_core.users import tasks as user_tasks
+from waldur_core.users.enums import InvitationState
+from waldur_core.users.models import Invitation
 from waldur_mastermind.billing import models as billing_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
@@ -437,6 +444,18 @@ class ProjectTypeViewSet(viewsets.ReadOnlyModelViewSet):
     filterset_class = filters.ProjectTypeFilter
 
 
+@extend_schema_view(
+    list=extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "include_terminated",
+                OpenApiTypes.BOOL,
+                OpenApiParameter.QUERY,
+                description="Include soft-deleted (terminated) projects. Only available to staff and support users, or users with organizational roles who can see their terminated projects.",
+            )
+        ]
+    )
+)
 class ProjectViewSet(
     checklist_mixins.UserChecklistMixin,
     UserRoleMixin,
@@ -444,6 +463,74 @@ class ProjectViewSet(
     core_views.ActionsViewSet,
 ):
     queryset = models.Project.available_objects.all().order_by("name")
+
+    def get_queryset(self):
+        user = getattr(self.request, "user", None)
+        query_params = getattr(self.request, "query_params", self.request.GET)
+        include_terminated = (
+            query_params.get("include_terminated", "false").lower() == "true"
+        )
+
+        if include_terminated and user and (user.is_staff or user.is_support):
+            # Staff and support users can see ALL terminated projects
+            return models.Project.objects.all().order_by("name")
+        elif include_terminated and user and user.is_authenticated:
+            # Regular users can see terminated projects they would normally have access to
+            # Get the base queryset using normal filtering but include terminated projects
+            base_queryset = models.Project.objects.all().order_by("name")
+            # Apply the same filters that would normally be applied (GenericRoleFilter logic)
+            filtered_queryset = filter_queryset_for_user(base_queryset, user)
+            filtered_queryset = filter_queryset_by_user_ip(
+                filtered_queryset, self.request
+            )
+            return filtered_queryset
+
+        return models.Project.available_objects.all().order_by("name")
+
+    def get_object(self):
+        """
+        Override get_object to allow access to soft-deleted projects by UUID.
+        This enables access to individual project endpoints (like stats) for
+        terminated projects without requiring include_terminated parameter.
+        For active projects, uses default Django behavior.
+        """
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        lookup_value = self.kwargs[lookup_url_kwarg]
+
+        # First check if the project exists and if it's soft-deleted
+        try:
+            project = models.Project.objects.get(**{self.lookup_field: lookup_value})
+
+            # If project is active, use default Django behavior (preserves existing permission logic)
+            if not project.is_removed:
+                return super().get_object()
+
+            # Only apply custom logic for soft-deleted projects
+            user = getattr(self.request, "user", None)
+
+            if not user or not user.is_authenticated:
+                raise Http404("No Project matches the given query.")
+
+            # Staff and support can access any terminated project
+            if user.is_staff or user.is_support:
+                return project
+
+            # Regular users need to have normal access to the project
+            filtered_queryset = filter_queryset_for_user(
+                models.Project.objects.filter(id=project.id), user
+            )
+            filtered_queryset = filter_queryset_by_user_ip(
+                filtered_queryset, self.request
+            )
+            if not filtered_queryset.exists():
+                raise Http404("No Project matches the given query.")
+
+            return project
+
+        except models.Project.DoesNotExist:
+            # Use default behavior for non-existent projects
+            return super().get_object()
+
     serializer_class = serializers.ProjectSerializer
     lookup_field = "uuid"
     filter_backends = (
@@ -540,13 +627,34 @@ class ProjectViewSet(
 
         super().perform_create(serializer)
 
+    def perform_destroy(self, instance):
+        """Override to pass the terminating user to the soft delete method."""
+        instance._soft_delete(terminated_by=self.request.user)
+
     @extend_schema(
         request=serializers.MoveProjectSerializer,
-        responses=serializers.ProjectSerializer,
+        responses={
+            200: serializers.ProjectSerializer,
+            400: {
+                "type": "object",
+                "properties": {
+                    "non_field_errors": {"type": "array", "items": {"type": "string"}}
+                },
+                "description": "Validation error when trying to move a terminated project",
+                "example": {"non_field_errors": ["Cannot move terminated projects."]},
+            },
+        },
     )
     @action(detail=True, methods=["post"])
     def move_project(self, request, uuid=None):
         project = self.get_object()
+
+        # Restrict moving terminated projects
+        if project.is_removed:
+            raise ValidationError(
+                {"non_field_errors": ["Cannot move terminated projects."]}
+            )
+
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -595,6 +703,324 @@ class ProjectViewSet(
             },
             status=status.HTTP_200_OK,
         )
+
+    @extend_schema(
+        request=serializers.ProjectRecoverySerializer,
+        responses=serializers.ProjectSerializer,
+        description="Recover a soft-deleted project with team member restoration",
+    )
+    @action(detail=True, methods=["post"])
+    def recover(self, request, uuid=None):
+        project = self.get_object()
+
+        # Check if project is actually soft-deleted
+        if not project.is_removed:
+            raise ValidationError("Project is not deleted and cannot be recovered.")
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        restore_team_members = serializer.validated_data["restore_team_members"]
+        send_invitations = serializer.validated_data[
+            "send_invitations_to_previous_members"
+        ]
+        end_date = serializer.validated_data.get("end_date")
+
+        # Validate that team recovery options are only used when metadata is available
+        if (
+            restore_team_members or send_invitations
+        ) and not project.termination_metadata:
+            raise ValidationError(
+                "This project was deleted before team member metadata was captured. "
+                "Only basic project recovery is available. "
+                "Team member restoration and invitations require projects deleted after the metadata feature was implemented."
+            )
+
+        # Recover the project
+        project.is_removed = False
+        if end_date is not None:
+            project.end_date = end_date
+            project.save(update_fields=["is_removed", "end_date"])
+        else:
+            project.save(update_fields=["is_removed"])
+
+        # Handle team recovery options
+        restored_users = []
+        sent_invitations = []
+
+        if restore_team_members:
+            restored_users = self._restore_team_members(project, request.user)
+        elif send_invitations:
+            sent_invitations = self._send_invitations_to_previous_members(
+                project, request.user
+            )
+
+        # Log the recovery action
+        event_context = {
+            "project": project,
+            "restore_team_members": restore_team_members,
+            "send_invitations": send_invitations,
+            "restored_users_count": len(restored_users),
+            "sent_invitations_count": len(sent_invitations),
+        }
+        if end_date is not None:
+            event_context["end_date"] = end_date.isoformat()
+
+        event_logger.emit(
+            "Project {project_name} has been recovered.",
+            event_type=EventType.PROJECT_UPDATE_SUCCEEDED,
+            event_context=event_context,
+            scopes=[project, project.customer],
+        )
+
+        serialized_project = serializers.ProjectSerializer(
+            project, context={"request": self.request}
+        )
+
+        # Add recovery information to response
+        response_data = serialized_project.data
+        if restore_team_members and restored_users:
+            response_data["recovery_info"] = {
+                "restored_users_count": len(restored_users),
+                "restored_users": [
+                    {
+                        "user_uuid": str(user_role.user.uuid),
+                        "username": user_role.user.username,
+                        "role": user_role.role.name,
+                    }
+                    for user_role in restored_users
+                ],
+            }
+        elif send_invitations and sent_invitations:
+            response_data["recovery_info"] = {
+                "sent_invitations_count": len(sent_invitations),
+                "sent_invitations": [
+                    {
+                        "invitation_uuid": str(invitation.uuid),
+                        "email": invitation.email,
+                        "role": invitation.role.name,
+                        "state": invitation.state,
+                    }
+                    for invitation in sent_invitations
+                ],
+            }
+
+        return Response(response_data, status=status.HTTP_200_OK)
+
+    def _validate_user_role_data(self, role_data, project):
+        """Validate user role data and return user, role objects if valid."""
+        User = get_user_model()
+
+        # Get user and role objects by username and role name
+        user = User.objects.get(username=role_data["user_username"])
+        role = Role.objects.get(name=role_data["role_name"])
+
+        # Check if user is still active
+        if not user.is_active:
+            return None, None
+
+        # Parse expiration time
+        expiration_time = None
+        if role_data.get("original_expiration_time"):
+            expiration_time = datetime.fromisoformat(
+                role_data["original_expiration_time"]
+            )
+
+        # Check if role hasn't expired
+        if expiration_time and expiration_time < timezone.now():
+            return None, None
+
+        # Check if user already has this role for this project
+        existing_role = UserRole.objects.filter(
+            user=user, role=role, scope=project, is_active=True
+        ).first()
+        if existing_role:
+            return None, None
+
+        return user, role
+
+    def _restore_team_members(self, project, restored_by_user):
+        """Restore team members from project termination metadata."""
+        User = get_user_model()
+
+        if (
+            not project.termination_metadata
+            or "user_roles" not in project.termination_metadata
+        ):
+            return []
+
+        restored_roles = []
+        user_roles_data = project.termination_metadata["user_roles"]
+
+        for role_data in user_roles_data:
+            if role_data.get("is_restored", False):
+                continue  # Skip already restored roles
+
+            try:
+                user, role = self._validate_user_role_data(role_data, project)
+                if not user or not role:
+                    # Check if users/roles exist and mark existing role as restored
+                    try:
+                        existing_user = User.objects.get(
+                            username=role_data["user_username"]
+                        )
+                        existing_role = Role.objects.get(name=role_data["role_name"])
+                        existing_user_role = UserRole.objects.filter(
+                            user=existing_user,
+                            role=existing_role,
+                            scope=project,
+                            is_active=True,
+                        ).first()
+                        if existing_user_role:
+                            role_data["is_restored"] = True
+                            role_data["restored_at"] = timezone.now().isoformat()
+                            role_data["restored_by"] = restored_by_user.username
+                    except (User.DoesNotExist, Role.DoesNotExist):
+                        pass  # Skip invalid users/roles
+                    continue
+
+                created_by = None
+                if role_data.get("created_by_username"):
+                    created_by = User.objects.get(
+                        username=role_data["created_by_username"]
+                    )
+
+                # Parse expiration time for user role creation
+                expiration_time = None
+                if role_data.get("original_expiration_time"):
+                    expiration_time = datetime.fromisoformat(
+                        role_data["original_expiration_time"]
+                    )
+
+                # Recreate the UserRole
+                user_role = UserRole.objects.create(
+                    user=user,
+                    role=role,
+                    scope=project,
+                    created_by=created_by,
+                    expiration_time=expiration_time,
+                    is_active=True,
+                )
+
+                # Mark as restored in metadata
+                role_data["is_restored"] = True
+                role_data["restored_at"] = timezone.now().isoformat()
+                role_data["restored_by"] = restored_by_user.username
+
+                restored_roles.append(user_role)
+
+            except (User.DoesNotExist, Role.DoesNotExist) as e:
+                # Log error and continue with other roles
+                logger.warning(f"Could not restore role for project {project.id}: {e}")
+                continue
+
+        # Save updated metadata
+        if user_roles_data:  # Only save if there was metadata to process
+            project.save(update_fields=["termination_metadata"])
+
+        return restored_roles
+
+    def _send_invitations_to_previous_members(self, project, invited_by_user):
+        """Send invitations to users who had access before project termination."""
+        User = get_user_model()
+
+        if (
+            not project.termination_metadata
+            or "user_roles" not in project.termination_metadata
+        ):
+            return []
+
+        sent_invitations = []
+        user_roles_data = project.termination_metadata["user_roles"]
+
+        for role_data in user_roles_data:
+            if role_data.get("invitation_sent", False):
+                continue  # Skip if invitation already sent
+
+            try:
+                user, role = self._validate_user_role_data(role_data, project)
+                if not user or not role:
+                    # Check if users/roles exist and mark existing role invitation as sent
+                    try:
+                        existing_user = User.objects.get(
+                            username=role_data["user_username"]
+                        )
+                        existing_role = Role.objects.get(name=role_data["role_name"])
+                        existing_user_role = UserRole.objects.filter(
+                            user=existing_user,
+                            role=existing_role,
+                            scope=project,
+                            is_active=True,
+                        ).first()
+                        if existing_user_role:
+                            role_data["invitation_sent"] = True
+                            role_data["invitation_sent_at"] = timezone.now().isoformat()
+                            role_data["invitation_sent_by"] = invited_by_user.username
+                    except (User.DoesNotExist, Role.DoesNotExist):
+                        pass  # Skip invalid users/roles
+                    continue
+
+                # Check if there's already a pending invitation for this user and role
+                project_ct = ContentType.objects.get_for_model(project)
+                existing_invitation = Invitation.objects.filter(
+                    email=user.email,
+                    role=role,
+                    content_type=project_ct,
+                    object_id=project.id,
+                    state=InvitationState.PENDING,
+                ).first()
+                if existing_invitation:
+                    # Mark as already invited
+                    role_data["invitation_sent"] = True
+                    role_data["invitation_sent_at"] = timezone.now().isoformat()
+                    role_data["invitation_sent_by"] = invited_by_user.username
+                    role_data["existing_invitation_uuid"] = str(
+                        existing_invitation.uuid
+                    )
+                    sent_invitations.append(existing_invitation)
+                    continue
+
+                # Create invitation
+                invitation = Invitation.objects.create(
+                    email=user.email,
+                    role=role,
+                    scope=project,
+                    created_by=invited_by_user,
+                    state=InvitationState.PENDING,
+                    customer=project.customer,
+                    full_name=user.full_name or user.get_full_name(),
+                    extra_invitation_text=f"You previously had {role.name} access to this project before it was temporarily removed.",
+                )
+
+                # Send invitation email
+                sender = invited_by_user.full_name or invited_by_user.username
+                user_tasks.send_invitation_created.delay(invitation.uuid.hex, sender)
+
+                # Mark as invitation sent in metadata
+                role_data["invitation_sent"] = True
+                role_data["invitation_sent_at"] = timezone.now().isoformat()
+                role_data["invitation_sent_by"] = invited_by_user.username
+                role_data["invitation_uuid"] = str(invitation.uuid)
+
+                sent_invitations.append(invitation)
+
+            except (User.DoesNotExist, Role.DoesNotExist) as e:
+                # Log error and continue with other roles
+                logger.warning(
+                    f"Could not send invitation for project {project.id}: {e}"
+                )
+                continue
+
+        # Save updated metadata
+        if user_roles_data:  # Only save if there was metadata to process
+            project.save(update_fields=["termination_metadata"])
+
+        return sent_invitations
+
+    recover_serializer_class = serializers.ProjectRecoverySerializer
+    recover_permissions = [
+        permission_factory(PermissionEnum.CREATE_PROJECT, ["customer"])
+    ]
 
 
 @extend_schema(
@@ -753,9 +1179,11 @@ class UserViewSet(core_views.ActionsViewSet):
     @action(detail=False, methods=["get"])
     def me(self, request):
         serializer = self.get_serializer(request.user)
+        response_data = serializer.data
+        response_data["ip_address"] = get_ip_address(request)
 
         return Response(
-            serializer.data,
+            response_data,
             status=status.HTTP_200_OK,
         )
 

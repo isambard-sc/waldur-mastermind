@@ -156,6 +156,44 @@ class ResourceGetTest(test.APITransactionTestCase):
         self.assertIn("order_in_progress", response.data)
         self.assertIsNotNone(response.data["order_in_progress"])
 
+    def test_order_in_progress_includes_url(self):
+        order = models.Order.objects.create(
+            project=self.project,
+            resource=self.resource,
+            state=OrderStates.EXECUTING,
+            created_by=self.fixture.owner,
+            offering=self.offering,
+        )
+        response = self.get_resource(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        order_in_progress = response.data["order_in_progress"]
+        self.assertIsNotNone(order_in_progress)
+        self.assertIn("url", order_in_progress)
+        self.assertTrue(
+            order_in_progress["url"].endswith(f"marketplace-orders/{order.uuid.hex}/")
+        )
+
+    def test_creation_order_includes_url(self):
+        order = models.Order.objects.create(
+            project=self.project,
+            resource=self.resource,
+            state=OrderStates.ERRED,
+            created_by=self.fixture.owner,
+            offering=self.offering,
+        )
+        self.resource.set_state_erred()
+        self.resource.save()
+        response = self.get_resource(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        creation_order = response.data["creation_order"]
+        self.assertIsNotNone(creation_order)
+        self.assertIn("url", creation_order)
+        self.assertTrue(
+            creation_order["url"].endswith(f"marketplace-orders/{order.uuid.hex}/")
+        )
+
     def test_resource_erred_creation_order_is_exposed(self):
         models.Order.objects.create(
             project=self.project,
@@ -1419,6 +1457,32 @@ class ResourceUpdateOptionsTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.resource.refresh_from_db()
         self.assertEqual(self.resource.options["email"], "order@example.com")
+
+    def test_create_order_when_offering_requires_order_for_option_change(self):
+        self.fixture.offering.plugin_options = {
+            "create_orders_on_resource_option_change": True
+        }
+        self.fixture.offering.save()
+        response = self.make_request(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.options, None)
+        self.assertTrue(
+            models.Order.objects.filter(uuid=response.data["order_uuid"]).exists()
+        )
+        order = models.Order.objects.filter(uuid=response.data["order_uuid"]).get()
+        self.assertEqual(
+            order.attributes.get("new_options"), {"email": "order@example.com"}
+        )
+
+        order.set_state_executing()
+        order.save()
+        marketplace_utils.process_order(order, self.fixture.owner)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.options, {"email": "order@example.com"})
+        order.refresh_from_db()
+        self.assertEqual(order.state, OrderStates.DONE)
+        self.assertEqual(self.resource.state, models.Resource.States.OK)
 
     @data("admin")
     def test_user_can_not_update_resource_options(self, user):

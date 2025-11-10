@@ -44,6 +44,8 @@ class CustomerSection(FeatureSection):
         "Allows to show permission reviews tab and popups for organisations."
     )
 
+    show_banking_data = Feature("Display banking related data under customer profile.")
+
 
 class ProjectSection(FeatureSection):
     class Meta:
@@ -159,6 +161,12 @@ class MarketplaceSection(FeatureSection):
 
     show_managed_projects = Feature(
         "Allows to show managed (openportal) remote projects in organization."
+    )
+
+    display_software_catalog = Feature("Enable display of software catalog in UI.")
+
+    display_offering_partitions = Feature(
+        "Enable display of offering partitions in UI."
     )
 
 

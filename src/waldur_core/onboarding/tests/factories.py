@@ -1,4 +1,5 @@
 import factory
+from django.urls import reverse
 from django.utils import timezone
 
 from waldur_core.core.tests.types import BaseMetaFactory
@@ -18,7 +19,6 @@ class OnboardingVerificationFactory(
     country = "EE"
     legal_person_identifier = factory.Sequence(lambda n: f"7000031{n}")
     legal_name = factory.Sequence(lambda n: f"Test Company {n}")
-    user_submitted_customer_metadata = factory.Dict({})
     status = VerificationStatus.PENDING
     validation_method = ""
     verified_user_roles = factory.List([])
@@ -30,6 +30,19 @@ class OnboardingVerificationFactory(
         lambda: timezone.now() + timezone.timedelta(hours=24)
     )
 
+    @classmethod
+    def get_url(cls, verification=None, action=None):
+        verification = verification or OnboardingVerificationFactory()
+        url = "http://testserver" + reverse(
+            "onboarding-verification-detail", kwargs={"uuid": verification.uuid.hex}
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = "http://testserver" + reverse("onboarding-verification-list")
+        return url if action is None else url + action + "/"
+
 
 class OnboardingJustificationFactory(
     factory.django.DjangoModelFactory,
@@ -40,6 +53,19 @@ class OnboardingJustificationFactory(
 
     verification = factory.SubFactory(OnboardingVerificationFactory)
     user = factory.SelfAttribute("verification.user")
-    user_justification = factory.Faker("text", max_nb_chars=500)
+    user_justification = "Please validate my company."
     validation_decision = ReviewDecision.PENDING
-    staff_notes = ""
+    staff_notes = "Notes from staff."
+
+    @classmethod
+    def get_url(cls, justification=None, action=None):
+        justification = justification or OnboardingJustificationFactory()
+        url = "http://testserver" + reverse(
+            "onboarding-justification-detail", kwargs={"uuid": justification.uuid.hex}
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = "http://testserver" + reverse("onboarding-justification-list")
+        return url if action is None else url + action + "/"

@@ -62,6 +62,7 @@ from waldur_mastermind.common.utils import prices_are_equal
 from waldur_mastermind.invoices.models import InvoiceItem
 from waldur_mastermind.invoices.serializers import PaymentProfileSerializer
 from waldur_mastermind.invoices.utils import get_billing_price_estimate_for_resources
+from waldur_mastermind.marketplace.billing_utils import convert_slurm_usage
 from waldur_mastermind.marketplace.enums import (
     OPENSTACK_TENANT_OFFERING,
     BillingTypes,
@@ -85,7 +86,6 @@ from waldur_mastermind.marketplace.plugins import manager
 from waldur_mastermind.marketplace.processors import CreateResourceProcessor
 from waldur_mastermind.marketplace.utils import (
     UsernameGenerationPolicy,
-    convert_slurm_usage,
     get_service_provider_resources,
     get_service_provider_user_ids,
     parse_date,
@@ -157,13 +157,21 @@ class LifecyclePluginOptionsSerializer(serializers.Serializer):
         required=False,
         help_text="Required user role in a project for provisioning of resources",
     )
-    order_supports_comments_and_metadata = serializers.BooleanField(
+    enable_purchase_order_upload = serializers.BooleanField(
         required=False,
-        help_text="If set to True, orders will support comments and metadata",
+        help_text="If set to True, users will be able to upload purchase orders.",
+    )
+    require_purchase_order_upload = serializers.BooleanField(
+        required=False,
+        help_text="If set to True, users will be required to upload purchase orders.",
     )
     conceal_billing_data = serializers.BooleanField(
         required=False,
         help_text="If set to True, pricing and components tab would be concealed.",
+    )
+    create_orders_on_resource_option_change = serializers.BooleanField(
+        required=False,
+        help_text="If set to True, create orders when options of related resources are changed.",
     )
 
 
@@ -190,6 +198,11 @@ class OpenStackPluginOptionsSerializer(serializers.Serializer):
         required=False,
         min_value=1,
         help_text="Default limit for number of volumes in OpenStack tenant",
+    )
+    max_security_groups = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        help_text="Default limit for number of security groups in OpenStack tenant",
     )
     storage_mode = serializers.ChoiceField(
         required=False,
@@ -321,6 +334,20 @@ class AgentPluginOptionsSerializer(serializers.Serializer):
     )
 
 
+class OfferingResourceDisplayOptionsSerializer(serializers.Serializer):
+    highlight_backend_id_display = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Defines if backend_id should be shown more prominently by the UI",
+    )
+    backend_id_display_label = serializers.CharField(
+        required=False,
+        default="Backend ID",
+        allow_blank=True,
+        help_text="Label used by UI for showing value of the backend_id",
+    )
+
+
 class MergedPluginOptionsSerializer(
     LifecyclePluginOptionsSerializer,
     OpenStackPluginOptionsSerializer,
@@ -329,6 +356,7 @@ class MergedPluginOptionsSerializer(
     SupportPluginOptionsSerializer,
     RancherPluginOptionsSerializer,
     AgentPluginOptionsSerializer,
+    OfferingResourceDisplayOptionsSerializer,
 ):
     pass
 
@@ -1070,6 +1098,147 @@ class QuotasUpdateSerializer(serializers.Serializer):
                 old_component.save(update_fields=["amount"])
 
 
+class DiscountConfigSerializer(serializers.Serializer):
+    """Serializer for individual component discount configuration."""
+
+    discount_threshold = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=1,
+        help_text="Minimum quantity to be eligible for discount.",
+    )
+    discount_rate = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=0,
+        max_value=100,
+        help_text="Discount rate in percentage (0-100).",
+    )
+
+    def validate(self, attrs):
+        """Ensure both threshold and rate are set together or both are None."""
+        threshold = attrs.get("discount_threshold")
+        rate = attrs.get("discount_rate")
+
+        # If one is provided, both must be provided
+        if (threshold is not None and rate is None) or (
+            threshold is None and rate is not None
+        ):
+            raise serializers.ValidationError(
+                "Both discount_threshold and discount_rate must be provided together, "
+                "or both must be null to remove discount."
+            )
+
+        # If both are provided, validate they are reasonable
+        if threshold is not None and rate is not None:
+            if threshold <= 0:
+                raise serializers.ValidationError(
+                    "discount_threshold must be a positive number."
+                )
+            if rate < 0 or rate > 100:
+                raise serializers.ValidationError(
+                    "discount_rate must be between 0 and 100."
+                )
+
+        return attrs
+
+
+class DiscountsUpdateSerializer(serializers.Serializer):
+    """Serializer for updating discounts for multiple plan components."""
+
+    discounts = serializers.DictField(
+        child=DiscountConfigSerializer(),
+        help_text="Dictionary mapping component types to their discount configuration.",
+    )
+
+    def validate_discounts(self, value):
+        """Validate that component types exist in the plan's offering."""
+        plan: models.Plan = self.instance
+
+        new_keys = set(value.keys())
+        valid_types = {component.type for component in plan.offering.components.all()}
+
+        invalid_types = new_keys - valid_types
+        if invalid_types:
+            raise serializers.ValidationError(
+                f"Invalid component types: {', '.join(invalid_types)}. "
+                f"Valid types are: {', '.join(valid_types)}"
+            )
+
+        return value
+
+    def save(self):
+        """Apply discount configuration to plan components."""
+        plan: models.Plan = self.instance
+        discounts_config = self.validated_data["discounts"]
+
+        updated_components = []
+
+        for component_type, discount_data in discounts_config.items():
+            try:
+                plan_component = plan.components.get(component__type=component_type)
+            except models.PlanComponent.DoesNotExist:
+                logger.warning(
+                    f"PlanComponent with type '{component_type}' not found in plan '{plan.uuid}'. "
+                    "Skipping discount update for this component."
+                )
+                continue
+
+            # Get the new values (could be None to clear discount)
+            new_threshold = discount_data.get("discount_threshold")
+            new_rate = discount_data.get("discount_rate")
+
+            # Track if changes were made
+            changed = False
+            update_fields = []
+
+            if plan_component.discount_threshold != new_threshold:
+                plan_component.discount_threshold = new_threshold
+                update_fields.append("discount_threshold")
+                changed = True
+
+            if plan_component.discount_rate != new_rate:
+                plan_component.discount_rate = new_rate
+                update_fields.append("discount_rate")
+                changed = True
+
+            if changed:
+                plan_component.save(update_fields=update_fields)
+                updated_components.append(
+                    {
+                        "component_type": component_type,
+                        "discount_threshold": new_threshold,
+                        "discount_rate": new_rate,
+                    }
+                )
+
+                logger.info(
+                    f"Updated discount for plan component '{component_type}' in plan '{plan.uuid}'. "
+                    f"Threshold: {new_threshold}, Rate: {new_rate}%"
+                )
+
+        return updated_components
+
+
+class NestedPlanComponentSerializer(serializers.ModelSerializer):
+    type = serializers.ReadOnlyField(source="component.type")
+    name = serializers.ReadOnlyField(source="component.name")
+    measured_unit = serializers.ReadOnlyField(source="component.measured_unit")
+
+    class Meta:
+        model = models.PlanComponent
+        fields = (
+            "type",
+            "name",
+            "measured_unit",
+            "amount",
+            "price",
+            "future_price",
+            "discount_threshold",
+            "discount_rate",
+        )
+
+
 class BasePlanSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
@@ -1079,6 +1248,7 @@ class BasePlanSerializer(
     )
     is_active = serializers.SerializerMethodField()
     description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    components = NestedPlanComponentSerializer(many=True, read_only=True)
 
     class Meta:
         model = models.Plan
@@ -1097,6 +1267,7 @@ class BasePlanSerializer(
             "switch_price",
             "backend_id",
             "organization_groups",
+            "components",
         )
         read_ony_fields = ("unit_price", "archived")
         extra_kwargs = {
@@ -1345,7 +1516,189 @@ FIELD_TYPES = (
     "select_multiple_openstack_instances",
     "date",
     "time",
+    "conditional_cascade",
+    "component_multiplier",
 )
+
+
+class CascadeStepSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    label = serializers.CharField()
+    type = serializers.ChoiceField(choices=["select_string", "select_string_multi"])
+    depends_on = serializers.CharField(required=False)
+    choices = serializers.JSONField(required=False)  # JSON string or parsed data
+    choices_map = serializers.JSONField(required=False)  # JSON string or parsed data
+
+    def validate(self, attrs):
+        import json
+
+        errors = {}
+
+        # Parse and validate choices if provided
+        if attrs.get("choices"):
+            choices_raw = attrs["choices"]
+            # Handle both JSON string and already parsed data
+            if isinstance(choices_raw, str):
+                try:
+                    choices_data = json.loads(choices_raw)
+                except json.JSONDecodeError:
+                    errors["choices"] = "choices must be valid JSON"
+                    choices_data = None
+            else:
+                # Already parsed (from JSONField)
+                choices_data = choices_raw
+
+            if choices_data is not None:
+                if not isinstance(choices_data, list):
+                    errors["choices"] = "choices must be a JSON array"
+                else:
+                    for i, choice in enumerate(choices_data):
+                        if (
+                            not isinstance(choice, dict)
+                            or "value" not in choice
+                            or "label" not in choice
+                        ):
+                            errors["choices"] = (
+                                f"Choice {i + 1} must be an object with 'value' and 'label' properties"
+                            )
+                            break
+                        # Convert value to string for JSON serialization consistency
+                        choice["value"] = str(choice["value"])
+                    if "choices" not in errors:
+                        attrs["choices"] = choices_data
+
+        # Parse and validate choices_map if provided
+        if attrs.get("choices_map"):
+            choices_map_raw = attrs["choices_map"]
+            # Handle both JSON string and already parsed data
+            if isinstance(choices_map_raw, str):
+                try:
+                    choices_map_data = json.loads(choices_map_raw)
+                except json.JSONDecodeError:
+                    errors["choices_map"] = "choices_map must be valid JSON"
+                    choices_map_data = None
+            else:
+                # Already parsed (from JSONField)
+                choices_map_data = choices_map_raw
+
+            if choices_map_data is not None:
+                if not isinstance(choices_map_data, dict):
+                    errors["choices_map"] = (
+                        'choices_map must be a JSON object mapping parent values to choice arrays, e.g. {"parent1": [{"value": "child1", "label": "Child 1"}]}'
+                    )
+                else:
+                    for key, value in choices_map_data.items():
+                        if not isinstance(value, list):
+                            errors["choices_map"] = (
+                                f"choices_map['{key}'] must be an array"
+                            )
+                            break
+                        for j, choice in enumerate(value):
+                            if (
+                                not isinstance(choice, dict)
+                                or "value" not in choice
+                                or "label" not in choice
+                            ):
+                                errors["choices_map"] = (
+                                    f"Choice {j + 1} in choices_map['{key}'] must be an object with 'value' and 'label' properties"
+                                )
+                                break
+                            # Convert value to string for JSON serialization consistency
+                            choice["value"] = str(choice["value"])
+                        if "choices_map" in errors:
+                            break
+                    if "choices_map" not in errors:
+                        attrs["choices_map"] = choices_map_data
+
+        # Validate required fields
+        if attrs.get("depends_on") and not attrs.get("choices_map"):
+            errors["choices_map"] = (
+                "choices_map is required when depends_on is specified"
+            )
+        if not attrs.get("depends_on") and not attrs.get("choices"):
+            errors["choices"] = "choices is required when depends_on is not specified"
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        return attrs
+
+
+class StringKeyListField(serializers.ListField):
+    """ListField that converts integer error keys to strings for JSON serialization"""
+
+    def run_validation(self, data=serializers.empty):
+        try:
+            return super().run_validation(data)
+        except serializers.ValidationError as exc:
+            # Convert any integer keys in error details to strings
+            if hasattr(exc, "detail") and isinstance(exc.detail, dict):
+                detail = {}
+                for key, value in exc.detail.items():
+                    detail[str(key)] = value
+                raise serializers.ValidationError(detail)
+            raise
+
+
+class CascadeConfigSerializer(serializers.Serializer):
+    steps = StringKeyListField(child=CascadeStepSerializer())
+
+    def validate(self, attrs):
+        steps = attrs.get("steps", [])
+
+        if not steps:
+            raise serializers.ValidationError(
+                {"steps": "At least one step is required"}
+            )
+
+        # Collect all validation errors for better error reporting
+        errors = {}
+
+        step_names = []
+        for i, step in enumerate(steps):
+            step_name = step.get("name")
+            if step_name:
+                step_names.append(step_name)
+
+        # Check for unique step names
+        if len(step_names) != len(set(step_names)):
+            errors["steps"] = "Step names must be unique"
+
+        # Validate dependencies exist and are not circular
+        for i, step in enumerate(steps):
+            depends_on = step.get("depends_on")
+            if depends_on:
+                # Check if dependency exists in previous steps
+                if depends_on not in [
+                    s.get("name") for s in steps[:i] if s.get("name")
+                ]:
+                    errors["steps"] = (
+                        f"Step '{step.get('name', f'step_{i}')}' depends on '{depends_on}' which must be defined earlier"
+                    )
+                    break
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        return attrs
+
+
+class ComponentMultiplierConfigSerializer(serializers.Serializer):
+    component_type = serializers.CharField()
+    factor = serializers.IntegerField(min_value=1)
+    min_limit = serializers.IntegerField(min_value=0, required=False)
+    max_limit = serializers.IntegerField(min_value=0, required=False)
+
+    def validate(self, attrs):
+        min_limit = attrs.get("min_limit")
+        max_limit = attrs.get("max_limit")
+
+        if min_limit is not None and max_limit is not None and min_limit > max_limit:
+            raise serializers.ValidationError(
+                "min_limit cannot be greater than max_limit"
+            )
+
+        return attrs
 
 
 class OptionFieldSerializer(serializers.Serializer):
@@ -1357,6 +1710,25 @@ class OptionFieldSerializer(serializers.Serializer):
     default = serializers.CharField(required=False)
     min = serializers.IntegerField(required=False)
     max = serializers.IntegerField(required=False)
+    cascade_config = CascadeConfigSerializer(required=False)
+    component_multiplier_config = ComponentMultiplierConfigSerializer(required=False)
+
+    def validate(self, attrs):
+        field_type = attrs.get("type")
+
+        if field_type == "conditional_cascade":
+            if not attrs.get("cascade_config"):
+                raise serializers.ValidationError(
+                    "cascade_config is required for conditional_cascade type"
+                )
+
+        if field_type == "component_multiplier":
+            if not attrs.get("component_multiplier_config"):
+                raise serializers.ValidationError(
+                    "component_multiplier_config is required for component_multiplier type"
+                )
+
+        return attrs
 
 
 class OfferingOptionsSerializer(serializers.Serializer):
@@ -1503,6 +1875,32 @@ class OfferingComponentSerializer(serializers.ModelSerializer):
 # Used only for OpenAPI schema generation
 class UpdateOfferingComponent(OfferingComponentSerializer):
     uuid = serializers.UUIDField()
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        # Check for type uniqueness within the offering when type is being updated
+        if "type" in attrs and self.instance:
+            new_type = attrs["type"]
+            current_type = self.instance.type
+
+            # Only check uniqueness if type is actually changing
+            if new_type != current_type:
+                offering = self.instance.offering
+                existing_component = (
+                    offering.components.filter(type=new_type)
+                    .exclude(uuid=self.instance.uuid)
+                    .first()
+                )
+
+                if existing_component:
+                    raise serializers.ValidationError(
+                        {
+                            "type": f"Component with type '{new_type}' already exists in this offering."
+                        }
+                    )
+
+        return attrs
 
 
 class ExportImportOfferingComponentSerializer(OfferingComponentSerializer):
@@ -1707,6 +2105,8 @@ class PlanComponentSerializer(serializers.ModelSerializer):
             "amount",
             "price",
             "future_price",
+            "discount_threshold",
+            "discount_rate",
         )
 
 
@@ -1722,6 +2122,10 @@ class EndpointUUIDSerializer(serializers.Serializer):
     uuid = serializers.UUIDField()
 
 
+class SoftwareCatalogUUIDSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField()
+
+
 class NestedRoleSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = models.OfferingUserRole
@@ -1732,6 +2136,98 @@ class NestedRoleSerializer(serializers.HyperlinkedModelSerializer):
                 "view_name": "marketplace-offering-user-role-detail",
             },
         }
+
+
+class NestedSoftwareCatalogSerializer(serializers.ModelSerializer):
+    catalog = serializers.SerializerMethodField()
+    partition = serializers.SerializerMethodField()
+    package_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.OfferingSoftwareCatalog
+        fields = (
+            "uuid",
+            "catalog",
+            "enabled_cpu_family",
+            "enabled_cpu_microarchitectures",
+            "package_count",
+            "partition",
+        )
+
+    @extend_schema_field(serializers.IntegerField())
+    def get_package_count(self, obj):
+        """Get total number of packages in this catalog."""
+        return obj.catalog.packages.count()
+
+    @extend_schema_field(
+        {
+            "type": "object",
+            "properties": {
+                "uuid": {"type": "string"},
+                "name": {"type": "string"},
+                "version": {"type": "string"},
+                "description": {"type": "string"},
+            },
+        }
+    )
+    def get_catalog(self, obj):
+        return {
+            "uuid": obj.catalog.uuid.hex,
+            "name": obj.catalog.name,
+            "version": obj.catalog.version,
+            "description": obj.catalog.description,
+        }
+
+    @extend_schema_field(
+        {
+            "type": "object",
+            "properties": {
+                "uuid": {"type": "string"},
+                "partition_name": {"type": "string"},
+                "priority_tier": {"type": "integer"},
+                "qos": {"type": "string"},
+            },
+        }
+    )
+    def get_partition(self, obj):
+        if not obj.partition:
+            return None
+        return {
+            "uuid": obj.partition.uuid.hex,
+            "partition_name": obj.partition.partition_name,
+            "priority_tier": obj.partition.priority_tier,
+            "qos": obj.partition.qos,
+        }
+
+
+class NestedPartitionSerializer(serializers.ModelSerializer):
+    """Nested serializer for OfferingPartition model."""
+
+    class Meta:
+        model = models.OfferingPartition
+        fields = (
+            "uuid",
+            "partition_name",
+            "cpu_bind",
+            "def_cpu_per_gpu",
+            "max_cpus_per_node",
+            "max_cpus_per_socket",
+            "def_mem_per_cpu",
+            "def_mem_per_gpu",
+            "def_mem_per_node",
+            "max_mem_per_cpu",
+            "max_mem_per_node",
+            "default_time",
+            "max_time",
+            "grace_time",
+            "max_nodes",
+            "min_nodes",
+            "exclusive_topo",
+            "exclusive_user",
+            "priority_tier",
+            "qos",
+            "req_resv",
+        )
 
 
 class OfferingBackendMetadataSerializer(serializers.ModelSerializer):
@@ -1781,6 +2277,8 @@ class ProviderOfferingDetailsSerializer(
     total_cost = serializers.SerializerMethodField()
     total_cost_estimated = serializers.SerializerMethodField()
     endpoints = NestedEndpointSerializer(many=True, read_only=True)
+    software_catalogs = NestedSoftwareCatalogSerializer(many=True, read_only=True)
+    partitions = NestedPartitionSerializer(many=True, read_only=True)
     roles = NestedRoleSerializer(many=True, read_only=True)
     has_compliance_requirements = serializers.SerializerMethodField()
     compliance_checklist = serializers.HyperlinkedRelatedField(
@@ -1806,6 +2304,8 @@ class ProviderOfferingDetailsSerializer(
             "privacy_policy_link",
             "access_url",
             "endpoints",
+            "software_catalogs",
+            "partitions",
             "roles",
             "customer",
             "customer_uuid",
@@ -1908,10 +2408,8 @@ class ProviderOfferingDetailsSerializer(
     def get_fields(self):
         fields = super().get_fields()
         if self.instance and not self.can_see_secret_options():
-            if "secret_options" in fields:
-                fields.pop("secret_options")
-            if "service_attributes" in fields:
-                fields.pop("service_attributes")
+            fields.pop("secret_options", None)
+            fields.pop("service_attributes", None)
         method = self.context["view"].request.method
         if method == "GET":
             if "components" in fields:
@@ -2045,6 +2543,13 @@ class ProviderOfferingDetailsSerializer(
         return offering.compliance_checklist is not None
 
 
+set_override(
+    ProviderOfferingDetailsSerializer,
+    "optional_fields",
+    ["secret_options", "service_attributes"],
+)
+
+
 class PublicOfferingDetailsSerializer(ProviderOfferingDetailsSerializer):
     class Meta(ProviderOfferingDetailsSerializer.Meta):
         view_name = "marketplace-public-offering-detail"
@@ -2075,10 +2580,8 @@ class PublicOfferingDetailsSerializer(ProviderOfferingDetailsSerializer):
 
     def get_fields(self):
         fields = super().get_fields()
-        if "secret_options" in fields:
-            fields.pop("secret_options")
-        if "service_attributes" in fields:
-            fields.pop("service_attributes")
+        fields.pop("secret_options", None)
+        fields.pop("service_attributes", None)
         return fields
 
 
@@ -2684,6 +3187,7 @@ class BaseOrderSerializer(BaseItemSerializer):
             "request_comment",
             "attachment",
             "type",
+            "start_date",
         )
 
         read_only_fields = (
@@ -2700,6 +3204,7 @@ class BaseOrderSerializer(BaseItemSerializer):
             "callback_url",
             "request_comment",
             "attachment",
+            "start_date",
         )
 
     type = NaturalChoiceField(
@@ -2747,6 +3252,7 @@ class BaseOrderSerializer(BaseItemSerializer):
 class OrderDetailsSerializer(BaseOrderSerializer):
     class Meta(BaseOrderSerializer.Meta):
         fields = BaseOrderSerializer.Meta.fields + (
+            "url",
             "consumer_reviewed_by",
             "consumer_reviewed_by_full_name",
             "consumer_reviewed_by_username",
@@ -2777,6 +3283,10 @@ class OrderDetailsSerializer(BaseOrderSerializer):
             "termination_comment",
             "backend_id",
         )
+        extra_kwargs = {
+            **BaseOrderSerializer.Meta.extra_kwargs,
+            "url": {"lookup_field": "uuid", "view_name": "marketplace-order-detail"},
+        }
 
     consumer_reviewed_by = serializers.ReadOnlyField(
         source="consumer_reviewed_by.username",
@@ -2871,6 +3381,9 @@ class OrderDetailsSerializer(BaseOrderSerializer):
             return False
 
         return True
+
+
+set_override(OrderDetailsSerializer, "optional_fields", ["error_traceback"])
 
 
 class OrderSetStateErredSerializer(
@@ -2990,6 +3503,7 @@ def validate_order(order: models.Order, request):
 
 class OrderCreateSerializer(
     BaseOrderSerializer,
+    core_serializers.SlugSerializerMixin,
     structure_serializers.PermissionFieldFilteringMixin,
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
@@ -3030,7 +3544,6 @@ class OrderCreateSerializer(
             "consumer_reviewed_at",
             "attachment",
         )
-        protected_fields = ("project",)
         related_paths = {
             **BaseOrderSerializer.Meta.related_paths,
             "created_by": ("username", "full_name"),
@@ -3057,6 +3570,33 @@ class OrderCreateSerializer(
 
     error_message = serializers.ReadOnlyField()
 
+    def get_fields(self):
+        fields = super().get_fields()
+
+        # Check if this is schema generation context (drf-spectacular)
+        # When generating schema, we want to include all fields
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
+            return fields
+
+        if not config.ENABLE_ORDER_START_DATE:
+            fields.pop("start_date", None)
+        return fields
+
+    def generate_slug(self, validated_data):
+        return models.Order(
+            project=validated_data["project"], offering=validated_data["offering"]
+        ).generate_slug()
+
+    def validate_project(
+        self, project: structure_models.Project
+    ) -> structure_models.Project:
+        """Validate that the project is not soft-deleted."""
+        if project.is_removed:
+            raise serializers.ValidationError(
+                _("Cannot create orders for terminated projects.")
+            )
+        return project
+
     @transaction.atomic
     def create(self, validated_data):
         request = self.context["request"]
@@ -3082,6 +3622,14 @@ class OrderCreateSerializer(
                 request.user if attributes.get("end_date") else None
             )
 
+        # Set resource options from offering's resource_options
+        resource.options = {}
+        for resource_option in (
+            validated_data["offering"].resource_options.get("options", {}).keys()
+        ):
+            if resource_option in attributes:
+                resource.options[resource_option] = attributes[resource_option]
+
         resource.save()
 
         order = models.Order(
@@ -3093,6 +3641,7 @@ class OrderCreateSerializer(
             attributes=attributes,
             limits=validated_data.get("limits", {}),
             type=validated_data.get("type"),
+            start_date=validated_data.get("start_date"),
         )
         validate_order(order, request)
         self.quotas_validate(order)
@@ -3145,12 +3694,15 @@ class OrderCreateSerializer(
         # Execute Validation Blocks
         self._validate_resource_name(attributes)
         self._validate_terms_of_service(user, offering, accepting_tos)
+        self._validate_project_not_terminated(project)
         self._validate_project_policy_constraints(project, offering)
 
         # Prepaid Offering Validation
         prepaid_components = offering.components.filter(is_prepaid=True)
         if prepaid_components.exists():
             self._validate_prepaid_attributes(attributes, prepaid_components)
+
+        self._validate_order_start_date(attrs)
 
         return attrs
 
@@ -3186,6 +3738,14 @@ class OrderCreateSerializer(
                 _("Terms of service for offering '%s' have not been accepted.")
                 % offering
             )
+
+    def _validate_project_not_terminated(self, project):
+        """
+        Validates that the project is not soft-deleted/terminated.
+        Prevents creating new marketplace orders for terminated projects.
+        """
+        if project.is_removed:
+            raise ValidationError(_("Cannot create orders for terminated projects."))
 
     def _validate_project_policy_constraints(self, project, offering):
         """
@@ -3358,6 +3918,45 @@ class OrderCreateSerializer(
                     }
                 )
 
+    def _validate_order_start_date(self, attrs):
+        start_date = attrs.get("start_date")
+        if not start_date:
+            return
+
+        # Basic validation: must not be in the past
+        if start_date < timezone.now().date():
+            raise serializers.ValidationError(
+                {"start_date": _("Start date cannot be in the past.")}
+            )
+
+        project: structure_models.Project = attrs["project"]
+
+        # Validate against project's lifecycle
+        if project.start_date and start_date < project.start_date:
+            raise serializers.ValidationError(
+                {
+                    "start_date": _(
+                        "Order start date cannot be earlier than the project start date (%(project_start_date)s)."
+                    )
+                    % {"project_start_date": project.start_date}
+                }
+            )
+
+        if project.end_date and start_date > project.end_date:
+            raise serializers.ValidationError(
+                {
+                    "start_date": _(
+                        "Order start date cannot be later than the project end date (%(project_end_date)s)."
+                    )
+                    % {"project_end_date": project.end_date}
+                }
+            )
+
+
+set_override(
+    OrderCreateSerializer, "optional_fields", ["start_date", "error_traceback"]
+)
+
 
 class OrderAttachmentSerializer(serializers.ModelSerializer):
     class Meta:
@@ -3407,6 +4006,7 @@ class ResourceSuggestNameSerializer(serializers.ModelSerializer):
 class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerializer):
     project_slug = serializers.ReadOnlyField(source="project.slug")
     customer_slug = serializers.ReadOnlyField(source="project.customer.slug")
+    renewal_date = serializers.SerializerMethodField()
 
     class Meta(BaseItemSerializer.Meta):
         model = models.Resource
@@ -3462,6 +4062,7 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             "project_slug",
             "customer_slug",
             "user_requires_reconsent",
+            "renewal_date",
         )
         read_only_fields = (
             "backend_metadata",
@@ -3691,6 +4292,83 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
                 del fields[key]
         return fields
 
+    @extend_schema_field(
+        serializers.DictField(child=serializers.DateField(), allow_null=True)
+    )
+    def get_renewal_date(self, resource: models.Resource):
+        """
+        Calculate renewal dates for all limit-based components in the resource's offering.
+
+        Returns a dictionary mapping component types to their next renewal dates.
+        The renewal date is the first day of the month when the next invoice item
+        for each component would be created by the billing service.
+
+        Returns:
+            dict: Mapping of component_type -> renewal_date for limit-based components
+            None: If no limit-based components exist
+        """
+        # Check if resource has an offering with limit-based components
+        if not resource.offering_id:
+            return None
+
+        # Use values_list to get only the data we need in a single query
+        # This avoids N+1 queries by fetching type and limit_period in bulk
+        limit_components_data = models.OfferingComponent.objects.filter(
+            offering_id=resource.offering_id,
+            billing_type=BillingTypes.LIMIT,
+            limit_period__isnull=False,
+        ).values_list("type", "limit_period")
+
+        if not limit_components_data:
+            return None
+
+        # Calculate renewal date for each component using the fetched data
+        renewal_dates = {}
+
+        for component_type, limit_period in limit_components_data:
+            renewal_date = self._calculate_renewal_date_for_period(limit_period)
+            if renewal_date:
+                renewal_dates[component_type] = renewal_date
+
+        return renewal_dates
+
+    def _calculate_renewal_date_for_period(self, limit_period):
+        """
+        Calculate the next renewal date for a specific limit period.
+
+        Args:
+            limit_period: The billing period (MONTH, QUARTERLY, ANNUAL, TOTAL)
+
+        Returns:
+            date: Next renewal date, or None for TOTAL periods
+        """
+        now = timezone.now().date()
+        if limit_period == LimitPeriods.MONTH:
+            # Monthly billing: next month's first day
+            return (now + relativedelta(months=1)).replace(day=1)
+
+        elif limit_period == LimitPeriods.QUARTERLY:
+            # Quarterly billing: first day of next quarter
+            # Quarters start in January, April, July, October
+            current_quarter = ((now.month - 1) // 3) + 1
+            if current_quarter == 4:
+                # Q4 -> Q1 next year
+                return datetime.date(now.year + 1, 1, 1)
+            else:
+                # Move to next quarter
+                next_quarter_month = current_quarter * 3 + 1
+                return datetime.date(now.year, next_quarter_month, 1)
+
+        elif limit_period == LimitPeriods.ANNUAL:
+            # Annual billing: first day of next year
+            return datetime.date(now.year + 1, 1, 1)
+
+        elif limit_period == LimitPeriods.TOTAL:
+            # No renewal for total limits
+            return None
+        else:
+            return None
+
 
 class OrderUUIDSerializer(serializers.Serializer):
     order_uuid = serializers.UUIDField(read_only=True)
@@ -3902,10 +4580,36 @@ class ResourceBackendIDSerializer(serializers.ModelSerializer):
         fields = ("backend_id",)
 
 
+class OrderBackendIDSerializer(serializers.ModelSerializer):
+    backend_id = serializers.CharField(write_only=True, required=True, max_length=255)
+
+    class Meta:
+        model = models.Order
+        fields = ("backend_id",)
+
+
 class ResourceSlugSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Resource
         fields = ("slug",)
+
+
+class ResourceDownscaledSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Resource
+        fields = ("downscaled",)
+
+
+class ResourcePausedSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Resource
+        fields = ("paused",)
+
+
+class ResourceRestrictMemberAccessSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Resource
+        fields = ("restrict_member_access",)
 
 
 class ResourceStateSerializer(serializers.Serializer):
@@ -5503,8 +6207,10 @@ class ProjectUserSerializer(serializers.ModelSerializer):
         permission = get_permissions(project, user).first()
         return permission and permission.expiration_time
 
-    @extend_schema_field(serializers.ChoiceField(choices=OfferingUserStates.VALUES))
-    def get_offering_user_state(self, user: User) -> OfferingUserStates | None:
+    @extend_schema_field(
+        serializers.ChoiceField(choices=OfferingUserStates.VALUES, allow_null=True)
+    )
+    def get_offering_user_state(self, user: User) -> OfferingUserStatesType | None:
         offering = self.context["offering"]
         offering_user = models.OfferingUser.objects.filter(
             user=user, offering=offering
@@ -6290,6 +6996,10 @@ class DetailStateSerializer(serializers.Serializer):
 
 class RemoveOfferingComponentSerializer(serializers.Serializer):
     uuid = serializers.UUIDField()
+
+
+class RemoveSoftwareCatalogSerializer(serializers.Serializer):
+    offering_catalog_uuid = serializers.UUIDField()
 
 
 class RuntimeStatesSerializer(serializers.Serializer):
@@ -7121,3 +7831,324 @@ class ToSConsentDashboardSerializer(serializers.Serializer):
     active_users_over_time = serializers.ListField(
         child=TimeSeriesToSDataSerializer(), read_only=True
     )
+
+
+class SoftwareCatalogSerializer(serializers.HyperlinkedModelSerializer):
+    """Serializer for SoftwareCatalog model."""
+
+    package_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.SoftwareCatalog
+        fields = (
+            "url",
+            "uuid",
+            "created",
+            "modified",
+            "name",
+            "version",
+            "source_url",
+            "description",
+            "package_count",
+        )
+        read_only_fields = ("url", "uuid", "created", "modified", "package_count")
+        extra_kwargs = {
+            "url": {
+                "view_name": "marketplace-software-catalog-detail",
+                "lookup_field": "uuid",
+            }
+        }
+
+    @extend_schema_field(serializers.IntegerField())
+    def get_package_count(self, obj):
+        """Get total number of packages in this catalog."""
+        return obj.packages.count()
+
+
+class NestedSoftwareTargetSerializer(serializers.ModelSerializer):
+    """Nested serializer for SoftwareTarget model."""
+
+    class Meta:
+        model = models.SoftwareTarget
+        fields = (
+            "uuid",
+            "cpu_family",
+            "cpu_microarchitecture",
+            "path",
+        )
+
+
+class NestedSoftwareVersionSerializer(serializers.ModelSerializer):
+    """Nested serializer for SoftwareVersion model."""
+
+    targets = NestedSoftwareTargetSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = models.SoftwareVersion
+        fields = (
+            "uuid",
+            "version",
+            "release_date",
+            "targets",
+        )
+
+
+class SoftwarePackageSerializer(serializers.HyperlinkedModelSerializer):
+    """Serializer for SoftwarePackage model."""
+
+    catalog_name = serializers.CharField(source="catalog.name", read_only=True)
+    catalog_version = serializers.CharField(source="catalog.version", read_only=True)
+    version_count = serializers.SerializerMethodField()
+    versions = NestedSoftwareVersionSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = models.SoftwarePackage
+        fields = (
+            "url",
+            "uuid",
+            "created",
+            "modified",
+            "catalog",
+            "name",
+            "description",
+            "homepage",
+            "catalog_name",
+            "catalog_version",
+            "version_count",
+            "versions",
+        )
+        read_only_fields = (
+            "url",
+            "uuid",
+            "created",
+            "modified",
+            "catalog_name",
+            "catalog_version",
+            "version_count",
+            "versions",
+        )
+        extra_kwargs = {
+            "url": {
+                "view_name": "marketplace-software-package-detail",
+                "lookup_field": "uuid",
+            },
+            "catalog": {
+                "view_name": "marketplace-software-catalog-detail",
+                "lookup_field": "uuid",
+            },
+        }
+
+    @extend_schema_field(serializers.IntegerField())
+    def get_version_count(self, obj):
+        """Get number of versions for this package."""
+        return obj.versions.count()
+
+
+class SoftwareVersionSerializer(serializers.HyperlinkedModelSerializer):
+    """Serializer for SoftwareVersion model."""
+
+    package_name = serializers.CharField(source="package.name", read_only=True)
+    target_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.SoftwareVersion
+        fields = (
+            "url",
+            "uuid",
+            "created",
+            "modified",
+            "version",
+            "release_date",
+            "package_name",
+            "target_count",
+        )
+        read_only_fields = fields
+        extra_kwargs = {
+            "url": {
+                "view_name": "marketplace-software-version-detail",
+                "lookup_field": "uuid",
+            }
+        }
+
+    @extend_schema_field(serializers.IntegerField())
+    def get_target_count(self, obj):
+        """Get number of targets for this version."""
+        return obj.targets.count()
+
+
+class SoftwareTargetSerializer(serializers.HyperlinkedModelSerializer):
+    """Serializer for SoftwareTarget model."""
+
+    class Meta:
+        model = models.SoftwareTarget
+        fields = (
+            "url",
+            "uuid",
+            "created",
+            "modified",
+            "cpu_family",
+            "cpu_microarchitecture",
+            "path",
+        )
+        read_only_fields = fields
+        extra_kwargs = {
+            "url": {
+                "view_name": "marketplace-software-target-detail",
+                "lookup_field": "uuid",
+            }
+        }
+
+
+class OfferingSoftwareCatalogSerializer(serializers.ModelSerializer):
+    """Serializer for OfferingSoftwareCatalog model."""
+
+    offering_name = serializers.CharField(source="offering.name", read_only=True)
+    catalog_name = serializers.CharField(source="catalog.name", read_only=True)
+    catalog_version = serializers.CharField(source="catalog.version", read_only=True)
+    offering = serializers.SlugRelatedField(
+        slug_field="uuid", queryset=models.Offering.objects.all()
+    )
+    catalog = serializers.SlugRelatedField(
+        slug_field="uuid", queryset=models.SoftwareCatalog.objects.all()
+    )
+    partition = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.OfferingPartition.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    partition_name = serializers.CharField(
+        source="partition.partition_name", read_only=True
+    )
+
+    class Meta:
+        model = models.OfferingSoftwareCatalog
+        fields = (
+            "uuid",
+            "created",
+            "modified",
+            "offering",
+            "catalog",
+            "offering_name",
+            "catalog_name",
+            "catalog_version",
+            "enabled_cpu_family",
+            "enabled_cpu_microarchitectures",
+            "partition",
+            "partition_name",
+        )
+
+
+class OfferingSoftwareCatalogUpdateSerializer(serializers.ModelSerializer):
+    """Serializer for updating OfferingSoftwareCatalog model."""
+
+    offering_catalog_uuid = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.OfferingSoftwareCatalog.objects.all(),
+        write_only=True,
+    )
+    catalog = serializers.SlugRelatedField(
+        slug_field="uuid", queryset=models.SoftwareCatalog.objects.all()
+    )
+    partition = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.OfferingPartition.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = models.OfferingSoftwareCatalog
+        fields = (
+            "offering_catalog_uuid",
+            "catalog",
+            "enabled_cpu_family",
+            "enabled_cpu_microarchitectures",
+            "partition",
+        )
+
+
+class OfferingPartitionUpdateSerializer(serializers.ModelSerializer):
+    """Serializer for updating OfferingPartition model."""
+
+    partition_uuid = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.OfferingPartition.objects.all(),
+        write_only=True,
+    )
+
+    class Meta:
+        model = models.OfferingPartition
+        fields = (
+            "partition_uuid",
+            "partition_name",
+            "cpu_bind",
+            "def_cpu_per_gpu",
+            "max_cpus_per_node",
+            "max_cpus_per_socket",
+            "def_mem_per_cpu",
+            "def_mem_per_gpu",
+            "def_mem_per_node",
+            "max_mem_per_cpu",
+            "max_mem_per_node",
+            "default_time",
+            "max_time",
+            "grace_time",
+            "max_nodes",
+            "min_nodes",
+            "exclusive_topo",
+            "exclusive_user",
+            "priority_tier",
+            "qos",
+            "req_resv",
+        )
+
+
+class OfferingPartitionSerializer(serializers.ModelSerializer):
+    """Serializer for OfferingPartition model."""
+
+    offering_name = serializers.CharField(source="offering.name", read_only=True)
+    offering = serializers.SlugRelatedField(
+        slug_field="uuid", queryset=models.Offering.objects.all()
+    )
+
+    class Meta:
+        model = models.OfferingPartition
+        fields = (
+            "uuid",
+            "created",
+            "modified",
+            "offering",
+            "offering_name",
+            "partition_name",
+            "cpu_bind",
+            "def_cpu_per_gpu",
+            "max_cpus_per_node",
+            "max_cpus_per_socket",
+            "def_mem_per_cpu",
+            "def_mem_per_gpu",
+            "def_mem_per_node",
+            "max_mem_per_cpu",
+            "max_mem_per_node",
+            "default_time",
+            "max_time",
+            "grace_time",
+            "max_nodes",
+            "min_nodes",
+            "exclusive_topo",
+            "exclusive_user",
+            "priority_tier",
+            "qos",
+            "req_resv",
+        )
+        read_only_fields = ("uuid", "created", "modified")
+        extra_kwargs = {
+            "url": {
+                "view_name": "marketplace-offering-partition-detail",
+                "lookup_field": "uuid",
+            }
+        }
+
+
+class RemovePartitionSerializer(serializers.Serializer):
+    partition_uuid = serializers.UUIDField()
