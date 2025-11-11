@@ -1281,9 +1281,6 @@ class UserSerializer(
                 {"last_name": _("Cannot specify last name with full name")}
             )
 
-        logger.info("Validating user data for user %s", self.instance)
-        logger.info(attrs)
-
         # Validate token_lifetime restriction when credentials feature is enabled
         if "token_lifetime" in attrs:
             request = self.context.get("request")
