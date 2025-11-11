@@ -299,6 +299,20 @@ class UserRoleDeleteSerializer(UserRoleMutateSerializer):
     def get_permission(self, scope):
         return get_delete_permission(scope)
 
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        scope = self.context["scope"]
+        target_user = attrs["user"]
+
+        # Prevent removing the creator from a proposal
+        if scope._meta.model_name == "proposal" and hasattr(scope, "created_by"):
+            if scope.created_by == target_user:
+                raise ValidationError(
+                    "Cannot remove the proposal creator from the proposal."
+                )
+
+        return attrs
+
 
 class UserRoleExpirationTimeSerializer(serializers.Serializer):
     expiration_time = serializers.DateTimeField(allow_null=True)

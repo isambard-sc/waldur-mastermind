@@ -706,7 +706,20 @@ class ProposalViewSet(
             return
         raise exceptions.PermissionDenied()
 
-    destroy_permissions = update_project_details_permissions = [is_creator]
+    def is_proposal_manager(request, view, obj=None):
+        """Check if user has PROPOSAL.MANAGER role on the proposal."""
+        if not obj:
+            return
+        user = request.user
+        if user.is_staff:
+            return
+        # Check if user has MANAGE_PROPOSAL permission on this proposal
+        if has_permission(user, PermissionEnum.MANAGE_PROPOSAL, obj):
+            return
+        raise exceptions.PermissionDenied()
+
+    destroy_permissions = [is_creator]
+    update_project_details_permissions = [is_proposal_manager]
 
     destroy_validators = update_project_details_validators = [
         core_validators.StateValidator(ProposalStates.DRAFT)
@@ -761,7 +774,7 @@ class ProposalViewSet(
 
     submit_validators = [core_validators.StateValidator(ProposalStates.DRAFT)]
 
-    submit_permissions = [is_creator]
+    submit_permissions = [is_proposal_manager]
 
     def perform_create(self, serializer):
         proposal: models.Proposal = serializer.save()
