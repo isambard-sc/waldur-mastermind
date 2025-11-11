@@ -718,8 +718,7 @@ class ProposalViewSet(
             return
         raise exceptions.PermissionDenied()
 
-    destroy_permissions = [is_creator]
-    update_project_details_permissions = [is_proposal_manager]
+    destroy_permissions = update_project_details_permissions = [is_proposal_manager]
 
     destroy_validators = update_project_details_validators = [
         core_validators.StateValidator(ProposalStates.DRAFT)
