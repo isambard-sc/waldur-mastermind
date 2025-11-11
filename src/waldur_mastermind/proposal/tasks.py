@@ -696,19 +696,22 @@ def send_stale_proposal_reminders():
 
 @shared_task(name="waldur_mastermind.proposal.delete_stale_proposals")
 def delete_stale_proposals():
-    """Delete draft proposals that haven't been edited in 28 days."""
+    """Delete draft proposals 14 days after reminder was sent."""
     from datetime import timedelta
 
     from waldur_core.permissions.enums import PermissionEnum
     from waldur_core.permissions.utils import get_users
 
-    # Calculate the date 28 days ago
-    deletion_threshold = timezone.now() - timedelta(days=28)
+    # Calculate the date 14 days ago
+    deletion_threshold = timezone.now() - timedelta(days=14)
 
-    # Find draft proposals that haven't been modified in 28 days
+    # Find draft proposals where:
+    # - Reminder was sent at least 14 days ago
+    # This ensures proposals are only deleted after managers have been notified
     stale_proposals = proposal_models.Proposal.objects.filter(
         state=ProposalStates.DRAFT,
-        modified__lte=deletion_threshold,
+        stale_reminder_sent_at__lte=deletion_threshold,
+        stale_reminder_sent_at__isnull=False,
     )
 
     for proposal in stale_proposals:
