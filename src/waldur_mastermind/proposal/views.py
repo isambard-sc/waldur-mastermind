@@ -740,7 +740,20 @@ class ProposalViewSet(
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
+        # Reset stale reminder flag when proposal is edited
+        if proposal.stale_reminder_sent_at:
+            proposal.stale_reminder_sent_at = None
+            proposal.save(update_fields=["stale_reminder_sent_at"])
+
         return response.Response(status=status.HTTP_200_OK)
+
+    def perform_update(self, serializer):
+        """Reset stale reminder flag when proposal is updated via standard endpoint."""
+        super().perform_update(serializer)
+        proposal = serializer.instance
+        if proposal.stale_reminder_sent_at:
+            proposal.stale_reminder_sent_at = None
+            proposal.save(update_fields=["stale_reminder_sent_at"])
 
     @staticmethod
     def validate_resource_requests_existing(proposal):

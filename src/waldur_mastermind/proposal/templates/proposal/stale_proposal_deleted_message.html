@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background-color: #f8f9fa; padding: 15px; border-left: 4px solid #dc3545; margin-bottom: 20px; }
+        .info { background-color: #d1ecf1; border-left: 4px solid #0c5460; padding: 15px; margin: 20px 0; }
+        .details { background-color: #f8f9fa; padding: 15px; margin: 20px 0; }
+        .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #dee2e6; font-size: 0.9em; color: #6c757d; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h2>Draft Proposal Deleted</h2>
+        </div>
+
+        <p>Dear {{ manager_name }},</p>
+
+        <p>Your draft proposal "<strong>{{ proposal_name }}</strong>" in call "<strong>{{ call_name }}</strong>" has been automatically deleted due to inactivity.</p>
+
+        <div class="details">
+            <strong>Proposal details:</strong>
+            <ul>
+                <li><strong>Proposal:</strong> {{ proposal_name }}</li>
+                <li><strong>Call:</strong> {{ call_name }}</li>
+                <li><strong>Last modified:</strong> {{ last_modified }}</li>
+                <li><strong>Deletion date:</strong> {{ deletion_date }}</li>
+                <li><strong>Reason:</strong> No activity for {{ days_since_modification }} days</li>
+            </ul>
+        </div>
+
+        <div class="info">
+            The proposal was not submitted and had not been edited for more than 28 days, so it was automatically removed to keep the system clean.
+        </div>
+
+        <p><strong>If you still wish to submit a proposal for this call:</strong></p>
+        <ol>
+            <li>Check if the call is still accepting submissions</li>
+            <li>Create a new proposal</li>
+        </ol>
+
+        <p>If you believe this deletion was made in error, please contact support.</p>
+
+        <div class="footer">
+            <p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
+        </div>
+    </div>
+</body>
+</html>

@@ -518,6 +518,11 @@ class Proposal(
 
     resources = models.ManyToManyField(RequestedOffering, through="RequestedResource")
     allocation_comment = models.CharField(blank=True, max_length=150, null=True)
+    stale_reminder_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Timestamp when the stale proposal reminder email was sent",
+    )
 
     # Note: checklist_completions relationship is automatically available via ChecklistCompletion.scope
 

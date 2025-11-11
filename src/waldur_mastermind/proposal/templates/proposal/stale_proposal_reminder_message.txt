@@ -1,0 +1,22 @@
+Dear {{ manager_name }},
+
+This is a reminder that your draft proposal "{{ proposal_name }}" in call "{{ call_name }}" has not been submitted yet.
+
+Proposal details:
+- Proposal: {{ proposal_name }}
+- Call: {{ call_name }}
+- Last modified: {{ last_modified }}
+- Days since last edit: {{ days_since_modification }}
+
+⚠️ IMPORTANT: This proposal will be automatically deleted in {{ days_until_deletion }} days (on {{ deletion_date }}) if it remains unsubmitted.
+
+To prevent deletion, please:
+1. Review and complete your proposal
+2. Submit it before the deletion date
+
+You can access your proposal here:
+{{ proposal_url }}
+
+If you no longer need this proposal, no action is required - it will be automatically cleaned up.
+
+This is an automated message from the {{ site_name }}. Please do not reply to this email.

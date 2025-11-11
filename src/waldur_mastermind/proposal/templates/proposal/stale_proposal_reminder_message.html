@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background-color: #f8f9fa; padding: 15px; border-left: 4px solid #ffc107; margin-bottom: 20px; }
+        .warning { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; }
+        .details { background-color: #f8f9fa; padding: 15px; margin: 20px 0; }
+        .button { display: inline-block; padding: 12px 24px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px; margin: 20px 0; }
+        .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #dee2e6; font-size: 0.9em; color: #6c757d; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h2>Reminder: Submit Your Draft Proposal</h2>
+        </div>
+
+        <p>Dear {{ manager_name }},</p>
+
+        <p>This is a reminder that your draft proposal "<strong>{{ proposal_name }}</strong>" in call "<strong>{{ call_name }}</strong>" has not been submitted yet.</p>
+
+        <div class="details">
+            <strong>Proposal details:</strong>
+            <ul>
+                <li><strong>Proposal:</strong> {{ proposal_name }}</li>
+                <li><strong>Call:</strong> {{ call_name }}</li>
+                <li><strong>Last modified:</strong> {{ last_modified }}</li>
+                <li><strong>Days since last edit:</strong> {{ days_since_modification }}</li>
+            </ul>
+        </div>
+
+        <div class="warning">
+            <strong>⚠️ IMPORTANT:</strong> This proposal will be automatically deleted in <strong>{{ days_until_deletion }} days</strong> (on <strong>{{ deletion_date }}</strong>) if it remains unsubmitted.
+        </div>
+
+        <p><strong>To prevent deletion, please:</strong></p>
+        <ol>
+            <li>Review and complete your proposal</li>
+            <li>Submit it before the deletion date</li>
+        </ol>
+
+        <a href="{{ proposal_url }}" class="button">View Your Proposal</a>
+
+        <p>If you no longer need this proposal, no action is required - it will be automatically cleaned up.</p>
+
+        <div class="footer">
+            <p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
+        </div>
+    </div>
+</body>
+</html>

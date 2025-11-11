@@ -3,7 +3,7 @@ from typing import Any, cast
 
 from celery import shared_task
 from constance import config
-from django.db.models import Avg, Count, Q
+from django.db.models import Avg, Count, F, Q
 from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
@@ -603,3 +603,157 @@ def notify_manager_when_reviews_are_completed(proposal_uuid):
         context,
         manager_emails,
     )
+
+@shared_task(name="waldur_mastermind.proposal.send_stale_proposal_reminders")
+def send_stale_proposal_reminders():
+    """Send reminder emails for draft proposals that haven't been edited in 14 days."""
+    from datetime import timedelta
+
+    from waldur_core.permissions.enums import PermissionEnum
+    from waldur_core.permissions.utils import get_users
+
+    # Calculate the date 14 days ago
+    reminder_threshold = timezone.now() - timedelta(days=14)
+    # Calculate the date 28 days ago (for deletion)
+    deletion_threshold = timezone.now() - timedelta(days=28)
+
+    # Find draft proposals that:
+    # - Are in DRAFT state
+    # - Haven't been modified in 14 days
+    # - Haven't been modified in less than 28 days (not yet ready for deletion)
+    # - Haven't already had a reminder sent (or reminder was sent before last modification)
+    stale_proposals = proposal_models.Proposal.objects.filter(
+        state=ProposalStates.DRAFT,
+        modified__lte=reminder_threshold,
+        modified__gt=deletion_threshold,
+    ).filter(
+        Q(stale_reminder_sent_at__isnull=True) | Q(stale_reminder_sent_at__lt=F("modified"))
+    )
+
+    for proposal in stale_proposals:
+        # Get all proposal managers
+        managers = get_users(proposal, PermissionEnum.MANAGE_PROPOSAL)
+
+        if not managers:
+            logger.warning(
+                f"Cannot send stale proposal reminder. Proposal {proposal.uuid} has no managers."
+            )
+            continue
+
+        # Get emails of managers
+        manager_emails = [m.email for m in managers if m.email]
+
+        if not manager_emails:
+            logger.warning(
+                f"Cannot send stale proposal reminder. Proposal {proposal.uuid} managers have no valid emails."
+            )
+            continue
+
+        proposal_link = core_utils.format_homeport_link(
+            "proposals/{proposal_uuid}/",
+            proposal_uuid=proposal.uuid,
+        )
+
+        days_since_modification = (timezone.now() - proposal.modified).days
+        days_until_deletion = 28 - days_since_modification
+        deletion_date = (proposal.modified + timedelta(days=28)).strftime(
+            "%B %d, %Y"
+        )
+
+        # Send email to each manager
+        for manager in managers:
+            if not manager.email:
+                continue
+
+            context = {
+                "site_name": config.SITE_NAME,
+                "manager_name": manager.full_name,
+                "proposal_name": proposal.name,
+                "call_name": proposal.round.call.name,
+                "proposal_url": proposal_link,
+                "last_modified": proposal.modified.strftime("%B %d, %Y at %H:%M"),
+                "days_since_modification": days_since_modification,
+                "days_until_deletion": days_until_deletion,
+                "deletion_date": deletion_date,
+            }
+
+            core_utils.broadcast_mail(
+                "proposal",
+                "stale_proposal_reminder",
+                context,
+                [manager.email],
+            )
+
+        # Mark that reminder has been sent (use update to avoid triggering auto_now on modified)
+        proposal_models.Proposal.objects.filter(pk=proposal.pk).update(
+            stale_reminder_sent_at=timezone.now()
+        )
+
+        logger.info(
+            f"Sent stale proposal reminder for proposal {proposal.name} to {len(manager_emails)} manager(s)."
+        )
+
+
+@shared_task(name="waldur_mastermind.proposal.delete_stale_proposals")
+def delete_stale_proposals():
+    """Delete draft proposals that haven't been edited in 28 days."""
+    from datetime import timedelta
+
+    from waldur_core.permissions.enums import PermissionEnum
+    from waldur_core.permissions.utils import get_users
+
+    # Calculate the date 28 days ago
+    deletion_threshold = timezone.now() - timedelta(days=28)
+
+    # Find draft proposals that haven't been modified in 28 days
+    stale_proposals = proposal_models.Proposal.objects.filter(
+        state=ProposalStates.DRAFT,
+        modified__lte=deletion_threshold,
+    )
+
+    for proposal in stale_proposals:
+        # Get all proposal managers for notification
+        managers = get_users(proposal, PermissionEnum.MANAGE_PROPOSAL)
+        manager_emails = [m.email for m in managers if m.email]
+
+        # Store proposal info before deletion
+        proposal_name = proposal.name
+        proposal_uuid = proposal.uuid
+        call_name = proposal.round.call.name
+        last_modified = proposal.modified.strftime("%B %d, %Y at %H:%M")
+        days_since_modification = (timezone.now() - proposal.modified).days
+        deletion_date = timezone.now().strftime("%B %d, %Y at %H:%M")
+
+        # Delete the proposal
+        proposal.delete()
+
+        logger.info(
+            f"Deleted stale proposal {proposal_name} (UUID: {proposal_uuid}) - last modified {days_since_modification} days ago."
+        )
+
+        # Send notification to managers
+        if manager_emails:
+            for manager in managers:
+                if not manager.email:
+                    continue
+
+                context = {
+                    "site_name": config.SITE_NAME,
+                    "manager_name": manager.full_name,
+                    "proposal_name": proposal_name,
+                    "call_name": call_name,
+                    "last_modified": last_modified,
+                    "days_since_modification": days_since_modification,
+                    "deletion_date": deletion_date,
+                }
+
+                core_utils.broadcast_mail(
+                    "proposal",
+                    "stale_proposal_deleted",
+                    context,
+                    [manager.email],
+                )
+
+            logger.info(
+                f"Sent deletion notification for proposal {proposal_name} to {len(manager_emails)} manager(s)."
+            )
