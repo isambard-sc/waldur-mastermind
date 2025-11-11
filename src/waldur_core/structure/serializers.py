@@ -1281,6 +1281,59 @@ class UserSerializer(
                 {"last_name": _("Cannot specify last name with full name")}
             )
 
+        logger.info("Validating user data for user %s", self.instance)
+        logger.info(attrs)
+
+        # Validate token_lifetime restriction when credentials feature is enabled
+        if "token_lifetime" in attrs:
+            request = self.context.get("request")
+            user = request.user if request else None
+
+            # Check if credentials feature is enabled
+            from waldur_core.core.models import Feature
+
+            disable_long_tokens = Feature.objects.filter(
+                key="user.disable_long_tokens", value=True
+            ).exists()
+
+            if disable_long_tokens:
+                if user is None:
+                    raise serializers.ValidationError(
+                        {
+                            "token_lifetime": _(
+                                "Cannot set token lifetime: unable to determine user."
+                            )
+                        }
+                    )
+
+                if not (user.is_staff or user.is_support):
+                    # Non-staff and non-support users are limited to 1 hour (3600 seconds)
+                    if attrs["token_lifetime"] is None:
+                        logger.error(
+                            f"User {user} attempted to set unlimited token lifetime."
+                        )
+                        raise serializers.ValidationError(
+                            {
+                                "token_lifetime": _(
+                                    "Token lifetime cannot be unlimited for non-staff and non-support users."
+                                )
+                            }
+                        )
+
+                    max_lifetime = 3600  # 1 hour in seconds
+                    if attrs["token_lifetime"] > max_lifetime:
+                        logger.error(
+                            f"User {user} attempted to set token lifetime of {attrs['token_lifetime']} seconds."
+                        )
+                        raise serializers.ValidationError(
+                            {
+                                "token_lifetime": _(
+                                    "Token lifetime cannot exceed 1 hour (3600 seconds) "
+                                    "for non-staff and non-support users."
+                                )
+                            }
+                        )
+
         # Convert validation error from Django to DRF
         # https://github.com/tomchristie/django-rest-framework/issues/2145
         try:

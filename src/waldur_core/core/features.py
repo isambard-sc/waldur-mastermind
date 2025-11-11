@@ -98,6 +98,10 @@ class UserSection(FeatureSection):
         "Enable credentials management (SSH keys, API tokens, etc.) in user workspace."
     )
 
+    disable_long_tokens = Feature(
+        "Disallow non-staff/support users from creating API tokens with unlimited or long expiration times (more than an hour)."
+    )
+
     preferred_language = Feature("Render preferred language column in users list.")
 
     ssh_keys = Feature("Enable SSH keys management in user workspace.")
