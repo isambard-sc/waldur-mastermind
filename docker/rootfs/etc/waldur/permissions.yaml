@@ -273,6 +273,7 @@
   scope: proposal
   permissions:
     - PROPOSAL.MANAGE
+    - PROPOSAL.DELETE_PERMISSION
 
 - role: PROJECT.MEMBER
   description: Project member
