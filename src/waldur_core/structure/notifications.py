@@ -810,6 +810,36 @@ class ProposalCancelledContext(BaseModel):
     proposal_creator_name: str = Field(description="Full name of the proposal creator.")
 
 
+class StaleProposalReminderContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_name: str = Field(description="Name of the stale draft proposal.")
+    call_name: str = Field(description="Name of the call.")
+    proposal_url: str = Field(description="URL to the proposal details page.")
+    last_modified: str = Field(description="Date when the proposal was last modified.")
+    days_since_modification: int = Field(
+        description="Number of days since the proposal was last modified."
+    )
+    days_until_deletion: int = Field(
+        description="Number of days until the proposal will be deleted."
+    )
+    deletion_date: str = Field(
+        description="Date when the proposal will be automatically deleted."
+    )
+
+
+class StaleProposalDeletedContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_name: str = Field(description="Name of the deleted proposal.")
+    call_name: str = Field(description="Name of the call.")
+    last_modified: str = Field(description="Date when the proposal was last modified.")
+    days_since_modification: int = Field(
+        description="Number of days since the proposal was last modified."
+    )
+    deletion_date: str = Field(
+        description="Date and time when the proposal was deleted."
+    )
+
+
 class ReviewAssignedContext(BaseModel):
     site_name: str = Field(description="Name of the site from settings.")
     reviewer_name: str = Field(description="Full name of the assigned reviewer.")
@@ -951,6 +981,16 @@ class ProposalSection(NotificationSection):
         key="round_closing_for_managers",
         description="Notifies call managers that a round has ended, with a summary of proposals and reviews.",
         context_model=RoundClosingForManagersContext,
+    )
+    stale_proposal_reminder = Notification(
+        key="stale_proposal_reminder",
+        description="Reminds proposal managers that a draft proposal will be deleted in 14 days if not submitted.",
+        context_model=StaleProposalReminderContext,
+    )
+    stale_proposal_deleted = Notification(
+        key="stale_proposal_deleted",
+        description="Notifies proposal managers that a draft proposal has been automatically deleted.",
+        context_model=StaleProposalDeletedContext,
     )
     round_opening_for_reviewers = Notification(
         key="round_opening_for_reviewers",

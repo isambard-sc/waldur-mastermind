@@ -279,6 +279,9 @@ def broadcast_mail(
     try:
         notification = Notification.objects.get(key=notification_key)
     except Notification.DoesNotExist:
+        logger.warning(
+            f"Notification with key '{notification_key}' does not exist. Email will not be sent."
+        )
         return
 
     if notification.enabled:
@@ -294,6 +297,10 @@ def broadcast_mail(
         text_message = format_text(text_template_name, context)
         html_message = render_to_string(html_template_name, context)
 
+        logger.info(
+            f"Sending email\nSubject: {subject}\nTo: {recipient_list}\n:Body:\n{text_message}"
+        )
+
         for recipient in recipient_list:
             logger.info(f"About to send {event_type} notification to {recipient}")
             send_mail(
@@ -306,6 +313,10 @@ def broadcast_mail(
                 content_type=content_type,
                 bcc=bcc,
             )
+    else:
+        logger.info(
+            f"Notification with key '{notification_key}' is disabled. Email will not be sent."
+        )
 
 
 def get_ordering(request):

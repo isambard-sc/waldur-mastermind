@@ -1,4 +1,3 @@
-Dear {{ manager_name }},
 
 This is a reminder that your draft proposal "{{ proposal_name }}" in call "{{ call_name }}" has not been submitted yet.
 

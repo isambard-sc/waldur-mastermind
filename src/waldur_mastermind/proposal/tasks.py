@@ -3,9 +3,12 @@ from typing import Any, cast
 
 from celery import shared_task
 from constance import config
-from django.db.models import Avg, Count, F, Q
+from django.db.models import Avg, Count, Q
 from django.utils import timezone
+from datetime import timedelta
 
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.utils import get_users
 from waldur_core.core import utils as core_utils
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
@@ -604,48 +607,56 @@ def notify_manager_when_reviews_are_completed(proposal_uuid):
         manager_emails,
     )
 
+
 @shared_task(name="waldur_mastermind.proposal.send_stale_proposal_reminders")
 def send_stale_proposal_reminders():
     """Send reminder emails for draft proposals that haven't been edited in 14 days."""
-    from datetime import timedelta
-
-    from waldur_core.permissions.enums import PermissionEnum
-    from waldur_core.permissions.utils import get_users
-
     # Calculate the date 14 days ago
     reminder_threshold = timezone.now() - timedelta(days=14)
-    # Calculate the date 28 days ago (for deletion)
-    deletion_threshold = timezone.now() - timedelta(days=28)
+
+    # First, clean up stale_reminder_sent_at for proposals that were modified recently
+    # This handles edge cases where the flag wasn't cleared on update
+    proposal_models.Proposal.objects.filter(
+        state=ProposalStates.DRAFT,
+        modified__gt=reminder_threshold,
+        stale_reminder_sent_at__isnull=False,
+    ).update(stale_reminder_sent_at=None)
 
     # Find draft proposals that:
     # - Are in DRAFT state
-    # - Haven't been modified in 14 days
-    # - Haven't been modified in less than 28 days (not yet ready for deletion)
-    # - Haven't already had a reminder sent (or reminder was sent before last modification)
+    # - Haven't been modified in at least 14 days
+    # - Reminder was never sent
     stale_proposals = proposal_models.Proposal.objects.filter(
         state=ProposalStates.DRAFT,
         modified__lte=reminder_threshold,
-        modified__gt=deletion_threshold,
-    ).filter(
-        Q(stale_reminder_sent_at__isnull=True) | Q(stale_reminder_sent_at__lt=F("modified"))
+        stale_reminder_sent_at__isnull=True,
     )
 
     for proposal in stale_proposals:
         # Get all proposal managers
         managers = get_users(proposal, PermissionEnum.MANAGE_PROPOSAL)
 
-        if not managers:
+        # Also include the proposal creator (for old proposals that may not have the permission)
+        recipients = set(managers) if managers else set()
+        if proposal.created_by:
+            recipients.add(proposal.created_by)
+
+        if not recipients:
             logger.warning(
-                f"Cannot send stale proposal reminder. Proposal {proposal.uuid} has no managers."
+                f"Cannot send stale proposal reminder. Proposal {proposal.uuid} has no managers or creator."
+            )
+            # still mark as sent as we still want to delete the proposal later
+            proposal_models.Proposal.objects.filter(pk=proposal.pk).update(
+                stale_reminder_sent_at=timezone.now()
             )
             continue
 
-        # Get emails of managers
-        manager_emails = [m.email for m in managers if m.email]
+        # Get emails of recipients (removing duplicates)
+        recipient_emails = [r.email for r in recipients if r.email]
 
-        if not manager_emails:
+        if not recipient_emails:
             logger.warning(
-                f"Cannot send stale proposal reminder. Proposal {proposal.uuid} managers have no valid emails."
+                f"Cannot send stale proposal reminder. Proposal {proposal.uuid} recipients have no valid emails."
             )
             continue
 
@@ -655,34 +666,33 @@ def send_stale_proposal_reminders():
         )
 
         days_since_modification = (timezone.now() - proposal.modified).days
-        days_until_deletion = 28 - days_since_modification
-        deletion_date = (proposal.modified + timedelta(days=28)).strftime(
-            "%B %d, %Y"
-        )
+        days_until_deletion = 14  # 14 days after reminder
+        reminder_date = timezone.now()
+        deletion_date = (reminder_date + timedelta(days=14)).strftime("%B %d, %Y")
 
-        # Send email to each manager
-        for manager in managers:
-            if not manager.email:
-                continue
+        context = {
+            "site_name": config.SITE_NAME,
+            "proposal_name": proposal.name,
+            "call_name": proposal.round.call.name,
+            "proposal_url": proposal_link,
+            "last_modified": proposal.modified.strftime("%B %d, %Y at %H:%M"),
+            "days_since_modification": days_since_modification,
+            "days_until_deletion": days_until_deletion,
+            "deletion_date": deletion_date,
+        }
 
-            context = {
-                "site_name": config.SITE_NAME,
-                "manager_name": manager.full_name,
-                "proposal_name": proposal.name,
-                "call_name": proposal.round.call.name,
-                "proposal_url": proposal_link,
-                "last_modified": proposal.modified.strftime("%B %d, %Y at %H:%M"),
-                "days_since_modification": days_since_modification,
-                "days_until_deletion": days_until_deletion,
-                "deletion_date": deletion_date,
-            }
-
+        try:
             core_utils.broadcast_mail(
                 "proposal",
                 "stale_proposal_reminder",
                 context,
-                [manager.email],
+                recipient_emails,
             )
+        except Exception as e:
+            logger.error(
+                f"Failed to send stale proposal reminder to {recipient_emails} for proposal {proposal.name}: {e}"
+            )
+            continue
 
         # Mark that reminder has been sent (use update to avoid triggering auto_now on modified)
         proposal_models.Proposal.objects.filter(pk=proposal.pk).update(
@@ -690,18 +700,13 @@ def send_stale_proposal_reminders():
         )
 
         logger.info(
-            f"Sent stale proposal reminder for proposal {proposal.name} to {len(manager_emails)} manager(s)."
+            f"Sent stale proposal reminder for proposal {proposal.name} to {len(recipient_emails)} recipient(s)."
         )
 
 
 @shared_task(name="waldur_mastermind.proposal.delete_stale_proposals")
 def delete_stale_proposals():
     """Delete draft proposals 14 days after reminder was sent."""
-    from datetime import timedelta
-
-    from waldur_core.permissions.enums import PermissionEnum
-    from waldur_core.permissions.utils import get_users
-
     # Calculate the date 14 days ago
     deletion_threshold = timezone.now() - timedelta(days=14)
 
@@ -717,7 +722,13 @@ def delete_stale_proposals():
     for proposal in stale_proposals:
         # Get all proposal managers for notification
         managers = get_users(proposal, PermissionEnum.MANAGE_PROPOSAL)
-        manager_emails = [m.email for m in managers if m.email]
+
+        # Also include the proposal creator (for old proposals that may not have the permission)
+        recipients = set(managers) if managers else set()
+        if proposal.created_by:
+            recipients.add(proposal.created_by)
+
+        recipient_emails = [r.email for r in recipients if r.email]
 
         # Store proposal info before deletion
         proposal_name = proposal.name
@@ -734,29 +745,29 @@ def delete_stale_proposals():
             f"Deleted stale proposal {proposal_name} (UUID: {proposal_uuid}) - last modified {days_since_modification} days ago."
         )
 
-        # Send notification to managers
-        if manager_emails:
-            for manager in managers:
-                if not manager.email:
-                    continue
+        # Send notification to managers and creator
+        if recipient_emails:
+            context = {
+                "site_name": config.SITE_NAME,
+                "proposal_name": proposal_name,
+                "call_name": call_name,
+                "last_modified": last_modified,
+                "days_since_modification": days_since_modification,
+                "deletion_date": deletion_date,
+            }
 
-                context = {
-                    "site_name": config.SITE_NAME,
-                    "manager_name": manager.full_name,
-                    "proposal_name": proposal_name,
-                    "call_name": call_name,
-                    "last_modified": last_modified,
-                    "days_since_modification": days_since_modification,
-                    "deletion_date": deletion_date,
-                }
-
+            try:
                 core_utils.broadcast_mail(
                     "proposal",
                     "stale_proposal_deleted",
                     context,
-                    [manager.email],
+                    recipient_emails,
                 )
 
-            logger.info(
-                f"Sent deletion notification for proposal {proposal_name} to {len(manager_emails)} manager(s)."
-            )
+                logger.info(
+                    f"Sent deletion notification for proposal {proposal_name} to {len(recipient_emails)} recipient(s)."
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to send stale proposal deletion notification to {recipient_emails} for proposal {proposal_name}: {e}"
+                )
