@@ -1166,6 +1166,18 @@ class ProposalUpdateProjectDetailsSerializer(serializers.ModelSerializer):
                 )
         return value
 
+    def validate_project_summary(self, value):
+        """Validate project summary length."""
+        if len(value) > core_models.DESCRIPTION_LENGTH:
+            raise serializers.ValidationError(
+                _(
+                    f"Project summary is too long. "
+                    f"Maximum length is {core_models.DESCRIPTION_LENGTH} "
+                    f"characters."
+                )
+            )
+        return value
+
 
 class ProposalSerializer(
     core_serializers.AugmentedSerializerMixin,
@@ -1285,6 +1297,20 @@ class ProposalSerializer(
                             f"Proposal name is too long. "
                             f"Maximum length is {max_length} characters "
                             f'when combined with call ID "{call_prefix}".'
+                        )
+                    }
+                )
+
+        # Validate project_summary length
+        if "project_summary" in attrs:
+            project_summary = attrs["project_summary"]
+            if len(project_summary) > core_models.DESCRIPTION_LENGTH:
+                raise serializers.ValidationError(
+                    {
+                        "project_summary": _(
+                            f"Project summary is too long. "
+                            f"Maximum length is "
+                            f"{core_models.DESCRIPTION_LENGTH} characters."
                         )
                     }
                 )
