@@ -2493,7 +2493,7 @@ A notification to the reviewer about the proposal decision (approved/rejected) w
 
     View proposal: {{ proposal_url }}
 
-    This is an automated message from {{ site_name }}. Please do not reply to this email.
+    This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
 ```
 
@@ -2526,7 +2526,7 @@ A notification to the reviewer about the proposal decision (approved/rejected) w
 
         <p>View proposal: <a href="{{ proposal_url }}">{{ proposal_url }}</a></p>
 
-        <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+        <p><em>This is an automated message from the {{ site_name }}. Please do not reply to this email.</em></p>
     </body>
     </html>
 
@@ -2741,7 +2741,7 @@ A notification to call manager about the decision on requested offering (accepte
     You can view the call details and manage offerings by visiting:
     {{ call_url }}
 
-    This is an automated message from {{ site_name }}. Please do not reply to this email.
+    This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
 ```
 
@@ -2778,7 +2778,7 @@ A notification to call manager about the decision on requested offering (accepte
         <p>You can view the call details and manage offerings by visiting:<br>
         <a href="{{ call_url }}">{{ call_url }}</a></p>
 
-        <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+        <p><em>This is an automated message from the {{ site_name }}. Please do not reply to this email.</em></p>
     </body>
     </html>
 
@@ -2818,7 +2818,7 @@ A notification to a reviewer about a new review assignment.
 
     If you accept this assignment, you'll be able to access the full proposal content and submit your review.
 
-    This is an automated message from {{ site_name }}. Please do not reply to this email.
+    This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
 ```
 
@@ -2849,7 +2849,7 @@ A notification to a reviewer about a new review assignment.
 
     <p>If you accept this assignment, you'll be able to access the full proposal content and submit your review.</p>
 
-    <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+    <p><em>This is an automated message from the {{ site_name }}. Please do not reply to this email.</em></p>
     </body>
     </html>
 
@@ -3073,7 +3073,7 @@ Notifies call managers that a round has ended, with a summary of proposals and r
     You can view the round details and manage proposals by visiting:
     {{ round_url }}
 
-    This is an automated message from {{ site_name }}. Please do not reply to this email.
+    This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
 ```
 

@@ -2051,7 +2051,7 @@ Thank you for your valuable contribution to the review process. Your expert asse
 
 View proposal: {{ proposal_url }}
 
-This is an automated message from {{ site_name }}. Please do not reply to this email.
+This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
 ```
 
@@ -2327,7 +2327,7 @@ Offering details:
 You can view the call details and manage offerings by visiting:
 {{ call_url }}
 
-This is an automated message from {{ site_name }}. Please do not reply to this email.
+This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
 ```
 
@@ -2493,7 +2493,7 @@ Please log in to the platform to review the proposal. You can accept or reject t
 
 If you accept this assignment, you'll be able to access the full proposal content and submit your review.
 
-This is an automated message from {{ site_name }}. Please do not reply to this email.
+This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
 ```
 
@@ -2530,7 +2530,7 @@ This is an automated message from {{ site_name }}. Please do not reply to this e
     <p>You can view the call details and manage offerings by visiting:<br>
     <a href="{{ call_url }}">{{ call_url }}</a></p>
 
-    <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+    <p><em>This is an automated message from the {{ site_name }}. Please do not reply to this email.</em></p>
 </body>
 </html>
 
@@ -2579,7 +2579,7 @@ Based on the review strategy selected for this round ({{ review_strategy }}), th
 You can view the round details and manage proposals by visiting:
 {{ round_url }}
 
-This is an automated message from {{ site_name }}. Please do not reply to this email.
+This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
 ```
 
@@ -2835,7 +2835,7 @@ Offering request {{ decision }}: {{ offering_name }}
 
     <p>View proposal: <a href="{{ proposal_url }}">{{ proposal_url }}</a></p>
 
-    <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+    <p><em>This is an automated message from the {{ site_name }}. Please do not reply to this email.</em></p>
 </body>
 </html>
 
@@ -2868,7 +2868,7 @@ Offering request {{ decision }}: {{ offering_name }}
 
 <p>If you accept this assignment, you'll be able to access the full proposal content and submit your review.</p>
 
-<p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+<p><em>This is an automated message from the {{ site_name }}. Please do not reply to this email.</em></p>
 </body>
 </html>
 

@@ -739,7 +739,7 @@ class ProposalStateChangedContext(BaseModel):
     call_name: str = Field(description="Name of the call for proposals.")
     rejection_feedback: str | None = Field(
         default=None,
-        description="Comments from the manager if the proposal was rejected.",
+        description="Comments from the manager if the proposal was rejected or returned.",
     )
     allocated_resources: list[dict[str, str]] | None = Field(
         default=None,

@@ -174,7 +174,25 @@ def camel_case_to_underscore(name):
 
 def format_text(template_name, context):
     template = get_template(template_name).template
-    return template.render(Context(context, autoescape=False)).strip()
+    text = template.render(Context(context, autoescape=False)).strip()
+
+    # go through the lines and make sure that blank lines are really blank,
+    # and that we don't have double-blank lines
+    lines = text.splitlines()
+
+    cleaned_lines = []
+    previous_line_blank = False
+    for line in lines:
+        stripped_line = line.strip()
+        if not stripped_line:
+            if not previous_line_blank:
+                cleaned_lines.append("")
+            previous_line_blank = True
+        else:
+            cleaned_lines.append(line.rstrip())
+            previous_line_blank = False
+
+    return "\n".join(cleaned_lines)
 
 
 def find_template_from_registry(app, event_type, template_suffix):
