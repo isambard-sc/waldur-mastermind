@@ -33,6 +33,7 @@ from waldur_core.permissions.fixtures import CallRole, ProposalRole
 from waldur_core.permissions.utils import has_permission, permission_factory
 from waldur_core.permissions.views import UserRoleMixin
 from waldur_core.structure import filters as structure_filters
+from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import (
     filter_queryset_for_user,
     get_connected_customers,
@@ -1025,6 +1026,32 @@ class ProposalViewSet(
     def approve(self, request, uuid=None):
         proposal = self.get_object()
         previous_state = proposal.state
+
+        # Validate that project name won't overflow
+        call = proposal.round.call
+        call_prefix = call.backend_id or call.slug
+        date_str = proposal.round.start_time.strftime("%Y-%m-%d")
+        project_name = " - ".join([call_prefix, date_str, proposal.name])
+
+        # Use NAME_LENGTH (150) not PROJECT_NAME_LENGTH (500)
+        # because marketplace Resource uses NameMixin
+        from waldur_core.core import models as core_models
+
+        if len(project_name) > core_models.NAME_LENGTH:
+            overhead = len(call_prefix) + len(date_str) + 6
+            max_length = core_models.NAME_LENGTH - overhead
+            return response.Response(
+                {
+                    "detail": _(
+                        f"Cannot approve: resulting project name would be "
+                        f"too long ({len(project_name)} characters). "
+                        f"Please shorten the proposal name to {max_length} "
+                        f"characters or less."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         utils.allocate_proposal(proposal)
         proposal.state = ProposalStates.ACCEPTED
         serializer = self.get_serializer(data=request.data)

@@ -1144,6 +1144,28 @@ class ProposalUpdateProjectDetailsSerializer(serializers.ModelSerializer):
             "oecd_fos_2007_code",
         ]
 
+    def validate_name(self, value):
+        """Validate proposal name length with call prefix."""
+        proposal = self.instance
+        if proposal and proposal.round:
+            call = proposal.round.call
+            call_prefix = call.backend_id or call.slug
+            date_str = proposal.round.start_time.strftime("%Y-%m-%d")
+            overhead = len(call_prefix) + len(date_str) + 6
+            # Use NAME_LENGTH (150) not PROJECT_NAME_LENGTH (500)
+            # because marketplace Resource uses NameMixin
+            max_length = core_models.NAME_LENGTH - overhead
+
+            if len(value) > max_length:
+                raise serializers.ValidationError(
+                    _(
+                        f"Proposal name is too long. "
+                        f"Maximum length is {max_length} characters "
+                        f'when combined with call ID "{call_prefix}".'
+                    )
+                )
+        return value
+
 
 class ProposalSerializer(
     core_serializers.AugmentedSerializerMixin,
@@ -1220,26 +1242,53 @@ class ProposalSerializer(
         }
 
     def validate(self, attrs):
+        # For updates (self.instance exists), get round from instance
         if self.instance:
-            return attrs
+            call_round = self.instance.round
+        else:
+            # For creates, get round from attrs
+            round_uuid = attrs.pop("round_uuid")
 
-        round_uuid = attrs.pop("round_uuid")
+            try:
+                call_round = models.Round.objects.get(uuid=round_uuid)
+            except models.Round.DoesNotExist:
+                raise serializers.ValidationError(
+                    {"round_uuid": _("Round not found.")}
+                )
 
-        try:
-            call_round = models.Round.objects.get(uuid=round_uuid)
-        except models.Round.DoesNotExist:
-            raise serializers.ValidationError({"round_uuid": _("Round not found.")})
+            if call_round.call.state != CallStates.ACTIVE:
+                raise serializers.ValidationError(_("Call is not active."))
 
-        if call_round.call.state != CallStates.ACTIVE:
-            raise serializers.ValidationError(_("Call is not active."))
+            if call_round.status not in (
+                RoundStatuses.SCHEDULED,
+                RoundStatuses.OPEN,
+            ):
+                raise serializers.ValidationError(_("Round is not active."))
 
-        if call_round.status not in (
-            RoundStatuses.SCHEDULED,
-            RoundStatuses.OPEN,
-        ):
-            raise serializers.ValidationError(_("Round is not active."))
+            attrs["round"] = call_round
 
-        attrs["round"] = call_round
+        # Validate proposal name length with call prefix
+        # (applies to both create and update)
+        if "name" in attrs:
+            name = attrs["name"]
+            call_prefix = call_round.call.backend_id or call_round.call.slug
+            date_str = call_round.start_time.strftime("%Y-%m-%d")
+            overhead = len(call_prefix) + len(date_str) + 6
+            # Use NAME_LENGTH (150) not PROJECT_NAME_LENGTH (500)
+            # because marketplace Resource uses NameMixin
+            max_length = core_models.NAME_LENGTH - overhead
+
+            if len(name) > max_length:
+                raise serializers.ValidationError(
+                    {
+                        "name": _(
+                            f"Proposal name is too long. "
+                            f"Maximum length is {max_length} characters "
+                            f'when combined with call ID "{call_prefix}".'
+                        )
+                    }
+                )
+
         return attrs
 
     def create(self, validated_data):

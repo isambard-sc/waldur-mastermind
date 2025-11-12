@@ -583,6 +583,31 @@ class Proposal(
 
         return True, None
 
+    def clean(self):
+        """Validate proposal name length with call prefix."""
+        super().clean()
+        if self.round and self.name:
+            call = self.round.call
+            call_prefix = call.backend_id or call.slug
+            date_str = self.round.start_time.strftime("%Y-%m-%d")
+            # Format: "[CALL_PREFIX] - [DATE] - [PROPOSAL_NAME]"
+            # 6 chars for " - " separators (3 chars × 2)
+            overhead = len(call_prefix) + len(date_str) + 6
+            # Use NAME_LENGTH (150) not PROJECT_NAME_LENGTH (500)
+            # because marketplace Resource uses NameMixin
+            max_length = core_models.NAME_LENGTH - overhead
+
+            if len(self.name) > max_length:
+                raise ValidationError(
+                    {
+                        "name": _(
+                            f"Proposal name is too long. "
+                            f"Maximum length is {max_length} characters "
+                            f'when combined with call ID "{call_prefix}".'
+                        )
+                    }
+                )
+
     def save(self, *args, **kwargs):
         if not self.slug:
             # Generate slug with Round slug prefix and unique counter
