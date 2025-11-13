@@ -210,6 +210,137 @@ def _calculate_luhn_checksum(digits: str) -> int:
     return checksum
 
 
+def migrate_proposal_and_project_ids():
+    """
+    Migrate existing proposals to use new ID format and sync project slugs.
+
+    This function:
+    1. Finds all proposals without the new ID format
+    2. Generates unique IDs for them using ProposalIDGenerator
+    3. If proposal is accepted and has a project, copies slug to project
+
+    Safe to run multiple times - only processes proposals without new format.
+
+    Returns:
+        Dict with counts of proposals and projects updated
+    """
+    from waldur_mastermind.proposal.models import Proposal, ProposalIDGenerator
+    from waldur_core.structure.models import Project
+
+    # Regex pattern to match new ID format: YYYV-NNNN-NNNNC-V
+    # Example: 0251-4788-8877-1
+    import re
+
+    new_id_pattern = re.compile(r"^\d{4}-\d{4}-\d{4}-\d+$")
+
+    proposals_updated = 0
+    projects_updated = 0
+    errors = []
+
+    # Get all proposals
+    all_proposals = Proposal.objects.all().order_by("created")
+
+    logger.info(f"Starting migration of {all_proposals.count()} proposals")
+
+    for proposal in all_proposals:
+        try:
+            # Check if proposal already has new format
+            if proposal.slug and new_id_pattern.match(proposal.slug):
+                # Already has new format - check if project needs updating
+                if proposal.project and proposal.project.slug != proposal.slug:
+                    old_project_slug = proposal.project.slug
+                    proposal.project.slug = proposal.slug
+                    proposal.project.save(update_fields=["slug"])
+                    projects_updated += 1
+                    logger.info(
+                        f"Updated project {proposal.project.id} slug: "
+                        f"{old_project_slug} -> {proposal.slug}"
+                    )
+                continue
+
+            # Proposal needs new ID - get year from creation date
+            year = proposal.created.year
+
+            # Get or create generator for this year
+            generator, created = ProposalIDGenerator.objects.get_or_create(
+                year=year
+            )
+
+            if created:
+                logger.info(
+                    f"Created ProposalIDGenerator for year {year}"
+                )
+
+            # Generate new ID with retry logic
+            max_retries = 100
+            new_slug = None
+
+            for attempt in range(max_retries):
+                sequence_number = generator.increment_count()
+                proposal_id = generate_proposal_id(
+                    sequence_number, proposal_version=1, year=year
+                )
+
+                # Check uniqueness
+                if not Proposal.objects.filter(slug=proposal_id).exclude(
+                    pk=proposal.pk
+                ).exists():
+                    new_slug = proposal_id
+                    break
+
+            if not new_slug:
+                error_msg = (
+                    f"Failed to generate unique ID for proposal "
+                    f"{proposal.pk} after {max_retries} attempts"
+                )
+                logger.error(error_msg)
+                errors.append(error_msg)
+                continue
+
+            # Update proposal slug
+            old_slug = proposal.slug
+            proposal.slug = new_slug
+            proposal.save(update_fields=["slug"])
+            proposals_updated += 1
+
+            logger.info(
+                f"Updated proposal {proposal.pk} slug: "
+                f"{old_slug} -> {new_slug}"
+            )
+
+            # If proposal has a project, update project slug too
+            if proposal.project:
+                old_project_slug = proposal.project.slug
+                proposal.project.slug = new_slug
+                proposal.project.save(update_fields=["slug"])
+                projects_updated += 1
+                logger.info(
+                    f"Updated project {proposal.project.id} slug: "
+                    f"{old_project_slug} -> {new_slug}"
+                )
+
+        except Exception as e:
+            error_msg = (
+                f"Error migrating proposal {proposal.pk}: {str(e)}"
+            )
+            logger.error(error_msg, exc_info=True)
+            errors.append(error_msg)
+
+    result = {
+        "proposals_processed": all_proposals.count(),
+        "proposals_updated": proposals_updated,
+        "projects_updated": projects_updated,
+        "errors": errors,
+    }
+
+    logger.info(
+        f"Migration complete: {proposals_updated} proposals updated, "
+        f"{projects_updated} projects updated, {len(errors)} errors"
+    )
+
+    return result
+
+
 def get_available_reviewer(proposal: proposal_models.Proposal):
     reviewer_ids = proposal.review_set.values_list("reviewer_id", flat=True)
     reviews = proposal_models.Review.objects.filter(
