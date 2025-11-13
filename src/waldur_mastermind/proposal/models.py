@@ -31,7 +31,6 @@ from waldur_mastermind.proposal.enums import (
     RequestedOfferingStates,
     RoundStatuses,
 )
-from waldur_mastermind.proposal.utils import generate_proposal_id
 
 from . import managers
 
@@ -685,6 +684,9 @@ class Proposal(
 
     def save(self, *args, **kwargs):
         if not self.slug:
+            # Import here to avoid circular import
+            from waldur_mastermind.proposal.utils import generate_proposal_id
+
             # Generate unique proposal ID using ProposalIDGenerator
             year = datetime.now().year
 
