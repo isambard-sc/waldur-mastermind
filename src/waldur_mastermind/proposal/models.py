@@ -6,7 +6,7 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.validators import MinValueValidator
 from django.db import models
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from model_utils import FieldTracker
@@ -31,10 +31,85 @@ from waldur_mastermind.proposal.enums import (
     RequestedOfferingStates,
     RoundStatuses,
 )
+from waldur_mastermind.proposal.utils import generate_proposal_id
 
 from . import managers
 
 logger = logging.getLogger(__name__)
+
+
+class ProposalIDGenerator(models.Model):
+    """
+    Generator for unique proposal IDs per year.
+
+    Maintains a counter for each year to generate sequential proposal IDs
+    in the format YYYV-NNNN-NNNNC-V (e.g., 0251-0000-0001-1).
+    Uses atomic database operations to prevent race conditions.
+    """
+
+    year = models.PositiveIntegerField(
+        unique=True,
+        verbose_name=_("year"),
+        help_text=_("The year for which this generator creates IDs."),
+        db_index=True,
+    )
+
+    count = models.PositiveIntegerField(
+        default=0,
+        verbose_name=_("count"),
+        help_text=_("The current count of proposals created in this year."),
+    )
+
+    def __str__(self) -> str:
+        return f"ProposalIDGenerator({self.year}): Count = {self.count}"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    def increment_count(self) -> int:
+        """
+        Atomically increment count and return new value.
+
+        Uses F() expression for atomic database-level increment
+        to prevent race conditions when multiple proposals are
+        created simultaneously. Wraps around to 0 after 9,999,999
+        (maximum 7-digit sequence number).
+
+        IMPORTANT: This increments BEFORE returning, so:
+        - First call returns 1 (not 0)
+        - Second call returns 2, etc.
+        This prevents race conditions by guaranteeing unique numbers.
+
+        Returns:
+            The new count value after incrementing (1, 2, 3, ...)
+        """
+        # Check if we need to wrap around
+        if self.count >= 9999999:
+            logger.warning(
+                f"ProposalIDGenerator for year {self.year} has reached "
+                f"maximum count (9999999). Wrapping around to 0."
+            )
+            self.count = 0
+        else:
+            self.count = F("count") + 1
+
+        self.save(update_fields=["count"])
+        self.refresh_from_db()
+        return int(self.count)
+
+    def get_current_count(self) -> int:
+        """
+        Get the current count value.
+
+        Returns:
+            The current count as an integer
+        """
+        return int(self.count)
+
+    class Meta:
+        verbose_name = _("Proposal ID Generator")
+        verbose_name_plural = _("Proposal ID Generators")
+        ordering = ["-year"]
 
 
 class CallDocument(
@@ -610,31 +685,52 @@ class Proposal(
 
     def save(self, *args, **kwargs):
         if not self.slug:
-            # Generate slug with Round slug prefix and unique counter
-            round_slug = (
-                self.round.slug if self.round and self.round.slug else "PROPOSAL"
-            )
-            # Clean the round slug but keep the separator hyphen
-            clean_round_slug = core_models.clean_slug_hyphens(round_slug)
-            base_slug = f"{clean_round_slug}-"
+            # Generate unique proposal ID using ProposalIDGenerator
+            year = datetime.now().year
 
-            # Find the highest counter for proposals in this round
-            existing_proposals = Proposal.objects.filter(
-                round=self.round, slug__startswith=base_slug
-            ).exclude(pk=self.pk if self.pk else None)
+            # Get or create the generator for this year
+            generator, created = ProposalIDGenerator.objects.get_or_create(year=year)
 
-            max_counter = 0
-            for proposal in existing_proposals:
-                try:
-                    # Extract counter from slug (e.g., "ROUND-SLUG-001" -> 1)
-                    suffix = proposal.slug[len(base_slug) :]
-                    if suffix.isdigit():
-                        max_counter = max(max_counter, int(suffix))
-                except (ValueError, IndexError):
-                    continue
+            if created:
+                logger.info(f"Created new ProposalIDGenerator for year {year}")
 
-            # Set slug with next available counter (capitalized, 3-digit zero-padded)
-            self.slug = f"{base_slug}{max_counter + 1:03d}".upper()
+            # Retry loop to handle potential slug collisions
+            max_retries = 100
+            for attempt in range(max_retries):
+                # INCREMENT FIRST - this is atomic and prevents race conditions
+                # Each process gets a unique sequence number
+                sequence_number = generator.increment_count()
+                proposal_id = generate_proposal_id(
+                    sequence_number, proposal_version=1, year=year
+                )
+
+                # Check if this slug already exists (shouldn't happen with
+                # atomic increment, but check anyway for safety)
+                if (
+                    not Proposal.objects.filter(slug=proposal_id)
+                    .exclude(pk=self.pk if self.pk else None)
+                    .exists()
+                ):
+                    # Slug is unique - use it
+                    self.slug = proposal_id
+                    logger.info(
+                        f"Generated unique proposal ID: {proposal_id} "
+                        f"(sequence: {sequence_number})"
+                    )
+                    break
+
+                # Collision detected (should be extremely rare) - retry
+                logger.warning(
+                    f"Proposal ID {proposal_id} already exists "
+                    f"despite atomic increment. "
+                    f"Retrying (attempt {attempt + 1}/{max_retries})"
+                )
+            else:
+                # Exhausted retries
+                raise ValueError(
+                    f"Failed to generate unique proposal ID after "
+                    f"{max_retries} attempts"
+                )
 
         super().save(*args, **kwargs)
 
