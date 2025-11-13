@@ -315,10 +315,6 @@ def broadcast_mail(
         text_message = format_text(text_template_name, context)
         html_message = render_to_string(html_template_name, context)
 
-        logger.info(
-            f"Sending email\nSubject: {subject}\nTo: {recipient_list}\n:Body:\n{text_message}"
-        )
-
         for recipient in recipient_list:
             logger.info(f"About to send {event_type} notification to {recipient}")
             send_mail(
