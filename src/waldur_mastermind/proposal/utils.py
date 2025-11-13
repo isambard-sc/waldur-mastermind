@@ -97,6 +97,10 @@ def allocate_proposal(proposal: proposal_models.Proposal):
     logger.info(f"Start date for project {project_name} is {start_date}.")
     logger.info(f"End date for project {project_name} is {end_date}.")
     logger.info(f"Duration in days is {duration_in_days}.")
+    logger.info(
+        f"Copying slug '{proposal.slug}' from proposal to project "
+        f"for consistent tracking."
+    )
 
     project = structure_models.Project.objects.create(
         customer=proposal_round.call.manager.customer,
@@ -105,6 +109,7 @@ def allocate_proposal(proposal: proposal_models.Proposal):
         start_date=start_date,
         end_date=end_date,
         short_name=short_name,
+        slug=proposal.slug,  # Copy slug from proposal for consistent tracking ID
     )
     project = cast(structure_models.Project, project)
 
