@@ -133,6 +133,7 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
     user_email = serializers.ReadOnlyField(source="user.email")
     user_full_name = serializers.ReadOnlyField(source="user.full_name")
     user_username = serializers.ReadOnlyField(source="user.username")
+    user_slug = serializers.CharField(read_only=True, source="user.slug")
     user_image = serializers.ImageField(source="user.image", read_only=True)
     created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
     created_by_uuid = serializers.UUIDField(read_only=True, source="created_by.uuid")
@@ -149,6 +150,7 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
             "user_email",
             "user_full_name",
             "user_username",
+            "user_slug",
             "user_uuid",
             "user_image",
             "created_by_full_name",
