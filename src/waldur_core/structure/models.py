@@ -912,11 +912,15 @@ class Project(
         # We will let the short name change here as a first step to removing it.
         # The unique shortname is now stored in the waldur_openportal plugin,
         # and this cannot be changed once set.
+
+        # Capture whether short_name changed BEFORE saving (tracker resets after save)
+        short_name_changed = hasattr(self, "tracker") and self.tracker.has_changed("short_name")
+
         super().save(*args, **kwargs)
 
         # Sync short_name changes to ProjectInfo.shortname and Project.slug
         # Use _syncing_to_projectinfo flag to prevent circular updates
-        if hasattr(self, "tracker") and self.tracker.has_changed("short_name"):
+        if short_name_changed:
             if self.short_name and not getattr(self, "_syncing_to_projectinfo", False):
                 try:
                     from waldur_openportal.models import ProjectInfo

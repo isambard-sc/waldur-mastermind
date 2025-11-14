@@ -463,12 +463,15 @@ class User(
                 )
             )
 
+        # Capture whether unix_username changed BEFORE saving (tracker resets after save)
+        unix_username_changed = self.tracker.has_changed("unix_username")
+
         super().save(*args, **kwargs)
 
         # Sync unix_username changes to UserInfo.shortname and User.slug
         # Use _syncing_to_userinfo flag to prevent circular updates
         if (
-            self.tracker.has_changed("unix_username")
+            unix_username_changed
             and self.unix_username
             and not getattr(self, "_syncing_to_userinfo", False)
         ):
