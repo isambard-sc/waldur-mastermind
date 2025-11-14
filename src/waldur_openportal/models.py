@@ -928,10 +928,24 @@ class UserInfo(models.Model):
                 shortname != self.user.unix_username
                 and self.user.unix_username is not None
             ):
-                self.user.unix_username = self.shortname
-                self.user.save()
+                # Set flag to prevent circular updates when saving unix_username
+                self.user._syncing_to_userinfo = True
+                try:
+                    self.user.unix_username = self.shortname
+                    self.user.save(update_fields=["unix_username"])
+                finally:
+                    self.user._syncing_to_userinfo = False
 
             self.shortname = self.user.unix_username
+
+        # make sure to copy the shortname to the slug
+        # Set flag to prevent circular updates
+        self.user._syncing_to_userinfo = True
+        try:
+            self.user.slug = shortname
+            self.user.save(update_fields=["slug"])
+        finally:
+            self.user._syncing_to_userinfo = False
 
         if self.shortname and self.shortname != shortname:
             logger.error(
@@ -1226,6 +1240,36 @@ class ProjectInfo(models.Model):
         self.shortname = shortname
         self.save(force_accept_changed_shortname=force)
         self.sanitise()
+
+        if self.project:
+            # Set flag to prevent circular updates
+            self.project._syncing_to_projectinfo = True
+            try:
+                if hasattr(self.project, "short_name"):
+                    if self.project.short_name != shortname:
+                        try:
+                            self.project.short_name = shortname
+                            self.project.save(update_fields=["short_name"])
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to save project short_name {shortname} for project {self.project}: {e}"
+                            )
+
+                # Only copy the shortname to the slug if we are NOT in
+                # application_portal_only mode (i.e., we're in Project Management mode)
+                try:
+                    application_portal_only = core_models.Feature.objects.get(
+                        key="deployment.application_portal_only"
+                    ).value
+                except core_models.Feature.DoesNotExist:
+                    # Default to False if feature flag doesn't exist
+                    application_portal_only = False
+
+                if not application_portal_only:
+                    self.project.slug = shortname
+                    self.project.save(update_fields=["slug"])
+            finally:
+                self.project._syncing_to_projectinfo = False
 
     def has_shortname(self) -> bool:
         """

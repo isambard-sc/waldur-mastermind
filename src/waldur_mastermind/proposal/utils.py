@@ -225,7 +225,6 @@ def migrate_proposal_and_project_ids():
         Dict with counts of proposals and projects updated
     """
     from waldur_mastermind.proposal.models import Proposal, ProposalIDGenerator
-    from waldur_core.structure.models import Project
 
     # Regex pattern to match new ID format: YYYV-NNNN-NNNNC-V
     # Example: 0251-4788-8877-1
@@ -297,10 +296,10 @@ def migrate_proposal_and_project_ids():
                 errors.append(error_msg)
                 continue
 
-            # Update proposal slug
+            # Update proposal slug using queryset update to avoid triggering save()
+            # and updating the modified timestamp
             old_slug = proposal.slug
-            proposal.slug = new_slug
-            proposal.save(update_fields=["slug"])
+            Proposal.objects.filter(pk=proposal.pk).update(slug=new_slug)
             proposals_updated += 1
 
             logger.info(
