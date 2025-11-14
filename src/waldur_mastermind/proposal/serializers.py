@@ -1235,6 +1235,7 @@ class ProposalSerializer(
             "oecd_fos_2007_label",
             "allocation_comment",
             "created",
+            "modified",
             "compliance_status",
             "can_submit",
         ]
