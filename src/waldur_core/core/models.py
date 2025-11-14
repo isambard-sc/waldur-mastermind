@@ -463,7 +463,34 @@ class User(
                 )
             )
 
+        # Capture whether unix_username changed BEFORE saving (tracker resets after save)
+        unix_username_changed = self.tracker.has_changed("unix_username")
+
         super().save(*args, **kwargs)
+
+        # Sync unix_username changes to UserInfo.shortname and User.slug
+        # Use _syncing_to_userinfo flag to prevent circular updates
+        if (
+            unix_username_changed
+            and self.unix_username
+            and not getattr(self, "_syncing_to_userinfo", False)
+        ):
+            try:
+                from waldur_openportal.models import UserInfo
+
+                user_info = UserInfo.objects.filter(user=self).first()
+                if user_info:
+                    # UserInfo exists - sync through set_shortname which will update slug
+                    if user_info.shortname != self.unix_username:
+                        user_info.set_shortname(self.unix_username)
+                else:
+                    # UserInfo doesn't exist yet - directly update slug to match unix_username
+                    if self.slug != self.unix_username:
+                        User.objects.filter(pk=self.pk).update(slug=self.unix_username)
+            except Exception:
+                # waldur_openportal may not be installed - still update slug
+                if self.slug != self.unix_username:
+                    User.objects.filter(pk=self.pk).update(slug=self.unix_username)
 
     def get_log_fields(self):
         return (

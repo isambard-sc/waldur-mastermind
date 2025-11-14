@@ -120,6 +120,10 @@ class UserSection(FeatureSection):
 
     show_username = Feature("Enable display of username field in user tables.")
 
+    show_slug_as_id = Feature(
+        "Show the user slug as an identifier on the dashboard and all user lists."
+    )
+
     minimal_user_profile = Feature(
         "Show and allow editing of minimal set of user profile fields (e.g. just name and email)."
     )
@@ -247,4 +251,7 @@ class WaldurDeploymentSection(FeatureSection):
     enable_cookie_notice = Feature("Enable cookie notice in marketplace.")
     application_portal_only = Feature(
         "Configure Waldur to function as an application and awards portal only."
+    )
+    make_slugs_immutable = Feature(
+        "Make slugs immutable, i.e. disallow direct changes to slugs after they have been set. Note that slugs may still be changed indirectly."
     )

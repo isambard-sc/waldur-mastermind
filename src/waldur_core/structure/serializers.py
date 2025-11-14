@@ -870,6 +870,7 @@ class CustomerUserSerializer(
             "username",
             "full_name",
             "email",
+            "slug",
             "role_name",
             "projects",
             "expiration_time",

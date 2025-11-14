@@ -8,7 +8,7 @@ Proposal details:
 - Deletion date: {{ deletion_date }}
 - Reason: No activity for {{ days_since_modification }} days
 
-The proposal was not submitted and had not been edited for more than 28 days, so it was automatically removed to keep the system clean.
+The proposal was not submitted and had not been edited for more than 28 days, so it was automatically removed to protect your data privacy and keep the system clean.
 
 If you still wish to submit a proposal for this call:
 1. Check if the call is still accepting submissions

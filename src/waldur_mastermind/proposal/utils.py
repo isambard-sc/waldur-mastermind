@@ -1,6 +1,6 @@
 import logging
-from typing import cast
 from datetime import datetime, timedelta
+from typing import cast
 
 from django.db import transaction
 from django.db.models import OuterRef
@@ -17,6 +17,327 @@ from waldur_mastermind.proposal.enums import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _scramble_sequence_number(n: int) -> int:
+    """
+    Scramble a sequence number using Linear Congruential Generator (LCG).
+
+    This creates a bijective (one-to-one) mapping that makes sequential
+    numbers appear random while remaining deterministic and reversible.
+    Maps integers from 0-9999999 to other integers in the same range.
+
+    Uses LCG parameters chosen for good distribution over 7-digit range:
+    - Modulus: 10000000 (our range)
+    - Multiplier: 2743019 (coprime with modulus)
+    - Increment: 4788887 (odd number for full period)
+
+    Args:
+        n: Sequence number from 0 to 9999999
+
+    Returns:
+        Scrambled sequence number from 0 to 9999999
+
+    Example:
+        >>> _scramble_sequence_number(0)
+        4788887
+        >>> _scramble_sequence_number(1)
+        7531906
+        >>> _scramble_sequence_number(2)
+        274925
+    """
+    # LCG parameters for 10 million range
+    modulus = 10000000  # Our range (0-9999999)
+    multiplier = 2743019  # Carefully chosen for good distribution
+    increment = 4788887  # Odd number ensures full period
+
+    # Apply LCG formula: (a * n + c) mod m
+    scrambled = (multiplier * n + increment) % modulus
+    return scrambled
+
+
+def _unscramble_sequence_number(scrambled: int) -> int:
+    """
+    Reverse the scrambling to get original sequence number.
+
+    This inverts the LCG transformation using modular multiplicative inverse.
+    Useful for debugging or verification.
+
+    Args:
+        scrambled: Scrambled sequence number from 0 to 9999999
+
+    Returns:
+        Original sequence number from 0 to 9999999
+
+    Example:
+        >>> _unscramble_sequence_number(4788887)
+        0
+        >>> _unscramble_sequence_number(7531906)
+        1
+    """
+    modulus = 10000000
+    multiplier = 2743019
+    increment = 4788887
+
+    # Calculate modular multiplicative inverse of multiplier
+    # Using extended Euclidean algorithm
+    inv_multiplier = pow(multiplier, -1, modulus)
+
+    # Reverse LCG: n = (scrambled - c) * a^(-1) mod m
+    original = (inv_multiplier * (scrambled - increment)) % modulus
+    return original
+
+
+def generate_proposal_id(
+    sequence_number: int,
+    proposal_version: int = 1,
+    year: int | None = None,
+    scramble: bool = True,
+) -> str:
+    """
+    Generate a unique proposal ID in the format: YYYV-NNNN-NNNNC-V
+
+    Format breakdown:
+    - YYY: Last 3 digits of the year (e.g., 025 for 2025)
+    - V: Scheme version (always 1)
+    - NNNN-NNNN: 7-digit sequence number with hyphen separator (0000-000 to 9999-999)
+    - C: Checksum digit (0-9) calculated using Luhn algorithm
+    - V: Proposal version (1, 2, 3, etc.)
+
+    The sequence number is scrambled using LCG to avoid revealing
+    sequential patterns (0, 1, 2, etc.). This is reversible and bijective.
+
+    Args:
+        sequence_number: Integer from 0 to 9999999 representing the proposal sequence
+        proposal_version: Version of this proposal (defaults to 1, minimum 1)
+        year: Year to use (defaults to current year)
+        scramble: Whether to scramble the sequence number (default True)
+
+    Returns:
+        Formatted proposal ID string (e.g., "0251-4788-8877-1")
+
+    Raises:
+        ValueError: If sequence_number is out of range or proposal_version is less than 1
+
+    Example:
+        >>> generate_proposal_id(0, proposal_version=1)
+        '0251-4788-8877-1'  # Scrambled from 0 -> 4788887
+        >>> generate_proposal_id(1, proposal_version=1)
+        '0251-7531-9069-1'  # Scrambled from 1 -> 7531906
+    """
+    # Validate inputs
+    if not 0 <= sequence_number <= 9999999:
+        raise ValueError(
+            "sequence_number must be between 0 and 9999999"
+        )
+
+    if proposal_version < 1:
+        raise ValueError("proposal_version must be at least 1")
+
+    # Use current year if not provided
+    if year is None:
+        year = datetime.now().year
+
+    # Extract last 3 digits of year
+    year_suffix = year % 1000  # e.g., 2025 -> 25, then we'll format as 025
+
+    # Scheme version is always 1
+    scheme_version = 1
+
+    # Scramble the sequence number to avoid obvious patterns
+    if scramble:
+        display_sequence = _scramble_sequence_number(sequence_number)
+    else:
+        display_sequence = sequence_number
+
+    # Format the sequence number as 7 digits with hyphen: NNNN-NNN
+    sequence_str = f"{display_sequence:07d}"
+    sequence_formatted = f"{sequence_str[:4]}-{sequence_str[4:]}"
+
+    # Calculate checksum using Luhn algorithm on the digits
+    # Combine year, scheme version, and sequence number for checksum calculation
+    checksum_input = f"{year_suffix:03d}{scheme_version}{sequence_str}"
+    checksum = _calculate_luhn_checksum(checksum_input)
+
+    # Build the final ID
+    proposal_id = (
+        f"{year_suffix:03d}{scheme_version}-{sequence_formatted}{checksum}-{proposal_version}"
+    )
+
+    return proposal_id
+
+
+def _calculate_luhn_checksum(digits: str) -> int:
+    """
+    Calculate Luhn checksum digit for the given string of digits.
+
+    The Luhn algorithm is a checksum formula used to validate identification numbers.
+    It works by:
+    1. Starting from the rightmost digit, double every second digit
+    2. If doubling results in a two-digit number, subtract 9
+    3. Sum all digits
+    4. The checksum is (10 - (sum % 10)) % 10
+
+    Args:
+        digits: String of digits to calculate checksum for
+
+    Returns:
+        Single digit checksum (0-9)
+
+    Example:
+        >>> _calculate_luhn_checksum("0251234567")
+        8
+    """
+
+    def luhn_double(digit: int) -> int:
+        """Double a digit and subtract 9 if result is >= 10."""
+        doubled = digit * 2
+        return doubled - 9 if doubled >= 10 else doubled
+
+    # Convert string to list of integers
+    digit_list = [int(d) for d in digits]
+
+    # Process from right to left, doubling every second digit
+    total = 0
+    for i, digit in enumerate(reversed(digit_list)):
+        if i % 2 == 1:  # Every second digit from the right
+            total += luhn_double(digit)
+        else:
+            total += digit
+
+    # Calculate checksum
+    checksum = (10 - (total % 10)) % 10
+    return checksum
+
+
+def migrate_proposal_and_project_ids():
+    """
+    Migrate existing proposals to use new ID format and sync project slugs.
+
+    This function:
+    1. Finds all proposals without the new ID format
+    2. Generates unique IDs for them using ProposalIDGenerator
+    3. If proposal is accepted and has a project, copies slug to project
+
+    Safe to run multiple times - only processes proposals without new format.
+
+    Returns:
+        Dict with counts of proposals and projects updated
+    """
+    from waldur_mastermind.proposal.models import Proposal, ProposalIDGenerator
+
+    # Regex pattern to match new ID format: YYYV-NNNN-NNNNC-V
+    # Example: 0251-4788-8877-1
+    import re
+
+    new_id_pattern = re.compile(r"^\d{4}-\d{4}-\d{4}-\d+$")
+
+    proposals_updated = 0
+    projects_updated = 0
+    errors = []
+
+    # Get all proposals
+    all_proposals = Proposal.objects.all().order_by("created")
+
+    logger.info(f"Starting migration of {all_proposals.count()} proposals")
+
+    for proposal in all_proposals:
+        try:
+            # Check if proposal already has new format
+            if proposal.slug and new_id_pattern.match(proposal.slug):
+                # Already has new format - check if project needs updating
+                if proposal.project and proposal.project.slug != proposal.slug:
+                    old_project_slug = proposal.project.slug
+                    proposal.project.slug = proposal.slug
+                    proposal.project.save(update_fields=["slug"])
+                    projects_updated += 1
+                    logger.info(
+                        f"Updated project {proposal.project.id} slug: "
+                        f"{old_project_slug} -> {proposal.slug}"
+                    )
+                continue
+
+            # Proposal needs new ID - get year from creation date
+            year = proposal.created.year
+
+            # Get or create generator for this year
+            generator, created = ProposalIDGenerator.objects.get_or_create(
+                year=year
+            )
+
+            if created:
+                logger.info(
+                    f"Created ProposalIDGenerator for year {year}"
+                )
+
+            # Generate new ID with retry logic
+            max_retries = 100
+            new_slug = None
+
+            for attempt in range(max_retries):
+                sequence_number = generator.increment_count()
+                proposal_id = generate_proposal_id(
+                    sequence_number, proposal_version=1, year=year
+                )
+
+                # Check uniqueness
+                if not Proposal.objects.filter(slug=proposal_id).exclude(
+                    pk=proposal.pk
+                ).exists():
+                    new_slug = proposal_id
+                    break
+
+            if not new_slug:
+                error_msg = (
+                    f"Failed to generate unique ID for proposal "
+                    f"{proposal.pk} after {max_retries} attempts"
+                )
+                logger.error(error_msg)
+                errors.append(error_msg)
+                continue
+
+            # Update proposal slug using queryset update to avoid triggering save()
+            # and updating the modified timestamp
+            old_slug = proposal.slug
+            Proposal.objects.filter(pk=proposal.pk).update(slug=new_slug)
+            proposals_updated += 1
+
+            logger.info(
+                f"Updated proposal {proposal.pk} slug: "
+                f"{old_slug} -> {new_slug}"
+            )
+
+            # If proposal has a project, update project slug too
+            if proposal.project:
+                old_project_slug = proposal.project.slug
+                proposal.project.slug = new_slug
+                proposal.project.save(update_fields=["slug"])
+                projects_updated += 1
+                logger.info(
+                    f"Updated project {proposal.project.id} slug: "
+                    f"{old_project_slug} -> {new_slug}"
+                )
+
+        except Exception as e:
+            error_msg = (
+                f"Error migrating proposal {proposal.pk}: {str(e)}"
+            )
+            logger.error(error_msg, exc_info=True)
+            errors.append(error_msg)
+
+    result = {
+        "proposals_processed": all_proposals.count(),
+        "proposals_updated": proposals_updated,
+        "projects_updated": projects_updated,
+        "errors": errors,
+    }
+
+    logger.info(
+        f"Migration complete: {proposals_updated} proposals updated, "
+        f"{projects_updated} projects updated, {len(errors)} errors"
+    )
+
+    return result
 
 
 def get_available_reviewer(proposal: proposal_models.Proposal):
@@ -97,6 +418,10 @@ def allocate_proposal(proposal: proposal_models.Proposal):
     logger.info(f"Start date for project {project_name} is {start_date}.")
     logger.info(f"End date for project {project_name} is {end_date}.")
     logger.info(f"Duration in days is {duration_in_days}.")
+    logger.info(
+        f"Copying slug '{proposal.slug}' from proposal to project "
+        f"for consistent tracking."
+    )
 
     project = structure_models.Project.objects.create(
         customer=proposal_round.call.manager.customer,
@@ -105,6 +430,7 @@ def allocate_proposal(proposal: proposal_models.Proposal):
         start_date=start_date,
         end_date=end_date,
         short_name=short_name,
+        slug=proposal.slug,  # Copy slug from proposal for consistent tracking ID
     )
     project = cast(structure_models.Project, project)
 

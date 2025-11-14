@@ -565,3 +565,135 @@ def invite_user_to_project(project, email, role, send_email: bool = True):
 
     if send_email:
         user_tasks.process_invitation.delay(invitation.uuid.hex, "OpenPortal")
+
+
+def sync_openportal_shortnames_to_slugs():
+    """
+    Synchronize shortnames from ProjectInfo and UserInfo to their respective
+    Project and User slug fields. This is used in "Project Management" mode
+    where these shortnames are used instead of proposal IDs.
+
+    This function:
+    1. Copies ProjectInfo.shortname to Project.slug where they differ
+    2. Copies UserInfo.shortname to User.slug where they differ
+
+    Only updates slugs where:
+    - The shortname exists (is not None/empty)
+    - The shortname differs from the current slug
+
+    Returns:
+        dict: Statistics about the sync operation with keys:
+            - projects_updated: Number of projects updated
+            - users_updated: Number of users updated
+            - projects_skipped: Number of projects skipped (no shortname or already matching)
+            - users_skipped: Number of users skipped (no shortname or already matching)
+            - errors: List of error messages encountered
+    """
+    projects_updated = 0
+    users_updated = 0
+    projects_skipped = 0
+    users_skipped = 0
+    errors = []
+
+    logger.info("Starting sync of OpenPortal shortnames to slugs...")
+
+    # Sync ProjectInfo shortnames to Project slugs
+    for project_info in models.ProjectInfo.objects.all().select_related("project"):
+        try:
+            # Skip if no shortname or project doesn't exist
+            if not project_info.shortname or not project_info.project:
+                projects_skipped += 1
+                logger.debug(
+                    f"Skipping ProjectInfo {project_info.id}: "
+                    f"shortname={project_info.shortname}, project exists={bool(project_info.project)}"
+                )
+                continue
+
+            project = project_info.project
+            shortname = project_info.shortname.strip()
+
+            # Skip if slug already matches
+            if project.slug == shortname:
+                projects_skipped += 1
+                logger.debug(
+                    f"Skipping project {project.name} ({project.uuid}): "
+                    f"slug already matches shortname '{shortname}'"
+                )
+                continue
+
+            # Update the slug
+            old_slug = project.slug
+            project.slug = shortname
+            project.save(update_fields=["slug"])
+            projects_updated += 1
+
+            logger.info(
+                f"Updated project {project.name} ({project.uuid}) slug: "
+                f"'{old_slug}' -> '{shortname}'"
+            )
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to sync ProjectInfo {project_info.id} "
+                f"(shortname='{project_info.shortname}'): {e}"
+            )
+            errors.append(error_msg)
+            logger.error(error_msg, exc_info=True)
+
+    # Sync UserInfo shortnames to User slugs
+    for user_info in models.UserInfo.objects.all().select_related("user"):
+        try:
+            # Skip if no shortname or user doesn't exist
+            if not user_info.shortname or not user_info.user:
+                users_skipped += 1
+                logger.debug(
+                    f"Skipping UserInfo {user_info.id}: "
+                    f"shortname={user_info.shortname}, user exists={bool(user_info.user)}"
+                )
+                continue
+
+            user = user_info.user
+            shortname = user_info.shortname.strip()
+
+            # Skip if slug already matches
+            if user.slug == shortname:
+                users_skipped += 1
+                logger.debug(
+                    f"Skipping user {user.username} ({user.uuid}): "
+                    f"slug already matches shortname '{shortname}'"
+                )
+                continue
+
+            # Update the slug
+            old_slug = user.slug
+            user.slug = shortname
+            user.save(update_fields=["slug"])
+            users_updated += 1
+
+            logger.info(
+                f"Updated user {user.username} ({user.uuid}) slug: "
+                f"'{old_slug}' -> '{shortname}'"
+            )
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to sync UserInfo {user_info.id} "
+                f"(shortname='{user_info.shortname}'): {e}"
+            )
+            errors.append(error_msg)
+            logger.error(error_msg, exc_info=True)
+
+    # Log summary
+    logger.info(
+        f"Sync complete. Projects: {projects_updated} updated, {projects_skipped} skipped. "
+        f"Users: {users_updated} updated, {users_skipped} skipped. "
+        f"Errors: {len(errors)}"
+    )
+
+    return {
+        "projects_updated": projects_updated,
+        "users_updated": users_updated,
+        "projects_skipped": projects_skipped,
+        "users_skipped": users_skipped,
+        "errors": errors,
+    }
