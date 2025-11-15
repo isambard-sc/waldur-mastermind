@@ -871,6 +871,7 @@ class CustomerUserSerializer(
             "full_name",
             "email",
             "slug",
+            "unix_username",
             "role_name",
             "projects",
             "expiration_time",
