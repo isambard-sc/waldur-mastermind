@@ -1156,10 +1156,10 @@ class ProjectInfo(models.Model):
                     self.project.save()
             else:
                 # no shortname set - need to get it from the slug
-                logger.warning(
-                    f"No shortname set for project {self.project} - using slug: {e}"
-                )
                 shortname = self.project.slug.strip()
+                logger.warning(
+                    f"No shortname set for project {self.project} - using slug: {shortname}"
+                )
 
                 if len(shortname) == 0:
                     raise ValueError(
