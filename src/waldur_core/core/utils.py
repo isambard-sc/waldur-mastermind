@@ -516,16 +516,20 @@ def get_system_robot():
     from waldur_core.core import models
 
     robot_user, created = models.User.objects.get_or_create(
-        username="system_robot", is_staff=True, is_active=True
+        username="system_robot",
+        defaults={
+            "is_staff": True,
+            "is_active": True,
+            "description": (
+                "Special user used for performing actions on behalf of a system."
+            ),
+            "first_name": "System",
+            "last_name": "Robot",
+        },
     )
     if created:
         robot_user.set_unusable_password()
-        robot_user.description = (
-            "Special user used for performing actions on behalf of a system."
-        )
-        robot_user.first_name = "System"
-        robot_user.last_name = "Robot"
-        robot_user.save()
+        robot_user.save(update_fields=["password"])
     return robot_user
 
 

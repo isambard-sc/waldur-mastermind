@@ -45,17 +45,21 @@ def get_openportal_robot():
     from waldur_core.core import models
 
     robot_user, created = models.User.objects.get_or_create(
-        username="openportal_robot", is_staff=True, is_active=True
+        username="openportal_robot",
+        defaults={
+            "is_staff": True,
+            "is_active": True,
+            "description": (
+                "Special user used for performing actions on behalf of OpenPortal."
+            ),
+            "first_name": "OpenPortal",
+            "last_name": "Robot",
+            "email": config.SITE_EMAIL,
+        },
     )
     if created:
         robot_user.set_unusable_password()
-        robot_user.description = (
-            "Special user used for performing actions on behalf of OpenPortal."
-        )
-        robot_user.first_name = "OpenPortal"
-        robot_user.last_name = "Robot"
-        robot_user.email = config.SITE_EMAIL
-        robot_user.save()
+        robot_user.save(update_fields=["password"])
     return robot_user
 
 
