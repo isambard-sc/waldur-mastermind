@@ -835,11 +835,11 @@ class ProposalViewSet(
         """
         Add a user to the proposal team.
 
-        For MANAGER role: Only one manager is allowed per proposal (the owner).
-        When adding a new manager, the system will:
-        1. Change the existing manager's role to MEMBER
-        2. Transfer ownership (created_by) to the new user
-        3. Add the new user as MANAGER
+        Handles:
+        - Adding new users with any role
+        - Ignoring duplicate additions (same user, same role)
+        - Changing user roles (except MANAGER cannot change their own role)
+        - For MANAGER role: Only one manager allowed, automatically transfers ownership
         """
         proposal = self.get_object()
         validate_scope_not_soft_deleted(proposal)
@@ -853,13 +853,91 @@ class ProposalViewSet(
         role = serializer.validated_data["role"]
         expiration_time = serializer.validated_data.get("expiration_time")
 
+        # Check if user already has ANY role on this proposal
+        existing_roles = permissions_models.UserRole.objects.filter(
+            user=target_user,
+            scope=proposal,
+            is_active=True,
+        )
+
+        # If user already has the exact same role, ignore (idempotent operation)
+        if existing_roles.filter(role=role).exists():
+            return response.Response(
+                status=status.HTTP_200_OK,
+                data={
+                    "detail": _("User already has this role."),
+                    "expiration_time": existing_roles.filter(role=role).first().expiration_time,
+                },
+            )
+
+        # If user has a different role, this is a role change
+        if existing_roles.exists():
+            current_role = existing_roles.first().role
+
+            # Prevent MANAGER from changing their own role
+            if current_role == ProposalRole.MANAGER and target_user == request.user:
+                raise exceptions.ValidationError(
+                    {"detail": _("You cannot change your own role as the proposal manager. "
+                                "To step down, transfer ownership by adding a new manager.")}
+                )
+
+            # Prevent changing someone's role TO manager (must use the transfer workflow)
+            if role == ProposalRole.MANAGER:
+                # This will be handled below in the MANAGER-specific logic
+                pass
+            else:
+                # For non-MANAGER role changes, revoke old role and add new one
+                logger.info(
+                    f"Changing role for {target_user.full_name} on proposal {proposal.uuid} "
+                    f"from {current_role.name} to {role.name}"
+                )
+
+                # Revoke all existing roles
+                for existing_role in existing_roles:
+                    existing_role.revoke(
+                        request.user,
+                        reason=f"Role changed from {existing_role.role.name} to {role.name}",
+                    )
+
+                # Add new role
+                perm = add_user_permission(
+                    proposal,
+                    target_user,
+                    role,
+                    created_by=request.user,
+                    expiration_time=expiration_time,
+                )
+
+                return response.Response(
+                    status=status.HTTP_200_OK,
+                    data={
+                        "detail": _("User role changed successfully."),
+                        "expiration_time": perm.expiration_time,
+                        "previous_role": current_role.name,
+                        "new_role": role.name,
+                    },
+                )
+
         # Special handling for MANAGER role - enforce single manager constraint
         if role == ProposalRole.MANAGER:
-            # Check if this user already has the MANAGER role
+            # Check if this user already has the MANAGER role (should be caught above, but double-check)
             if permissions_utils.has_user(proposal, target_user, ProposalRole.MANAGER):
                 raise exceptions.ValidationError(
                     {"detail": _("User already has the MANAGER role on this proposal.")}
                 )
+
+            # If the target user has an existing non-MANAGER role, revoke it first
+            # (they'll become MANAGER, so their old role is no longer relevant)
+            if existing_roles.exists():
+                logger.info(
+                    f"Promoting {target_user.full_name} to MANAGER on proposal {proposal.uuid}, "
+                    f"revoking existing role(s)"
+                )
+                for existing_role in existing_roles:
+                    existing_role.revoke(
+                        request.user,
+                        reason=f"Promoted to MANAGER from {existing_role.role.name}",
+                    )
 
             # Find the current manager (should be the created_by user)
             current_manager = proposal.created_by
