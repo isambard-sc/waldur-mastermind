@@ -98,6 +98,18 @@ class BaseInvitationSerializer(BaseInvitationDetailsSerializer):
             raise serializers.ValidationError(
                 "Role and scope should belong to the same content type."
             )
+
+        # Prevent invitations with PROPOSAL.MANAGER role
+        # Only one manager (the owner/creator) is allowed per proposal
+        if role.name == "PROPOSAL.MANAGER":
+            raise serializers.ValidationError(
+                {
+                    "role": "Cannot invite users with MANAGER role for proposals. "
+                    "Only the proposal owner can be the manager. "
+                    "To transfer ownership, use the add_user endpoint directly."
+                }
+            )
+
         return attrs
 
     def create(self, validated_data):

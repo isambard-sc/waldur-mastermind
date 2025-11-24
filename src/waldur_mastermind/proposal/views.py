@@ -30,8 +30,10 @@ from waldur_core.logging.enums import EventType
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
-from waldur_core.permissions.utils import has_permission, permission_factory
-from waldur_core.permissions.views import UserRoleMixin
+from waldur_core.permissions.utils import has_permission, permission_factory, add_user as add_user_permission
+from waldur_core.permissions.views import UserRoleMixin, validate_scope_not_soft_deleted
+from waldur_core.permissions import serializers as permissions_serializers
+from waldur_core.permissions import models as permissions_models
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import (
@@ -795,6 +797,175 @@ class ProposalViewSet(
             self.request.user,
             ProposalRole.MANAGER,
             created_by=self.request.user,
+        )
+
+    @extend_schema(
+        request=permissions_serializers.UserRoleCreateSerializer,
+        responses={
+            200: permissions_serializers.UserRoleExpirationTimeSerializer,
+            400: {
+                "type": "object",
+                "properties": {
+                    "detail": {"type": "string"},
+                    "requires_confirmation": {"type": "boolean"},
+                    "current_manager": {
+                        "type": "object",
+                        "properties": {
+                            "uuid": {"type": "string"},
+                            "full_name": {"type": "string"},
+                            "email": {"type": "string"},
+                        },
+                    },
+                    "new_manager": {
+                        "type": "object",
+                        "properties": {
+                            "uuid": {"type": "string"},
+                            "full_name": {"type": "string"},
+                            "email": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        },
+        description="Add a user to the proposal team. "
+        "If adding a MANAGER role, ownership will be transferred from the current manager.",
+    )
+    @decorators.action(detail=True, methods=["POST"])
+    def add_user(self, request, uuid=None):
+        """
+        Add a user to the proposal team.
+
+        For MANAGER role: Only one manager is allowed per proposal (the owner).
+        When adding a new manager, the system will:
+        1. Change the existing manager's role to MEMBER
+        2. Transfer ownership (created_by) to the new user
+        3. Add the new user as MANAGER
+        """
+        proposal = self.get_object()
+        validate_scope_not_soft_deleted(proposal)
+
+        serializer = permissions_serializers.UserRoleCreateSerializer(
+            data=request.data, context={"scope": proposal, "request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        target_user = serializer.validated_data["user"]
+        role = serializer.validated_data["role"]
+        expiration_time = serializer.validated_data.get("expiration_time")
+
+        # Special handling for MANAGER role - enforce single manager constraint
+        if role == ProposalRole.MANAGER:
+            # Check if this user already has the MANAGER role
+            if permissions_utils.has_user(proposal, target_user, ProposalRole.MANAGER):
+                raise exceptions.ValidationError(
+                    {"detail": _("User already has the MANAGER role on this proposal.")}
+                )
+
+            # Find the current manager (should be the created_by user)
+            current_manager = proposal.created_by
+
+            if not current_manager:
+                # Edge case: no created_by set, just add the manager
+                perm = add_user_permission(
+                    proposal,
+                    target_user,
+                    role,
+                    created_by=request.user,
+                    expiration_time=expiration_time,
+                )
+                proposal.created_by = target_user
+                proposal.save(update_fields=["created_by"])
+                return response.Response(
+                    status=status.HTTP_201_CREATED,
+                    data={"expiration_time": perm.expiration_time},
+                )
+
+            if current_manager == target_user:
+                raise exceptions.ValidationError(
+                    {"detail": _("User is already the manager of this proposal.")}
+                )
+
+            # Transfer ownership workflow:
+            # 1. Demote current manager to MEMBER
+            # 2. Update proposal.created_by to new manager
+            # 3. Add new user as MANAGER
+
+            # Step 1: Change current manager's role to MEMBER
+            try:
+                current_manager_perm = permissions_models.UserRole.objects.get(
+                    user=current_manager,
+                    role=ProposalRole.MANAGER,
+                    scope=proposal,
+                    is_active=True,
+                )
+                # Revoke the manager role
+                current_manager_perm.revoke(
+                    request.user,
+                    reason=f"Ownership transferred to {target_user.full_name}",
+                )
+
+                # Add as MEMBER
+                add_user_permission(
+                    proposal,
+                    current_manager,
+                    ProposalRole.MEMBER,
+                    created_by=request.user,
+                    expiration_time=None,
+                )
+
+                logger.info(
+                    f"Transferred proposal {proposal.uuid} ownership from "
+                    f"{current_manager.full_name} to {target_user.full_name}"
+                )
+            except permissions_models.UserRole.DoesNotExist:
+                # Current manager doesn't have an active role, just proceed
+                logger.warning(
+                    f"Current manager {current_manager.full_name} doesn't have "
+                    f"active MANAGER role on proposal {proposal.uuid}"
+                )
+
+            # Step 2: Update proposal owner
+            proposal.created_by = target_user
+            proposal.save(update_fields=["created_by"])
+
+            # Step 3: Add new manager
+            perm = add_user_permission(
+                proposal,
+                target_user,
+                role,
+                created_by=request.user,
+                expiration_time=expiration_time,
+            )
+
+            event_logger.emit(
+                f"Ownership of proposal {proposal.name} transferred from "
+                f"{current_manager.full_name} to {target_user.full_name}.",
+                event_type=EventType.ROLE_GRANTED,
+                event_context={"proposal": proposal, "user": target_user},
+                scopes=[_get_customer(proposal)],
+            )
+
+            return response.Response(
+                status=status.HTTP_201_CREATED,
+                data={
+                    "expiration_time": perm.expiration_time,
+                    "ownership_transferred": True,
+                    "previous_manager": current_manager.full_name,
+                    "new_manager": target_user.full_name,
+                },
+            )
+
+        # For non-MANAGER roles, use standard add_user logic
+        perm = add_user_permission(
+            proposal,
+            target_user,
+            role,
+            created_by=request.user,
+            expiration_time=expiration_time,
+        )
+        return response.Response(
+            status=status.HTTP_201_CREATED,
+            data={"expiration_time": perm.expiration_time},
         )
 
     @extend_schema(
