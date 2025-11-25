@@ -791,6 +791,10 @@ class ProposalViewSet(
 
     submit_permissions = [is_proposal_manager]
 
+    add_user_permissions = [is_proposal_manager]
+
+    delete_user_permissions = [is_proposal_manager]
+
     def perform_create(self, serializer):
         proposal: models.Proposal = serializer.save()
         proposal.add_user(
@@ -1045,6 +1049,64 @@ class ProposalViewSet(
             status=status.HTTP_201_CREATED,
             data={"expiration_time": perm.expiration_time},
         )
+
+    @extend_schema(
+        request=permissions_serializers.UserRoleDeleteSerializer,
+        responses={200: None},
+        description="Remove a user from the proposal team. "
+        "Proposal managers can remove any team member except themselves.",
+    )
+    @decorators.action(detail=True, methods=["POST"])
+    def delete_user(self, request, uuid=None):
+        """
+        Remove a user from the proposal team.
+
+        - Proposal managers can remove any team member
+        - Managers cannot remove themselves (must transfer ownership first)
+        - The proposal creator (owner) cannot be removed
+        """
+        proposal = self.get_object()
+        validate_scope_not_soft_deleted(proposal)
+
+        serializer = permissions_serializers.UserRoleDeleteSerializer(
+            data=request.data, context={"scope": proposal, "request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        target_user = serializer.validated_data["user"]
+        role = serializer.validated_data["role"]
+
+        # Prevent removing the proposal creator/owner
+        if proposal.created_by == target_user:
+            raise exceptions.ValidationError(
+                {"detail": _("Cannot remove the proposal owner. "
+                           "To change ownership, add a new manager.")}
+            )
+
+        # Prevent manager from removing themselves
+        if request.user == target_user and role == ProposalRole.MANAGER:
+            raise exceptions.ValidationError(
+                {"detail": _("You cannot remove yourself as manager. "
+                           "To step down, transfer ownership by adding a new manager.")}
+            )
+
+        # Perform the deletion
+        from waldur_core.permissions.utils import delete_user as delete_user_permission
+
+        success = delete_user_permission(
+            proposal,
+            target_user,
+            role,
+            request.user,
+            reason="Manual user removal via delete_user API endpoint",
+        )
+
+        if not success:
+            raise exceptions.ValidationError(
+                {"detail": _("User does not have this role on the proposal.")}
+            )
+
+        return response.Response(status=status.HTTP_200_OK)
 
     @extend_schema(
         methods=["get"],

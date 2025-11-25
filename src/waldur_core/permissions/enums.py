@@ -234,7 +234,7 @@ DELETE_PERMISSIONS = {
     "project": PermissionEnum.DELETE_PROJECT_PERMISSION,
     "offering": PermissionEnum.DELETE_OFFERING_PERMISSION,
     "call": PermissionEnum.DELETE_CALL_PERMISSION,
-    "proposal": PermissionEnum.DELETE_PROPOSAL_PERMISSION,
+    "proposal": PermissionEnum.MANAGE_PROPOSAL,  # Use MANAGE_PROPOSAL so managers can delete team members
     "call_organizer": PermissionEnum.DELETE_CALL_PERMISSION,
     "service_provider": PermissionEnum.DELETE_CUSTOMER_PERMISSION,
 }
