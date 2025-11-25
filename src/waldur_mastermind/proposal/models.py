@@ -464,6 +464,10 @@ class Round(
         blank=True,
         validators=[MinValueValidator(0)],
     )
+    minimum_required_uploads = models.PositiveIntegerField(
+        default=0,
+        help_text="Minimum number of documents required to submit a proposal. Set to 0 for no requirement.",
+    )
     allocation_date = models.DateTimeField(null=True, blank=True)
     start_time = models.DateTimeField()
     cutoff_time = models.DateTimeField()

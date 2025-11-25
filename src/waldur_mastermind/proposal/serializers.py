@@ -505,6 +505,7 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
             "minimal_average_scoring",
             "review_duration_in_days",
             "minimum_number_of_reviewers",
+            "minimum_required_uploads",
         ]
         extra_kwargs = {
             "slug": {"required": False},
