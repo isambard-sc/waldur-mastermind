@@ -930,20 +930,19 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
             if is_report_complete:
                 logger.debug(f"Skipping {month} as report is complete")
-                continue
+            else:
+                report = self.client.get_usage_report(project, month)
 
-            report = self.client.get_usage_report(project, month)
+                if report.total_usage.seconds > 0:
+                    self._update_usage_from_report(
+                        allocation, report, update_current=is_current_month
+                    )
 
-            if report.total_usage.seconds > 0:
-                self._update_usage_from_report(
-                    allocation, report, update_current=is_current_month
-                )
-
-            historical_report.node_usage = report.total_usage.hours
-            historical_report.is_complete = (
-                not is_current_month
-            ) and report.is_complete
-            historical_report.save()
+                historical_report.node_usage = report.total_usage.hours
+                historical_report.is_complete = (
+                    not is_current_month
+                ) and report.is_complete
+                historical_report.save()
 
             # Reconcile historical usage with billing for completed months
             try:
