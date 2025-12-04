@@ -1,5 +1,6 @@
 import logging
 import functools
+from decimal import Decimal
 
 from django.conf import settings
 from django.db import transaction
@@ -380,8 +381,6 @@ def _sync_project_credits_for_project(project, created=False):
 
     # Calculate total allocation from all active RemoteAllocations
     try:
-        from decimal import Decimal
-
         total_allocation = Decimal(0)
 
         remote_allocations = models.RemoteAllocation.objects.filter(

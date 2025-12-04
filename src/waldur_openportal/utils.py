@@ -308,9 +308,15 @@ def get_remote_association(user, allocation):
             )
 
 
-def get_project_spend_info(project) -> (decimal.Decimal, decimal.Decimal):
+def get_project_spend_info(
+    project, include_current_month: bool = True
+) -> tuple[decimal.Decimal, decimal.Decimal]:
     """
     Return a tuple of the total credits and total spend for the passed project
+
+    Args:
+        project: The project to get spend info for
+        include_current_month: If False, exclude current month's invoice items from spend calculation
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
@@ -328,7 +334,18 @@ def get_project_spend_info(project) -> (decimal.Decimal, decimal.Decimal):
     # Get all the spend for the project
     try:
         invoice_items = invoice_models.InvoiceItem.objects.filter(project=project)
-    except Exception:
+
+        # Exclude current month if requested
+        if not include_current_month:
+            now = timezone.now()
+            current_year = now.year
+            current_month = now.month
+
+            invoice_items = invoice_items.exclude(
+                invoice__year=current_year, invoice__month=current_month
+            )
+    except Exception as e:
+        logger.error(f"Failed to get invoice items for project {project}: {e}")
         invoice_items = []
 
     for invoice_item in invoice_items:
@@ -344,7 +361,8 @@ def get_project_spend_info(project) -> (decimal.Decimal, decimal.Decimal):
         # no need to do anything if usage == 0
 
     logger.info(
-        f"Project {project} has total credits: {total_credits}, total spend: {total_spend}"
+        f"Project {project} has total credits: {total_credits}, total spend: {total_spend} "
+        f"(include_current_month={include_current_month})"
     )
 
     return (total_credits, total_spend)
@@ -387,25 +405,30 @@ def set_project_credits(project, credits: decimal.Decimal | float):
     if credits < decimal.Decimal(0.0):
         credits = decimal.Decimal(0.0)
 
-    (total_credits, total_spend) = get_project_spend_info(project)
+    # Get spend info excluding current month (we want start-of-month balance)
+    (total_credits, total_spend) = get_project_spend_info(
+        project, include_current_month=False
+    )
 
-    if credits < total_credits:
-        # cannot reduce to less than the current total spend
-        if credits < total_spend:
-            logger.warning(
-                f"Cannot set project credits to {credits} as it is less than the total spend {total_spend} for project {project}"
-            )
-            logger.warning(
-                f"Instead, setting project credits to the total spend {total_spend} so that no more can be consumed"
-            )
-            credits = total_spend
+    # Calculate what the credit balance should be: allocation - historical_spend
+    # This gives us the start-of-month balance for the current month
+    desired_credit_balance = credits - total_spend
 
-    change_in_credits = credits - total_credits
+    if desired_credit_balance < decimal.Decimal(0):
+        logger.warning(
+            f"Desired credit balance ({desired_credit_balance}) is negative for project {project}. "
+            f"Allocation: {credits}, Spend: {total_spend}. "
+            f"Setting balance to 0."
+        )
+        desired_credit_balance = decimal.Decimal(0)
+
+    change_in_credits = desired_credit_balance - total_credits
 
     if abs(change_in_credits) < decimal.Decimal(0.01):
         # no change in credits, so nothing to do
         logger.info(
-            f"No change in credits for project {project}: {total_credits} -> {credits}"
+            f"No change in credits for project {project}: {total_credits} -> {desired_credit_balance} "
+            f"(allocation: {credits}, spend: {total_spend})"
         )
         return
 
@@ -449,7 +472,8 @@ def set_project_credits(project, credits: decimal.Decimal | float):
         project_credit.value = project_credit.value + change_in_credits
         project_credit.save(update_fields=["value"])
         logger.info(
-            f"Project credits for project {project} set to {project_credit.value} (was {total_credits})"
+            f"Project credits for project {project} set to {project_credit.value} (was {total_credits}, "
+            f"allocation: {credits}, spend: {total_spend}, change: {change_in_credits})"
         )
     except Exception as e:
         logger.error(
