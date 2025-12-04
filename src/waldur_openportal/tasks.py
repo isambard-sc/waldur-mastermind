@@ -30,6 +30,7 @@ def run_once_task(takeover_timeout, include_args=False):
         include_args: If True, include positional arguments in the lock ID to create
                      per-argument locks (e.g., per-customer locks)
     """
+
     def task_exc(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -339,7 +340,19 @@ def sync_remote_allocation_usage(serialized_allocation):
 
     backend = allocation.get_backend()
 
-    allocation = backend.check_added_allocation(allocation)
+    try:
+        allocation = backend.check_added_allocation(allocation)
+    except Exception as e:
+        if str(e).find("ManagedProjectPendingError") != -1:
+            logger.debug(
+                f"Allocation {allocation} is still pending in remote portal - skipping usage sync"
+            )
+        else:
+            logger.error(f"Failed to check allocation {allocation}: {e}")
+
+        # just return for now - we can't sync usage as the project is not connected
+        return
+
     backend.sync_usage(allocation)
 
 
@@ -435,7 +448,9 @@ def sync_customer_allocations(customer_id):
         logger.error(f"Customer with id {customer_id} does not exist")
         return
 
-    logger.info(f"OpenPortal task.sync_customer_allocations for customer {customer.name}")
+    logger.info(
+        f"OpenPortal task.sync_customer_allocations for customer {customer.name}"
+    )
 
     # Get all active allocations for this customer
     allocations = models.Allocation.objects.filter(
