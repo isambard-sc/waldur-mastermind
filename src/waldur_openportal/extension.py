@@ -63,11 +63,11 @@ class OpenPortalExtension(WaldurExtension):
             # This task synchronises all usage from remote OpenPortal resources
             # back to this remote portal. This is the "near-real time"
             # consumption data visible in the remote portal
-            "waldur-openportal-sync-remote-usage": {
-                "task": "waldur_openportal.sync_remote_usage",
-                "schedule": timedelta(minutes=9),
-                "args": (),
-            },
+            # "waldur-openportal-sync-remote-usage": {
+            #    "task": "waldur_openportal.sync_remote_usage",
+            #    "schedule": timedelta(minutes=9),
+            #    "args": (),
+            # },
             # This task synchronises all offering agents
             "waldur-openportal-sync-offering-agents": {
                 "task": "waldur_openportal.sync_offering_agents",
