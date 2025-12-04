@@ -469,7 +469,7 @@ def set_project_credits(project, credits: decimal.Decimal | float):
     )
 
     try:
-        project_credit.value = project_credit.value + change_in_credits
+        project_credit.value = desired_credit_balance
         project_credit.save(update_fields=["value"])
         logger.info(
             f"Project credits for project {project} set to {project_credit.value} (was {total_credits}, "
