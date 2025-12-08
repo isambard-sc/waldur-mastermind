@@ -899,6 +899,17 @@ class RequestedResourceSerializer(
 
     def create(self, validated_data):
         validated_data["created_by"] = self.context["request"].user
+
+        # If a call_resource_template is specified, check for and replace any existing resource with the same template
+        call_resource_template = validated_data.get("call_resource_template")
+        if call_resource_template:
+            proposal = validated_data["proposal"]
+            # Delete any existing resource with the same template for this proposal
+            models.RequestedResource.objects.filter(
+                proposal=proposal,
+                call_resource_template=call_resource_template,
+            ).delete()
+
         return super().create(validated_data)
 
 
