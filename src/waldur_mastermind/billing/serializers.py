@@ -149,15 +149,23 @@ def _optimize_customer_serializer_eager_load(sender):
     if hasattr(sender.eager_load, "_credit_optimized"):
         # Store the credit-optimized method
         credit_optimized_method = sender.eager_load
+        # Get the truly original method that was stored by the credit optimization
+        true_original = getattr(credit_optimized_method, "_original_eager_load", credit_optimized_method)
 
         @staticmethod
         def combined_eager_load(queryset, request=None):
-            # Call the credit-optimized method first
-            queryset = credit_optimized_method(queryset, request)
+            # Call the TRUE original method once
+            queryset = true_original(queryset, request)
 
-            # Add billing optimizations
+            # Add both optimizations
             if request:
                 fields = request.query_params.getlist("field")
+
+                # Credit optimization
+                if "customer_credit" in fields:
+                    queryset = queryset.select_related("customercredit")
+
+                # Billing optimization
                 if "billing_price_estimate" in fields:
                     queryset._billing_optimization_enabled = True
 
@@ -166,6 +174,7 @@ def _optimize_customer_serializer_eager_load(sender):
         # Mark as optimized for both
         combined_eager_load._billing_optimized = True
         combined_eager_load._credit_optimized = True
+        combined_eager_load._original_eager_load = true_original
 
         # Replace the eager_load method
         sender.eager_load = combined_eager_load
@@ -193,10 +202,8 @@ def _optimize_customer_serializer_eager_load(sender):
 
     # Mark as optimized to avoid double optimization
     optimized_eager_load._billing_optimized = True
-
-    # Preserve the credit optimization flag if it exists
-    if hasattr(original_eager_load, "_credit_optimized"):
-        optimized_eager_load._credit_optimized = True
+    # Store reference to the true original for later combining
+    optimized_eager_load._original_eager_load = original_eager_load
 
     # Replace the eager_load method
     sender.eager_load = optimized_eager_load
