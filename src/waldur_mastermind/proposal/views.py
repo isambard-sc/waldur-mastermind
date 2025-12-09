@@ -1582,6 +1582,30 @@ class ReviewViewSet(ActionsViewSet):
         review: models.Review = serializer.save()
         tasks.notify_reviewer_about_assignment.delay(review.uuid)
 
+    def perform_update(self, serializer):
+        """Auto-accept review when reviewer starts working on it."""
+        review = self.get_object()
+
+        # If review is in CREATED state and reviewer is updating it, auto-accept
+        if review.state == models.Review.States.CREATED:
+            logger.info(
+                f"Auto-accepting review {review.uuid} for proposal {review.proposal.name} "
+                f"as reviewer {review.reviewer.full_name} started working on it."
+            )
+            review.state = models.Review.States.IN_REVIEW
+            review.save(update_fields=["state"])
+
+            # Update proposal state to IN_REVIEW if not already
+            if review.proposal.state not in [ProposalStates.IN_REVIEW, ProposalStates.ACCEPTED, ProposalStates.REJECTED]:
+                proposal_old_state = review.proposal.state
+                review.proposal.state = ProposalStates.IN_REVIEW
+                review.proposal.save(update_fields=["state"])
+                tasks.notify_user_about_proposal_state_update.delay(
+                    review.proposal.uuid, proposal_old_state, review.proposal.state
+                )
+
+        super().perform_update(serializer)
+
     def check_create_permissions(request, view, obj=None):
         """Check permissions for creating reviews."""
         serializer = view.get_serializer(data=request.data)
@@ -1686,6 +1710,22 @@ class ReviewViewSet(ActionsViewSet):
     @decorators.action(detail=True, methods=["post"])
     def submit(self, request, uuid=None):
         review: models.Review = self.get_object()
+
+        # Auto-accept review if submitting from CREATED state
+        if review.state == models.Review.States.CREATED:
+            logger.info(
+                f"Auto-accepting review {review.uuid} for proposal {review.proposal.name} "
+                f"on submission by reviewer {review.reviewer.full_name}."
+            )
+            # Update proposal state to IN_REVIEW if not already
+            if review.proposal.state not in [ProposalStates.IN_REVIEW, ProposalStates.ACCEPTED, ProposalStates.REJECTED]:
+                proposal_old_state = review.proposal.state
+                review.proposal.state = ProposalStates.IN_REVIEW
+                review.proposal.save(update_fields=["state"])
+                tasks.notify_user_about_proposal_state_update.delay(
+                    review.proposal.uuid, proposal_old_state, review.proposal.state
+                )
+
         serializer = ReviewSubmitSerializer(
             instance=review, data=request.data, partial=True
         )
@@ -1699,7 +1739,7 @@ class ReviewViewSet(ActionsViewSet):
         )
 
     submit_validators = [
-        core_validators.StateValidator(models.Review.States.IN_REVIEW),
+        core_validators.StateValidator(models.Review.States.CREATED, models.Review.States.IN_REVIEW),
     ]
     accept_permissions = reject_permissions = submit_permissions = (
         update_permissions

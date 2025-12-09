@@ -542,7 +542,8 @@ def filter_proposals(user):
                 user
             )
         )
-        | Q(round__call__in=managers.get_connected_calls(user))
+        | Q(round__call__in=managers.get_connected_calls(user, role=RoleEnum.CALL_MANAGER))
+        | Q(review__reviewer=user)
     )
 
 
