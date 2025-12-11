@@ -55,6 +55,10 @@ class RemoteOpenPortalClient:
 
         details.project_template = self._project_template
 
+        # also add in the allowed email domains associated with this template
+        for domain in self._project_template.allowed_email_domains:
+            details.add_allowed_domain(domain)
+
         return details
 
     def _to_usage(self, usage) -> openportal.Usage:
