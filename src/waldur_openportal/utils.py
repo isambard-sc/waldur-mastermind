@@ -308,18 +308,6 @@ def get_remote_association(user, allocation):
             )
 
 
-def get_project_total_allocation(project) -> decimal.Decimal:
-    """
-    Return the total allocation for the passed project.
-    If the project has no allocations, return 0.0
-    """
-    (total_credits, total_spend) = get_project_spend_info(
-        project, include_current_month=False
-    )
-
-    return total_credits + total_spend
-
-
 def fix_total_allocation(project):
     """
     Run this function to fix the balance of managed projects so that
