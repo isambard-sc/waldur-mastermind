@@ -4,6 +4,8 @@ import os
 import json
 import decimal
 
+from django.utils import timezone
+
 from waldur_core.structure import models as structure_models
 from waldur_core.core.enums import ReviewStates
 from waldur_mastermind.invoices import models as invoice_models
@@ -780,15 +782,28 @@ class OpenPortalBoard:
             )
             self._create_local_project(managed_project)
 
-        if managed_project.project.is_expired or managed_project.project.is_removed:
-            # we can't make any changes to this project - return an error
+        # Always reject updates to removed projects
+        if managed_project.project.is_removed:
             managed_project.reject(
                 utils.get_openportal_robot(),
-                f"{identifier} is expired or removed, cannot update project.",
+                f"{identifier} is removed, cannot update project.",
             )
-            logger.warning(
-                f"{identifier} is expired or removed, cannot update project."
+            logger.warning(f"{identifier} is removed, cannot update project.")
+            raise openportal.ManagedProjectRejectedError()
+
+        # Check if trying to reactivate with a future end_date
+        is_reactivating = (
+            new_details.end_date is not None and
+            new_details.end_date >= timezone.now().date()
+        )
+
+        # Reject updates for expired projects unless reactivating
+        if managed_project.project.is_expired and not is_reactivating:
+            managed_project.reject(
+                utils.get_openportal_robot(),
+                f"{identifier} is expired, cannot update project.",
             )
+            logger.warning(f"{identifier} is expired, cannot update project.")
             raise openportal.ManagedProjectRejectedError()
 
         if managed_project.local_identifier is None:
