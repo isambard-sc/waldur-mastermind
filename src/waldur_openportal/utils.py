@@ -411,15 +411,17 @@ def get_project_spend_info(
 
 def get_project_credits(project) -> decimal.Decimal:
     """
-    Get the credits for the project.
+    Get the total lifetime credits awarded to the project.
     If the project has no credits, return 0.0
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
 
-    (total_credits, _) = get_project_spend_info(project)
+    (total_credits, total_spend) = get_project_spend_info(
+        project, include_current_month=False
+    )
 
-    return total_credits
+    return total_credits + total_spend
 
 
 def set_project_credits(project, credits: decimal.Decimal | float):
