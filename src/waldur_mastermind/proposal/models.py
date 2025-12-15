@@ -159,10 +159,19 @@ class CallManagingOrganisation(
 
 
 def filter_calls(user):
-    return Q(
-        manager__customer__callmanagingorganisation__in=managers.get_connected_call_organizers(
-            user
+    """
+    Filter calls visible to user.
+    - Call organizers and managers see all calls they manage
+    - Reviewers see only calls where they have been assigned to review proposals
+    """
+    return (
+        Q(
+            manager__customer__callmanagingorganisation__in=managers.get_connected_call_organizers(
+                user
+            )
         )
+        | Q(pk__in=managers.get_connected_calls(user, role=RoleEnum.CALL_MANAGER))
+        | Q(round__proposal__review__reviewer=user)
     )
 
 
@@ -393,10 +402,19 @@ class CallResourceTemplate(
 
 
 def filter_rounds(user):
-    return Q(
-        call__manager__customer__callmanagingorganisation__in=managers.get_connected_call_organizers(
-            user
+    """
+    Filter rounds visible to user.
+    - Call organizers and managers see all rounds in their calls
+    - Reviewers see only rounds where they have been assigned to review proposals
+    """
+    return (
+        Q(
+            call__manager__customer__callmanagingorganisation__in=managers.get_connected_call_organizers(
+                user
+            )
         )
+        | Q(call__in=managers.get_connected_calls(user, role=RoleEnum.CALL_MANAGER))
+        | Q(proposal__review__reviewer=user)
     )
 
 

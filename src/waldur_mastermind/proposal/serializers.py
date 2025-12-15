@@ -457,7 +457,8 @@ class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
     def get_reviews(self, obj) -> list:
         """
         Return serialized reviews based on user permissions and visibility settings.
-        - Staff, call managers, and reviewers see all reviews.
+        - Staff and call managers see all reviews.
+        - Reviewers see only their own reviews.
         - Submitters see submitted reviews if visibility is enabled.
         """
         request = self.context.get("request")
@@ -468,13 +469,17 @@ class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
 
         reviews_qs = obj.review_set.all()
 
-        if (
-            user.is_staff
-            or obj.round.call.manager.customer.has_user(user)
-            or reviews_qs.filter(reviewer=user).exists()
-        ):
+        # Staff and call managers see all reviews
+        if user.is_staff or obj.round.call.manager.customer.has_user(user):
             return ProposalReviewSerializer(
                 reviews_qs, many=True, context=self.context
+            ).data
+
+        # Reviewers see only their own reviews
+        if reviews_qs.filter(reviewer=user).exists():
+            reviewer_reviews = reviews_qs.filter(reviewer=user)
+            return ProposalReviewSerializer(
+                reviewer_reviews, many=True, context=self.context
             ).data
 
         # Submitter logic
@@ -1078,13 +1083,48 @@ class ProtectedRoundSerializer(
     core_serializers.AugmentedSerializerMixin, NestedRoundSerializer
 ):
     url = serializers.SerializerMethodField()
-    proposals = ProtectedProposalListSerializer(
-        many=True, read_only=True, source="proposal_set"
-    )
+    proposals = serializers.SerializerMethodField()
     review_duration_in_days = serializers.IntegerField(required=False)
 
     class Meta(NestedRoundSerializer.Meta):
         fields = NestedRoundSerializer.Meta.fields + ["url", "proposals"]
+
+    def get_proposals(self, obj) -> list:
+        """
+        Return proposals based on user permissions:
+        - Staff and call managers see all proposals
+        - Reviewers see only proposals they are assigned to review
+        - Submitters see their own proposals
+        """
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+
+        if not user or not request:
+            return []
+
+        proposals_qs = obj.proposal_set.all()
+
+        # Staff and call managers see all proposals
+        if user.is_staff or obj.call.manager.customer.has_user(user):
+            return ProtectedProposalListSerializer(
+                proposals_qs, many=True, context=self.context
+            ).data
+
+        # Reviewers see only proposals they're assigned to review
+        reviewer_proposals = proposals_qs.filter(review__reviewer=user)
+        if reviewer_proposals.exists():
+            return ProtectedProposalListSerializer(
+                reviewer_proposals, many=True, context=self.context
+            ).data
+
+        # Submitters see their own proposals
+        submitter_proposals = proposals_qs.filter(created_by=user)
+        if submitter_proposals.exists():
+            return ProtectedProposalListSerializer(
+                submitter_proposals, many=True, context=self.context
+            ).data
+
+        return []
 
     def get_fields(self):
         fields = super().get_fields()
