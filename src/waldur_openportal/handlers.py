@@ -64,16 +64,6 @@ def schedule_project_sync(project):
 
 
 @if_plugin_enabled
-def schedule_sync_on_quota_change(sender, instance, created=False, **kwargs):
-    if instance.name != utils.QUOTA_NAME:
-        return
-    if created and instance.value == -1:
-        return
-
-    transaction.on_commit(schedule_sync)
-
-
-@if_plugin_enabled
 def update_allocation_credits(sender, instance, force_update=False, **kwargs):
     """
     Update the allocation credits for the given resource. This is called
