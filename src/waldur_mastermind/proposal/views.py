@@ -1682,14 +1682,17 @@ class ReviewViewSet(ActionsViewSet):
 
     @extend_schema(
         description="Reject a review, changing its state to REJECTED.",
-        request=None,
+        request=serializers.ReviewRejectSerializer,
         responses={status.HTTP_200_OK: None},
     )
     @decorators.action(detail=True, methods=["post"])
     def reject(self, request, uuid=None):
         review: models.Review = self.get_object()
-        review.state = models.Review.States.REJECTED
-        review.save()
+        serializer = serializers.ReviewRejectSerializer(
+            instance=review, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save(state=models.Review.States.REJECTED)
         tasks.notify_call_managers_about_rejected_review.delay(review.uuid)
         return response.Response(
             "Review has been rejected.",
