@@ -1838,6 +1838,28 @@ class RoundViewSet(ReadOnlyActionsViewSet):
     def get_queryset(self):
         return filter_queryset_for_user(models.Round.objects.all(), self.request.user)
 
+    def check_reviewers_permission(request, view, obj=None):
+        """Only call managers and organizers can see the list of reviewers."""
+        if not obj:
+            return
+
+        user = request.user
+
+        # Staff and support can always see
+        if user.is_staff or user.is_support:
+            return
+
+        # Check if user is call manager or organizer
+        if (
+            obj.call.manager.customer.has_user(user)
+            or obj.call.has_user(user, CallRole.MANAGER)
+        ):
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers and organizers can view the list of reviewers."
+        )
+
     @extend_schema(
         description="Return list of reviewers for round.",
         request=None,
@@ -1883,6 +1905,8 @@ class RoundViewSet(ReadOnlyActionsViewSet):
             page, many=True, context={"round_obj": round_obj}
         )
         return self.get_paginated_response(serializer.data)
+
+    reviewers_permissions = [check_reviewers_permission]
 
 
 class ProposalProjectRoleMappingViewSet(ActionsViewSet):

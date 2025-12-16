@@ -522,6 +522,43 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
             "slug": {"required": False},
         }
 
+    def get_fields(self):
+        fields = super().get_fields()
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+
+        if not user:
+            return fields
+
+        # Check if user is staff, support, call manager, or call organizer
+        is_authorized = user.is_staff or user.is_support
+
+        # Check if user is call manager or organizer
+        if not is_authorized and hasattr(self, "instance") and self.instance:
+            round_obj = self.instance if isinstance(self.instance, models.Round) else None
+            if round_obj:
+                is_authorized = (
+                    round_obj.call.manager.customer.has_user(user)
+                    or round_obj.call.has_user(user, CallRole.MANAGER)
+                )
+
+        # Remove sensitive fields for reviewers and other non-authorized users
+        if not is_authorized:
+            sensitive_fields = [
+                "review_strategy",
+                "deciding_entity",
+                "allocation_time",
+                "allocation_date",
+                "minimal_average_scoring",
+                "review_duration_in_days",
+                "minimum_number_of_reviewers",
+                "minimum_required_uploads",
+            ]
+            for field_name in sensitive_fields:
+                fields.pop(field_name, None)
+
+        return fields
+
 
 class CallDocumentSerializer(serializers.ModelSerializer):
     file_name = serializers.CharField(source="file.name", read_only=True)
@@ -1051,6 +1088,43 @@ class ProtectedCallSerializer(PublicCallSerializer):
                     "Cannot change compliance checklist when proposals exist"
                 )
         return value
+
+    def get_fields(self):
+        fields = super().get_fields()
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+
+        if not user:
+            return fields
+
+        # Check if user is staff, support, call manager, or call organizer
+        is_authorized = user.is_staff or user.is_support
+
+        # Check if user is call manager or organizer
+        if not is_authorized and hasattr(self, "instance") and self.instance:
+            call = self.instance if isinstance(self.instance, models.Call) else None
+            if call:
+                is_authorized = (
+                    call.manager.customer.has_user(user)
+                    or call.has_user(user, CallRole.MANAGER)
+                )
+
+        # Remove sensitive administrative fields for reviewers and other non-authorized users
+        if not is_authorized:
+            sensitive_fields = [
+                "reviewer_identity_visible_to_submitters",
+                "reviews_visible_to_submitters",
+                "compliance_checklist",
+                "compliance_checklist_name",
+                "reference_code",
+                "manager",
+                "manager_uuid",
+                "created_by",
+            ]
+            for field_name in sensitive_fields:
+                fields.pop(field_name, None)
+
+        return fields
 
     def create(self, validated_data):
         request = self.context["request"]
