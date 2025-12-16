@@ -432,7 +432,7 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
         # now try to add in any members for this project
         # also keeping note of the allowed email domains
         # for this project
-        allowed_domains = set()
+        # allowed_domains = set()
 
         for user_id in get_project_users(project.id):
             try:
@@ -470,11 +470,11 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                     )
                     continue
 
-                if "@" in email:
-                    domain = email.split("@")[1].strip().lower()
-                    if domain:
-                        allowed_domains.add(domain)
-                        allowed_domains.add(f"*.{domain}")
+                # if "@" in email:
+                #    domain = email.split("@")[1].strip().lower()
+                #    if domain:
+                #        allowed_domains.add(domain)
+                #        allowed_domains.add(f"*.{domain}")
 
                 # get the role name of this user in the project
                 roles = UserRole.objects.filter(
@@ -531,12 +531,12 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
             except Exception as e:
                 logger.warning(f"Failed to add user {user} to project {project}: {e}")
 
-        try:
-            details.allowed_domains = list(allowed_domains)
-        except Exception as e:
-            logger.warning(
-                f"Failed to set allowed domains for project {project} to {allowed_domains}: {e}"
-            )
+        # try:
+        #    details.allowed_domains = list(allowed_domains)
+        # except Exception as e:
+        #    logger.warning(
+        #        f"Failed to set allowed domains for project {project} to {allowed_domains}: {e}"
+        #    )
 
         logger.info(f"Returning project details for project {project}: {details}")
 
