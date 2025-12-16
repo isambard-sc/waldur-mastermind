@@ -184,6 +184,29 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             super().get_queryset(), self.request.user
         ).order_by("created")
 
+    def check_call_modify_permission(request, view, obj=None):
+        """Only staff, support, call managers, and call organizers can modify calls."""
+        if not obj:
+            return
+
+        user = request.user
+
+        # Staff and support can always modify
+        if user.is_staff or user.is_support:
+            return
+
+        # Check if user is call manager or organizer
+        if obj.manager.customer.has_user(user) or obj.has_user(user, CallRole.MANAGER):
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers and organizers can modify calls."
+        )
+
+    update_permissions = partial_update_permissions = create_permissions = destroy_permissions = [
+        check_call_modify_permission
+    ]
+
     @extend_schema(
         methods=["get"],
         operation_id="proposal_protected_calls_offerings_list",
@@ -230,8 +253,21 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         return self.action_list_method("requestedoffering_set")(self, request, uuid)
 
     offerings_serializer_class = serializers.RequestedOfferingSerializer
+    offerings_permissions = [check_call_modify_permission]
 
     def offering_detail(self, request, uuid=None, obj_uuid=None):
+        """Handle nested offering detail operations with permission checks."""
+        # For non-GET requests, check modify permissions
+        if request.method != "GET":
+            call = self.get_object()
+            user = request.user
+            # Staff and support can always modify
+            if not (user.is_staff or user.is_support):
+                # Check if user is call manager or organizer
+                if not (call.manager.customer.has_user(user) or call.has_user(user, CallRole.MANAGER)):
+                    raise exceptions.PermissionDenied(
+                        "Only call managers and organizers can modify offerings."
+                    )
         return self.action_detail_method(
             "requestedoffering_set",
             delete_validators=[],
@@ -366,8 +402,24 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         )
 
     rounds_serializer_class = serializers.ProtectedRoundSerializer
+    rounds_permissions = [check_call_modify_permission]
 
     def round_detail(self, request, uuid=None, obj_uuid=None):
+        """Handle nested round detail operations with permission checks."""
+        # Check permissions first - get the round object
+        call = self.get_object()
+
+        # For non-GET requests, check modify permissions
+        if request.method != "GET":
+            user = request.user
+            # Staff and support can always modify
+            if not (user.is_staff or user.is_support):
+                # Check if user is call manager or organizer
+                if not (call.manager.customer.has_user(user) or call.has_user(user, CallRole.MANAGER)):
+                    raise exceptions.PermissionDenied(
+                        "Only call managers and organizers can modify rounds."
+                    )
+
         def validate_call_state(call_round):
             if call_round.call.state == CallStates.ARCHIVED:
                 raise IncorrectStateException()
@@ -514,8 +566,22 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         return self.action_list_method("resource_templates")(self, request, uuid)
 
     resource_templates_serializer_class = serializers.CallResourceTemplateSerializer
+    resource_templates_permissions = [check_call_modify_permission]
 
     def resource_template_detail(self, request, uuid=None, obj_uuid=None):
+        """Handle nested resource template detail operations with permission checks."""
+        # For non-GET requests, check modify permissions
+        if request.method != "GET":
+            call = self.get_object()
+            user = request.user
+            # Staff and support can always modify
+            if not (user.is_staff or user.is_support):
+                # Check if user is call manager or organizer
+                if not (call.manager.customer.has_user(user) or call.has_user(user, CallRole.MANAGER)):
+                    raise exceptions.PermissionDenied(
+                        "Only call managers and organizers can modify resource templates."
+                    )
+
         return self.action_detail_method(
             "resource_templates", delete_validators=[], update_validators=[]
         )(self, request, uuid, obj_uuid)
@@ -1446,12 +1512,33 @@ class ProposalViewSet(
             ProposalStates.IN_REVIEW,
         )
     ]
-    reject_permissions = approve_permissions = [
-        permission_factory(
-            PermissionEnum.APPROVE_AND_REJECT_PROPOSALS,
-            ["round.call", "round.call.manager"],
+    def check_proposal_management_permission(request, view, obj=None):
+        """Check if user can approve/reject proposals - explicit Call Manager check."""
+        if not obj:
+            return
+
+        user = request.user
+        call = obj.round.call
+
+        # Staff and support can always manage
+        if user.is_staff or user.is_support:
+            return
+
+        # Check if user is a Call Manager
+        if call.has_user(user, CallRole.MANAGER):
+            return
+
+        # Check permission-based access
+        if has_permission(user, PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, call) or has_permission(
+            user, PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, call.manager
+        ):
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers and authorized users can manage proposals."
         )
-    ]
+
+    reject_permissions = approve_permissions = [check_proposal_management_permission]
     reject_serializer_class = approve_serializer_class = (
         serializers.ProposalApproveSerializer
     )
@@ -1499,12 +1586,7 @@ class ProposalViewSet(
             ProposalStates.IN_REVIEW,
         )
     ]
-    return_to_applicant_permissions = [
-        permission_factory(
-            PermissionEnum.APPROVE_AND_REJECT_PROPOSALS,
-            ["round.call", "round.call.manager"],
-        )
-    ]
+    return_to_applicant_permissions = [check_proposal_management_permission]
     return_to_applicant_serializer_class = serializers.ProposalApproveSerializer
 
     # Checklist Integration Endpoints
@@ -1607,36 +1689,55 @@ class ReviewViewSet(ActionsViewSet):
         super().perform_update(serializer)
 
     def check_create_permissions(request, view, obj=None):
-        """Check permissions for creating reviews."""
+        """Check permissions for creating reviews - explicit Call Manager check."""
         serializer = view.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         proposal = serializer.validated_data["proposal"]
 
         user = request.user
-        permission = PermissionEnum.MANAGE_PROPOSAL_REVIEW
         call = proposal.round.call
 
-        if not (
-            has_permission(user, permission, call)
-            or has_permission(user, permission, call.manager)
-        ):
-            raise exceptions.PermissionDenied()
+        # Staff and support can always create reviews
+        if user.is_staff or user.is_support:
+            return
+
+        # Check if user is a Call Manager
+        if call.has_user(user, CallRole.MANAGER):
+            return
+
+        # Check permission-based access
+        permission = PermissionEnum.MANAGE_PROPOSAL_REVIEW
+        if has_permission(user, permission, call) or has_permission(user, permission, call.manager):
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers and authorized users can manage reviews."
+        )
 
     def check_destroy_permissions(request, view, obj=None):
-        """Check permissions for destroying reviews."""
-        if obj and not (
-            has_permission(
-                request.user,
-                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-                obj.proposal.round.call,
-            )
-            or has_permission(
-                request.user,
-                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-                obj.proposal.round.call.manager,
-            )
-        ):
-            raise exceptions.PermissionDenied()
+        """Check permissions for destroying reviews - explicit Call Manager check."""
+        if not obj:
+            return
+
+        user = request.user
+        call = obj.proposal.round.call
+
+        # Staff and support can always destroy reviews
+        if user.is_staff or user.is_support:
+            return
+
+        # Check if user is a Call Manager
+        if call.has_user(user, CallRole.MANAGER):
+            return
+
+        # Check permission-based access
+        permission = PermissionEnum.MANAGE_PROPOSAL_REVIEW
+        if has_permission(user, permission, call) or has_permission(user, permission, call.manager):
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers and authorized users can delete reviews."
+        )
 
     create_permissions = [check_create_permissions]
     destroy_permissions = [check_destroy_permissions]
