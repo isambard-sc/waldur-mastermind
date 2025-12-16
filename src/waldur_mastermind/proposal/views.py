@@ -207,6 +207,12 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         check_call_modify_permission
     ]
 
+    # Restrict list_users to only call managers and organizers (prevents reviewer identity leakage)
+    list_users_permissions = [check_call_modify_permission]
+    add_user_permissions = [check_call_modify_permission]
+    update_user_permissions = [check_call_modify_permission]
+    delete_user_permissions = [check_call_modify_permission]
+
     @extend_schema(
         methods=["get"],
         operation_id="proposal_protected_calls_offerings_list",
