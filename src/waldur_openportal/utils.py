@@ -308,6 +308,35 @@ def get_remote_association(user, allocation):
             )
 
 
+def fix_total_allocation(project):
+    """
+    Run this function to fix the balance of managed projects so that
+    their balance at the beginning of the month is correct. This fixes
+    any issues or discrepancies that may have arisen.
+    """
+    try:
+        managed_project = models.ManagedProject.objects.get(project=project)
+    except models.ManagedProject.DoesNotExist:
+        logger.error(f"Project {project} is not a managed project")
+        return
+
+    project_template = managed_project.get_project_template()
+
+    if project_template is None:
+        logger.error(f"Managed project {project} has no project template")
+        return
+
+    details = managed_project.get_details()
+
+    if details is None:
+        logger.error(f"Managed project {project} has no details")
+        return
+
+    allocation = project_template.convert_to_credits(details.allocation)
+
+    set_project_credits(project, allocation)
+
+
 def get_project_spend_info(
     project, include_current_month: bool = True
 ) -> tuple[decimal.Decimal, decimal.Decimal]:
@@ -370,15 +399,17 @@ def get_project_spend_info(
 
 def get_project_credits(project) -> decimal.Decimal:
     """
-    Get the credits for the project.
+    Get the total lifetime credits awarded to the project.
     If the project has no credits, return 0.0
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
 
-    (total_credits, _) = get_project_spend_info(project)
+    (total_credits, total_spend) = get_project_spend_info(
+        project, include_current_month=False
+    )
 
-    return total_credits
+    return total_credits + total_spend
 
 
 def set_project_credits(project, credits: decimal.Decimal | float):
