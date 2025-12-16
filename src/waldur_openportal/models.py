@@ -392,18 +392,18 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
         if project.end_date is not None:
             details.end_date = project.end_date
 
-        try:
-            # Set the award details - this is in a try block
-            # in case this feature is not supported by the current
-            # version of OpenPortal
-            award = openportal.AwardDetails()
-            award.award_id = str(project.slug)
-            award.link = core_utils.format_homeport_link(
-                "projects/{uuid}/", uuid=project.uuid.hex
-            )
-            details.award = award
-        except Exception as e:
-            logger.warning(f"Failed to set award details for project {project}: {e}")
+        # try:
+        # Set the award details - this is in a try block
+        # in case this feature is not supported by the current
+        # version of OpenPortal
+        #    award = openportal.AwardDetails()
+        #    award.award_id = str(project.slug)
+        #    award.link = core_utils.format_homeport_link(
+        #        "projects/{uuid}/", uuid=project.uuid.hex
+        #    )
+        #    details.award = award
+        # except Exception as e:
+        #    logger.warning(f"Failed to set award details for project {project}: {e}")
 
         # The project key is the UUID of the organisation that owns
         # the project. This way, only projects within the approved
