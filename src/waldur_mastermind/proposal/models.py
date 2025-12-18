@@ -620,6 +620,11 @@ class Proposal(
         blank=True,
         help_text="Timestamp when the stale proposal reminder email was sent",
     )
+    submitted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Timestamp when the proposal was submitted",
+    )
 
     # Note: checklist_completions relationship is automatically available via ChecklistCompletion.scope
 

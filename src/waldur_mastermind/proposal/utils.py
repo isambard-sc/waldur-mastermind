@@ -127,9 +127,7 @@ def generate_proposal_id(
     """
     # Validate inputs
     if not 0 <= sequence_number <= 9999999:
-        raise ValueError(
-            "sequence_number must be between 0 and 9999999"
-        )
+        raise ValueError("sequence_number must be between 0 and 9999999")
 
     if proposal_version < 1:
         raise ValueError("proposal_version must be at least 1")
@@ -160,9 +158,7 @@ def generate_proposal_id(
     checksum = _calculate_luhn_checksum(checksum_input)
 
     # Build the final ID
-    proposal_id = (
-        f"{year_suffix:03d}{scheme_version}-{sequence_formatted}{checksum}-{proposal_version}"
-    )
+    proposal_id = f"{year_suffix:03d}{scheme_version}-{sequence_formatted}{checksum}-{proposal_version}"
 
     return proposal_id
 
@@ -261,14 +257,10 @@ def migrate_proposal_and_project_ids():
             year = proposal.created.year
 
             # Get or create generator for this year
-            generator, created = ProposalIDGenerator.objects.get_or_create(
-                year=year
-            )
+            generator, created = ProposalIDGenerator.objects.get_or_create(year=year)
 
             if created:
-                logger.info(
-                    f"Created ProposalIDGenerator for year {year}"
-                )
+                logger.info(f"Created ProposalIDGenerator for year {year}")
 
             # Generate new ID with retry logic
             max_retries = 100
@@ -281,9 +273,11 @@ def migrate_proposal_and_project_ids():
                 )
 
                 # Check uniqueness
-                if not Proposal.objects.filter(slug=proposal_id).exclude(
-                    pk=proposal.pk
-                ).exists():
+                if (
+                    not Proposal.objects.filter(slug=proposal_id)
+                    .exclude(pk=proposal.pk)
+                    .exists()
+                ):
                     new_slug = proposal_id
                     break
 
@@ -303,8 +297,7 @@ def migrate_proposal_and_project_ids():
             proposals_updated += 1
 
             logger.info(
-                f"Updated proposal {proposal.pk} slug: "
-                f"{old_slug} -> {new_slug}"
+                f"Updated proposal {proposal.pk} slug: {old_slug} -> {new_slug}"
             )
 
             # If proposal has a project, update project slug too
@@ -319,9 +312,7 @@ def migrate_proposal_and_project_ids():
                 )
 
         except Exception as e:
-            error_msg = (
-                f"Error migrating proposal {proposal.pk}: {str(e)}"
-            )
+            error_msg = f"Error migrating proposal {proposal.pk}: {str(e)}"
             logger.error(error_msg, exc_info=True)
             errors.append(error_msg)
 
@@ -541,3 +532,29 @@ def get_proposal_review_counts(proposal: proposal_models.Proposal) -> dict:
         "rejected_reviews": rejected_reviews,
         "pending_reviews": pending_reviews,
     }
+
+
+def fix_submitted_at_field():
+    """Fix submitted_at field for proposals in submitted or later states."""
+    from waldur_mastermind.proposal.models import Proposal
+
+    proposals_to_fix = Proposal.objects.filter(
+        state__in=[
+            ProposalStates.SUBMITTED,
+            ProposalStates.IN_REVIEW,
+            ProposalStates.ACCEPTED,
+            ProposalStates.REJECTED,
+            ProposalStates.CANCELED,
+        ],
+        submitted_at__isnull=True,
+    )
+
+    for proposal in proposals_to_fix:
+        # Set submitted_at to last modified time if available, else to created time
+        proposal.submitted_at = proposal.modified or proposal.created
+        proposal.save(update_fields=["submitted_at"])
+        logger.info(
+            f"Set submitted_at for proposal {proposal} to {proposal.submitted_at}."
+        )
+
+    logger.info(f"Fixed submitted_at field for {proposals_to_fix.count()} proposal(s).")

@@ -849,6 +849,7 @@ class ProposalViewSet(
         proposal = self.get_object()
         previous_state = proposal.state
         proposal.state = ProposalStates.SUBMITTED
+        proposal.submitted_at = timezone.now()
         proposal.save()
         tasks.notify_user_about_proposal_state_update.delay(
             proposal.uuid, previous_state, proposal.state
@@ -1559,6 +1560,7 @@ class ProposalViewSet(
         proposal = self.get_object()
         previous_state = proposal.state
         proposal.state = ProposalStates.DRAFT
+        proposal.submitted_at = None
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         proposal.allocation_comment = serializer.validated_data.get(

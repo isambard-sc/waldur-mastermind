@@ -108,6 +108,7 @@ class ProposalFilter(django_filters.FilterSet):
             "state",
             "created",
             "slug",
+            "submitted_at",
         )
     )
 

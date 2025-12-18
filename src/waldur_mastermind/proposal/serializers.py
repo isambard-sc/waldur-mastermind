@@ -448,6 +448,7 @@ class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
             "approved_by_name",
             "created_by_name",
             "created",
+            "submitted_at",
         ]
         extra_kwargs = {
             "created_by": {"lookup_field": "uuid", "view_name": "user-detail"},
@@ -527,7 +528,7 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
 
-        if not user:
+        if not user or not user.is_authenticated:
             return fields
 
         # Check if user is staff, support, call manager, or call organizer
@@ -1094,7 +1095,7 @@ class ProtectedCallSerializer(PublicCallSerializer):
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
 
-        if not user:
+        if not user or not user.is_authenticated:
             return fields
 
         # Check if user is staff, support, call manager, or call organizer
@@ -1368,6 +1369,7 @@ class ProposalSerializer(
             "allocation_comment",
             "created",
             "modified",
+            "submitted_at",
             "compliance_status",
             "can_submit",
         ]
@@ -1376,6 +1378,7 @@ class ProposalSerializer(
             "approved_by",
             "project",
             "allocation_comment",
+            "submitted_at",
         )
         protected_fields = ("round_uuid",)
         extra_kwargs = {
