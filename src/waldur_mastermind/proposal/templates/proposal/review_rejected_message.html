@@ -9,6 +9,11 @@
     <p>A reviewer has rejected their assignment to review proposal "{{ proposal_name }}" in call "{{ call_name }}".</p>
 
     <p>
+        <strong>The reason given was:</strong><br>
+        {{ rejection_reason }}
+    </p>
+
+    <p>
         <strong>Assignment details:</strong><br>
         - Reviewer: {{ reviewer_name }}<br>
         - Assigned date: {{ assign_date }}<br>
