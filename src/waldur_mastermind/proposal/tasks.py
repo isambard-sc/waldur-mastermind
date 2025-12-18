@@ -61,16 +61,14 @@ def create_reviews_if_strategy_is_after_proposal():
     name="waldur_mastermind.proposal.proposals_for_ended_rounds_should_be_cancelled"
 )
 def proposals_for_ended_rounds_should_be_cancelled():
-    """Cancel proposals for rounds that have ended."""
+    """Cancel draft proposals for rounds that have ended."""
     date = timezone.now()
     cancellation_date = date.strftime("%Y-%m-%d %H:%M:%S")
-    for proposal in proposal_models.Proposal.objects.exclude(
-        state__in=(
-            ProposalStates.ACCEPTED,
-            ProposalStates.REJECTED,
-            ProposalStates.CANCELED,
-        )
-    ).filter(round__cutoff_time__lt=date):
+    # Only cancel DRAFT proposals - submitted/in-review proposals need time for review and decision
+    for proposal in proposal_models.Proposal.objects.filter(
+        state=ProposalStates.DRAFT,
+        round__cutoff_time__lt=date,
+    ):
         proposal.state = ProposalStates.CANCELED
         proposal.save(update_fields=["state"])
 
@@ -91,24 +89,30 @@ def proposals_for_ended_rounds_should_be_cancelled():
 
 @shared_task(name="waldur_mastermind.proposal.expired_reviews_should_be_cancelled")
 def expired_reviews_should_be_cancelled():
-    """Cancel reviews that have expired."""
+    """Cancel reviews when their proposal has been decided (accepted/rejected)."""
+    # Only expire reviews when a decision has been made on the proposal
+    # Reviews should remain open until the proposal is decided, regardless of deadline
     for review in proposal_models.Review.objects.filter(
         state__in=(
             proposal_models.Review.States.IN_REVIEW,
             proposal_models.Review.States.CREATED,
-        )
+        ),
+        proposal__state__in=(
+            ProposalStates.ACCEPTED,
+            ProposalStates.REJECTED,
+            ProposalStates.CANCELED,
+        ),
     ):
-        if review.review_end_date <= timezone.now():
-            review.state = proposal_models.Review.States.REJECTED
-            review.save(update_fields=["state"])
+        review.state = proposal_models.Review.States.REJECTED
+        review.save(update_fields=["state"])
 
-            event_logger.emit(
-                f"Review for {review.proposal.name} has been canceled.",
-                event_type=EventType.REVIEW_CANCELED,
-                event_context={"review": review},
-                scopes=[_get_customer(review)],
-            )
-            logger.info(f"Review {review.proposal.name} has been canceled.")
+        event_logger.emit(
+            f"Review for {review.proposal.name} has been canceled.",
+            event_type=EventType.REVIEW_CANCELED,
+            event_context={"review": review},
+            scopes=[_get_customer(review)],
+        )
+        logger.info(f"Review {review.proposal.name} has been canceled.")
 
 
 @shared_task(name="waldur_mastermind.proposal.notify_user_about_proposal_state_update")

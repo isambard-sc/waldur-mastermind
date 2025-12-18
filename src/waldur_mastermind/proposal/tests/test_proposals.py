@@ -638,15 +638,14 @@ class TaskTest(test.APITransactionTestCase):
         tasks.proposals_for_ended_rounds_should_be_cancelled()
         self.proposal.refresh_from_db()
 
-        # Verify that notification email has been sent to proposal creator
-        # in fixtures.py there are two proposals belong to this round; therefore, there are two emails in the mail outbox
-        self.assertEqual(len(mail.outbox), 2)
+        # Only DRAFT proposals should be cancelled after round ends
+        # SUBMITTED proposals (like proposal_submitted) should remain for review
+        self.assertEqual(len(mail.outbox), 1)
 
-        # Check that both expected email recipients are present (order doesn't matter)
+        # Only the DRAFT proposal creator should receive an email
         email_recipients = [mail.to for mail in mail.outbox]
         expected_recipients = [
             [self.proposal.created_by.email],
-            [self.fixture.proposal_submitted.created_by.email],
         ]
 
         self.assertEqual(sorted(email_recipients), sorted(expected_recipients))
@@ -665,3 +664,70 @@ class TaskTest(test.APITransactionTestCase):
             body,
         )
         self.assertIn("Cancellation details:", body)
+
+    def test_submitted_and_in_review_proposals_not_cancelled_after_round_ends(self):
+        """Verify that SUBMITTED and IN_REVIEW proposals are NOT cancelled when round ends."""
+        # Set round cutoff time to the past
+        self.round.cutoff_time = datetime.datetime.now() - datetime.timedelta(days=1)
+        self.round.save()
+
+        # Create proposals in different states
+        submitted_proposal = self.fixture.proposal_submitted
+        in_review_proposal = factories.ProposalFactory(
+            round=self.round,
+            state=ProposalStates.IN_REVIEW,
+        )
+
+        # Run the cancellation task
+        tasks.proposals_for_ended_rounds_should_be_cancelled()
+
+        # Verify SUBMITTED and IN_REVIEW proposals remain unchanged
+        submitted_proposal.refresh_from_db()
+        in_review_proposal.refresh_from_db()
+        self.assertEqual(submitted_proposal.state, ProposalStates.SUBMITTED)
+        self.assertEqual(in_review_proposal.state, ProposalStates.IN_REVIEW)
+
+    def test_reviews_cancelled_when_proposal_decided(self):
+        """Verify that reviews are only cancelled when proposal has been decided."""
+        from waldur_mastermind.proposal.models import Review
+
+        # Create a proposal in SUBMITTED state with reviews
+        proposal = self.fixture.proposal_submitted
+        review = factories.ReviewFactory(
+            proposal=proposal,
+            state=Review.States.IN_REVIEW,
+            review_end_date=datetime.datetime.now() - datetime.timedelta(days=1),
+        )
+
+        # Run the expiration task - review should NOT be cancelled yet
+        tasks.expired_reviews_should_be_cancelled()
+        review.refresh_from_db()
+        self.assertEqual(review.state, Review.States.IN_REVIEW)
+
+        # Now make a decision on the proposal
+        proposal.state = ProposalStates.ACCEPTED
+        proposal.save()
+
+        # Run the task again - now review should be cancelled
+        tasks.expired_reviews_should_be_cancelled()
+        review.refresh_from_db()
+        self.assertEqual(review.state, Review.States.REJECTED)
+
+    def test_reviews_remain_active_for_undecided_proposals(self):
+        """Verify that reviews remain active even past deadline if proposal not decided."""
+        from waldur_mastermind.proposal.models import Review
+
+        # Create proposal and review with expired deadline
+        proposal = self.fixture.proposal_submitted
+        review = factories.ReviewFactory(
+            proposal=proposal,
+            state=Review.States.CREATED,
+            review_end_date=datetime.datetime.now() - datetime.timedelta(days=30),
+        )
+
+        # Run expiration task
+        tasks.expired_reviews_should_be_cancelled()
+
+        # Review should still be active since proposal is not decided
+        review.refresh_from_db()
+        self.assertEqual(review.state, Review.States.CREATED)
