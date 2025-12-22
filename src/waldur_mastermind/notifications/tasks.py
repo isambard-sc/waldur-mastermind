@@ -1,3 +1,4 @@
+import logging
 from celery import shared_task
 from django.conf import settings
 from django.utils import timezone
@@ -6,11 +7,15 @@ from waldur_core.core.utils import send_mail
 
 from . import models
 
+logger = logging.getLogger(__name__)
+
 
 @shared_task(name="waldur_mastermind.notifications.send_broadcast_message_email")
 def send_broadcast_message_email(broadcast_message_uuid):
     broadcast_message = models.BroadcastMessage.objects.get(uuid=broadcast_message_uuid)
     emails = broadcast_message.emails
+
+    logger.info(f"Sending broadcast message '{broadcast_message.subject}' to {emails}")
 
     for part in [emails[i : i + 50] for i in range(0, len(emails), 50)]:
         send_mail(

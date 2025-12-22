@@ -128,15 +128,21 @@ class BroadcastMessageSerializer(
     def create(self, validated_data):
         current_user = self.context["request"].user
         validated_data["author"] = current_user
+        # Pass request object for send_to_me functionality
+        query_with_request = validated_data["query"].copy()
+        query_with_request["_request"] = self.context["request"]
         validated_data["emails"] = utils.get_user_emails_for_query(
-            validated_data["query"]
+            query_with_request
         )
         validated_data["query"] = serialize_query(validated_data["query"])
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
+        # Pass request object for send_to_me functionality
+        query_with_request = validated_data["query"].copy()
+        query_with_request["_request"] = self.context["request"]
         validated_data["emails"] = utils.get_user_emails_for_query(
-            validated_data["query"]
+            query_with_request
         )
         validated_data["query"] = serialize_query(validated_data["query"])
         return super().update(instance, validated_data)
