@@ -46,7 +46,10 @@ class BroadcastMessageViewSet(ActionsViewSet):
             context=self.get_serializer_context(), data=request.query_params
         )
         serializer.is_valid(raise_exception=True)
-        users = utils.get_recipients_for_query(serializer.validated_data)
+        # Pass request object for send_to_me functionality
+        query_data = serializer.validated_data.copy()
+        query_data["_request"] = request
+        users = utils.get_recipients_for_query(query_data)
         paginated_result = self.paginate_queryset(users)
         return self.get_paginated_response(paginated_result)
 

@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from waldur_core.core import serializers as core_serializers
+from waldur_core.core.models import User
 from waldur_core.core.serializers import (
     AugmentedSerializerMixin,
     RestrictedSerializerMixin,
@@ -25,10 +26,55 @@ class QuerySerializer(serializers.Serializer):
         required=False,
     )
     all_users = serializers.BooleanField(default=False)
+    proposal_states = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+    )
+    send_to_me = serializers.BooleanField(default=False)
+    additional_recipients = serializers.ListField(
+        child=serializers.EmailField(),
+        required=False,
+    )
+    excluded_recipients = serializers.ListField(
+        child=serializers.EmailField(),
+        required=False,
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Avoid circular import - set Round queryset dynamically
+        try:
+            from waldur_mastermind.proposal.models import Round
+
+            self.fields["round"] = serializers.SlugRelatedField(
+                slug_field="uuid",
+                queryset=Round.objects.all(),
+                required=False,
+            )
+        except ImportError:
+            # proposal app not installed - make it read-only
+            self.fields["round"] = serializers.SlugRelatedField(
+                slug_field="uuid",
+                read_only=True,
+                required=False,
+            )
 
 
 def format_options(options):
-    return [{"name": option.name, "uuid": option.uuid.hex} for option in options]
+    return [
+        {"name": option.name, "uuid": option.uuid.hex} for option in options
+    ]
+
+
+def format_users(users):
+    return [
+        {
+            "uuid": user.uuid.hex,
+            "email": user.email,
+            "full_name": user.full_name,
+        }
+        for user in users
+    ]
 
 
 def serialize_query(query):
@@ -38,6 +84,18 @@ def serialize_query(query):
     if "offerings" in query:
         serialized_query["offerings"] = format_options(query["offerings"])
     serialized_query["all_users"] = query.get("all_users", False)
+    if "round" in query and query["round"]:
+        serialized_query["round"] = {
+            "name": query["round"].name,
+            "uuid": query["round"].uuid.hex,
+        }
+    if "proposal_states" in query:
+        serialized_query["proposal_states"] = query["proposal_states"]
+    serialized_query["send_to_me"] = query.get("send_to_me", False)
+    if "additional_recipients" in query:
+        serialized_query["additional_recipients"] = query["additional_recipients"]
+    if "excluded_recipients" in query:
+        serialized_query["excluded_recipients"] = query["excluded_recipients"]
     return serialized_query
 
 
