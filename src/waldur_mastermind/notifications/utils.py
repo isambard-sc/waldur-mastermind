@@ -48,6 +48,42 @@ def get_proposal_team_members(round_obj, proposal_states=None):
     return users
 
 
+def get_proposal_reviewers(round_obj, proposal_states=None):
+    """
+    Get all unique reviewers assigned to proposals in a round.
+
+    Args:
+        round_obj: Round object to filter proposals by
+        proposal_states: Optional list of proposal states to filter by
+
+    Returns:
+        Set of User objects
+    """
+    try:
+        from waldur_mastermind.proposal.models import Proposal, Review
+    except ImportError:
+        logger.warning("Proposal app not installed, skipping proposal reviewers")
+        return set()
+
+    # Get proposals in the round
+    proposals = Proposal.objects.filter(round=round_obj)
+
+    # Filter by proposal states if provided
+    if proposal_states:
+        proposals = proposals.filter(state__in=proposal_states)
+
+    # Get all reviews for these proposals
+    reviews = Review.objects.filter(proposal__in=proposals)
+
+    # Collect all unique reviewers
+    reviewers = set()
+    for review in reviews:
+        if review.reviewer.is_active and review.reviewer.email:
+            reviewers.add(review.reviewer)
+
+    return reviewers
+
+
 def get_user_emails_for_query(query):
     """Get email addresses for users matching the query, including notification emails."""
     users, _, _, notification_emails = get_mapping(query)
@@ -87,12 +123,19 @@ def get_mapping(query):
         offerings = query.get("offerings", [])
         round_obj = query.get("round")
         proposal_states = query.get("proposal_states")
+        include_reviewers = query.get("include_reviewers", False)
 
         # Handle proposal round filtering
         if round_obj:
             proposal_users = get_proposal_team_members(round_obj, proposal_states)
             for user in proposal_users:
                 users[user.id] = user
+
+            # Include reviewers if requested
+            if include_reviewers:
+                reviewers = get_proposal_reviewers(round_obj, proposal_states)
+                for reviewer in reviewers:
+                    users[reviewer.id] = reviewer
 
         if offerings:
             resources = Resource.objects.filter(

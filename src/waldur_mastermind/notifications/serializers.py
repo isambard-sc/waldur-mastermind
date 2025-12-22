@@ -30,6 +30,7 @@ class QuerySerializer(serializers.Serializer):
         child=serializers.CharField(),
         required=False,
     )
+    include_reviewers = serializers.BooleanField(default=False)
     send_to_me = serializers.BooleanField(default=False)
     additional_recipients = serializers.ListField(
         child=serializers.EmailField(),
@@ -91,6 +92,7 @@ def serialize_query(query):
         }
     if "proposal_states" in query:
         serialized_query["proposal_states"] = query["proposal_states"]
+    serialized_query["include_reviewers"] = query.get("include_reviewers", False)
     serialized_query["send_to_me"] = query.get("send_to_me", False)
     if "additional_recipients" in query:
         serialized_query["additional_recipients"] = query["additional_recipients"]
