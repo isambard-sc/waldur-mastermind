@@ -40,6 +40,39 @@ class BroadcastMessage(UuidMixin):
         return f"{self.subject} / {self.author} / {self.created}"
 
 
+class BroadcastMessageAttachment(UuidMixin, TimeStampedModel):
+    """File attachments for broadcast messages with download links."""
+
+    broadcast_message = models.ForeignKey(
+        BroadcastMessage,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    file = models.FileField(
+        upload_to="broadcast_attachments",
+        help_text="Attachment file for broadcast message",
+    )
+    filename = models.CharField(
+        max_length=255,
+        help_text="Original filename of the attachment",
+    )
+    size = models.PositiveIntegerField(
+        help_text="File size in bytes",
+    )
+    uploaded_by = models.ForeignKey(
+        to=User,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="+",
+    )
+
+    class Meta:
+        ordering = ["created"]
+
+    def __str__(self):
+        return f"{self.filename} ({self.size} bytes)"
+
+
 class AdminAnnouncement(UuidMixin, DescribableMixin, TimeStampedModel):
     class Type:
         INFORMATION = "information"

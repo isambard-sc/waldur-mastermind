@@ -53,6 +53,80 @@ class BroadcastMessageViewSet(ActionsViewSet):
         paginated_result = self.paginate_queryset(users)
         return self.get_paginated_response(paginated_result)
 
+    @extend_schema(
+        request={"multipart/form-data": {"type": "object"}},
+        responses={status.HTTP_201_CREATED: serializers.BroadcastMessageAttachmentSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def attach_file(self, request, uuid=None):
+        """Attach a file to a broadcast message."""
+        broadcast_message = self.get_object()
+
+        if "file" not in request.FILES:
+            return Response(
+                {"detail": "No file provided"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        uploaded_file = request.FILES["file"]
+
+        attachment = models.BroadcastMessageAttachment.objects.create(
+            broadcast_message=broadcast_message,
+            file=uploaded_file,
+            filename=uploaded_file.name,
+            size=uploaded_file.size,
+            uploaded_by=request.user,
+        )
+
+        serializer = serializers.BroadcastMessageAttachmentSerializer(
+            attachment, context={"request": request}
+        )
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    attach_file_validators = [
+        core_validators.StateValidator(
+            models.BroadcastMessage.States.DRAFT,
+            models.BroadcastMessage.States.SCHEDULED,
+        )
+    ]
+
+    @extend_schema(
+        request={"application/json": {"type": "object", "properties": {"uuid": {"type": "string"}}}},
+        responses={status.HTTP_204_NO_CONTENT: None},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def detach_file(self, request, uuid=None):
+        """Detach a file from a broadcast message."""
+        broadcast_message = self.get_object()
+
+        attachment_uuid = request.data.get("uuid")
+        if not attachment_uuid:
+            return Response(
+                {"detail": "Attachment UUID is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            attachment = models.BroadcastMessageAttachment.objects.get(
+                uuid=attachment_uuid,
+                broadcast_message=broadcast_message,
+            )
+            attachment.file.delete(save=False)
+            attachment.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except models.BroadcastMessageAttachment.DoesNotExist:
+            return Response(
+                {"detail": "Attachment not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+    detach_file_validators = [
+        core_validators.StateValidator(
+            models.BroadcastMessage.States.DRAFT,
+            models.BroadcastMessage.States.SCHEDULED,
+        )
+    ]
+
 
 class MessageTemplateViewSet(ActionsViewSet):
     queryset = models.MessageTemplate.objects.all().order_by("name")

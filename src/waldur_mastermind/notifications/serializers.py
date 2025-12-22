@@ -101,12 +101,38 @@ def serialize_query(query):
     return serialized_query
 
 
+class BroadcastMessageAttachmentSerializer(serializers.ModelSerializer):
+    uploaded_by_full_name = serializers.ReadOnlyField(
+        source="uploaded_by.full_name"
+    )
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.BroadcastMessageAttachment
+        fields = (
+            "uuid",
+            "filename",
+            "size",
+            "created",
+            "uploaded_by_full_name",
+            "file_url",
+        )
+        read_only_fields = ("uuid", "created", "uploaded_by_full_name", "file_url")
+
+    def get_file_url(self, obj):
+        request = self.context.get("request")
+        if request and obj.file:
+            return request.build_absolute_uri(obj.file.url)
+        return None
+
+
 class BroadcastMessageSerializer(
     RestrictedSerializerMixin, serializers.ModelSerializer
 ):
     author_full_name = serializers.ReadOnlyField(source="author.full_name")
     state = serializers.ReadOnlyField()
     emails = serializers.ReadOnlyField()
+    attachments = BroadcastMessageAttachmentSerializer(many=True, read_only=True)
 
     class Meta:
         model = models.BroadcastMessage
@@ -120,6 +146,7 @@ class BroadcastMessageSerializer(
             "emails",
             "state",
             "send_at",
+            "attachments",
         )
 
     def validate_query(self, query):
