@@ -29,6 +29,10 @@ def get_proposal_team_members(round_obj, proposal_states=None):
         logger.warning("Proposal app not installed, skipping proposal team members")
         return set()
 
+    if proposal_states is None or len(proposal_states) == 0:
+        # don't match any proposals if no states are provided
+        return set()
+
     # Get proposals in the round
     proposals = Proposal.objects.filter(round=round_obj)
 
@@ -48,38 +52,25 @@ def get_proposal_team_members(round_obj, proposal_states=None):
     return users
 
 
-def get_proposal_reviewers(round_obj, proposal_states=None):
+def get_proposal_reviewers(round_obj):
     """
-    Get all unique reviewers assigned to proposals in a round.
+    Get all potential reviewers for a round.
+
+    This returns all users who have the Reviewer role on the call team,
+    not just those who have been assigned to review specific proposals.
 
     Args:
-        round_obj: Round object to filter proposals by
-        proposal_states: Optional list of proposal states to filter by
+        round_obj: Round object to get reviewers for
+        proposal_states: Not used (kept for backwards compatibility)
 
     Returns:
         Set of User objects
     """
-    try:
-        from waldur_mastermind.proposal.models import Proposal, Review
-    except ImportError:
-        logger.warning("Proposal app not installed, skipping proposal reviewers")
-        return set()
-
-    # Get proposals in the round
-    proposals = Proposal.objects.filter(round=round_obj)
-
-    # Filter by proposal states if provided
-    if proposal_states:
-        proposals = proposals.filter(state__in=proposal_states)
-
-    # Get all reviews for these proposals
-    reviews = Review.objects.filter(proposal__in=proposals)
-
-    # Collect all unique reviewers
+    # Get all reviewers from the call team
     reviewers = set()
-    for review in reviews:
-        if review.reviewer.is_active and review.reviewer.email:
-            reviewers.add(review.reviewer)
+    for reviewer in round_obj.call.reviewers:
+        if reviewer.is_active and reviewer.email:
+            reviewers.add(reviewer)
 
     return reviewers
 
@@ -122,7 +113,7 @@ def get_mapping(query):
         customers = query.get("customers", [])
         offerings = query.get("offerings", [])
         round_obj = query.get("round")
-        proposal_states = query.get("proposal_states")
+        proposal_states = query.get("proposal_states", [])
         include_reviewers = query.get("include_reviewers", False)
 
         # Handle proposal round filtering
@@ -133,7 +124,7 @@ def get_mapping(query):
 
             # Include reviewers if requested
             if include_reviewers:
-                reviewers = get_proposal_reviewers(round_obj, proposal_states)
+                reviewers = get_proposal_reviewers(round_obj)
                 for reviewer in reviewers:
                     users[reviewer.id] = reviewer
 
