@@ -119,7 +119,7 @@ class BroadcastMessageAttachmentSerializer(serializers.ModelSerializer):
         )
         read_only_fields = ("uuid", "created", "uploaded_by_full_name", "file_url")
 
-    def get_file_url(self, obj):
+    def get_file_url(self, obj) -> str | None:
         request = self.context.get("request")
         if request and obj.file:
             return request.build_absolute_uri(obj.file.url)
