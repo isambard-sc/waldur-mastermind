@@ -3,7 +3,7 @@ from celery import shared_task
 from django.conf import settings
 from django.utils import timezone
 
-from waldur_core.core.utils import send_mail
+from waldur_core.core.utils import send_mail, format_homeport_link
 
 from . import models
 
@@ -18,7 +18,7 @@ def format_attachment_links(attachments):
     lines = ["\n\n--- Attachments ---"]
     for attachment in attachments:
         # Build absolute URL for download
-        file_url = f"{settings.WALDUR_CORE['MASTERMIND_URL']}{attachment.file.url}"
+        file_url = format_homeport_link(attachment.file.url)
         size_mb = attachment.size / (1024 * 1024)
         if size_mb >= 1:
             size_str = f"{size_mb:.2f} MB"
@@ -47,6 +47,8 @@ def send_broadcast_message_email(broadcast_message_uuid):
     email_body = broadcast_message.body
     if attachment_links:
         email_body = f"{broadcast_message.body}{attachment_links}"
+
+    logger.info(f"Email body:\n{email_body}")
 
     for part in [emails[i : i + 50] for i in range(0, len(emails), 50)]:
         send_mail(
