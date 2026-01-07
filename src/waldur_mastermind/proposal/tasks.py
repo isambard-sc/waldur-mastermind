@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 )
 def create_reviews_if_strategy_is_after_round():
     """Create reviews for active rounds with 'after round' review strategy."""
+
+    logger.info("Skipping create_reviews_if_strategy_is_after_round task")
+    return
+
     rounds = proposal_models.Round.objects.filter(
         start_time__lte=timezone.now(),
         cutoff_time__lt=timezone.now(),
@@ -42,6 +46,9 @@ def create_reviews_if_strategy_is_after_round():
 )
 def create_reviews_if_strategy_is_after_proposal():
     """Create reviews for active rounds with 'after proposal' review strategy."""
+    logger.info("Skipping create_reviews_if_strategy_is_after_proposal task")
+    return
+
     rounds = proposal_models.Round.objects.filter(
         call__state=CallStates.ACTIVE,
         review_strategy=proposal_models.Round.ReviewStrategies.AFTER_PROPOSAL,
@@ -117,6 +124,10 @@ def expired_reviews_should_be_cancelled():
 
 @shared_task(name="waldur_mastermind.proposal.notify_user_about_proposal_state_update")
 def notify_user_about_proposal_state_update(proposal_uuid, previous_state, new_state):
+    # skip notification if state has not changed
+    if previous_state == new_state:
+        return
+
     proposal = proposal_models.Proposal.objects.get(uuid=proposal_uuid)
 
     if not proposal.created_by or not proposal.created_by.email:

@@ -353,6 +353,9 @@ def get_available_reviewer(proposal: proposal_models.Proposal):
 
 
 def process_proposals_pending_reviewers(proposal: proposal_models.Proposal):
+    logger.warning(f"Skipping processing proposal {proposal.uuid} for reviewers")
+    return proposal
+
     for reviewer in get_available_reviewer(proposal):
         proposal_models.Review.objects.create(reviewer=reviewer, proposal=proposal)
 
