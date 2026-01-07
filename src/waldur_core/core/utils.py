@@ -504,7 +504,34 @@ class QuietSession(requests.Session):
 
 
 def format_homeport_link(format_str="", **kwargs):
-    link = config.HOMEPORT_URL + format_str
+    homeport_url = config.HOMEPORT_URL
+
+    if len(format_str) > 0:
+        # make sure we don't have double slashes in the URL
+        if format_str.startswith("/") and homeport_url.endswith("/"):
+            format_str = format_str[1:]
+
+        # make sure we have at least one slash between HOMEPORT_URL and format_str
+        if not format_str.startswith("/") and not homeport_url.endswith("/"):
+            format_str = "/" + format_str
+
+    link = homeport_url + format_str
+    return link.format(**kwargs)
+
+
+def format_mastermind_link(format_str="", **kwargs):
+    mastermind_url = settings.WALDUR_CORE["MASTERMIND_URL"]  # type: ignore
+
+    if len(format_str) > 0:
+        # make sure we don't have double slashes in the URL
+        if format_str.startswith("/") and mastermind_url.endswith("/"):
+            format_str = format_str[1:]
+
+        # make sure we have at least one slash between MASTERMIND_URL and format_str
+        if not format_str.startswith("/") and not mastermind_url.endswith("/"):
+            format_str = "/" + format_str
+
+    link = mastermind_url + format_str
     return link.format(**kwargs)
 
 
