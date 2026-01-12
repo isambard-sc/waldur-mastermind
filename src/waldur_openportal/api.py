@@ -232,8 +232,13 @@ def project_spend_info(request):
 @permission_classes([IsAuthenticated])
 def access_for_email(request):
     """
-    Return the level of access available for the passed email address, short_name,
-    project_name, or project_id.
+    Return the level of access available based on an intelligent free text search query.
+    
+    This endpoint automatically detects the search type based on the query format:
+    - Email addresses (contains @)
+    - Short names (alphanumeric between 5 and 20 characters)
+    - Project IDs (alphanumeric, full project ID contains dot)
+    - Project names (any text)
     
     The aim of this API call is to allow, e.g. Keycloak, to determine whether
     an identity connected to the specified email address is authorised
@@ -243,11 +248,8 @@ def access_for_email(request):
     a user belongs to, which platform they can access, and what account
     should be used.
 
-    Query parameters (one required):
-    - email: Email address to search for
-    - short_name: Short name (username) to search for
-    - project_name: Project name to search for (returns all users in that project)
-    - project_id: Project ID to search for (returns all users in that project)
+    Query parameters:
+    - q: Free text search query (required) - can be email, short_name, project_name, or project_id
 
     Note that this is only available to authenticated users, and a user
     can only query for which they have access (i.e. a staff user can query 
@@ -256,6 +258,7 @@ def access_for_email(request):
 
     The returned JSON object is as follows:
 
+    Single user result:
     {
         "email": email_in_waldur,
         "status": status_in_waldur,
@@ -264,6 +267,19 @@ def access_for_email(request):
         "invited_by": email of the user who invited this person, if invited
         "reason": the reason for any rejection, if status is rejected
     }
+
+    Multiple user result (for project searches):
+    [
+        {
+            "email": email_in_waldur,
+            "status": status_in_waldur,
+            "short_name": shortname_in_waldur,
+            "projects": projects,
+            "invited_by": "",
+            "reason": ""
+        },
+        ...
+    ]
 
     Where "projects" is a dictionary as follows, with key/value pairs
     for each project the user with the email can access
@@ -301,100 +317,121 @@ def access_for_email(request):
         response.status_code = status.UNAUTHORIZED
         return response
 
-    # Get all possible search parameters
+    # Get the free text search query
+    query = request.query_params.get("q")
+    
+    # Also support legacy parameters for backwards compatibility
     email = request.query_params.get("email")
     short_name = request.query_params.get("short_name")
     project_name = request.query_params.get("project_name")
     project_id = request.query_params.get("project_id")
 
-    # Count how many parameters were provided
-    params_provided = sum([
-        email is not None,
-        short_name is not None,
-        project_name is not None,
-        project_id is not None
-    ])
+    # If no 'q' parameter, check for legacy parameters
+    if query is None:
+        if email:
+            query = email
+        elif short_name:
+            query = short_name
+        elif project_name:
+            query = project_name
+        elif project_id:
+            query = project_id
 
-    if params_provided == 0:
+    if query is None:
         response = JsonResponse({
-            "error": "One of email, short_name, project_name, or project_id must be provided."
+            "error": "Search query parameter 'q' is required. You can search by email, short_name, project_name, or project_id."
         })
         response.status_code = status.BAD_REQUEST
         return response
 
-    if params_provided > 1:
+    # Clean and normalize the query
+    query = str(query).strip()
+
+    if len(query) == 0:
         response = JsonResponse({
-            "error": "Only one search parameter (email, short_name, project_name, or project_id) can be provided at a time."
+            "error": "Search query cannot be empty."
         })
         response.status_code = status.BAD_REQUEST
         return response
 
     can_query_all = user.is_staff or user.is_support
 
-    # Handle email search (original logic)
-    if email:
-        email = str(email).lstrip().rstrip().lower()
+    logger.info(
+        f"api/openportal/access_for_email request for query='{query}' from {user} ({user.email})"
+    )
 
-        if "@" not in email:
-            response = JsonResponse({"error": "A valid email address must be provided."})
-            response.status_code = status.BAD_REQUEST
-            return response
+    # Intelligent search routing based on query format
+    return _intelligent_search(user, query, can_query_all)
 
-        if (not can_query_all) and user.email != email:
-            response = JsonResponse({"error": "You can only query your own email"})
-            response.status_code = status.FORBIDDEN
-            return response
 
-        logger.info(
-            f"api/openportal/access_for_email request for email={email} from {user} ({user.email})"
-        )
-
-        return _search_by_email(user, email, can_query_all)
-
-    # Handle short_name search
-    elif short_name:
-        short_name = str(short_name).lstrip().rstrip()
-
-        if len(short_name) == 0:
-            response = JsonResponse({"error": "A valid short_name must be provided."})
-            response.status_code = status.BAD_REQUEST
-            return response
-
-        logger.info(
-            f"api/openportal/access_for_email request for short_name={short_name} from {user} ({user.email})"
-        )
-
-        return _search_by_short_name(user, short_name, can_query_all)
-
-    # Handle project_name search
-    elif project_name:
-        project_name = str(project_name).lstrip().rstrip()
-
-        if len(project_name) == 0:
-            response = JsonResponse({"error": "A valid project_name must be provided."})
-            response.status_code = status.BAD_REQUEST
-            return response
-
-        logger.info(
-            f"api/openportal/access_for_email request for project_name={project_name} from {user} ({user.email})"
-        )
-
-        return _search_by_project_name(user, project_name, can_query_all)
-
-    # Handle project_id search
-    elif project_id:
-        project_id = str(project_id).lstrip().rstrip()
-
-        if len(project_id) == 0:
-            response = JsonResponse({"error": "A valid project_id must be provided."})
-            response.status_code = status.BAD_REQUEST
-            return response
-
-        logger.info(
-            f"api/openportal/access_for_email request for project_id={project_id} from {user} ({user.email})"
-        )
-
-        return _search_by_project_id(user, project_id, can_query_all)
+def _intelligent_search(requesting_user, query, can_query_all):
+    """
+    Intelligently route the search based on query format.
+    Tries multiple search strategies and returns the best match.
+    """
+    results = []
+    
+    # Strategy 1: Check if it's an email (contains @)
+    if "@" in query:
+        logger.info(f"Detected email format in query: '{query}'")
+        # Try email search
+        try:
+            result = _search_by_email(requesting_user, query.lower(), can_query_all)
+            # If we got a successful response, return it
+            if result.status_code == status.OK:
+                return result
+        except Exception as e:
+            logger.warning(f"Email search failed: {e}")
+    
+    # Strategy 2: Check if it looks like a project ID (project_shortname.portal format or just project_shortname)
+    if "." in query or (len(query) < 10 and not " " in query):
+        logger.info(f"Attempting project ID search for query: '{query}'")
+        try:
+            result = _search_by_project_id(requesting_user, query, can_query_all)
+            if result.status_code == status.OK:
+                # Check if we got actual results (not an error response)
+                import json
+                data = json.loads(result.content)
+                if isinstance(data, list) and len(data) > 0:
+                    return result
+                # If single object with projects
+                elif isinstance(data, dict) and data.get("projects"):
+                    return result
+        except Exception as e:
+            logger.info(f"Project ID search didn't match: {e}")
+    
+    # Strategy 3: Try shortname search
+    if not " " in query and 5 <= len(query) <= 20:  # Short names are between 5 and 20 characters
+        logger.info(f"Attempting short_name search for query: '{query}'")
+        try:
+            result = _search_by_short_name(requesting_user, query, can_query_all)
+            if result.status_code == status.OK:
+                import json
+                data = json.loads(result.content)
+                # Check if we got a real user (not "unknown" status)
+                if isinstance(data, dict) and data.get("status") != "unknown":
+                    return result
+        except Exception as e:
+            logger.info(f"Short name search didn't match: {e}")
+    
+    # Strategy 4: Try project name search (broader text search)
+    logger.info(f"Attempting project name search for query: '{query}'")
+    try:
+        result = _search_by_project_name(requesting_user, query, can_query_all)
+        if result.status_code == status.OK:
+            return result
+        # If not found, that's okay - we'll return a generic not found
+    except Exception as e:
+        logger.info(f"Project name search didn't match: {e}")
+    
+    # If nothing matched, return a helpful error message
+    response = JsonResponse({
+        "error": f"No results found for query: '{query}'. Tried searching by email, project ID, short name, and project name.",
+        "query": query,
+        "searched_types": ["email", "project_id", "short_name", "project_name"]
+    })
+    response.status_code = status.NOT_FOUND
+    return response
 
 
 def _search_by_email(requesting_user, email, can_query_all):
