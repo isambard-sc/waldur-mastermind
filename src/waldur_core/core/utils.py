@@ -25,7 +25,7 @@ from django.core.serializers.json import DjangoJSONEncoder
 from django.db.models import F, Subquery
 from django.db.models.fields import PositiveIntegerField
 from django.db.models.sql.query import get_order_dir
-from django.http import QueryDict
+from django.http import HttpRequest, QueryDict
 from django.template import Context
 from django.template.loader import get_template, render_to_string
 from django.urls import resolve
@@ -174,7 +174,25 @@ def camel_case_to_underscore(name):
 
 def format_text(template_name, context):
     template = get_template(template_name).template
-    return template.render(Context(context, autoescape=False)).strip()
+    text = template.render(Context(context, autoescape=False)).strip()
+
+    # go through the lines and make sure that blank lines are really blank,
+    # and that we don't have double-blank lines
+    lines = text.splitlines()
+
+    cleaned_lines = []
+    previous_line_blank = False
+    for line in lines:
+        stripped_line = line.strip()
+        if not stripped_line:
+            if not previous_line_blank:
+                cleaned_lines.append("")
+            previous_line_blank = True
+        else:
+            cleaned_lines.append(line.rstrip())
+            previous_line_blank = False
+
+    return "\n".join(cleaned_lines)
 
 
 def find_template_from_registry(app, event_type, template_suffix):
@@ -279,6 +297,9 @@ def broadcast_mail(
     try:
         notification = Notification.objects.get(key=notification_key)
     except Notification.DoesNotExist:
+        logger.warning(
+            f"Notification with key '{notification_key}' does not exist. Email will not be sent."
+        )
         return
 
     if notification.enabled:
@@ -306,6 +327,10 @@ def broadcast_mail(
                 content_type=content_type,
                 bcc=bcc,
             )
+    else:
+        logger.info(
+            f"Notification with key '{notification_key}' is disabled. Email will not be sent."
+        )
 
 
 def get_ordering(request):
@@ -479,7 +504,34 @@ class QuietSession(requests.Session):
 
 
 def format_homeport_link(format_str="", **kwargs):
-    link = config.HOMEPORT_URL + format_str
+    homeport_url = config.HOMEPORT_URL
+
+    if len(format_str) > 0:
+        # make sure we don't have double slashes in the URL
+        if format_str.startswith("/") and homeport_url.endswith("/"):
+            format_str = format_str[1:]
+
+        # make sure we have at least one slash between HOMEPORT_URL and format_str
+        if not format_str.startswith("/") and not homeport_url.endswith("/"):
+            format_str = "/" + format_str
+
+    link = homeport_url + format_str
+    return link.format(**kwargs)
+
+
+def format_mastermind_link(format_str="", **kwargs):
+    mastermind_url = settings.WALDUR_CORE["MASTERMIND_URL"]  # type: ignore
+
+    if len(format_str) > 0:
+        # make sure we don't have double slashes in the URL
+        if format_str.startswith("/") and mastermind_url.endswith("/"):
+            format_str = format_str[1:]
+
+        # make sure we have at least one slash between MASTERMIND_URL and format_str
+        if not format_str.startswith("/") and not mastermind_url.endswith("/"):
+            format_str = "/" + format_str
+
+    link = mastermind_url + format_str
     return link.format(**kwargs)
 
 
@@ -487,20 +539,24 @@ def get_system_robot():
     from waldur_core.core import models
 
     robot_user, created = models.User.objects.get_or_create(
-        username="system_robot", is_staff=True, is_active=True
+        username="system_robot",
+        defaults={
+            "is_staff": True,
+            "is_active": True,
+            "description": (
+                "Special user used for performing actions on behalf of a system."
+            ),
+            "first_name": "System",
+            "last_name": "Robot",
+        },
     )
     if created:
         robot_user.set_unusable_password()
-        robot_user.description = (
-            "Special user used for performing actions on behalf of a system."
-        )
-        robot_user.first_name = "System"
-        robot_user.last_name = "Robot"
-        robot_user.save()
+        robot_user.save(update_fields=["password"])
     return robot_user
 
 
-def get_ip_address(request):
+def get_ip_address(request: HttpRequest) -> str | None:
     """
     Correct IP address is expected as first element of HTTP_X_FORWARDED_FOR or REMOTE_ADDR
     """
@@ -508,6 +564,7 @@ def get_ip_address(request):
         return request.META["HTTP_X_FORWARDED_FOR"].split(",")[0].strip()
     elif "REMOTE_ADDR" in request.META:
         return request.META["REMOTE_ADDR"]
+    return None
 
 
 def get_user_agent(request):

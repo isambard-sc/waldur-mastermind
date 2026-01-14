@@ -17,11 +17,27 @@ class MarketplaceConfig(AppConfig):
         from waldur_core.structure import signals as structure_signals
         from waldur_core.structure.serializers import BaseResourceSerializer
         from waldur_freeipa import models as freeipa_models
+        from waldur_mastermind.marketplace.billing_usage import BillingUsageProcessor
+        from waldur_mastermind.marketplace.handlers import (
+            process_billing_on_resource_save,
+        )
 
         from . import handlers, models, processors, utils
-        from . import registrators as marketplace_registrators
         from . import signals as marketplace_signals
         from .plugins import manager
+
+        signals.post_save.connect(
+            process_billing_on_resource_save,
+            sender=models.Resource,
+            dispatch_uid="waldur_mastermind.marketplace.process_billing_on_resource_save",
+        )
+
+        signals.post_save.connect(
+            BillingUsageProcessor.update_invoice_when_usage_is_reported,
+            sender=models.ComponentUsage,
+            dispatch_uid="waldur_mastermind.marketplace."
+            "update_invoice_when_usage_is_reported",
+        )
 
         signals.post_save.connect(
             handlers.create_screenshot_thumbnail,
@@ -215,8 +231,6 @@ class MarketplaceConfig(AppConfig):
             can_terminate_order=True,
         )
 
-        marketplace_registrators.MarketplaceRegistrator.connect()
-
         structure_signals.project_moved.connect(
             handlers.update_customer_of_offering_if_project_has_been_moved,
             sender=structure_models.Project,
@@ -270,6 +284,24 @@ class MarketplaceConfig(AppConfig):
             handlers.delete_offering_user_checklist_completions,
             sender=models.OfferingUser,
             dispatch_uid="waldur_mastermind.marketplace.delete_offering_user_checklist_completions",
+        )
+
+        signals.post_save.connect(
+            handlers.send_offering_user_created_message,
+            sender=models.OfferingUser,
+            dispatch_uid="waldur_mastermind.marketplace.send_offering_user_created_message",
+        )
+
+        signals.post_save.connect(
+            handlers.send_offering_user_updated_message,
+            sender=models.OfferingUser,
+            dispatch_uid="waldur_mastermind.marketplace.send_offering_user_updated_message",
+        )
+
+        signals.post_delete.connect(
+            handlers.send_offering_user_deleted_message,
+            sender=models.OfferingUser,
+            dispatch_uid="waldur_mastermind.marketplace.send_offering_user_deleted_message",
         )
 
         signals.post_save.connect(
@@ -399,4 +431,15 @@ class MarketplaceConfig(AppConfig):
             handlers.log_terms_of_service_consent_revoked,
             sender=models.UserOfferingConsent,
             dispatch_uid="waldur_mastermind.marketplace.log_terms_of_service_consent_revoked",
+        )
+
+        signals.post_save.connect(
+            handlers.notify_users_about_tos_update_signal,
+            sender=models.OfferingTermsOfService,
+            dispatch_uid="waldur_mastermind.marketplace.notify_users_about_tos_update_signal",
+        )
+        signals.post_save.connect(
+            handlers.notify_offering_user_about_tos_requirement,
+            sender=models.OfferingUser,
+            dispatch_uid="waldur_mastermind.marketplace.notify_offering_user_about_tos_requirement",
         )

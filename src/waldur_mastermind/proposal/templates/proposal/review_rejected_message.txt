@@ -2,6 +2,10 @@ Dear call manager,
 
 A reviewer has rejected their assignment to review proposal "{{ proposal_name }}" in call "{{ call_name }}".
 
+The reason given was:
+
+{{ rejection_reason }}
+
 Assignment details:
 - Reviewer: {{ reviewer_name }}
 - Assigned date: {{ assign_date }}

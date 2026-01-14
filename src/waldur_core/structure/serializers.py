@@ -226,6 +226,8 @@ class ProjectSerializer(
     end_date_with_grace = serializers.SerializerMethodField()
     is_in_grace_period = serializers.SerializerMethodField()
     is_expired = serializers.SerializerMethodField()
+    termination_metadata = serializers.JSONField(read_only=True, allow_null=True)
+    staff_notes = core_serializers.HTMLCleanField(required=False, allow_blank=True)
 
     class Meta:
         model = models.Project
@@ -262,8 +264,15 @@ class ProjectSerializer(
             "resources_count",
             "max_service_accounts",
             "kind",
+            "is_removed",
+            "termination_metadata",
+            "staff_notes",
         )
-        read_only_fields = ("end_date_requested_by",)
+        read_only_fields = (
+            "end_date_requested_by",
+            "is_removed",
+            "termination_metadata",
+        )
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
             "customer": {"lookup_field": "uuid"},
@@ -302,6 +311,29 @@ class ProjectSerializer(
             and not self.context["request"].user.is_staff
         ):
             fields["max_service_accounts"].read_only = True
+
+        # Handle staff_notes field visibility and permissions
+        if "staff_notes" in fields:
+            user = self.context["request"].user
+            # Check if this is schema generation context (drf-spectacular)
+            # When generating schema, we want to include all fields
+            is_schema_generation = getattr(
+                self.context.get("view"), "swagger_fake_view", False
+            )
+
+            if not is_schema_generation:
+                if not (user.is_staff or user.is_support):
+                    # Remove field entirely for non-staff/non-support users
+                    del fields["staff_notes"]
+                elif not user.is_staff:
+                    # Support users can see but not edit
+                    fields["staff_notes"].read_only = True
+
+        # Make all fields read-only for terminated (soft-deleted) projects
+        if isinstance(self.instance, models.Project) and self.instance.is_removed:
+            for field_name, field in fields.items():
+                if field_name not in self.Meta.read_only_fields:
+                    field.read_only = True
 
         return fields
 
@@ -371,6 +403,16 @@ class ProjectSerializer(
             ):
                 raise serializers.ValidationError(
                     {"oecd_fos_2007_code": _("This field is required.")}
+                )
+
+        if config.PROJECT_END_DATE_MANDATORY:
+            if (not self.instance and not attrs.get("end_date")) or (
+                self.instance
+                and not self.instance.end_date
+                and not attrs.get("end_date")
+            ):
+                raise serializers.ValidationError(
+                    {"end_date": _("This field is required.")}
                 )
 
         if attrs.get("kind") == ProjectKind.COURSE.value:
@@ -828,6 +870,8 @@ class CustomerUserSerializer(
             "username",
             "full_name",
             "email",
+            "slug",
+            "unix_username",
             "role_name",
             "projects",
             "expiration_time",
@@ -1037,6 +1081,8 @@ class UserSerializer(
     identity_provider_management_url = serializers.SerializerMethodField()
     identity_provider_fields = serializers.SerializerMethodField()
     has_active_session = serializers.SerializerMethodField()
+    ip_address = serializers.CharField(read_only=True, required=False, allow_null=True)
+    birth_date = serializers.DateField(required=False, allow_null=True)
 
     @extend_schema_field(PermissionSerializer(many=True))
     def get_permissions(self, user: core_models.User):
@@ -1105,6 +1151,7 @@ class UserSerializer(
             "affiliations",
             "first_name",
             "last_name",
+            "birth_date",
             "identity_provider_name",
             "identity_provider_label",
             "identity_provider_management_url",
@@ -1113,6 +1160,7 @@ class UserSerializer(
             "unix_username",
             "identity_source",
             "has_active_session",
+            "ip_address",
         )
         read_only_fields = (
             "uuid",
@@ -1235,6 +1283,56 @@ class UserSerializer(
                 {"last_name": _("Cannot specify last name with full name")}
             )
 
+        # Validate token_lifetime restriction when credentials feature is enabled
+        if "token_lifetime" in attrs:
+            request = self.context.get("request")
+            user = request.user if request else None
+
+            # Check if credentials feature is enabled
+            from waldur_core.core.models import Feature
+
+            disable_long_tokens = Feature.objects.filter(
+                key="user.disable_long_tokens", value=True
+            ).exists()
+
+            if disable_long_tokens:
+                if user is None:
+                    raise serializers.ValidationError(
+                        {
+                            "token_lifetime": _(
+                                "Cannot set token lifetime: unable to determine user."
+                            )
+                        }
+                    )
+
+                if not (user.is_staff or user.is_support):
+                    # Non-staff and non-support users are limited to 1 hour (3600 seconds)
+                    if attrs["token_lifetime"] is None:
+                        logger.error(
+                            f"User {user} attempted to set unlimited token lifetime."
+                        )
+                        raise serializers.ValidationError(
+                            {
+                                "token_lifetime": _(
+                                    "Token lifetime cannot be unlimited for non-staff and non-support users."
+                                )
+                            }
+                        )
+
+                    max_lifetime = 3600  # 1 hour in seconds
+                    if attrs["token_lifetime"] > max_lifetime:
+                        logger.error(
+                            f"User {user} attempted to set token lifetime of {attrs['token_lifetime']} seconds."
+                        )
+                        raise serializers.ValidationError(
+                            {
+                                "token_lifetime": _(
+                                    "Token lifetime cannot exceed 1 hour (3600 seconds) "
+                                    "for non-staff and non-support users."
+                                )
+                            }
+                        )
+
         # Convert validation error from Django to DRF
         # https://github.com/tomchristie/django-rest-framework/issues/2145
         try:
@@ -1305,6 +1403,61 @@ class MoveProjectSerializer(serializers.Serializer):
         lookup_field="uuid",
     )
     preserve_permissions = serializers.BooleanField(required=True)
+
+
+class ProjectRecoverySerializer(serializers.Serializer):
+    restore_team_members = serializers.BooleanField(
+        default=False,
+        help_text=_(
+            "Whether to automatically restore team members who had access before project deletion (staff only)"
+        ),
+    )
+    send_invitations_to_previous_members = serializers.BooleanField(
+        default=False,
+        help_text=_(
+            "Whether to send invitations to users who had access before project deletion"
+        ),
+    )
+    end_date = serializers.DateField(
+        required=False,
+        allow_null=True,
+        help_text=_("End date for the recovered project"),
+    )
+
+    def validate_end_date(self, end_date):
+        # Allow None to clear the field
+        if end_date is None:
+            return end_date
+
+        # Only validate non-None values
+        if end_date < timezone.datetime.today().date():
+            raise serializers.ValidationError(
+                {"end_date": _("Cannot be earlier than the current date.")}
+            )
+        return end_date
+
+    def validate(self, data):
+        request = self.context.get("request")
+
+        # Check mutual exclusion
+        if data.get("restore_team_members") and data.get(
+            "send_invitations_to_previous_members"
+        ):
+            raise serializers.ValidationError(
+                _(
+                    "Cannot both restore team members and send invitations. Choose one approach."
+                )
+            )
+
+        # Check staff-only permission for automatic restoration
+        if data.get("restore_team_members") and request and not request.user.is_staff:
+            raise serializers.ValidationError(
+                _(
+                    "Only staff users can automatically restore team members. Use send_invitations_to_previous_members instead."
+                )
+            )
+
+        return data
 
 
 class ServiceOptionsSerializer(serializers.Serializer):
@@ -1452,6 +1605,9 @@ class BaseResourceSerializer(
         read_only=True,
         lookup_field="uuid",
     )
+    customer_uuid = serializers.UUIDField(
+        source="project.customer.uuid", read_only=True
+    )
 
     customer_name = serializers.CharField(
         read_only=True, source="project.customer.name"
@@ -1467,6 +1623,14 @@ class BaseResourceSerializer(
     resource_type = serializers.SerializerMethodField()
 
     access_url = serializers.SerializerMethodField()
+
+    def validate_project(self, project: models.Project) -> models.Project:
+        """Validate that the project is not soft-deleted."""
+        if project.is_removed:
+            raise serializers.ValidationError(
+                _("Cannot create resources for terminated projects.")
+            )
+        return project
 
     class Meta:
         model = NotImplemented
@@ -1484,6 +1648,7 @@ class BaseResourceSerializer(
             "project_name",
             "project_uuid",
             "customer",
+            "customer_uuid",
             "customer_name",
             "customer_native_name",
             "customer_abbreviation",

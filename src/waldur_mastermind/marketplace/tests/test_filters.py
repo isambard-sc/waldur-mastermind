@@ -3,8 +3,10 @@ import unittest
 from freezegun import freeze_time
 from rest_framework import status, test
 
+from waldur_core.core import utils as core_utils
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
+from waldur_mastermind.common.utils import parse_datetime
 from waldur_mastermind.marketplace import plugins
 from waldur_mastermind.marketplace.enums import OfferingStates, OrderTypes
 from waldur_mastermind.marketplace.tests import factories, fixtures
@@ -338,3 +340,574 @@ class AccessibleViaCallsFilterTest(test.APITransactionTestCase):
         self.client.force_authenticate(self.fixture.staff)
         response = self.client.get(self.url, {"accessible_via_calls": "false"})
         self.assertEqual(len(response.json()), 0)
+
+
+class ResourceBillingTypeFilterTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.url = factories.ResourceFactory.get_list_url()
+
+        # Create offering with usage-based components
+        self.usage_offering = factories.OfferingFactory()
+        factories.OfferingComponentFactory(
+            offering=self.usage_offering, billing_type="usage"
+        )
+        self.usage_resource = factories.ResourceFactory(
+            offering=self.usage_offering, project=self.fixture.project
+        )
+
+        # Create offering with limit-based components
+        self.limit_offering = factories.OfferingFactory()
+        factories.OfferingComponentFactory(
+            offering=self.limit_offering, billing_type="limit"
+        )
+        self.limit_resource = factories.ResourceFactory(
+            offering=self.limit_offering, project=self.fixture.project
+        )
+
+        # Create offering with fixed components
+        self.fixed_offering = factories.OfferingFactory()
+        factories.OfferingComponentFactory(
+            offering=self.fixed_offering, billing_type="fixed"
+        )
+        self.fixed_resource = factories.ResourceFactory(
+            offering=self.fixed_offering, project=self.fixture.project
+        )
+
+    def test_usage_based_filter_true(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"usage_based": "true"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertIn(self.usage_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.limit_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.fixed_resource.uuid.hex, resource_uuids)
+
+    def test_usage_based_filter_false(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"usage_based": "false"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertNotIn(self.usage_resource.uuid.hex, resource_uuids)
+
+    def test_limit_based_filter_true(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"limit_based": "true"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertIn(self.limit_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.usage_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.fixed_resource.uuid.hex, resource_uuids)
+
+    def test_limit_based_filter_false(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"limit_based": "false"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertNotIn(self.limit_resource.uuid.hex, resource_uuids)
+
+    def test_combined_filters(self):
+        # Test that we can combine both filters
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            self.url, {"usage_based": "true", "limit_based": "true"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Should return empty result since no resource can be both usage-based and limit-based
+        self.assertEqual(len(response.data), 0)
+
+    def test_no_filter_returns_all(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Should return all resources including the fixture resource
+        self.assertGreaterEqual(len(response.data), 4)
+
+    def test_only_limit_based_filter_true(self):
+        # Test filter that includes only resources with only limit-based components
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"only_limit_based": "true"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        # Should include only limit-only resources
+        self.assertIn(self.limit_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.usage_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.fixed_resource.uuid.hex, resource_uuids)
+
+    def test_only_limit_based_filter_false(self):
+        # Test filter that excludes resources with only limit-based components
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"only_limit_based": "false"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        # Should exclude limit-only resources but include mixed and non-limit resources
+        self.assertNotIn(self.limit_resource.uuid.hex, resource_uuids)
+        self.assertIn(self.usage_resource.uuid.hex, resource_uuids)
+        self.assertIn(self.fixed_resource.uuid.hex, resource_uuids)
+
+    def test_only_usage_based_filter_true(self):
+        # Test filter that includes only resources with only usage-based components
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"only_usage_based": "true"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        # Should include only usage-only resources
+        self.assertIn(self.usage_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.limit_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.fixed_resource.uuid.hex, resource_uuids)
+
+    def test_only_usage_based_filter_false(self):
+        # Test filter that excludes resources with only usage-based components
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"only_usage_based": "false"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        # Should exclude usage-only resources but include mixed and non-usage resources
+        self.assertNotIn(self.usage_resource.uuid.hex, resource_uuids)
+        self.assertIn(self.limit_resource.uuid.hex, resource_uuids)
+        self.assertIn(self.fixed_resource.uuid.hex, resource_uuids)
+
+
+class ComponentCountFilterTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.url = factories.ResourceFactory.get_list_url()
+
+        # Create offering with 1 component (limit-based)
+        self.single_component_offering = factories.OfferingFactory()
+        factories.OfferingComponentFactory(
+            offering=self.single_component_offering, billing_type="limit", type="cpu"
+        )
+        self.single_component_resource = factories.ResourceFactory(
+            offering=self.single_component_offering, project=self.fixture.project
+        )
+
+        # Create offering with 2 components (1 limit, 1 usage)
+        self.two_component_offering = factories.OfferingFactory()
+        factories.OfferingComponentFactory(
+            offering=self.two_component_offering, billing_type="limit", type="cpu"
+        )
+        factories.OfferingComponentFactory(
+            offering=self.two_component_offering, billing_type="usage", type="ram"
+        )
+        self.two_component_resource = factories.ResourceFactory(
+            offering=self.two_component_offering, project=self.fixture.project
+        )
+
+        # Create offering with 3 components (2 limit, 1 fixed)
+        self.three_component_offering = factories.OfferingFactory()
+        factories.OfferingComponentFactory(
+            offering=self.three_component_offering, billing_type="limit", type="cpu"
+        )
+        factories.OfferingComponentFactory(
+            offering=self.three_component_offering, billing_type="limit", type="ram"
+        )
+        factories.OfferingComponentFactory(
+            offering=self.three_component_offering, billing_type="fixed", type="storage"
+        )
+        self.three_component_resource = factories.ResourceFactory(
+            offering=self.three_component_offering, project=self.fixture.project
+        )
+
+        # Create offering with no components
+        self.no_component_offering = factories.OfferingFactory()
+        self.no_component_resource = factories.ResourceFactory(
+            offering=self.no_component_offering, project=self.fixture.project
+        )
+
+    def test_component_count_filter_one(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"component_count": "1"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertIn(self.single_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.two_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.three_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.no_component_resource.uuid.hex, resource_uuids)
+
+    def test_component_count_filter_two(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"component_count": "2"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertNotIn(self.single_component_resource.uuid.hex, resource_uuids)
+        self.assertIn(self.two_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.three_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.no_component_resource.uuid.hex, resource_uuids)
+
+    def test_component_count_filter_three(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"component_count": "3"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertNotIn(self.single_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.two_component_resource.uuid.hex, resource_uuids)
+        self.assertIn(self.three_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.no_component_resource.uuid.hex, resource_uuids)
+
+    def test_component_count_filter_zero(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"component_count": "0"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertNotIn(self.single_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.two_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.three_component_resource.uuid.hex, resource_uuids)
+        self.assertIn(self.no_component_resource.uuid.hex, resource_uuids)
+
+    def test_limit_component_count_filter_one(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"limit_component_count": "1"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertIn(self.single_component_resource.uuid.hex, resource_uuids)
+        self.assertIn(self.two_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.three_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.no_component_resource.uuid.hex, resource_uuids)
+
+    def test_limit_component_count_filter_two(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"limit_component_count": "2"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertNotIn(self.single_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.two_component_resource.uuid.hex, resource_uuids)
+        self.assertIn(self.three_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.no_component_resource.uuid.hex, resource_uuids)
+
+    def test_limit_component_count_filter_zero(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"limit_component_count": "0"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertNotIn(self.single_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.two_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.three_component_resource.uuid.hex, resource_uuids)
+        self.assertIn(self.no_component_resource.uuid.hex, resource_uuids)
+
+    def test_combined_component_filters(self):
+        # Test filtering for resources with exactly 2 total components and 1 limit component
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            self.url, {"component_count": "2", "limit_component_count": "1"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertNotIn(self.single_component_resource.uuid.hex, resource_uuids)
+        self.assertIn(self.two_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.three_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.no_component_resource.uuid.hex, resource_uuids)
+
+    def test_combined_with_existing_filters(self):
+        # Test combining new filters with existing limit_based filter
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            self.url, {"component_count": "1", "limit_based": "true"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        self.assertIn(self.single_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.two_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.three_component_resource.uuid.hex, resource_uuids)
+        self.assertNotIn(self.no_component_resource.uuid.hex, resource_uuids)
+
+    def test_invalid_component_count_returns_empty(self):
+        # Test with non-existent component count
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"component_count": "999"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 0)
+
+    def test_no_filter_returns_all(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Should return all resources including the fixture resource
+        self.assertGreaterEqual(len(response.data), 5)
+
+
+class OnlyUsageBasedFilterRealWorldTest(test.APITransactionTestCase):
+    """Test the only_usage_based filter with real-world scenario to ensure the fix works"""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.url = factories.ResourceFactory.get_list_url()
+
+        # Create offering with ONLY limit-based components (like the user reported)
+        self.limit_only_offering = factories.OfferingFactory()
+        factories.OfferingComponentFactory(
+            offering=self.limit_only_offering, billing_type="limit", type="cpu"
+        )
+        self.limit_only_resource = factories.ResourceFactory(
+            offering=self.limit_only_offering, project=self.fixture.project
+        )
+
+        # Create offering with ONLY usage-based components
+        self.usage_only_offering = factories.OfferingFactory()
+        factories.OfferingComponentFactory(
+            offering=self.usage_only_offering, billing_type="usage", type="ram"
+        )
+        self.usage_only_resource = factories.ResourceFactory(
+            offering=self.usage_only_offering, project=self.fixture.project
+        )
+
+    def test_only_usage_based_true_includes_usage_only_resources(self):
+        """Test that only_usage_based=true includes only resources with only usage-based components"""
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"only_usage_based": "true"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        # Should include only usage-only resources
+        self.assertIn(self.usage_only_resource.uuid.hex, resource_uuids)
+        # Should exclude limit-only resources (they are not usage-only)
+        self.assertNotIn(self.limit_only_resource.uuid.hex, resource_uuids)
+
+    def test_only_usage_based_false_excludes_usage_only_resources(self):
+        """Test that only_usage_based=false excludes resources with only usage-based components"""
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"only_usage_based": "false"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        resource_uuids = [r["uuid"] for r in response.data]
+        # Should exclude usage-only resources
+        self.assertNotIn(self.usage_only_resource.uuid.hex, resource_uuids)
+        # Should include limit-only resources
+        self.assertIn(self.limit_only_resource.uuid.hex, resource_uuids)
+
+
+class ComponentUsageFilterTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.url = factories.ComponentUsageFactory.get_list_url()
+
+        # Create component usage for 2019-06
+        self.usage_2019_06 = factories.ComponentUsageFactory(
+            billing_period=core_utils.month_start(parse_datetime("2019-06-15")),
+            date=parse_datetime("2019-06-15"),
+        )
+
+        # Create component usage for 2019-12
+        self.usage_2019_12 = factories.ComponentUsageFactory(
+            billing_period=core_utils.month_start(parse_datetime("2019-12-15")),
+            date=parse_datetime("2019-12-15"),
+        )
+
+        # Create component usage for 2020-06
+        self.usage_2020_06 = factories.ComponentUsageFactory(
+            billing_period=core_utils.month_start(parse_datetime("2020-06-15")),
+            date=parse_datetime("2020-06-15"),
+        )
+
+    def test_billing_period_year_filter(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"billing_period_year": "2019"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        usage_uuids = [u["uuid"] for u in response.data]
+        self.assertIn(self.usage_2019_06.uuid.hex, usage_uuids)
+        self.assertIn(self.usage_2019_12.uuid.hex, usage_uuids)
+        self.assertNotIn(self.usage_2020_06.uuid.hex, usage_uuids)
+
+    def test_billing_period_month_filter(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"billing_period_month": "6"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        usage_uuids = [u["uuid"] for u in response.data]
+        self.assertIn(self.usage_2019_06.uuid.hex, usage_uuids)
+        self.assertNotIn(self.usage_2019_12.uuid.hex, usage_uuids)
+        self.assertIn(self.usage_2020_06.uuid.hex, usage_uuids)
+
+    def test_combined_billing_period_filters(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            self.url, {"billing_period_year": "2019", "billing_period_month": "6"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        usage_uuids = [u["uuid"] for u in response.data]
+        self.assertIn(self.usage_2019_06.uuid.hex, usage_uuids)
+        self.assertNotIn(self.usage_2019_12.uuid.hex, usage_uuids)
+        self.assertNotIn(self.usage_2020_06.uuid.hex, usage_uuids)
+
+    def test_no_billing_period_filter_returns_all(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Should return all component usages
+        self.assertGreaterEqual(len(response.data), 3)
+
+
+class OfferingQueryFilterTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.offering1 = factories.OfferingFactory(
+            name="Alpha Cloud Service", description="Premium cloud hosting"
+        )
+        self.offering2 = factories.OfferingFactory(
+            name="Beta Analytics", description="Data processing service"
+        )
+        self.offering3 = factories.OfferingFactory(
+            name="Gamma Storage", description="Reliable data storage"
+        )
+        # Manually set specific slugs for predictable testing
+        self.offering1.slug = "alpha-cloud-service"
+        self.offering1.save()
+        self.offering2.slug = "beta-analytics"
+        self.offering2.save()
+        self.offering3.slug = "gamma-storage"
+        self.offering3.save()
+
+        self.url = factories.OfferingFactory.get_list_url()
+
+    def test_query_filter_by_name(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": "Alpha"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.offering1.uuid.hex)
+
+    def test_query_filter_by_slug(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Test exact slug match
+        response = self.client.get(self.url, {"query": "beta-analytics"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.offering2.uuid.hex)
+
+        # Test partial slug match
+        response = self.client.get(self.url, {"query": "gamma"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.offering3.uuid.hex)
+
+    def test_query_filter_by_description(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": "Premium"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.offering1.uuid.hex)
+
+    def test_query_filter_by_uuid(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": self.offering1.uuid.hex})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.offering1.uuid.hex)
+
+
+class OrderQueryFilterTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.order1 = factories.OrderFactory(project=self.fixture.project)
+        self.order2 = factories.OrderFactory(project=self.fixture.project)
+        # Manually set specific slugs for predictable testing
+        self.order1.slug = "order-alpha-123"
+        self.order1.save()
+        self.order2.slug = "order-beta-456"
+        self.order2.save()
+        # Also create a resource with a specific name
+        self.order1.attributes = {"name": "Test Resource Alpha"}
+        self.order1.save()
+
+        self.url = factories.OrderFactory.get_list_url()
+
+    def test_query_filter_by_slug(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Test exact slug match
+        response = self.client.get(self.url, {"query": "order-alpha-123"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.order1.uuid.hex)
+
+        # Test partial slug match
+        response = self.client.get(self.url, {"query": "beta"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.order2.uuid.hex)
+
+    def test_query_filter_by_project_name(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": self.fixture.project.name})
+        # Should return all orders from this project
+        self.assertGreaterEqual(len(response.data), 2)
+
+    def test_query_filter_by_resource_name(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": "Test Resource Alpha"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.order1.uuid.hex)
+
+    def test_query_filter_by_uuid(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": self.order1.uuid.hex})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.order1.uuid.hex)
+
+
+class ResourceQueryFilterSlugTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.resource1 = factories.ResourceFactory(
+            name="Alpha Database",
+            backend_id="alpha-db-001",
+            project=self.fixture.project,
+        )
+        self.resource2 = factories.ResourceFactory(
+            name="Beta Cache", backend_id="beta-cache-002", project=self.fixture.project
+        )
+        # Manually set specific slugs for predictable testing
+        self.resource1.slug = "alpha-database"
+        self.resource1.save()
+        self.resource2.slug = "beta-cache"
+        self.resource2.save()
+
+        self.url = factories.ResourceFactory.get_list_url()
+
+    def test_query_filter_by_slug(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Test exact slug match
+        response = self.client.get(self.url, {"query": "alpha-database"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.resource1.uuid.hex)
+
+        # Test partial slug match
+        response = self.client.get(self.url, {"query": "beta"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.resource2.uuid.hex)
+
+    def test_query_filter_by_name(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": "Alpha Database"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.resource1.uuid.hex)
+
+    def test_query_filter_by_backend_id(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": "alpha-db-001"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.resource1.uuid.hex)
+
+    def test_query_filter_by_uuid(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": self.resource1.uuid.hex})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], self.resource1.uuid.hex)

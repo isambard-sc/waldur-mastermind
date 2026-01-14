@@ -99,6 +99,7 @@ class ProposalFilter(django_filters.FilterSet):
     organization_uuid = django_filters.UUIDFilter(
         field_name="round__call__manager__customer__uuid"
     )
+    project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
     o = django_filters.OrderingFilter(
         fields=(
             "round__call__name",
@@ -107,6 +108,7 @@ class ProposalFilter(django_filters.FilterSet):
             "state",
             "created",
             "slug",
+            "submitted_at",
         )
     )
 

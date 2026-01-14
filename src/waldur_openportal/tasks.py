@@ -21,11 +21,25 @@ from .board import OpenPortalBoard
 logger = logging.getLogger(__name__)
 
 
-def run_once_task(takeover_timeout):
+def run_once_task(takeover_timeout, include_args=False):
+    """
+    Decorator to ensure only one instance of a task runs at a time.
+
+    Args:
+        takeover_timeout: Timeout in seconds before a stale lock can be taken over
+        include_args: If True, include positional arguments in the lock ID to create
+                     per-argument locks (e.g., per-customer locks)
+    """
+
     def task_exc(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            # Build lock_id based on function name and optionally arguments
             lock_id = "openportal-run-once-" + func.__name__
+            if include_args and args:
+                # Include positional arguments in lock ID for per-argument locking
+                args_str = "-".join(str(arg) for arg in args)
+                lock_id = f"{lock_id}-{args_str}"
 
             def acquire_lock():
                 now = datetime.datetime.now(datetime.UTC)
@@ -58,7 +72,7 @@ def run_once_task(takeover_timeout):
 
                         # create a new lock
                         lock, created = models.OnceTask.objects.get_or_create(
-                            task_name="sync_openportal",
+                            task_name=lock_id,
                             defaults={"last_run": now},
                         )
 
@@ -326,7 +340,19 @@ def sync_remote_allocation_usage(serialized_allocation):
 
     backend = allocation.get_backend()
 
-    allocation = backend.check_added_allocation(allocation)
+    try:
+        allocation = backend.check_added_allocation(allocation)
+    except Exception as e:
+        if str(e).find("ManagedProjectPendingError") != -1:
+            logger.debug(
+                f"Allocation {allocation} is still pending in remote portal - skipping usage sync"
+            )
+        else:
+            logger.error(f"Failed to check allocation {allocation}: {e}")
+
+        # just return for now - we can't sync usage as the project is not connected
+        return
+
     backend.sync_usage(allocation)
 
 
@@ -408,10 +434,13 @@ def sync_remote_usage():
 
 
 @shared_task(name="waldur_openportal.sync_customer_allocations")
+@run_once_task(takeover_timeout=60 * 60, include_args=True)
 def sync_customer_allocations(customer_id):
     """
     This task synchronises the usage for all allocations belonging to a single customer.
     Allocations are processed serially within each customer to avoid race conditions.
+    Uses run_once_task with include_args=True to ensure only one instance per customer
+    can run at a time, preventing backup of long-running tasks.
     """
     try:
         customer = structure_models.Customer.objects.get(id=customer_id)
@@ -419,7 +448,9 @@ def sync_customer_allocations(customer_id):
         logger.error(f"Customer with id {customer_id} does not exist")
         return
 
-    logger.info(f"OpenPortal task.sync_customer_allocations for customer {customer.name}")
+    logger.info(
+        f"OpenPortal task.sync_customer_allocations for customer {customer.name}"
+    )
 
     # Get all active allocations for this customer
     allocations = models.Allocation.objects.filter(

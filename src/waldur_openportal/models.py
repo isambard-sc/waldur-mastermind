@@ -13,6 +13,7 @@ from django.core import validators
 from model_utils import FieldTracker
 
 from waldur_core.core import models as core_models
+from waldur_core.core import utils as core_utils
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.invoices import models as invoice_models
@@ -391,6 +392,19 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
         if project.end_date is not None:
             details.end_date = project.end_date
 
+        # try:
+        # Set the award details - this is in a try block
+        # in case this feature is not supported by the current
+        # version of OpenPortal
+        #    award = openportal.AwardDetails()
+        #    award.award_id = str(project.slug)
+        #    award.link = core_utils.format_homeport_link(
+        #        "projects/{uuid}/", uuid=project.uuid.hex
+        #    )
+        #    details.award = award
+        # except Exception as e:
+        #    logger.warning(f"Failed to set award details for project {project}: {e}")
+
         # The project key is the UUID of the organisation that owns
         # the project. This way, only projects within the approved
         # organisation can create remote projects using this
@@ -416,6 +430,10 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                 )
 
         # now try to add in any members for this project
+        # also keeping note of the allowed email domains
+        # for this project
+        # allowed_domains = set()
+
         for user_id in get_project_users(project.id):
             try:
                 user = core_models.User.objects.filter(id=user_id)
@@ -451,6 +469,12 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                         f"Skipping user {user} with empty email for project {project}"
                     )
                     continue
+
+                # if "@" in email:
+                #    domain = email.split("@")[1].strip().lower()
+                #    if domain:
+                #        allowed_domains.add(domain)
+                #        allowed_domains.add(f"*.{domain}")
 
                 # get the role name of this user in the project
                 roles = UserRole.objects.filter(
@@ -506,6 +530,13 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                     details.add_member(email, role_name)
             except Exception as e:
                 logger.warning(f"Failed to add user {user} to project {project}: {e}")
+
+        # try:
+        #    details.allowed_domains = list(allowed_domains)
+        # except Exception as e:
+        #    logger.warning(
+        #        f"Failed to set allowed domains for project {project} to {allowed_domains}: {e}"
+        #    )
 
         logger.info(f"Returning project details for project {project}: {details}")
 
@@ -928,10 +959,24 @@ class UserInfo(models.Model):
                 shortname != self.user.unix_username
                 and self.user.unix_username is not None
             ):
-                self.user.unix_username = self.shortname
-                self.user.save()
+                # Set flag to prevent circular updates when saving unix_username
+                self.user._syncing_to_userinfo = True
+                try:
+                    self.user.unix_username = self.shortname
+                    self.user.save(update_fields=["unix_username"])
+                finally:
+                    self.user._syncing_to_userinfo = False
 
             self.shortname = self.user.unix_username
+
+        # make sure to copy the shortname to the slug
+        # Set flag to prevent circular updates
+        self.user._syncing_to_userinfo = True
+        try:
+            self.user.slug = shortname
+            self.user.save(update_fields=["slug"])
+        finally:
+            self.user._syncing_to_userinfo = False
 
         if self.shortname and self.shortname != shortname:
             logger.error(
@@ -1142,10 +1187,10 @@ class ProjectInfo(models.Model):
                     self.project.save()
             else:
                 # no shortname set - need to get it from the slug
-                logger.warning(
-                    f"No shortname set for project {self.project} - using slug: {e}"
-                )
                 shortname = self.project.slug.strip()
+                logger.warning(
+                    f"No shortname set for project {self.project} - using slug: {shortname}"
+                )
 
                 if len(shortname) == 0:
                     raise ValueError(
@@ -1226,6 +1271,36 @@ class ProjectInfo(models.Model):
         self.shortname = shortname
         self.save(force_accept_changed_shortname=force)
         self.sanitise()
+
+        if self.project:
+            # Set flag to prevent circular updates
+            self.project._syncing_to_projectinfo = True
+            try:
+                if hasattr(self.project, "short_name"):
+                    if self.project.short_name != shortname:
+                        try:
+                            self.project.short_name = shortname
+                            self.project.save(update_fields=["short_name"])
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to save project short_name {shortname} for project {self.project}: {e}"
+                            )
+
+                # Only copy the shortname to the slug if we are NOT in
+                # application_portal_only mode (i.e., we're in Project Management mode)
+                try:
+                    application_portal_only = core_models.Feature.objects.get(
+                        key="deployment.application_portal_only"
+                    ).value
+                except core_models.Feature.DoesNotExist:
+                    # Default to False if feature flag doesn't exist
+                    application_portal_only = False
+
+                if not application_portal_only:
+                    self.project.slug = shortname
+                    self.project.save(update_fields=["slug"])
+            finally:
+                self.project._syncing_to_projectinfo = False
 
     def has_shortname(self) -> bool:
         """

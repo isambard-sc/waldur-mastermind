@@ -6,6 +6,7 @@ from django.db.models import Q
 from django.db.models.query import QuerySet
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.drainage import set_override
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
@@ -401,6 +402,19 @@ class ProposalReviewSerializer(
         return super().create(validated_data)
 
 
+set_override(
+    ProposalReviewSerializer,
+    "optional_fields",
+    [
+        "anonymous_reviewer_name",
+        "reviewer",
+        "reviewer_full_name",
+        "reviewer_uuid",
+        "summary_private_comment",
+    ],
+)
+
+
 class ReviewSubmitSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Review
@@ -409,6 +423,12 @@ class ReviewSubmitSerializer(serializers.ModelSerializer):
             "summary_public_comment",
             "summary_private_comment",
         )
+
+
+class ReviewRejectSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Review
+        fields = ("summary_private_comment",)
 
 
 class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
@@ -428,6 +448,7 @@ class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
             "approved_by_name",
             "created_by_name",
             "created",
+            "submitted_at",
         ]
         extra_kwargs = {
             "created_by": {"lookup_field": "uuid", "view_name": "user-detail"},
@@ -437,7 +458,8 @@ class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
     def get_reviews(self, obj) -> list:
         """
         Return serialized reviews based on user permissions and visibility settings.
-        - Staff, call managers, and reviewers see all reviews.
+        - Staff and call managers see all reviews.
+        - Reviewers see only their own reviews.
         - Submitters see submitted reviews if visibility is enabled.
         """
         request = self.context.get("request")
@@ -448,13 +470,17 @@ class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
 
         reviews_qs = obj.review_set.all()
 
-        if (
-            user.is_staff
-            or obj.round.call.manager.customer.has_user(user)
-            or reviews_qs.filter(reviewer=user).exists()
-        ):
+        # Staff and call managers see all reviews
+        if user.is_staff or obj.round.call.manager.customer.has_user(user):
             return ProposalReviewSerializer(
                 reviews_qs, many=True, context=self.context
+            ).data
+
+        # Reviewers see only their own reviews
+        if reviews_qs.filter(reviewer=user).exists():
+            reviewer_reviews = reviews_qs.filter(reviewer=user)
+            return ProposalReviewSerializer(
+                reviewer_reviews, many=True, context=self.context
             ).data
 
         # Submitter logic
@@ -491,10 +517,48 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
             "minimal_average_scoring",
             "review_duration_in_days",
             "minimum_number_of_reviewers",
+            "minimum_required_uploads",
         ]
         extra_kwargs = {
             "slug": {"required": False},
         }
+
+    def get_fields(self):
+        fields = super().get_fields()
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+
+        if not user or not user.is_authenticated:
+            return fields
+
+        # Check if user is staff, support, call manager, or call organizer
+        is_authorized = user.is_staff or user.is_support
+
+        # Check if user is call manager or organizer
+        if not is_authorized and hasattr(self, "instance") and self.instance:
+            round_obj = self.instance if isinstance(self.instance, models.Round) else None
+            if round_obj:
+                is_authorized = (
+                    round_obj.call.manager.customer.has_user(user)
+                    or round_obj.call.has_user(user, CallRole.MANAGER)
+                )
+
+        # Remove sensitive fields for reviewers and other non-authorized users
+        if not is_authorized:
+            sensitive_fields = [
+                "review_strategy",
+                "deciding_entity",
+                "allocation_time",
+                "allocation_date",
+                "minimal_average_scoring",
+                "review_duration_in_days",
+                "minimum_number_of_reviewers",
+                "minimum_required_uploads",
+            ]
+            for field_name in sensitive_fields:
+                fields.pop(field_name, None)
+
+        return fields
 
 
 class CallDocumentSerializer(serializers.ModelSerializer):
@@ -884,6 +948,17 @@ class RequestedResourceSerializer(
 
     def create(self, validated_data):
         validated_data["created_by"] = self.context["request"].user
+
+        # If a call_resource_template is specified, check for and replace any existing resource with the same template
+        call_resource_template = validated_data.get("call_resource_template")
+        if call_resource_template:
+            proposal = validated_data["proposal"]
+            # Delete any existing resource with the same template for this proposal
+            models.RequestedResource.objects.filter(
+                proposal=proposal,
+                call_resource_template=call_resource_template,
+            ).delete()
+
         return super().create(validated_data)
 
 
@@ -1015,6 +1090,43 @@ class ProtectedCallSerializer(PublicCallSerializer):
                 )
         return value
 
+    def get_fields(self):
+        fields = super().get_fields()
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+
+        if not user or not user.is_authenticated:
+            return fields
+
+        # Check if user is staff, support, call manager, or call organizer
+        is_authorized = user.is_staff or user.is_support
+
+        # Check if user is call manager or organizer
+        if not is_authorized and hasattr(self, "instance") and self.instance:
+            call = self.instance if isinstance(self.instance, models.Call) else None
+            if call:
+                is_authorized = (
+                    call.manager.customer.has_user(user)
+                    or call.has_user(user, CallRole.MANAGER)
+                )
+
+        # Remove sensitive administrative fields for reviewers and other non-authorized users
+        if not is_authorized:
+            sensitive_fields = [
+                "reviewer_identity_visible_to_submitters",
+                "reviews_visible_to_submitters",
+                "compliance_checklist",
+                "compliance_checklist_name",
+                "reference_code",
+                "manager",
+                "manager_uuid",
+                "created_by",
+            ]
+            for field_name in sensitive_fields:
+                fields.pop(field_name, None)
+
+        return fields
+
     def create(self, validated_data):
         request = self.context["request"]
         customer = validated_data.get("manager", None).customer
@@ -1046,13 +1158,48 @@ class ProtectedRoundSerializer(
     core_serializers.AugmentedSerializerMixin, NestedRoundSerializer
 ):
     url = serializers.SerializerMethodField()
-    proposals = ProtectedProposalListSerializer(
-        many=True, read_only=True, source="proposal_set"
-    )
+    proposals = serializers.SerializerMethodField()
     review_duration_in_days = serializers.IntegerField(required=False)
 
     class Meta(NestedRoundSerializer.Meta):
         fields = NestedRoundSerializer.Meta.fields + ["url", "proposals"]
+
+    def get_proposals(self, obj) -> list:
+        """
+        Return proposals based on user permissions:
+        - Staff and call managers see all proposals
+        - Reviewers see only proposals they are assigned to review
+        - Submitters see their own proposals
+        """
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+
+        if not user or not request:
+            return []
+
+        proposals_qs = obj.proposal_set.all()
+
+        # Staff and call managers see all proposals
+        if user.is_staff or obj.call.manager.customer.has_user(user):
+            return ProtectedProposalListSerializer(
+                proposals_qs, many=True, context=self.context
+            ).data
+
+        # Reviewers see only proposals they're assigned to review
+        reviewer_proposals = proposals_qs.filter(review__reviewer=user)
+        if reviewer_proposals.exists():
+            return ProtectedProposalListSerializer(
+                reviewer_proposals, many=True, context=self.context
+            ).data
+
+        # Submitters see their own proposals
+        submitter_proposals = proposals_qs.filter(created_by=user)
+        if submitter_proposals.exists():
+            return ProtectedProposalListSerializer(
+                submitter_proposals, many=True, context=self.context
+            ).data
+
+        return []
 
     def get_fields(self):
         fields = super().get_fields()
@@ -1130,6 +1277,40 @@ class ProposalUpdateProjectDetailsSerializer(serializers.ModelSerializer):
             "oecd_fos_2007_code",
         ]
 
+    def validate_name(self, value):
+        """Validate proposal name length with call prefix."""
+        proposal = self.instance
+        if proposal and proposal.round:
+            call = proposal.round.call
+            call_prefix = call.backend_id or call.slug
+            date_str = proposal.round.start_time.strftime("%Y-%m-%d")
+            overhead = len(call_prefix) + len(date_str) + 6
+            # Use NAME_LENGTH (150) not PROJECT_NAME_LENGTH (500)
+            # because marketplace Resource uses NameMixin
+            max_length = core_models.NAME_LENGTH - overhead
+
+            if len(value) > max_length:
+                raise serializers.ValidationError(
+                    _(
+                        f"Proposal name is too long. "
+                        f"Maximum length is {max_length} characters "
+                        f'when combined with call ID "{call_prefix}".'
+                    )
+                )
+        return value
+
+    def validate_project_summary(self, value):
+        """Validate project summary length."""
+        if len(value) > core_models.DESCRIPTION_LENGTH:
+            raise serializers.ValidationError(
+                _(
+                    f"Project summary is too long. "
+                    f"Maximum length is {core_models.DESCRIPTION_LENGTH} "
+                    f"characters."
+                )
+            )
+        return value
+
 
 class ProposalSerializer(
     core_serializers.AugmentedSerializerMixin,
@@ -1187,6 +1368,8 @@ class ProposalSerializer(
             "oecd_fos_2007_label",
             "allocation_comment",
             "created",
+            "modified",
+            "submitted_at",
             "compliance_status",
             "can_submit",
         ]
@@ -1195,6 +1378,7 @@ class ProposalSerializer(
             "approved_by",
             "project",
             "allocation_comment",
+            "submitted_at",
         )
         protected_fields = ("round_uuid",)
         extra_kwargs = {
@@ -1206,26 +1390,67 @@ class ProposalSerializer(
         }
 
     def validate(self, attrs):
+        # For updates (self.instance exists), get round from instance
         if self.instance:
-            return attrs
+            call_round = self.instance.round
+        else:
+            # For creates, get round from attrs
+            round_uuid = attrs.pop("round_uuid")
 
-        round_uuid = attrs.pop("round_uuid")
+            try:
+                call_round = models.Round.objects.get(uuid=round_uuid)
+            except models.Round.DoesNotExist:
+                raise serializers.ValidationError(
+                    {"round_uuid": _("Round not found.")}
+                )
 
-        try:
-            call_round = models.Round.objects.get(uuid=round_uuid)
-        except models.Round.DoesNotExist:
-            raise serializers.ValidationError({"round_uuid": _("Round not found.")})
+            if call_round.call.state != CallStates.ACTIVE:
+                raise serializers.ValidationError(_("Call is not active."))
 
-        if call_round.call.state != CallStates.ACTIVE:
-            raise serializers.ValidationError(_("Call is not active."))
+            if call_round.status not in (
+                RoundStatuses.SCHEDULED,
+                RoundStatuses.OPEN,
+            ):
+                raise serializers.ValidationError(_("Round is not active."))
 
-        if call_round.status not in (
-            RoundStatuses.SCHEDULED,
-            RoundStatuses.OPEN,
-        ):
-            raise serializers.ValidationError(_("Round is not active."))
+            attrs["round"] = call_round
 
-        attrs["round"] = call_round
+        # Validate proposal name length with call prefix
+        # (applies to both create and update)
+        if "name" in attrs:
+            name = attrs["name"]
+            call_prefix = call_round.call.backend_id or call_round.call.slug
+            date_str = call_round.start_time.strftime("%Y-%m-%d")
+            overhead = len(call_prefix) + len(date_str) + 6
+            # Use NAME_LENGTH (150) not PROJECT_NAME_LENGTH (500)
+            # because marketplace Resource uses NameMixin
+            max_length = core_models.NAME_LENGTH - overhead
+
+            if len(name) > max_length:
+                raise serializers.ValidationError(
+                    {
+                        "name": _(
+                            f"Proposal name is too long. "
+                            f"Maximum length is {max_length} characters "
+                            f'when combined with call ID "{call_prefix}".'
+                        )
+                    }
+                )
+
+        # Validate project_summary length
+        if "project_summary" in attrs:
+            project_summary = attrs["project_summary"]
+            if len(project_summary) > core_models.DESCRIPTION_LENGTH:
+                raise serializers.ValidationError(
+                    {
+                        "project_summary": _(
+                            f"Project summary is too long. "
+                            f"Maximum length is "
+                            f"{core_models.DESCRIPTION_LENGTH} characters."
+                        )
+                    }
+                )
+
         return attrs
 
     def create(self, validated_data):
@@ -1588,6 +1813,7 @@ class ProposalUserSerializer(serializers.Serializer):
         Get or create a user based on email.
 
         Returns existing user if found, otherwise creates new user.
+        User creation can be disabled via the 'allow_user_creation' feature flag.
         """
         email = validated_data["email"]
         first_name = validated_data["first_name"]
@@ -1606,6 +1832,27 @@ class ProposalUserSerializer(serializers.Serializer):
         if user:
             logger.info(f"Retrieved existing user {user.uuid} for username {email}")
             return user
+
+        # Check if user creation is disabled by feature flag
+        try:
+            feature = core_models.Feature.objects.get(
+                key="user.allow_user_creation"
+            )
+            if not feature.value:
+                # Feature is explicitly disabled
+                logger.warning(
+                    f"User creation disabled for email {email} "
+                    "due to feature flag"
+                )
+                raise serializers.ValidationError(
+                    {
+                        "email": "User with this email does not exist. "
+                        "User creation is disabled."
+                    }
+                )
+        except core_models.Feature.DoesNotExist:
+            # Feature flag not set, allow creation (default behavior)
+            pass
 
         # Create new user - the username is the email
         user = core_models.User.objects.create_user(

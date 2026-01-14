@@ -133,6 +133,8 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
     user_email = serializers.ReadOnlyField(source="user.email")
     user_full_name = serializers.ReadOnlyField(source="user.full_name")
     user_username = serializers.ReadOnlyField(source="user.username")
+    user_slug = serializers.CharField(read_only=True, source="user.slug")
+    user_unix_username = serializers.CharField(read_only=True, source="user.unix_username")
     user_image = serializers.ImageField(source="user.image", read_only=True)
     created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
     created_by_uuid = serializers.UUIDField(read_only=True, source="created_by.uuid")
@@ -149,6 +151,8 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
             "user_email",
             "user_full_name",
             "user_username",
+            "user_slug",
+            "user_unix_username",
             "user_uuid",
             "user_image",
             "created_by_full_name",
@@ -298,6 +302,20 @@ class UserRoleUpdateSerializer(UserRoleMutateSerializer):
 class UserRoleDeleteSerializer(UserRoleMutateSerializer):
     def get_permission(self, scope):
         return get_delete_permission(scope)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        scope = self.context["scope"]
+        target_user = attrs["user"]
+
+        # Prevent removing the creator from a proposal
+        if scope._meta.model_name == "proposal" and hasattr(scope, "created_by"):
+            if scope.created_by == target_user:
+                raise ValidationError(
+                    "Cannot remove the proposal creator from the proposal."
+                )
+
+        return attrs
 
 
 class UserRoleExpirationTimeSerializer(serializers.Serializer):

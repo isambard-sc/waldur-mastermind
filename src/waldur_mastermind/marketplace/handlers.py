@@ -20,6 +20,8 @@ from waldur_core.checklist import models as checklist_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core.models import User
 from waldur_core.logging import event_logger
+from waldur_core.logging import tasks as logging_tasks
+from waldur_core.logging import utils as logging_utils
 from waldur_core.logging.enums import EventType
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.models import Customer, Project
@@ -27,6 +29,8 @@ from waldur_core.users import models as users_models
 from waldur_core.users.enums import InvitationState
 from waldur_core.users.tasks import process_invitation
 from waldur_freeipa.models import Profile
+from waldur_mastermind.marketplace import utils as marketplace_utils
+from waldur_mastermind.marketplace.billing import MarketplaceBillingService
 from waldur_mastermind.marketplace.enums import (
     BASIC_OFFERING,
     MaintenanceState,
@@ -339,20 +343,7 @@ def process_invitations_and_orders_when_project_start_date_is_unset(
         state=OrderStates.PENDING_PROJECT, project=project
     )
     for order in orders:
-        # Setting the state to PENDING_PROVIDER because direct transition
-        # from PENDING_PROJECT to EXECUTING is not supported
-        order.state = OrderStates.PENDING_PROVIDER
-        order.save(update_fields=["state"])
-        if utils.order_should_not_be_reviewed_by_provider(order):
-            order.set_state_executing()
-            order.save(update_fields=["state"])
-            transaction.on_commit(
-                lambda: tasks.process_order_on_commit(order, order.created_by)
-            )
-        else:
-            transaction.on_commit(
-                lambda: tasks.notify_provider_about_pending_order.delay(order.uuid)
-            )
+        tasks.continue_order_processing(order)
 
 
 def update_resource_when_order_is_rejected_or_erred(
@@ -1813,6 +1804,7 @@ def add_maintenance_fields_to_admin_announcement_serializer(sender, fields, **kw
     fields["maintenance_scheduled_end"] = serializers.SerializerMethodField()
     fields["maintenance_service_provider"] = serializers.SerializerMethodField()
     fields["maintenance_affected_offerings"] = serializers.SerializerMethodField()
+    fields["maintenance_external_reference_url"] = serializers.SerializerMethodField()
 
     # Add methods to the sender class (AdminAnnouncementSerializer)
     @extend_schema_field(OpenApiTypes.STR)
@@ -1940,6 +1932,18 @@ def add_maintenance_fields_to_admin_announcement_serializer(sender, fields, **kw
         except AttributeError:
             return []
 
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_maintenance_external_reference_url(self, obj) -> str | None:
+        try:
+            return (
+                obj.maintenance_announcement.external_reference_url
+                if hasattr(obj, "maintenance_announcement")
+                and obj.maintenance_announcement
+                else None
+            )
+        except AttributeError:
+            return None
+
     # Add the methods to the serializer class
     sender.get_maintenance_uuid = get_maintenance_uuid
     sender.get_maintenance_name = get_maintenance_name
@@ -1949,6 +1953,9 @@ def add_maintenance_fields_to_admin_announcement_serializer(sender, fields, **kw
     sender.get_maintenance_scheduled_end = get_maintenance_scheduled_end
     sender.get_maintenance_service_provider = get_maintenance_service_provider
     sender.get_maintenance_affected_offerings = get_maintenance_affected_offerings
+    sender.get_maintenance_external_reference_url = (
+        get_maintenance_external_reference_url
+    )
 
 
 def close_course_accounts_after_project_removal(
@@ -2025,3 +2032,181 @@ def log_terms_of_service_consent_revoked(
         },
         scopes=[instance.offering, instance.offering.customer],
     )
+
+
+def send_offering_user_created_message(
+    sender, instance: models.OfferingUser, created=False, **kwargs
+):
+    """Send OfferingUser creation message to message queue for external systems."""
+    if not created:
+        return
+
+    offering_user = instance
+    offering = offering_user.offering
+
+    payload = {
+        "offering_user_uuid": offering_user.uuid.hex,
+        "user_uuid": offering_user.user.uuid.hex,
+        "username": offering_user.username,
+        "state": offering_user.get_state_display(),
+        "action": "create",
+    }
+
+    logger.info("Preparing OfferingUser creation messages for %s", offering_user)
+
+    messages = marketplace_utils.prepare_messages(
+        offering,
+        payload,
+        logging_utils.ObservableObjectType.OFFERING_USER,
+    )
+    if messages:
+        logging_tasks.publish_messages.delay(messages)
+
+
+def send_offering_user_updated_message(
+    sender, instance: models.OfferingUser, created=False, **kwargs
+):
+    """Send OfferingUser update message to message queue for external systems."""
+    if created:
+        return
+
+    offering_user = instance
+    offering = offering_user.offering
+
+    changed_fields = offering_user.tracker.changed()
+    if not changed_fields:
+        return
+
+    payload = {
+        "offering_user_uuid": offering_user.uuid.hex,
+        "user_uuid": offering_user.user.uuid.hex,
+        "username": offering_user.username,
+        "state": offering_user.get_state_display(),
+        "changed_fields": list(changed_fields.keys()),
+        "action": "update",
+    }
+
+    logger.info("Preparing OfferingUser update message for %s", offering_user)
+
+    messages = marketplace_utils.prepare_messages(
+        offering,
+        payload,
+        logging_utils.ObservableObjectType.OFFERING_USER,
+    )
+    if messages:
+        logging_tasks.publish_messages.delay(messages)
+
+
+def send_offering_user_deleted_message(sender, instance: models.OfferingUser, **kwargs):
+    """Send OfferingUser deletion message to message queue for external systems."""
+    offering_user = instance
+    offering = offering_user.offering
+
+    payload = {
+        "offering_user_uuid": offering_user.uuid.hex,
+        "user_uuid": offering_user.user.uuid.hex,
+        "username": offering_user.username,
+        "action": "delete",
+    }
+
+    logger.info("Preparing OfferingUser deletion message for %s", offering_user)
+
+    messages = marketplace_utils.prepare_messages(
+        offering,
+        payload,
+        logging_utils.ObservableObjectType.OFFERING_USER,
+    )
+    if messages:
+        logging_tasks.publish_messages.delay(messages)
+
+
+def notify_users_about_tos_update_signal(sender, instance, created, **kwargs):
+    """Notify users when ToS is updated and requires re-consent."""
+
+    if not config.ENFORCE_USER_CONSENT_FOR_OFFERINGS:
+        return
+
+    if created:
+        return
+
+    tos_config = instance
+
+    if not tos_config.is_active or not tos_config.requires_reconsent:
+        return
+
+    if "version" not in tos_config.tracker.changed():
+        return
+
+    old_version = tos_config.tracker.previous("version") or ""
+    new_version = tos_config.version
+
+    transaction.on_commit(
+        lambda: tasks.send_tos_reconsent_notification.delay(
+            tos_config.offering.uuid, old_version, new_version
+        )
+    )
+
+
+def notify_offering_user_about_tos_requirement(sender, instance, created, **kwargs):
+    """Notify user about ToS requirement when OfferingUser is created."""
+
+    if not config.ENFORCE_USER_CONSENT_FOR_OFFERINGS:
+        return
+
+    if not created:
+        return
+
+    offering_user = instance
+    user = offering_user.user
+    offering = offering_user.offering
+
+    if user.is_staff or user.is_support:
+        return
+
+    if not offering.has_terms_of_service():
+        return
+
+    if not offering.plugin_options.get(
+        "service_provider_can_create_offering_user", False
+    ):
+        return
+
+    if offering.check_user_consent(user):
+        return
+
+    transaction.on_commit(
+        lambda u=user.uuid, o=offering.uuid: tasks.send_tos_consent_notification.delay(
+            o, u
+        )
+    )
+
+
+def process_billing_on_resource_save(
+    sender, instance: models.Resource, created=False, **kwargs
+):
+    """
+    Handle resource state changes and billing events.
+    """
+    resource = instance
+    if created:
+        return
+
+    tracker = resource.tracker
+
+    if (
+        resource.state == ResourceStates.OK
+        and tracker.previous("state") == ResourceStates.CREATING
+    ):
+        MarketplaceBillingService.handle_resource_creation(resource)
+
+    if (
+        resource.state == ResourceStates.TERMINATED
+        and tracker.previous("state") == ResourceStates.TERMINATING
+    ):
+        MarketplaceBillingService.handle_resource_termination(resource)
+
+    if resource.state != ResourceStates.CREATING and tracker.has_changed("plan_id"):
+        MarketplaceBillingService.handle_plan_change(resource)
+
+    if resource.state != ResourceStates.CREATING and tracker.has_changed("limits"):
+        MarketplaceBillingService.handle_limits_change(resource)

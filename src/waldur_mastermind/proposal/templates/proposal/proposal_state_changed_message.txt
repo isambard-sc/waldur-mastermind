@@ -24,6 +24,14 @@ No resources allocated yet.
 Feedback: {{ rejection_feedback }}
 {% endif %}
 
+{% if new_state == 'draft' %}
+Your proposal has been returned by the call manager as they require further information or modifications before it can proceed to the review stage. Please review any comments or feedback provided.
+
+Feedback: {{ rejection_feedback }}
+
+If you still wish to continue, please make the necessary changes to your proposal and then resubmit it for review.
+{% endif %}
+
 {% if new_state == 'submitted' %}
 Your proposal has been successfully submitted and will be reviewed according to the review process for this call. You will receive further notifications as your proposal progresses through the review process.
 {% endif %}

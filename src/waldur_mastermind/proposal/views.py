@@ -30,9 +30,16 @@ from waldur_core.logging.enums import EventType
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
-from waldur_core.permissions.utils import has_permission, permission_factory
-from waldur_core.permissions.views import UserRoleMixin
+from waldur_core.permissions.utils import (
+    has_permission,
+    permission_factory,
+    add_user as add_user_permission,
+)
+from waldur_core.permissions.views import UserRoleMixin, validate_scope_not_soft_deleted
+from waldur_core.permissions import serializers as permissions_serializers
+from waldur_core.permissions import models as permissions_models
 from waldur_core.structure import filters as structure_filters
+from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import (
     filter_queryset_for_user,
     get_connected_customers,
@@ -181,6 +188,35 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             super().get_queryset(), self.request.user
         ).order_by("created")
 
+    def check_call_modify_permission(request, view, obj=None):
+        """Only staff, support, call managers, and call organizers can modify calls."""
+        if not obj:
+            return
+
+        user = request.user
+
+        # Staff and support can always modify
+        if user.is_staff or user.is_support:
+            return
+
+        # Check if user is call manager or organizer
+        if obj.manager.customer.has_user(user) or obj.has_user(user, CallRole.MANAGER):
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers and organizers can modify calls."
+        )
+
+    update_permissions = partial_update_permissions = create_permissions = (
+        destroy_permissions
+    ) = [check_call_modify_permission]
+
+    # Restrict list_users to only call managers and organizers (prevents reviewer identity leakage)
+    list_users_permissions = [check_call_modify_permission]
+    add_user_permissions = [check_call_modify_permission]
+    update_user_permissions = [check_call_modify_permission]
+    delete_user_permissions = [check_call_modify_permission]
+
     @extend_schema(
         methods=["get"],
         operation_id="proposal_protected_calls_offerings_list",
@@ -227,8 +263,24 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         return self.action_list_method("requestedoffering_set")(self, request, uuid)
 
     offerings_serializer_class = serializers.RequestedOfferingSerializer
+    offerings_permissions = [check_call_modify_permission]
 
     def offering_detail(self, request, uuid=None, obj_uuid=None):
+        """Handle nested offering detail operations with permission checks."""
+        # For non-GET requests, check modify permissions
+        if request.method != "GET":
+            call = self.get_object()
+            user = request.user
+            # Staff and support can always modify
+            if not (user.is_staff or user.is_support):
+                # Check if user is call manager or organizer
+                if not (
+                    call.manager.customer.has_user(user)
+                    or call.has_user(user, CallRole.MANAGER)
+                ):
+                    raise exceptions.PermissionDenied(
+                        "Only call managers and organizers can modify offerings."
+                    )
         return self.action_detail_method(
             "requestedoffering_set",
             delete_validators=[],
@@ -363,8 +415,27 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         )
 
     rounds_serializer_class = serializers.ProtectedRoundSerializer
+    rounds_permissions = [check_call_modify_permission]
 
     def round_detail(self, request, uuid=None, obj_uuid=None):
+        """Handle nested round detail operations with permission checks."""
+        # Check permissions first - get the round object
+        call = self.get_object()
+
+        # For non-GET requests, check modify permissions
+        if request.method != "GET":
+            user = request.user
+            # Staff and support can always modify
+            if not (user.is_staff or user.is_support):
+                # Check if user is call manager or organizer
+                if not (
+                    call.manager.customer.has_user(user)
+                    or call.has_user(user, CallRole.MANAGER)
+                ):
+                    raise exceptions.PermissionDenied(
+                        "Only call managers and organizers can modify rounds."
+                    )
+
         def validate_call_state(call_round):
             if call_round.call.state == CallStates.ARCHIVED:
                 raise IncorrectStateException()
@@ -407,7 +478,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         if call_round.cutoff_time < timezone.now():
             call_round.cutoff_time = timezone.now()
 
-        utils.create_reviews_of_round(call_round)
+        utils.process_closed_round(call_round)
 
         return response.Response(
             "Round has been closed.",
@@ -511,8 +582,25 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         return self.action_list_method("resource_templates")(self, request, uuid)
 
     resource_templates_serializer_class = serializers.CallResourceTemplateSerializer
+    resource_templates_permissions = [check_call_modify_permission]
 
     def resource_template_detail(self, request, uuid=None, obj_uuid=None):
+        """Handle nested resource template detail operations with permission checks."""
+        # For non-GET requests, check modify permissions
+        if request.method != "GET":
+            call = self.get_object()
+            user = request.user
+            # Staff and support can always modify
+            if not (user.is_staff or user.is_support):
+                # Check if user is call manager or organizer
+                if not (
+                    call.manager.customer.has_user(user)
+                    or call.has_user(user, CallRole.MANAGER)
+                ):
+                    raise exceptions.PermissionDenied(
+                        "Only call managers and organizers can modify resource templates."
+                    )
+
         return self.action_detail_method(
             "resource_templates", delete_validators=[], update_validators=[]
         )(self, request, uuid, obj_uuid)
@@ -706,7 +794,19 @@ class ProposalViewSet(
             return
         raise exceptions.PermissionDenied()
 
-    destroy_permissions = update_project_details_permissions = [is_creator]
+    def is_proposal_manager(request, view, obj=None):
+        """Check if user has PROPOSAL.MANAGER role on the proposal."""
+        if not obj:
+            return
+        user = request.user
+        if user.is_staff:
+            return
+        # Check if user has MANAGE_PROPOSAL permission on this proposal
+        if has_permission(user, PermissionEnum.MANAGE_PROPOSAL, obj):
+            return
+        raise exceptions.PermissionDenied()
+
+    destroy_permissions = update_project_details_permissions = [is_proposal_manager]
 
     destroy_validators = update_project_details_validators = [
         core_validators.StateValidator(ProposalStates.DRAFT)
@@ -728,7 +828,20 @@ class ProposalViewSet(
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
+        # Reset stale reminder flag when proposal is edited
+        if proposal.stale_reminder_sent_at:
+            proposal.stale_reminder_sent_at = None
+            proposal.save(update_fields=["stale_reminder_sent_at"])
+
         return response.Response(status=status.HTTP_200_OK)
+
+    def perform_update(self, serializer):
+        """Reset stale reminder flag when proposal is updated via standard endpoint."""
+        super().perform_update(serializer)
+        proposal = serializer.instance
+        if proposal.stale_reminder_sent_at:
+            proposal.stale_reminder_sent_at = None
+            proposal.save(update_fields=["stale_reminder_sent_at"])
 
     @staticmethod
     def validate_resource_requests_existing(proposal):
@@ -749,6 +862,7 @@ class ProposalViewSet(
         proposal = self.get_object()
         previous_state = proposal.state
         proposal.state = ProposalStates.SUBMITTED
+        proposal.submitted_at = timezone.now()
         proposal.save()
         tasks.notify_user_about_proposal_state_update.delay(
             proposal.uuid, previous_state, proposal.state
@@ -761,7 +875,11 @@ class ProposalViewSet(
 
     submit_validators = [core_validators.StateValidator(ProposalStates.DRAFT)]
 
-    submit_permissions = [is_creator]
+    submit_permissions = [is_proposal_manager]
+
+    add_user_permissions = [is_proposal_manager]
+
+    delete_user_permissions = [is_proposal_manager]
 
     def perform_create(self, serializer):
         proposal: models.Proposal = serializer.save()
@@ -770,6 +888,325 @@ class ProposalViewSet(
             ProposalRole.MANAGER,
             created_by=self.request.user,
         )
+
+    @extend_schema(
+        request=permissions_serializers.UserRoleCreateSerializer,
+        responses={
+            200: permissions_serializers.UserRoleExpirationTimeSerializer,
+            400: {
+                "type": "object",
+                "properties": {
+                    "detail": {"type": "string"},
+                    "requires_confirmation": {"type": "boolean"},
+                    "current_manager": {
+                        "type": "object",
+                        "properties": {
+                            "uuid": {"type": "string"},
+                            "full_name": {"type": "string"},
+                            "email": {"type": "string"},
+                        },
+                    },
+                    "new_manager": {
+                        "type": "object",
+                        "properties": {
+                            "uuid": {"type": "string"},
+                            "full_name": {"type": "string"},
+                            "email": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        },
+        description="Add a user to the proposal team. "
+        "If adding a MANAGER role, ownership will be transferred from the current manager.",
+    )
+    @decorators.action(detail=True, methods=["POST"])
+    def add_user(self, request, uuid=None):
+        """
+        Add a user to the proposal team.
+
+        Handles:
+        - Adding new users with any role
+        - Ignoring duplicate additions (same user, same role)
+        - Changing user roles (except MANAGER cannot change their own role)
+        - For MANAGER role: Only one manager allowed, automatically transfers ownership
+        """
+        proposal = self.get_object()
+        validate_scope_not_soft_deleted(proposal)
+
+        serializer = permissions_serializers.UserRoleCreateSerializer(
+            data=request.data, context={"scope": proposal, "request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        target_user = serializer.validated_data["user"]
+        role = serializer.validated_data["role"]
+        expiration_time = serializer.validated_data.get("expiration_time")
+
+        # Check if user already has ANY role on this proposal
+        existing_roles = permissions_models.UserRole.objects.filter(
+            user=target_user,
+            scope=proposal,
+            is_active=True,
+        )
+
+        # If user already has the exact same role, ignore (idempotent operation)
+        if existing_roles.filter(role=role).exists():
+            return response.Response(
+                status=status.HTTP_200_OK,
+                data={
+                    "detail": _("User already has this role."),
+                    "expiration_time": existing_roles.filter(role=role)
+                    .first()
+                    .expiration_time,
+                },
+            )
+
+        # If user has a different role, this is a role change
+        if existing_roles.exists():
+            current_role = existing_roles.first().role
+
+            # Prevent MANAGER from changing their own role
+            if current_role == ProposalRole.MANAGER and target_user == request.user:
+                raise exceptions.ValidationError(
+                    {
+                        "detail": _(
+                            "You cannot change your own role as the proposal manager. "
+                            "To step down, transfer ownership by adding a new manager."
+                        )
+                    }
+                )
+
+            # Prevent changing someone's role TO manager (must use the transfer workflow)
+            if role == ProposalRole.MANAGER:
+                # This will be handled below in the MANAGER-specific logic
+                pass
+            else:
+                # For non-MANAGER role changes, revoke old role and add new one
+                logger.info(
+                    f"Changing role for {target_user.full_name} on proposal {proposal.uuid} "
+                    f"from {current_role.name} to {role.name}"
+                )
+
+                # Revoke all existing roles
+                for existing_role in existing_roles:
+                    existing_role.revoke(
+                        request.user,
+                        reason=f"Role changed from {existing_role.role.name} to {role.name}",
+                    )
+
+                # Add new role
+                perm = add_user_permission(
+                    proposal,
+                    target_user,
+                    role,
+                    created_by=request.user,
+                    expiration_time=expiration_time,
+                )
+
+                return response.Response(
+                    status=status.HTTP_200_OK,
+                    data={
+                        "detail": _("User role changed successfully."),
+                        "expiration_time": perm.expiration_time,
+                        "previous_role": current_role.name,
+                        "new_role": role.name,
+                    },
+                )
+
+        # Special handling for MANAGER role - enforce single manager constraint
+        if role == ProposalRole.MANAGER:
+            # Check if this user already has the MANAGER role (should be caught above, but double-check)
+            if permissions_utils.has_user(proposal, target_user, ProposalRole.MANAGER):
+                raise exceptions.ValidationError(
+                    {"detail": _("User already has the MANAGER role on this proposal.")}
+                )
+
+            # If the target user has an existing non-MANAGER role, revoke it first
+            # (they'll become MANAGER, so their old role is no longer relevant)
+            if existing_roles.exists():
+                logger.info(
+                    f"Promoting {target_user.full_name} to MANAGER on proposal {proposal.uuid}, "
+                    f"revoking existing role(s)"
+                )
+                for existing_role in existing_roles:
+                    existing_role.revoke(
+                        request.user,
+                        reason=f"Promoted to MANAGER from {existing_role.role.name}",
+                    )
+
+            # Find the current manager (should be the created_by user)
+            current_manager = proposal.created_by
+
+            if not current_manager:
+                # Edge case: no created_by set, just add the manager
+                perm = add_user_permission(
+                    proposal,
+                    target_user,
+                    role,
+                    created_by=request.user,
+                    expiration_time=expiration_time,
+                )
+                proposal.created_by = target_user
+                proposal.save(update_fields=["created_by"])
+                return response.Response(
+                    status=status.HTTP_201_CREATED,
+                    data={"expiration_time": perm.expiration_time},
+                )
+
+            if current_manager == target_user:
+                raise exceptions.ValidationError(
+                    {"detail": _("User is already the manager of this proposal.")}
+                )
+
+            # Transfer ownership workflow:
+            # 1. Demote current manager to MEMBER
+            # 2. Update proposal.created_by to new manager
+            # 3. Add new user as MANAGER
+
+            # Step 1: Change current manager's role to MEMBER
+            try:
+                current_manager_perm = permissions_models.UserRole.objects.get(
+                    user=current_manager,
+                    role=ProposalRole.MANAGER,
+                    scope=proposal,
+                    is_active=True,
+                )
+                # Revoke the manager role
+                current_manager_perm.revoke(
+                    request.user,
+                    reason=f"Ownership transferred to {target_user.full_name}",
+                )
+
+                # Add as MEMBER
+                add_user_permission(
+                    proposal,
+                    current_manager,
+                    ProposalRole.MEMBER,
+                    created_by=request.user,
+                    expiration_time=None,
+                )
+
+                logger.info(
+                    f"Transferred proposal {proposal.uuid} ownership from "
+                    f"{current_manager.full_name} to {target_user.full_name}"
+                )
+            except permissions_models.UserRole.DoesNotExist:
+                # Current manager doesn't have an active role, just proceed
+                logger.warning(
+                    f"Current manager {current_manager.full_name} doesn't have "
+                    f"active MANAGER role on proposal {proposal.uuid}"
+                )
+
+            # Step 2: Update proposal owner
+            proposal.created_by = target_user
+            proposal.save(update_fields=["created_by"])
+
+            # Step 3: Add new manager
+            perm = add_user_permission(
+                proposal,
+                target_user,
+                role,
+                created_by=request.user,
+                expiration_time=expiration_time,
+            )
+
+            event_logger.emit(
+                f"Ownership of proposal {proposal.name} transferred from "
+                f"{current_manager.full_name} to {target_user.full_name}.",
+                event_type=EventType.ROLE_GRANTED,
+                event_context={"proposal": proposal, "user": target_user},
+                scopes=[_get_customer(proposal)],
+            )
+
+            return response.Response(
+                status=status.HTTP_201_CREATED,
+                data={
+                    "expiration_time": perm.expiration_time,
+                    "ownership_transferred": True,
+                    "previous_manager": current_manager.full_name,
+                    "new_manager": target_user.full_name,
+                },
+            )
+
+        # For non-MANAGER roles, use standard add_user logic
+        perm = add_user_permission(
+            proposal,
+            target_user,
+            role,
+            created_by=request.user,
+            expiration_time=expiration_time,
+        )
+        return response.Response(
+            status=status.HTTP_201_CREATED,
+            data={"expiration_time": perm.expiration_time},
+        )
+
+    @extend_schema(
+        request=permissions_serializers.UserRoleDeleteSerializer,
+        responses={200: None},
+        description="Remove a user from the proposal team. "
+        "Proposal managers can remove any team member except themselves.",
+    )
+    @decorators.action(detail=True, methods=["POST"])
+    def delete_user(self, request, uuid=None):
+        """
+        Remove a user from the proposal team.
+
+        - Proposal managers can remove any team member
+        - Managers cannot remove themselves (must transfer ownership first)
+        - The proposal creator (owner) cannot be removed
+        """
+        proposal = self.get_object()
+        validate_scope_not_soft_deleted(proposal)
+
+        serializer = permissions_serializers.UserRoleDeleteSerializer(
+            data=request.data, context={"scope": proposal, "request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        target_user = serializer.validated_data["user"]
+        role = serializer.validated_data["role"]
+
+        # Prevent removing the proposal creator/owner
+        if proposal.created_by == target_user:
+            raise exceptions.ValidationError(
+                {
+                    "detail": _(
+                        "Cannot remove the proposal owner. "
+                        "To change ownership, add a new manager."
+                    )
+                }
+            )
+
+        # Prevent manager from removing themselves
+        if request.user == target_user and role == ProposalRole.MANAGER:
+            raise exceptions.ValidationError(
+                {
+                    "detail": _(
+                        "You cannot remove yourself as manager. "
+                        "To step down, transfer ownership by adding a new manager."
+                    )
+                }
+            )
+
+        # Perform the deletion
+        from waldur_core.permissions.utils import delete_user as delete_user_permission
+
+        success = delete_user_permission(
+            proposal,
+            target_user,
+            role,
+            request.user,
+            reason="Manual user removal via delete_user API endpoint",
+        )
+
+        if not success:
+            raise exceptions.ValidationError(
+                {"detail": _("User does not have this role on the proposal.")}
+            )
+
+        return response.Response(status=status.HTTP_200_OK)
 
     @extend_schema(
         methods=["get"],
@@ -1000,6 +1437,32 @@ class ProposalViewSet(
     def approve(self, request, uuid=None):
         proposal = self.get_object()
         previous_state = proposal.state
+
+        # Validate that project name won't overflow
+        call = proposal.round.call
+        call_prefix = call.backend_id or call.slug
+        date_str = proposal.round.start_time.strftime("%Y-%m-%d")
+        project_name = " - ".join([call_prefix, date_str, proposal.name])
+
+        # Use NAME_LENGTH (150) not PROJECT_NAME_LENGTH (500)
+        # because marketplace Resource uses NameMixin
+        from waldur_core.core import models as core_models
+
+        if len(project_name) > core_models.NAME_LENGTH:
+            overhead = len(call_prefix) + len(date_str) + 6
+            max_length = core_models.NAME_LENGTH - overhead
+            return response.Response(
+                {
+                    "detail": _(
+                        f"Cannot approve: resulting project name would be "
+                        f"too long ({len(project_name)} characters). "
+                        f"Please shorten the proposal name to {max_length} "
+                        f"characters or less."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         utils.allocate_proposal(proposal)
         proposal.state = ProposalStates.ACCEPTED
         serializer = self.get_serializer(data=request.data)
@@ -1083,12 +1546,36 @@ class ProposalViewSet(
             ProposalStates.IN_REVIEW,
         )
     ]
-    reject_permissions = approve_permissions = [
-        permission_factory(
-            PermissionEnum.APPROVE_AND_REJECT_PROPOSALS,
-            ["round.call", "round.call.manager"],
+
+    def check_proposal_management_permission(request, view, obj=None):
+        """Check if user can approve/reject proposals - explicit Call Manager check."""
+        if not obj:
+            return
+
+        user = request.user
+        call = obj.round.call
+
+        # Staff and support can always manage
+        if user.is_staff or user.is_support:
+            return
+
+        # Check if user is a Call Manager
+        if call.has_user(user, CallRole.MANAGER):
+            return
+
+        # Check permission-based access
+        if has_permission(
+            user, PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, call
+        ) or has_permission(
+            user, PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, call.manager
+        ):
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers and authorized users can manage proposals."
         )
-    ]
+
+    reject_permissions = approve_permissions = [check_proposal_management_permission]
     reject_serializer_class = approve_serializer_class = (
         serializers.ProposalApproveSerializer
     )
@@ -1103,6 +1590,7 @@ class ProposalViewSet(
         proposal = self.get_object()
         previous_state = proposal.state
         proposal.state = ProposalStates.DRAFT
+        proposal.submitted_at = None
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         proposal.allocation_comment = serializer.validated_data.get(
@@ -1136,12 +1624,7 @@ class ProposalViewSet(
             ProposalStates.IN_REVIEW,
         )
     ]
-    return_to_applicant_permissions = [
-        permission_factory(
-            PermissionEnum.APPROVE_AND_REJECT_PROPOSALS,
-            ["round.call", "round.call.manager"],
-        )
-    ]
+    return_to_applicant_permissions = [check_proposal_management_permission]
     return_to_applicant_serializer_class = serializers.ProposalApproveSerializer
 
     # Checklist Integration Endpoints
@@ -1209,47 +1692,99 @@ class ReviewViewSet(ActionsViewSet):
     def perform_create(self, serializer):
         proposal = serializer.validated_data["proposal"]
         if proposal.state not in [
-            ProposalStates.DRAFT,
             ProposalStates.IN_REVIEW,
             ProposalStates.SUBMITTED,
         ]:
             raise exceptions.ValidationError(
-                _("Valid states for proposals: Draft, In Review, Submitted.")
+                _(
+                    "Reviews can only be created for proposals in In Review or Submitted state."
+                )
             )
         review: models.Review = serializer.save()
         tasks.notify_reviewer_about_assignment.delay(review.uuid)
 
+    def perform_update(self, serializer):
+        """Auto-accept review when reviewer starts working on it."""
+        review = self.get_object()
+
+        # If review is in CREATED state and reviewer is updating it, auto-accept
+        if review.state == models.Review.States.CREATED:
+            logger.info(
+                f"Auto-accepting review {review.uuid} for proposal {review.proposal.name} "
+                f"as reviewer {review.reviewer.full_name} started working on it."
+            )
+            review.state = models.Review.States.IN_REVIEW
+            review.save(update_fields=["state"])
+
+            # Update proposal state to IN_REVIEW if not already
+            if review.proposal.state not in [
+                ProposalStates.IN_REVIEW,
+                ProposalStates.ACCEPTED,
+                ProposalStates.REJECTED,
+            ]:
+                proposal_old_state = review.proposal.state
+                review.proposal.state = ProposalStates.IN_REVIEW
+                review.proposal.save(update_fields=["state"])
+                tasks.notify_user_about_proposal_state_update.delay(
+                    review.proposal.uuid, proposal_old_state, review.proposal.state
+                )
+
+        super().perform_update(serializer)
+
     def check_create_permissions(request, view, obj=None):
-        """Check permissions for creating reviews."""
+        """Check permissions for creating reviews - explicit Call Manager check."""
         serializer = view.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         proposal = serializer.validated_data["proposal"]
 
         user = request.user
-        permission = PermissionEnum.MANAGE_PROPOSAL_REVIEW
         call = proposal.round.call
 
-        if not (
-            has_permission(user, permission, call)
-            or has_permission(user, permission, call.manager)
+        # Staff and support can always create reviews
+        if user.is_staff or user.is_support:
+            return
+
+        # Check if user is a Call Manager
+        if call.has_user(user, CallRole.MANAGER):
+            return
+
+        # Check permission-based access
+        permission = PermissionEnum.MANAGE_PROPOSAL_REVIEW
+        if has_permission(user, permission, call) or has_permission(
+            user, permission, call.manager
         ):
-            raise exceptions.PermissionDenied()
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers and authorized users can manage reviews."
+        )
 
     def check_destroy_permissions(request, view, obj=None):
-        """Check permissions for destroying reviews."""
-        if obj and not (
-            has_permission(
-                request.user,
-                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-                obj.proposal.round.call,
-            )
-            or has_permission(
-                request.user,
-                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-                obj.proposal.round.call.manager,
-            )
+        """Check permissions for destroying reviews - explicit Call Manager check."""
+        if not obj:
+            return
+
+        user = request.user
+        call = obj.proposal.round.call
+
+        # Staff and support can always destroy reviews
+        if user.is_staff or user.is_support:
+            return
+
+        # Check if user is a Call Manager
+        if call.has_user(user, CallRole.MANAGER):
+            return
+
+        # Check permission-based access
+        permission = PermissionEnum.MANAGE_PROPOSAL_REVIEW
+        if has_permission(user, permission, call) or has_permission(
+            user, permission, call.manager
         ):
-            raise exceptions.PermissionDenied()
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers and authorized users can delete reviews."
+        )
 
     create_permissions = [check_create_permissions]
     destroy_permissions = [check_destroy_permissions]
@@ -1264,6 +1799,27 @@ class ReviewViewSet(ActionsViewSet):
             return
 
         raise exceptions.PermissionDenied()
+
+    @extend_schema(
+        description="Return a review to the reviewer, changing its state to IN_REVIEW.",
+        request=None,
+        responses={status.HTTP_200_OK: None},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def return_to_reviewer(self, request, uuid=None):
+        review: models.Review = self.get_object()
+        review.state = models.Review.States.IN_REVIEW
+        review.save()
+        return response.Response(
+            "Review has been returned to reviewer.",
+            status=status.HTTP_200_OK,
+        )
+
+    return_to_reviewer_validators = [
+        core_validators.StateValidator(models.Review.States.SUBMITTED),
+    ]
+
+    return_to_reviewer_permissions = [check_destroy_permissions]
 
     @extend_schema(
         description="Accept a review, changing its state to IN_REVIEW.",
@@ -1281,9 +1837,13 @@ class ReviewViewSet(ActionsViewSet):
         logger.info(
             f"Review {review.uuid}, by {review.reviewer.full_name} for proposal {review.proposal.name} has been accepted. Proposal state changed to IN_REVIEW."
         )
-        tasks.notify_user_about_proposal_state_update.delay(
-            review.proposal.uuid, proposal_old_state, review.proposal.state
-        )
+
+        if proposal_old_state != review.proposal.state:
+            # Only notify the user once
+            tasks.notify_user_about_proposal_state_update.delay(
+                review.proposal.uuid, proposal_old_state, review.proposal.state
+            )
+
         return response.Response(
             "Review has been accepted.",
             status=status.HTTP_200_OK,
@@ -1295,14 +1855,17 @@ class ReviewViewSet(ActionsViewSet):
 
     @extend_schema(
         description="Reject a review, changing its state to REJECTED.",
-        request=None,
+        request=serializers.ReviewRejectSerializer,
         responses={status.HTTP_200_OK: None},
     )
     @decorators.action(detail=True, methods=["post"])
     def reject(self, request, uuid=None):
         review: models.Review = self.get_object()
-        review.state = models.Review.States.REJECTED
-        review.save()
+        serializer = serializers.ReviewRejectSerializer(
+            instance=review, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save(state=models.Review.States.REJECTED)
         tasks.notify_call_managers_about_rejected_review.delay(review.uuid)
         return response.Response(
             "Review has been rejected.",
@@ -1323,6 +1886,26 @@ class ReviewViewSet(ActionsViewSet):
     @decorators.action(detail=True, methods=["post"])
     def submit(self, request, uuid=None):
         review: models.Review = self.get_object()
+
+        # Auto-accept review if submitting from CREATED state
+        if review.state == models.Review.States.CREATED:
+            logger.info(
+                f"Auto-accepting review {review.uuid} for proposal {review.proposal.name} "
+                f"on submission by reviewer {review.reviewer.full_name}."
+            )
+            # Update proposal state to IN_REVIEW if not already
+            if review.proposal.state not in [
+                ProposalStates.IN_REVIEW,
+                ProposalStates.ACCEPTED,
+                ProposalStates.REJECTED,
+            ]:
+                proposal_old_state = review.proposal.state
+                review.proposal.state = ProposalStates.IN_REVIEW
+                review.proposal.save(update_fields=["state"])
+                tasks.notify_user_about_proposal_state_update.delay(
+                    review.proposal.uuid, proposal_old_state, review.proposal.state
+                )
+
         serializer = ReviewSubmitSerializer(
             instance=review, data=request.data, partial=True
         )
@@ -1336,7 +1919,9 @@ class ReviewViewSet(ActionsViewSet):
         )
 
     submit_validators = [
-        core_validators.StateValidator(models.Review.States.IN_REVIEW),
+        core_validators.StateValidator(
+            models.Review.States.CREATED, models.Review.States.IN_REVIEW
+        ),
     ]
     accept_permissions = reject_permissions = submit_permissions = (
         update_permissions
@@ -1432,6 +2017,27 @@ class RoundViewSet(ReadOnlyActionsViewSet):
     def get_queryset(self):
         return filter_queryset_for_user(models.Round.objects.all(), self.request.user)
 
+    def check_reviewers_permission(request, view, obj=None):
+        """Only call managers and organizers can see the list of reviewers."""
+        if not obj:
+            return
+
+        user = request.user
+
+        # Staff and support can always see
+        if user.is_staff or user.is_support:
+            return
+
+        # Check if user is call manager or organizer
+        if obj.call.manager.customer.has_user(user) or obj.call.has_user(
+            user, CallRole.MANAGER
+        ):
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers and organizers can view the list of reviewers."
+        )
+
     @extend_schema(
         description="Return list of reviewers for round.",
         request=None,
@@ -1477,6 +2083,8 @@ class RoundViewSet(ReadOnlyActionsViewSet):
             page, many=True, context={"round_obj": round_obj}
         )
         return self.get_paginated_response(serializer.data)
+
+    reviewers_permissions = [check_reviewers_permission]
 
 
 class ProposalProjectRoleMappingViewSet(ActionsViewSet):

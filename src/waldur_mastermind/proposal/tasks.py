@@ -5,7 +5,10 @@ from celery import shared_task
 from constance import config
 from django.db.models import Avg, Count, Q
 from django.utils import timezone
+from datetime import timedelta
 
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.utils import get_users
 from waldur_core.core import utils as core_utils
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
@@ -23,15 +26,19 @@ logger = logging.getLogger(__name__)
 )
 def create_reviews_if_strategy_is_after_round():
     """Create reviews for active rounds with 'after round' review strategy."""
+
+    logger.info("Skipping create_reviews_if_strategy_is_after_round task")
+    return
+
     rounds = proposal_models.Round.objects.filter(
         start_time__lte=timezone.now(),
-        cutoff_time__gte=timezone.now(),
+        cutoff_time__lt=timezone.now(),
         call__state=CallStates.ACTIVE,
         review_strategy=proposal_models.Round.ReviewStrategies.AFTER_ROUND,
     )
 
     for r in rounds:
-        utils.create_reviews_of_round(r)
+        utils.process_closed_round(r)
 
 
 @shared_task(
@@ -39,6 +46,9 @@ def create_reviews_if_strategy_is_after_round():
 )
 def create_reviews_if_strategy_is_after_proposal():
     """Create reviews for active rounds with 'after proposal' review strategy."""
+    logger.info("Skipping create_reviews_if_strategy_is_after_proposal task")
+    return
+
     rounds = proposal_models.Round.objects.filter(
         call__state=CallStates.ACTIVE,
         review_strategy=proposal_models.Round.ReviewStrategies.AFTER_PROPOSAL,
@@ -58,16 +68,14 @@ def create_reviews_if_strategy_is_after_proposal():
     name="waldur_mastermind.proposal.proposals_for_ended_rounds_should_be_cancelled"
 )
 def proposals_for_ended_rounds_should_be_cancelled():
-    """Cancel proposals for rounds that have ended."""
+    """Cancel draft proposals for rounds that have ended."""
     date = timezone.now()
     cancellation_date = date.strftime("%Y-%m-%d %H:%M:%S")
-    for proposal in proposal_models.Proposal.objects.exclude(
-        state__in=(
-            ProposalStates.ACCEPTED,
-            ProposalStates.REJECTED,
-            ProposalStates.CANCELED,
-        )
-    ).filter(round__cutoff_time__lt=date):
+    # Only cancel DRAFT proposals - submitted/in-review proposals need time for review and decision
+    for proposal in proposal_models.Proposal.objects.filter(
+        state=ProposalStates.DRAFT,
+        round__cutoff_time__lt=date,
+    ):
         proposal.state = ProposalStates.CANCELED
         proposal.save(update_fields=["state"])
 
@@ -88,28 +96,38 @@ def proposals_for_ended_rounds_should_be_cancelled():
 
 @shared_task(name="waldur_mastermind.proposal.expired_reviews_should_be_cancelled")
 def expired_reviews_should_be_cancelled():
-    """Cancel reviews that have expired."""
+    """Cancel reviews when their proposal has been decided (accepted/rejected)."""
+    # Only expire reviews when a decision has been made on the proposal
+    # Reviews should remain open until the proposal is decided, regardless of deadline
     for review in proposal_models.Review.objects.filter(
         state__in=(
             proposal_models.Review.States.IN_REVIEW,
             proposal_models.Review.States.CREATED,
-        )
+        ),
+        proposal__state__in=(
+            ProposalStates.ACCEPTED,
+            ProposalStates.REJECTED,
+            ProposalStates.CANCELED,
+        ),
     ):
-        if review.review_end_date <= timezone.now():
-            review.state = proposal_models.Review.States.REJECTED
-            review.save(update_fields=["state"])
+        review.state = proposal_models.Review.States.REJECTED
+        review.save(update_fields=["state"])
 
-            event_logger.emit(
-                f"Review for {review.proposal.name} has been canceled.",
-                event_type=EventType.REVIEW_CANCELED,
-                event_context={"review": review},
-                scopes=[_get_customer(review)],
-            )
-            logger.info(f"Review {review.proposal.name} has been canceled.")
+        event_logger.emit(
+            f"Review for {review.proposal.name} has been canceled.",
+            event_type=EventType.REVIEW_CANCELED,
+            event_context={"review": review},
+            scopes=[_get_customer(review)],
+        )
+        logger.info(f"Review {review.proposal.name} has been canceled.")
 
 
 @shared_task(name="waldur_mastermind.proposal.notify_user_about_proposal_state_update")
 def notify_user_about_proposal_state_update(proposal_uuid, previous_state, new_state):
+    # skip notification if state has not changed
+    if previous_state == new_state:
+        return
+
     proposal = proposal_models.Proposal.objects.get(uuid=proposal_uuid)
 
     if not proposal.created_by or not proposal.created_by.email:
@@ -255,6 +273,7 @@ def notify_call_managers_about_rejected_review(review_uuid):
         "reviewer_name": review.reviewer.full_name,
         "assign_date": review.created,
         "rejection_date": review.modified,
+        "rejection_reason": review.summary_private_comment,
         "create_review_link": core_utils.format_homeport_link(
             "call-management/{customer_uuid}/proposals/",
             customer_uuid=review.proposal.round.call.manager.customer.uuid,
@@ -603,3 +622,168 @@ def notify_manager_when_reviews_are_completed(proposal_uuid):
         context,
         manager_emails,
     )
+
+
+@shared_task(name="waldur_mastermind.proposal.send_stale_proposal_reminders")
+def send_stale_proposal_reminders():
+    """Send reminder emails for draft proposals that haven't been edited in 14 days."""
+    # Calculate the date 14 days ago
+    reminder_threshold = timezone.now() - timedelta(days=14)
+
+    # First, clean up stale_reminder_sent_at for proposals that were modified recently
+    # This handles edge cases where the flag wasn't cleared on update
+    proposal_models.Proposal.objects.filter(
+        state=ProposalStates.DRAFT,
+        modified__gt=reminder_threshold,
+        stale_reminder_sent_at__isnull=False,
+    ).update(stale_reminder_sent_at=None)
+
+    # Find draft proposals that:
+    # - Are in DRAFT state
+    # - Haven't been modified in at least 14 days
+    # - Reminder was never sent
+    stale_proposals = proposal_models.Proposal.objects.filter(
+        state=ProposalStates.DRAFT,
+        modified__lte=reminder_threshold,
+        stale_reminder_sent_at__isnull=True,
+    )
+
+    for proposal in stale_proposals:
+        # Get all proposal managers
+        managers = get_users(proposal, PermissionEnum.MANAGE_PROPOSAL)
+
+        # Also include the proposal creator (for old proposals that may not have the permission)
+        recipients = set(managers) if managers else set()
+        if proposal.created_by:
+            recipients.add(proposal.created_by)
+
+        if not recipients:
+            logger.warning(
+                f"Cannot send stale proposal reminder. Proposal {proposal.uuid} has no managers or creator."
+            )
+            # still mark as sent as we still want to delete the proposal later
+            proposal_models.Proposal.objects.filter(pk=proposal.pk).update(
+                stale_reminder_sent_at=timezone.now()
+            )
+            continue
+
+        # Get emails of recipients (removing duplicates)
+        recipient_emails = [r.email for r in recipients if r.email]
+
+        if not recipient_emails:
+            logger.warning(
+                f"Cannot send stale proposal reminder. Proposal {proposal.uuid} recipients have no valid emails."
+            )
+            continue
+
+        proposal_link = core_utils.format_homeport_link(
+            "proposals/{proposal_uuid}/",
+            proposal_uuid=proposal.uuid,
+        )
+
+        days_since_modification = (timezone.now() - proposal.modified).days
+        days_until_deletion = 14  # 14 days after reminder
+        reminder_date = timezone.now()
+        deletion_date = (reminder_date + timedelta(days=14)).strftime("%B %d, %Y")
+
+        context = {
+            "site_name": config.SITE_NAME,
+            "proposal_name": proposal.name,
+            "call_name": proposal.round.call.name,
+            "proposal_url": proposal_link,
+            "last_modified": proposal.modified.strftime("%B %d, %Y at %H:%M"),
+            "days_since_modification": days_since_modification,
+            "days_until_deletion": days_until_deletion,
+            "deletion_date": deletion_date,
+        }
+
+        try:
+            core_utils.broadcast_mail(
+                "proposal",
+                "stale_proposal_reminder",
+                context,
+                recipient_emails,
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to send stale proposal reminder to {recipient_emails} for proposal {proposal.name}: {e}"
+            )
+            continue
+
+        # Mark that reminder has been sent (use update to avoid triggering auto_now on modified)
+        proposal_models.Proposal.objects.filter(pk=proposal.pk).update(
+            stale_reminder_sent_at=timezone.now()
+        )
+
+        logger.info(
+            f"Sent stale proposal reminder for proposal {proposal.name} to {len(recipient_emails)} recipient(s)."
+        )
+
+
+@shared_task(name="waldur_mastermind.proposal.delete_stale_proposals")
+def delete_stale_proposals():
+    """Delete draft proposals 14 days after reminder was sent."""
+    # Calculate the date 14 days ago
+    deletion_threshold = timezone.now() - timedelta(days=14)
+
+    # Find draft proposals where:
+    # - Reminder was sent at least 14 days ago
+    # This ensures proposals are only deleted after managers have been notified
+    stale_proposals = proposal_models.Proposal.objects.filter(
+        state=ProposalStates.DRAFT,
+        stale_reminder_sent_at__lte=deletion_threshold,
+        stale_reminder_sent_at__isnull=False,
+    )
+
+    for proposal in stale_proposals:
+        # Get all proposal managers for notification
+        managers = get_users(proposal, PermissionEnum.MANAGE_PROPOSAL)
+
+        # Also include the proposal creator (for old proposals that may not have the permission)
+        recipients = set(managers) if managers else set()
+        if proposal.created_by:
+            recipients.add(proposal.created_by)
+
+        recipient_emails = [r.email for r in recipients if r.email]
+
+        # Store proposal info before deletion
+        proposal_name = proposal.name
+        proposal_uuid = proposal.uuid
+        call_name = proposal.round.call.name
+        last_modified = proposal.modified.strftime("%B %d, %Y at %H:%M")
+        days_since_modification = (timezone.now() - proposal.modified).days
+        deletion_date = timezone.now().strftime("%B %d, %Y at %H:%M")
+
+        # Delete the proposal
+        proposal.delete()
+
+        logger.info(
+            f"Deleted stale proposal {proposal_name} (UUID: {proposal_uuid}) - last modified {days_since_modification} days ago."
+        )
+
+        # Send notification to managers and creator
+        if recipient_emails:
+            context = {
+                "site_name": config.SITE_NAME,
+                "proposal_name": proposal_name,
+                "call_name": call_name,
+                "last_modified": last_modified,
+                "days_since_modification": days_since_modification,
+                "deletion_date": deletion_date,
+            }
+
+            try:
+                core_utils.broadcast_mail(
+                    "proposal",
+                    "stale_proposal_deleted",
+                    context,
+                    recipient_emails,
+                )
+
+                logger.info(
+                    f"Sent deletion notification for proposal {proposal_name} to {len(recipient_emails)} recipient(s)."
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to send stale proposal deletion notification to {recipient_emails} for proposal {proposal_name}: {e}"
+                )

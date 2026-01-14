@@ -421,6 +421,39 @@ class ResourceEndingContext(BaseModel):
     delta: int = Field(description="The number of days until the resource's end date.")
 
 
+class ToSConsentRequiredContext(BaseModel):
+    user: Any = Field(
+        description="The User model instance who needs to provide consent."
+    )
+    offering: Any = Field(
+        description="The Offering model instance. Provides offering.name."
+    )
+    terms_of_service_link: str = Field(
+        description="Direct link to the Terms of Service document."
+    )
+    tos_management_url: str = Field(
+        description="URL to the ToS management page where user can manage all consents."
+    )
+    version: str = Field(description="Version of the ToS requiring consent.")
+    site_name: str = Field(description="Name of the site from settings.")
+
+
+class ToSReconsentRequiredContext(BaseModel):
+    user: Any = Field(description="The User model instance whose consent expired.")
+    offering: Any = Field(
+        description="The Offering model instance. Provides offering.name."
+    )
+    terms_of_service_link: str = Field(
+        description="Direct link to the updated Terms of Service."
+    )
+    tos_management_url: str = Field(
+        description="URL to the ToS management page where user can consent or revoke consent."
+    )
+    old_version: str = Field(description="Previous ToS version.")
+    new_version: str = Field(description="New ToS version requiring re-consent.")
+    site_name: str = Field(description="Name of the site from settings.")
+
+
 class MarketplaceSection(NotificationSection):
     class Meta:
         key = "marketplace"
@@ -509,6 +542,16 @@ class MarketplaceSection(NotificationSection):
         key="notify_provider_about_pending_order",
         description="Notifies service provider owners about a pending order for their offering.",
         context_model=NotifyProviderAboutPendingOrderContext,
+    )
+    tos_consent_required = Notification(
+        key="tos_consent_required",
+        description="Notifies user that ToS consent is required to access a resource.",
+        context_model=ToSConsentRequiredContext,
+    )
+    tos_reconsent_required = Notification(
+        key="tos_reconsent_required",
+        description="Notifies user that ToS has been updated and re-consent is required.",
+        context_model=ToSReconsentRequiredContext,
     )
 
 
@@ -696,7 +739,7 @@ class ProposalStateChangedContext(BaseModel):
     call_name: str = Field(description="Name of the call for proposals.")
     rejection_feedback: str | None = Field(
         default=None,
-        description="Comments from the manager if the proposal was rejected.",
+        description="Comments from the manager if the proposal was rejected or returned.",
     )
     allocated_resources: list[dict[str, str]] | None = Field(
         default=None,
@@ -765,6 +808,36 @@ class ProposalCancelledContext(BaseModel):
     cancellation_date: Any = Field(description="The date and time of cancellation.")
     proposal_url: str = Field(description="A URL to the cancelled proposal.")
     proposal_creator_name: str = Field(description="Full name of the proposal creator.")
+
+
+class StaleProposalReminderContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_name: str = Field(description="Name of the stale draft proposal.")
+    call_name: str = Field(description="Name of the call.")
+    proposal_url: str = Field(description="URL to the proposal details page.")
+    last_modified: str = Field(description="Date when the proposal was last modified.")
+    days_since_modification: int = Field(
+        description="Number of days since the proposal was last modified."
+    )
+    days_until_deletion: int = Field(
+        description="Number of days until the proposal will be deleted."
+    )
+    deletion_date: str = Field(
+        description="Date when the proposal will be automatically deleted."
+    )
+
+
+class StaleProposalDeletedContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_name: str = Field(description="Name of the deleted proposal.")
+    call_name: str = Field(description="Name of the call.")
+    last_modified: str = Field(description="Date when the proposal was last modified.")
+    days_since_modification: int = Field(
+        description="Number of days since the proposal was last modified."
+    )
+    deletion_date: str = Field(
+        description="Date and time when the proposal was deleted."
+    )
 
 
 class ReviewAssignedContext(BaseModel):
@@ -908,6 +981,16 @@ class ProposalSection(NotificationSection):
         key="round_closing_for_managers",
         description="Notifies call managers that a round has ended, with a summary of proposals and reviews.",
         context_model=RoundClosingForManagersContext,
+    )
+    stale_proposal_reminder = Notification(
+        key="stale_proposal_reminder",
+        description="Reminds proposal managers that a draft proposal will be deleted in 14 days if not submitted.",
+        context_model=StaleProposalReminderContext,
+    )
+    stale_proposal_deleted = Notification(
+        key="stale_proposal_deleted",
+        description="Notifies proposal managers that a draft proposal has been automatically deleted.",
+        context_model=StaleProposalDeletedContext,
     )
     round_opening_for_reviewers = Notification(
         key="round_opening_for_reviewers",

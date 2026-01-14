@@ -343,6 +343,7 @@ class AccessSubnet(core_models.UuidMixin, core_models.DescribableMixin, Loggable
 
     class Meta:
         unique_together = ("customer", "inet")
+        ordering = ["inet"]
 
     def __str__(self):
         return self.customer.name + " | " + str(self.inet)
@@ -819,6 +820,20 @@ class Project(
         choices=ProjectKind.choices,
         verbose_name=_("project type"),
     )
+
+    termination_metadata = JSONField(
+        null=True,
+        blank=True,
+        help_text=_("Metadata captured at project termination for recovery purposes"),
+    )
+
+    staff_notes = models.CharField(
+        _("staff notes"),
+        max_length=core_models.DESCRIPTION_LENGTH,
+        blank=True,
+        help_text=_("Internal notes visible only to staff and support users"),
+    )
+
     tracker = cast(FieldInstanceTracker, FieldTracker())
     # Entities returned in manager available_objects are limited to not-deleted instances.
     # Entities returned in manager objects include deleted objects.
@@ -877,8 +892,12 @@ class Project(
         return User.objects.filter(id__in=project_users).order_by("username")
 
     @transaction.atomic()
-    def _soft_delete(self, using=None):
+    def _soft_delete(self, using=None, terminated_by=None):
         """Method for project soft delete. It doesn't delete a project, only mark as 'removed', but it sends signals"""
+        # Store terminating user for handler access
+        if terminated_by:
+            self._terminating_user = terminated_by
+
         # Set flag to indicate this object is being deleted to skip quota aggregation
         self._deleting = True
 
@@ -893,7 +912,53 @@ class Project(
         # We will let the short name change here as a first step to removing it.
         # The unique shortname is now stored in the waldur_openportal plugin,
         # and this cannot be changed once set.
+
+        # Capture whether short_name changed BEFORE saving (tracker resets after save)
+        short_name_changed = hasattr(self, "tracker") and self.tracker.has_changed("short_name")
+
         super().save(*args, **kwargs)
+
+        # Sync short_name changes to ProjectInfo.shortname and Project.slug
+        # Use _syncing_to_projectinfo flag to prevent circular updates
+        if short_name_changed:
+            if self.short_name and not getattr(self, "_syncing_to_projectinfo", False):
+                try:
+                    from waldur_openportal.models import ProjectInfo
+
+                    project_info = ProjectInfo.objects.filter(project=self).first()
+                    if project_info:
+                        # ProjectInfo exists - sync through set_shortname which will update slug
+                        if project_info.shortname != self.short_name:
+                            project_info.set_shortname(self.short_name, force=True)
+                    else:
+                        # ProjectInfo doesn't exist yet - check if we should update slug
+                        # Only update slug if NOT in application_portal_only mode
+                        try:
+                            from waldur_core.core.models import Feature
+
+                            application_portal_only = Feature.objects.get(
+                                key="deployment.application_portal_only"
+                            ).value
+                        except Exception:
+                            # Default to False if feature flag doesn't exist
+                            application_portal_only = False
+
+                        if not application_portal_only and self.slug != self.short_name:
+                            Project.objects.filter(pk=self.pk).update(slug=self.short_name)
+                except Exception:
+                    # waldur_openportal may not be installed
+                    # In this case, try to update slug if not in portal mode
+                    try:
+                        from waldur_core.core.models import Feature
+
+                        application_portal_only = Feature.objects.get(
+                            key="deployment.application_portal_only"
+                        ).value
+                    except Exception:
+                        application_portal_only = False
+
+                    if not application_portal_only and self.slug != self.short_name:
+                        Project.objects.filter(pk=self.pk).update(slug=self.short_name)
 
     def delete(self, using=None, soft=True, *args, **kwargs):
         """Use soft delete, i.e. mark a project as 'removed'."""

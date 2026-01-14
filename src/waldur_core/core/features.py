@@ -44,6 +44,8 @@ class CustomerSection(FeatureSection):
         "Allows to show permission reviews tab and popups for organisations."
     )
 
+    show_banking_data = Feature("Display banking related data under customer profile.")
+
 
 class ProjectSection(FeatureSection):
     class Meta:
@@ -92,6 +94,14 @@ class UserSection(FeatureSection):
         key = "user"
         description = "User workspace"
 
+    credentials = Feature(
+        "Enable credentials management (SSH keys, API tokens, etc.) in user workspace."
+    )
+
+    disable_long_tokens = Feature(
+        "Disallow non-staff/support users from creating API tokens with unlimited or long expiration times (more than an hour)."
+    )
+
     preferred_language = Feature("Render preferred language column in users list.")
 
     ssh_keys = Feature("Enable SSH keys management in user workspace.")
@@ -100,11 +110,27 @@ class UserSection(FeatureSection):
         "Enable email and webhook notifications management in user workspace."
     )
 
+    permission_requests = Feature(
+        "Enable permission requests management in user workspace."
+    )
+
     disable_user_termination = Feature("Disable user termination in user workspace.")
 
     show_slug = Feature("Enable display of slug field in user summary.")
 
     show_username = Feature("Enable display of username field in user tables.")
+
+    show_slug_as_id = Feature(
+        "Show the user slug as an identifier on the dashboard and all user lists."
+    )
+
+    minimal_user_profile = Feature(
+        "Show and allow editing of minimal set of user profile fields (e.g. just name and email)."
+    )
+
+    allow_user_creation = Feature(
+        "Allow users to create new user accounts when adding team members to projects and proposals."
+    )
 
 
 class MarketplaceSection(FeatureSection):
@@ -140,6 +166,16 @@ class MarketplaceSection(FeatureSection):
         "Allow display of images in markdown format."
     )
     display_user_tos = Feature("Enable display of user terms of service in UI.")
+
+    show_managed_projects = Feature(
+        "Allows to show managed (openportal) remote projects in organization."
+    )
+
+    display_software_catalog = Feature("Enable display of software catalog in UI.")
+
+    display_offering_partitions = Feature(
+        "Enable display of offering partitions in UI."
+    )
 
 
 class SupportSection(FeatureSection):
@@ -213,3 +249,9 @@ class WaldurDeploymentSection(FeatureSection):
 
     send_metrics = Feature("Send telemetry metrics.")
     enable_cookie_notice = Feature("Enable cookie notice in marketplace.")
+    application_portal_only = Feature(
+        "Configure Waldur to function as an application and awards portal only."
+    )
+    make_slugs_immutable = Feature(
+        "Make slugs immutable, i.e. disallow direct changes to slugs after they have been set. Note that slugs may still be changed indirectly."
+    )

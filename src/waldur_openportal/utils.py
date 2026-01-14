@@ -45,17 +45,21 @@ def get_openportal_robot():
     from waldur_core.core import models
 
     robot_user, created = models.User.objects.get_or_create(
-        username="openportal_robot", is_staff=True, is_active=True
+        username="openportal_robot",
+        defaults={
+            "is_staff": True,
+            "is_active": True,
+            "description": (
+                "Special user used for performing actions on behalf of OpenPortal."
+            ),
+            "first_name": "OpenPortal",
+            "last_name": "Robot",
+            "email": config.SITE_EMAIL,
+        },
     )
     if created:
         robot_user.set_unusable_password()
-        robot_user.description = (
-            "Special user used for performing actions on behalf of OpenPortal."
-        )
-        robot_user.first_name = "OpenPortal"
-        robot_user.last_name = "Robot"
-        robot_user.email = config.SITE_EMAIL
-        robot_user.save()
+        robot_user.save(update_fields=["password"])
     return robot_user
 
 
@@ -304,9 +308,44 @@ def get_remote_association(user, allocation):
             )
 
 
-def get_project_spend_info(project) -> (decimal.Decimal, decimal.Decimal):
+def fix_total_allocation(project):
+    """
+    Run this function to fix the balance of managed projects so that
+    their balance at the beginning of the month is correct. This fixes
+    any issues or discrepancies that may have arisen.
+    """
+    try:
+        managed_project = models.ManagedProject.objects.get(project=project)
+    except models.ManagedProject.DoesNotExist:
+        logger.error(f"Project {project} is not a managed project")
+        return
+
+    project_template = managed_project.get_project_template()
+
+    if project_template is None:
+        logger.error(f"Managed project {project} has no project template")
+        return
+
+    details = managed_project.get_details()
+
+    if details is None:
+        logger.error(f"Managed project {project} has no details")
+        return
+
+    allocation = project_template.convert_to_credits(details.allocation)
+
+    set_project_credits(project, allocation)
+
+
+def get_project_spend_info(
+    project, include_current_month: bool = True
+) -> tuple[decimal.Decimal, decimal.Decimal]:
     """
     Return a tuple of the total credits and total spend for the passed project
+
+    Args:
+        project: The project to get spend info for
+        include_current_month: If False, exclude current month's invoice items from spend calculation
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
@@ -324,7 +363,18 @@ def get_project_spend_info(project) -> (decimal.Decimal, decimal.Decimal):
     # Get all the spend for the project
     try:
         invoice_items = invoice_models.InvoiceItem.objects.filter(project=project)
-    except Exception:
+
+        # Exclude current month if requested
+        if not include_current_month:
+            now = timezone.now()
+            current_year = now.year
+            current_month = now.month
+
+            invoice_items = invoice_items.exclude(
+                invoice__year=current_year, invoice__month=current_month
+            )
+    except Exception as e:
+        logger.error(f"Failed to get invoice items for project {project}: {e}")
         invoice_items = []
 
     for invoice_item in invoice_items:
@@ -340,7 +390,8 @@ def get_project_spend_info(project) -> (decimal.Decimal, decimal.Decimal):
         # no need to do anything if usage == 0
 
     logger.info(
-        f"Project {project} has total credits: {total_credits}, total spend: {total_spend}"
+        f"Project {project} has total credits: {total_credits}, total spend: {total_spend} "
+        f"(include_current_month={include_current_month})"
     )
 
     return (total_credits, total_spend)
@@ -348,15 +399,17 @@ def get_project_spend_info(project) -> (decimal.Decimal, decimal.Decimal):
 
 def get_project_credits(project) -> decimal.Decimal:
     """
-    Get the credits for the project.
+    Get the total lifetime credits awarded to the project.
     If the project has no credits, return 0.0
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
 
-    (total_credits, _) = get_project_spend_info(project)
+    (total_credits, total_spend) = get_project_spend_info(
+        project, include_current_month=False
+    )
 
-    return total_credits
+    return total_credits + total_spend
 
 
 def set_project_credits(project, credits: decimal.Decimal | float):
@@ -383,25 +436,30 @@ def set_project_credits(project, credits: decimal.Decimal | float):
     if credits < decimal.Decimal(0.0):
         credits = decimal.Decimal(0.0)
 
-    (total_credits, total_spend) = get_project_spend_info(project)
+    # Get spend info excluding current month (we want start-of-month balance)
+    (total_credits, total_spend) = get_project_spend_info(
+        project, include_current_month=False
+    )
 
-    if credits < total_credits:
-        # cannot reduce to less than the current total spend
-        if credits < total_spend:
-            logger.warning(
-                f"Cannot set project credits to {credits} as it is less than the total spend {total_spend} for project {project}"
-            )
-            logger.warning(
-                f"Instead, setting project credits to the total spend {total_spend} so that no more can be consumed"
-            )
-            credits = total_spend
+    # Calculate what the credit balance should be: allocation - historical_spend
+    # This gives us the start-of-month balance for the current month
+    desired_credit_balance = credits - total_spend
 
-    change_in_credits = credits - total_credits
+    if desired_credit_balance < decimal.Decimal(0):
+        logger.warning(
+            f"Desired credit balance ({desired_credit_balance}) is negative for project {project}. "
+            f"Allocation: {credits}, Spend: {total_spend}. "
+            f"Setting balance to 0."
+        )
+        desired_credit_balance = decimal.Decimal(0)
+
+    change_in_credits = desired_credit_balance - total_credits
 
     if abs(change_in_credits) < decimal.Decimal(0.01):
         # no change in credits, so nothing to do
         logger.info(
-            f"No change in credits for project {project}: {total_credits} -> {credits}"
+            f"No change in credits for project {project}: {total_credits} -> {desired_credit_balance} "
+            f"(allocation: {credits}, spend: {total_spend})"
         )
         return
 
@@ -442,10 +500,11 @@ def set_project_credits(project, credits: decimal.Decimal | float):
     )
 
     try:
-        project_credit.value = project_credit.value + change_in_credits
+        project_credit.value = desired_credit_balance
         project_credit.save(update_fields=["value"])
         logger.info(
-            f"Project credits for project {project} set to {project_credit.value} (was {total_credits})"
+            f"Project credits for project {project} set to {project_credit.value} (was {total_credits}, "
+            f"allocation: {credits}, spend: {total_spend}, change: {change_in_credits})"
         )
     except Exception as e:
         logger.error(
@@ -565,3 +624,135 @@ def invite_user_to_project(project, email, role, send_email: bool = True):
 
     if send_email:
         user_tasks.process_invitation.delay(invitation.uuid.hex, "OpenPortal")
+
+
+def sync_openportal_shortnames_to_slugs():
+    """
+    Synchronize shortnames from ProjectInfo and UserInfo to their respective
+    Project and User slug fields. This is used in "Project Management" mode
+    where these shortnames are used instead of proposal IDs.
+
+    This function:
+    1. Copies ProjectInfo.shortname to Project.slug where they differ
+    2. Copies UserInfo.shortname to User.slug where they differ
+
+    Only updates slugs where:
+    - The shortname exists (is not None/empty)
+    - The shortname differs from the current slug
+
+    Returns:
+        dict: Statistics about the sync operation with keys:
+            - projects_updated: Number of projects updated
+            - users_updated: Number of users updated
+            - projects_skipped: Number of projects skipped (no shortname or already matching)
+            - users_skipped: Number of users skipped (no shortname or already matching)
+            - errors: List of error messages encountered
+    """
+    projects_updated = 0
+    users_updated = 0
+    projects_skipped = 0
+    users_skipped = 0
+    errors = []
+
+    logger.info("Starting sync of OpenPortal shortnames to slugs...")
+
+    # Sync ProjectInfo shortnames to Project slugs
+    for project_info in models.ProjectInfo.objects.all().select_related("project"):
+        try:
+            # Skip if no shortname or project doesn't exist
+            if not project_info.shortname or not project_info.project:
+                projects_skipped += 1
+                logger.debug(
+                    f"Skipping ProjectInfo {project_info.id}: "
+                    f"shortname={project_info.shortname}, project exists={bool(project_info.project)}"
+                )
+                continue
+
+            project = project_info.project
+            shortname = project_info.shortname.strip()
+
+            # Skip if slug already matches
+            if project.slug == shortname:
+                projects_skipped += 1
+                logger.debug(
+                    f"Skipping project {project.name} ({project.uuid}): "
+                    f"slug already matches shortname '{shortname}'"
+                )
+                continue
+
+            # Update the slug
+            old_slug = project.slug
+            project.slug = shortname
+            project.save(update_fields=["slug"])
+            projects_updated += 1
+
+            logger.info(
+                f"Updated project {project.name} ({project.uuid}) slug: "
+                f"'{old_slug}' -> '{shortname}'"
+            )
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to sync ProjectInfo {project_info.id} "
+                f"(shortname='{project_info.shortname}'): {e}"
+            )
+            errors.append(error_msg)
+            logger.error(error_msg, exc_info=True)
+
+    # Sync UserInfo shortnames to User slugs
+    for user_info in models.UserInfo.objects.all().select_related("user"):
+        try:
+            # Skip if no shortname or user doesn't exist
+            if not user_info.shortname or not user_info.user:
+                users_skipped += 1
+                logger.debug(
+                    f"Skipping UserInfo {user_info.id}: "
+                    f"shortname={user_info.shortname}, user exists={bool(user_info.user)}"
+                )
+                continue
+
+            user = user_info.user
+            shortname = user_info.shortname.strip()
+
+            # Skip if slug already matches
+            if user.slug == shortname:
+                users_skipped += 1
+                logger.debug(
+                    f"Skipping user {user.username} ({user.uuid}): "
+                    f"slug already matches shortname '{shortname}'"
+                )
+                continue
+
+            # Update the slug
+            old_slug = user.slug
+            user.slug = shortname
+            user.save(update_fields=["slug"])
+            users_updated += 1
+
+            logger.info(
+                f"Updated user {user.username} ({user.uuid}) slug: "
+                f"'{old_slug}' -> '{shortname}'"
+            )
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to sync UserInfo {user_info.id} "
+                f"(shortname='{user_info.shortname}'): {e}"
+            )
+            errors.append(error_msg)
+            logger.error(error_msg, exc_info=True)
+
+    # Log summary
+    logger.info(
+        f"Sync complete. Projects: {projects_updated} updated, {projects_skipped} skipped. "
+        f"Users: {users_updated} updated, {users_skipped} skipped. "
+        f"Errors: {len(errors)}"
+    )
+
+    return {
+        "projects_updated": projects_updated,
+        "users_updated": users_updated,
+        "projects_skipped": projects_skipped,
+        "users_skipped": users_skipped,
+        "errors": errors,
+    }

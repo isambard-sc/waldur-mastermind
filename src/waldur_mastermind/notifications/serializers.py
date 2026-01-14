@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from waldur_core.core import serializers as core_serializers
+from waldur_core.core.models import User
 from waldur_core.core.serializers import (
     AugmentedSerializerMixin,
     RestrictedSerializerMixin,
@@ -25,10 +26,56 @@ class QuerySerializer(serializers.Serializer):
         required=False,
     )
     all_users = serializers.BooleanField(default=False)
+    proposal_states = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+    )
+    include_reviewers = serializers.BooleanField(default=False)
+    send_to_me = serializers.BooleanField(default=False)
+    additional_recipients = serializers.ListField(
+        child=serializers.EmailField(),
+        required=False,
+    )
+    excluded_recipients = serializers.ListField(
+        child=serializers.EmailField(),
+        required=False,
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Avoid circular import - set Round queryset dynamically
+        try:
+            from waldur_mastermind.proposal.models import Round
+
+            self.fields["round"] = serializers.SlugRelatedField(
+                slug_field="uuid",
+                queryset=Round.objects.all(),
+                required=False,
+            )
+        except ImportError:
+            # proposal app not installed - make it read-only
+            self.fields["round"] = serializers.SlugRelatedField(
+                slug_field="uuid",
+                read_only=True,
+                required=False,
+            )
 
 
 def format_options(options):
-    return [{"name": option.name, "uuid": option.uuid.hex} for option in options]
+    return [
+        {"name": option.name, "uuid": option.uuid.hex} for option in options
+    ]
+
+
+def format_users(users):
+    return [
+        {
+            "uuid": user.uuid.hex,
+            "email": user.email,
+            "full_name": user.full_name,
+        }
+        for user in users
+    ]
 
 
 def serialize_query(query):
@@ -38,7 +85,45 @@ def serialize_query(query):
     if "offerings" in query:
         serialized_query["offerings"] = format_options(query["offerings"])
     serialized_query["all_users"] = query.get("all_users", False)
+    if "round" in query and query["round"]:
+        serialized_query["round"] = {
+            "name": query["round"].name,
+            "uuid": query["round"].uuid.hex,
+        }
+    if "proposal_states" in query:
+        serialized_query["proposal_states"] = query["proposal_states"]
+    serialized_query["include_reviewers"] = query.get("include_reviewers", False)
+    serialized_query["send_to_me"] = query.get("send_to_me", False)
+    if "additional_recipients" in query:
+        serialized_query["additional_recipients"] = query["additional_recipients"]
+    if "excluded_recipients" in query:
+        serialized_query["excluded_recipients"] = query["excluded_recipients"]
     return serialized_query
+
+
+class BroadcastMessageAttachmentSerializer(serializers.ModelSerializer):
+    uploaded_by_full_name = serializers.ReadOnlyField(
+        source="uploaded_by.full_name"
+    )
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.BroadcastMessageAttachment
+        fields = (
+            "uuid",
+            "filename",
+            "size",
+            "created",
+            "uploaded_by_full_name",
+            "file_url",
+        )
+        read_only_fields = ("uuid", "created", "uploaded_by_full_name", "file_url")
+
+    def get_file_url(self, obj) -> str | None:
+        request = self.context.get("request")
+        if request and obj.file:
+            return request.build_absolute_uri(obj.file.url)
+        return None
 
 
 class BroadcastMessageSerializer(
@@ -47,6 +132,7 @@ class BroadcastMessageSerializer(
     author_full_name = serializers.ReadOnlyField(source="author.full_name")
     state = serializers.ReadOnlyField()
     emails = serializers.ReadOnlyField()
+    attachments = BroadcastMessageAttachmentSerializer(many=True, read_only=True)
 
     class Meta:
         model = models.BroadcastMessage
@@ -60,6 +146,7 @@ class BroadcastMessageSerializer(
             "emails",
             "state",
             "send_at",
+            "attachments",
         )
 
     def validate_query(self, query):
@@ -70,15 +157,21 @@ class BroadcastMessageSerializer(
     def create(self, validated_data):
         current_user = self.context["request"].user
         validated_data["author"] = current_user
+        # Pass request object for send_to_me functionality
+        query_with_request = validated_data["query"].copy()
+        query_with_request["_request"] = self.context["request"]
         validated_data["emails"] = utils.get_user_emails_for_query(
-            validated_data["query"]
+            query_with_request
         )
         validated_data["query"] = serialize_query(validated_data["query"])
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
+        # Pass request object for send_to_me functionality
+        query_with_request = validated_data["query"].copy()
+        query_with_request["_request"] = self.context["request"]
         validated_data["emails"] = utils.get_user_emails_for_query(
-            validated_data["query"]
+            query_with_request
         )
         validated_data["query"] = serialize_query(validated_data["query"])
         return super().update(instance, validated_data)

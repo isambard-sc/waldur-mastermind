@@ -1,5 +1,6 @@
 import logging
 import functools
+from decimal import Decimal
 
 from django.conf import settings
 from django.db import transaction
@@ -60,16 +61,6 @@ def schedule_project_sync(project):
     transaction.on_commit(
         lambda: tasks.sync_project.delay(core_utils.serialize_instance(project))
     )
-
-
-@if_plugin_enabled
-def schedule_sync_on_quota_change(sender, instance, created=False, **kwargs):
-    if instance.name != utils.QUOTA_NAME:
-        return
-    if created and instance.value == -1:
-        return
-
-    transaction.on_commit(schedule_sync)
 
 
 @if_plugin_enabled
@@ -380,8 +371,6 @@ def _sync_project_credits_for_project(project, created=False):
 
     # Calculate total allocation from all active RemoteAllocations
     try:
-        from decimal import Decimal
-
         total_allocation = Decimal(0)
 
         remote_allocations = models.RemoteAllocation.objects.filter(

@@ -49,9 +49,10 @@ def refresh_token(user: models.User) -> Token:
         lifetime = timezone.timedelta(seconds=user.token_lifetime)
 
         if token.created < timezone.now() - lifetime:
+            # Fix race condition: use get_or_create after delete to handle
+            # concurrent token deletion/creation atomically
             token.delete()
-            token = Token.objects.create(user=user)
-            created = True
+            token, created = Token.objects.get_or_create(user=user)
 
     if not created:
         # Token is updated for each request therefore it may become bottleneck.

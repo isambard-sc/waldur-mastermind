@@ -50,6 +50,25 @@ class InvitationFilterBackend(BaseFilterBackend):
             if not permission:
                 continue
             scopes = get_scope_ids(user, content_type, permission=permission)
+
+            # Special handling for Call invitations - only show to managers, not reviewers
+            if content_type.model == 'call' and content_type.app_label == 'proposal':
+                from waldur_core.permissions.enums import RoleEnum
+                from waldur_core.permissions.utils import get_users
+
+                # Filter to only include Calls where user is a manager
+                from waldur_mastermind.proposal import models as proposal_models
+                call_manager_scopes = []
+                for call_id in scopes:
+                    try:
+                        call = proposal_models.Call.objects.get(id=call_id)
+                        # Check if user is a Call Manager (not just a reviewer)
+                        if call.has_user(user, RoleEnum.CALL_MANAGER):
+                            call_manager_scopes.append(call_id)
+                    except proposal_models.Call.DoesNotExist:
+                        pass
+                scopes = call_manager_scopes
+
             subquery |= Q(content_type=content_type, object_id__in=scopes)
 
         return queryset.filter(subquery).distinct()

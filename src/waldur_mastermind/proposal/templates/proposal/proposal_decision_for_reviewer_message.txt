@@ -13,4 +13,4 @@ Thank you for your valuable contribution to the review process. Your expert asse
 
 View proposal: {{ proposal_url }}
 
-This is an automated message from {{ site_name }}. Please do not reply to this email.
+This is an automated message from the {{ site_name }}. Please do not reply to this email.

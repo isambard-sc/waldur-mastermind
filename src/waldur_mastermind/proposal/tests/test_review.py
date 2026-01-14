@@ -118,6 +118,32 @@ class ReviewCreateTest(test.APITransactionTestCase):
         self.assertIn(self.fixture.proposal_submitted.name, body)
         self.assertIn(self.fixture.call.name, body)
 
+    @data("staff", "call_manager")
+    def test_cannot_create_review_for_draft_proposal(self, user):
+        # Create a draft proposal
+        draft_proposal = factories.ProposalFactory(
+            name="Draft proposal",
+            round=self.fixture.round,
+            state=ProposalStates.DRAFT,
+        )
+
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+
+        payload = {
+            "proposal": factories.ProposalFactory.get_url(draft_proposal),
+            "reviewer": structure_factories.UserFactory.get_url(
+                self.fixture.reviewer_2
+            ),
+        }
+
+        response = self.client.post(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Reviews can only be created for proposals in In Review or Submitted state",
+            str(response.data),
+        )
+
     def create(self, user, **kwargs):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
@@ -329,6 +355,34 @@ class ActionTest(test.APITransactionTestCase):
         )
         self.assertIn(user.first_name, body)
         self.assertIn("Review Progress:", body)
+
+    @data("staff", "reviewer_1")
+    def test_reviewer_can_reject_with_comment(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        rejection_comment = "I don't have the expertise to review this proposal."
+
+        response = self.client.post(
+            factories.ReviewFactory.get_url(self.review, "reject"),
+            {"summary_private_comment": rejection_comment},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.state, models.Review.States.REJECTED)
+        self.assertEqual(self.review.summary_private_comment, rejection_comment)
+
+    @data("staff", "reviewer_1")
+    def test_reviewer_can_reject_without_comment(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+
+        response = self.client.post(
+            factories.ReviewFactory.get_url(self.review, "reject"),
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.state, models.Review.States.REJECTED)
+        self.assertEqual(self.review.summary_private_comment, "")
 
     @override_settings(task_always_eager=True)
     @data("reviewer_1")

@@ -121,6 +121,16 @@ class EventFilterBackend(filters.BaseFilterBackend):
             if not visible.filter(pk=scope.pk).exists():
                 return queryset.none()
 
+            # Special handling for Call scopes - only allow managers to see events, not reviewers
+            if scope._meta.model_name == 'call' and scope._meta.app_label == 'proposal':
+                from waldur_core.permissions.enums import RoleEnum
+                # Only allow Call Managers and staff/support to see events
+                if not (request.user.is_staff or request.user.is_support):
+                    if not scope.has_user(request.user, RoleEnum.CALL_MANAGER):
+                        # Also check if user is call organizer (customer owner)
+                        if not scope.manager.customer.has_user(request.user):
+                            return queryset.none()
+
             content_type = ContentType.objects.get_for_model(scope)
             subquery = Q(feed__content_type=content_type, feed__object_id=scope.id)
 

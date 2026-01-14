@@ -62,6 +62,21 @@
         </div>
         {% endif %}
 
+        {% if new_state == 'draft' %}
+        <p>
+          Your proposal has been returned by the call manager as they require further information or modifications before it can proceed to the review stage. Please review any comments or feedback provided.
+        </p>
+
+        <p>
+          <strong>Feedback:</strong> {{ rejection_feedback }}
+        </p>
+
+        <p>
+          If you still wish to continue, please make the necessary changes to your proposal and then resubmit it for review.
+        </p>
+        {% endif %}
+
+
         {% if new_state == 'rejected' %}
         <p><strong>Feedback:</strong> {{ rejection_feedback }}</p>
         {% endif %}

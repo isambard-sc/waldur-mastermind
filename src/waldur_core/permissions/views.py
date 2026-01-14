@@ -42,6 +42,22 @@ def can_destroy_role(role):
         raise ValidationError("Role is still used.")
 
 
+def validate_scope_not_soft_deleted(scope):
+    """Validate that the scope is not a soft-deleted project."""
+    if (
+        scope._meta.model_name == "project"
+        and hasattr(scope, "is_removed")
+        and scope.is_removed
+    ):
+        raise ValidationError(
+            {
+                "non_field_errors": [
+                    "Cannot manage team members for terminated projects."
+                ]
+            }
+        )
+
+
 class RoleViewSet(ActionsViewSet):
     queryset = models.Role.objects.all()
     serializer_class = serializers.RoleDetailsSerializer
@@ -242,15 +258,32 @@ class UserRoleMixin:
 
     @extend_schema(
         request=serializers.UserRoleCreateSerializer,
-        responses={201: serializers.UserRoleExpirationTimeSerializer},
+        responses={
+            201: serializers.UserRoleExpirationTimeSerializer,
+            400: {
+                "type": "object",
+                "properties": {
+                    "non_field_errors": {"type": "array", "items": {"type": "string"}}
+                },
+                "description": "Validation error when trying to add user to terminated project",
+                "example": {
+                    "non_field_errors": [
+                        "Cannot manage team members for terminated projects."
+                    ]
+                },
+            },
+        },
     )
     @action(detail=True, methods=["POST"])
     def add_user(self, request, uuid=None):
         scope = self.get_object()
+        validate_scope_not_soft_deleted(scope)
+
         serializer = serializers.UserRoleCreateSerializer(
             data=request.data, context={"scope": scope, "request": request}
         )
         serializer.is_valid(raise_exception=True)
+
         target_user = serializer.validated_data["user"]
         role = serializer.validated_data["role"]
         expiration_time = serializer.validated_data.get("expiration_time")
@@ -274,10 +307,13 @@ class UserRoleMixin:
     @action(detail=True, methods=["POST"])
     def update_user(self, request, uuid=None):
         scope = self.get_object()
+        validate_scope_not_soft_deleted(scope)
+
         serializer = serializers.UserRoleUpdateSerializer(
             data=request.data, context={"scope": scope, "request": request}
         )
         serializer.is_valid(raise_exception=True)
+
         target_user = serializer.validated_data["user"]
         role = serializer.validated_data["role"]
         expiration_time = serializer.validated_data.get("expiration_time")
@@ -300,6 +336,8 @@ class UserRoleMixin:
     @action(detail=True, methods=["POST"])
     def delete_user(self, request, uuid=None):
         scope = self.get_object()
+        validate_scope_not_soft_deleted(scope)
+
         serializer = serializers.UserRoleDeleteSerializer(
             data=request.data, context={"scope": scope, "request": request}
         )

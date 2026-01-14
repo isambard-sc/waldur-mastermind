@@ -14,4 +14,4 @@ Please log in to the platform to review the proposal. You can accept or reject t
 
 If you accept this assignment, you'll be able to access the full proposal content and submit your review.
 
-This is an automated message from {{ site_name }}. Please do not reply to this email.
+This is an automated message from the {{ site_name }}. Please do not reply to this email.

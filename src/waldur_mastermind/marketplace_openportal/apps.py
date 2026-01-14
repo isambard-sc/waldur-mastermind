@@ -20,14 +20,9 @@ class MarketplaceOpenPortalConfig(AppConfig):
             handlers,
             processor,
         )
-        from waldur_mastermind.marketplace_openportal import (
-            registrators as openportal_registrators,
-        )
         from waldur_openportal.apps import OpenPortalConfig
         from waldur_openportal import models as openportal_models
         from waldur_openportal import signals as openportal_signals
-
-        openportal_registrators.OpenPortalRegistrator.connect()
 
         signals.post_save.connect(
             handlers.update_component_quota,
@@ -56,9 +51,7 @@ class MarketplaceOpenPortalConfig(AppConfig):
                     measured_unit="hours",
                     billing_type=USAGE,
                     limit_period=TOTAL,
-                    limit_amount=openportal_registrators.OpenPortalRegistrator.convert_quantity(
-                        default_limits["NODE"], "node"
-                    ),
+                    limit_amount=default_limits["NODE"],
                 ),
             ),
             service_type=OpenPortalConfig.service_name,

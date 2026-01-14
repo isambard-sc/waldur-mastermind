@@ -13,6 +13,7 @@ from drf_spectacular.utils import OpenApiParameter
 from rest_framework.serializers import ListSerializer
 
 from waldur_core.core.serializers import RestrictedSerializerMixin
+from waldur_core.core.signals import pre_serializer_fields
 
 
 class WaldurOpenApiInspector(AutoSchema):
@@ -88,24 +89,75 @@ class WaldurOpenApiInspector(AutoSchema):
     def get_override_parameters(self):
         if self.method != "GET":
             return []
+
         serializer = self.get_response_serializers()
-        if not isinstance(serializer, RestrictedSerializerMixin):
-            return []
+
         if isinstance(serializer, ListSerializer):
             serializer = serializer.child
 
-        try:
-            fields = serializer.fields.keys()
-        except (KeyError, AttributeError):
+        if not isinstance(serializer, RestrictedSerializerMixin):
             return []
+
+        # Get the serializer class, not the instance
+        serializer_class = serializer.__class__
+
+        try:
+            # Create a temporary serializer with schema generation context
+            # but also trigger signal-based field additions
+            temp_serializer = serializer_class(context={"swagger_fake_view": True})
+
+            # Get fields after initialization to include any dynamically added fields
+            fields = list(temp_serializer.get_fields().keys())
+
+            # Additionally, trigger pre_serializer_fields signal to ensure
+            # signal-based fields are included in schema generation
+            # Create a temporary fields dict to collect signal-based additions
+            signal_fields = {}
+            pre_serializer_fields.send(
+                sender=serializer_class,
+                fields=signal_fields,
+            )
+
+            # Merge signal-based fields with existing fields
+            all_fields = set(fields) | set(signal_fields.keys())
+            fields = list(all_fields)
+
+        except Exception:
+            # Fallback: try to get fields from the Meta class directly
+            try:
+                if hasattr(serializer_class, "Meta") and hasattr(
+                    serializer_class.Meta, "fields"
+                ):
+                    meta_fields = serializer_class.Meta.fields
+                    if meta_fields == "__all__":
+                        # Can't determine fields for __all__, skip parameter generation
+                        return []
+                    fields = list(meta_fields)
+
+                    # Even in fallback, try to get signal-based fields
+                    try:
+                        signal_fields = {}
+                        pre_serializer_fields.send(
+                            sender=serializer_class,
+                            fields=signal_fields,
+                        )
+                        fields = list(set(fields) | set(signal_fields.keys()))
+                    except Exception:
+                        pass  # If signal processing fails, continue with Meta fields only
+                else:
+                    return []
+            except (KeyError, AttributeError):
+                return []
+
         if not fields or len(fields) == 1:
             return []
+
         return [
             OpenApiParameter(
                 name=RestrictedSerializerMixin.FIELDS_PARAM_NAME,
                 type=build_array_type(build_basic_type(OpenApiTypes.STR)),
                 location=OpenApiParameter.QUERY,
-                enum=sorted(fields),
+                enum=sorted(set(fields)),
             )
         ]
 

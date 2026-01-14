@@ -48,12 +48,6 @@ class OpenPortalConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.schedule_sync_on_quota_change,
-            sender=quota_models.QuotaLimit,
-            dispatch_uid="waldur_openportal.handlers.schedule_sync_on_quota_save",
-        )
-
-        signals.post_save.connect(
             handlers.update_allocation_credits,
             sender=marketplace_models.Resource,
             dispatch_uid="waldur_openportal.handlers.update_allocation_credits",

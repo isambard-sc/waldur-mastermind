@@ -11,7 +11,6 @@ import traceback
 import unicodedata
 import uuid
 from collections import defaultdict
-from decimal import Decimal
 from enum import Enum
 from functools import lru_cache
 from io import BytesIO
@@ -62,10 +61,10 @@ from waldur_core.structure.managers import (
 from waldur_freeipa import models as freeipa_models
 from waldur_mastermind.common.utils import create_request, mb_to_gb
 from waldur_mastermind.invoices import models as invoice_models
-from waldur_mastermind.invoices import registrators
 from waldur_mastermind.invoices.structures import InvoiceResourceLimitPeriodDict
 from waldur_mastermind.invoices.utils import get_full_days
 from waldur_mastermind.marketplace import attribute_types
+from waldur_mastermind.marketplace.billing import MarketplaceBillingService
 from waldur_mastermind.marketplace.enums import REMOTE_OFFERING as REMOTE_PLUGIN_NAME
 from waldur_mastermind.marketplace.enums import (
     SITE_AGENT_OFFERING as SITE_AGENT_PLUGIN_NAME,
@@ -740,7 +739,7 @@ def move_resource(resource: models.Resource, project):
     ):
         start_invoice = invoice_item.invoice
 
-        target_invoice, _ = registrators.RegistrationManager.get_or_create_invoice(
+        target_invoice, _ = MarketplaceBillingService.get_or_create_invoice(
             project.customer,
             date=datetime.date(
                 year=start_invoice.year, month=start_invoice.month, day=1
@@ -1958,7 +1957,7 @@ def rotate_service_account_api_key(service_account: models.ScopedServiceAccount)
 
 
 def post_service_account_to_url(
-    url: str, service_account: dict, username: str = "", scope_type: str = ""
+    url: str, service_account: dict, owner_username: str = "", scope_type: str = ""
 ):
     try:
         api_access_token = get_service_account_api_token()
@@ -1988,9 +1987,9 @@ def post_service_account_to_url(
         scope_offering_slugs = list(offering_slugs)
 
         payload = {
-            "ownerUsername": username,
+            "ownerUsername": owner_username,
             "preferredIdentifier": service_account["preferred_identifier"],
-            "email": customer.email,
+            "email": service_account.get("email", customer.email),
             "description": service_account.get("description", ""),
             "scopeType": scope_type,
             "scopeName": scope_name,
@@ -2008,7 +2007,7 @@ def post_service_account_to_url(
         raise
 
 
-def create_service_account(service_account: dict, username: str, scope_type: str):
+def create_service_account(service_account: dict, owner_username: str, scope_type: str):
     """
     Makes a synchronous call to the webhook URL to create a service account.
     Raises exceptions on failure which should be handled by the viewset.
@@ -2016,7 +2015,7 @@ def create_service_account(service_account: dict, username: str, scope_type: str
     if config.ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND:
         logger.info("Mock mode enabled for create_service_account")
         return generate_mock_service_account_creation_response(
-            service_account, username, scope_type
+            service_account, owner_username, scope_type
         )
 
     if not settings.WALDUR_CORE.get("SERVICE_ACCOUNT_USE_API"):
@@ -2030,7 +2029,7 @@ def create_service_account(service_account: dict, username: str, scope_type: str
 
     try:
         response = post_service_account_to_url(
-            service_account_url, service_account, username, scope_type
+            service_account_url, service_account, owner_username, scope_type
         )
         return response.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -2361,18 +2360,6 @@ def publish_backend_resource_request(request: models.BackendResourceRequest):
     )
     if messages:
         logging_tasks.publish_messages.delay(messages)
-
-
-def convert_slurm_usage(usage: int | float | Decimal, component_type: str) -> int:
-    # This is temporarily uplifted to marketplace in order to avoid circular dependency
-    minutes_in_hour = 60
-    usage_float = float(usage)
-    if component_type in ["ram", "mem"]:
-        mb_in_gb = 1024
-        quantity = int(math.ceil(usage_float / mb_in_gb / minutes_in_hour))
-    else:
-        quantity = int(math.ceil(usage_float / minutes_in_hour))
-    return quantity
 
 
 def post_course_account_to_url(
