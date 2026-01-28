@@ -368,12 +368,24 @@ def _intelligent_search(requesting_user, query, can_query_all):
     """
     Intelligently route the search based on query format.
     Tries multiple search strategies and returns the best match.
+    
+    Non-staff users can only search by their own email or short_name.
+    Staff/support users can search by any criteria.
     """
     results = []
     
     # Strategy 1: Check if it's an email (contains @)
     if "@" in query:
         logger.info(f"Detected email format in query: '{query}'")
+        
+        # Permission check for non-staff: can only search their own email
+        if not can_query_all and requesting_user.email.lower() != query.lower():
+            response = JsonResponse({
+                "error": "You can only search by your own email address. Staff users can search for any user."
+            })
+            response.status_code = status.FORBIDDEN
+            return response
+        
         # Try email search
         try:
             result = _search_by_email(requesting_user, query.lower(), can_query_all)
@@ -383,25 +395,33 @@ def _intelligent_search(requesting_user, query, can_query_all):
         except Exception as e:
             logger.warning(f"Email search failed: {e}")
     
-    # Strategy 2: Check if it looks like a project ID (project_shortname.portal format or just project_shortname)
+    # Strategy 2: Check if it looks like a project ID (shortname.portal format or just shortname)
+    # NON-STAFF USERS CANNOT SEARCH BY PROJECT
     if "." in query or (len(query) < 10 and not " " in query):
         logger.info(f"Attempting project ID search for query: '{query}'")
-        try:
-            result = _search_by_project_id(requesting_user, query, can_query_all)
-            if result.status_code == status.OK:
-                # Check if we got actual results (not an error response)
-                import json
-                data = json.loads(result.content)
-                if isinstance(data, list) and len(data) > 0:
-                    return result
-                # If single object with projects
-                elif isinstance(data, dict) and data.get("projects"):
-                    return result
-        except Exception as e:
-            logger.info(f"Project ID search didn't match: {e}")
+        
+        # Permission check: only staff can search by project
+        if not can_query_all:
+            # This might be a short_name, so don't block yet - let it fall through to short_name search
+            logger.info(f"Non-staff user attempted project search, will try short_name instead")
+        else:
+            try:
+                result = _search_by_project_id(requesting_user, query, can_query_all)
+                if result.status_code == status.OK:
+                    # Check if we got actual results (not an error response)
+                    import json
+                    data = json.loads(result.content)
+                    if isinstance(data, list) and len(data) > 0:
+                        return result
+                    # If single object with projects
+                    elif isinstance(data, dict) and data.get("projects"):
+                        return result
+            except Exception as e:
+                logger.info(f"Project ID search didn't match: {e}")
     
-    # Strategy 3: Try shortname search
-    if not " " in query and 5 <= len(query) <= 20:  # Short names are between 5 and 20 characters
+    # Strategy 3: Try short_name search (for usernames)
+    # Short names are between 5 and 20 characters, no spaces
+    if not " " in query and 5 <= len(query) <= 20:
         logger.info(f"Attempting short_name search for query: '{query}'")
         try:
             result = _search_by_short_name(requesting_user, query, can_query_all)
@@ -410,11 +430,39 @@ def _intelligent_search(requesting_user, query, can_query_all):
                 data = json.loads(result.content)
                 # Check if we got a real user (not "unknown" status)
                 if isinstance(data, dict) and data.get("status") != "unknown":
+                    # Additional permission check for non-staff users
+                    if not can_query_all:
+                        # Verify this is their own short_name
+                        try:
+                            userinfo = models.UserInfo.objects.get(user=requesting_user)
+                            if userinfo.shortname and userinfo.shortname.lower() != query.lower():
+                                response = JsonResponse({
+                                    "error": "You can only search by your own short name. Staff users can search for any user."
+                                })
+                                response.status_code = status.FORBIDDEN
+                                return response
+                        except models.UserInfo.DoesNotExist:
+                            # User doesn't have a short_name, so they can't search by short_name
+                            response = JsonResponse({
+                                "error": "You don't have a short name configured, so you can only search by your email address."
+                            })
+                            response.status_code = status.FORBIDDEN
+                            return response
                     return result
         except Exception as e:
             logger.info(f"Short name search didn't match: {e}")
     
     # Strategy 4: Try project name search (broader text search)
+    # NON-STAFF USERS CANNOT SEARCH BY PROJECT
+    if not can_query_all:
+        # Non-staff user trying to search by project name
+        response = JsonResponse({
+            "error": "You can only search by your own email address or short name. Project searches are only available to staff users.",
+            "allowed_searches": ["your_email", "your_short_name"]
+        })
+        response.status_code = status.FORBIDDEN
+        return response
+    
     logger.info(f"Attempting project name search for query: '{query}'")
     try:
         result = _search_by_project_name(requesting_user, query, can_query_all)
@@ -425,11 +473,18 @@ def _intelligent_search(requesting_user, query, can_query_all):
         logger.info(f"Project name search didn't match: {e}")
     
     # If nothing matched, return a helpful error message
-    response = JsonResponse({
-        "error": f"No results found for query: '{query}'. Tried searching by email, project ID, short name, and project name.",
-        "query": query,
-        "searched_types": ["email", "project_id", "short_name", "project_name"]
-    })
+    if can_query_all:
+        response = JsonResponse({
+            "error": f"No results found for query: '{query}'. Tried searching by email, project ID, short name, and project name.",
+            "query": query,
+            "searched_types": ["email", "project_id", "short_name", "project_name"]
+        })
+    else:
+        response = JsonResponse({
+            "error": f"No results found for query: '{query}'. You can only search by your own email address or short name.",
+            "query": query,
+            "allowed_searches": ["your_email", "your_short_name"]
+        })
     response.status_code = status.NOT_FOUND
     return response
 
