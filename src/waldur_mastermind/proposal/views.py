@@ -1244,6 +1244,231 @@ class ProposalViewSet(
 
     resource_detail_serializer_class = serializers.RequestedResourceSerializer
 
+    # Resource Adjustments endpoints
+    @extend_schema(
+        methods=["get"],
+        operation_id="proposal_proposals_resource_adjustments_list",
+        request=None,
+        responses=serializers.ProposalResourceAdjustmentSerializer(many=True),
+        description="List resource adjustments for a proposal.",
+        filters=False,
+    )
+    @extend_schema(
+        methods=["post"],
+        operation_id="proposal_proposals_resource_adjustments_create",
+        request=serializers.ProposalResourceAdjustmentSerializer,
+        responses=serializers.ProposalResourceAdjustmentSerializer,
+        description="Create resource adjustment for a proposal.",
+    )
+    @decorators.action(detail=True, methods=["get", "post"])
+    def resource_adjustments(self, request, uuid=None):
+        """List or create resource adjustments for a proposal."""
+        proposal = self.get_object()
+
+        if request.method == "GET":
+            adjustments = proposal.resource_adjustments.all().order_by("-created")
+            serializer = self.get_serializer(
+                adjustments,
+                context=self.get_serializer_context(),
+                many=True,
+            )
+            return response.Response(serializer.data, status=status.HTTP_200_OK)
+
+        # POST - create new adjustment
+        context = self.get_serializer_context()
+        context["proposal"] = proposal
+        serializer = self.get_serializer(
+            context=context,
+            data=request.data,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return response.Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    resource_adjustments_serializer_class = (
+        serializers.ProposalResourceAdjustmentSerializer
+    )
+
+    def _check_adjustment_management_permission(self, request, proposal):
+        """Check if user can manage adjustments for this proposal."""
+        user = request.user
+        call = proposal.round.call
+
+        if user.is_staff or user.is_support:
+            return
+
+        if call.has_user(user, CallRole.MANAGER):
+            return
+
+        if has_permission(
+            user, PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, call
+        ) or has_permission(
+            user, PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, call.manager
+        ):
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers can manage resource adjustments."
+        )
+
+    def _validate_adjustment_proposal_state(self, proposal):
+        """Validate that proposal is in a state that allows adjustments."""
+        if proposal.state not in [ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW]:
+            raise IncorrectStateException(
+                "Adjustments can only be made to proposals in SUBMITTED or IN_REVIEW state."
+            )
+
+    def resource_adjustment_detail(self, request, uuid=None, obj_uuid=None):
+        """Handle nested adjustment detail operations (GET/PATCH/DELETE)."""
+        proposal = self.get_object()
+
+        try:
+            adjustment = models.ProposalResourceAdjustment.objects.get(
+                uuid=obj_uuid,
+                proposal=proposal,
+            )
+        except models.ProposalResourceAdjustment.DoesNotExist:
+            return response.Response(status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == "GET":
+            serializer = self.get_serializer(
+                adjustment, context=self.get_serializer_context()
+            )
+            return response.Response(serializer.data, status=status.HTTP_200_OK)
+
+        # For write operations, check permissions and state
+        self._check_adjustment_management_permission(request, proposal)
+        self._validate_adjustment_proposal_state(proposal)
+
+        if request.method == "DELETE":
+            adjustment.delete()
+            return response.Response(status=status.HTTP_204_NO_CONTENT)
+
+        if request.method in ["PUT", "PATCH"]:
+            context = self.get_serializer_context()
+            context["proposal"] = proposal
+            serializer = self.get_serializer(
+                adjustment,
+                context=context,
+                data=request.data,
+                partial=(request.method == "PATCH"),
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return response.Response(serializer.data, status=status.HTTP_200_OK)
+
+    resource_adjustment_detail_serializer_class = (
+        serializers.ProposalResourceAdjustmentSerializer
+    )
+
+    @extend_schema(
+        description="Get effective resource allocation for a proposal (after adjustments).",
+        request=None,
+        responses=serializers.EffectiveAllocationItemSerializer(many=True),
+    )
+    @decorators.action(detail=True, methods=["get"])
+    def effective_allocation(self, request, uuid=None):
+        """Get effective resource allocation after applying adjustments."""
+        proposal = self.get_object()
+
+        result = []
+
+        # Process existing requested resources
+        for requested_resource in proposal.requestedresource_set.all():
+            # Check for adjustments
+            adjustment = requested_resource.adjustments.order_by("-created").first()
+
+            is_removed = False
+            is_added = False
+            has_modifications = False
+            effective_attributes = dict(requested_resource.attributes)
+            effective_limits = dict(requested_resource.limits)
+
+            if adjustment:
+                if adjustment.action == models.ProposalResourceAdjustment.Actions.REMOVE:
+                    is_removed = True
+                elif adjustment.action == models.ProposalResourceAdjustment.Actions.MODIFY:
+                    has_modifications = True
+                    effective_attributes = dict(adjustment.adjusted_attributes)
+                    effective_limits = dict(adjustment.adjusted_limits)
+
+            result.append(
+                {
+                    "requested_resource_uuid": requested_resource.uuid,
+                    "requested_resource_name": str(
+                        requested_resource.requested_offering.offering.name
+                    ),
+                    "offering_uuid": requested_resource.requested_offering.offering.uuid,
+                    "offering_name": requested_resource.requested_offering.offering.name,
+                    "original_attributes": requested_resource.attributes,
+                    "original_limits": requested_resource.limits,
+                    "effective_attributes": effective_attributes,
+                    "effective_limits": effective_limits,
+                    "is_removed": is_removed,
+                    "is_added": is_added,
+                    "has_modifications": has_modifications,
+                    "adjustment": serializers.ProposalResourceAdjustmentSerializer(
+                        adjustment, context=self.get_serializer_context()
+                    ).data
+                    if adjustment
+                    else None,
+                }
+            )
+
+        # Process ADD adjustments (new resources)
+        add_adjustments = proposal.resource_adjustments.filter(
+            action=models.ProposalResourceAdjustment.Actions.ADD
+        )
+        for adjustment in add_adjustments:
+            result.append(
+                {
+                    "requested_resource_uuid": None,
+                    "requested_resource_name": None,
+                    "offering_uuid": adjustment.call_offering.offering.uuid,
+                    "offering_name": adjustment.call_offering.offering.name,
+                    "original_attributes": {},
+                    "original_limits": {},
+                    "effective_attributes": dict(adjustment.adjusted_attributes),
+                    "effective_limits": dict(adjustment.adjusted_limits),
+                    "is_removed": False,
+                    "is_added": True,
+                    "has_modifications": False,
+                    "adjustment": serializers.ProposalResourceAdjustmentSerializer(
+                        adjustment, context=self.get_serializer_context()
+                    ).data,
+                }
+            )
+
+        return response.Response(result, status=status.HTTP_200_OK)
+
+    def check_adjustment_permission(request, view, obj=None):
+        """Permission check for resource adjustments endpoints."""
+        if not obj:
+            return
+
+        user = request.user
+        call = obj.round.call
+
+        if user.is_staff or user.is_support:
+            return
+
+        if call.has_user(user, CallRole.MANAGER):
+            return
+
+        if has_permission(
+            user, PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, call
+        ) or has_permission(
+            user, PermissionEnum.APPROVE_AND_REJECT_PROPOSALS, call.manager
+        ):
+            return
+
+        raise exceptions.PermissionDenied(
+            "Only call managers can manage resource adjustments."
+        )
+
+    resource_adjustments_permissions = [check_adjustment_permission]
+    effective_allocation_permissions = [check_adjustment_permission]
+
     @extend_schema(
         description="Attach document to proposal.",
         request=serializers.ProposalDocumentationSerializer,
