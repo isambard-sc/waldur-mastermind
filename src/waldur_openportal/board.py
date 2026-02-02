@@ -456,6 +456,14 @@ class OpenPortalBoard:
             # This project already exists - nothing to do?
             return
 
+        today = date.today()
+        end_date = managed_project.get_details().end_date
+
+        if end_date is not None and end_date <= today:
+            raise openportal.ManagedProjectRejectedError(
+                f"End date {end_date} is today or in the past - cannot create a new project!"
+            )
+
         identifier = managed_project.get_remote_identifier()
         project_template: models.ProjectTemplate = managed_project.project_template
         details: openportal.ProjectDetails = managed_project.get_details()
@@ -554,6 +562,13 @@ class OpenPortalBoard:
         if self.destination() is None:
             raise openportal.ManagedProjectRejectedError(
                 "Board is not connected to a destination"
+            )
+
+        today = date.today()
+
+        if details.end_date is not None and details.end_date < today:
+            raise openportal.ManagedProjectRejectedError(
+                f"End date {details.end_date} is in the past"
             )
 
         # Get (or create) the ManagedProject for the given project identifier
@@ -682,6 +697,13 @@ class OpenPortalBoard:
         """
         logger.info(f"Updating project {identifier} with details {new_details}")
 
+        today = date.today()
+
+        if new_details.end_date is not None and new_details.end_date < today:
+            raise openportal.ManagedProjectRejectedError(
+                f"End date {new_details.end_date} is in the past"
+            )
+
         if not isinstance(identifier, openportal.ProjectIdentifier):
             raise openportal.ManagedProjectRejectedError(
                 f"Invalid project identifier: {identifier}"
@@ -793,8 +815,8 @@ class OpenPortalBoard:
 
         # Check if trying to reactivate with a future end_date
         is_reactivating = (
-            new_details.end_date is not None and
-            new_details.end_date >= timezone.now().date()
+            new_details.end_date is not None
+            and new_details.end_date >= timezone.now().date()
         )
 
         # Reject updates for expired projects unless reactivating
@@ -867,7 +889,9 @@ class OpenPortalBoard:
             )
             project.save(update_fields=update_fields)
 
-        if project.is_expired or project.is_removed:
+        if (
+            project.is_expired and not project.is_in_grace_period
+        ) or project.is_removed:
             # we can't make any further changes to this project - return an error
             managed_project.reject(
                 utils.get_openportal_robot(),

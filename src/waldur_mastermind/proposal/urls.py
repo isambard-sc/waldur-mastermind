@@ -97,3 +97,18 @@ urlpatterns += [
         name="proposal-call-close_round",
     )
 ]
+
+urlpatterns += [
+    re_path(
+        r"^api/proposal-proposals/(?P<uuid>[a-f0-9]+)/resource-adjustments/(?P<obj_uuid>[a-f0-9]+)/$",
+        views.ProposalViewSet.as_view(
+            {
+                "get": "resource_adjustment_detail",
+                "delete": "resource_adjustment_detail",
+                "patch": "resource_adjustment_detail",
+                "put": "resource_adjustment_detail",
+            }
+        ),
+        name="proposal-resource-adjustment-detail",
+    )
+]

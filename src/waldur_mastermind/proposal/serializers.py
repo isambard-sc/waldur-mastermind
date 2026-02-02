@@ -1870,3 +1870,206 @@ class ProposalUserSerializer(serializers.Serializer):
         )
 
         return user
+
+
+class ProposalResourceAdjustmentSerializer(
+    core_serializers.AugmentedSerializerMixin,
+    serializers.HyperlinkedModelSerializer,
+):
+    """Serializer for creating and managing resource adjustments."""
+
+    requested_resource_uuid = serializers.UUIDField(write_only=True, required=False)
+    call_offering_uuid = serializers.UUIDField(write_only=True, required=False)
+
+    # Read-only fields for display
+    requested_resource = serializers.SerializerMethodField()
+    requested_resource_name = serializers.SerializerMethodField()
+    call_offering = serializers.SerializerMethodField()
+    call_offering_name = serializers.SerializerMethodField()
+    proposal_uuid = serializers.ReadOnlyField(source="proposal.uuid")
+    proposal_name = serializers.ReadOnlyField(source="proposal.name")
+    created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.ProposalResourceAdjustment
+        fields = [
+            "uuid",
+            "url",
+            "proposal",
+            "proposal_uuid",
+            "proposal_name",
+            "requested_resource",
+            "requested_resource_uuid",
+            "requested_resource_name",
+            "call_offering",
+            "call_offering_uuid",
+            "call_offering_name",
+            "action",
+            "adjusted_attributes",
+            "adjusted_limits",
+            "comment",
+            "created_by",
+            "created_by_name",
+            "created",
+            "modified",
+        ]
+        read_only_fields = (
+            "created_by",
+        )
+        extra_kwargs = {
+            "created_by": {
+                "lookup_field": "uuid",
+                "view_name": "user-detail",
+            },
+            "proposal": {
+                "lookup_field": "uuid",
+                "view_name": "proposal-proposal-detail",
+                "read_only": True,
+            },
+        }
+
+    def get_url(self, adjustment) -> str:
+        return self.context["request"].build_absolute_uri(
+            reverse(
+                "proposal-resource-adjustment-detail",
+                kwargs={
+                    "uuid": adjustment.proposal.uuid.hex,
+                    "obj_uuid": adjustment.uuid.hex,
+                },
+            )
+        )
+
+    def get_requested_resource(self, adjustment) -> dict | None:
+        if adjustment.requested_resource:
+            return {
+                "uuid": adjustment.requested_resource.uuid,
+                "url": self.context["request"].build_absolute_uri(
+                    reverse(
+                        "proposal-proposal-resource-detail",
+                        kwargs={
+                            "uuid": adjustment.proposal.uuid.hex,
+                            "obj_uuid": adjustment.requested_resource.uuid.hex,
+                        },
+                    )
+                ),
+            }
+        return None
+
+    def get_requested_resource_name(self, adjustment) -> str | None:
+        if adjustment.requested_resource:
+            return str(adjustment.requested_resource.requested_offering.offering.name)
+        return None
+
+    def get_call_offering(self, adjustment) -> dict | None:
+        if adjustment.call_offering:
+            return {
+                "uuid": adjustment.call_offering.uuid,
+                "url": self.context["request"].build_absolute_uri(
+                    reverse(
+                        "proposal-call-offering-detail",
+                        kwargs={
+                            "uuid": adjustment.call_offering.call.uuid.hex,
+                            "obj_uuid": adjustment.call_offering.uuid.hex,
+                        },
+                    )
+                ),
+            }
+        return None
+
+    def get_call_offering_name(self, adjustment) -> str | None:
+        if adjustment.call_offering:
+            return str(adjustment.call_offering.offering.name)
+        return None
+
+    def validate(self, attrs):
+        proposal = self.context.get("proposal")
+        if not proposal:
+            raise serializers.ValidationError(_("Proposal context is required."))
+
+        # Validate proposal state
+        if proposal.state not in [ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW]:
+            raise serializers.ValidationError(
+                _(
+                    "Adjustments can only be made to proposals in SUBMITTED or IN_REVIEW state."
+                )
+            )
+
+        action = attrs.get("action", models.ProposalResourceAdjustment.Actions.MODIFY)
+        requested_resource_uuid = attrs.pop("requested_resource_uuid", None)
+        call_offering_uuid = attrs.pop("call_offering_uuid", None)
+
+        if action in [
+            models.ProposalResourceAdjustment.Actions.MODIFY,
+            models.ProposalResourceAdjustment.Actions.REMOVE,
+        ]:
+            # Require requested_resource for modify/remove actions
+            if not requested_resource_uuid:
+                raise serializers.ValidationError(
+                    {
+                        "requested_resource_uuid": _(
+                            "This field is required for modify/remove actions."
+                        )
+                    }
+                )
+
+            try:
+                requested_resource = models.RequestedResource.objects.get(
+                    uuid=requested_resource_uuid, proposal=proposal
+                )
+            except models.RequestedResource.DoesNotExist:
+                raise serializers.ValidationError(
+                    {"requested_resource_uuid": _("Requested resource not found.")}
+                )
+
+            attrs["requested_resource"] = requested_resource
+
+        elif action == models.ProposalResourceAdjustment.Actions.ADD:
+            # Require call_offering for add action
+            if not call_offering_uuid:
+                raise serializers.ValidationError(
+                    {"call_offering_uuid": _("This field is required for add action.")}
+                )
+
+            call = proposal.round.call
+            try:
+                call_offering = call.requestedoffering_set.get(uuid=call_offering_uuid)
+            except models.RequestedOffering.DoesNotExist:
+                raise serializers.ValidationError(
+                    {"call_offering_uuid": _("Call offering not found.")}
+                )
+
+            if call_offering.state != RequestedOfferingStates.ACCEPTED:
+                raise serializers.ValidationError(
+                    {"call_offering_uuid": _("Call offering must be in ACCEPTED state.")}
+                )
+
+            attrs["call_offering"] = call_offering
+
+        attrs["proposal"] = proposal
+        return attrs
+
+    def create(self, validated_data):
+        validated_data["created_by"] = self.context["request"].user
+        return super().create(validated_data)
+
+
+class EffectiveAllocationItemSerializer(serializers.Serializer):
+    """Serializer for a single item in effective allocation response."""
+
+    requested_resource_uuid = serializers.UUIDField(allow_null=True)
+    requested_resource_name = serializers.CharField(allow_null=True)
+    offering_uuid = serializers.UUIDField()
+    offering_name = serializers.CharField()
+
+    original_attributes = serializers.JSONField()
+    original_limits = serializers.JSONField()
+
+    effective_attributes = serializers.JSONField()
+    effective_limits = serializers.JSONField()
+
+    is_removed = serializers.BooleanField()
+    is_added = serializers.BooleanField()
+    has_modifications = serializers.BooleanField()
+
+    adjustment = serializers.JSONField()

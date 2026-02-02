@@ -814,6 +814,84 @@ class RequestedResource(
     proposal = models.ForeignKey(Proposal, on_delete=models.CASCADE)
 
 
+class ProposalResourceAdjustment(
+    core_models.UuidMixin,
+    TimeStampedModel,
+):
+    """Tracks call manager adjustments to proposal resource allocations.
+
+    Allows call managers to modify, remove, or add resources before approval
+    while preserving original requests for auditing.
+    """
+
+    class Actions:
+        MODIFY = "modify"
+        REMOVE = "remove"
+        ADD = "add"
+        CHOICES = (
+            (MODIFY, "Modify limits"),
+            (REMOVE, "Remove from allocation"),
+            (ADD, "Add new resource"),
+        )
+
+    class Permissions:
+        customer_path = "proposal__round__call__manager__customer"
+
+    proposal = models.ForeignKey(
+        Proposal,
+        on_delete=models.CASCADE,
+        related_name="resource_adjustments",
+    )
+
+    # Link to original resource (null for 'add' action)
+    requested_resource = models.ForeignKey(
+        "RequestedResource",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="adjustments",
+    )
+
+    # For 'add' action - specify which offering to add
+    call_offering = models.ForeignKey(
+        "RequestedOffering",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+
+    action = models.CharField(
+        max_length=20,
+        choices=Actions.CHOICES,
+        default=Actions.MODIFY,
+    )
+
+    # Adjusted values (for 'modify' and 'add' actions)
+    adjusted_attributes = models.JSONField(blank=True, default=dict)
+    adjusted_limits = models.JSONField(blank=True, default=dict)
+
+    # Audit fields
+    created_by = models.ForeignKey(
+        core_models.User,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="+",
+    )
+    comment = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-created"]
+        verbose_name = "Proposal resource adjustment"
+        verbose_name_plural = "Proposal resource adjustments"
+
+    def __str__(self):
+        return f"Adjustment ({self.action}) for proposal {self.proposal_id}"
+
+    @classmethod
+    def get_url_name(cls):
+        return "proposal-resource-adjustment"
+
+
 class Review(
     TimeStampedModel,
     core_models.UuidMixin,
