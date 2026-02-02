@@ -455,10 +455,14 @@ def allocate_proposal(proposal: proposal_models.Proposal):
             else:
                 continue
 
+    created_offerings = []
+
     for requested_resource in requested_resources:
         with transaction.atomic():
-            # Check for adjustments on this resource
+            # Check for adjustments on this resource - there can only be a single
+            # adjustment per resource
             adjustment = requested_resource.adjustments.order_by("-created").first()
+            logger.info(f"Latest adjustment: {adjustment}")
 
             # Skip removed resources
             if (
@@ -498,12 +502,20 @@ def allocate_proposal(proposal: proposal_models.Proposal):
                 attributes=effective_attributes,
                 limits=effective_limits,
             )
+
+            logger.info(
+                f"Creating resource for requested resource {requested_resource.uuid}"
+            )
+            logger.info(f"Resource attributes: {attrs}")
+
             resource = marketplace_models.Resource(
                 **attrs,
                 name=project.name,
             )
             resource.init_cost()
             resource.save()
+
+            created_offerings.append(resource.offering.uuid)
 
             order = marketplace_models.Order(
                 **attrs,
@@ -516,17 +528,59 @@ def allocate_proposal(proposal: proposal_models.Proposal):
             requested_resource.resource = resource
             requested_resource.save()
 
+            if "allocation" in effective_attributes:
+                try:
+                    allocation = float(effective_attributes["allocation"])
+                except Exception as e:
+                    logger.warning(f"Invalid allocation value: {e}")
+                    continue
+
+                if allocation >= 0:
+                    options = resource.options or {}
+
+                    if "allocation" in options:
+                        # make sure that the used allocation is reflected in
+                        # the resource options
+                        try:
+                            if float(options["allocation"]) != allocation:
+                                logger.info(
+                                    f"Updating allocation for resource {resource} to {allocation} units"
+                                )
+                                options["allocation"] = allocation
+                                resource.options = options
+                                resource.save(update_fields=["options"])
+                        except Exception as e:
+                            logger.warning(f"Failed to set allocation: {e}")
+                    else:
+                        try:
+                            logger.info(
+                                f"Recording default allocation {allocation} units for resource {resource}"
+                            )
+                            options["allocation"] = allocation
+                            resource.options = options
+                            resource.save(update_fields=["options"])
+                        except Exception as e:
+                            logger.warning(f"Failed to set allocation: {e}")
+
     # Process ADD adjustments (new resources not in original request)
     add_adjustments = proposal.resource_adjustments.filter(
         action=proposal_models.ProposalResourceAdjustment.Actions.ADD
     )
+
+    logger.info(
+        f"Processing {add_adjustments.count()} ADD adjustments for proposal {proposal.uuid}"
+    )
+
     for adjustment in add_adjustments:
         with transaction.atomic():
+            logger.info(f"Creating resource for ADD adjustment {adjustment}")
             effective_attributes = dict(adjustment.adjusted_attributes)
             effective_limits = dict(adjustment.adjusted_limits)
 
             if "name" not in effective_attributes:
-                effective_attributes["name"] = str(adjustment.call_offering.offering.name)
+                effective_attributes["name"] = str(
+                    adjustment.call_offering.offering.name
+                )
 
             attrs = dict(
                 project=project,
@@ -535,12 +589,25 @@ def allocate_proposal(proposal: proposal_models.Proposal):
                 attributes=effective_attributes,
                 limits=effective_limits,
             )
+
+            logger.info(f"Resource attributes: {attrs}")
+
+            if adjustment.call_offering.offering.uuid in created_offerings:
+                logger.info(
+                    f"Skipping creation of duplicate offering "
+                    f"{adjustment.call_offering.offering.name} "
+                    f"for ADD adjustment {adjustment.uuid}"
+                )
+                continue
+
             resource = marketplace_models.Resource(
                 **attrs,
                 name=project.name,
             )
             resource.init_cost()
             resource.save()
+
+            created_offerings.append(resource.offering.uuid)
 
             order = marketplace_models.Order(
                 **attrs,
@@ -549,6 +616,40 @@ def allocate_proposal(proposal: proposal_models.Proposal):
             )
             order.init_cost()
             order.save()
+
+            if "allocation" in effective_attributes:
+                try:
+                    allocation = float(effective_attributes["allocation"])
+                except Exception as e:
+                    logger.warning(f"Invalid allocation value: {e}")
+                    continue
+
+                if allocation >= 0:
+                    options = resource.options or {}
+
+                    if "allocation" in options:
+                        # make sure that the used allocation is reflected in
+                        # the resource options
+                        try:
+                            if float(options["allocation"]) != allocation:
+                                logger.info(
+                                    f"Updating allocation for resource {resource} to {allocation} units"
+                                )
+                                options["allocation"] = allocation
+                                resource.options = options
+                                resource.save(update_fields=["options"])
+                        except Exception as e:
+                            logger.warning(f"Failed to set allocation: {e}")
+                    else:
+                        try:
+                            logger.info(
+                                f"Recording default allocation {allocation} units for resource {resource}"
+                            )
+                            options["allocation"] = allocation
+                            resource.options = options
+                            resource.save(update_fields=["options"])
+                        except Exception as e:
+                            logger.warning(f"Failed to set allocation: {e}")
 
             logger.info(
                 f"Created resource from ADD adjustment {adjustment.uuid} "
