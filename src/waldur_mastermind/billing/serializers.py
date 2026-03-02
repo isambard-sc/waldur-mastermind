@@ -152,7 +152,6 @@ def _optimize_customer_serializer_eager_load(sender):
         # Get the truly original method that was stored by the credit optimization
         true_original = getattr(credit_optimized_method, "_original_eager_load", credit_optimized_method)
 
-        @staticmethod
         def combined_eager_load(queryset, request=None):
             # Call the TRUE original method once
             queryset = true_original(queryset, request)
@@ -171,19 +170,18 @@ def _optimize_customer_serializer_eager_load(sender):
 
             return queryset
 
-        # Mark as optimized for both
+        # Mark as optimized for both (attrs on raw fn, not staticmethod descriptor)
         combined_eager_load._billing_optimized = True
         combined_eager_load._credit_optimized = True
         combined_eager_load._original_eager_load = true_original
 
         # Replace the eager_load method
-        sender.eager_load = combined_eager_load
+        sender.eager_load = staticmethod(combined_eager_load)
         return
 
     # Store the original eager_load method
     original_eager_load = sender.eager_load
 
-    @staticmethod
     def optimized_eager_load(queryset, request=None):
         # Call the original eager_load first
         queryset = original_eager_load(queryset, request)
@@ -200,13 +198,13 @@ def _optimize_customer_serializer_eager_load(sender):
 
         return queryset
 
-    # Mark as optimized to avoid double optimization
+    # Mark as optimized (attrs on raw fn, not staticmethod descriptor)
     optimized_eager_load._billing_optimized = True
     # Store reference to the true original for later combining
     optimized_eager_load._original_eager_load = original_eager_load
 
     # Replace the eager_load method
-    sender.eager_load = optimized_eager_load
+    sender.eager_load = staticmethod(optimized_eager_load)
 
 
 class FinancialReportSerializer(serializers.ModelSerializer):
