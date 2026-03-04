@@ -23,11 +23,18 @@ class OpenPortalExtension(WaldurExtension):
         from datetime import timedelta
 
         return {
-            # This task re-tries to add or remove users in case
+            # This task re-tries to add or remove local users in case
             # user management failed when called directly
-            "waldur-openportal-sync-users": {
-                "task": "waldur_openportal.sync",
-                "schedule": timedelta(minutes=119),
+            "waldur-openportal-sync-local-users": {
+                "task": "waldur_openportal.sync_local_users",
+                "schedule": timedelta(minutes=19),
+                "args": (),
+            },
+            # This task re-tries to add or remove remote users in case
+            # user management failed when called directly
+            "waldur-openportal-sync-remote-users": {
+                "task": "waldur_openportal.sync_remote_users",
+                "schedule": timedelta(minutes=23),
                 "args": (),
             },
             # This task synchronises all usage from the OpenPortal resources
