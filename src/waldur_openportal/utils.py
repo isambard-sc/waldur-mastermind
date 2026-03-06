@@ -334,11 +334,13 @@ def fix_total_allocation(project):
 
     allocation = project_template.convert_to_credits(details.allocation)
 
-    set_project_credits(project, allocation)
+    set_project_credits(project, allocation, silent=True)
 
 
 def get_project_spend_info(
-    project, include_current_month: bool = True
+    project,
+    include_current_month: bool = True,
+    silent: bool = False,
 ) -> tuple[decimal.Decimal, decimal.Decimal]:
     """
     Return a tuple of the total credits and total spend for the passed project
@@ -346,6 +348,7 @@ def get_project_spend_info(
     Args:
         project: The project to get spend info for
         include_current_month: If False, exclude current month's invoice items from spend calculation
+        silent: If True, suppress logging
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
@@ -389,15 +392,16 @@ def get_project_spend_info(
 
         # no need to do anything if usage == 0
 
-    logger.info(
-        f"Project {project} has total credits: {total_credits}, total spend: {total_spend} "
-        f"(include_current_month={include_current_month})"
-    )
+    if not silent:
+        logger.info(
+            f"Project {project} has total credits: {total_credits}, total spend: {total_spend} "
+            f"(include_current_month={include_current_month})"
+        )
 
     return (total_credits, total_spend)
 
 
-def get_project_credits(project) -> decimal.Decimal:
+def get_project_credits(project, silent: bool = False) -> decimal.Decimal:
     """
     Get the total lifetime credits awarded to the project.
     If the project has no credits, return 0.0
@@ -406,13 +410,15 @@ def get_project_credits(project) -> decimal.Decimal:
         raise TypeError("project must be an instance of Project")
 
     (total_credits, total_spend) = get_project_spend_info(
-        project, include_current_month=False
+        project, include_current_month=False, silent=silent
     )
 
     return total_credits + total_spend
 
 
-def set_project_credits(project, credits: decimal.Decimal | float):
+def set_project_credits(
+    project, credits: decimal.Decimal | float, silent: bool = False
+):
     """
     Set the credits for the project to the passed value
     """
@@ -438,7 +444,7 @@ def set_project_credits(project, credits: decimal.Decimal | float):
 
     # Get spend info excluding current month (we want start-of-month balance)
     (total_credits, total_spend) = get_project_spend_info(
-        project, include_current_month=False
+        project, include_current_month=False, silent=silent
     )
 
     # Calculate what the credit balance should be: allocation - historical_spend
@@ -457,10 +463,11 @@ def set_project_credits(project, credits: decimal.Decimal | float):
 
     if abs(change_in_credits) < decimal.Decimal(0.01):
         # no change in credits, so nothing to do
-        logger.info(
-            f"No change in credits for project {project}: {total_credits} -> {desired_credit_balance} "
-            f"(allocation: {credits}, spend: {total_spend})"
-        )
+        if not silent:
+            logger.info(
+                f"No change in credits for project {project}: {total_credits} -> {desired_credit_balance} "
+                f"(allocation: {credits}, spend: {total_spend})"
+            )
         return
 
     if change_in_credits > decimal.Decimal(0):
@@ -502,10 +509,11 @@ def set_project_credits(project, credits: decimal.Decimal | float):
     try:
         project_credit.value = desired_credit_balance
         project_credit.save(update_fields=["value"])
-        logger.info(
-            f"Project credits for project {project} set to {project_credit.value} (was {total_credits}, "
-            f"allocation: {credits}, spend: {total_spend}, change: {change_in_credits})"
-        )
+        if not silent:
+            logger.info(
+                f"Project credits for project {project} set to {project_credit.value} (was {total_credits}, "
+                f"allocation: {credits}, spend: {total_spend}, change: {change_in_credits})"
+            )
     except Exception as e:
         logger.error(
             f"Failed to set project credits for project {project} to {credits + change_in_credits}: {e}"

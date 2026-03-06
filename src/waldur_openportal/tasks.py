@@ -1,5 +1,6 @@
 import logging
 import datetime
+import random
 import time
 import functools
 
@@ -418,7 +419,15 @@ def sync_remote_usage():
     now = datetime.datetime.now()
     fail_count = 0
 
-    for allocation in models.RemoteAllocation.objects.filter(is_active=True):
+    allocations = list(models.RemoteAllocation.objects.filter(is_active=True))
+
+    # randomise the order of the allocations to avoid always processing in the same order and potentially
+    # leaving some allocations with outdated usage for a long time
+    random.shuffle(allocations)
+
+    now = datetime.datetime.now()
+
+    for allocation in allocations:
         try:
             sync_remote_allocation_usage(allocation)
         except Exception as e:
@@ -431,6 +440,10 @@ def sync_remote_usage():
             elif (datetime.datetime.now() - now).seconds > 3600:
                 logger.error("sync_remote_usage took too long - aborting")
                 return
+
+        if (datetime.datetime.now() - now).seconds > 3600:
+            logger.error("sync_remote_usage took too long - aborting")
+            return
 
 
 @shared_task(name="waldur_openportal.sync_customer_allocations")
@@ -453,15 +466,25 @@ def sync_customer_allocations(customer_id):
     )
 
     # Get all active allocations for this customer
-    allocations = models.Allocation.objects.filter(
-        is_active=True, project__customer=customer
+    allocations = list(
+        models.Allocation.objects.filter(is_active=True, project__customer=customer)
     )
+
+    # randomise the order of the allocations to avoid always processing in the same order and potentially
+    # leaving some allocations with outdated usage for a long time
+    random.shuffle(allocations)
+
+    now = datetime.datetime.now()
 
     for allocation in allocations:
         try:
             sync_allocation_usage(allocation)
         except Exception as e:
             logger.error(f"Failed to sync usage for {allocation}: {e}")
+
+        if (datetime.datetime.now() - now).seconds > 3600:
+            logger.error("sync_customer_allocations took too long - aborting")
+            return
 
 
 @shared_task(name="waldur_openportal.sync_usage")
@@ -505,59 +528,73 @@ def sync_allocation_limits():
     logger.info("OpenPortal task.sync_allocation_limits")
     now = datetime.datetime.now()
 
-    for project_credit in invoice_models.ProjectCredit.objects.all():
-        project = project_credit.project
+    project_credits = list(invoice_models.ProjectCredit.objects.all())
 
-        # Skip fully removed projects
-        if project.is_removed:
-            continue
+    # randomise the order of the projects to avoid always processing in the same order and potentially
+    # leaving some projects with outdated limits for a long time
+    random.shuffle(project_credits)
 
-        # For projects in grace period or past grace period, set limits to zero
-        if project.is_in_grace_period:
-            logger.info(
-                f"Project {project} is in grace period (until {project.end_date_with_grace}) - setting limits to zero"
-            )
-            credits_available = 0
-        elif project.is_expired:
-            # Project is expired and past grace period
-            logger.info(
-                f"Project {project} is expired (past grace period) - setting limits to zero"
-            )
-            credits_available = 0
-        else:
-            # Project is active, use normal credit logic
-            credits_available = project_credit.value
+    for project_credit in project_credits:
+        try:
+            project = project_credit.project
 
-            if credits_available is None or credits_available <= 0:
-                credits_available = 0
-            else:
-                credits_available = float(credits_available)
+            # Skip fully removed projects
+            if project.is_removed:
+                continue
 
-        # find any openportal allocations associated with the project
-        allocations = models.Allocation.objects.filter(project=project, is_active=True)
-
-        if not allocations:
-            logger.debug(f"Project {project} has no OpenPortal allocations - skipping")
-            continue
-
-        # Calculate the total usage so far this month across OpenPortal allocations
-        # for this project - if it exceeds the number of project credits available
-        # then we have to set the limits to zero to prevent any more spend
-        if credits_available > 0:
-            total_spend = 0.0
-
-            for allocation in allocations:
-                total_spend += float(allocation.node_usage)
-
-            logger.info(
-                f"Total spend for {project} is {total_spend} hours - {credits_available} available"
-            )
-
-            if total_spend >= credits_available:
-                logger.warning(
-                    f"Total spend for {project} exceeds available credits - setting limits to zero"
+            # For projects in grace period or past grace period, set limits to zero
+            if project.is_in_grace_period:
+                logger.info(
+                    f"Project {project} is in grace period (until {project.end_date_with_grace}) - setting limits to zero"
                 )
                 credits_available = 0
+            elif project.is_expired:
+                # Project is expired and past grace period
+                logger.info(
+                    f"Project {project} is expired (past grace period) - setting limits to zero"
+                )
+                credits_available = 0
+            else:
+                # Project is active, use normal credit logic
+                credits_available = project_credit.value
+
+                if credits_available is None or credits_available <= 0:
+                    credits_available = 0
+                else:
+                    credits_available = float(credits_available)
+
+            # find any openportal allocations associated with the project
+            allocations = models.Allocation.objects.filter(
+                project=project, is_active=True
+            )
+
+            if not allocations:
+                logger.debug(
+                    f"Project {project} has no OpenPortal allocations - skipping"
+                )
+                continue
+
+            # Calculate the total usage so far this month across OpenPortal allocations
+            # for this project - if it exceeds the number of project credits available
+            # then we have to set the limits to zero to prevent any more spend
+            if credits_available > 0:
+                total_spend = 0.0
+
+                for allocation in allocations:
+                    total_spend += float(allocation.node_usage)
+
+                logger.info(
+                    f"Total spend for {project} is {total_spend} hours - {credits_available} available"
+                )
+
+                if total_spend >= credits_available:
+                    logger.warning(
+                        f"Total spend for {project} exceeds available credits - setting limits to zero"
+                    )
+                    credits_available = 0
+        except Exception as e:
+            logger.error(f"Failed to calculate credits for {project}: {e}")
+            continue
 
         for allocation in allocations:
             try:
@@ -619,58 +656,62 @@ def sync_remote():
     # First, try to create all of the remote projects that are not
     # already created in the remote portal
     for remote_allocation in models.RemoteAllocation.objects.filter(is_active=True):
-        project = remote_allocation.project
+        try:
+            project = remote_allocation.project
 
-        if project is None:
-            logger.warning(
-                f"Remote allocation {remote_allocation} has no associated project - deleting"
-            )
-            try:
-                remote_allocation.delete()
-            except Exception as e:
-                logger.error(
-                    f"Failed to delete remote allocation {remote_allocation}: {e}"
+            if project is None:
+                logger.warning(
+                    f"Remote allocation {remote_allocation} has no associated project - deleting"
                 )
-            continue
+                try:
+                    remote_allocation.delete()
+                except Exception as e:
+                    logger.error(
+                        f"Failed to delete remote allocation {remote_allocation}: {e}"
+                    )
+                continue
 
-        # Skip removed projects or projects past grace period
-        if project.is_removed:
-            logger.info(
-                f"Remote allocation {remote_allocation} is for a removed project - deleting"
-            )
-            try:
-                remote_allocation.delete()
-            except Exception as e:
-                logger.error(
-                    f"Failed to delete remote allocation {remote_allocation}: {e}"
+            # Skip removed projects or projects past grace period
+            if project.is_removed:
+                logger.info(
+                    f"Remote allocation {remote_allocation} is for a removed project - deleting"
                 )
-            continue
+                try:
+                    remote_allocation.delete()
+                except Exception as e:
+                    logger.error(
+                        f"Failed to delete remote allocation {remote_allocation}: {e}"
+                    )
+                continue
 
-        # Delete allocations for projects past grace period (fully expired)
-        if project.is_expired and not project.is_in_grace_period:
-            logger.info(
-                f"Remote allocation {remote_allocation} is for a project past grace period - deleting"
-            )
-            try:
-                remote_allocation.delete()
-            except Exception as e:
-                logger.error(
-                    f"Failed to delete remote allocation {remote_allocation}: {e}"
+            # Delete allocations for projects past grace period (fully expired)
+            if project.is_expired and not project.is_in_grace_period:
+                logger.info(
+                    f"Remote allocation {remote_allocation} is for a project past grace period - deleting"
                 )
-            continue
+                try:
+                    remote_allocation.delete()
+                except Exception as e:
+                    logger.error(
+                        f"Failed to delete remote allocation {remote_allocation}: {e}"
+                    )
+                continue
 
-        # Projects in grace period are kept but will have limits set to zero by sync_usage
+            # Projects in grace period are kept but will have limits set to zero by sync_usage
 
-        if remote_allocation.state not in [
-            CoreStates.CREATION_SCHEDULED,
-            CoreStates.CREATING,
-            CoreStates.UPDATE_SCHEDULED,
-            CoreStates.UPDATING,
-            CoreStates.OK,
-        ]:
-            logger.debug(
-                f"Remote allocation {remote_allocation} is not in a valid state {remote_allocation.state} for syncing - skipping"
-            )
+            if remote_allocation.state not in [
+                CoreStates.CREATION_SCHEDULED,
+                CoreStates.CREATING,
+                CoreStates.UPDATE_SCHEDULED,
+                CoreStates.UPDATING,
+                CoreStates.OK,
+            ]:
+                logger.debug(
+                    f"Remote allocation {remote_allocation} is not in a valid state {remote_allocation.state} for syncing - skipping"
+                )
+                continue
+        except Exception as e:
+            logger.error(f"Failed to check remote allocation {remote_allocation}: {e}")
             continue
 
         try:
@@ -699,6 +740,62 @@ def sync_remote():
                 break
 
 
+@shared_task(name="waldur_openportal.sync_local_users")
+@run_once_task(takeover_timeout=60 * 60)
+def sync_local_users():
+    """
+    This task runs through all of the allocations and makes sure that all
+    users associated with those allocations are properly synced (e.g.
+    added or removed)
+    """
+    logger.info("OpenPortal task.sync_local_users")
+    now = datetime.datetime.now()
+
+    allocations = list(models.Allocation.objects.filter(is_active=True))
+
+    # randomise the order of the allocations to avoid always processing in the same order and potentially
+    # leaving some allocations with unsynced users for a long time
+    random.shuffle(allocations)
+
+    for allocation in allocations:
+        try:
+            sync_allocation_users(allocation)
+        except Exception as e:
+            logger.error(f"Failed to sync users for {allocation}: {e}")
+
+        if (datetime.datetime.now() - now).seconds > 3600:
+            logger.error("sync_users took too long - aborting")
+            break
+
+
+@shared_task(name="waldur_openportal.sync_remote_users")
+@run_once_task(takeover_timeout=60 * 60)
+def sync_remote_users():
+    """
+    This task runs through all of the remote allocations and makes sure that all
+    users associated with those allocations are properly synced (e.g.
+    added or removed)
+    """
+    logger.info("OpenPortal task.sync_remote_users")
+    now = datetime.datetime.now()
+
+    allocations = list(models.RemoteAllocation.objects.filter(is_active=True))
+
+    # randomise the order of the allocations to avoid always processing in the same order and potentially
+    # leaving some allocations with unsynced users for a long time
+    random.shuffle(allocations)
+
+    for allocation in allocations:
+        try:
+            sync_remote_allocation_users(allocation)
+        except Exception as e:
+            logger.error(f"Failed to sync remote users for {allocation}: {e}")
+
+        if (datetime.datetime.now() - now).seconds > 3600:
+            logger.error("sync_remote_users took too long - aborting")
+            break
+
+
 @shared_task(name="waldur_openportal.sync")
 @run_once_task(takeover_timeout=60 * 60)
 def sync():
@@ -709,38 +806,6 @@ def sync():
     This will add and remove users as needed.
     """
     logger.info("OpenPortal task.sync")
-    now = datetime.datetime.now()
-    fail_count = 0
-
-    # First, sync all of the usage, so we have up-to-date accounting data
-    for customer in structure_models.Customer.objects.all():
-        for allocation in get_structure_allocations(customer):
-            try:
-                sync_allocation_users(allocation)
-            except Exception as e:
-                logger.error(f"Failed to sync users for {allocation}: {e}")
-                fail_count += 1
-
-                if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
-                    logger.error("Too many failures - aborting")
-                    break
-                elif (datetime.datetime.now() - now).seconds > 3600:
-                    logger.error("sync_usage took too long - aborting")
-                    break
-
-        for allocation in get_structure_remote_allocations(customer):
-            try:
-                sync_remote_allocation_users(allocation)
-            except Exception as e:
-                logger.error(f"Failed to sync remote users for {allocation}: {e}")
-                fail_count += 1
-
-                if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
-                    logger.error("Too many failures - aborting")
-                    break
-                elif (datetime.datetime.now() - now).seconds > 3600:
-                    logger.error("sync_remote_usage took too long - aborting")
-                    break
 
 
 @shared_task(name="waldur_openportal.sync_project")
@@ -1560,3 +1625,45 @@ def sync_board():
         except Exception as e:
             logger.error(f"Failed to process job {job.id}: {e}")
             continue
+
+
+@shared_task(name="waldur_openportal.clean_stale_jobs")
+def clean_stale_jobs():
+    """
+    This task deletes all OpenPortal jobs that were created more than
+    2 days ago - this is to prevent the database from filling up with
+    old jobs that are no longer relevant.
+    """
+    logger.info("OpenPortal task.clean_stale_jobs")
+
+    cutoff = datetime.date.today() - datetime.timedelta(days=2)
+
+    stale_jobs = models.Job.objects.filter(created__lt=cutoff)
+
+    stale_jobs.delete()
+
+
+@shared_task(name="waldur_openportal.fix_total_allocation")
+def fix_total_allocation():
+    """
+    This task goes through all OpenPortal remote allocations and makes sure
+    that the project balance is correct, given the total awarded from
+    the remote allocation, and the total consumption for the project
+    over its lifetime. We have seen that these can drift apart
+    over time, as Waldur does some strange accounting at the start
+    of each month. This should be run daily
+    """
+    logger.info("OpenPortal task.fix_total_allocation")
+
+    managed_projects = models.ManagedProject.objects.filter(project__isnull=False)
+
+    for managed_project in managed_projects:
+        project = managed_project.project
+
+        if project.is_removed:
+            continue
+
+        if project.is_expired:
+            continue
+
+        utils.fix_total_allocation(project)
