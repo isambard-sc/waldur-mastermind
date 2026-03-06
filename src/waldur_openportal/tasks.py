@@ -1625,3 +1625,45 @@ def sync_board():
         except Exception as e:
             logger.error(f"Failed to process job {job.id}: {e}")
             continue
+
+
+@shared_task(name="waldur_openportal.clean_stale_jobs")
+def clean_stale_jobs():
+    """
+    This task deletes all OpenPortal jobs that were created more than
+    2 days ago - this is to prevent the database from filling up with
+    old jobs that are no longer relevant.
+    """
+    logger.info("OpenPortal task.clean_stale_jobs")
+
+    cutoff = datetime.date.today() - datetime.timedelta(days=2)
+
+    stale_jobs = models.Job.objects.filter(created__lt=cutoff)
+
+    stale_jobs.delete()
+
+
+@shared_task(name="waldur_openportal.fix_total_allocation")
+def fix_total_allocation():
+    """
+    This task goes through all OpenPortal remote allocations and makes sure
+    that the project balance is correct, given the total awarded from
+    the remote allocation, and the total consumption for the project
+    over its lifetime. We have seen that these can drift apart
+    over time, as Waldur does some strange accounting at the start
+    of each month. This should be run daily
+    """
+    logger.info("OpenPortal task.fix_total_allocation")
+
+    managed_projects = models.ManagedProject.objects.filter(project__isnull=False)
+
+    for managed_project in managed_projects:
+        project = managed_project.project
+
+        if project.is_removed:
+            continue
+
+        if project.is_expired:
+            continue
+
+        utils.fix_total_allocation(project)
