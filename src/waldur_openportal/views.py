@@ -104,6 +104,31 @@ class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
     filterset_class = filters.AllocationUserUsageFilter
 
 
+class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = serializers.CachedProjectUsageReportSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.CachedProjectUsageReportFilter
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = models.CachedProjectUsageReport.objects.all().order_by(
+            "year", "month", "project_identifier", "resource"
+        )
+        if user.is_staff or user.is_support:
+            return qs
+        # Restrict to project_identifiers reachable via allocations on projects
+        # the user has any role in.
+        from waldur_core.structure.managers import get_connected_projects
+
+        accessible_project_ids = get_connected_projects(user)
+        accessible_identifiers = models.Allocation.objects.filter(
+            project_id__in=accessible_project_ids,
+            backend_id__isnull=False,
+        ).exclude(backend_id="").values_list("backend_id", flat=True)
+        return qs.filter(project_identifier__in=accessible_identifiers)
+
+
 class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
     queryset = models.Association.objects.all().order_by("username")

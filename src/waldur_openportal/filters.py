@@ -63,6 +63,18 @@ class ProjectTemplateFilter(django_filters.FilterSet):
     uuid = django_filters.UUIDFilter(field_name="uuid")
 
 
+class CachedProjectUsageReportFilter(django_filters.FilterSet):
+    year = django_filters.NumberFilter(field_name="year")
+    month = django_filters.NumberFilter(field_name="month")
+    project_identifier = django_filters.CharFilter(field_name="project_identifier")
+    resource = django_filters.CharFilter(field_name="resource")
+    is_complete = django_filters.BooleanFilter(field_name="is_complete")
+
+    class Meta:
+        model = models.CachedProjectUsageReport
+        fields = []
+
+
 class ManagedProjectFilter(django_filters.FilterSet):
     identifier = django_filters.CharFilter(
         field_name="identifier", lookup_expr="icontains"

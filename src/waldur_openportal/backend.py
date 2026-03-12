@@ -2,6 +2,7 @@ import logging
 import re
 import decimal
 import datetime
+import json
 
 from django.conf import settings as django_settings
 
@@ -803,6 +804,19 @@ class OpenPortalBackend(ServiceBackend):
                 not is_current_month
             ) and report.is_complete
             historical_report.save()
+
+            # Cache the full report JSON for rich frontend consumption
+            resource = str(self.client.destination())
+            models.CachedProjectUsageReport.objects.update_or_create(
+                year=first_day.year,
+                month=first_day.month,
+                project_identifier=str(project),
+                resource=resource,
+                defaults={
+                    "is_complete": historical_report.is_complete,
+                    "report": json.loads(report.to_json()),
+                },
+            )
 
     def pull_allocation(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):
