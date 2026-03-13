@@ -271,6 +271,19 @@ class CachedProjectUsageReportSerializer(rf_serializers.ModelSerializer):
         )
 
 
+class CachedProjectStorageReportSerializer(rf_serializers.ModelSerializer):
+    class Meta:
+        model = models.CachedProjectStorageReport
+        fields = (
+            "id",
+            "year",
+            "month",
+            "project_identifier",
+            "resource",
+            "report",
+        )
+
+
 class UserInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
     class Meta:
         model = models.UserInfo

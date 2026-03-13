@@ -75,6 +75,17 @@ class CachedProjectUsageReportFilter(django_filters.FilterSet):
         fields = []
 
 
+class CachedProjectStorageReportFilter(django_filters.FilterSet):
+    year = django_filters.NumberFilter(field_name="year")
+    month = django_filters.NumberFilter(field_name="month")
+    project_identifier = django_filters.CharFilter(field_name="project_identifier")
+    resource = django_filters.CharFilter(field_name="resource")
+
+    class Meta:
+        model = models.CachedProjectStorageReport
+        fields = []
+
+
 class ManagedProjectFilter(django_filters.FilterSet):
     identifier = django_filters.CharFilter(
         field_name="identifier", lookup_expr="icontains"

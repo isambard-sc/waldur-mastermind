@@ -33,6 +33,11 @@ def register_in(router):
         basename="openportal-project-usage-report",
     )
     router.register(
+        r"openportal-project-storage-reports",
+        views.CachedProjectStorageReportViewSet,
+        basename="openportal-project-storage-report",
+    )
+    router.register(
         r"openportal-associations",
         views.AssociationViewSet,
         basename="openportal-association",

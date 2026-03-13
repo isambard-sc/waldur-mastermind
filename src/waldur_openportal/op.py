@@ -104,8 +104,12 @@ try:
         ProjectDetails,
         ProjectIdentifier,
         ProjectMapping,
+        ProjectStorageReport,
         ProjectTemplate,
+        ProjectUsageReport,
+        Quota,
         Status,
+        StorageReport,
         UserIdentifier,
         UserMapping,
         is_config_loaded,
@@ -121,7 +125,6 @@ try:
         DateRange,
         UsageReport,
         Usage,
-        ProjectUsageReport,
     )
 
     _have_openportal = True
@@ -216,6 +219,18 @@ except ImportError:
             _raise_no_openportal_error()
 
     class Usage:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class Quota:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class StorageReport:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class ProjectStorageReport:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
