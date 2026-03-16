@@ -63,6 +63,50 @@ class ProjectTemplateFilter(django_filters.FilterSet):
     uuid = django_filters.UUIDFilter(field_name="uuid")
 
 
+def _identifiers_for_project_uuid(value):
+    """Return the set of OpenPortal project_identifier strings for a Waldur project UUID."""
+    return (
+        models.Allocation.objects.filter(project__uuid=value)
+        .exclude(backend_id="")
+        .values_list("backend_id", flat=True)
+    )
+
+
+class CachedProjectUsageReportFilter(django_filters.FilterSet):
+    year = django_filters.NumberFilter(field_name="year")
+    month = django_filters.NumberFilter(field_name="month")
+    project_identifier = django_filters.CharFilter(field_name="project_identifier")
+    resource = django_filters.CharFilter(field_name="resource")
+    is_complete = django_filters.BooleanFilter(field_name="is_complete")
+    project_uuid = django_filters.UUIDFilter(method="filter_by_project_uuid")
+
+    def filter_by_project_uuid(self, queryset, name, value):
+        return queryset.filter(
+            project_identifier__in=_identifiers_for_project_uuid(value)
+        )
+
+    class Meta:
+        model = models.CachedProjectUsageReport
+        fields = []
+
+
+class CachedProjectStorageReportFilter(django_filters.FilterSet):
+    year = django_filters.NumberFilter(field_name="year")
+    month = django_filters.NumberFilter(field_name="month")
+    project_identifier = django_filters.CharFilter(field_name="project_identifier")
+    resource = django_filters.CharFilter(field_name="resource")
+    project_uuid = django_filters.UUIDFilter(method="filter_by_project_uuid")
+
+    def filter_by_project_uuid(self, queryset, name, value):
+        return queryset.filter(
+            project_identifier__in=_identifiers_for_project_uuid(value)
+        )
+
+    class Meta:
+        model = models.CachedProjectStorageReport
+        fields = []
+
+
 class ManagedProjectFilter(django_filters.FilterSet):
     identifier = django_filters.CharFilter(
         field_name="identifier", lookup_expr="icontains"

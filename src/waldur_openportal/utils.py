@@ -1,3 +1,6 @@
+import calendar
+import datetime
+import json
 import re
 import decimal
 import logging
@@ -632,6 +635,144 @@ def invite_user_to_project(project, email, role, send_email: bool = True):
 
     if send_email:
         user_tasks.process_invitation.delay(invitation.uuid.hex, "OpenPortal")
+
+
+def backfill_usage_report_cache():
+    """
+    Backfill CachedProjectUsageReport for all historical months.
+
+    Run this once manually after deploying to populate the cache for months
+    prior to the current one. The regular sync_usage task handles the current
+    (and previous) month going forward, so this only fetches up to and
+    including the month before the current one.
+
+    A project's history starts at its start_date (falling back to its
+    created date if start_date is not set), and ends at the earlier of:
+      - the month before the current month, or
+      - the month it expired / passed its grace period end date.
+
+    Skips any month for which a complete CachedProjectUsageReport already
+    exists, so it is safe to re-run.
+    """
+    from . import op as openportal
+    from .backend import OpenPortalBackend
+
+    today = timezone.now().date()
+    # Last day of the previous month — we backfill up to and including this
+    first_of_current = today.replace(day=1)
+    last_historical = first_of_current - datetime.timedelta(days=1)
+
+    active_allocations = list(
+        models.Allocation.objects.filter(is_active=True).select_related("project")
+    )
+
+    total_fetched = 0
+    total_skipped = 0
+    total_errors = 0
+
+    for allocation in active_allocations:
+        project = allocation.project
+
+        if project.is_removed:
+            continue
+
+        if not allocation.has_project_identifier():
+            logger.debug(f"backfill: skipping {allocation} - no project identifier")
+            continue
+
+        # Determine the start month for this allocation
+        start_date = project.start_date or project.created.date()
+        start_month_first = start_date.replace(day=1)
+
+        # Determine the end month (don't go past last_historical)
+        if project.end_date_with_grace:
+            project_end = min(project.end_date_with_grace, last_historical)
+        else:
+            project_end = last_historical
+
+        if start_month_first > project_end:
+            logger.debug(
+                f"backfill: skipping {allocation} - no historical months to fill"
+            )
+            continue
+
+        try:
+            backend = OpenPortalBackend(allocation.service_settings)
+        except Exception as e:
+            logger.error(f"backfill: could not create backend for {allocation}: {e}")
+            total_errors += 1
+            continue
+
+        resource = str(backend.client.destination())
+        project_identifier = str(allocation.get_project_identifier())
+
+        # Walk month by month from start_month_first to the end month
+        cursor = start_month_first
+        while cursor <= project_end:
+            year, month = cursor.year, cursor.month
+            last_day = calendar.monthrange(year, month)[1]
+            month_end = cursor.replace(day=last_day)
+
+            logger.info(
+                f"backfill: processing {project_identifier} {year}-{month:02d} ({resource})"
+            )
+
+            # Skip if we already have a complete cached report for this month
+            already_complete = models.CachedProjectUsageReport.objects.filter(
+                year=year,
+                month=month,
+                project_identifier=project_identifier,
+                resource=resource,
+                is_complete=True,
+            ).exists()
+
+            if already_complete:
+                logger.debug(
+                    f"backfill: skipping {project_identifier} {year}-{month:02d} "
+                    f"({resource}) - already complete"
+                )
+                total_skipped += 1
+            else:
+                try:
+                    date_range = openportal.DateRange(cursor, month_end)
+                    report = backend.client.get_usage_report(
+                        allocation.get_project_identifier(), date_range
+                    )
+                    models.CachedProjectUsageReport.objects.update_or_create(
+                        year=year,
+                        month=month,
+                        project_identifier=project_identifier,
+                        resource=resource,
+                        defaults={
+                            "is_complete": True,
+                            "report": json.loads(report.to_json()),
+                        },
+                    )
+                    logger.info(
+                        f"backfill: cached {project_identifier} {year}-{month:02d} ({resource})"
+                    )
+                    total_fetched += 1
+                except Exception as e:
+                    logger.error(
+                        f"backfill: failed for {project_identifier} {year}-{month:02d}: {e}"
+                    )
+                    total_errors += 1
+
+            # Advance to the first of the next month
+            if month == 12:
+                cursor = cursor.replace(year=year + 1, month=1, day=1)
+            else:
+                cursor = cursor.replace(month=month + 1, day=1)
+
+    logger.info(
+        f"backfill_usage_report_cache complete: "
+        f"{total_fetched} fetched, {total_skipped} skipped, {total_errors} errors"
+    )
+    return {
+        "fetched": total_fetched,
+        "skipped": total_skipped,
+        "errors": total_errors,
+    }
 
 
 def sync_openportal_shortnames_to_slugs():

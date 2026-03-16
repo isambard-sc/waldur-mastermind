@@ -81,6 +81,15 @@ class OpenPortalExtension(WaldurExtension):
                 "schedule": timedelta(minutes=19),
                 "args": (),
             },
+            # This task fetches storage snapshots for all active allocations and
+            # accumulates them into monthly CachedProjectStorageReport records.
+            # 8 hours is frequent enough for at least one snapshot per day without
+            # overloading the filesystems.
+            "waldur-openportal-sync-storage": {
+                "task": "waldur_openportal.sync_storage",
+                "schedule": timedelta(hours=8),
+                "args": (),
+            },
             # This task cleans up stale OpenPortal jobs from the database
             "waldur_openportal.clean_stale_jobs": {
                 "task": "waldur_openportal.clean_stale_jobs",

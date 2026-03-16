@@ -518,6 +518,52 @@ def sync_usage():
             logger.error(f"Failed to schedule sync for customer {customer_id}: {e}")
 
 
+@shared_task(name="waldur_openportal.sync_allocation_storage")
+def sync_allocation_storage(serialized_allocation):
+    """
+    Fetch the current storage snapshot for the passed allocation and merge it
+    into the month-accumulated CachedProjectStorageReport.
+    """
+    logger.info(f"task.sync_allocation_storage: {serialized_allocation}")
+
+    if isinstance(serialized_allocation, models.Allocation):
+        allocation = serialized_allocation
+    else:
+        allocation = core_utils.deserialize_instance(serialized_allocation)
+
+        if not isinstance(allocation, models.Allocation):
+            logger.info(
+                f"Skipping allocation {allocation} - not an Allocation instance"
+            )
+            return
+
+    backend_obj = allocation.get_backend()
+    backend_obj.sync_storage(allocation)
+
+
+@shared_task(name="waldur_openportal.sync_storage")
+@run_once_task(takeover_timeout=60 * 60)
+def sync_storage():
+    """
+    Fetch and accumulate storage snapshots for all active allocations.
+    Runs every 8 hours so each project gets at least one storage report per day
+    without hammering the filesystems.
+    """
+    logger.info("OpenPortal task.sync_storage")
+
+    allocations = list(models.Allocation.objects.filter(is_active=True))
+
+    # Randomise order so repeated errors on individual allocations don't
+    # consistently block others from being processed.
+    random.shuffle(allocations)
+
+    for allocation in allocations:
+        try:
+            sync_allocation_storage(allocation)
+        except Exception as e:
+            logger.error(f"Failed to sync storage for {allocation}: {e}")
+
+
 @shared_task(name="waldur_openportal.sync_allocation_limits")
 @run_once_task(takeover_timeout=60 * 60)
 def sync_allocation_limits():
