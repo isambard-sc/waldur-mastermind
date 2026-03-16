@@ -735,9 +735,31 @@ def backfill_usage_report_cache():
             else:
                 try:
                     date_range = openportal.DateRange(cursor, month_end)
-                    report = backend.client.get_usage_report(
-                        allocation.get_project_identifier(), date_range
-                    )
+
+                    # should try to get the report 10 times, as sometimes this
+                    # can take OpenPortal a while if there are lots of jobs that month
+                    report = None
+
+                    for attempt in range(10):
+                        try:
+                            report = backend.client.get_usage_report(
+                                allocation.get_project_identifier(), date_range
+                            )
+                            break
+                        except Exception as e:
+                            logger.warning(
+                                f"backfill: attempt {attempt + 1} - failed to fetch report for "
+                                f"{project_identifier} {year}-{month:02d} ({resource}): {e}"
+                            )
+
+                    if report is None:
+                        logger.error(
+                            f"backfill: failed to fetch report for {project_identifier} "
+                            f"{year}-{month:02d} ({resource}) after 10 attempts"
+                        )
+                        total_errors += 1
+                        continue
+
                     models.CachedProjectUsageReport.objects.update_or_create(
                         year=year,
                         month=month,

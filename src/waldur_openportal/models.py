@@ -910,6 +910,7 @@ class CachedProjectUsageReport(models.Model):
 
     class Meta:
         unique_together = [("year", "month", "project_identifier", "resource")]
+        indexes = [models.Index(fields=["project_identifier"])]
 
     def get_report(self) -> "openportal.ProjectUsageReport":
         return openportal.ProjectUsageReport.from_json(json.dumps(self.report))
@@ -944,6 +945,7 @@ class CachedProjectStorageReport(models.Model):
 
     class Meta:
         unique_together = [("year", "month", "project_identifier", "resource")]
+        indexes = [models.Index(fields=["project_identifier"])]
 
     def get_report(self) -> "openportal.ProjectStorageReport":
         return openportal.ProjectStorageReport.from_json(json.dumps(self.report))
