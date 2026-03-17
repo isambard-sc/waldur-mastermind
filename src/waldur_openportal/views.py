@@ -105,12 +105,15 @@ class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.CachedProjectUsageReport.objects.none()
     serializer_class = serializers.CachedProjectUsageReportSerializer
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (DjangoFilterBackend,)
     filterset_class = filters.CachedProjectUsageReportFilter
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.CachedProjectUsageReport.objects.none()
         user = self.request.user
         qs = models.CachedProjectUsageReport.objects.all().order_by(
             "year", "month", "project_identifier", "resource"
@@ -130,12 +133,15 @@ class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.CachedProjectStorageReport.objects.none()
     serializer_class = serializers.CachedProjectStorageReportSerializer
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (DjangoFilterBackend,)
     filterset_class = filters.CachedProjectStorageReportFilter
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.CachedProjectStorageReport.objects.none()
         user = self.request.user
         qs = models.CachedProjectStorageReport.objects.all().order_by(
             "year", "month", "project_identifier", "resource"
@@ -1054,6 +1060,42 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         return Response(
             {"message": "Project detached successfully"}, status=status.HTTP_200_OK
         )
+
+
+class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Read-only endpoint returning accounting summaries for projects.
+
+    Each summary contains project start/end dates, total lifetime credits,
+    total historical spend (excluding the current month), and current month spend.
+    Data is derived from invoice items and project credits via get_project_spend_info.
+
+    Staff and support users see all projects. Regular users see only projects they
+    have a membership role in (directly or via their organisation/customer).
+
+    Filterable by:
+      - project_uuid: return summary for a single project
+      - customer_uuid: return summaries for all projects in an organisation
+    """
+
+    queryset = structure_models.Project.objects.none()
+    serializer_class = serializers.ProjectAccountingSummarySerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.ProjectAccountingSummaryFilter
+    lookup_field = "uuid"
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return structure_models.Project.objects.none()
+        from waldur_core.structure.managers import get_connected_projects
+
+        user = self.request.user
+        qs = structure_models.Project.objects.all().select_related("customer")
+        if user.is_staff or user.is_support:
+            return qs
+        accessible_project_ids = get_connected_projects(user)
+        return qs.filter(id__in=accessible_project_ids)
 
 
 class UnmanagedProjectViewSet(structure_views.ProjectViewSet):
