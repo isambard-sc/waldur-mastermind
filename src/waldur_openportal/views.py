@@ -1056,6 +1056,39 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         )
 
 
+class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Read-only endpoint returning accounting summaries for projects.
+
+    Each summary contains project start/end dates, total lifetime credits,
+    total historical spend (excluding the current month), and current month spend.
+    Data is derived from invoice items and project credits via get_project_spend_info.
+
+    Staff and support users see all projects. Regular users see only projects they
+    have a membership role in (directly or via their organisation/customer).
+
+    Filterable by:
+      - project_uuid: return summary for a single project
+      - customer_uuid: return summaries for all projects in an organisation
+    """
+
+    serializer_class = serializers.ProjectAccountingSummarySerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.ProjectAccountingSummaryFilter
+    lookup_field = "uuid"
+
+    def get_queryset(self):
+        from waldur_core.structure.managers import get_connected_projects
+
+        user = self.request.user
+        qs = structure_models.Project.objects.all().select_related("customer")
+        if user.is_staff or user.is_support:
+            return qs
+        accessible_project_ids = get_connected_projects(user)
+        return qs.filter(id__in=accessible_project_ids)
+
+
 class UnmanagedProjectViewSet(structure_views.ProjectViewSet):
     """
     ViewSet that only matches Projects that do not have an associated ManagedProject.

@@ -2,6 +2,7 @@ import django_filters
 
 from waldur_core.core import filters as core_filters
 from waldur_core.structure import filters as structure_filters
+from waldur_core.structure import models as structure_models
 
 from . import models
 
@@ -104,6 +105,15 @@ class CachedProjectStorageReportFilter(django_filters.FilterSet):
 
     class Meta:
         model = models.CachedProjectStorageReport
+        fields = []
+
+
+class ProjectAccountingSummaryFilter(django_filters.FilterSet):
+    project_uuid = django_filters.UUIDFilter(field_name="uuid")
+    customer_uuid = django_filters.UUIDFilter(field_name="customer__uuid")
+
+    class Meta:
+        model = structure_models.Project
         fields = []
 
 
