@@ -105,12 +105,15 @@ class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.CachedProjectUsageReport.objects.none()
     serializer_class = serializers.CachedProjectUsageReportSerializer
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (DjangoFilterBackend,)
     filterset_class = filters.CachedProjectUsageReportFilter
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.CachedProjectUsageReport.objects.none()
         user = self.request.user
         qs = models.CachedProjectUsageReport.objects.all().order_by(
             "year", "month", "project_identifier", "resource"
@@ -130,12 +133,15 @@ class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.CachedProjectStorageReport.objects.none()
     serializer_class = serializers.CachedProjectStorageReportSerializer
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (DjangoFilterBackend,)
     filterset_class = filters.CachedProjectStorageReportFilter
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.CachedProjectStorageReport.objects.none()
         user = self.request.user
         qs = models.CachedProjectStorageReport.objects.all().order_by(
             "year", "month", "project_identifier", "resource"
@@ -1072,6 +1078,7 @@ class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
       - customer_uuid: return summaries for all projects in an organisation
     """
 
+    queryset = structure_models.Project.objects.none()
     serializer_class = serializers.ProjectAccountingSummarySerializer
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (DjangoFilterBackend,)
@@ -1079,6 +1086,8 @@ class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return structure_models.Project.objects.none()
         from waldur_core.structure.managers import get_connected_projects
 
         user = self.request.user
