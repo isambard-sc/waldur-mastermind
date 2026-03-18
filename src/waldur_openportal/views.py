@@ -5,6 +5,7 @@ from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
 from drf_spectacular.types import OpenApiTypes
+from rest_framework import filters as rf_filters
 from rest_framework import permissions, response, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -720,8 +721,17 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         StateValidator(ReviewStates.PENDING, state_enum=ReviewStates)
     ]
 
-    filter_backends = [GenericRoleFilter, DjangoFilterBackend]
+    filter_backends = [GenericRoleFilter, DjangoFilterBackend, rf_filters.OrderingFilter]
     filterset_class = filters.ManagedProjectFilter
+    ordering_fields = (
+        "created",
+        "state",
+        "identifier",
+        "project__name",
+        "project_template__name",
+        "project__customer__name",
+        "project_template__offering",
+    )
 
     disabled_actions = ["create", "update", "partial_update", "retrieve", "destroy"]
 
