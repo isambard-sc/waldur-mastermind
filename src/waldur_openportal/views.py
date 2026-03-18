@@ -35,6 +35,10 @@ from . import executors, filters, models, serializers, tasks
 logger = logging.getLogger(__name__)
 
 
+class ShortOrderingFilter(rf_filters.OrderingFilter):
+    ordering_param = "o"
+
+
 class AllocationViewSet(structure_views.ResourceViewSet):
     queryset = models.Allocation.objects.all().order_by("name")
     serializer_class = serializers.AllocationSerializer
@@ -721,13 +725,13 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         StateValidator(ReviewStates.PENDING, state_enum=ReviewStates)
     ]
 
-    filter_backends = [GenericRoleFilter, DjangoFilterBackend, rf_filters.OrderingFilter]
+    filter_backends = [GenericRoleFilter, DjangoFilterBackend, ShortOrderingFilter]
     filterset_class = filters.ManagedProjectFilter
     ordering_fields = (
         "created",
         "state",
         "identifier",
-        "project__name",
+        "details__name",
         "project_template__name",
         "project__customer__name",
         "project_template__offering",

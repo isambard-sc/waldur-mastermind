@@ -138,7 +138,7 @@ class ManagedProjectFilter(django_filters.FilterSet):
     local_identifier = django_filters.CharFilter(
         field_name="local_identifier", lookup_expr="icontains"
     )
-    search = django_filters.CharFilter(method="filter_search")
+    query = django_filters.CharFilter(method="filter_search")
 
     def filter_search(self, queryset, name, value):
         return queryset.filter(
