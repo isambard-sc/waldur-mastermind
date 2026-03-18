@@ -6,7 +6,13 @@ import httpx
 from django.contrib import auth
 from django.utils.translation import gettext_lazy as _
 from django.http import JsonResponse
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiTypes,
+    extend_schema,
+    inline_serializer,
+)
+from rest_framework import serializers as drf_serializers
 from waldur_core.core import models
 from django.core.cache import cache
 from waldur_core.core.authentication import refresh_token
@@ -1042,6 +1048,26 @@ def get_api_token(request):
         "Returns a dict keyed by identifier; unknown destinations map to null. "
         "Accessible to all authenticated users."
     ),
+    parameters=[
+        OpenApiParameter(
+            name="identifier",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            many=True,
+            description="OpenPortal destination string (repeatable).",
+        ),
+    ],
+    responses={
+        200: inline_serializer(
+            name="OfferingMappingResponse",
+            fields={
+                "uuid": drf_serializers.CharField(),
+                "name": drf_serializers.CharField(),
+                "description": drf_serializers.CharField(),
+                "slug": drf_serializers.CharField(),
+            },
+        )
+    },
 )
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -1108,6 +1134,26 @@ def offering_mapping(request):
         "Staff and support see all projects; regular users see only projects "
         "they are a member of."
     ),
+    parameters=[
+        OpenApiParameter(
+            name="identifier",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            many=True,
+            description="OpenPortal ProjectIdentifier string (repeatable).",
+        ),
+    ],
+    responses={
+        200: inline_serializer(
+            name="ProjectMappingResponse",
+            fields={
+                "uuid": drf_serializers.CharField(),
+                "name": drf_serializers.CharField(),
+                "customer_uuid": drf_serializers.CharField(),
+                "customer_name": drf_serializers.CharField(),
+            },
+        )
+    },
 )
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -1167,6 +1213,26 @@ def project_mapping(request):
         "Staff and support see all users; regular users may only look up "
         "users who share a project with them."
     ),
+    parameters=[
+        OpenApiParameter(
+            name="identifier",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            many=True,
+            description="OpenPortal UserIdentifier string (repeatable).",
+        ),
+    ],
+    responses={
+        200: inline_serializer(
+            name="UserMappingResponse",
+            fields={
+                "uuid": drf_serializers.CharField(),
+                "full_name": drf_serializers.CharField(),
+                "email": drf_serializers.EmailField(),
+                "username": drf_serializers.CharField(),
+            },
+        )
+    },
 )
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
