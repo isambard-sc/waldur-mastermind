@@ -5,6 +5,7 @@ from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
 from drf_spectacular.types import OpenApiTypes
+from rest_framework import filters as rf_filters
 from rest_framework import permissions, response, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -32,6 +33,10 @@ from waldur_core.core import utils as core_utils
 from . import executors, filters, models, serializers, tasks
 
 logger = logging.getLogger(__name__)
+
+
+class ShortOrderingFilter(rf_filters.OrderingFilter):
+    ordering_param = "o"
 
 
 class AllocationViewSet(structure_views.ResourceViewSet):
@@ -720,8 +725,17 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         StateValidator(ReviewStates.PENDING, state_enum=ReviewStates)
     ]
 
-    filter_backends = [GenericRoleFilter, DjangoFilterBackend]
+    filter_backends = [GenericRoleFilter, DjangoFilterBackend, ShortOrderingFilter]
     filterset_class = filters.ManagedProjectFilter
+    ordering_fields = (
+        "created",
+        "state",
+        "identifier",
+        "details__name",
+        "project_template__name",
+        "project__customer__name",
+        "project_template__offering",
+    )
 
     disabled_actions = ["create", "update", "partial_update", "retrieve", "destroy"]
 

@@ -6,7 +6,13 @@ import httpx
 from django.contrib import auth
 from django.utils.translation import gettext_lazy as _
 from django.http import JsonResponse
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiTypes,
+    extend_schema,
+    inline_serializer,
+)
+from rest_framework import serializers as drf_serializers
 from waldur_core.core import models
 from django.core.cache import cache
 from waldur_core.core.authentication import refresh_token
@@ -1446,3 +1452,253 @@ def get_api_token(request):
     return JsonResponse(
         {"token": waldur_api_token, "user_access": user_access, "user_email": email}
     )
+
+
+@extend_schema(
+    description=(
+        "Map OpenPortal destination strings to Waldur Offering objects. "
+        "Pass each destination as a repeated 'identifier' query parameter. "
+        "Returns a dict keyed by identifier; unknown destinations map to null. "
+        "Accessible to all authenticated users."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="identifier",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            many=True,
+            description="OpenPortal destination string (repeatable).",
+        ),
+    ],
+    responses={
+        200: inline_serializer(
+            name="OfferingMappingResponse",
+            fields={
+                "uuid": drf_serializers.CharField(),
+                "name": drf_serializers.CharField(),
+                "description": drf_serializers.CharField(),
+                "slug": drf_serializers.CharField(),
+            },
+        )
+    },
+)
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def offering_mapping(request):
+    """
+    Map OpenPortal destination strings to Waldur Offering objects.
+
+    Chain: destination -> ServiceSettings (options.instance_name)
+           -> Offering (scope GenericFK)
+    """
+    from django.contrib.contenttypes.models import ContentType
+    from waldur_mastermind.marketplace import models as marketplace_models
+
+    identifiers = request.query_params.getlist("identifier")
+    if not identifiers:
+        return JsonResponse({})
+
+    ss_ct = ContentType.objects.get_for_model(structure_models.ServiceSettings)
+
+    # options is a TextField (not a real JSONField) so key-path ORM lookups
+    # don't work. Fetch all ServiceSettings backing OpenPortal Allocations and
+    # match instance_name in Python — there are very few of these in practice.
+    openportal_ss = structure_models.ServiceSettings.objects.filter(
+        id__in=models.Allocation.objects.values("service_settings_id")
+    )
+    instance_name_to_ss = {
+        ss.options.get("instance_name"): ss
+        for ss in openportal_ss
+        if isinstance(ss.options, dict) and ss.options.get("instance_name")
+    }
+
+    result = {}
+    for identifier in identifiers:
+        ss = instance_name_to_ss.get(identifier)
+
+        if ss is None:
+            result[identifier] = None
+            continue
+
+        offering = marketplace_models.Offering.objects.filter(
+            content_type=ss_ct,
+            object_id=ss.pk,
+        ).first()
+
+        if offering is None:
+            result[identifier] = None
+            continue
+
+        result[identifier] = {
+            "uuid": str(offering.uuid),
+            "name": offering.name,
+            "description": offering.description,
+            "slug": offering.slug,
+        }
+
+    return JsonResponse(result)
+
+
+@extend_schema(
+    description=(
+        "Map OpenPortal ProjectIdentifier strings to Waldur Project objects. "
+        "Pass each identifier as a repeated 'identifier' query parameter. "
+        "Returns a dict keyed by identifier; unknown identifiers map to null. "
+        "Staff and support see all projects; regular users see only projects "
+        "they are a member of."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="identifier",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            many=True,
+            description="OpenPortal ProjectIdentifier string (repeatable).",
+        ),
+    ],
+    responses={
+        200: inline_serializer(
+            name="ProjectMappingResponse",
+            fields={
+                "uuid": drf_serializers.CharField(),
+                "name": drf_serializers.CharField(),
+                "customer_uuid": drf_serializers.CharField(),
+                "customer_name": drf_serializers.CharField(),
+            },
+        )
+    },
+)
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def project_mapping(request):
+    """
+    Map OpenPortal ProjectIdentifier strings to Waldur Project objects.
+
+    Chain: Allocation.backend_id == identifier -> Allocation.project
+    """
+    identifiers = request.query_params.getlist("identifier")
+    if not identifiers:
+        return JsonResponse({})
+
+    user = request.user
+
+    if user.is_staff or user.is_support:
+        accessible_project_ids = None
+    else:
+        accessible_project_ids = set(get_connected_projects(user))
+
+    result = {}
+    for identifier in identifiers:
+        allocation = (
+            models.Allocation.objects.filter(backend_id=identifier)
+            .select_related("project", "project__customer")
+            .first()
+        )
+
+        if allocation is None:
+            result[identifier] = None
+            continue
+
+        project = allocation.project
+
+        if (
+            accessible_project_ids is not None
+            and project.pk not in accessible_project_ids
+        ):
+            result[identifier] = None
+            continue
+
+        result[identifier] = {
+            "uuid": str(project.uuid),
+            "name": project.name,
+            "customer_uuid": str(project.customer.uuid),
+            "customer_name": project.customer.name,
+        }
+
+    return JsonResponse(result)
+
+
+@extend_schema(
+    description=(
+        "Map OpenPortal UserIdentifier strings to Waldur User objects. "
+        "Pass each identifier as a repeated 'identifier' query parameter. "
+        "Returns a dict keyed by identifier; unknown identifiers map to null. "
+        "Staff and support see all users; regular users may only look up "
+        "users who share a project with them."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="identifier",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            many=True,
+            description="OpenPortal UserIdentifier string (repeatable).",
+        ),
+    ],
+    responses={
+        200: inline_serializer(
+            name="UserMappingResponse",
+            fields={
+                "uuid": drf_serializers.CharField(),
+                "full_name": drf_serializers.CharField(),
+                "email": drf_serializers.EmailField(),
+                "username": drf_serializers.CharField(),
+            },
+        )
+    },
+)
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def user_mapping(request):
+    """
+    Map OpenPortal UserIdentifier strings to Waldur User objects.
+
+    Chain: Association.useridentifier == identifier -> Association.user
+    Permission: regular users may only resolve identifiers for users on
+    projects they themselves belong to.
+    """
+    identifiers = request.query_params.getlist("identifier")
+    if not identifiers:
+        return JsonResponse({})
+
+    user = request.user
+
+    if user.is_staff or user.is_support:
+        accessible_user_ids = None
+    else:
+        accessible_project_ids = get_connected_projects(user)
+        accessible_user_ids = set(
+            models.Association.objects.filter(
+                allocation__project_id__in=accessible_project_ids
+            ).values_list("user_id", flat=True)
+        )
+
+    result = {}
+    for identifier in identifiers:
+        association = (
+            models.Association.objects.filter(useridentifier=identifier)
+            .select_related("user")
+            .first()
+        )
+
+        if association is None or association.user is None:
+            result[identifier] = None
+            continue
+
+        mapped_user = association.user
+
+        if (
+            accessible_user_ids is not None
+            and mapped_user.pk not in accessible_user_ids
+        ):
+            result[identifier] = None
+            continue
+
+        result[identifier] = {
+            "uuid": str(mapped_user.uuid),
+            "full_name": mapped_user.full_name,
+            "username": mapped_user.username,
+            "email": mapped_user.email,
+        }
+
+    return JsonResponse(result)

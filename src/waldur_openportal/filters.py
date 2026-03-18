@@ -1,4 +1,5 @@
 import django_filters
+from django.db.models import Q
 from django.utils import timezone
 
 from waldur_core.core import filters as core_filters
@@ -137,6 +138,15 @@ class ManagedProjectFilter(django_filters.FilterSet):
     local_identifier = django_filters.CharFilter(
         field_name="local_identifier", lookup_expr="icontains"
     )
+    query = django_filters.CharFilter(method="filter_search")
+
+    def filter_search(self, queryset, name, value):
+        return queryset.filter(
+            Q(identifier__icontains=value)
+            | Q(project__name__icontains=value)
+            | Q(project_template__name__icontains=value)
+            | Q(details__name__icontains=value)
+        )
 
     project = core_filters.URLFilter(
         view_name="project-detail", field_name="project__uuid"

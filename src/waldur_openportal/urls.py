@@ -8,6 +8,9 @@ from .api import (
     fetch_job,
     whoami,
     get_api_token,
+    offering_mapping,
+    project_mapping,
+    user_mapping,
 )
 
 
@@ -109,6 +112,21 @@ urlpatterns = [
         r"^api/openportal/get_api_token/",
         get_api_token,
         name="get_api_token",
+    ),
+    re_path(
+        r"^api/openportal/offering_mapping/",
+        offering_mapping,
+        name="offering-mapping",
+    ),
+    re_path(
+        r"^api/openportal/project_mapping/",
+        project_mapping,
+        name="project-mapping",
+    ),
+    re_path(
+        r"^api/openportal/user_mapping/",
+        user_mapping,
+        name="user-mapping",
     ),
     # Custom routes for ManagedProject with composite lookup
     re_path(

@@ -382,7 +382,7 @@ class ProjectTemplateSerializer(
         lookup_field="uuid",
     )
 
-    provider_data = structure_serializers.CustomerSerializer(
+    provider_data = structure_serializers.BasicCustomerSerializer(
         source="provider", read_only=True
     )
 
@@ -392,7 +392,7 @@ class ProjectTemplateSerializer(
         lookup_field="uuid",
     )
 
-    customer_data = structure_serializers.CustomerSerializer(
+    customer_data = structure_serializers.BasicCustomerSerializer(
         source="customer", read_only=True
     )
 
@@ -403,7 +403,7 @@ class ProjectTemplateSerializer(
         lookup_field="uuid",
     )
 
-    offerings_data = marketplace_serializers.ProviderOfferingDetailsSerializer(
+    offerings_data = marketplace_serializers.ResourceOfferingSerializer(
         source="offerings", many=True, read_only=True
     )
 
@@ -548,7 +548,7 @@ class ManagedProjectSerializer(
         lookup_field="uuid",
     )
 
-    project_data = structure_serializers.ProjectSerializer(
+    project_data = structure_serializers.BasicProjectSerializer(
         source="project", read_only=True
     )
 
