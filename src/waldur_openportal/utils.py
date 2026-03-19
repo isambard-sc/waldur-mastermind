@@ -797,6 +797,93 @@ def backfill_usage_report_cache():
     }
 
 
+def compare_historical_usage_with_cache():
+    """
+    Compare historical monthly node-hour consumption recorded in HistoricalAllocation
+    against the totals from CachedProjectUsageReport for the same months.
+
+    This is useful for understanding the impact of changes to node-hour accounting
+    (e.g. rounding up to the next highest node second) on previously recorded usage.
+
+    Only complete months are compared (is_complete=True on both sides). Months
+    where no CachedProjectUsageReport exists are skipped.
+
+    Returns a dict keyed by project_identifier with:
+        - allocation_name: human-readable name of the allocation
+        - total_historical: sum of HistoricalAllocation.node_usage across all complete months
+        - total_cached: sum of CachedProjectUsageReport total_usage.hours across the same months
+        - total_difference: total_cached - total_historical (positive = cached is higher)
+        - months: list of per-month dicts with keys:
+            year, month, historical, cached, difference
+    """
+    results = {}
+
+    historical_qs = (
+        models.HistoricalAllocation.objects.filter(is_complete=True)
+        .select_related("allocation")
+        .order_by("allocation__id", "year", "month")
+    )
+
+    for hist in historical_qs:
+        allocation = hist.allocation
+        if not allocation.has_project_identifier():
+            continue
+
+        project_identifier = str(allocation.get_project_identifier())
+
+        cached_reports = models.CachedProjectUsageReport.objects.filter(
+            year=hist.year,
+            month=hist.month,
+            project_identifier=project_identifier,
+            is_complete=True,
+        )
+
+        if not cached_reports.exists():
+            continue
+
+        try:
+            cached_total = sum(
+                float(cr.get_report().total_usage.hours) for cr in cached_reports
+            )
+        except Exception as e:
+            logger.warning(
+                f"compare_historical_usage_with_cache: could not read cached report "
+                f"for {project_identifier} {hist.year}-{hist.month:02d}: {e}"
+            )
+            continue
+
+        historical = float(hist.node_usage)
+        difference = cached_total - historical
+
+        if project_identifier not in results:
+            results[project_identifier] = {
+                "allocation_name": allocation.name,
+                "total_historical": 0.0,
+                "total_cached": 0.0,
+                "total_difference": 0.0,
+                "months": [],
+            }
+
+        entry = results[project_identifier]
+        entry["total_historical"] += historical
+        entry["total_cached"] += cached_total
+        entry["total_difference"] += difference
+        entry["months"].append(
+            {
+                "year": hist.year,
+                "month": hist.month,
+                "historical": historical,
+                "cached": cached_total,
+                "difference": difference,
+            }
+        )
+
+    logger.info(
+        f"compare_historical_usage_with_cache: compared {len(results)} projects"
+    )
+    return results
+
+
 def sync_openportal_shortnames_to_slugs():
     """
     Synchronize shortnames from ProjectInfo and UserInfo to their respective
