@@ -32,7 +32,7 @@ from waldur_core.core import utils as core_utils
 from waldur_core.users.enums import InvitationState
 from waldur_core.structure import models as structure_models
 from waldur_core.core import models as core_models
-from waldur_core.structure.managers import get_connected_projects
+from waldur_core.structure.managers import get_connected_projects, get_visible_projects
 
 from waldur_mastermind.invoices import models as invoice_models
 
@@ -1172,7 +1172,7 @@ def project_mapping(request):
     if user.is_staff or user.is_support:
         accessible_project_ids = None
     else:
-        accessible_project_ids = set(get_connected_projects(user))
+        accessible_project_ids = set(get_visible_projects(user))
 
     result = {}
     for identifier in identifiers:
@@ -1253,7 +1253,7 @@ def user_mapping(request):
     if user.is_staff or user.is_support:
         accessible_user_ids = None
     else:
-        accessible_project_ids = get_connected_projects(user)
+        accessible_project_ids = list(get_visible_projects(user))
         accessible_user_ids = set(
             models.Association.objects.filter(
                 allocation__project_id__in=accessible_project_ids
