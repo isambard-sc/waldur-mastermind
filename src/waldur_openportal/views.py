@@ -126,10 +126,11 @@ class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
         if user.is_staff or user.is_support:
             return qs
         # Restrict to project_identifiers reachable via allocations on projects
-        # the user has any role in.
-        from waldur_core.structure.managers import get_connected_projects
+        # the user has any role in, including projects in customers where the user
+        # is an organisation viewer.
+        from waldur_core.structure.managers import get_visible_projects
 
-        accessible_project_ids = get_connected_projects(user)
+        accessible_project_ids = list(get_visible_projects(user))
         accessible_identifiers = models.Allocation.objects.filter(
             project_id__in=accessible_project_ids,
             backend_id__isnull=False,
@@ -153,9 +154,9 @@ class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
         )
         if user.is_staff or user.is_support:
             return qs
-        from waldur_core.structure.managers import get_connected_projects
+        from waldur_core.structure.managers import get_visible_projects
 
-        accessible_project_ids = get_connected_projects(user)
+        accessible_project_ids = list(get_visible_projects(user))
         accessible_identifiers = models.Allocation.objects.filter(
             project_id__in=accessible_project_ids,
             backend_id__isnull=False,
