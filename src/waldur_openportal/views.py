@@ -1103,13 +1103,13 @@ class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return structure_models.Project.objects.none()
-        from waldur_core.structure.managers import get_connected_projects
+        from waldur_core.structure.managers import get_visible_projects
 
         user = self.request.user
         qs = structure_models.Project.objects.all().select_related("customer")
         if user.is_staff or user.is_support:
             return qs
-        accessible_project_ids = get_connected_projects(user)
+        accessible_project_ids = list(get_visible_projects(user))
         return qs.filter(id__in=accessible_project_ids)
 
 
