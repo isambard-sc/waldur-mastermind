@@ -128,13 +128,29 @@ class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
         # Restrict to project_identifiers reachable via allocations on projects
         # the user has any role in, including projects in customers where the user
         # is an organisation viewer.
+        from waldur_core.structure import models as structure_models
         from waldur_core.structure.managers import get_visible_projects
 
+        from . import op as openportal
+
         accessible_project_ids = list(get_visible_projects(user))
-        accessible_identifiers = models.Allocation.objects.filter(
-            project_id__in=accessible_project_ids,
-            backend_id__isnull=False,
-        ).exclude(backend_id="").values_list("backend_id", flat=True)
+        # Identifiers from active allocations
+        allocation_identifiers = set(
+            models.Allocation.objects.filter(
+                project_id__in=accessible_project_ids,
+                backend_id__isnull=False,
+            ).exclude(backend_id="").values_list("backend_id", flat=True)
+        )
+        # Identifiers from soft-deleted projects (allocations no longer exist)
+        portal = str(openportal.get_portal())
+        deleted_identifiers = {
+            f"{project.slug}.{portal}"
+            for project in structure_models.Project.objects.filter(
+                is_removed=True,
+                id__in=accessible_project_ids,
+            ).exclude(slug__isnull=True).exclude(slug="")
+        }
+        accessible_identifiers = allocation_identifiers | deleted_identifiers
         return qs.filter(project_identifier__in=accessible_identifiers)
 
 
@@ -154,13 +170,29 @@ class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
         )
         if user.is_staff or user.is_support:
             return qs
+        from waldur_core.structure import models as structure_models
         from waldur_core.structure.managers import get_visible_projects
 
+        from . import op as openportal
+
         accessible_project_ids = list(get_visible_projects(user))
-        accessible_identifiers = models.Allocation.objects.filter(
-            project_id__in=accessible_project_ids,
-            backend_id__isnull=False,
-        ).exclude(backend_id="").values_list("backend_id", flat=True)
+        # Identifiers from active allocations
+        allocation_identifiers = set(
+            models.Allocation.objects.filter(
+                project_id__in=accessible_project_ids,
+                backend_id__isnull=False,
+            ).exclude(backend_id="").values_list("backend_id", flat=True)
+        )
+        # Identifiers from soft-deleted projects (allocations no longer exist)
+        portal = str(openportal.get_portal())
+        deleted_identifiers = {
+            f"{project.slug}.{portal}"
+            for project in structure_models.Project.objects.filter(
+                is_removed=True,
+                id__in=accessible_project_ids,
+            ).exclude(slug__isnull=True).exclude(slug="")
+        }
+        accessible_identifiers = allocation_identifiers | deleted_identifiers
         return qs.filter(project_identifier__in=accessible_identifiers)
 
 
