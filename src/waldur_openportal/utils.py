@@ -646,6 +646,10 @@ def backfill_usage_report_cache():
     (and previous) month going forward, so this only fetches up to and
     including the month before the current one.
 
+    Covers all allocations that ever had an OpenPortal project identifier,
+    including those on inactive or soft-deleted projects, so the full
+    historical record is preserved.
+
     A project's history starts at its start_date (falling back to its
     created date if start_date is not set), and ends at the earlier of:
       - the month before the current month, or
@@ -662,19 +666,16 @@ def backfill_usage_report_cache():
     first_of_current = today.replace(day=1)
     last_historical = first_of_current - datetime.timedelta(days=1)
 
-    active_allocations = list(
-        models.Allocation.objects.filter(is_active=True).select_related("project")
+    all_allocations = list(
+        models.Allocation.objects.all().select_related("project")
     )
 
     total_fetched = 0
     total_skipped = 0
     total_errors = 0
 
-    for allocation in active_allocations:
+    for allocation in all_allocations:
         project = allocation.project
-
-        if project.is_removed:
-            continue
 
         if not allocation.has_project_identifier():
             logger.debug(f"backfill: skipping {allocation} - no project identifier")
