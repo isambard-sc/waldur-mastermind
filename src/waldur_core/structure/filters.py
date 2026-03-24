@@ -323,6 +323,11 @@ class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
 
     is_removed = django_filters.BooleanFilter(widget=BooleanWidget)
 
+    start_date_after = django_filters.DateFilter(field_name="start_date", lookup_expr="gte")
+    start_date_before = django_filters.DateFilter(field_name="start_date", lookup_expr="lte")
+    end_date_after = django_filters.DateFilter(field_name="end_date", lookup_expr="gte")
+    end_date_before = django_filters.DateFilter(field_name="end_date", lookup_expr="lte")
+
     active_during = django_filters.CharFilter(
         method="filter_active_during",
         label=(
