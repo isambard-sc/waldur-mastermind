@@ -78,6 +78,7 @@ def _identifiers_for_project_uuid(value):
 
     from . import op as openportal
 
+    openportal.ensure_config_loaded()
     allocation_identifiers = set(
         models.Allocation.objects.filter(project__uuid=value)
         .exclude(backend_id="")
