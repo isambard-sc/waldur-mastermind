@@ -67,12 +67,30 @@ class ProjectTemplateFilter(django_filters.FilterSet):
 
 
 def _identifiers_for_project_uuid(value):
-    """Return the set of OpenPortal project_identifier strings for a Waldur project UUID."""
-    return (
+    """Return the set of OpenPortal project_identifier strings for a Waldur project UUID.
+
+    Always combines two sources:
+    1. Allocation.backend_id — covers active projects with existing allocations.
+    2. {project.slug}.{portal} — covers cases where the allocation has been deleted
+       (e.g. soft-deleted projects, or allocations removed from a project).
+    """
+    from waldur_core.structure import models as structure_models
+
+    from . import op as openportal
+
+    allocation_identifiers = set(
         models.Allocation.objects.filter(project__uuid=value)
         .exclude(backend_id="")
         .values_list("backend_id", flat=True)
     )
+    portal = str(openportal.get_portal())
+    slug_identifiers = set(
+        f"{project.slug}.{portal}"
+        for project in structure_models.Project.objects.filter(uuid=value)
+        .exclude(slug__isnull=True)
+        .exclude(slug="")
+    )
+    return allocation_identifiers | slug_identifiers
 
 
 class CachedProjectUsageReportFilter(django_filters.FilterSet):

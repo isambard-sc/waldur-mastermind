@@ -38,6 +38,7 @@ from waldur_core.structure.managers import (
     get_project_users,
     get_visible_users,
 )
+from waldur_core.structure.models import PROJECT_GRACE_PERIOD_DAYS
 from waldur_core.structure.registry import SupportedServices
 from waldur_mastermind.billing import models as billing_models
 
@@ -321,6 +322,110 @@ class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
     )
 
     is_removed = django_filters.BooleanFilter(widget=BooleanWidget)
+
+    active_during = django_filters.CharFilter(
+        method="filter_active_during",
+        label=(
+            "Return projects that were active during the given period. "
+            "Accepts a year (e.g. '2024') or year-month (e.g. '2024-03'). "
+            "A project is considered active if its start (start_date, falling back to "
+            "created date) is on or before the end of the period, and its end_date is "
+            "on or after the start of the period (or has no end_date)."
+        ),
+    )
+
+    started = django_filters.BooleanFilter(
+        method="filter_started",
+        widget=BooleanWidget,
+        label=(
+            "Filter by whether the project has started. "
+            "started=true returns projects whose start_date is in the past or unset. "
+            "started=false returns projects with a future start_date."
+        ),
+    )
+
+    ended = django_filters.BooleanFilter(
+        method="filter_ended",
+        widget=BooleanWidget,
+        label=(
+            "Filter by whether the project end_date has passed. "
+            "ended=true returns projects whose end_date is set and in the past. "
+            "ended=false returns projects with no end_date or a future end_date."
+        ),
+    )
+
+    in_grace = django_filters.BooleanFilter(
+        method="filter_in_grace",
+        widget=BooleanWidget,
+        label=(
+            "Filter by whether the project is currently in its grace period "
+            "(end_date has passed but end_date + 30 days has not). "
+            "in_grace=true returns projects currently in grace period. "
+            "in_grace=false returns projects not in grace period."
+        ),
+    )
+
+    def filter_started(self, queryset, _name, value):
+        today = timezone.now().date()
+        if value:
+            return queryset.filter(
+                Q(start_date__isnull=True) | Q(start_date__lte=today)
+            )
+        else:
+            return queryset.filter(start_date__gt=today)
+
+    def filter_ended(self, queryset, _name, value):
+        today = timezone.now().date()
+        if value:
+            return queryset.filter(end_date__isnull=False, end_date__lte=today)
+        else:
+            return queryset.filter(Q(end_date__isnull=True) | Q(end_date__gt=today))
+
+    def filter_in_grace(self, queryset, _name, value):
+        import datetime
+
+        today = timezone.now().date()
+        grace_cutoff = today - datetime.timedelta(days=PROJECT_GRACE_PERIOD_DAYS)
+        if value:
+            # end_date has passed but is within the grace period
+            return queryset.filter(
+                end_date__isnull=False,
+                end_date__lt=today,
+                end_date__gte=grace_cutoff,
+            )
+        else:
+            return queryset.exclude(
+                end_date__isnull=False,
+                end_date__lt=today,
+                end_date__gte=grace_cutoff,
+            )
+
+    def filter_active_during(self, queryset, _name, value):
+        import calendar
+        import datetime
+
+        value = value.strip()
+        try:
+            if len(value) == 4:
+                year = int(value)
+                period_start = datetime.date(year, 1, 1)
+                period_end = datetime.date(year, 12, 31)
+            elif len(value) == 7:
+                year, month = int(value[:4]), int(value[5:])
+                period_start = datetime.date(year, month, 1)
+                period_end = datetime.date(
+                    year, month, calendar.monthrange(year, month)[1]
+                )
+            else:
+                return queryset.none()
+        except (ValueError, IndexError):
+            return queryset.none()
+
+        start_condition = Q(start_date__lte=period_end) | Q(
+            start_date__isnull=True, created__date__lte=period_end
+        )
+        end_condition = Q(end_date__gte=period_start) | Q(end_date__isnull=True)
+        return queryset.filter(start_condition & end_condition)
 
     o = django_filters.OrderingFilter(
         fields=(

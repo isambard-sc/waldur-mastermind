@@ -642,6 +642,7 @@ class SoftDeletableManager(SoftDeletableManagerMixin, models.Manager):
 
 
 PROJECT_NAME_LENGTH = 500
+PROJECT_GRACE_PERIOD_DAYS = 30
 
 PROJECT_DETAILS_FIELDS = (
     "name",
@@ -848,7 +849,7 @@ class Project(
         During grace period, the project remains active but credits are set to zero.
         This allows for a transition period before full termination.
         """
-        return 30  # Default grace period of 30 days
+        return PROJECT_GRACE_PERIOD_DAYS
 
     @property
     def end_date_with_grace(self):
