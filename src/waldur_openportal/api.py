@@ -1673,32 +1673,29 @@ def user_mapping(request):
             ).values_list("user_id", flat=True)
         )
 
-    result = {}
-    for identifier in identifiers:
-        association = (
-            models.Association.objects.filter(useridentifier=identifier)
-            .select_related("user")
-            .first()
-        )
+    resolved = utils.resolve_useridentifiers(identifiers)
 
-        if association is None or association.user is None:
-            result[identifier] = None
-            continue
-
-        mapped_user = association.user
-
-        if (
-            accessible_user_ids is not None
-            and mapped_user.pk not in accessible_user_ids
-        ):
-            result[identifier] = None
-            continue
-
-        result[identifier] = {
-            "uuid": str(mapped_user.uuid),
-            "full_name": mapped_user.full_name,
-            "username": mapped_user.username,
-            "email": mapped_user.email,
-        }
+    if accessible_user_ids is not None:
+        # Filter out users that are not accessible to the requesting user
+        result = {}
+        for identifier, user_info in resolved.items():
+            if user_info is None:
+                result[identifier] = None
+                continue
+            # Look up the user pk to check accessibility
+            association = (
+                models.Association.objects.filter(useridentifier=identifier)
+                .select_related("user")
+                .first()
+            )
+            if association is None or association.user is None:
+                result[identifier] = None
+                continue
+            if association.user.pk not in accessible_user_ids:
+                result[identifier] = None
+                continue
+            result[identifier] = user_info
+    else:
+        result = resolved
 
     return JsonResponse(result)

@@ -170,6 +170,12 @@ except ImportError:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
+        def add_unattributed_usage(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def set_complete(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
     class Destination:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
@@ -218,8 +224,16 @@ except ImportError:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
+        @staticmethod
+        def combine(*args, **kwargs):
+            _raise_no_openportal_error()
+
     class Usage:
         def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        @staticmethod
+        def from_hours(*args, **kwargs):
             _raise_no_openportal_error()
 
     class Quota:
@@ -234,8 +248,57 @@ except ImportError:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
-    class ProjectUsageReport:
+    class ProjectUsageReport(UsageReport):
         def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        @staticmethod
+        def combine(*args, **kwargs):
+            _raise_no_openportal_error()
+
+        def users(self):
+            _raise_no_openportal_error()
+            return []
+
+        def add_mappings(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def remap_users(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def remap_project(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        @property
+        def dates(self):
+            _raise_no_openportal_error()
+            return []
+
+        def daily_reports(self, *args, **kwargs):
+            _raise_no_openportal_error()
+            return []
+
+        def get_report(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def add_report(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def set_project(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def scale_total(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def __iadd__(self, other):
+            _raise_no_openportal_error()
+            return self
+
+        def __add__(self, other):
+            _raise_no_openportal_error()
+            return self
+
+        def to_usage_report(self, *args, **kwargs):
             _raise_no_openportal_error()
 
     class ProjectTemplate:

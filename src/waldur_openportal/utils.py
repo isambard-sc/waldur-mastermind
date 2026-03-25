@@ -637,6 +637,93 @@ def invite_user_to_project(project, email, role, send_email: bool = True):
         user_tasks.process_invitation.delay(invitation.uuid.hex, "OpenPortal")
 
 
+def _user_info_dict(user):
+    return {
+        "uuid": str(user.uuid),
+        "full_name": user.full_name,
+        "username": user.username,
+        "email": user.email,
+    }
+
+
+def _resolve_useridentifier_from_slugs(identifier: str):
+    """
+    Fallback resolver when the Association record has been deleted.
+
+    A UserIdentifier has the form "{user_slug}.{project_slug}.{portal}".
+    We verify the portal suffix matches, then look up the project and user
+    by their slugs and confirm the user is still a member of that project.
+    Returns a user info dict or None.
+    """
+    from waldur_core.permissions.models import UserRole
+    from waldur_core.structure import models as structure_models
+
+    from . import op as openportal
+
+    try:
+        portal = str(openportal.get_portal())
+    except Exception:
+        return None
+
+    portal_suffix = f".{portal}"
+    if not identifier.endswith(portal_suffix):
+        return None
+
+    remainder = identifier[: -len(portal_suffix)]
+
+    # remainder is "{user_slug}.{project_slug}" — split from the right once
+    parts = remainder.rsplit(".", 1)
+    if len(parts) != 2:
+        return None
+
+    user_slug, project_slug = parts
+
+    try:
+        project = structure_models.Project.objects.get(slug=project_slug)
+    except structure_models.Project.DoesNotExist:
+        return None
+
+    try:
+        user = structure_models.User.objects.get(slug=user_slug)
+    except structure_models.User.DoesNotExist:
+        return None
+
+    if not UserRole.objects.filter(user=user, scope=project, is_active=True).exists():
+        return None
+
+    return _user_info_dict(user)
+
+
+def resolve_useridentifiers(identifiers: list) -> dict:
+    """
+    Map OpenPortal UserIdentifier strings to Waldur user info dicts.
+
+    Primary chain: Association.useridentifier == identifier -> Association.user
+    Fallback (when Association is deleted): parse the identifier as
+    "{user_slug}.{project_slug}.{portal}" and verify the user is still a
+    member of the project.
+
+    Returns dict of {identifier_string: {"uuid", "email", "full_name", "username"}}
+    Missing or unmapped identifiers map to None.
+    """
+    result = {}
+    for identifier in identifiers:
+        association = (
+            models.Association.objects.filter(useridentifier=identifier)
+            .select_related("user")
+            .first()
+        )
+
+        if association is not None and association.user is not None:
+            result[identifier] = _user_info_dict(association.user)
+            continue
+
+        # Association missing or user deleted — try slug-based fallback
+        result[identifier] = _resolve_useridentifier_from_slugs(identifier)
+
+    return result
+
+
 def backfill_usage_report_cache():
     """
     Backfill CachedProjectUsageReport for all historical months.
