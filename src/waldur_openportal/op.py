@@ -167,6 +167,37 @@ except ImportError:
             _raise_no_openportal_error()
 
     class DailyProjectUsageReport:
+        # Properties (Rust #[getter])
+        @property
+        def num_jobs(self):
+            _raise_no_openportal_error()
+
+        @property
+        def total_wait_seconds(self):
+            _raise_no_openportal_error()
+
+        @property
+        def is_consistent(self):
+            _raise_no_openportal_error()
+
+        @property
+        def average_wait_seconds(self):
+            _raise_no_openportal_error()
+
+        @property
+        def components(self):
+            _raise_no_openportal_error()
+            return []
+
+        @property
+        def total_usage(self):
+            _raise_no_openportal_error()
+
+        @property
+        def is_complete(self):
+            _raise_no_openportal_error()
+
+        # Regular methods
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
@@ -245,6 +276,33 @@ except ImportError:
             _raise_no_openportal_error()
 
     class ProjectStorageReport:
+        # Properties (Rust #[getter])
+        @property
+        def project(self):
+            _raise_no_openportal_error()
+
+        @property
+        def generated_at(self):
+            _raise_no_openportal_error()
+
+        @property
+        def project_quotas(self):
+            _raise_no_openportal_error()
+
+        @property
+        def user_quotas(self):
+            _raise_no_openportal_error()
+
+        @property
+        def users(self):
+            _raise_no_openportal_error()
+            return []
+
+        @property
+        def user_mapping(self):
+            _raise_no_openportal_error()
+
+        # Regular methods
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
@@ -256,17 +314,26 @@ except ImportError:
         def combine(*args, **kwargs):
             _raise_no_openportal_error()
 
-        def to_json(self, *args, **kwargs):
+        def to_json(self):
             _raise_no_openportal_error()
 
-        def users(self):
+        def is_empty(self):
+            _raise_no_openportal_error()
+
+        def daily_reports(self, *args, **kwargs):
             _raise_no_openportal_error()
             return []
 
-        def remap_users(self, *args, **kwargs):
+        def get_report(self, *args, **kwargs):
             _raise_no_openportal_error()
 
         def remap_project(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def remap_portal(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def remap_users(self, *args, **kwargs):
             _raise_no_openportal_error()
 
         def __iadd__(self, other):
@@ -278,45 +345,128 @@ except ImportError:
             return self
 
     class ProjectUsageReport(UsageReport):
+        # Properties (Rust #[getter])
+        @property
+        def dates(self):
+            _raise_no_openportal_error()
+            return []
+
+        @property
+        def components(self):
+            _raise_no_openportal_error()
+            return []
+
+        @property
+        def project(self):
+            _raise_no_openportal_error()
+
+        @property
+        def portal(self):
+            _raise_no_openportal_error()
+
+        @property
+        def users(self):
+            _raise_no_openportal_error()
+            return []
+
+        @property
+        def user_mapping(self):
+            _raise_no_openportal_error()
+
+        @property
+        def unmapped_users(self):
+            _raise_no_openportal_error()
+            return []
+
+        @property
+        def total_usage(self):
+            _raise_no_openportal_error()
+
+        @property
+        def num_jobs(self):
+            _raise_no_openportal_error()
+
+        @property
+        def total_wait_seconds(self):
+            _raise_no_openportal_error()
+
+        @property
+        def average_wait_seconds(self):
+            _raise_no_openportal_error()
+
+        @property
+        def unmapped_usage(self):
+            _raise_no_openportal_error()
+
+        @property
+        def is_complete(self):
+            _raise_no_openportal_error()
+
+        # Regular methods
         def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        @staticmethod
+        def from_json(*args, **kwargs):
             _raise_no_openportal_error()
 
         @staticmethod
         def combine(*args, **kwargs):
             _raise_no_openportal_error()
 
-        def users(self):
-            _raise_no_openportal_error()
-            return []
-
-        def add_mappings(self, *args, **kwargs):
+        def to_json(self):
             _raise_no_openportal_error()
 
-        def remap_users(self, *args, **kwargs):
+        def in_hours(self):
             _raise_no_openportal_error()
 
-        def remap_project(self, *args, **kwargs):
+        def usage(self, *args, **kwargs):
             _raise_no_openportal_error()
-
-        @property
-        def dates(self):
-            _raise_no_openportal_error()
-            return []
-
-        def daily_reports(self, *args, **kwargs):
-            _raise_no_openportal_error()
-            return []
 
         def get_report(self, *args, **kwargs):
             _raise_no_openportal_error()
 
-        def add_report(self, *args, **kwargs):
+        def get_component(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def add_mapping(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def add_mappings(self, *args, **kwargs):
             _raise_no_openportal_error()
 
         def set_project(self, *args, **kwargs):
             _raise_no_openportal_error()
 
         def scale_total(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def set_report(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def add_report(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def daily_reports(self, *args, **kwargs):
+            _raise_no_openportal_error()
+            return []
+
+        def set_complete(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def set_day_complete(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def to_usage_report(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def remap_project(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def remap_portal(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def remap_users(self, *args, **kwargs):
             _raise_no_openportal_error()
 
         def __iadd__(self, other):
@@ -326,9 +476,6 @@ except ImportError:
         def __add__(self, other):
             _raise_no_openportal_error()
             return self
-
-        def to_usage_report(self, *args, **kwargs):
-            _raise_no_openportal_error()
 
     class ProjectTemplate:
         def __init__(self, *args, **kwargs):

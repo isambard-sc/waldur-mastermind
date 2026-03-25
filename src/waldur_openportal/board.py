@@ -1208,10 +1208,6 @@ class OpenPortalBoard:
         if not isinstance(date_range, openportal.DateRange):
             raise openportal.OpenPortalError(f"Invalid date range: {date_range}")
 
-        logger.info(
-            f"Getting usage report for project {identifier} and date range {date_range}"
-        )
-
         # Get the ManagedProject for this identifier, which must already exist
         try:
             managed_project = models.ManagedProject.objects.get(
@@ -1261,13 +1257,6 @@ class OpenPortalBoard:
                     )
 
         report = openportal.ProjectUsageReport(managed_project.get_remote_identifier())
-
-        logger.info(
-            f"Creating usage report for project {project} with scale factor {scale_factor}"
-        )
-        logger.info(f"Date range: {date_range}")
-        logger.info(f"report = {report}")
-
         this_month = date.today().month
         this_year = date.today().year
 
@@ -1288,7 +1277,7 @@ class OpenPortalBoard:
                 # Build {UserIdentifier: email} map for remap_users.
                 # resolve_useridentifiers works on strings; we keep the
                 # original UserIdentifier objects to pass to remap_users.
-                user_identifiers = cached.users()
+                user_identifiers = cached.users
                 uid_strings = [str(uid) for uid in user_identifiers]
                 user_info_map = utils.resolve_useridentifiers(uid_strings)
 
@@ -1303,8 +1292,14 @@ class OpenPortalBoard:
 
                 # remap_project updates the project identifier and rebuilds
                 # all UserIdentifier keys so that report += cached succeeds.
-                cached.remap_project(managed_project.get_remote_identifier())
+                remote_id = managed_project.get_remote_identifier()
+                cached.remap_project(remote_id)
+
+                logger.info(cached)
+
                 report += cached
+
+                logger.info(report)
 
             else:
                 # Fall back to building usage from InvoiceItem objects
@@ -1378,10 +1373,7 @@ class OpenPortalBoard:
         if scale_factor is None or scale_factor <= 0:
             logger.warning(f"Invalid scale factor: {scale_factor}")
         elif scale_factor != 1.0:
-            logger.warning(
-                f"SHOULD SCALE USAGE BY {scale_factor} FOR PROJECT {project}"
-            )
-            # report.scale_total(scale_factor)
+            report.scale_total(scale_factor)
 
         return report
 
@@ -1498,7 +1490,7 @@ class OpenPortalBoard:
             )
 
             # Remap unix usernames to email addresses
-            user_identifiers = monthly.users()
+            user_identifiers = monthly.users
             uid_strings = [str(uid) for uid in user_identifiers]
             user_info_map = utils.resolve_useridentifiers(uid_strings)
             user_email_map = {}
@@ -1523,6 +1515,40 @@ class OpenPortalBoard:
             return monthly_reports[0]
 
         return openportal.ProjectStorageReport.combine(monthly_reports)
+
+    def get_storage_reports(
+        self, portal: openportal.PortalIdentifier, date_range: openportal.DateRange
+    ) -> openportal.StorageReport:
+        """
+        Return a storage report that covers all of the projects managed by the
+        specified portal.
+        """
+        if not isinstance(portal, openportal.PortalIdentifier):
+            raise openportal.OpenPortalError(f"Invalid portal identifier: {portal}")
+
+        reports = []
+
+        for project in models.ManagedProject.objects.filter(
+            destination=str(self.destination())
+        ):
+            if not project.has_remote_identifier():
+                continue
+
+            remote_identifier = project.get_remote_identifier()
+
+            if remote_identifier.portal_identifier != portal:
+                # This project is not in the requested portal
+                continue
+
+            if project.has_local_identifier():
+                reports.append(
+                    self.get_storage_report(
+                        identifier=remote_identifier,
+                        date_range=date_range,
+                    ).to_storage_report()
+                )
+
+        return openportal.StorageReport.combine(reports)
 
     def send_result(self, job: openportal.Job) -> None:
         """
