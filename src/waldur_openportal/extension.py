@@ -90,6 +90,13 @@ class OpenPortalExtension(WaldurExtension):
                 "schedule": timedelta(hours=8),
                 "args": (),
             },
+            # This task fetches accumulated storage reports from remote portals
+            # for all active RemoteAllocations and stores them locally.
+            "waldur-openportal-sync-remote-storage": {
+                "task": "waldur_openportal.sync_remote_storage",
+                "schedule": timedelta(hours=8),
+                "args": (),
+            },
             # This task cleans up stale OpenPortal jobs from the database
             "waldur_openportal.clean_stale_jobs": {
                 "task": "waldur_openportal.clean_stale_jobs",

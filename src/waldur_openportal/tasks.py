@@ -564,6 +564,86 @@ def sync_storage():
             logger.error(f"Failed to sync storage for {allocation}: {e}")
 
 
+@shared_task(name="waldur_openportal.sync_remote_allocation_storage")
+def sync_remote_allocation_storage(serialized_allocation):
+    """
+    Fetch the accumulated storage report from the remote portal for the
+    passed RemoteAllocation and store it in CachedProjectStorageReport.
+    """
+    logger.info(
+        f"task.sync_remote_allocation_storage: {serialized_allocation}"
+    )
+
+    if isinstance(serialized_allocation, models.RemoteAllocation):
+        allocation = serialized_allocation
+    else:
+        allocation = core_utils.deserialize_instance(serialized_allocation)
+
+        if not isinstance(allocation, models.RemoteAllocation):
+            logger.info(
+                f"Skipping allocation {allocation}"
+                " - not a RemoteAllocation instance"
+            )
+            return
+
+    backend = allocation.get_backend()
+
+    try:
+        allocation = backend.check_added_allocation(allocation)
+    except Exception as e:
+        if str(e).find("ManagedProjectPendingError") != -1:
+            logger.debug(
+                f"Allocation {allocation} is still pending"
+                " - skipping storage sync"
+            )
+        else:
+            logger.error(
+                f"Failed to check allocation {allocation}: {e}"
+            )
+        return
+
+    backend.sync_storage(allocation)
+
+
+@shared_task(name="waldur_openportal.sync_remote_storage")
+@run_once_task(takeover_timeout=60 * 60)
+def sync_remote_storage():
+    """
+    Fetch and store accumulated storage reports from remote portals for all
+    active RemoteAllocations.
+    """
+    logger.info("OpenPortal task.sync_remote_storage")
+    now = datetime.datetime.now()
+    fail_count = 0
+
+    allocations = list(models.RemoteAllocation.objects.filter(is_active=True))
+    random.shuffle(allocations)
+
+    for allocation in allocations:
+        try:
+            sync_remote_allocation_storage(allocation)
+        except Exception as e:
+            logger.error(
+                f"Failed to sync storage for {allocation}: {e}"
+            )
+            fail_count += 1
+
+            if fail_count > 5 and (
+                datetime.datetime.now() - now
+            ).seconds > 60:
+                logger.error("Too many failures - aborting")
+                return
+            elif (datetime.datetime.now() - now).seconds > 3600:
+                logger.error(
+                    "sync_remote_storage took too long - aborting"
+                )
+                return
+
+        if (datetime.datetime.now() - now).seconds > 3600:
+            logger.error("sync_remote_storage took too long - aborting")
+            return
+
+
 @shared_task(name="waldur_openportal.sync_allocation_limits")
 @run_once_task(takeover_timeout=60 * 60)
 def sync_allocation_limits():
@@ -1539,6 +1619,10 @@ def run_job(serialized_job):
             identifier = openportal.PortalIdentifier(args[0])
             dates = openportal.DateRange.parse(args[1])
             result = board.get_usage_reports(identifier, dates)
+        elif command == "get_storage_report":
+            identifier = openportal.ProjectIdentifier(args[0])
+            dates = openportal.DateRange.parse(args[1])
+            result = board.get_storage_report(identifier, dates)
         else:
             raise ValueError(f"Unknown command {command} for job {job.id}")
 

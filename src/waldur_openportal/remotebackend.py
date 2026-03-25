@@ -1,5 +1,6 @@
 import datetime
 import decimal
+import json
 import logging
 import re
 
@@ -953,6 +954,80 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 logger.error(
                     f"Failed to reconcile historical usage for {allocation} in {month}: {e}"
                 )
+
+    def sync_storage(self, allocation: models.RemoteAllocation):
+        """
+        Fetch the accumulated storage report from the remote portal for this
+        allocation and store it in CachedProjectStorageReport.  Last month and
+        the current month are always fetched so that data is current across
+        month boundaries.
+        """
+        if not isinstance(allocation, models.RemoteAllocation):
+            raise ServiceBackendError(
+                "Invalid allocation type %s" % type(allocation)
+            )
+
+        if not allocation.is_added_to_openportal():
+            allocation = self.add_allocated_project(allocation)
+
+            if not allocation.is_added_to_openportal():
+                logger.error(
+                    f"Allocation {allocation} is not in OpenPortal"
+                    " - cannot sync storage"
+                )
+                return
+
+        if not allocation.has_project_identifier():
+            logger.error(
+                f"Allocation {allocation} has no project identifier"
+                " - cannot sync storage"
+            )
+            return
+
+        project = allocation.get_project_identifier()
+        logger.debug(
+            f"Syncing OpenPortal storage for allocation {allocation}"
+            f" and project {project}"
+        )
+
+        months = [
+            openportal.DateRange.last_month(),
+            openportal.DateRange.this_month(),
+        ]
+
+        resource = str(self.client.destination())
+
+        for month in months:
+            first_day = month.days[0]
+
+            try:
+                report = self.client.get_storage_report(project, month)
+            except openportal.OpenPortalError as e:
+                logger.warning(
+                    f"Failed to get storage report for {allocation}"
+                    f" in {month}: {e}"
+                )
+                continue
+            except Exception as e:
+                logger.error(
+                    f"Failed to get storage report for {allocation}"
+                    f" in {month}: {e}"
+                )
+                continue
+
+            report_json = json.loads(report.to_json())
+
+            models.CachedProjectStorageReport.objects.update_or_create(
+                year=first_day.year,
+                month=first_day.month,
+                project_identifier=str(project),
+                resource=resource,
+                defaults={"report": report_json},
+            )
+            logger.debug(
+                f"Stored storage report for {project}"
+                f" [{first_day.year}-{first_day.month:02d}]"
+            )
 
     def pull_allocation(self, allocation):
         logger.info(f"Pulling remote allocation: {allocation}")

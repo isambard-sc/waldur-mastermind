@@ -248,6 +248,35 @@ except ImportError:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
+        @staticmethod
+        def from_json(*args, **kwargs):
+            _raise_no_openportal_error()
+
+        @staticmethod
+        def combine(*args, **kwargs):
+            _raise_no_openportal_error()
+
+        def to_json(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def users(self):
+            _raise_no_openportal_error()
+            return []
+
+        def remap_users(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def remap_project(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        def __iadd__(self, other):
+            _raise_no_openportal_error()
+            return self
+
+        def __add__(self, other):
+            _raise_no_openportal_error()
+            return self
+
     class ProjectUsageReport(UsageReport):
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()

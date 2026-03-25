@@ -1419,6 +1419,111 @@ class OpenPortalBoard:
 
         return openportal.UsageReport.combine(reports)
 
+    def get_storage_report(
+        self,
+        identifier: openportal.ProjectIdentifier,
+        date_range: openportal.DateRange,
+    ) -> openportal.ProjectStorageReport:
+        """
+        Return the accumulated storage report for a managed project over the given
+        date range.  Only CachedProjectStorageReport records are used — there is no
+        InvoiceItem fallback, and no unit scaling.
+        """
+        if not isinstance(identifier, openportal.ProjectIdentifier):
+            raise openportal.OpenPortalError(
+                f"Invalid project identifier: {identifier}"
+            )
+
+        if not isinstance(date_range, openportal.DateRange):
+            raise openportal.OpenPortalError(f"Invalid date range: {date_range}")
+
+        logger.info(
+            f"Getting storage report for project {identifier} and date range {date_range}"
+        )
+
+        try:
+            managed_project = models.ManagedProject.objects.get(
+                identifier=str(identifier),
+                destination=str(self.destination()),
+            )
+        except models.ManagedProject.DoesNotExist:
+            raise openportal.OpenPortalError(
+                f"ManagedProject for identifier '{identifier}' does not exist"
+            )
+
+        if managed_project.project is None:
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' does not have an associated project"
+            )
+
+        project = managed_project.project
+
+        if project.is_removed:
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' is removed"
+            )
+
+        from .filters import _identifiers_for_project_uuid
+
+        project_identifiers = _identifiers_for_project_uuid(project.uuid)
+
+        if not project_identifiers:
+            raise openportal.OpenPortalError(
+                f"No project identifiers found for project {project}"
+            )
+
+        monthly_reports = []
+
+        for month_range in date_range.months:
+            month = month_range.start_date.month
+            year = month_range.start_date.year
+
+            cached_records = models.CachedProjectStorageReport.objects.filter(
+                project_identifier__in=project_identifiers,
+                year=year,
+                month=month,
+            )
+
+            if not cached_records.exists():
+                logger.info(
+                    f"No cached storage report for project {project} for {month}/{year} - skipping"
+                )
+                continue
+
+            reports = [cr.get_report() for cr in cached_records]
+            monthly = (
+                reports[0]
+                if len(reports) == 1
+                else openportal.ProjectStorageReport.combine(reports)
+            )
+
+            # Remap unix usernames to email addresses
+            user_identifiers = monthly.users()
+            uid_strings = [str(uid) for uid in user_identifiers]
+            user_info_map = utils.resolve_useridentifiers(uid_strings)
+            user_email_map = {}
+            for uid in user_identifiers:
+                user_info = user_info_map.get(str(uid))
+                if user_info and user_info.get("email"):
+                    user_email_map[uid] = user_info["email"]
+            if user_email_map:
+                monthly.remap_users(user_email_map)
+
+            # Remap project identifier to the remote portal's identifier and
+            # rebuild UserIdentifier keys so += works correctly.
+            monthly.remap_project(managed_project.get_remote_identifier())
+            monthly_reports.append(monthly)
+
+        if not monthly_reports:
+            raise openportal.OpenPortalError(
+                f"No storage data found for project {identifier} in date range {date_range}"
+            )
+
+        if len(monthly_reports) == 1:
+            return monthly_reports[0]
+
+        return openportal.ProjectStorageReport.combine(monthly_reports)
+
     def send_result(self, job: openportal.Job) -> None:
         """
         Send the result of a job back to OpenPortal.

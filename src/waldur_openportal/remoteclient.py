@@ -274,6 +274,21 @@ class RemoteOpenPortalClient:
         )
         return report
 
+    def get_storage_report(
+        self,
+        project: openportal.ProjectIdentifier,
+        date_range: openportal.DateRange,
+    ) -> "openportal.ProjectStorageReport":
+        """
+        Return the accumulated storage report for the specified project and date range
+        """
+        project = self._to_project_identifier(project)
+
+        report = self.run(
+            f"{self.destination()} get_storage_report {project} {date_range}"
+        )
+        return report
+
     def get_users(
         self, project: openportal.ProjectIdentifier
     ) -> list[openportal.UserMapping]:
