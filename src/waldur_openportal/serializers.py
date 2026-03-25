@@ -484,9 +484,7 @@ class ProjectAccountingSummarySerializer(rf_serializers.Serializer):
             "project_name": project.name,
             "customer_uuid": str(project.customer.uuid),
             "customer_name": project.customer.name,
-            "start_date": project.start_date.isoformat()
-            if project.start_date
-            else None,
+            "start_date": (project.start_date or project.created.date()).isoformat(),
             "end_date": project.end_date.isoformat() if project.end_date else None,
         }
 

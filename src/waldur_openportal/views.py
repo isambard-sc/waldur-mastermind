@@ -133,24 +133,24 @@ class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
 
         from . import op as openportal
 
+        openportal.ensure_config_loaded()
         accessible_project_ids = list(get_visible_projects(user))
-        # Identifiers from active allocations
+        portal = str(openportal.get_portal())
+        # Identifiers from allocations (covers active projects with existing allocations)
         allocation_identifiers = set(
             models.Allocation.objects.filter(
                 project_id__in=accessible_project_ids,
                 backend_id__isnull=False,
             ).exclude(backend_id="").values_list("backend_id", flat=True)
         )
-        # Identifiers from soft-deleted projects (allocations no longer exist)
-        portal = str(openportal.get_portal())
-        deleted_identifiers = {
+        # Identifiers from project slugs (covers all projects regardless of allocation state)
+        slug_identifiers = {
             f"{project.slug}.{portal}"
             for project in structure_models.Project.objects.filter(
-                is_removed=True,
                 id__in=accessible_project_ids,
             ).exclude(slug__isnull=True).exclude(slug="")
         }
-        accessible_identifiers = allocation_identifiers | deleted_identifiers
+        accessible_identifiers = allocation_identifiers | slug_identifiers
         return qs.filter(project_identifier__in=accessible_identifiers)
 
 
@@ -175,24 +175,24 @@ class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
 
         from . import op as openportal
 
+        openportal.ensure_config_loaded()
         accessible_project_ids = list(get_visible_projects(user))
-        # Identifiers from active allocations
+        portal = str(openportal.get_portal())
+        # Identifiers from allocations (covers active projects with existing allocations)
         allocation_identifiers = set(
             models.Allocation.objects.filter(
                 project_id__in=accessible_project_ids,
                 backend_id__isnull=False,
             ).exclude(backend_id="").values_list("backend_id", flat=True)
         )
-        # Identifiers from soft-deleted projects (allocations no longer exist)
-        portal = str(openportal.get_portal())
-        deleted_identifiers = {
+        # Identifiers from project slugs (covers all projects regardless of allocation state)
+        slug_identifiers = {
             f"{project.slug}.{portal}"
             for project in structure_models.Project.objects.filter(
-                is_removed=True,
                 id__in=accessible_project_ids,
             ).exclude(slug__isnull=True).exclude(slug="")
         }
-        accessible_identifiers = allocation_identifiers | deleted_identifiers
+        accessible_identifiers = allocation_identifiers | slug_identifiers
         return qs.filter(project_identifier__in=accessible_identifiers)
 
 
