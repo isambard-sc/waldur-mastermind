@@ -1274,6 +1274,11 @@ class OpenPortalBoard:
                     f"Using cached usage report for project {project} for {month}/{year}"
                 )
 
+                # Trim to the exact requested sub-range (a no-op for full
+                # months; clips data for partial months at either end of the
+                # requested date range).
+                cached = cached.filter(month_range)
+
                 # Build {UserIdentifier: email} map for remap_users.
                 # resolve_useridentifiers works on strings; we keep the
                 # original UserIdentifier objects to pass to remap_users.
@@ -1294,13 +1299,7 @@ class OpenPortalBoard:
                 # all UserIdentifier keys so that report += cached succeeds.
                 remote_id = managed_project.get_remote_identifier()
                 cached.remap_project(remote_id)
-
-                logger.info(cached)
-
                 report += cached
-
-                logger.info(report)
-
             else:
                 # Fall back to building usage from InvoiceItem objects
                 logger.info(

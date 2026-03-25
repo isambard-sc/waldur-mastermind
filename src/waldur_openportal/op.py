@@ -259,6 +259,10 @@ except ImportError:
         def combine(*args, **kwargs):
             _raise_no_openportal_error()
 
+        def filter(self, *args, **kwargs):
+            _raise_no_openportal_error()
+            return self
+
     class Usage:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
@@ -274,6 +278,10 @@ except ImportError:
     class StorageReport:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
+
+        def filter(self, *args, **kwargs):
+            _raise_no_openportal_error()
+            return self
 
     class ProjectStorageReport:
         # Properties (Rust #[getter])
@@ -335,6 +343,10 @@ except ImportError:
 
         def remap_users(self, *args, **kwargs):
             _raise_no_openportal_error()
+
+        def filter(self, *args, **kwargs):
+            _raise_no_openportal_error()
+            return self
 
         def __iadd__(self, other):
             _raise_no_openportal_error()
@@ -468,6 +480,10 @@ except ImportError:
 
         def remap_users(self, *args, **kwargs):
             _raise_no_openportal_error()
+
+        def filter(self, *args, **kwargs):
+            _raise_no_openportal_error()
+            return self
 
         def __iadd__(self, other):
             _raise_no_openportal_error()
