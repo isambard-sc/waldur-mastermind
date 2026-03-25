@@ -1176,6 +1176,10 @@ class OpenPortalBoard:
         if not isinstance(date_range, openportal.DateRange):
             raise openportal.OpenPortalError(f"Invalid date range: {date_range}")
 
+        logger.info(
+            f"Getting usage report for project {identifier} and date range {date_range}"
+        )
+
         # Get the ManagedProject for this identifier, which must already exist
         try:
             managed_project = models.ManagedProject.objects.get(
@@ -1221,7 +1225,7 @@ class OpenPortalBoard:
                     scale_factor = template.get_allocation_mapping_for(allocation_units)
                 except Exception as e:
                     logger.warning(
-                        f"Failed to get the allocation mapping for {allocation_units}: {e}"
+                        f"Failed to get the allocation mapping for {allocation_units} from template {template}: {e}"
                     )
 
         report = openportal.ProjectUsageReport(managed_project.get_remote_identifier())
@@ -1237,7 +1241,7 @@ class OpenPortalBoard:
             month = month_range.start_date.month
             year = month_range.start_date.year
 
-            logger.debug(
+            logger.info(
                 f"Fetching invoice items for project {project} for {month}/{year}"
             )
 

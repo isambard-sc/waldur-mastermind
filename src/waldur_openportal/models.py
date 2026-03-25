@@ -1824,11 +1824,26 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
         If the allocation unit does not exist, raise an error.
         """
         if allocation_unit not in self.allocation_units_mapping:
-            raise ValueError(
-                f"Allocation unit {allocation_unit} does not exist in this class."
-            )
+            canonical_unit = openportal.Allocation.canonicalize(allocation_unit)
 
-        return self.allocation_units_mapping[allocation_unit]
+            if (
+                canonical_unit == allocation_unit
+                and allocation_unit.lower().endswith("s")
+                and len(allocation_unit) > 1
+            ):
+                canonical_unit = openportal.Allocation.canonicalize(
+                    allocation_unit[:-1]
+                )
+
+            if canonical_unit not in self.allocation_units_mapping:
+                raise ValueError(
+                    f"Allocation unit {allocation_unit} does not exist in this class. "
+                    f"Available allocation units: {list(self.allocation_units_mapping.keys())}"
+                )
+
+            return self.allocation_units_mapping[canonical_unit]
+        else:
+            return self.allocation_units_mapping[allocation_unit]
 
     def create_allocation_mappings_from_node(self, node: openportal.Node):
         """
