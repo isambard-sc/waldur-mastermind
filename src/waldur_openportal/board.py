@@ -1274,11 +1274,6 @@ class OpenPortalBoard:
                     f"Using cached usage report for project {project} for {month}/{year}"
                 )
 
-                # Trim to the exact requested sub-range (a no-op for full
-                # months; clips data for partial months at either end of the
-                # requested date range).
-                cached = cached.filter(month_range)
-
                 # Build {UserIdentifier: email} map for remap_users.
                 # resolve_useridentifiers works on strings; we keep the
                 # original UserIdentifier objects to pass to remap_users.
@@ -1299,6 +1294,13 @@ class OpenPortalBoard:
                 # all UserIdentifier keys so that report += cached succeeds.
                 remote_id = managed_project.get_remote_identifier()
                 cached.remap_project(remote_id)
+
+                if year <= this_year and month < this_month and not cached.is_complete:
+                    # this is a month in the past - we don't expect the usage to change
+                    logger.warning(
+                        f"Cached usage report for project {project} for {month}/{year} is not marked complete, but this month is in the past. Will need to refetch in the future to get the completed report."
+                    )
+
                 report += cached
             else:
                 # Fall back to building usage from InvoiceItem objects
@@ -1360,6 +1362,14 @@ class OpenPortalBoard:
                     # change the day to the first of the month
                     consumption_date = utils.get_first_day_of_month(consumption_date)
 
+                    # But make sure that the consumption date fits within
+                    # the date range - this is messy as we don't have day-based
+                    # consumption from the invoice
+                    if consumption_date < date_range.start_date:
+                        consumption_date = date_range.start_date
+                    elif consumption_date > date_range.end_date:
+                        consumption_date = date_range.end_date
+
                     d = openportal.DailyProjectUsageReport()
                     d.add_unattributed_usage(openportal.Usage.from_hours(usage))
 
@@ -1374,7 +1384,8 @@ class OpenPortalBoard:
         elif scale_factor != 1.0:
             report.scale_total(scale_factor)
 
-        return report
+        # now filter the report to the requested date range
+        return report.filter(date_range)
 
     def get_usage_reports(
         self, portal: openportal.PortalIdentifier, date_range: openportal.DateRange
