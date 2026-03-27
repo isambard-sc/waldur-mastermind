@@ -972,6 +972,248 @@ def compare_historical_usage_with_cache():
     return results
 
 
+def backfill_remote_usage_report_cache():
+    """
+    Backfill CachedProjectUsageReport for all historical months using data
+    fetched from remote portals via RemoteOpenPortalBackend.
+
+    This is the remote-portal equivalent of backfill_usage_report_cache(): it
+    iterates over RemoteAllocation objects and fetches usage reports from the
+    remote portal for each historical month, storing them in the local
+    CachedProjectUsageReport table.
+
+    Run this once manually after deploying to populate the cache for months
+    prior to the current one. The regular sync_remote_usage task handles the
+    current (and previous) month going forward.
+
+    Skips any month for which a complete CachedProjectUsageReport already
+    exists, so it is safe to re-run.
+    """
+    from . import op as openportal
+    from .remotebackend import RemoteOpenPortalBackend
+
+    today = timezone.now().date()
+    first_of_current = today.replace(day=1)
+    last_historical = first_of_current - datetime.timedelta(days=1)
+
+    all_allocations = list(
+        models.RemoteAllocation.objects.all().select_related("project")
+    )
+
+    total_fetched = 0
+    total_skipped = 0
+    total_errors = 0
+
+    for allocation in all_allocations:
+        project = allocation.project
+
+        if not allocation.has_project_identifier():
+            logger.debug(
+                f"backfill_remote: skipping {allocation} - no project identifier"
+            )
+            continue
+
+        start_date = project.start_date or project.created.date()
+        start_month_first = start_date.replace(day=1)
+
+        if project.end_date_with_grace:
+            project_end = min(project.end_date_with_grace, last_historical)
+        else:
+            project_end = last_historical
+
+        if start_month_first > project_end:
+            logger.debug(
+                f"backfill_remote: skipping {allocation} - no historical months to fill"
+            )
+            continue
+
+        try:
+            backend = RemoteOpenPortalBackend(allocation.service_settings)
+        except Exception as e:
+            logger.error(
+                f"backfill_remote: could not create backend for {allocation}: {e}"
+            )
+            total_errors += 1
+            continue
+
+        resource = str(backend.client.destination())
+        project_identifier = str(allocation.get_project_identifier())
+
+        cursor = start_month_first
+        while cursor <= project_end:
+            year, month = cursor.year, cursor.month
+            last_day = calendar.monthrange(year, month)[1]
+            month_end = cursor.replace(day=last_day)
+
+            logger.info(
+                f"backfill_remote: processing {project_identifier} "
+                f"{year}-{month:02d} ({resource})"
+            )
+
+            already_complete = models.CachedProjectUsageReport.objects.filter(
+                year=year,
+                month=month,
+                project_identifier=project_identifier,
+                resource=resource,
+                is_complete=True,
+            ).exists()
+
+            if already_complete:
+                logger.debug(
+                    f"backfill_remote: skipping {project_identifier} "
+                    f"{year}-{month:02d} ({resource}) - already complete"
+                )
+                total_skipped += 1
+            else:
+                try:
+                    date_range = openportal.DateRange(cursor, month_end)
+
+                    report = None
+                    for attempt in range(10):
+                        try:
+                            report = backend.client.get_usage_report(
+                                allocation.get_project_identifier(), date_range
+                            )
+                            break
+                        except Exception as e:
+                            logger.warning(
+                                f"backfill_remote: attempt {attempt + 1} - failed to fetch "
+                                f"report for {project_identifier} {year}-{month:02d}: {e}"
+                            )
+
+                    if report is None:
+                        logger.error(
+                            f"backfill_remote: failed to fetch report for "
+                            f"{project_identifier} {year}-{month:02d} after 10 attempts"
+                        )
+                        total_errors += 1
+                    else:
+                        models.CachedProjectUsageReport.objects.update_or_create(
+                            year=year,
+                            month=month,
+                            project_identifier=project_identifier,
+                            resource=resource,
+                            defaults={
+                                "is_complete": True,
+                                "report": json.loads(report.to_json()),
+                            },
+                        )
+                        logger.info(
+                            f"backfill_remote: cached {project_identifier} "
+                            f"{year}-{month:02d} ({resource})"
+                        )
+                        total_fetched += 1
+                except Exception as e:
+                    logger.error(
+                        f"backfill_remote: failed for {project_identifier} "
+                        f"{year}-{month:02d}: {e}"
+                    )
+                    total_errors += 1
+
+            if month == 12:
+                cursor = cursor.replace(year=year + 1, month=1, day=1)
+            else:
+                cursor = cursor.replace(month=month + 1, day=1)
+
+    logger.info(
+        f"backfill_remote_usage_report_cache complete: "
+        f"{total_fetched} fetched, {total_skipped} skipped, {total_errors} errors"
+    )
+    return {
+        "fetched": total_fetched,
+        "skipped": total_skipped,
+        "errors": total_errors,
+    }
+
+
+def compare_historical_remote_usage_with_cache():
+    """
+    Compare historical monthly node-hour consumption recorded in HistoricalRemoteAllocation
+    against the totals from CachedProjectUsageReport for the same months.
+
+    This is the remote-portal equivalent of compare_historical_usage_with_cache: it
+    uses HistoricalRemoteAllocation (populated by RemoteOpenPortalBackend.sync_usage)
+    and the CachedProjectUsageReport records that sync_usage now also writes.
+
+    Only complete months are compared (is_complete=True on both sides). Months
+    where no CachedProjectUsageReport exists are skipped.
+
+    Returns a dict keyed by project_identifier with:
+        - allocation_name: human-readable name of the remote allocation
+        - total_historical: sum of HistoricalRemoteAllocation.node_usage across all complete months
+        - total_cached: sum of CachedProjectUsageReport total_usage.hours across the same months
+        - total_difference: total_cached - total_historical (positive = cached is higher)
+        - months: list of per-month dicts with keys:
+            year, month, historical, cached, difference
+    """
+    results = {}
+
+    historical_qs = (
+        models.HistoricalRemoteAllocation.objects.filter(is_complete=True)
+        .select_related("allocation")
+        .order_by("allocation__id", "year", "month")
+    )
+
+    for hist in historical_qs:
+        allocation = hist.allocation
+        if not allocation.has_project_identifier():
+            continue
+
+        project_identifier = str(allocation.get_project_identifier())
+
+        cached_reports = models.CachedProjectUsageReport.objects.filter(
+            year=hist.year,
+            month=hist.month,
+            project_identifier=project_identifier,
+            is_complete=True,
+        )
+
+        if not cached_reports.exists():
+            continue
+
+        try:
+            cached_total = sum(
+                float(cr.get_report().total_usage.hours) for cr in cached_reports
+            )
+        except Exception as e:
+            logger.warning(
+                f"compare_historical_remote_usage_with_cache: could not read cached report "
+                f"for {project_identifier} {hist.year}-{hist.month:02d}: {e}"
+            )
+            continue
+
+        historical = float(hist.node_usage)
+        difference = cached_total - historical
+
+        if project_identifier not in results:
+            results[project_identifier] = {
+                "allocation_name": allocation.name,
+                "total_historical": 0.0,
+                "total_cached": 0.0,
+                "total_difference": 0.0,
+                "months": [],
+            }
+
+        entry = results[project_identifier]
+        entry["total_historical"] += historical
+        entry["total_cached"] += cached_total
+        entry["total_difference"] += difference
+        entry["months"].append(
+            {
+                "year": hist.year,
+                "month": hist.month,
+                "historical": historical,
+                "cached": cached_total,
+                "difference": difference,
+            }
+        )
+
+    logger.info(
+        f"compare_historical_remote_usage_with_cache: compared {len(results)} projects"
+    )
+    return results
+
+
 def sync_openportal_shortnames_to_slugs():
     """
     Synchronize shortnames from ProjectInfo and UserInfo to their respective

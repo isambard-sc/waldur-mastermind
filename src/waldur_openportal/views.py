@@ -143,6 +143,13 @@ class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
                 backend_id__isnull=False,
             ).exclude(backend_id="").values_list("backend_id", flat=True)
         )
+        # Identifiers from remote allocations (local portal: projects on a remote cluster)
+        remote_allocation_identifiers = set(
+            models.RemoteAllocation.objects.filter(
+                project_id__in=accessible_project_ids,
+                backend_id__isnull=False,
+            ).exclude(backend_id="").values_list("backend_id", flat=True)
+        )
         # Identifiers from project slugs (covers all projects regardless of allocation state)
         slug_identifiers = {
             f"{project.slug}.{portal}"
@@ -150,7 +157,9 @@ class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
                 id__in=accessible_project_ids,
             ).exclude(slug__isnull=True).exclude(slug="")
         }
-        accessible_identifiers = allocation_identifiers | slug_identifiers
+        accessible_identifiers = (
+            allocation_identifiers | remote_allocation_identifiers | slug_identifiers
+        )
         return qs.filter(project_identifier__in=accessible_identifiers)
 
 
@@ -185,6 +194,13 @@ class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
                 backend_id__isnull=False,
             ).exclude(backend_id="").values_list("backend_id", flat=True)
         )
+        # Identifiers from remote allocations (local portal: projects on a remote cluster)
+        remote_allocation_identifiers = set(
+            models.RemoteAllocation.objects.filter(
+                project_id__in=accessible_project_ids,
+                backend_id__isnull=False,
+            ).exclude(backend_id="").values_list("backend_id", flat=True)
+        )
         # Identifiers from project slugs (covers all projects regardless of allocation state)
         slug_identifiers = {
             f"{project.slug}.{portal}"
@@ -192,7 +208,9 @@ class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
                 id__in=accessible_project_ids,
             ).exclude(slug__isnull=True).exclude(slug="")
         }
-        accessible_identifiers = allocation_identifiers | slug_identifiers
+        accessible_identifiers = (
+            allocation_identifiers | remote_allocation_identifiers | slug_identifiers
+        )
         return qs.filter(project_identifier__in=accessible_identifiers)
 
 

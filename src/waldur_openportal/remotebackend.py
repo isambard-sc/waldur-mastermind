@@ -945,6 +945,20 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 ) and report.is_complete
                 historical_report.save()
 
+                # Cache the full report JSON so the remote portal can serve
+                # rich usage data (per-user, per-date) without re-fetching
+                resource = str(self.client.destination())
+                models.CachedProjectUsageReport.objects.update_or_create(
+                    year=first_day.year,
+                    month=first_day.month,
+                    project_identifier=str(project),
+                    resource=resource,
+                    defaults={
+                        "is_complete": historical_report.is_complete,
+                        "report": json.loads(report.to_json()),
+                    },
+                )
+
             # Reconcile historical usage with billing for completed months
             try:
                 self._reconcile_historical_usage(
