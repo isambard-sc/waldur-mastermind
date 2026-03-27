@@ -694,6 +694,23 @@ def _resolve_useridentifier_from_slugs(identifier: str):
     return _user_info_dict(user)
 
 
+def resolve_emails(emails: list) -> dict:
+    """
+    Map email address strings to Waldur user info dicts.
+
+    Used for cached reports from remote portals, where the user_mapping field
+    contains email addresses rather than UserIdentifier strings.
+
+    Returns dict of {email_string: {"uuid", "email", "full_name", "username"}}
+    Emails that do not match any Waldur user map to None.
+    """
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    users = {u.email: u for u in User.objects.filter(email__in=emails)}
+    return {email: (_user_info_dict(users[email]) if email in users else None) for email in emails}
+
+
 def resolve_useridentifiers(identifiers: list) -> dict:
     """
     Map OpenPortal UserIdentifier strings to Waldur user info dicts.

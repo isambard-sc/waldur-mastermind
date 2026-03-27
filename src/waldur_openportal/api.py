@@ -1620,9 +1620,12 @@ def project_mapping(request):
 
 @extend_schema(
     description=(
-        "Map OpenPortal UserIdentifier strings to Waldur User objects. "
-        "Pass each identifier as a repeated 'identifier' query parameter. "
-        "Returns a dict keyed by identifier; unknown identifiers map to null. "
+        "Map OpenPortal UserIdentifier strings (or email addresses) to Waldur User objects. "
+        "Pass each value as a repeated 'identifier' query parameter. "
+        "If the values contain '@' they are treated as email addresses (used for cached "
+        "reports from remote portals); otherwise they are treated as UserIdentifier strings "
+        "(used for local OpenPortal resources). "
+        "Returns a dict keyed by the supplied string; unknown values map to null. "
         "Staff and support see all users; regular users may only look up "
         "users who share a project with them."
     ),
@@ -1632,7 +1635,10 @@ def project_mapping(request):
             type=OpenApiTypes.STR,
             location=OpenApiParameter.QUERY,
             many=True,
-            description="OpenPortal UserIdentifier string (repeatable).",
+            description=(
+                "OpenPortal UserIdentifier string or email address (repeatable). "
+                "All values in a single request must be the same type."
+            ),
         ),
     ],
     responses={
@@ -1651,9 +1657,12 @@ def project_mapping(request):
 @permission_classes([IsAuthenticated])
 def user_mapping(request):
     """
-    Map OpenPortal UserIdentifier strings to Waldur User objects.
+    Map OpenPortal UserIdentifier strings (or email addresses) to Waldur User objects.
 
-    Chain: Association.useridentifier == identifier -> Association.user
+    If the supplied identifiers contain '@' they are resolved by email address
+    (remote portal reports remap UserIdentifiers to emails via remap_users).
+    Otherwise they are resolved via the Association.useridentifier chain.
+
     Permission: regular users may only resolve identifiers for users on
     projects they themselves belong to.
     """
@@ -1661,41 +1670,76 @@ def user_mapping(request):
     if not identifiers:
         return JsonResponse({})
 
+    emails = [i for i in identifiers if "@" in i]
+    uid_strings = [i for i in identifiers if "@" not in i]
+
     user = request.user
 
     if user.is_staff or user.is_support:
-        accessible_user_ids = None
+        accessible_uid_user_ids = None
+        accessible_email_user_ids = None
     else:
         accessible_project_ids = list(get_visible_projects(user))
-        accessible_user_ids = set(
-            models.Association.objects.filter(
-                allocation__project_id__in=accessible_project_ids
-            ).values_list("user_id", flat=True)
+        accessible_uid_user_ids = (
+            set(
+                models.Association.objects.filter(
+                    allocation__project_id__in=accessible_project_ids
+                ).values_list("user_id", flat=True)
+            )
+            if uid_strings
+            else set()
+        )
+        # Permission for email lookups via RemoteAssociation — remote-portal
+        # users are linked to RemoteAllocation, not local Allocation
+        accessible_email_user_ids = (
+            set(
+                models.RemoteAssociation.objects.filter(
+                    allocation__project_id__in=accessible_project_ids,
+                    user__isnull=False,
+                ).values_list("user_id", flat=True)
+            )
+            if emails
+            else set()
         )
 
-    resolved = utils.resolve_useridentifiers(identifiers)
+    result = {}
 
-    if accessible_user_ids is not None:
-        # Filter out users that are not accessible to the requesting user
-        result = {}
-        for identifier, user_info in resolved.items():
-            if user_info is None:
-                result[identifier] = None
-                continue
-            # Look up the user pk to check accessibility
-            association = (
-                models.Association.objects.filter(useridentifier=identifier)
-                .select_related("user")
-                .first()
-            )
-            if association is None or association.user is None:
-                result[identifier] = None
-                continue
-            if association.user.pk not in accessible_user_ids:
-                result[identifier] = None
-                continue
-            result[identifier] = user_info
-    else:
-        result = resolved
+    if emails:
+        resolved = utils.resolve_emails(emails)
+        if accessible_email_user_ids is not None:
+            email_users = {u.email: u for u in User.objects.filter(email__in=emails)}
+            for email, user_info in resolved.items():
+                if user_info is None:
+                    result[email] = None
+                    continue
+                resolved_user = email_users.get(email)
+                if resolved_user is None or resolved_user.pk not in accessible_email_user_ids:
+                    result[email] = None
+                    continue
+                result[email] = user_info
+        else:
+            result.update(resolved)
+
+    if uid_strings:
+        resolved = utils.resolve_useridentifiers(uid_strings)
+        if accessible_uid_user_ids is not None:
+            for identifier, user_info in resolved.items():
+                if user_info is None:
+                    result[identifier] = None
+                    continue
+                association = (
+                    models.Association.objects.filter(useridentifier=identifier)
+                    .select_related("user")
+                    .first()
+                )
+                if association is None or association.user is None:
+                    result[identifier] = None
+                    continue
+                if association.user.pk not in accessible_uid_user_ids:
+                    result[identifier] = None
+                    continue
+                result[identifier] = user_info
+        else:
+            result.update(resolved)
 
     return JsonResponse(result)
