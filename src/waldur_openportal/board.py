@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 import logging
 import os
 import json
@@ -7,6 +7,7 @@ import decimal
 from django.utils import timezone
 
 from waldur_core.structure import models as structure_models
+from waldur_core.structure.models import PROJECT_GRACE_PERIOD_DAYS
 from waldur_core.core.enums import ReviewStates
 from waldur_mastermind.invoices import models as invoice_models
 
@@ -566,7 +567,9 @@ class OpenPortalBoard:
 
         today = date.today()
 
-        if details.end_date is not None and details.end_date < today:
+        if details.end_date is not None and details.end_date + timedelta(
+            days=PROJECT_GRACE_PERIOD_DAYS
+        ) < today:
             raise openportal.ManagedProjectRejectedError(
                 f"End date {details.end_date} is in the past"
             )
@@ -699,7 +702,9 @@ class OpenPortalBoard:
 
         today = date.today()
 
-        if new_details.end_date is not None and new_details.end_date < today:
+        if new_details.end_date is not None and new_details.end_date + timedelta(
+            days=PROJECT_GRACE_PERIOD_DAYS
+        ) < today:
             raise openportal.ManagedProjectRejectedError(
                 f"End date {new_details.end_date} is in the past"
             )
@@ -819,8 +824,12 @@ class OpenPortalBoard:
             and new_details.end_date >= timezone.now().date()
         )
 
-        # Reject updates for expired projects unless reactivating
-        if managed_project.project.is_expired and not is_reactivating:
+        # Reject updates for expired projects unless still in grace period or reactivating
+        if (
+            managed_project.project.is_expired
+            and not managed_project.project.is_in_grace_period
+            and not is_reactivating
+        ):
             managed_project.reject(
                 utils.get_openportal_robot(),
                 f"{identifier} is expired, cannot update project.",
@@ -1474,8 +1483,14 @@ class OpenPortalBoard:
                 f"No project identifiers found for project {project}"
             )
 
-        monthly_reports = []
+        report = openportal.ProjectStorageReport(
+            managed_project.get_remote_identifier()
+        )
 
+        logger.info(f"Date range: {date_range}")
+        logger.info(f"report = {report}")
+
+        # Get the storage month by month
         for month_range in date_range.months:
             month = month_range.start_date.month
             year = month_range.start_date.year
@@ -1488,15 +1503,21 @@ class OpenPortalBoard:
 
             if not cached_records.exists():
                 logger.info(
-                    f"No cached storage report for project {project} for {month}/{year} - skipping"
+                    f"No cached storage report for project {project}"
+                    f" for {month}/{year} - skipping"
                 )
                 continue
 
-            reports = [cr.get_report() for cr in cached_records]
+            logger.info(
+                f"Using cached storage report for project {project}"
+                f" for {month}/{year}"
+            )
+
+            records = [cr.get_report() for cr in cached_records]
             monthly = (
-                reports[0]
-                if len(reports) == 1
-                else openportal.ProjectStorageReport.combine(reports)
+                records[0]
+                if len(records) == 1
+                else openportal.ProjectStorageReport.combine(records)
             )
 
             # Remap unix usernames to email addresses
@@ -1511,20 +1532,14 @@ class OpenPortalBoard:
             if user_email_map:
                 monthly.remap_users(user_email_map)
 
-            # Remap project identifier to the remote portal's identifier and
-            # rebuild UserIdentifier keys so += works correctly.
+            # remap_project updates the project identifier and rebuilds
+            # all UserIdentifier keys so that report += monthly succeeds.
             monthly.remap_project(managed_project.get_remote_identifier())
-            monthly_reports.append(monthly)
+            report += monthly
 
-        if not monthly_reports:
-            raise openportal.OpenPortalError(
-                f"No storage data found for project {identifier} in date range {date_range}"
-            )
-
-        if len(monthly_reports) == 1:
-            return monthly_reports[0]
-
-        return openportal.ProjectStorageReport.combine(monthly_reports)
+        # Filter to the exact requested date range (trims partial months
+        # at either end of the requested range).
+        return report.filter(date_range)
 
     def get_storage_reports(
         self, portal: openportal.PortalIdentifier, date_range: openportal.DateRange
