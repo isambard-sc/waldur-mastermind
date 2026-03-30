@@ -128,7 +128,6 @@ class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
         # Restrict to project_identifiers reachable via allocations on projects
         # the user has any role in, including projects in customers where the user
         # is an organisation viewer.
-        from waldur_core.structure import models as structure_models
         from waldur_core.structure.managers import get_visible_projects
 
         from . import op as openportal
@@ -150,15 +149,16 @@ class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
                 backend_id__isnull=False,
             ).exclude(backend_id="").values_list("backend_id", flat=True)
         )
-        # Identifiers from project slugs (covers all projects regardless of allocation state)
-        slug_identifiers = {
-            f"{project.slug}.{portal}"
-            for project in structure_models.Project.objects.filter(
-                id__in=accessible_project_ids,
-            ).exclude(slug__isnull=True).exclude(slug="")
-        }
+        # Identifiers from ProjectInfo shortnames (covers all projects)
+        shortnames = models.ProjectInfo.objects.filter(
+            project_id__in=accessible_project_ids,
+            shortname__isnull=False,
+        ).exclude(shortname="").values_list("shortname", flat=True)
+        shortname_identifiers = {f"{sn}.{portal}" for sn in shortnames}
         accessible_identifiers = (
-            allocation_identifiers | remote_allocation_identifiers | slug_identifiers
+            allocation_identifiers
+            | remote_allocation_identifiers
+            | shortname_identifiers
         )
         return qs.filter(project_identifier__in=accessible_identifiers)
 
@@ -179,7 +179,6 @@ class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
         )
         if user.is_staff or user.is_support:
             return qs
-        from waldur_core.structure import models as structure_models
         from waldur_core.structure.managers import get_visible_projects
 
         from . import op as openportal
@@ -201,15 +200,16 @@ class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
                 backend_id__isnull=False,
             ).exclude(backend_id="").values_list("backend_id", flat=True)
         )
-        # Identifiers from project slugs (covers all projects regardless of allocation state)
-        slug_identifiers = {
-            f"{project.slug}.{portal}"
-            for project in structure_models.Project.objects.filter(
-                id__in=accessible_project_ids,
-            ).exclude(slug__isnull=True).exclude(slug="")
-        }
+        # Identifiers from ProjectInfo shortnames (covers all projects)
+        shortnames = models.ProjectInfo.objects.filter(
+            project_id__in=accessible_project_ids,
+            shortname__isnull=False,
+        ).exclude(shortname="").values_list("shortname", flat=True)
+        shortname_identifiers = {f"{sn}.{portal}" for sn in shortnames}
         accessible_identifiers = (
-            allocation_identifiers | remote_allocation_identifiers | slug_identifiers
+            allocation_identifiers
+            | remote_allocation_identifiers
+            | shortname_identifiers
         )
         return qs.filter(project_identifier__in=accessible_identifiers)
 
