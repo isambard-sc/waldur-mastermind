@@ -1363,7 +1363,7 @@ def sync_openportal_shortnames_to_slugs():
     }
 
 
-def backfill_remote_projects():
+def backfill_remote_projects(dry_run: bool = False):
     """
     Create or update RemoteProject objects for all existing
     RemoteAllocations that have a project identifier set.
@@ -1371,14 +1371,21 @@ def backfill_remote_projects():
     This is a one-time utility for migrating existing data.  Safe to
     run multiple times — get_or_create ensures no duplicates.
 
-    Returns a summary dict with counts and any errors.
+    Args:
+        dry_run: If True, no database writes are performed.  The return
+                 value shows exactly what *would* happen, including a
+                 'plan' list of per-allocation actions.
+
+    Returns a summary dict with counts, errors, and (in dry-run mode)
+    a 'plan' list of dicts describing what would be done.
     """
-    from . import remote_project_service
+    from . import remote_project_service  # noqa: F401 (used when not dry)
 
     created_count = 0
     updated_count = 0
     skipped_count = 0
     errors = []
+    plan = []  # populated in dry-run mode
 
     allocations = models.RemoteAllocation.objects.filter(is_active=True)
 
@@ -1389,6 +1396,12 @@ def backfill_remote_projects():
                 f"backfill_remote_projects: skipping {allocation}"
                 " — no project identifier"
             )
+            if dry_run:
+                plan.append({
+                    "allocation": str(allocation),
+                    "action": "skip",
+                    "reason": "no project identifier",
+                })
             continue
 
         try:
@@ -1401,8 +1414,15 @@ def backfill_remote_projects():
             )
             errors.append(msg)
             logger.warning(msg)
+            if dry_run:
+                plan.append({
+                    "allocation": str(allocation),
+                    "action": "error",
+                    "reason": msg,
+                })
             continue
 
+        identifier = None
         try:
             identifier = str(allocation.get_project_identifier())
 
@@ -1410,6 +1430,31 @@ def backfill_remote_projects():
                 destination=destination,
                 identifier=identifier,
             ).first()
+
+            if dry_run:
+                alloc_value, _ = allocation._get_requested_allocation()
+                plan.append({
+                    "allocation": str(allocation),
+                    "identifier": identifier,
+                    "destination": destination,
+                    "action": "update" if existing else "create",
+                    "is_added": allocation.is_added,
+                    "allocation_value": (
+                        float(alloc_value)
+                        if alloc_value is not None
+                        else None
+                    ),
+                    "current_project": (
+                        str(allocation.project)
+                        if allocation.project
+                        else None
+                    ),
+                })
+                if existing is None:
+                    created_count += 1
+                else:
+                    updated_count += 1
+                continue
 
             remote_project = (
                 remote_project_service.get_or_create_remote_project(
@@ -1467,15 +1512,20 @@ def backfill_remote_projects():
             errors.append(msg)
             logger.error(msg, exc_info=True)
 
+    prefix = "[DRY RUN] " if dry_run else ""
     logger.info(
-        f"backfill_remote_projects complete: "
+        f"{prefix}backfill_remote_projects complete: "
         f"{created_count} created, {updated_count} updated, "
         f"{skipped_count} skipped, {len(errors)} errors"
     )
 
-    return {
+    result = {
+        "dry_run": dry_run,
         "created": created_count,
         "updated": updated_count,
         "skipped": skipped_count,
         "errors": errors,
     }
+    if dry_run:
+        result["plan"] = plan
+    return result
