@@ -14,6 +14,7 @@ from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.invoices import models as invoice_models
 
+from waldur_openportal import remote_project_service
 from waldur_openportal import signals
 from waldur_openportal.remoteclient import RemoteOpenPortalClient
 
@@ -347,6 +348,22 @@ class RemoteOpenPortalBackend(ServiceBackend):
             allocation.is_added = True
 
         allocation.save()
+        try:
+            destination = str(self.destination())
+            remote_project = remote_project_service.get_or_create_remote_project(
+                allocation, destination
+            )
+            attachment = remote_project_service.ensure_current_attachment(remote_project)
+            details_json = json.loads(details.json())
+            allocation_value, _ = allocation._get_requested_allocation()
+            alloc = decimal.Decimal(str(allocation_value)) if allocation_value is not None else None
+            remote_project_service.record_award_created(
+                remote_project, details_json, alloc, attachment
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to update RemoteProject record for {allocation}: {e}"
+            )
         return allocation
 
     def add_allocated_project(self, allocation: models.RemoteAllocation):
@@ -410,12 +427,39 @@ class RemoteOpenPortalBackend(ServiceBackend):
             )
             return
 
+        # Track the outgoing update in RemoteProject
+        _remote_project = None
+        _attachment = None
+        _details_json = None
+        _alloc_value = None
+        try:
+            destination = str(self.destination())
+            _remote_project = remote_project_service.get_or_create_remote_project(
+                allocation, destination
+            )
+            _attachment = remote_project_service.ensure_current_attachment(_remote_project)
+            _details_json = json.loads(project_details.json())
+            _alloc_value_raw, _ = allocation._get_requested_allocation()
+            _alloc_value = decimal.Decimal(str(_alloc_value_raw)) if _alloc_value_raw is not None else None
+            remote_project_service.record_award_sent(
+                _remote_project, _details_json, _alloc_value, _attachment
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record award_sent for {allocation}: {e}")
+
         try:
             mapping = self.client.update_project(project_identifier, project_details)
             allocation.successfully_updated(version)
             allocation.update_mapping(mapping)
             allocation.state = CoreStates.OK
             allocation.save()
+            try:
+                if _remote_project is not None:
+                    remote_project_service.record_award_update_confirmed(
+                        _remote_project, _details_json, _alloc_value, _attachment
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to record award_update_confirmed for {allocation}: {e}")
         except openportal.ManagedProjectRejectedError as e:
             logger.warning(
                 f"OpenPortal project {project_identifier} is rejected: {e}. "
@@ -423,6 +467,13 @@ class RemoteOpenPortalBackend(ServiceBackend):
             allocation.error_message = str(e)
             allocation.set_erred()
             allocation.save()
+            try:
+                if _remote_project is not None:
+                    remote_project_service.record_award_update_rejected(
+                        _remote_project, str(e)
+                    )
+            except Exception as exc:
+                logger.warning(f"Failed to record award_update_rejected for {allocation}: {exc}")
         except Exception as e:
             logger.warning(
                 f"Unable to update OpenPortal project {project_identifier}: {e}."
@@ -525,6 +576,14 @@ class RemoteOpenPortalBackend(ServiceBackend):
             allocation.remote_project_identifier = None
             allocation.is_added = False
             allocation.save()
+            try:
+                remote_project = getattr(allocation, "remote_project", None)
+                if remote_project is not None:
+                    remote_project_service.record_resource_deleted(remote_project)
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to record resource_deleted for {allocation}: {exc}"
+                )
         except Exception as e:
             logger.error(
                 f"Unable to delete allocation {allocation} from OpenPortal: {e}"
@@ -903,6 +962,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
         logger.debug(f"Months to get accounts: {months}")
 
+        got_usage_report = False
         for month in months:
             # get the historical report for this month
             first_day = month.days[0]
@@ -933,6 +993,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 logger.debug(f"Skipping {month} as report is complete")
             else:
                 report = self.client.get_usage_report(project, month)
+                got_usage_report = True
 
                 if report.total_usage.seconds > 0:
                     self._update_usage_from_report(
@@ -967,6 +1028,16 @@ class RemoteOpenPortalBackend(ServiceBackend):
             except Exception as e:
                 logger.error(
                     f"Failed to reconcile historical usage for {allocation} in {month}: {e}"
+                )
+
+        if got_usage_report:
+            try:
+                remote_project = getattr(allocation, "remote_project", None)
+                if remote_project is not None:
+                    remote_project_service.touch_last_contact(remote_project)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to touch last_contact_time for {allocation}: {e}"
                 )
 
     def sync_storage(self, allocation: models.RemoteAllocation):
@@ -1011,6 +1082,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
         resource = str(self.client.destination())
 
+        got_storage_report = False
         for month in months:
             first_day = month.days[0]
 
@@ -1042,6 +1114,17 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 f"Stored storage report for {project}"
                 f" [{first_day.year}-{first_day.month:02d}]"
             )
+            got_storage_report = True
+
+        if got_storage_report:
+            try:
+                remote_project = getattr(allocation, "remote_project", None)
+                if remote_project is not None:
+                    remote_project_service.touch_last_contact(remote_project)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to touch last_contact_time for {allocation}: {e}"
+                )
 
     def pull_allocation(self, allocation):
         logger.info(f"Pulling remote allocation: {allocation}")
