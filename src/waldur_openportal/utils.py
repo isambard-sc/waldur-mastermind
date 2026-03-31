@@ -1361,3 +1361,121 @@ def sync_openportal_shortnames_to_slugs():
         "users_skipped": users_skipped,
         "errors": errors,
     }
+
+
+def backfill_remote_projects():
+    """
+    Create or update RemoteProject objects for all existing
+    RemoteAllocations that have a project identifier set.
+
+    This is a one-time utility for migrating existing data.  Safe to
+    run multiple times — get_or_create ensures no duplicates.
+
+    Returns a summary dict with counts and any errors.
+    """
+    from . import remote_project_service
+
+    created_count = 0
+    updated_count = 0
+    skipped_count = 0
+    errors = []
+
+    allocations = models.RemoteAllocation.objects.filter(is_active=True)
+
+    for allocation in allocations:
+        if not allocation.has_project_identifier():
+            skipped_count += 1
+            logger.debug(
+                f"backfill_remote_projects: skipping {allocation}"
+                " — no project identifier"
+            )
+            continue
+
+        try:
+            backend = allocation.get_backend()
+            destination = str(backend.destination())
+        except Exception as e:
+            msg = (
+                f"backfill_remote_projects: cannot get destination"
+                f" for {allocation}: {e}"
+            )
+            errors.append(msg)
+            logger.warning(msg)
+            continue
+
+        try:
+            identifier = str(allocation.get_project_identifier())
+
+            existing = models.RemoteProject.objects.filter(
+                destination=destination,
+                identifier=identifier,
+            ).first()
+
+            remote_project = (
+                remote_project_service.get_or_create_remote_project(
+                    allocation, destination
+                )
+            )
+            remote_project_service.ensure_current_attachment(
+                remote_project
+            )
+
+            if existing is None:
+                # Newly created — set state and allocation from what
+                # we know about the allocation right now.  Do NOT set
+                # last_contact_time: we don't know when we last heard
+                # from the remote portal for this historical entry.
+                if allocation.is_added:
+                    remote_project.state = (
+                        models.RemoteProjectState.ACTIVE
+                    )
+                    alloc_value, _ = (
+                        allocation._get_requested_allocation()
+                    )
+                    if alloc_value is not None:
+                        remote_project.current_allocation = (
+                            decimal.Decimal(str(alloc_value))
+                        )
+                    remote_project.save()
+
+                models.RemoteProjectAuditEntry.objects.create(
+                    remote_project=remote_project,
+                    event_type=(
+                        models.RemoteProjectAuditEventType.AWARD_CREATED
+                    ),
+                    note=(
+                        "Created by backfill_remote_projects utility."
+                    ),
+                )
+                created_count += 1
+                logger.info(
+                    f"backfill_remote_projects: created RemoteProject"
+                    f" {identifier} via {destination}"
+                )
+            else:
+                updated_count += 1
+                logger.debug(
+                    f"backfill_remote_projects: updated RemoteProject"
+                    f" {identifier} via {destination}"
+                )
+
+        except Exception as e:
+            msg = (
+                f"backfill_remote_projects: failed for {allocation}"
+                f" ({identifier} via {destination}): {e}"
+            )
+            errors.append(msg)
+            logger.error(msg, exc_info=True)
+
+    logger.info(
+        f"backfill_remote_projects complete: "
+        f"{created_count} created, {updated_count} updated, "
+        f"{skipped_count} skipped, {len(errors)} errors"
+    )
+
+    return {
+        "created": created_count,
+        "updated": updated_count,
+        "skipped": skipped_count,
+        "errors": errors,
+    }

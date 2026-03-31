@@ -30,6 +30,8 @@ from waldur_core.structure.permissions import IsAdminOrOwner
 from waldur_core.structure.permissions import _has_owner_access
 from waldur_core.core import utils as core_utils
 
+from waldur_core.structure.managers import filter_queryset_for_user
+
 from . import executors, filters, models, serializers, tasks
 
 logger = logging.getLogger(__name__)
@@ -1178,3 +1180,104 @@ class UnmanagedProjectViewSet(structure_views.ProjectViewSet):
         unmanaged_queryset = base_queryset.exclude(id__in=managed_project_ids)
 
         return unmanaged_queryset
+
+
+class RemoteProjectViewSet(core_views.ActionsViewSet):
+    """
+    Read-only view of RemoteProject records.
+
+    Any user who has access to the local Project (current_project)
+    can see its RemoteProject.  Staff users can see all RemoteProjects.
+    """
+
+    serializer_class = serializers.RemoteProjectSerializer
+    filterset_class = filters.RemoteProjectFilter
+    filter_backends = [DjangoFilterBackend, ShortOrderingFilter]
+    lookup_field = "uuid"
+    disabled_actions = [
+        "create",
+        "update",
+        "partial_update",
+        "destroy",
+    ]
+    ordering_fields = ("created", "state", "identifier", "destination")
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_staff:
+            return models.RemoteProject.objects.all().order_by(
+                "-created"
+            )
+        accessible_projects = filter_queryset_for_user(
+            structure_models.Project.objects.all(), user
+        )
+        return models.RemoteProject.objects.filter(
+            current_project__in=accessible_projects
+        ).order_by("-created")
+
+
+class RemoteProjectAuditEntryViewSet(core_views.ActionsViewSet):
+    """
+    Read-only audit log for RemoteProject.
+
+    Accessible to any user who can see the associated RemoteProject.
+    """
+
+    serializer_class = serializers.RemoteProjectAuditEntrySerializer
+    filterset_class = filters.RemoteProjectAuditEntryFilter
+    filter_backends = [DjangoFilterBackend, ShortOrderingFilter]
+    disabled_actions = [
+        "create",
+        "update",
+        "partial_update",
+        "destroy",
+    ]
+    ordering_fields = ("timestamp", "event_type")
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_staff:
+            return models.RemoteProjectAuditEntry.objects.all().order_by(
+                "-timestamp"
+            )
+        accessible_projects = filter_queryset_for_user(
+            structure_models.Project.objects.all(), user
+        )
+        return models.RemoteProjectAuditEntry.objects.filter(
+            remote_project__current_project__in=accessible_projects
+        ).order_by("-timestamp")
+
+
+class RemoteProjectAllocationEntryViewSet(core_views.ActionsViewSet):
+    """
+    Read-only allocation ledger for RemoteProject.
+
+    Accessible to any user who can see the associated RemoteProject.
+    """
+
+    serializer_class = (
+        serializers.RemoteProjectAllocationEntrySerializer
+    )
+    filterset_class = filters.RemoteProjectAllocationEntryFilter
+    filter_backends = [DjangoFilterBackend, ShortOrderingFilter]
+    disabled_actions = [
+        "create",
+        "update",
+        "partial_update",
+        "destroy",
+    ]
+    ordering_fields = ("submitted_at", "allocation")
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_staff:
+            return (
+                models.RemoteProjectAllocationEntry.objects.all()
+                .order_by("-submitted_at")
+            )
+        accessible_projects = filter_queryset_for_user(
+            structure_models.Project.objects.all(), user
+        )
+        return models.RemoteProjectAllocationEntry.objects.filter(
+            remote_project__current_project__in=accessible_projects
+        ).order_by("-submitted_at")

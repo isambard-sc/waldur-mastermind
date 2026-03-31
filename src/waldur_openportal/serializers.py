@@ -589,3 +589,89 @@ class ManagedProjectSerializer(
 
     def get_filtered_field_names(self):
         return ("project",)
+
+
+class RemoteProjectAllocationEntrySerializer(rf_serializers.ModelSerializer):
+    is_confirmed = rf_serializers.BooleanField(read_only=True)
+    delta = rf_serializers.DecimalField(
+        max_digits=20, decimal_places=2, read_only=True
+    )
+    source_project_name = rf_serializers.CharField(
+        source="source_project.name", read_only=True
+    )
+    source_project_uuid = rf_serializers.UUIDField(
+        source="source_project.uuid", read_only=True
+    )
+
+    class Meta:
+        model = models.RemoteProjectAllocationEntry
+        fields = (
+            "id",
+            "allocation",
+            "previous_allocation",
+            "delta",
+            "source_project_name",
+            "source_project_uuid",
+            "submitted_at",
+            "confirmed_at",
+            "is_confirmed",
+            "note",
+        )
+
+
+class RemoteProjectAuditEntrySerializer(rf_serializers.ModelSerializer):
+    performed_by_full_name = rf_serializers.CharField(
+        source="performed_by.full_name", read_only=True
+    )
+    performed_by_uuid = rf_serializers.UUIDField(
+        source="performed_by.uuid", read_only=True
+    )
+
+    class Meta:
+        model = models.RemoteProjectAuditEntry
+        fields = (
+            "id",
+            "timestamp",
+            "event_type",
+            "previous_details",
+            "new_details",
+            "performed_by_full_name",
+            "performed_by_uuid",
+            "remote_response",
+            "note",
+        )
+
+
+class RemoteProjectSerializer(rf_serializers.ModelSerializer):
+    state_display = rf_serializers.CharField(
+        source="get_state_display", read_only=True
+    )
+    current_project_name = rf_serializers.CharField(
+        source="current_project.name", read_only=True
+    )
+    current_project_uuid = rf_serializers.UUIDField(
+        source="current_project.uuid", read_only=True
+    )
+    has_pending_change = rf_serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = models.RemoteProject
+        fields = (
+            "uuid",
+            "destination",
+            "identifier",
+            "state",
+            "state_display",
+            "current_allocation",
+            "pending_allocation",
+            "last_sent_details",
+            "last_confirmed_details",
+            "pending_details",
+            "pending_since",
+            "last_contact_time",
+            "has_pending_change",
+            "current_project_name",
+            "current_project_uuid",
+            "created",
+            "modified",
+        )

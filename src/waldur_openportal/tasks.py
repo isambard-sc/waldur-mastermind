@@ -1801,3 +1801,60 @@ def fix_total_allocation():
             continue
 
         utils.fix_total_allocation(project)
+
+
+@shared_task(name="waldur_openportal.mark_stale_remote_projects")
+@run_once_task(takeover_timeout=60 * 60)
+def mark_stale_remote_projects():
+    """
+    Mark RemoteProjects as STALE when we have not received any contact
+    from the remote portal for more than STALE_THRESHOLD_HOURS hours.
+
+    This covers two cases:
+      - last_contact_time is set but is older than the threshold
+      - last_contact_time is null and the project was created more than
+        the threshold ago (i.e. we never heard back after creation)
+
+    A STALE project transitions back to ACTIVE automatically when
+    touch_last_contact() is called (e.g. on a successful usage or
+    storage report fetch).
+    """
+    STALE_THRESHOLD_HOURS = 12
+    logger.info("OpenPortal task.mark_stale_remote_projects")
+
+    threshold = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
+        hours=STALE_THRESHOLD_HOURS
+    )
+
+    # Projects that were contacted before the threshold
+    stale_by_contact = models.RemoteProject.objects.filter(
+        state=models.RemoteProjectState.ACTIVE,
+        last_contact_time__lt=threshold,
+    )
+
+    # Projects that were never contacted and were created before the threshold
+    stale_by_silence = models.RemoteProject.objects.filter(
+        state=models.RemoteProjectState.ACTIVE,
+        last_contact_time__isnull=True,
+        created__lt=threshold,
+    )
+
+    stale_projects = list(stale_by_contact) + list(stale_by_silence)
+
+    for remote_project in stale_projects:
+        try:
+            remote_project.state = models.RemoteProjectState.STALE
+            remote_project.save(update_fields=["state", "modified"])
+            models.RemoteProjectAuditEntry.objects.create(
+                remote_project=remote_project,
+                event_type=models.RemoteProjectAuditEventType.STATE_CHANGED,
+                note=(
+                    f"Marked STALE: no contact from remote portal "
+                    f"for more than {STALE_THRESHOLD_HOURS} hours."
+                ),
+            )
+            logger.info(f"Marked RemoteProject {remote_project} as STALE")
+        except Exception as e:
+            logger.error(
+                f"Failed to mark RemoteProject {remote_project} as STALE: {e}"
+            )

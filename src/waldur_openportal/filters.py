@@ -181,3 +181,47 @@ class ManagedProjectFilter(django_filters.FilterSet):
     class Meta:
         model = models.ManagedProject
         fields = []
+
+
+class RemoteProjectFilter(django_filters.FilterSet):
+    project_uuid = django_filters.UUIDFilter(
+        field_name="current_project__uuid"
+    )
+    project = core_filters.URLFilter(
+        view_name="project-detail",
+        field_name="current_project__uuid",
+    )
+    state = django_filters.CharFilter(field_name="state")
+    identifier = django_filters.CharFilter(lookup_expr="icontains")
+    destination = django_filters.CharFilter(lookup_expr="icontains")
+
+    class Meta:
+        model = models.RemoteProject
+        fields = []
+
+
+class RemoteProjectAuditEntryFilter(django_filters.FilterSet):
+    remote_project_uuid = django_filters.UUIDFilter(
+        field_name="remote_project__uuid"
+    )
+    project_uuid = django_filters.UUIDFilter(
+        field_name="remote_project__current_project__uuid"
+    )
+    event_type = django_filters.CharFilter(field_name="event_type")
+
+    class Meta:
+        model = models.RemoteProjectAuditEntry
+        fields = []
+
+
+class RemoteProjectAllocationEntryFilter(django_filters.FilterSet):
+    remote_project_uuid = django_filters.UUIDFilter(
+        field_name="remote_project__uuid"
+    )
+    project_uuid = django_filters.UUIDFilter(
+        field_name="remote_project__current_project__uuid"
+    )
+
+    class Meta:
+        model = models.RemoteProjectAllocationEntry
+        fields = []
