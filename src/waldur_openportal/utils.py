@@ -1478,54 +1478,65 @@ def get_project_member_domains(project) -> list:
 
 def get_proposal_links_for_project(project):
     """
-    Return ``(link_award, link_call)`` dicts for the first Proposal
-    attached to *project*, or ``(None, None)`` if no proposal is found.
+    Return ``(link_award, link_call)`` dicts for *project*, or
+    ``(None, None)`` if no proposal is attached.
 
-    ``link_award`` points to the proposal page in homeport:
-        url  = call-management/{customer_uuid}/proposals/{proposal_uuid}/
-        id   = proposal name
+    ``link_award`` points to the local project (the "award") in homeport:
+        url  = projects/{project_uuid}/
+        id   = project.slug  (set to the human-readable award ID,
+               e.g. "026-235785392-1")
 
     ``link_call`` points to the call page in homeport:
         url  = call/{call_uuid}/
         id   = "{call.name} - {round.start_time:%Y-%m}"
+
+    ``link_call`` is derived from the first Proposal attached to the
+    project; it is None if no proposal is found.
     """
     try:
         from waldur_core.core.utils import format_homeport_link
-        from waldur_mastermind.proposal.models import Proposal
-
-        proposal = (
-            Proposal.objects.filter(project=project)
-            .select_related("round__call__manager__customer")
-            .first()
-        )
-        if proposal is None:
-            return None, None
-
-        call = proposal.round.call
-        customer_uuid = call.manager.customer.uuid
 
         link_award = {
-            "id": proposal.name,
+            "id": project.slug,
             "url": format_homeport_link(
-                "call-management/{customer_uuid}/proposals/{proposal_uuid}/",
-                customer_uuid=customer_uuid,
-                proposal_uuid=proposal.uuid,
+                "projects/{project_uuid}/",
+                project_uuid=project.uuid,
             ),
         }
 
-        round_label = proposal.round.start_time.strftime("%Y-%m")
-        link_call = {
-            "id": f"{call.name} - {round_label}",
-            "url": format_homeport_link(
-                "call/{call_uuid}/",
-                call_uuid=call.uuid,
-            ),
-        }
+        try:
+            from waldur_mastermind.proposal.models import Proposal
+
+            proposal = (
+                Proposal.objects.filter(project=project)
+                .select_related("round__call__manager__customer")
+                .first()
+            )
+            if proposal is not None:
+                call = proposal.round.call
+                round_label = proposal.round.start_time.strftime("%Y-%m")
+                link_call = {
+                    "id": f"{call.name} - {round_label}",
+                    "url": format_homeport_link(
+                        "call/{call_uuid}/",
+                        call_uuid=call.uuid,
+                    ),
+                }
+            else:
+                link_call = None
+        except Exception as e:
+            logger.warning(
+                f"get_proposal_links_for_project: could not resolve"
+                f" call link for {project}: {e}"
+            )
+            link_call = None
 
         return link_award, link_call
 
     except Exception as e:
-        logger.warning(f"get_proposal_links_for_project: failed for {project}: {e}")
+        logger.warning(
+            f"get_proposal_links_for_project: failed for {project}: {e}"
+        )
         return None, None
 
 

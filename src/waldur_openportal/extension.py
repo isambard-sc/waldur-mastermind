@@ -110,6 +110,15 @@ class OpenPortalExtension(WaldurExtension):
                 "schedule": timedelta(minutes=60 * 24),
                 "args": (),
             },
+            # This task transitions ACTIVE RemoteProjects to STALE when
+            # no contact has been received from the remote portal for
+            # more than 12 hours.  Running hourly ensures the state is
+            # updated within an hour of the threshold being crossed.
+            "waldur-openportal-mark-stale-remote-projects": {
+                "task": "waldur_openportal.mark_stale_remote_projects",
+                "schedule": timedelta(hours=1),
+                "args": (),
+            },
         }
 
     @staticmethod
