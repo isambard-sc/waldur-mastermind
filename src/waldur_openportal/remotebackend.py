@@ -303,12 +303,42 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
         self.assert_can_add_allocation(allocation)
 
+        destination = str(self.destination())
+
         if allocation.has_project_identifier():
             project = allocation.get_project_identifier()
             details = allocation.get_project_details()
             logger.debug(
                 f"Allocation already exists: {allocation} | {project} | {details}"
             )
+
+            # Ensure a RemoteProject exists and merge its extras into
+            # details before sending, so the remote portal receives the
+            # full award specification.
+            remote_project = None
+            try:
+                _rid = (
+                    str(allocation.get_remote_project_identifier())
+                    if allocation.has_remote_project_identifier()
+                    else None
+                )
+                remote_project = (
+                    remote_project_service.get_or_create_remote_project(
+                        allocation, destination, remote_identifier=_rid
+                    )
+                )
+                extras = remote_project.get_extras()
+                if extras:
+                    details = details.merge(
+                        openportal.AwardDetails.from_json(
+                            json.dumps(extras)
+                        )
+                    )
+            except Exception as _rp_e:
+                logger.warning(
+                    f"Failed to prepare RemoteProject extras for"
+                    f" {allocation}: {_rp_e}"
+                )
 
             # add it again just to be sure
             try:
@@ -319,17 +349,21 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 allocation.set_erred()
                 allocation.save()
                 try:
-                    _destination = str(self.destination())
-                    _rid = (
-                        str(allocation.get_remote_project_identifier())
-                        if allocation.has_remote_project_identifier()
-                        else None
-                    )
-                    _rp = remote_project_service.get_or_create_remote_project(
-                        allocation, _destination, remote_identifier=_rid
-                    )
+                    if remote_project is None:
+                        _rid = (
+                            str(allocation.get_remote_project_identifier())
+                            if allocation.has_remote_project_identifier()
+                            else None
+                        )
+                        remote_project = (
+                            remote_project_service.get_or_create_remote_project(
+                                allocation,
+                                destination,
+                                remote_identifier=_rid,
+                            )
+                        )
                     remote_project_service.record_award_rejected(
-                        _rp, json.loads(details.to_json()), str(e)
+                        remote_project, json.loads(details.to_json()), str(e)
                     )
                 except Exception as _rp_e:
                     logger.warning(
@@ -339,21 +373,25 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 return allocation
             except Exception as e:
                 logger.warning(
-                    f"Unable to re-add project {project} to OpenPortal: {e}. This will be re-added later..."
+                    f"Unable to re-add project {project} to OpenPortal:"
+                    f" {e}. This will be re-added later..."
                 )
                 try:
-                    _destination = str(self.destination())
-                    _rid = (
-                        str(allocation.get_remote_project_identifier())
-                        if allocation.has_remote_project_identifier()
-                        else None
-                    )
-                    _rp = remote_project_service.get_or_create_remote_project(
-                        allocation, _destination, remote_identifier=_rid
-                    )
-                    _details_json = json.loads(details.to_json())
+                    if remote_project is None:
+                        _rid = (
+                            str(allocation.get_remote_project_identifier())
+                            if allocation.has_remote_project_identifier()
+                            else None
+                        )
+                        remote_project = (
+                            remote_project_service.get_or_create_remote_project(
+                                allocation,
+                                destination,
+                                remote_identifier=_rid,
+                            )
+                        )
                     remote_project_service.record_award_attempted(
-                        _rp, _details_json, note=str(e)
+                        remote_project, json.loads(details.to_json()), note=str(e)
                     )
                 except Exception as _rp_e:
                     logger.warning(
@@ -365,6 +403,28 @@ class RemoteOpenPortalBackend(ServiceBackend):
             project = self.client.get_project_identifier(allocation.project)
             details = allocation.get_project_details()
 
+            # Ensure a RemoteProject exists and merge its extras into
+            # details before sending.
+            remote_project = None
+            try:
+                remote_project = (
+                    remote_project_service.get_or_create_remote_project(
+                        allocation, destination, remote_identifier=None
+                    )
+                )
+                extras = remote_project.get_extras()
+                if extras:
+                    details = details.merge(
+                        openportal.AwardDetails.from_json(
+                            json.dumps(extras)
+                        )
+                    )
+            except Exception as _rp_e:
+                logger.warning(
+                    f"Failed to prepare RemoteProject extras for"
+                    f" {allocation}: {_rp_e}"
+                )
+
             try:
                 mapping = self.client.add_project(project, details)
             except openportal.ManagedProjectRejectedError as e:
@@ -373,12 +433,16 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 allocation.set_erred()
                 allocation.save()
                 try:
-                    _destination = str(self.destination())
-                    _rp = remote_project_service.get_or_create_remote_project(
-                        allocation, _destination, remote_identifier=None
-                    )
+                    if remote_project is None:
+                        remote_project = (
+                            remote_project_service.get_or_create_remote_project(
+                                allocation,
+                                destination,
+                                remote_identifier=None,
+                            )
+                        )
                     remote_project_service.record_award_rejected(
-                        _rp, json.loads(details.to_json()), str(e)
+                        remote_project, json.loads(details.to_json()), str(e)
                     )
                 except Exception as _rp_e:
                     logger.warning(
@@ -388,16 +452,22 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 return allocation
             except Exception as e:
                 logger.warning(
-                    f"Unable to create OpenPortal project for {project}: {e}. This will be created later..."
+                    f"Unable to create OpenPortal project for {project}:"
+                    f" {e}. This will be created later..."
                 )
                 try:
-                    _destination = str(self.destination())
-                    _rp = remote_project_service.get_or_create_remote_project(
-                        allocation, _destination, remote_identifier=None
-                    )
-                    _details_json = json.loads(details.to_json())
+                    if remote_project is None:
+                        remote_project = (
+                            remote_project_service.get_or_create_remote_project(
+                                allocation,
+                                destination,
+                                remote_identifier=None,
+                            )
+                        )
                     remote_project_service.record_award_attempted(
-                        _rp, _details_json, note=str(e)
+                        remote_project,
+                        json.loads(details.to_json()),
+                        note=str(e),
                     )
                 except Exception as _rp_e:
                     logger.warning(
@@ -413,19 +483,30 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
         allocation.save()
         try:
-            destination = str(self.destination())
             remote_identifier = (
                 str(allocation.get_remote_project_identifier())
                 if allocation.has_remote_project_identifier()
                 else None
             )
-            remote_project = remote_project_service.get_or_create_remote_project(
-                allocation, destination, remote_identifier=remote_identifier
+            # Identifier now known after successful add — upgrade the
+            # pending record if needed.
+            remote_project = (
+                remote_project_service.get_or_create_remote_project(
+                    allocation,
+                    destination,
+                    remote_identifier=remote_identifier,
+                )
             )
-            attachment = remote_project_service.ensure_current_attachment(remote_project)
+            attachment = remote_project_service.ensure_current_attachment(
+                remote_project
+            )
             details_json = json.loads(details.to_json())
             allocation_value, _ = allocation._get_requested_allocation()
-            alloc = decimal.Decimal(str(allocation_value)) if allocation_value is not None else None
+            alloc = (
+                decimal.Decimal(str(allocation_value))
+                if allocation_value is not None
+                else None
+            )
             remote_project_service.record_award_created(
                 remote_project, details_json, alloc, attachment
             )
@@ -485,22 +566,30 @@ class RemoteOpenPortalBackend(ServiceBackend):
         project_identifier = allocation.get_project_identifier()
         project_details = allocation.get_project_details()
 
-        # Merge in award-level extras set by org managers on RemoteProject
+        # Get (or create) the RemoteProject, merge its extras into
+        # project_details, and set up audit tracking — all in one place.
+        destination = str(self.destination())
+        remote_identifier = (
+            str(allocation.get_remote_project_identifier())
+            if allocation.has_remote_project_identifier()
+            else None
+        )
+        _remote_project = None
+        _attachment = None
+        _details_json = None
+        _alloc_value = None
         try:
-            _rp = getattr(allocation, "remote_project", None)
-            if _rp is not None:
-                extras = _rp.get_extras()
-                if extras:
-                    extras_details = openportal.AwardDetails.from_json(
-                        json.dumps(extras)
-                    )
-                    project_details = project_details.merge(
-                        extras_details
-                    )
+            _remote_project = remote_project_service.get_or_create_remote_project(
+                allocation, destination, remote_identifier=remote_identifier
+            )
+            extras = _remote_project.get_extras()
+            if extras:
+                project_details = project_details.merge(
+                    openportal.AwardDetails.from_json(json.dumps(extras))  # type: ignore[attr-defined]
+                )
         except Exception as e:
             logger.warning(
-                f"Failed to merge RemoteProject extras for "
-                f"{allocation}: {e}"
+                f"Failed to prepare RemoteProject for {allocation}: {e}"
             )
 
         if force_update:
@@ -514,20 +603,17 @@ class RemoteOpenPortalBackend(ServiceBackend):
             )
             return
 
-        # Track the outgoing update in RemoteProject
-        _remote_project = None
-        _attachment = None
-        _details_json = None
-        _alloc_value = None
         try:
-            destination = str(self.destination())
-            _remote_project = remote_project_service.get_or_create_remote_project(
-                allocation, destination
+            _attachment = remote_project_service.ensure_current_attachment(
+                _remote_project
             )
-            _attachment = remote_project_service.ensure_current_attachment(_remote_project)
-            _details_json = json.loads(project_details.json())
+            _details_json = json.loads(project_details.to_json())
             _alloc_value_raw, _ = allocation._get_requested_allocation()
-            _alloc_value = decimal.Decimal(str(_alloc_value_raw)) if _alloc_value_raw is not None else None
+            _alloc_value = (
+                decimal.Decimal(str(_alloc_value_raw))
+                if _alloc_value_raw is not None
+                else None
+            )
             remote_project_service.record_award_sent(
                 _remote_project, _details_json, _alloc_value, _attachment
             )
