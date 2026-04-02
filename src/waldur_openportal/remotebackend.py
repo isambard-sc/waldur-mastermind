@@ -416,6 +416,24 @@ class RemoteOpenPortalBackend(ServiceBackend):
         project_identifier = allocation.get_project_identifier()
         project_details = allocation.get_project_details()
 
+        # Merge in award-level extras set by org managers on RemoteProject
+        try:
+            _rp = getattr(allocation, "remote_project", None)
+            if _rp is not None:
+                extras = _rp.get_extras()
+                if extras:
+                    extras_details = openportal.AwardDetails.from_json(
+                        json.dumps(extras)
+                    )
+                    project_details = project_details.merge(
+                        extras_details
+                    )
+        except Exception as e:
+            logger.warning(
+                f"Failed to merge RemoteProject extras for "
+                f"{allocation}: {e}"
+            )
+
         if force_update:
             version = allocation.increment_version()
         else:

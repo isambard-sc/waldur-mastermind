@@ -2391,6 +2391,25 @@ class ManagedProject(ReviewMixin, models.Model):
 # ---------------------------------------------------------------------------
 
 
+class MembershipControlChoices:
+    """
+    Controls whether the receiving portal may independently modify
+    project membership or roles.  Mirrors the MembershipControl enum
+    in the OpenPortal AwardDetails grammar.
+    """
+    OPEN = "open"
+    MEMBERS_ONLY = "members_only"
+    ROLES_ONLY = "roles_only"
+    LOCKED = "locked"
+
+    CHOICES = [
+        (OPEN, _("Open — receiving portal manages membership freely")),
+        (MEMBERS_ONLY, _("Members only — roles are authoritative")),
+        (ROLES_ONLY, _("Roles only — membership is authoritative")),
+        (LOCKED, _("Locked — both membership and roles are authoritative")),
+    ]
+
+
 class RemoteProjectState:
     """
     State machine for RemoteProject.
@@ -2565,6 +2584,94 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         ),
     )
 
+    # ------------------------------------------------------------------
+    # Award-level extras — set by org managers, merged into AwardDetails
+    # before each update_award call.
+    # ------------------------------------------------------------------
+
+    notes = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name=_("notes"),
+        help_text=_(
+            "Append-only list of timestamped notes "
+            "{timestamp, author, text} communicated to the remote portal."
+        ),
+    )
+
+    earliest_approve = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("earliest approve"),
+        help_text=_(
+            "Earliest UTC time the remote portal may approve this award. "
+            "Gives the sender a window to make corrections before "
+            "provisioning begins."
+        ),
+    )
+
+    membership_control = models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        choices=MembershipControlChoices.CHOICES,
+        verbose_name=_("membership control"),
+        help_text=_(
+            "Policy controlling whether the remote portal may "
+            "independently modify project membership or roles."
+        ),
+    )
+
+    allowed_domains = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name=_("allowed domains"),
+        help_text=_(
+            "List of email domain glob patterns allowed to join "
+            "the project on the remote portal, e.g. ['*.ac.uk']."
+        ),
+    )
+
+    breakdown = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name=_("allocation breakdown"),
+        help_text=_(
+            "Free-form allocation breakdown sent to the remote portal, "
+            "e.g. {'gpu_hours': '500 GPUHR', 'storage': '5 TB'}."
+        ),
+    )
+
+    link_award = models.JSONField(
+        null=True,
+        blank=True,
+        verbose_name=_("award link"),
+        help_text=_("Link to the award record on the funder's system."),
+    )
+
+    link_call = models.JSONField(
+        null=True,
+        blank=True,
+        verbose_name=_("call link"),
+        help_text=_("Link to the funding call this award came from."),
+    )
+
+    link_project = models.JSONField(
+        null=True,
+        blank=True,
+        verbose_name=_("project page link"),
+        help_text=_(
+            "Link to the project page on the awarding portal."
+        ),
+    )
+
+    link_renewal = models.JSONField(
+        null=True,
+        blank=True,
+        verbose_name=_("renewal link"),
+        help_text=_("Link to where renewal or more time can be requested."),
+    )
+
     # Current live RemoteAllocation handle.  Set to null when the resource
     # is deleted; the RemoteProject record is retained.
     remote_allocation = models.OneToOneField(
@@ -2610,6 +2717,38 @@ class RemoteProject(core_models.UuidMixin, models.Model):
 
     def get_identifier(self) -> openportal.ProjectIdentifier:
         return openportal.ProjectIdentifier(self.identifier)
+
+    def get_extras(self) -> dict:
+        """
+        Return a dict compatible with AwardDetails JSON representing all
+        manually-set award-level extras.  This is merged into the
+        synthesised AwardDetails (from RemoteAllocation.get_project_details)
+        before each update_award call.
+        """
+        extras: dict = {}
+
+        if self.link_award:
+            extras["award"] = self.link_award
+        if self.link_call:
+            extras["call"] = self.link_call
+        if self.link_project:
+            extras["project_link"] = self.link_project
+        if self.link_renewal:
+            extras["renewal"] = self.link_renewal
+        if self.notes:
+            extras["notes"] = self.notes
+        if self.earliest_approve is not None:
+            extras["earliest_approve"] = (
+                self.earliest_approve.isoformat()
+            )
+        if self.membership_control:
+            extras["membership_control"] = self.membership_control
+        if self.allowed_domains:
+            extras["allowed_domains"] = self.allowed_domains
+        if self.breakdown:
+            extras["breakdown"] = self.breakdown
+
+        return extras
 
     def __str__(self) -> str:
         return f"RemoteProject [{self.identifier} via {self.destination}] ({self.state})"

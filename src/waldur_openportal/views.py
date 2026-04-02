@@ -1,6 +1,7 @@
 import logging
 
 from django.http import Http404
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
@@ -1184,10 +1185,18 @@ class UnmanagedProjectViewSet(structure_views.ProjectViewSet):
 
 class RemoteProjectViewSet(core_views.ActionsViewSet):
     """
-    Read-only view of RemoteProject records.
+    RemoteProject API.
 
-    Any user who has access to the local Project (current_project)
-    can see its RemoteProject.  Staff users can see all RemoteProjects.
+    List / retrieve: any authenticated user who has access to
+    current_project.
+
+    Write actions (add_note, set_earliest_approve,
+    set_membership_control, set_allowed_domains, set_links): staff,
+    support, or CustomerOwner of the organisation.
+
+    Sensitive fields in the serializer (raw AwardDetails JSON, notes,
+    earliest_approve) are filtered to privileged users by the
+    serializer itself.
     """
 
     serializer_class = serializers.RemoteProjectSerializer
@@ -1214,6 +1223,273 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         return models.RemoteProject.objects.filter(
             current_project__in=accessible_projects
         ).order_by("-created")
+
+    def get_serializer_class(self):
+        action_map = {
+            "add_note": serializers.AddNoteSerializer,
+            "set_earliest_approve": (
+                serializers.SetEarliestApproveSerializer
+            ),
+            "set_membership_control": (
+                serializers.SetMembershipControlSerializer
+            ),
+            "set_allowed_domains": (
+                serializers.SetAllowedDomainsSerializer
+            ),
+            "set_links": serializers.SetLinksSerializer,
+        }
+        return action_map.get(
+            self.action, serializers.RemoteProjectSerializer
+        )
+
+    def _check_write_permission(self, request, remote_project):
+        """
+        Raise PermissionDenied unless the user is staff, support, or
+        CustomerOwner of the organisation that owns current_project.
+        """
+        user = request.user
+        if user.is_staff or getattr(user, "is_support", False):
+            return
+        if remote_project.current_project is None:
+            raise PermissionDenied(
+                "Cannot write: remote project has no current project."
+            )
+        customer = remote_project.current_project.customer
+        from waldur_core.permissions.fixtures import CustomerRole
+        if not customer.has_user(user, CustomerRole.OWNER):
+            raise PermissionDenied(
+                "Organisation owner access required."
+            )
+
+    def _trigger_update(self, remote_project):
+        """
+        Schedule an update_award for the current RemoteAllocation, if
+        one exists.
+        """
+        if remote_project.remote_allocation is not None:
+            project = remote_project.current_project
+            if project is not None:
+                from waldur_core.core import utils as core_utils
+                tasks.update_remote_project.delay(
+                    core_utils.serialize_instance(project)
+                )
+
+    @action(detail=True, methods=["post"], url_path="add-note")
+    def add_note(self, request, uuid=None):
+        """
+        Append a timestamped note to the award.  The note is merged
+        into AwardDetails and sent to the remote portal on the next
+        update.
+        """
+        remote_project = self.get_object()
+        self._check_write_permission(request, remote_project)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        author = serializer.validated_data["author"]
+        text = serializer.validated_data["text"]
+
+        note = {
+            "timestamp": timezone.now().isoformat(),
+            "author": author,
+            "text": text,
+        }
+        notes = list(remote_project.notes or [])
+        notes.append(note)
+        remote_project.notes = notes
+        remote_project.save(update_fields=["notes", "modified"])
+
+        models.RemoteProjectAuditEntry.objects.create(
+            remote_project=remote_project,
+            event_type=(
+                models.RemoteProjectAuditEventType.AWARD_UPDATED
+            ),
+            performed_by=request.user,
+            note=f"Note added by {author}: {text[:120]}",
+        )
+        self._trigger_update(remote_project)
+
+        return Response(
+            serializers.RemoteProjectSerializer(
+                remote_project, context={"request": request}
+            ).data
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="set-earliest-approve",
+    )
+    def set_earliest_approve(self, request, uuid=None):
+        """
+        Set or clear the earliest time the remote portal may approve
+        this award.  Pass null to clear.
+        """
+        remote_project = self.get_object()
+        self._check_write_permission(request, remote_project)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        remote_project.earliest_approve = (
+            serializer.validated_data["earliest_approve"]
+        )
+        remote_project.save(
+            update_fields=["earliest_approve", "modified"]
+        )
+
+        models.RemoteProjectAuditEntry.objects.create(
+            remote_project=remote_project,
+            event_type=(
+                models.RemoteProjectAuditEventType.AWARD_UPDATED
+            ),
+            performed_by=request.user,
+            note=(
+                f"earliest_approve set to "
+                f"{remote_project.earliest_approve}"
+            ),
+        )
+        self._trigger_update(remote_project)
+
+        return Response(
+            serializers.RemoteProjectSerializer(
+                remote_project, context={"request": request}
+            ).data
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="set-membership-control",
+    )
+    def set_membership_control(self, request, uuid=None):
+        """
+        Set or clear the membership control policy.  Pass null to
+        reset to the default Open behaviour.
+        """
+        remote_project = self.get_object()
+        self._check_write_permission(request, remote_project)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        remote_project.membership_control = (
+            serializer.validated_data["membership_control"]
+        )
+        remote_project.save(
+            update_fields=["membership_control", "modified"]
+        )
+
+        models.RemoteProjectAuditEntry.objects.create(
+            remote_project=remote_project,
+            event_type=(
+                models.RemoteProjectAuditEventType.AWARD_UPDATED
+            ),
+            performed_by=request.user,
+            note=(
+                f"membership_control set to "
+                f"{remote_project.membership_control}"
+            ),
+        )
+        self._trigger_update(remote_project)
+
+        return Response(
+            serializers.RemoteProjectSerializer(
+                remote_project, context={"request": request}
+            ).data
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="set-allowed-domains",
+    )
+    def set_allowed_domains(self, request, uuid=None):
+        """
+        Replace the list of allowed email domain patterns.  Pass an
+        empty list to remove all restrictions.
+        """
+        remote_project = self.get_object()
+        self._check_write_permission(request, remote_project)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        remote_project.allowed_domains = (
+            serializer.validated_data["allowed_domains"]
+        )
+        remote_project.save(
+            update_fields=["allowed_domains", "modified"]
+        )
+
+        models.RemoteProjectAuditEntry.objects.create(
+            remote_project=remote_project,
+            event_type=(
+                models.RemoteProjectAuditEventType.AWARD_UPDATED
+            ),
+            performed_by=request.user,
+            note=(
+                f"allowed_domains set to "
+                f"{remote_project.allowed_domains}"
+            ),
+        )
+        self._trigger_update(remote_project)
+
+        return Response(
+            serializers.RemoteProjectSerializer(
+                remote_project, context={"request": request}
+            ).data
+        )
+
+    @action(detail=True, methods=["post"], url_path="set-links")
+    def set_links(self, request, uuid=None):
+        """
+        Set or clear any combination of the four award links in one
+        call.  Fields not present in the request are left unchanged.
+        Pass null to clear a specific link.
+        """
+        remote_project = self.get_object()
+        self._check_write_permission(request, remote_project)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        data = serializer.validated_data
+        changed = []
+
+        if "award" in data:
+            remote_project.link_award = data["award"]
+            changed.append("link_award")
+        if "call" in data:
+            remote_project.link_call = data["call"]
+            changed.append("link_call")
+        if "project_link" in data:
+            remote_project.link_project = data["project_link"]
+            changed.append("link_project")
+        if "renewal" in data:
+            remote_project.link_renewal = data["renewal"]
+            changed.append("link_renewal")
+
+        if changed:
+            remote_project.save(
+                update_fields=changed + ["modified"]
+            )
+            models.RemoteProjectAuditEntry.objects.create(
+                remote_project=remote_project,
+                event_type=(
+                    models.RemoteProjectAuditEventType.AWARD_UPDATED
+                ),
+                performed_by=request.user,
+                note=f"Links updated: {', '.join(changed)}",
+            )
+            self._trigger_update(remote_project)
+
+        return Response(
+            serializers.RemoteProjectSerializer(
+                remote_project, context={"request": request}
+            ).data
+        )
 
 
 class RemoteProjectAuditEntryViewSet(core_views.ActionsViewSet):

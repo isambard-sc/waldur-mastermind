@@ -642,7 +642,68 @@ class RemoteProjectAuditEntrySerializer(rf_serializers.ModelSerializer):
         )
 
 
+class LinkSerializer(rf_serializers.Serializer):
+    """Serializer for an OpenPortal Link (optional id + optional URL)."""
+    id = rf_serializers.CharField(
+        required=False, allow_blank=True, allow_null=True
+    )
+    url = rf_serializers.URLField(
+        required=False, allow_blank=True, allow_null=True
+    )
+
+
+class AddNoteSerializer(rf_serializers.Serializer):
+    author = rf_serializers.CharField(max_length=255)
+    text = rf_serializers.CharField()
+
+
+class SetEarliestApproveSerializer(rf_serializers.Serializer):
+    earliest_approve = rf_serializers.DateTimeField(allow_null=True)
+
+
+class SetMembershipControlSerializer(rf_serializers.Serializer):
+    membership_control = rf_serializers.ChoiceField(
+        choices=models.MembershipControlChoices.CHOICES,
+        allow_null=True,
+    )
+
+
+class SetAllowedDomainsSerializer(rf_serializers.Serializer):
+    allowed_domains = rf_serializers.ListField(
+        child=rf_serializers.CharField(max_length=255),
+        allow_empty=True,
+    )
+
+
+class SetLinksSerializer(rf_serializers.Serializer):
+    """
+    Update any combination of the four award links in one call.
+    Pass null to clear a link.
+    """
+    award = LinkSerializer(required=False, allow_null=True)
+    call = LinkSerializer(required=False, allow_null=True)
+    project_link = LinkSerializer(required=False, allow_null=True)
+    renewal = LinkSerializer(required=False, allow_null=True)
+
+    def to_internal_value(self, data):
+        value = super().to_internal_value(data)
+        # Ensure Serializer instances are converted to plain dicts
+        for key in ("award", "call", "project_link", "renewal"):
+            if key in value and value[key] is not None:
+                value[key] = dict(value[key])
+        return value
+
+
 class RemoteProjectSerializer(rf_serializers.ModelSerializer):
+    """
+    Serializer for RemoteProject.
+
+    Privileged fields (raw AwardDetails JSON, notes, earliest_approve)
+    are only returned to staff, support, or CustomerOwner of the
+    organisation that owns current_project.  All other fields are
+    visible to any authenticated user who can see the project.
+    """
+
     state_display = rf_serializers.CharField(
         source="get_state_display", read_only=True
     )
@@ -654,24 +715,92 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     )
     has_pending_change = rf_serializers.BooleanField(read_only=True)
 
+    # Privileged-only fields exposed via SerializerMethodField so that
+    # unprivileged users receive null rather than a 403.
+    last_sent_details = rf_serializers.SerializerMethodField()
+    last_confirmed_details = rf_serializers.SerializerMethodField()
+    pending_details = rf_serializers.SerializerMethodField()
+    notes = rf_serializers.SerializerMethodField()
+    earliest_approve = rf_serializers.SerializerMethodField()
+
     class Meta:
         model = models.RemoteProject
         fields = (
+            # Identity
             "uuid",
             "destination",
             "identifier",
+            # State
             "state",
             "state_display",
+            # Allocation
             "current_allocation",
             "pending_allocation",
+            # Links (always visible)
+            "link_award",
+            "link_call",
+            "link_project",
+            "link_renewal",
+            # Award extras (always visible)
+            "membership_control",
+            "allowed_domains",
+            "breakdown",
+            # Privileged
             "last_sent_details",
             "last_confirmed_details",
             "pending_details",
             "pending_since",
-            "last_contact_time",
+            "notes",
+            "earliest_approve",
+            # Misc
             "has_pending_change",
             "current_project_name",
             "current_project_uuid",
+            "last_contact_time",
             "created",
             "modified",
         )
+
+    def _is_privileged(self, obj):
+        """
+        True for staff, support, or CustomerOwner of the organisation
+        that owns current_project.
+        """
+        request = self.context.get("request")
+        if request is None:
+            return False
+        user = request.user
+        if user.is_staff or getattr(user, "is_support", False):
+            return True
+        if obj.current_project is None:
+            return False
+        customer = obj.current_project.customer
+        from waldur_core.permissions.fixtures import CustomerRole
+        return customer.has_user(user, CustomerRole.OWNER)
+
+    def get_last_sent_details(self, obj):
+        return (
+            obj.last_sent_details if self._is_privileged(obj) else None
+        )
+
+    def get_last_confirmed_details(self, obj):
+        return (
+            obj.last_confirmed_details
+            if self._is_privileged(obj)
+            else None
+        )
+
+    def get_pending_details(self, obj):
+        return (
+            obj.pending_details if self._is_privileged(obj) else None
+        )
+
+    def get_notes(self, obj):
+        return obj.notes if self._is_privileged(obj) else None
+
+    def get_earliest_approve(self, obj):
+        if not self._is_privileged(obj):
+            return None
+        if obj.earliest_approve is None:
+            return None
+        return obj.earliest_approve.isoformat()
