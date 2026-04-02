@@ -708,7 +708,10 @@ def resolve_emails(emails: list) -> dict:
 
     User = get_user_model()
     users = {u.email: u for u in User.objects.filter(email__in=emails)}
-    return {email: (_user_info_dict(users[email]) if email in users else None) for email in emails}
+    return {
+        email: (_user_info_dict(users[email]) if email in users else None)
+        for email in emails
+    }
 
 
 def resolve_useridentifiers(identifiers: list) -> dict:
@@ -770,9 +773,7 @@ def backfill_usage_report_cache():
     first_of_current = today.replace(day=1)
     last_historical = first_of_current - datetime.timedelta(days=1)
 
-    all_allocations = list(
-        models.Allocation.objects.all().select_related("project")
-    )
+    all_allocations = list(models.Allocation.objects.all().select_related("project"))
 
     total_fetched = 0
     total_skipped = 0
@@ -1468,15 +1469,10 @@ def get_project_member_domains(project) -> list:
         for user in project.get_users():
             if user.email:
                 domain = user.email.split("@")[-1].strip().lower()
-                if (
-                    domain
-                    and not is_likely_personal_email_address(domain)
-                ):
+                if domain and not is_likely_personal_email_address(domain):
                     domains.add(domain)
     except Exception as e:
-        logger.warning(
-            f"get_project_member_domains: failed for {project}: {e}"
-        )
+        logger.warning(f"get_project_member_domains: failed for {project}: {e}")
     return sorted(domains)
 
 
@@ -1511,8 +1507,7 @@ def get_proposal_links_for_project(project):
         link_award = {
             "id": proposal.name,
             "url": format_homeport_link(
-                "call-management/{customer_uuid}/proposals/"
-                "{proposal_uuid}/",
+                "call-management/{customer_uuid}/proposals/{proposal_uuid}/",
                 customer_uuid=customer_uuid,
                 proposal_uuid=proposal.uuid,
             ),
@@ -1530,9 +1525,7 @@ def get_proposal_links_for_project(project):
         return link_award, link_call
 
     except Exception as e:
-        logger.warning(
-            f"get_proposal_links_for_project: failed for {project}: {e}"
-        )
+        logger.warning(f"get_proposal_links_for_project: failed for {project}: {e}")
         return None, None
 
 
@@ -1563,20 +1556,6 @@ def backfill_remote_projects(dry_run: bool = False):
     allocations = models.RemoteAllocation.objects.filter(is_active=True)
 
     for allocation in allocations:
-        if not allocation.has_remote_project_identifier():
-            skipped_count += 1
-            logger.debug(
-                f"backfill_remote_projects: skipping {allocation}"
-                " — no project identifier"
-            )
-            if dry_run:
-                plan.append({
-                    "allocation": str(allocation),
-                    "action": "skip",
-                    "reason": "no project identifier",
-                })
-            continue
-
         try:
             backend = allocation.get_backend()
             destination = str(backend.destination())
@@ -1588,11 +1567,13 @@ def backfill_remote_projects(dry_run: bool = False):
             errors.append(msg)
             logger.warning(msg)
             if dry_run:
-                plan.append({
-                    "allocation": str(allocation),
-                    "action": "error",
-                    "reason": msg,
-                })
+                plan.append(
+                    {
+                        "allocation": str(allocation),
+                        "action": "error",
+                        "reason": msg,
+                    }
+                )
             continue
 
         identifier = None
@@ -1617,38 +1598,33 @@ def backfill_remote_projects(dry_run: bool = False):
 
             if dry_run:
                 alloc_value, _ = allocation._get_requested_allocation()
-                plan.append({
-                    "allocation": str(allocation),
-                    "identifier": identifier,
-                    "destination": destination,
-                    "action": "update" if existing else "create",
-                    "is_added": allocation.is_added,
-                    "allocation_value": (
-                        float(alloc_value)
-                        if alloc_value is not None
-                        else None
-                    ),
-                    "current_project": (
-                        str(allocation.project)
-                        if allocation.project
-                        else None
-                    ),
-                })
+                plan.append(
+                    {
+                        "allocation": str(allocation),
+                        "identifier": identifier,
+                        "destination": destination,
+                        "action": "update" if existing else "create",
+                        "is_added": allocation.is_added,
+                        "allocation_value": (
+                            float(alloc_value) if alloc_value is not None else None
+                        ),
+                        "current_project": (
+                            str(allocation.project) if allocation.project else None
+                        ),
+                    }
+                )
                 if existing is None:
                     created_count += 1
                 else:
                     updated_count += 1
                 continue
 
-            remote_project = (
-                remote_project_service.get_or_create_remote_project(
-                    allocation, destination,
-                    remote_identifier=identifier,
-                )
+            remote_project = remote_project_service.get_or_create_remote_project(
+                allocation,
+                destination,
+                remote_identifier=identifier,
             )
-            remote_project_service.ensure_current_attachment(
-                remote_project
-            )
+            remote_project_service.ensure_current_attachment(remote_project)
 
             if existing is None:
                 # Newly created — set state and allocation from what
@@ -1656,26 +1632,18 @@ def backfill_remote_projects(dry_run: bool = False):
                 # last_contact_time: we don't know when we last heard
                 # from the remote portal for this historical entry.
                 if allocation.is_added:
-                    remote_project.state = (
-                        models.RemoteProjectState.ACTIVE
-                    )
-                    alloc_value, _ = (
-                        allocation._get_requested_allocation()
-                    )
+                    remote_project.state = models.RemoteProjectState.ACTIVE
+                    alloc_value, _ = allocation._get_requested_allocation()
                     if alloc_value is not None:
-                        remote_project.current_allocation = (
-                            decimal.Decimal(str(alloc_value))
+                        remote_project.current_allocation = decimal.Decimal(
+                            str(alloc_value)
                         )
                     remote_project.save()
 
                 models.RemoteProjectAuditEntry.objects.create(
                     remote_project=remote_project,
-                    event_type=(
-                        models.RemoteProjectAuditEventType.AWARD_CREATED
-                    ),
-                    note=(
-                        "Created by backfill_remote_projects utility."
-                    ),
+                    event_type=(models.RemoteProjectAuditEventType.AWARD_CREATED),
+                    note=("Created by backfill_remote_projects utility."),
                 )
                 created_count += 1
                 logger.info(
