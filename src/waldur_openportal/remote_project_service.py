@@ -120,6 +120,58 @@ def get_or_create_remote_project(
         return remote_project
 
 
+def record_award_rejected(remote_project, details_json, error_message):
+    """
+    Called when a create_award attempt is explicitly rejected by the
+    remote portal (ManagedProjectRejectedError on initial add_project).
+
+    Sets: last_sent_details, state=ERROR.
+    Creates audit entry with event_type=AWARD_REJECTED,
+    note=error_message.
+    """
+    remote_project.state = models.RemoteProjectState.ERROR
+    remote_project.last_sent_details = details_json
+    remote_project.save(
+        update_fields=["state", "last_sent_details", "modified"]
+    )
+
+    audit_entry = models.RemoteProjectAuditEntry.objects.create(
+        remote_project=remote_project,
+        event_type=models.RemoteProjectAuditEventType.AWARD_REJECTED,
+        new_details=details_json,
+        note=error_message,
+    )
+
+    return audit_entry
+
+
+def record_award_attempted(remote_project, details_json, note=""):
+    """
+    Called when a create_award attempt was made but no confirmation was
+    received (the remote portal requires human approval, or the call
+    raised an unexpected exception).
+
+    Records what was attempted so there is a full audit trail even for
+    pending / failed creation attempts.
+
+    Sets: last_sent_details.
+    Creates audit entry with event_type=AWARD_ATTEMPTED.
+    """
+    remote_project.last_sent_details = details_json
+    remote_project.save(
+        update_fields=["last_sent_details", "modified"]
+    )
+
+    audit_entry = models.RemoteProjectAuditEntry.objects.create(
+        remote_project=remote_project,
+        event_type=models.RemoteProjectAuditEventType.AWARD_ATTEMPTED,
+        new_details=details_json,
+        note=note,
+    )
+
+    return audit_entry
+
+
 def ensure_current_attachment(remote_project):
     """
     Ensure there is an open RemoteProjectAttachment for

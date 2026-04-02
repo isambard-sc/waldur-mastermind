@@ -2949,6 +2949,8 @@ class RemoteProjectAuditEventType(models.TextChoices):
     """Event types for RemoteProjectAuditEntry."""
 
     # Award lifecycle on the remote portal
+    AWARD_ATTEMPTED = "award_attempted", _("Award creation attempted but not yet confirmed (pending approval or error)")
+    AWARD_REJECTED = "award_rejected", _("Award creation explicitly rejected by remote portal")
     AWARD_CREATED = "award_created", _("Award created (create_award sent)")
     AWARD_CONFIRMED = "award_confirmed", _("Award creation confirmed by remote portal")
     AWARD_UPDATED = "award_updated", _("Award updated (update_award sent)")

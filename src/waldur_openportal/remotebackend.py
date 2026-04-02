@@ -318,6 +318,24 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 allocation.error_message = str(e)
                 allocation.set_erred()
                 allocation.save()
+                try:
+                    _destination = str(self.destination())
+                    _rid = (
+                        str(allocation.get_remote_project_identifier())
+                        if allocation.has_remote_project_identifier()
+                        else None
+                    )
+                    _rp = remote_project_service.get_or_create_remote_project(
+                        allocation, _destination, remote_identifier=_rid
+                    )
+                    remote_project_service.record_award_rejected(
+                        _rp, json.loads(details.to_json()), str(e)
+                    )
+                except Exception as _rp_e:
+                    logger.warning(
+                        f"Failed to record award rejection in RemoteProject"
+                        f" for {allocation}: {_rp_e}"
+                    )
                 return allocation
             except Exception as e:
                 logger.warning(
@@ -330,8 +348,12 @@ class RemoteOpenPortalBackend(ServiceBackend):
                         if allocation.has_remote_project_identifier()
                         else None
                     )
-                    remote_project_service.get_or_create_remote_project(
+                    _rp = remote_project_service.get_or_create_remote_project(
                         allocation, _destination, remote_identifier=_rid
+                    )
+                    _details_json = json.loads(details.to_json())
+                    remote_project_service.record_award_attempted(
+                        _rp, _details_json, note=str(e)
                     )
                 except Exception as _rp_e:
                     logger.warning(
@@ -350,6 +372,19 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 allocation.error_message = str(e)
                 allocation.set_erred()
                 allocation.save()
+                try:
+                    _destination = str(self.destination())
+                    _rp = remote_project_service.get_or_create_remote_project(
+                        allocation, _destination, remote_identifier=None
+                    )
+                    remote_project_service.record_award_rejected(
+                        _rp, json.loads(details.to_json()), str(e)
+                    )
+                except Exception as _rp_e:
+                    logger.warning(
+                        f"Failed to record award rejection in RemoteProject"
+                        f" for {allocation}: {_rp_e}"
+                    )
                 return allocation
             except Exception as e:
                 logger.warning(
@@ -357,8 +392,12 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 )
                 try:
                     _destination = str(self.destination())
-                    remote_project_service.get_or_create_remote_project(
+                    _rp = remote_project_service.get_or_create_remote_project(
                         allocation, _destination, remote_identifier=None
+                    )
+                    _details_json = json.loads(details.to_json())
+                    remote_project_service.record_award_attempted(
+                        _rp, _details_json, note=str(e)
                     )
                 except Exception as _rp_e:
                     logger.warning(
@@ -384,7 +423,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 allocation, destination, remote_identifier=remote_identifier
             )
             attachment = remote_project_service.ensure_current_attachment(remote_project)
-            details_json = json.loads(details.json())
+            details_json = json.loads(details.to_json())
             allocation_value, _ = allocation._get_requested_allocation()
             alloc = decimal.Decimal(str(allocation_value)) if allocation_value is not None else None
             remote_project_service.record_award_created(

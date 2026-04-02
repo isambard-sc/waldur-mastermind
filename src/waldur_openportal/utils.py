@@ -1514,11 +1514,20 @@ def get_proposal_links_for_project(project):
             )
             if proposal is not None:
                 call = proposal.round.call
-                round_label = proposal.round.start_time.strftime("%Y-%m")
+                start_time = (
+                    proposal.round.start_time.strftime("%Y-%m-%d")
+                    if proposal.round.start_time
+                    else "unknown"
+                )
+                end_time = (
+                    proposal.round.cutoff_time.strftime("%Y-%m-%d")
+                    if proposal.round.cutoff_time
+                    else "unknown"
+                )
                 link_call = {
-                    "id": f"{call.name} - {round_label}",
+                    "id": f"{call.name} - round: {start_time} to {end_time}",
                     "url": format_homeport_link(
-                        "call/{call_uuid}/",
+                        "calls/{call_uuid}/",
                         call_uuid=call.uuid,
                     ),
                 }
@@ -1534,9 +1543,7 @@ def get_proposal_links_for_project(project):
         return link_award, link_call
 
     except Exception as e:
-        logger.warning(
-            f"get_proposal_links_for_project: failed for {project}: {e}"
-        )
+        logger.warning(f"get_proposal_links_for_project: failed for {project}: {e}")
         return None, None
 
 
