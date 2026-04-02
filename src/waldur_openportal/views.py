@@ -1491,6 +1491,78 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             ).data
         )
 
+    @action(detail=True, methods=["post"], url_path="approve-now")
+    def approve_now(self, request, uuid=None):
+        """
+        Remove the earliest_approve gate so the remote portal may
+        approve this award immediately.
+        """
+        remote_project = self.get_object()
+        self._check_write_permission(request, remote_project)
+
+        remote_project.earliest_approve = None
+        remote_project.save(
+            update_fields=["earliest_approve", "modified"]
+        )
+
+        models.RemoteProjectAuditEntry.objects.create(
+            remote_project=remote_project,
+            event_type=(
+                models.RemoteProjectAuditEventType.AWARD_UPDATED
+            ),
+            performed_by=request.user,
+            note="earliest_approve cleared — award may be approved now",
+        )
+        self._trigger_update(remote_project)
+
+        return Response(
+            serializers.RemoteProjectSerializer(
+                remote_project, context={"request": request}
+            ).data
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="hold-indefinitely",
+    )
+    def hold_indefinitely(self, request, uuid=None):
+        """
+        Prevent the remote portal from approving this award for 100
+        years, effectively placing it on indefinite hold.  Use
+        approve_now to release the hold.
+        """
+        from datetime import timedelta
+
+        remote_project = self.get_object()
+        self._check_write_permission(request, remote_project)
+
+        remote_project.earliest_approve = (
+            timezone.now() + timedelta(days=36500)
+        )
+        remote_project.save(
+            update_fields=["earliest_approve", "modified"]
+        )
+
+        models.RemoteProjectAuditEntry.objects.create(
+            remote_project=remote_project,
+            event_type=(
+                models.RemoteProjectAuditEventType.AWARD_UPDATED
+            ),
+            performed_by=request.user,
+            note=(
+                "Award placed on indefinite hold "
+                "(earliest_approve set ~100 years ahead)"
+            ),
+        )
+        self._trigger_update(remote_project)
+
+        return Response(
+            serializers.RemoteProjectSerializer(
+                remote_project, context={"request": request}
+            ).data
+        )
+
 
 class RemoteProjectAuditEntryViewSet(core_views.ActionsViewSet):
     """

@@ -323,6 +323,21 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 logger.warning(
                     f"Unable to re-add project {project} to OpenPortal: {e}. This will be re-added later..."
                 )
+                try:
+                    _destination = str(self.destination())
+                    _rid = (
+                        str(allocation.get_remote_project_identifier())
+                        if allocation.has_remote_project_identifier()
+                        else None
+                    )
+                    remote_project_service.get_or_create_remote_project(
+                        allocation, _destination, remote_identifier=_rid
+                    )
+                except Exception as _rp_e:
+                    logger.warning(
+                        f"Failed to create/update RemoteProject for"
+                        f" {allocation} after re-add failure: {_rp_e}"
+                    )
                 return allocation
         else:
             project = self.client.get_project_identifier(allocation.project)
@@ -340,6 +355,16 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 logger.warning(
                     f"Unable to create OpenPortal project for {project}: {e}. This will be created later..."
                 )
+                try:
+                    _destination = str(self.destination())
+                    remote_project_service.get_or_create_remote_project(
+                        allocation, _destination, remote_identifier=None
+                    )
+                except Exception as _rp_e:
+                    logger.warning(
+                        f"Failed to create pending RemoteProject for"
+                        f" {allocation}: {_rp_e}"
+                    )
                 return allocation
 
             logger.info(f"Created OpenPortal project {project} with mapping {mapping}")
@@ -350,8 +375,13 @@ class RemoteOpenPortalBackend(ServiceBackend):
         allocation.save()
         try:
             destination = str(self.destination())
+            remote_identifier = (
+                str(allocation.get_remote_project_identifier())
+                if allocation.has_remote_project_identifier()
+                else None
+            )
             remote_project = remote_project_service.get_or_create_remote_project(
-                allocation, destination
+                allocation, destination, remote_identifier=remote_identifier
             )
             attachment = remote_project_service.ensure_current_attachment(remote_project)
             details_json = json.loads(details.json())

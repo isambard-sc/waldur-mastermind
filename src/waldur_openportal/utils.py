@@ -1363,6 +1363,179 @@ def sync_openportal_shortnames_to_slugs():
     }
 
 
+PERSONAL_EMAIL_DOMAINS = frozenset(
+    [
+        # Google
+        "gmail.com",
+        "googlemail.com",
+        # Yahoo
+        "yahoo.com",
+        "yahoo.co.uk",
+        "yahoo.fr",
+        "yahoo.de",
+        "yahoo.es",
+        "yahoo.it",
+        "yahoo.com.au",
+        "yahoo.ca",
+        "yahoo.co.in",
+        "ymail.com",
+        # Microsoft
+        "hotmail.com",
+        "hotmail.co.uk",
+        "hotmail.fr",
+        "hotmail.de",
+        "hotmail.es",
+        "hotmail.it",
+        "outlook.com",
+        "outlook.co.uk",
+        "outlook.fr",
+        "live.com",
+        "live.co.uk",
+        "live.fr",
+        "msn.com",
+        # Apple
+        "icloud.com",
+        "me.com",
+        "mac.com",
+        # Proton
+        "protonmail.com",
+        "protonmail.ch",
+        "proton.me",
+        "pm.me",
+        # AOL
+        "aol.com",
+        "aol.co.uk",
+        # Other common
+        "mail.com",
+        "zoho.com",
+        "yandex.com",
+        "yandex.ru",
+        "gmx.com",
+        "gmx.de",
+        "gmx.net",
+        "web.de",
+        "t-online.de",
+        "tutanota.com",
+        "tutanota.de",
+        "fastmail.com",
+        "fastmail.fm",
+        "inbox.com",
+        "hushmail.com",
+        "mailfence.com",
+        "disroot.org",
+        "riseup.net",
+        "posteo.de",
+        "posteo.net",
+        "mailbox.org",
+        "cock.li",
+        "seznam.cz",
+        "wp.pl",
+        "o2.pl",
+        "interia.pl",
+    ]
+)
+
+
+def is_likely_personal_email_address(email_or_domain: str) -> bool:
+    """
+    Return True if the email address or domain is a known personal /
+    consumer email provider.
+
+    Accepts either a full address ("user@gmail.com") or just the
+    domain ("gmail.com").  The check is case-insensitive.
+
+    Not exhaustive — only checks against a curated list of well-known
+    personal email providers.
+    """
+    if "@" in email_or_domain:
+        domain = email_or_domain.split("@")[-1].strip().lower()
+    else:
+        domain = email_or_domain.strip().lower()
+    return domain in PERSONAL_EMAIL_DOMAINS
+
+
+def get_project_member_domains(project) -> list:
+    """
+    Return a sorted list of unique email domains used by the active
+    members of *project*, excluding domains that are likely personal
+    email providers (gmail.com, hotmail.com, etc.).
+
+    Returns an empty list if the project has no members with
+    institutional email addresses.
+    """
+    domains = set()
+    try:
+        for user in project.get_users():
+            if user.email:
+                domain = user.email.split("@")[-1].strip().lower()
+                if (
+                    domain
+                    and not is_likely_personal_email_address(domain)
+                ):
+                    domains.add(domain)
+    except Exception as e:
+        logger.warning(
+            f"get_project_member_domains: failed for {project}: {e}"
+        )
+    return sorted(domains)
+
+
+def get_proposal_links_for_project(project):
+    """
+    Return ``(link_award, link_call)`` dicts for the first Proposal
+    attached to *project*, or ``(None, None)`` if no proposal is found.
+
+    ``link_award`` points to the proposal page in homeport:
+        url  = call-management/{customer_uuid}/proposals/{proposal_uuid}/
+        id   = proposal name
+
+    ``link_call`` points to the call page in homeport:
+        url  = call/{call_uuid}/
+        id   = "{call.name} - {round.start_time:%Y-%m}"
+    """
+    try:
+        from waldur_core.core.utils import format_homeport_link
+        from waldur_mastermind.proposal.models import Proposal
+
+        proposal = (
+            Proposal.objects.filter(project=project)
+            .select_related("round__call__manager__customer")
+            .first()
+        )
+        if proposal is None:
+            return None, None
+
+        call = proposal.round.call
+        customer_uuid = call.manager.customer.uuid
+
+        link_award = {
+            "id": proposal.name,
+            "url": format_homeport_link(
+                "call-management/{customer_uuid}/proposals/"
+                "{proposal_uuid}/",
+                customer_uuid=customer_uuid,
+                proposal_uuid=proposal.uuid,
+            ),
+        }
+
+        round_label = proposal.round.start_time.strftime("%Y-%m")
+        link_call = {
+            "id": f"{call.name} - {round_label}",
+            "url": format_homeport_link(
+                "call/{call_uuid}/",
+                call_uuid=call.uuid,
+            ),
+        }
+
+        return link_award, link_call
+
+    except Exception as e:
+        logger.warning(
+            f"get_proposal_links_for_project: failed for {project}: {e}"
+        )
+        return None, None
+
+
 def backfill_remote_projects(dry_run: bool = False):
     """
     Create or update RemoteProject objects for all existing
@@ -1390,7 +1563,7 @@ def backfill_remote_projects(dry_run: bool = False):
     allocations = models.RemoteAllocation.objects.filter(is_active=True)
 
     for allocation in allocations:
-        if not allocation.has_project_identifier():
+        if not allocation.has_remote_project_identifier():
             skipped_count += 1
             logger.debug(
                 f"backfill_remote_projects: skipping {allocation}"
@@ -1424,12 +1597,23 @@ def backfill_remote_projects(dry_run: bool = False):
 
         identifier = None
         try:
-            identifier = str(allocation.get_project_identifier())
+            identifier = (
+                str(allocation.get_remote_project_identifier())
+                if allocation.has_remote_project_identifier()
+                else None
+            )
 
-            existing = models.RemoteProject.objects.filter(
-                destination=destination,
-                identifier=identifier,
-            ).first()
+            if identifier is not None:
+                existing = models.RemoteProject.objects.filter(
+                    destination=destination,
+                    identifier=identifier,
+                ).first()
+            else:
+                existing = models.RemoteProject.objects.filter(
+                    destination=destination,
+                    identifier__isnull=True,
+                    current_project=allocation.project,
+                ).first()
 
             if dry_run:
                 alloc_value, _ = allocation._get_requested_allocation()
@@ -1458,7 +1642,8 @@ def backfill_remote_projects(dry_run: bool = False):
 
             remote_project = (
                 remote_project_service.get_or_create_remote_project(
-                    allocation, destination
+                    allocation, destination,
+                    remote_identifier=identifier,
                 )
             )
             remote_project_service.ensure_current_attachment(

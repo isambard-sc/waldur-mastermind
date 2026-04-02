@@ -2474,17 +2474,34 @@ class RemoteProject(core_models.UuidMixin, models.Model):
 
     identifier = models.CharField(
         max_length=MAX_PROJECTIDENTIFIER_LENGTH,
+        null=True,
+        blank=True,
         verbose_name=_("identifier"),
         help_text=_(
             "Stable remote project identifier, e.g. 'u6ac.brics'.  "
-            "Uniquely identifies the project on the remote portal and never changes."
+            "Uniquely identifies the project on the remote portal and never changes.  "
+            "Null while the project is pending first approval."
         ),
     )
 
     class Meta:
-        unique_together = ("destination", "identifier")
         verbose_name = _("Remote Project")
         verbose_name_plural = _("Remote Projects")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["destination", "identifier"],
+                condition=models.Q(identifier__isnull=False),
+                name="unique_remote_project_destination_identifier",
+            ),
+            models.UniqueConstraint(
+                fields=["destination", "current_project"],
+                condition=models.Q(
+                    identifier__isnull=True,
+                    current_project__isnull=False,
+                ),
+                name="unique_pending_remote_project_destination_project",
+            ),
+        ]
 
     # ------------------------------------------------------------------
     # State

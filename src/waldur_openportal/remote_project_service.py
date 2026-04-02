@@ -8,39 +8,116 @@ from waldur_openportal import models
 logger = logging.getLogger(__name__)
 
 
-def get_or_create_remote_project(allocation, destination: str):
+def get_or_create_remote_project(
+    allocation, destination: str, remote_identifier=None
+):
     """
-    Get or create a RemoteProject for (destination, identifier).
+    Get or create a RemoteProject for this allocation.
 
-    identifier = str(allocation.get_project_identifier())
+    remote_identifier:
+        str  — the remote portal's project ID (e.g. 'u6f.brics'),
+               available only after the award is approved.
+        None — the award is still pending approval; key on
+               (destination, current_project).
 
-    On create: sets remote_allocation, current_project, state=PENDING.
-    On get: if remote_allocation or current_project differ, update them.
+    Defaults applied on creation:
+        membership_control = LOCKED
+        earliest_approve   = now + 1 hour
+        allowed_domains    = institutional domains of current members
+        link_award, link_call from proposal if attached
+
+    On get (not created): syncs remote_allocation / current_project if
+    they have changed.  When a pending record is found and
+    remote_identifier is now known, its identifier is updated.
     """
-    identifier = str(allocation.get_project_identifier())
+    from datetime import timedelta
 
-    remote_project, created = models.RemoteProject.objects.get_or_create(
-        destination=destination,
-        identifier=identifier,
-        defaults={
-            "remote_allocation": allocation,
-            "current_project": allocation.project,
-            "state": models.RemoteProjectState.PENDING,
-        },
+    from django.utils import timezone
+
+    from waldur_openportal.utils import (
+        get_project_member_domains,
+        get_proposal_links_for_project,
     )
 
-    if not created:
-        changed = False
-        if remote_project.remote_allocation != allocation:
-            remote_project.remote_allocation = allocation
-            changed = True
-        if remote_project.current_project != allocation.project:
-            remote_project.current_project = allocation.project
-            changed = True
-        if changed:
-            remote_project.save()
+    project = allocation.project
+    now = timezone.now()
 
-    return remote_project
+    # Compute defaults — used when a new record is created.
+    link_award, link_call = get_proposal_links_for_project(project)
+    allowed_domains = get_project_member_domains(project)
+    creation_defaults = {
+        "remote_allocation": allocation,
+        "current_project": project,
+        "state": models.RemoteProjectState.PENDING,
+        "membership_control": models.MembershipControlChoices.LOCKED,
+        "earliest_approve": now + timedelta(hours=1),
+        "allowed_domains": allowed_domains if allowed_domains else [],
+        "link_award": link_award,
+        "link_call": link_call,
+    }
+
+    if remote_identifier is not None:
+        # ---- approved path ----
+        # 1. Check if there is an existing pending record for this
+        #    project that we can upgrade (fill in the identifier).
+        pending = models.RemoteProject.objects.filter(
+            destination=destination,
+            identifier__isnull=True,
+            current_project=project,
+        ).first()
+
+        if pending is not None:
+            update_fields = ["identifier", "modified"]
+            pending.identifier = remote_identifier
+            if pending.remote_allocation != allocation:
+                pending.remote_allocation = allocation
+                update_fields.append("remote_allocation")
+            pending.save(update_fields=update_fields)
+            return pending
+
+        # 2. No pending record — get or create by (destination, identifier).
+        remote_project, created = models.RemoteProject.objects.get_or_create(
+            destination=destination,
+            identifier=remote_identifier,
+            defaults=creation_defaults,
+        )
+
+        if not created:
+            changed = []
+            if remote_project.remote_allocation != allocation:
+                remote_project.remote_allocation = allocation
+                changed.append("remote_allocation")
+            if remote_project.current_project != project:
+                remote_project.current_project = project
+                changed.append("current_project")
+            if changed:
+                remote_project.save(
+                    update_fields=changed + ["modified"]
+                )
+
+        return remote_project
+
+    else:
+        # ---- pending path ----
+        # Key on (destination, identifier=None, current_project).
+        remote_project, created = models.RemoteProject.objects.get_or_create(
+            destination=destination,
+            identifier=None,
+            current_project=project,
+            defaults={
+                k: v
+                for k, v in creation_defaults.items()
+                if k != "current_project"
+            },
+        )
+
+        if not created and remote_project.remote_allocation != allocation:
+            remote_project.remote_allocation = allocation
+            remote_project.save(
+                update_fields=["remote_allocation", "modified"]
+            )
+
+        return remote_project
 
 
 def ensure_current_attachment(remote_project):
