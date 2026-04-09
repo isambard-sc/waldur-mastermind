@@ -1700,3 +1700,31 @@ def backfill_remote_projects(dry_run: bool = False):
     if dry_run:
         result["plan"] = plan
     return result
+
+
+def find_finished_projects():
+    """
+    Find projects that have finished, i.e. are removed, or past their
+    grace period
+    """
+    all_projects = structure_models.Project.objects.all()
+    finished_projects = []
+    today = timezone.now().date()
+
+    for project in all_projects:
+        try:
+            end_date_with_grace = project.end_date_with_grace
+
+            if end_date_with_grace is not None and end_date_with_grace < today:
+                logger.debug(
+                    f"Project {project} has end date with grace {end_date_with_grace} "
+                    f"which is in the past."
+                )
+                finished_projects.append(project)
+            elif project.is_removed:
+                logger.debug(f"Project {project} is removed.")
+                finished_projects.append(project)
+        except Exception as e:
+            logger.warning(f"Failed to check if project {project} is finished: {e}")
+
+    return finished_projects

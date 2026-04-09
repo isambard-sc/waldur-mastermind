@@ -585,7 +585,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
             extras = _remote_project.get_extras()
             if extras:
                 project_details = project_details.merge(
-                    openportal.AwardDetails.from_json(json.dumps(extras))  # type: ignore[attr-defined]
+                    openportal.AwardDetails.from_json(json.dumps(extras))
                 )
         except Exception as e:
             logger.warning(

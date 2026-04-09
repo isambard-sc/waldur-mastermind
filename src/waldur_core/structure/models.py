@@ -872,7 +872,7 @@ class Project(
         if not self.end_date:
             return False
         today = timezone.now().date()
-        return self.end_date < today <= self.end_date_with_grace
+        return self.end_date <= today <= self.end_date_with_grace
 
     @property
     def is_expired(self):
@@ -915,7 +915,9 @@ class Project(
         # and this cannot be changed once set.
 
         # Capture whether short_name changed BEFORE saving (tracker resets after save)
-        short_name_changed = hasattr(self, "tracker") and self.tracker.has_changed("short_name")
+        short_name_changed = hasattr(self, "tracker") and self.tracker.has_changed(
+            "short_name"
+        )
 
         super().save(*args, **kwargs)
 
@@ -945,7 +947,9 @@ class Project(
                             application_portal_only = False
 
                         if not application_portal_only and self.slug != self.short_name:
-                            Project.objects.filter(pk=self.pk).update(slug=self.short_name)
+                            Project.objects.filter(pk=self.pk).update(
+                                slug=self.short_name
+                            )
                 except Exception:
                     # waldur_openportal may not be installed
                     # In this case, try to update slug if not in portal mode

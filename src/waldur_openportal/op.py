@@ -94,6 +94,7 @@ def convert_to_openportal_error(error_message: str) -> OpenPortalError:
 try:
     from openportal import (
         Allocation,
+        AwardDetails,
         DailyProjectUsageReport,
         Destination,
         Health,
@@ -161,6 +162,21 @@ except ImportError:
 
     def _raise_no_openportal_error():
         raise OpenPortalError("OpenPortal is not installed.")
+
+    class AwardDetails:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        @staticmethod
+        def from_json(*args, **kwargs):
+            _raise_no_openportal_error()
+
+        def merge(self, *args, **kwargs):
+            _raise_no_openportal_error()
+            return self
+
+        def to_json(self):
+            _raise_no_openportal_error()
 
     class Allocation:
         def __init__(self, *args, **kwargs):
