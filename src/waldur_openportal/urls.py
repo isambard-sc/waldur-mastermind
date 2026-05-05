@@ -146,7 +146,7 @@ urlpatterns = [
     # Custom routes for ManagedProject with composite lookup
     re_path(
         r"^api/openportal-managed-projects/(?P<identifier>[\w.-]+)/(?P<destination>[\w.-]+)/$",
-        views.ManagedProjectViewSet.as_view({"get": "retrieve"}),
+        views.ManagedProjectViewSet.as_view({"get": "retrieve_custom", "head": "retrieve_custom"}),
         name="openportal-managed-project-detail",
     ),
     re_path(

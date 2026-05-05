@@ -899,7 +899,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["get", "head"],
-        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)",
+        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)",
     )
     def retrieve_custom(self, request, identifier=None, destination=None, **kwargs):
         """Custom retrieve action with composite key"""
@@ -935,7 +935,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["post"],
-        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/approve",
+        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)/approve",
     )
     def approve(self, request, identifier=None, destination=None, **kwargs):
         project: models.ManagedProject = self.get_object()
@@ -971,7 +971,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["post"],
-        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/reject",
+        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)/reject",
     )
     def reject(self, request, identifier=None, destination=None, **kwargs):
         project: models.ManagedProject = self.get_object()
@@ -1005,7 +1005,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["delete"],
-        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/delete",
+        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)/delete",
     )
     def delete(self, request, identifier=None, destination=None, **kwargs):
         project: models.ManagedProject = self.get_object()
@@ -1037,7 +1037,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["post"],
-        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/attach",
+        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)/attach",
     )
     def attach(self, request, identifier=None, destination=None, **kwargs):
         managed_project: models.ManagedProject = self.get_object()
@@ -1102,7 +1102,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["post"],
-        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/detach",
+        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)/detach",
     )
     def detach(self, request, identifier=None, destination=None, **kwargs):
         managed_project: models.ManagedProject = self.get_object()
