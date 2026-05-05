@@ -657,6 +657,10 @@ class AddNoteSerializer(rf_serializers.Serializer):
     text = rf_serializers.CharField()
 
 
+class AddManagedProjectNoteSerializer(rf_serializers.Serializer):
+    text = rf_serializers.CharField()
+
+
 class SetEarliestApproveSerializer(rf_serializers.Serializer):
     earliest_approve = rf_serializers.DateTimeField(allow_null=True)
 

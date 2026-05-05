@@ -174,4 +174,9 @@ urlpatterns = [
         views.ManagedProjectViewSet.as_view({"post": "detach"}),
         name="openportal-managed-project-detach",
     ),
+    re_path(
+        r"^api/openportal-managed-projects/(?P<identifier>[\w.-]+)/(?P<destination>[\w.-]+)/add-note/$",
+        views.ManagedProjectViewSet.as_view({"post": "add_note"}),
+        name="openportal-managed-project-add-note",
+    ),
 ]

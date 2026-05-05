@@ -1129,6 +1129,56 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
             {"message": "Project detached successfully"}, status=status.HTTP_200_OK
         )
 
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="identifier",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The identifier of the managed project",
+            ),
+            OpenApiParameter(
+                name="destination",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="The destination of the managed project",
+            ),
+        ],
+        request=serializers.AddManagedProjectNoteSerializer,
+        responses=serializers.ManagedProjectSerializer,
+        description="Append a note to the managed project. Author and timestamp are set automatically.",
+    )
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)/add-note",
+    )
+    def add_note(self, request, identifier=None, destination=None, **kwargs):
+        managed_project: models.ManagedProject = self.get_object()
+        serializer = serializers.AddManagedProjectNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        from . import op as openportal
+
+        details = managed_project.get_details()
+        details.add_note(
+            openportal.Note(
+                request.user.full_name or request.user.email,
+                serializer.validated_data["text"],
+            )
+        )
+        managed_project.set_details(details)
+
+        logger.info(
+            f"Note added to ManagedProject {managed_project.identifier} by user {request.user}"
+        )
+
+        return Response(
+            serializers.ManagedProjectSerializer(
+                managed_project, context={"request": request}
+            ).data
+        )
+
 
 class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
     """

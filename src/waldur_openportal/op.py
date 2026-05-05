@@ -101,6 +101,7 @@ try:
         Instruction,
         Job,
         Node,
+        Note,
         PortalIdentifier,
         ProjectDetails,
         ProjectIdentifier,
