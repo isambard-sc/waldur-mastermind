@@ -155,6 +155,11 @@ class OpenPortalBoard:
             return managed_project.get_project_template()
 
         if not managed_project.has_remote_identifier():
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.DELETED,
+                note="Deleted: ManagedProject does not have a remote identifier set",
+            )
             managed_project.delete()
 
             raise openportal.ManagedProjectRejectedError(
@@ -165,6 +170,11 @@ class OpenPortalBoard:
 
         # get the project class of the new project
         if details.project_template is None:
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.DELETED,
+                note="Deleted: project template is not set in project details",
+            )
             managed_project.delete()
 
             raise openportal.ManagedProjectRejectedError(
@@ -172,6 +182,11 @@ class OpenPortalBoard:
             )
 
         if not isinstance(details.project_template, openportal.ProjectTemplate):
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.DELETED,
+                note=f"Deleted: invalid project class '{details.project_template}'",
+            )
             managed_project.delete()
 
             raise openportal.ManagedProjectRejectedError(
@@ -181,6 +196,11 @@ class OpenPortalBoard:
         project_template = str(details.project_template).strip()
 
         if len(project_template) == 0:
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.DELETED,
+                note="Deleted: project class is empty",
+            )
             managed_project.delete()
 
             raise openportal.ManagedProjectRejectedError(
@@ -194,6 +214,14 @@ class OpenPortalBoard:
             logger.error(
                 f"ManagedProject {managed_project} is not managed by this board. "
                 f"Expected destination {self.destination()}, got {project_destination}."
+            )
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.DELETED,
+                note=(
+                    f"Deleted: destination mismatch — expected {self.destination()}, "
+                    f"got {project_destination}"
+                ),
             )
             managed_project.delete()
 
@@ -210,6 +238,14 @@ class OpenPortalBoard:
                 portal=remote_portal, name=project_template, offering=self.offering()
             ).first()
         except Exception:
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.DELETED,
+                note=(
+                    f"Deleted: failed to look up project template "
+                    f"{project_template}@{self.offering()} for portal '{remote_portal}'"
+                ),
+            )
             managed_project.delete()
 
             logger.warning(
@@ -221,6 +257,14 @@ class OpenPortalBoard:
             )
 
         if not project_template:
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.DELETED,
+                note=(
+                    f"Deleted: project template {details.project_template}@{self.offering()} "
+                    f"not found for portal '{remote_portal}'"
+                ),
+            )
             managed_project.delete()
 
             logger.warning(
@@ -235,6 +279,14 @@ class OpenPortalBoard:
         try:
             project_template.assert_matching_key(details.key)
         except Exception:
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.DELETED,
+                note=(
+                    f"Deleted: key validation failed for project template "
+                    f"{details.project_template}@{self.offering()} for portal '{remote_portal}'"
+                ),
+            )
             managed_project.delete()
 
             logger.warning(
@@ -594,6 +646,11 @@ class OpenPortalBoard:
             logger.info(
                 f"Created new ManagedProject for identifier {identifier} in {self.destination()}: {managed_project}"
             )
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.CREATED,
+                new_details=json.loads(str(details)),
+            )
         else:
             logger.info(
                 f"Retrieved existing ManagedProject for identifier {identifier} in {self.destination()}: {managed_project}"
@@ -605,6 +662,11 @@ class OpenPortalBoard:
         if project_template is None:
             # This is a bug - we should not have a ManagedProject without a project class
             logger.error(f"{identifier} does not have a project class set")
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.DELETED,
+                note=f"Deleted: no project class could be resolved for {identifier}",
+            )
             managed_project.delete()
 
             raise openportal.ManagedProjectRejectedError(
@@ -743,6 +805,11 @@ class OpenPortalBoard:
             logger.error(
                 f"{identifier} does not have a project class set. Cannot update project."
             )
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.DELETED,
+                note=f"Deleted: no project class set for {identifier}, cannot update",
+            )
             managed_project.delete()
             raise openportal.ManagedProjectRejectedError(
                 f"{identifier} does not have a project class set"
@@ -848,10 +915,18 @@ class OpenPortalBoard:
 
         # merge in the new details
         logger.info(f"Merging new details into project {identifier}: {new_details}")
+        existing_details_dict = managed_project.details
         details = managed_project.get_details().merge(new_details)
         logger.info(f"New details after merge: {details}")
         managed_project.set_details(details)
         logger.info(f"Updated ManagedProject {managed_project} with new details.")
+
+        models.ManagedProjectAuditEntry.record(
+            managed_project,
+            models.ManagedProjectAuditEventType.DETAILS_UPDATED,
+            previous_details=existing_details_dict,
+            new_details=managed_project.details,
+        )
 
         # We still go through and check everything, in case the
         # project has moved away from the requested details
@@ -1023,6 +1098,13 @@ class OpenPortalBoard:
             raise openportal.OpenPortalError(
                 f"ManagedProject for identifier '{identifier}' does not exist"
             )
+
+        # Record audit entry BEFORE deletion so the FK is still valid
+        models.ManagedProjectAuditEntry.record(
+            managed_project,
+            models.ManagedProjectAuditEventType.DELETED,
+            note=f"Deleted via delete_project for identifier '{identifier}'",
+        )
 
         # Delete the ManagedProject
         managed_project.delete()

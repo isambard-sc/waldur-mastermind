@@ -2442,6 +2442,163 @@ class RemoteProjectState:
     ]
 
 
+class ManagedProjectAuditEventType(models.TextChoices):
+    """Event types for ManagedProjectAuditEntry."""
+
+    CREATED = "created", _("Project request received")
+    APPROVED = "approved", _("Project request approved")
+    REJECTED = "rejected", _("Project request rejected")
+    DELETED = "deleted", _("ManagedProject deleted")
+    NOTE_ADDED = "note_added", _("Note added")
+    DETAILS_UPDATED = "details_updated", _("Award details updated")
+    PROJECT_ATTACHED = "project_attached", _("Waldur project attached")
+    PROJECT_DETACHED = "project_detached", _("Waldur project detached")
+
+
+class ManagedProjectAuditEntry(models.Model):
+    """
+    Permanent audit log for a ManagedProject.
+
+    Unlike RemoteProjectAuditEntry (which uses CASCADE), these entries survive
+    the deletion of the ManagedProject itself.  The stable composite identity
+    (identifier + destination) is copied from the ManagedProject at creation time
+    so that history is preserved even after the ManagedProject is gone.
+
+    The nullable FK to ManagedProject is kept for convenience while the object
+    still exists.
+    """
+
+    # Copied from the ManagedProject at record() time — survive deletion
+    identifier = models.CharField(
+        max_length=MAX_PROJECTIDENTIFIER_LENGTH,
+        verbose_name=_("identifier"),
+        help_text=_("Project identifier copied from ManagedProject at record time."),
+    )
+
+    destination = models.CharField(
+        max_length=MAX_DESTINATION_LENGTH,
+        verbose_name=_("destination"),
+        help_text=_("Destination copied from ManagedProject at record time."),
+    )
+
+    # Nullable FK — set to NULL when the ManagedProject is deleted
+    managed_project = models.ForeignKey(
+        to="ManagedProject",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_log",
+        verbose_name=_("managed project"),
+    )
+
+    timestamp = models.DateTimeField(
+        auto_now_add=True,
+        db_index=True,
+        verbose_name=_("timestamp"),
+    )
+
+    event_type = models.CharField(
+        max_length=32,
+        choices=ManagedProjectAuditEventType.choices,
+        db_index=True,
+        verbose_name=_("event type"),
+    )
+
+    previous_details = models.JSONField(
+        blank=True,
+        null=True,
+        verbose_name=_("previous details"),
+        help_text=_("Project details before this event.  Null for creation events."),
+    )
+
+    new_details = models.JSONField(
+        blank=True,
+        null=True,
+        verbose_name=_("new details"),
+        help_text=_(
+            "Project details after this event.  "
+            "Null for events that do not change the details."
+        ),
+    )
+
+    performed_by = models.ForeignKey(
+        to=core_models.User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name=_("performed by"),
+        help_text=_("The user who triggered this event, if it was a human action."),
+    )
+
+    note = models.TextField(
+        blank=True,
+        verbose_name=_("note"),
+        help_text=_("Optional free-text comment about this event."),
+    )
+
+    class Meta:
+        ordering = ["-timestamp"]
+        verbose_name = _("Managed Project Audit Entry")
+        verbose_name_plural = _("Managed Project Audit Entries")
+
+    def __str__(self) -> str:
+        return (
+            f"{self.identifier}@{self.destination} — {self.event_type} at {self.timestamp}"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    @classmethod
+    def record(
+        cls,
+        managed_project: "ManagedProject",
+        event_type: str,
+        performed_by=None,
+        note: str = "",
+        previous_details=None,
+        new_details=None,
+    ) -> "ManagedProjectAuditEntry | None":
+        """
+        Create and save an audit entry for the given ManagedProject.
+
+        Copies identifier and destination from the ManagedProject at call time
+        so that the record survives deletion of the ManagedProject.
+
+        For events that carry new_details, the entry is skipped if new_details
+        is identical to the most recent entry for this project, preventing
+        duplicate records when the remote portal repeatedly sends the same
+        unchanged request.
+        """
+        if new_details is not None and event_type in (
+            ManagedProjectAuditEventType.CREATED,
+            ManagedProjectAuditEventType.DETAILS_UPDATED,
+        ):
+            last = (
+                cls.objects.filter(
+                    identifier=managed_project.identifier,
+                    destination=managed_project.destination,
+                    new_details__isnull=False,
+                )
+                .order_by("-timestamp")
+                .first()
+            )
+            if last is not None and last.new_details == new_details:
+                return None
+
+        return cls.objects.create(
+            identifier=managed_project.identifier,
+            destination=managed_project.destination,
+            managed_project=managed_project,
+            event_type=event_type,
+            performed_by=performed_by,
+            note=note or "",
+            previous_details=previous_details,
+            new_details=new_details,
+        )
+
+
 class RemoteProject(core_models.UuidMixin, models.Model):
     """
     Persistent record of a project on a remote OpenPortal portal, held on the

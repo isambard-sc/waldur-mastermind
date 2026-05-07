@@ -225,3 +225,13 @@ class RemoteProjectAllocationEntryFilter(django_filters.FilterSet):
     class Meta:
         model = models.RemoteProjectAllocationEntry
         fields = []
+
+
+class ManagedProjectAuditEntryFilter(django_filters.FilterSet):
+    managed_project_identifier = django_filters.CharFilter(field_name="identifier")
+    managed_project_destination = django_filters.CharFilter(field_name="destination")
+    event_type = django_filters.CharFilter(field_name="event_type")
+
+    class Meta:
+        model = models.ManagedProjectAuditEntry
+        fields = []

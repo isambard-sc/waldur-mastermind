@@ -95,6 +95,11 @@ def register_in(router):
         views.RemoteProjectAllocationEntryViewSet,
         basename="openportal-remote-project-allocation",
     )
+    router.register(
+        r"openportal-managed-project-audit",
+        views.ManagedProjectAuditEntryViewSet,
+        basename="openportal-managed-project-audit",
+    )
 
 
 urlpatterns = [

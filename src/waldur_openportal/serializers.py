@@ -642,6 +642,30 @@ class RemoteProjectAuditEntrySerializer(rf_serializers.ModelSerializer):
         )
 
 
+class ManagedProjectAuditEntrySerializer(rf_serializers.ModelSerializer):
+    performed_by_full_name = rf_serializers.CharField(
+        source="performed_by.full_name", read_only=True
+    )
+    performed_by_uuid = rf_serializers.UUIDField(
+        source="performed_by.uuid", read_only=True
+    )
+
+    class Meta:
+        model = models.ManagedProjectAuditEntry
+        fields = (
+            "id",
+            "identifier",
+            "destination",
+            "timestamp",
+            "event_type",
+            "previous_details",
+            "new_details",
+            "performed_by_full_name",
+            "performed_by_uuid",
+            "note",
+        )
+
+
 class LinkSerializer(rf_serializers.Serializer):
     """Serializer for an OpenPortal Link (optional id + optional URL)."""
     id = rf_serializers.CharField(

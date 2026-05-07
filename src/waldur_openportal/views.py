@@ -1,5 +1,6 @@
 import logging
 
+from django.db.models import Q
 from django.http import Http404
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -957,6 +958,14 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
 
         project.approve(request.user, comment)
 
+        models.ManagedProjectAuditEntry.record(
+            project,
+            models.ManagedProjectAuditEventType.APPROVED,
+            performed_by=request.user,
+            note=comment or "",
+            new_details=project.details,
+        )
+
         # trigger a task to update the project
         tasks.managed_project_approved.delay(core_utils.serialize_instance(project))
 
@@ -995,6 +1004,14 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
         project.reject(request.user, comment)
+
+        models.ManagedProjectAuditEntry.record(
+            project,
+            models.ManagedProjectAuditEventType.REJECTED,
+            performed_by=request.user,
+            note=comment or "",
+        )
+
         return Response(status=status.HTTP_200_OK)
 
     @extend_schema(
@@ -1024,6 +1041,15 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         project: models.ManagedProject = self.get_object()
 
         logger.info(f"Deleting {project} by user {request.user}")
+
+        # Record audit entry BEFORE deletion so the FK is still valid
+        models.ManagedProjectAuditEntry.record(
+            project,
+            models.ManagedProjectAuditEventType.DELETED,
+            performed_by=request.user,
+            note=f"Deleted by {request.user}",
+        )
+
         project.delete()
 
         return Response(status=status.HTTP_200_OK)
@@ -1085,6 +1111,13 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
                 f"by user {request.user}"
             )
 
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.PROJECT_ATTACHED,
+                performed_by=request.user,
+                note=f"Attached project {project_uuid}",
+            )
+
             return Response(
                 {"message": "Project attached successfully"}, status=status.HTTP_200_OK
             )
@@ -1138,6 +1171,12 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
             f"by user {request.user}"
         )
 
+        models.ManagedProjectAuditEntry.record(
+            managed_project,
+            models.ManagedProjectAuditEventType.PROJECT_DETACHED,
+            performed_by=request.user,
+        )
+
         return Response(
             {"message": "Project detached successfully"}, status=status.HTTP_200_OK
         )
@@ -1184,6 +1223,13 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
 
         logger.info(
             f"Note added to ManagedProject {managed_project.identifier} by user {request.user}"
+        )
+
+        models.ManagedProjectAuditEntry.record(
+            managed_project,
+            models.ManagedProjectAuditEventType.NOTE_ADDED,
+            performed_by=request.user,
+            note=serializer.validated_data["text"],
         )
 
         return Response(
@@ -1692,3 +1738,45 @@ class RemoteProjectAllocationEntryViewSet(core_views.ActionsViewSet):
         return models.RemoteProjectAllocationEntry.objects.filter(
             remote_project__current_project__in=accessible_projects
         ).order_by("-submitted_at")
+
+
+class ManagedProjectAuditEntryViewSet(core_views.ActionsViewSet):
+    """
+    Read-only audit log for ManagedProject.
+
+    Staff users see all entries.  Other authenticated users see entries whose
+    (identifier, destination) pair matches a ManagedProject whose linked
+    Waldur project is visible to them.
+    """
+
+    serializer_class = serializers.ManagedProjectAuditEntrySerializer
+    filterset_class = filters.ManagedProjectAuditEntryFilter
+    filter_backends = [DjangoFilterBackend, ShortOrderingFilter]
+    disabled_actions = [
+        "create",
+        "update",
+        "partial_update",
+        "destroy",
+    ]
+    ordering_fields = ("timestamp", "event_type")
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_staff:
+            return models.ManagedProjectAuditEntry.objects.all().order_by(
+                "-timestamp"
+            )
+        accessible_projects = filter_queryset_for_user(
+            structure_models.Project.objects.all(), user
+        )
+        accessible_managed = models.ManagedProject.objects.filter(
+            project__in=accessible_projects
+        )
+        return models.ManagedProjectAuditEntry.objects.filter(
+            Q(managed_project__in=accessible_managed)
+            | Q(
+                managed_project__isnull=True,
+                identifier__in=accessible_managed.values("identifier"),
+                destination__in=accessible_managed.values("destination"),
+            )
+        ).order_by("-timestamp")
