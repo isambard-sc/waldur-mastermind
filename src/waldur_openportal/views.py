@@ -942,6 +942,19 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
+
+        details = project.get_details()
+        earliest_approve = details.earliest_approve
+        if earliest_approve is not None and timezone.now() < earliest_approve:
+            return Response(
+                {
+                    "detail": _(
+                        f"This project cannot be approved until {earliest_approve.isoformat()}."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         project.approve(request.user, comment)
 
         # trigger a task to update the project
