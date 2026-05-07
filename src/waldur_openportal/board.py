@@ -150,7 +150,7 @@ class OpenPortalBoard:
         project class means that this project cannot be created
         """
         if managed_project.has_project_template():
-            managed_project.set_details(details)
+            managed_project.set_details(managed_project.get_details().merge(details))
             managed_project.save()
             return managed_project.get_project_template()
 
