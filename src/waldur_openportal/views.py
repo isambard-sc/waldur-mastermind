@@ -1744,9 +1744,9 @@ class ManagedProjectAuditEntryViewSet(core_views.ActionsViewSet):
     """
     Read-only audit log for ManagedProject.
 
-    Staff users see all entries.  Other authenticated users see entries whose
-    (identifier, destination) pair matches a ManagedProject whose linked
-    Waldur project is visible to them.
+    Accessible to staff, support, and organisation owners only.
+    Project members cannot see these entries as they may contain privileged
+    information.
     """
 
     serializer_class = serializers.ManagedProjectAuditEntrySerializer
@@ -1761,17 +1761,20 @@ class ManagedProjectAuditEntryViewSet(core_views.ActionsViewSet):
     ordering_fields = ("timestamp", "event_type")
 
     def get_queryset(self):
+        from waldur_core.permissions.enums import RoleEnum
+        from waldur_core.structure.managers import get_connected_customers
+
         user = self.request.user
-        if user.is_staff:
-            return models.ManagedProjectAuditEntry.objects.all().order_by(
-                "-timestamp"
-            )
-        accessible_projects = filter_queryset_for_user(
-            structure_models.Project.objects.all(), user
-        )
+
+        if user.is_staff or getattr(user, "is_support", False):
+            return models.ManagedProjectAuditEntry.objects.all().order_by("-timestamp")
+
+        # Restrict to organisations where the user is an owner
+        owned_customer_ids = get_connected_customers(user, role=RoleEnum.CUSTOMER_OWNER)
         accessible_managed = models.ManagedProject.objects.filter(
-            project__in=accessible_projects
+            project__customer_id__in=owned_customer_ids
         )
+
         return models.ManagedProjectAuditEntry.objects.filter(
             Q(managed_project__in=accessible_managed)
             | Q(
