@@ -144,20 +144,28 @@ class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
             models.Allocation.objects.filter(
                 project_id__in=accessible_project_ids,
                 backend_id__isnull=False,
-            ).exclude(backend_id="").values_list("backend_id", flat=True)
+            )
+            .exclude(backend_id="")
+            .values_list("backend_id", flat=True)
         )
         # Identifiers from remote allocations (local portal: projects on a remote cluster)
         remote_allocation_identifiers = set(
             models.RemoteAllocation.objects.filter(
                 project_id__in=accessible_project_ids,
                 backend_id__isnull=False,
-            ).exclude(backend_id="").values_list("backend_id", flat=True)
+            )
+            .exclude(backend_id="")
+            .values_list("backend_id", flat=True)
         )
         # Identifiers from ProjectInfo shortnames (covers all projects)
-        shortnames = models.ProjectInfo.objects.filter(
-            project_id__in=accessible_project_ids,
-            shortname__isnull=False,
-        ).exclude(shortname="").values_list("shortname", flat=True)
+        shortnames = (
+            models.ProjectInfo.objects.filter(
+                project_id__in=accessible_project_ids,
+                shortname__isnull=False,
+            )
+            .exclude(shortname="")
+            .values_list("shortname", flat=True)
+        )
         shortname_identifiers = {f"{sn}.{portal}" for sn in shortnames}
         accessible_identifiers = (
             allocation_identifiers
@@ -195,20 +203,28 @@ class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
             models.Allocation.objects.filter(
                 project_id__in=accessible_project_ids,
                 backend_id__isnull=False,
-            ).exclude(backend_id="").values_list("backend_id", flat=True)
+            )
+            .exclude(backend_id="")
+            .values_list("backend_id", flat=True)
         )
         # Identifiers from remote allocations (local portal: projects on a remote cluster)
         remote_allocation_identifiers = set(
             models.RemoteAllocation.objects.filter(
                 project_id__in=accessible_project_ids,
                 backend_id__isnull=False,
-            ).exclude(backend_id="").values_list("backend_id", flat=True)
+            )
+            .exclude(backend_id="")
+            .values_list("backend_id", flat=True)
         )
         # Identifiers from ProjectInfo shortnames (covers all projects)
-        shortnames = models.ProjectInfo.objects.filter(
-            project_id__in=accessible_project_ids,
-            shortname__isnull=False,
-        ).exclude(shortname="").values_list("shortname", flat=True)
+        shortnames = (
+            models.ProjectInfo.objects.filter(
+                project_id__in=accessible_project_ids,
+                shortname__isnull=False,
+            )
+            .exclude(shortname="")
+            .values_list("shortname", flat=True)
+        )
         shortname_identifiers = {f"{sn}.{portal}" for sn in shortnames}
         accessible_identifiers = (
             allocation_identifiers
@@ -1103,8 +1119,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            managed_project.project = project
-            managed_project.save(update_fields=["project"])
+            managed_project.set_project(project)
 
             logger.info(
                 f"Project {project.uuid} attached to ManagedProject {managed_project.identifier} "
@@ -1160,8 +1175,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
             )
 
         old_project = managed_project.project
-        managed_project.project = None
-        managed_project.save(update_fields=["project"])
+        managed_project.set_project(None)
 
         # We will need to approve any further changes to this managed project
         managed_project.set_needs_approval(True)
@@ -1323,9 +1337,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_staff:
-            return models.RemoteProject.objects.all().order_by(
-                "-created"
-            )
+            return models.RemoteProject.objects.all().order_by("-created")
         accessible_projects = filter_queryset_for_user(
             structure_models.Project.objects.all(), user
         )
@@ -1336,20 +1348,12 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
     def get_serializer_class(self):
         action_map = {
             "add_note": serializers.AddNoteSerializer,
-            "set_earliest_approve": (
-                serializers.SetEarliestApproveSerializer
-            ),
-            "set_membership_control": (
-                serializers.SetMembershipControlSerializer
-            ),
-            "set_allowed_domains": (
-                serializers.SetAllowedDomainsSerializer
-            ),
+            "set_earliest_approve": (serializers.SetEarliestApproveSerializer),
+            "set_membership_control": (serializers.SetMembershipControlSerializer),
+            "set_allowed_domains": (serializers.SetAllowedDomainsSerializer),
             "set_links": serializers.SetLinksSerializer,
         }
-        return action_map.get(
-            self.action, serializers.RemoteProjectSerializer
-        )
+        return action_map.get(self.action, serializers.RemoteProjectSerializer)
 
     def _check_write_permission(self, request, remote_project):
         """
@@ -1365,10 +1369,9 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             )
         customer = remote_project.current_project.customer
         from waldur_core.permissions.fixtures import CustomerRole
+
         if not customer.has_user(user, CustomerRole.OWNER):
-            raise PermissionDenied(
-                "Organisation owner access required."
-            )
+            raise PermissionDenied("Organisation owner access required.")
 
     def _trigger_update(self, remote_project):
         """
@@ -1379,6 +1382,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             project = remote_project.current_project
             if project is not None:
                 from waldur_core.core import utils as core_utils
+
                 tasks.update_remote_project.delay(
                     core_utils.serialize_instance(project)
                 )
@@ -1411,9 +1415,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
 
         models.RemoteProjectAuditEntry.objects.create(
             remote_project=remote_project,
-            event_type=(
-                models.RemoteProjectAuditEventType.AWARD_UPDATED
-            ),
+            event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATED),
             performed_by=request.user,
             note=f"Note added by {author}: {text[:120]}",
         )
@@ -1441,23 +1443,14 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        remote_project.earliest_approve = (
-            serializer.validated_data["earliest_approve"]
-        )
-        remote_project.save(
-            update_fields=["earliest_approve", "modified"]
-        )
+        remote_project.earliest_approve = serializer.validated_data["earliest_approve"]
+        remote_project.save(update_fields=["earliest_approve", "modified"])
 
         models.RemoteProjectAuditEntry.objects.create(
             remote_project=remote_project,
-            event_type=(
-                models.RemoteProjectAuditEventType.AWARD_UPDATED
-            ),
+            event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATED),
             performed_by=request.user,
-            note=(
-                f"earliest_approve set to "
-                f"{remote_project.earliest_approve}"
-            ),
+            note=(f"earliest_approve set to {remote_project.earliest_approve}"),
         )
         self._trigger_update(remote_project)
 
@@ -1483,23 +1476,16 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        remote_project.membership_control = (
-            serializer.validated_data["membership_control"]
-        )
-        remote_project.save(
-            update_fields=["membership_control", "modified"]
-        )
+        remote_project.membership_control = serializer.validated_data[
+            "membership_control"
+        ]
+        remote_project.save(update_fields=["membership_control", "modified"])
 
         models.RemoteProjectAuditEntry.objects.create(
             remote_project=remote_project,
-            event_type=(
-                models.RemoteProjectAuditEventType.AWARD_UPDATED
-            ),
+            event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATED),
             performed_by=request.user,
-            note=(
-                f"membership_control set to "
-                f"{remote_project.membership_control}"
-            ),
+            note=(f"membership_control set to {remote_project.membership_control}"),
         )
         self._trigger_update(remote_project)
 
@@ -1525,23 +1511,14 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        remote_project.allowed_domains = (
-            serializer.validated_data["allowed_domains"]
-        )
-        remote_project.save(
-            update_fields=["allowed_domains", "modified"]
-        )
+        remote_project.allowed_domains = serializer.validated_data["allowed_domains"]
+        remote_project.save(update_fields=["allowed_domains", "modified"])
 
         models.RemoteProjectAuditEntry.objects.create(
             remote_project=remote_project,
-            event_type=(
-                models.RemoteProjectAuditEventType.AWARD_UPDATED
-            ),
+            event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATED),
             performed_by=request.user,
-            note=(
-                f"allowed_domains set to "
-                f"{remote_project.allowed_domains}"
-            ),
+            note=(f"allowed_domains set to {remote_project.allowed_domains}"),
         )
         self._trigger_update(remote_project)
 
@@ -1581,14 +1558,10 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             changed.append("link_renewal")
 
         if changed:
-            remote_project.save(
-                update_fields=changed + ["modified"]
-            )
+            remote_project.save(update_fields=changed + ["modified"])
             models.RemoteProjectAuditEntry.objects.create(
                 remote_project=remote_project,
-                event_type=(
-                    models.RemoteProjectAuditEventType.AWARD_UPDATED
-                ),
+                event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATED),
                 performed_by=request.user,
                 note=f"Links updated: {', '.join(changed)}",
             )
@@ -1610,15 +1583,11 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         self._check_write_permission(request, remote_project)
 
         remote_project.earliest_approve = None
-        remote_project.save(
-            update_fields=["earliest_approve", "modified"]
-        )
+        remote_project.save(update_fields=["earliest_approve", "modified"])
 
         models.RemoteProjectAuditEntry.objects.create(
             remote_project=remote_project,
-            event_type=(
-                models.RemoteProjectAuditEventType.AWARD_UPDATED
-            ),
+            event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATED),
             performed_by=request.user,
             note="earliest_approve cleared — award may be approved now",
         )
@@ -1646,18 +1615,12 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         remote_project = self.get_object()
         self._check_write_permission(request, remote_project)
 
-        remote_project.earliest_approve = (
-            timezone.now() + timedelta(days=36500)
-        )
-        remote_project.save(
-            update_fields=["earliest_approve", "modified"]
-        )
+        remote_project.earliest_approve = timezone.now() + timedelta(days=36500)
+        remote_project.save(update_fields=["earliest_approve", "modified"])
 
         models.RemoteProjectAuditEntry.objects.create(
             remote_project=remote_project,
-            event_type=(
-                models.RemoteProjectAuditEventType.AWARD_UPDATED
-            ),
+            event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATED),
             performed_by=request.user,
             note=(
                 "Award placed on indefinite hold "
@@ -1694,9 +1657,7 @@ class RemoteProjectAuditEntryViewSet(core_views.ActionsViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_staff:
-            return models.RemoteProjectAuditEntry.objects.all().order_by(
-                "-timestamp"
-            )
+            return models.RemoteProjectAuditEntry.objects.all().order_by("-timestamp")
         accessible_projects = filter_queryset_for_user(
             structure_models.Project.objects.all(), user
         )
@@ -1712,9 +1673,7 @@ class RemoteProjectAllocationEntryViewSet(core_views.ActionsViewSet):
     Accessible to any user who can see the associated RemoteProject.
     """
 
-    serializer_class = (
-        serializers.RemoteProjectAllocationEntrySerializer
-    )
+    serializer_class = serializers.RemoteProjectAllocationEntrySerializer
     filterset_class = filters.RemoteProjectAllocationEntryFilter
     filter_backends = [DjangoFilterBackend, ShortOrderingFilter]
     disabled_actions = [
@@ -1728,9 +1687,8 @@ class RemoteProjectAllocationEntryViewSet(core_views.ActionsViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_staff:
-            return (
-                models.RemoteProjectAllocationEntry.objects.all()
-                .order_by("-submitted_at")
+            return models.RemoteProjectAllocationEntry.objects.all().order_by(
+                "-submitted_at"
             )
         accessible_projects = filter_queryset_for_user(
             structure_models.Project.objects.all(), user

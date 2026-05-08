@@ -100,6 +100,7 @@ try:
         Health,
         Instruction,
         Job,
+        Link,
         Node,
         Note,
         PortalIdentifier,

@@ -2310,6 +2310,85 @@ class ManagedProject(ReviewMixin, models.Model):
         """
         return openportal.ProjectDetails(json.dumps(self.details))
 
+    def _get_project_link(self) -> openportal.Link | None:
+        """
+        Get the project link for the attached project, or None
+        if there is no such project
+        """
+        if self.project is not None:
+            from waldur_core.core.utils import format_homeport_link
+
+            link = openportal.Link()
+            link.id = str(self.project.slug)
+            try:
+                link.url = format_homeport_link(f"/projects/{self.project.uuid}/")
+            except Exception:
+                link.url = None
+            return link
+        else:
+            return None
+
+    def set_project(self, project: structure_models.Project | None):
+        """
+        Set the project for this managed project.
+        This will also update the project link in the project details to point
+        to the new project.
+        If the project is not an instance of Project, raise an error.
+        """
+        if project is None:
+            self.project = None
+            self.save(update_fields=["project"])
+            existing_details = self.get_details()
+            existing_details.project_link = None
+            self.set_details(existing_details)
+            return
+
+        if not isinstance(project, structure_models.Project):
+            raise ValueError("Project must be an instance of Project.")
+
+        if self.project and self.project != project:
+            logger.warning(
+                f"Project for managed project {self} is being changed from {self.project} to {project}."
+            )
+
+        self.project = project
+        self.save(update_fields=["project"])
+        existing_details = self.get_details()
+        existing_details.project_link = self._get_project_link()
+        self.set_details(existing_details)
+
+    def merge_details(
+        self, new_details: openportal.ProjectDetails
+    ) -> openportal.ProjectDetails:
+        """
+        Merge incoming details from the local portal into the existing details,
+        preserving any project_link that was set by this (remote) portal.
+        The local portal has no knowledge of the remote project URL/slug, so it
+        must never be allowed to override it.
+        """
+        existing = self.get_details()
+        merged = existing.merge(new_details)
+        merged.project_link = self._get_project_link()
+        return merged
+
+    def set_project_link(self, waldur_project) -> None:
+        """
+        Set the project_link in AwardDetails to point to this portal's
+        representation of the project (UUID as id, homeport URL as url).
+        Called whenever a Waldur project is attached or created.
+        """
+        from waldur_core.core.utils import format_homeport_link
+
+        details = self.get_details()
+        link = openportal.Link()
+        link.id = str()
+        try:
+            link.set_url(format_homeport_link(f"/projects/{waldur_project.uuid}/"))
+        except Exception:
+            pass
+        details.project_link = link
+        self.set_details(details)
+
     def get_default_offerings(self) -> list[marketplace_models.Offering]:
         """
         Get the default marketplace offerings for this project.
@@ -2397,6 +2476,7 @@ class MembershipControlChoices:
     project membership or roles.  Mirrors the MembershipControl enum
     in the OpenPortal AwardDetails grammar.
     """
+
     OPEN = "open"
     MEMBERS_ONLY = "members_only"
     ROLES_ONLY = "roles_only"
@@ -2543,9 +2623,7 @@ class ManagedProjectAuditEntry(models.Model):
         verbose_name_plural = _("Managed Project Audit Entries")
 
     def __str__(self) -> str:
-        return (
-            f"{self.identifier}@{self.destination} — {self.event_type} at {self.timestamp}"
-        )
+        return f"{self.identifier}@{self.destination} — {self.event_type} at {self.timestamp}"
 
     def __repr__(self) -> str:
         return self.__str__()
@@ -2834,9 +2912,7 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         null=True,
         blank=True,
         verbose_name=_("project page link"),
-        help_text=_(
-            "Link to the project page on the awarding portal."
-        ),
+        help_text=_("Link to the project page on the awarding portal."),
     )
 
     link_renewal = models.JSONField(
@@ -2912,9 +2988,7 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         if self.notes:
             extras["notes"] = self.notes
         if self.earliest_approve is not None:
-            extras["earliest_approve"] = (
-                self.earliest_approve.isoformat()
-            )
+            extras["earliest_approve"] = self.earliest_approve.isoformat()
         if self.membership_control:
             extras["membership_control"] = self.membership_control
         if self.allowed_domains:
@@ -2925,7 +2999,9 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         return extras
 
     def __str__(self) -> str:
-        return f"RemoteProject [{self.identifier} via {self.destination}] ({self.state})"
+        return (
+            f"RemoteProject [{self.identifier} via {self.destination}] ({self.state})"
+        )
 
 
 class RemoteProjectAttachment(models.Model):
@@ -3067,7 +3143,9 @@ class RemoteProjectAllocationEntry(models.Model):
         blank=True,
         null=True,
         verbose_name=_("confirmed at"),
-        help_text=_("When the remote portal confirmed this allocation.  Null if pending."),
+        help_text=_(
+            "When the remote portal confirmed this allocation.  Null if pending."
+        ),
     )
 
     note = models.TextField(
@@ -3106,14 +3184,29 @@ class RemoteProjectAuditEventType(models.TextChoices):
     """Event types for RemoteProjectAuditEntry."""
 
     # Award lifecycle on the remote portal
-    AWARD_ATTEMPTED = "award_attempted", _("Award creation attempted but not yet confirmed (pending approval or error)")
-    AWARD_REJECTED = "award_rejected", _("Award creation explicitly rejected by remote portal")
+    AWARD_ATTEMPTED = (
+        "award_attempted",
+        _("Award creation attempted but not yet confirmed (pending approval or error)"),
+    )
+    AWARD_REJECTED = (
+        "award_rejected",
+        _("Award creation explicitly rejected by remote portal"),
+    )
     AWARD_CREATED = "award_created", _("Award created (create_award sent)")
     AWARD_CONFIRMED = "award_confirmed", _("Award creation confirmed by remote portal")
     AWARD_UPDATED = "award_updated", _("Award updated (update_award sent)")
-    AWARD_UPDATE_CONFIRMED = "award_update_confirmed", _("Award update confirmed by remote portal")
-    AWARD_UPDATE_REJECTED = "award_update_rejected", _("Award update rejected by remote portal")
-    AWARD_FETCHED = "award_fetched", _("Award details fetched from remote portal (get_award)")
+    AWARD_UPDATE_CONFIRMED = (
+        "award_update_confirmed",
+        _("Award update confirmed by remote portal"),
+    )
+    AWARD_UPDATE_REJECTED = (
+        "award_update_rejected",
+        _("Award update rejected by remote portal"),
+    )
+    AWARD_FETCHED = (
+        "award_fetched",
+        _("Award details fetched from remote portal (get_award)"),
+    )
 
     # Allocation changes (cross-referenced with RemoteProjectAllocationEntry)
     ALLOCATION_CHANGED = "allocation_changed", _("Allocation changed")
@@ -3121,8 +3214,14 @@ class RemoteProjectAuditEventType(models.TextChoices):
     ALLOCATION_REJECTED = "allocation_rejected", _("Allocation change rejected")
 
     # Local project attachment history
-    PROJECT_ATTACHED = "project_attached", _("Remote project attached to a local project")
-    PROJECT_DETACHED = "project_detached", _("Remote project detached from a local project")
+    PROJECT_ATTACHED = (
+        "project_attached",
+        _("Remote project attached to a local project"),
+    )
+    PROJECT_DETACHED = (
+        "project_detached",
+        _("Remote project detached from a local project"),
+    )
 
     # State transitions
     STATE_CHANGED = "state_changed", _("State changed")

@@ -150,7 +150,7 @@ class OpenPortalBoard:
         project class means that this project cannot be created
         """
         if managed_project.has_project_template():
-            managed_project.set_details(managed_project.get_details().merge(details))
+            managed_project.set_details(managed_project.merge_details(details))
             managed_project.save()
             return managed_project.get_project_template()
 
@@ -311,8 +311,7 @@ class OpenPortalBoard:
         existing_project: structure_models.Project,
     ) -> openportal.ProjectMapping:
         if managed_project.project is None:
-            managed_project.project = existing_project
-            managed_project.save()
+            managed_project.set_project(existing_project)
         elif managed_project.project != existing_project:
             # This is a bug - we should not have a ManagedProject with a different project
             logger.error(
@@ -584,9 +583,7 @@ class OpenPortalBoard:
             customer=customer,
         )
 
-        managed_project.project = waldur_project
-        managed_project.save()
-
+        managed_project.set_project(waldur_project)
         self._get_local_identifier(managed_project)
 
     def create_project(
@@ -619,9 +616,10 @@ class OpenPortalBoard:
 
         today = date.today()
 
-        if details.end_date is not None and details.end_date + timedelta(
-            days=PROJECT_GRACE_PERIOD_DAYS
-        ) < today:
+        if (
+            details.end_date is not None
+            and details.end_date + timedelta(days=PROJECT_GRACE_PERIOD_DAYS) < today
+        ):
             raise openportal.ManagedProjectRejectedError(
                 f"End date {details.end_date} is in the past"
             )
@@ -764,9 +762,10 @@ class OpenPortalBoard:
 
         today = date.today()
 
-        if new_details.end_date is not None and new_details.end_date + timedelta(
-            days=PROJECT_GRACE_PERIOD_DAYS
-        ) < today:
+        if (
+            new_details.end_date is not None
+            and new_details.end_date + timedelta(days=PROJECT_GRACE_PERIOD_DAYS) < today
+        ):
             raise openportal.ManagedProjectRejectedError(
                 f"End date {new_details.end_date} is in the past"
             )
@@ -826,7 +825,7 @@ class OpenPortalBoard:
                 )
 
                 # Save the merged details so can debug
-                new_details = managed_project.get_details().merge(new_details)
+                new_details = managed_project.merge_details(new_details)
                 managed_project.set_details(new_details)
 
                 managed_project.reject(
@@ -844,9 +843,7 @@ class OpenPortalBoard:
             )
 
             # Make sure to save the updated request
-            managed_project.set_details(
-                managed_project.get_details().merge(new_details)
-            )
+            managed_project.set_details(managed_project.merge_details(new_details))
 
             managed_project.set_needs_approval()
 
@@ -857,9 +854,7 @@ class OpenPortalBoard:
             logger.warning(f"{identifier} is pending approval!")
 
             # We should update the project details to reflect the pending state
-            managed_project.set_details(
-                managed_project.get_details().merge(new_details)
-            )
+            managed_project.set_details(managed_project.merge_details(new_details))
 
             raise openportal.ManagedProjectPendingError()
         elif managed_project.is_canceled():
@@ -916,7 +911,7 @@ class OpenPortalBoard:
         # merge in the new details
         logger.info(f"Merging new details into project {identifier}: {new_details}")
         existing_details_dict = managed_project.details
-        details = managed_project.get_details().merge(new_details)
+        details = managed_project.merge_details(new_details)
         logger.info(f"New details after merge: {details}")
         managed_project.set_details(details)
         logger.info(f"Updated ManagedProject {managed_project} with new details.")
@@ -1591,8 +1586,7 @@ class OpenPortalBoard:
                 continue
 
             logger.info(
-                f"Using cached storage report for project {project}"
-                f" for {month}/{year}"
+                f"Using cached storage report for project {project} for {month}/{year}"
             )
 
             records = [cr.get_report() for cr in cached_records]
