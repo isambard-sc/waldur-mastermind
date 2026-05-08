@@ -40,6 +40,37 @@ FIELD_NAMES = MAPPING.keys()
 QUOTA_NAMES = MAPPING.values()
 
 
+def check_managed_project_membership_control(scope, change_type):
+    """
+    If scope is a Project linked to a ManagedProject, check whether the
+    requested change is permitted by the ManagedProject's AwardDetails.
+
+    change_type: "membership" — add/delete members (checks can_change_membership())
+                 "roles"      — update a member's role (checks can_change_roles())
+
+    Raises PermissionDenied if the AwardDetails blocks the change.
+    Does nothing if scope is not a Project or has no associated ManagedProject.
+    """
+    from rest_framework.exceptions import PermissionDenied
+
+    if not isinstance(scope, structure_models.Project):
+        return
+
+    managed = models.ManagedProject.objects.filter(project=scope).first()
+    if managed is None:
+        return
+
+    details = managed.get_details()
+    if change_type == "membership" and not details.can_change_membership():
+        raise PermissionDenied(
+            "Membership changes are not allowed for this managed project."
+        )
+    elif change_type == "roles" and not details.can_change_roles():
+        raise PermissionDenied(
+            "Role changes are not allowed for this managed project."
+        )
+
+
 def get_openportal_robot():
     """
     Return the OpenPortal robot user.

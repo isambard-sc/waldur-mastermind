@@ -14,7 +14,7 @@ from drf_spectacular.plumbing import (
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.viewsets import ReadOnlyModelViewSet
 
@@ -278,6 +278,11 @@ class UserRoleMixin:
     def add_user(self, request, uuid=None):
         scope = self.get_object()
         validate_scope_not_soft_deleted(scope)
+        try:
+            from waldur_openportal.utils import check_managed_project_membership_control
+            check_managed_project_membership_control(scope, "membership")
+        except ImportError:
+            pass
 
         serializer = serializers.UserRoleCreateSerializer(
             data=request.data, context={"scope": scope, "request": request}
@@ -308,6 +313,11 @@ class UserRoleMixin:
     def update_user(self, request, uuid=None):
         scope = self.get_object()
         validate_scope_not_soft_deleted(scope)
+        try:
+            from waldur_openportal.utils import check_managed_project_membership_control
+            check_managed_project_membership_control(scope, "roles")
+        except ImportError:
+            pass
 
         serializer = serializers.UserRoleUpdateSerializer(
             data=request.data, context={"scope": scope, "request": request}
@@ -337,6 +347,11 @@ class UserRoleMixin:
     def delete_user(self, request, uuid=None):
         scope = self.get_object()
         validate_scope_not_soft_deleted(scope)
+        try:
+            from waldur_openportal.utils import check_managed_project_membership_control
+            check_managed_project_membership_control(scope, "membership")
+        except ImportError:
+            pass
 
         serializer = serializers.UserRoleDeleteSerializer(
             data=request.data, context={"scope": scope, "request": request}

@@ -42,6 +42,11 @@ class InvitationViewSet(ProtectedViewSet):
         scope = serializer.validated_data["scope"]
         if not can_manage_invitation_with(self.request, scope):
             raise PermissionDenied()
+        try:
+            from waldur_openportal.utils import check_managed_project_membership_control
+            check_managed_project_membership_control(scope, "membership")
+        except ImportError:
+            pass
 
         invitation: models.Invitation = serializer.save()
         if isinstance(invitation.scope, Project):
@@ -203,6 +208,12 @@ class InvitationViewSet(ProtectedViewSet):
         if config.INVITATION_DISABLE_MULTIPLE_ROLES:
             if UserRole.objects.filter(user=request.user, is_active=True).exists():
                 raise ValidationError(_("User already has role within another scope."))
+
+        try:
+            from waldur_openportal.utils import check_managed_project_membership_control
+            check_managed_project_membership_control(invitation.scope, "membership")
+        except ImportError:
+            pass
 
         invitation.accept(request.user)
 
