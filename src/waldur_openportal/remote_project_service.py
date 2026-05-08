@@ -8,9 +8,7 @@ from waldur_openportal import models
 logger = logging.getLogger(__name__)
 
 
-def get_or_create_remote_project(
-    allocation, destination: str, remote_identifier=None
-):
+def get_or_create_remote_project(allocation, destination: str, remote_identifier=None):
     """
     Get or create a RemoteProject for this allocation.
 
@@ -22,7 +20,7 @@ def get_or_create_remote_project(
 
     Defaults applied on creation:
         membership_control = LOCKED
-        earliest_approve   = now + 1 hour
+        earliest_approve   = allocation.created + 1 hour
         allowed_domains    = institutional domains of current members
         link_award, link_call from proposal if attached
 
@@ -32,15 +30,12 @@ def get_or_create_remote_project(
     """
     from datetime import timedelta
 
-    from django.utils import timezone
-
     from waldur_openportal.utils import (
         get_project_member_domains,
         get_proposal_links_for_project,
     )
 
     project = allocation.project
-    now = timezone.now()
 
     # Compute defaults — used when a new record is created.
     link_award, link_call = get_proposal_links_for_project(project)
@@ -50,7 +45,7 @@ def get_or_create_remote_project(
         "current_project": project,
         "state": models.RemoteProjectState.PENDING,
         "membership_control": models.MembershipControlChoices.LOCKED,
-        "earliest_approve": now + timedelta(hours=1),
+        "earliest_approve": allocation.created + timedelta(hours=1),
         "allowed_domains": allowed_domains if allowed_domains else [],
         "link_award": link_award,
         "link_call": link_call,
@@ -86,14 +81,16 @@ def get_or_create_remote_project(
             changed = []
             if remote_project.remote_allocation != allocation:
                 remote_project.remote_allocation = allocation
+                remote_project.earliest_approve = allocation.created + timedelta(
+                    hours=1
+                )
                 changed.append("remote_allocation")
+                changed.append("earliest_approve")
             if remote_project.current_project != project:
                 remote_project.current_project = project
                 changed.append("current_project")
             if changed:
-                remote_project.save(
-                    update_fields=changed + ["modified"]
-                )
+                remote_project.save(update_fields=changed + ["modified"])
 
         return remote_project
 
@@ -105,16 +102,15 @@ def get_or_create_remote_project(
             identifier=None,
             current_project=project,
             defaults={
-                k: v
-                for k, v in creation_defaults.items()
-                if k != "current_project"
+                k: v for k, v in creation_defaults.items() if k != "current_project"
             },
         )
 
         if not created and remote_project.remote_allocation != allocation:
             remote_project.remote_allocation = allocation
+            remote_project.earliest_approve = allocation.created + timedelta(hours=1)
             remote_project.save(
-                update_fields=["remote_allocation", "modified"]
+                update_fields=["remote_allocation", "modified", "earliest_approve"]
             )
 
         return remote_project
@@ -131,9 +127,7 @@ def record_award_rejected(remote_project, details_json, error_message):
     """
     remote_project.state = models.RemoteProjectState.ERROR
     remote_project.last_sent_details = details_json
-    remote_project.save(
-        update_fields=["state", "last_sent_details", "modified"]
-    )
+    remote_project.save(update_fields=["state", "last_sent_details", "modified"])
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
         remote_project=remote_project,
@@ -158,9 +152,7 @@ def record_award_attempted(remote_project, details_json, note=""):
     Creates audit entry with event_type=AWARD_ATTEMPTED.
     """
     remote_project.last_sent_details = details_json
-    remote_project.save(
-        update_fields=["last_sent_details", "modified"]
-    )
+    remote_project.save(update_fields=["last_sent_details", "modified"])
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
         remote_project=remote_project,
@@ -222,15 +214,13 @@ def record_award_created(
 
     allocation_entry = None
     if allocation_value is not None:
-        allocation_entry = (
-            models.RemoteProjectAllocationEntry.objects.create(
-                remote_project=remote_project,
-                allocation=Decimal(str(allocation_value)),
-                previous_allocation=remote_project.current_allocation,
-                attachment=attachment,
-                source_project=remote_project.current_project,
-                confirmed_at=now,
-            )
+        allocation_entry = models.RemoteProjectAllocationEntry.objects.create(
+            remote_project=remote_project,
+            allocation=Decimal(str(allocation_value)),
+            previous_allocation=remote_project.current_allocation,
+            attachment=attachment,
+            source_project=remote_project.current_project,
+            confirmed_at=now,
         )
 
     remote_project.last_sent_details = details_json
@@ -276,15 +266,13 @@ def record_award_sent(
     if allocation_value is not None:
         current = remote_project.current_allocation
         if Decimal(str(allocation_value)) != current:
-            allocation_entry = (
-                models.RemoteProjectAllocationEntry.objects.create(
-                    remote_project=remote_project,
-                    allocation=Decimal(str(allocation_value)),
-                    previous_allocation=current,
-                    attachment=attachment,
-                    source_project=remote_project.current_project,
-                    confirmed_at=None,
-                )
+            allocation_entry = models.RemoteProjectAllocationEntry.objects.create(
+                remote_project=remote_project,
+                allocation=Decimal(str(allocation_value)),
+                previous_allocation=current,
+                attachment=attachment,
+                source_project=remote_project.current_project,
+                confirmed_at=None,
             )
 
     remote_project.last_sent_details = details_json
@@ -337,15 +325,13 @@ def record_award_update_confirmed(
             unconfirmed.save()
             allocation_entry = unconfirmed
         else:
-            allocation_entry = (
-                models.RemoteProjectAllocationEntry.objects.create(
-                    remote_project=remote_project,
-                    allocation=Decimal(str(allocation_value)),
-                    previous_allocation=remote_project.current_allocation,
-                    attachment=attachment,
-                    source_project=remote_project.current_project,
-                    confirmed_at=now,
-                )
+            allocation_entry = models.RemoteProjectAllocationEntry.objects.create(
+                remote_project=remote_project,
+                allocation=Decimal(str(allocation_value)),
+                previous_allocation=remote_project.current_allocation,
+                attachment=attachment,
+                source_project=remote_project.current_project,
+                confirmed_at=now,
             )
 
     remote_project.last_confirmed_details = details_json
@@ -362,9 +348,7 @@ def record_award_update_confirmed(
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
         remote_project=remote_project,
-        event_type=(
-            models.RemoteProjectAuditEventType.AWARD_UPDATE_CONFIRMED
-        ),
+        event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATE_CONFIRMED),
         new_details=details_json,
         allocation_entry=allocation_entry,
     )
@@ -372,9 +356,7 @@ def record_award_update_confirmed(
     return audit_entry
 
 
-def record_award_update_rejected(
-    remote_project, error_message, remote_response=None
-):
+def record_award_update_rejected(remote_project, error_message, remote_response=None):
     """
     Called when update_award is rejected (ManagedProjectRejectedError).
 
@@ -387,16 +369,12 @@ def record_award_update_rejected(
     remote_project.save()
 
     response_data = (
-        remote_response
-        if remote_response is not None
-        else {"error": error_message}
+        remote_response if remote_response is not None else {"error": error_message}
     )
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
         remote_project=remote_project,
-        event_type=(
-            models.RemoteProjectAuditEventType.AWARD_UPDATE_REJECTED
-        ),
+        event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATE_REJECTED),
         remote_response=response_data,
         note=error_message,
     )
