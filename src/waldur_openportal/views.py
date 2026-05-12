@@ -1719,6 +1719,9 @@ class ManagedProjectAuditEntryViewSet(core_views.ActionsViewSet):
     ordering_fields = ("timestamp", "event_type")
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.ManagedProjectAuditEntry.objects.none()
+
         from waldur_core.permissions.enums import RoleEnum
         from waldur_core.structure.managers import get_connected_customers
 

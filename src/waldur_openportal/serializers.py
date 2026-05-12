@@ -2,6 +2,8 @@ import logging
 
 from django.core.validators import MinValueValidator
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import exceptions as rf_exceptions
 from rest_framework import serializers as rf_serializers
 
@@ -806,11 +808,13 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
         from waldur_core.permissions.fixtures import CustomerRole
         return customer.has_user(user, CustomerRole.OWNER)
 
+    @extend_schema_field(rf_serializers.DictField(allow_null=True))
     def get_last_sent_details(self, obj):
         return (
             obj.last_sent_details if self._is_privileged(obj) else None
         )
 
+    @extend_schema_field(rf_serializers.DictField(allow_null=True))
     def get_last_confirmed_details(self, obj):
         return (
             obj.last_confirmed_details
@@ -818,14 +822,17 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
             else None
         )
 
+    @extend_schema_field(rf_serializers.DictField(allow_null=True))
     def get_pending_details(self, obj):
         return (
             obj.pending_details if self._is_privileged(obj) else None
         )
 
+    @extend_schema_field(rf_serializers.ListField(allow_null=True))
     def get_notes(self, obj):
         return obj.notes if self._is_privileged(obj) else None
 
+    @extend_schema_field(OpenApiTypes.DATETIME)
     def get_earliest_approve(self, obj):
         if not self._is_privileged(obj):
             return None
