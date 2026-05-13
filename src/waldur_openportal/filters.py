@@ -191,7 +191,17 @@ class RemoteProjectFilter(django_filters.FilterSet):
         view_name="project-detail",
         field_name="current_project__uuid",
     )
-    state = django_filters.CharFilter(field_name="state")
+    customer = core_filters.URLFilter(
+        view_name="customer-detail",
+        field_name="current_project__customer__uuid",
+    )
+    customer_uuid = django_filters.UUIDFilter(
+        field_name="current_project__customer__uuid",
+    )
+    state = django_filters.MultipleChoiceFilter(
+        field_name="state",
+        choices=models.RemoteProjectState.CHOICES,
+    )
     identifier = django_filters.CharFilter(lookup_expr="icontains")
     destination = django_filters.CharFilter(lookup_expr="icontains")
 
