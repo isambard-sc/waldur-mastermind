@@ -106,12 +106,27 @@ def get_or_create_remote_project(allocation, destination: str, remote_identifier
             },
         )
 
-        if not created and remote_project.remote_allocation != allocation:
-            remote_project.remote_allocation = allocation
-            remote_project.earliest_approve = allocation.created + timedelta(hours=1)
-            remote_project.save(
-                update_fields=["remote_allocation", "modified", "earliest_approve"]
-            )
+        if not created:
+            if remote_project.state == models.RemoteProjectState.DELETED:
+                # Revive the record: reset to the same defaults that would
+                # have been applied on creation.
+                for field, value in creation_defaults.items():
+                    if field != "current_project":
+                        setattr(remote_project, field, value)
+                remote_project.error_message = ""
+                remote_project.save()
+            elif remote_project.remote_allocation != allocation:
+                remote_project.remote_allocation = allocation
+                remote_project.earliest_approve = (
+                    allocation.created + timedelta(hours=1)
+                )
+                remote_project.save(
+                    update_fields=[
+                        "remote_allocation",
+                        "earliest_approve",
+                        "modified",
+                    ]
+                )
 
         return remote_project
 
