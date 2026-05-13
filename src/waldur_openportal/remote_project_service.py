@@ -1,4 +1,5 @@
 import logging
+import re
 from decimal import Decimal
 
 from django.utils import timezone
@@ -6,6 +7,19 @@ from django.utils import timezone
 from waldur_openportal import models
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_allocation_from_details(details_json):
+    """
+    Extract the numeric allocation from an AwardDetails JSON dict.
+    The allocation field is a string like '1000 GPUHR'; returns the
+    numeric part as a Decimal, or None if absent or unparseable.
+    """
+    alloc_str = (details_json or {}).get("allocation")
+    if not alloc_str:
+        return None
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)", str(alloc_str))
+    return Decimal(m.group(1)) if m else None
 
 
 def get_or_create_remote_project(allocation, destination: str, remote_identifier=None):
@@ -170,7 +184,12 @@ def record_award_attempted(remote_project, details_json, note=""):
     Creates audit entry with event_type=AWARD_ATTEMPTED.
     """
     remote_project.last_sent_details = details_json
-    remote_project.save(update_fields=["last_sent_details", "modified"])
+    update_fields = ["last_sent_details", "modified"]
+    pending = _parse_allocation_from_details(details_json)
+    if pending is not None:
+        remote_project.pending_allocation = pending
+        update_fields.append("pending_allocation")
+    remote_project.save(update_fields=update_fields)
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
         remote_project=remote_project,
@@ -245,6 +264,7 @@ def record_award_created(
     remote_project.last_confirmed_details = details_json
     remote_project.pending_details = None
     remote_project.pending_since = None
+    remote_project.pending_allocation = None
     remote_project.state = models.RemoteProjectState.ACTIVE
     remote_project.error_message = ""
     remote_project.last_contact_time = now
@@ -297,6 +317,8 @@ def record_award_sent(
     remote_project.last_sent_details = details_json
     remote_project.pending_details = details_json
     remote_project.pending_since = now
+    if allocation_value is not None:
+        remote_project.pending_allocation = Decimal(str(allocation_value))
     remote_project.save()
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
