@@ -2750,6 +2750,16 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         db_index=True,
     )
 
+    error_message = models.TextField(
+        blank=True,
+        default="",
+        verbose_name=_("error message"),
+        help_text=_(
+            "The most recent rejection or error message received from the "
+            "remote portal.  Cleared when the state transitions to ACTIVE."
+        ),
+    )
+
     # ------------------------------------------------------------------
     # Award details snapshots
     # ------------------------------------------------------------------

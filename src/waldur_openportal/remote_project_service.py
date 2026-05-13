@@ -127,7 +127,10 @@ def record_award_rejected(remote_project, details_json, error_message):
     """
     remote_project.state = models.RemoteProjectState.ERROR
     remote_project.last_sent_details = details_json
-    remote_project.save(update_fields=["state", "last_sent_details", "modified"])
+    remote_project.error_message = error_message
+    remote_project.save(
+        update_fields=["state", "last_sent_details", "error_message", "modified"]
+    )
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
         remote_project=remote_project,
@@ -228,6 +231,7 @@ def record_award_created(
     remote_project.pending_details = None
     remote_project.pending_since = None
     remote_project.state = models.RemoteProjectState.ACTIVE
+    remote_project.error_message = ""
     remote_project.last_contact_time = now
 
     if allocation_value is not None:
@@ -338,6 +342,7 @@ def record_award_update_confirmed(
     remote_project.pending_details = None
     remote_project.pending_since = None
     remote_project.state = models.RemoteProjectState.ACTIVE
+    remote_project.error_message = ""
     remote_project.last_contact_time = now
     remote_project.pending_allocation = None
 
@@ -366,7 +371,8 @@ def record_award_update_rejected(remote_project, error_message, remote_response=
     note=error_message.
     """
     remote_project.state = models.RemoteProjectState.ERROR
-    remote_project.save()
+    remote_project.error_message = error_message
+    remote_project.save(update_fields=["state", "error_message", "modified"])
 
     response_data = (
         remote_response if remote_response is not None else {"error": error_message}

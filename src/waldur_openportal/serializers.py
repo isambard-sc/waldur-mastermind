@@ -782,6 +782,8 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
             "pending_since",
             "notes",
             "earliest_approve",
+            # Error
+            "error_message",
             # Misc
             "has_pending_change",
             "current_project_name",
