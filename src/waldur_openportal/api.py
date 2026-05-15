@@ -1324,6 +1324,64 @@ def fetch_job(request):
 
 @extend_schema(exclude=True)
 @api_view(["GET"])
+@authentication_classes([])
+@permission_classes([])
+def fetch_notification(request):
+    """
+    End-point called by the OpenPortal bridge agent to signal to Waldur
+    that a new notification has arrived and needs to be fetched.
+
+    The bridge sends GET /fetch_notification?notification_id=<uuid>.
+    The notification_id acts as a shared secret — an unknown ID returns
+    403 Forbidden, preventing unauthorised access to this endpoint.
+
+    Notifications are fire-and-forget: no DB record is created and no
+    retry/idempotency logic is applied. The event is dispatched
+    synchronously to the appropriate handler and 200 OK returned.
+    """
+
+    board = OpenPortalBoard()
+
+    notification_id = request.query_params.get("notification_id")
+
+    if not notification_id:
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    notification_id = str(notification_id).strip()
+
+    if len(notification_id) == 0:
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    try:
+        notification = board.fetch_notification(notification_id)
+        if notification is None:
+            response = JsonResponse({})
+            response.status_code = status.UNAUTHORIZED
+            return response
+    except Exception as e:
+        logger.error(
+            f"Error fetching notification {notification_id}: {e}"
+        )
+        response = JsonResponse({})
+        response.status_code = status.UNAUTHORIZED
+        return response
+
+    tasks.dispatch_notification(
+        notification.event_type,
+        notification.event_argument,
+    )
+
+    response = JsonResponse({})
+    response.status_code = status.OK
+    return response
+
+
+@extend_schema(exclude=True)
+@api_view(["GET"])
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
 def whoami(request):

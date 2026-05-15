@@ -139,6 +139,27 @@ class OpenPortalBoard:
 
         return job
 
+    def fetch_notification(
+        self, notification_id: str
+    ) -> openportal.Notification:
+        """
+        Fetch the OpenPortal notification with the specified notification_id
+        """
+        if not openportal.have_openportal():
+            raise openportal.OpenPortalError(
+                "OpenPortal is not available - cannot fetch notification"
+                f" with ID '{notification_id}'"
+            )
+
+        try:
+            notification = openportal.fetch_notification(str(notification_id))
+        except Exception as e:
+            raise openportal.OpenPortalError(
+                f"Failed to fetch notification with ID '{notification_id}': {e}"
+            )
+
+        return notification
+
     def _get_project_template(
         self, managed_project: models.ManagedProject, details: openportal.ProjectDetails
     ) -> models.ProjectTemplate:

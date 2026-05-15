@@ -103,6 +103,7 @@ try:
         Link,
         Node,
         Note,
+        Notification,
         PortalIdentifier,
         ProjectDetails,
         ProjectIdentifier,
@@ -118,6 +119,7 @@ try:
         is_config_loaded,
         fetch_job,
         fetch_jobs,
+        fetch_notification,
         load_config,
         health,
         get,
@@ -243,6 +245,37 @@ except ImportError:
 
     class Node:
         def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class Notification:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        @staticmethod
+        def from_json(*args, **kwargs):
+            _raise_no_openportal_error()
+
+        @property
+        def id(self):
+            _raise_no_openportal_error()
+
+        @property
+        def destination(self):
+            _raise_no_openportal_error()
+
+        @property
+        def event(self):
+            _raise_no_openportal_error()
+
+        @property
+        def event_type(self):
+            _raise_no_openportal_error()
+
+        @property
+        def event_argument(self):
+            _raise_no_openportal_error()
+
+        def to_json(self):
             _raise_no_openportal_error()
 
     class PortalIdentifier:

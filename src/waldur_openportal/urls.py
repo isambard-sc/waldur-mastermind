@@ -6,6 +6,7 @@ from .api import (
     project_spend_info,
     customer_spend_info,
     fetch_job,
+    fetch_notification,
     whoami,
     get_api_token,
     offering_mapping,
@@ -122,6 +123,11 @@ urlpatterns = [
         r"^api/openportal/fetch_job/",
         fetch_job,
         name="fetch-job",
+    ),
+    re_path(
+        r"^api/openportal/fetch_notification/",
+        fetch_notification,
+        name="fetch-notification",
     ),
     re_path(
         r"^api/openportal/whoami/",
