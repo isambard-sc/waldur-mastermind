@@ -139,9 +139,7 @@ class OpenPortalBoard:
 
         return job
 
-    def fetch_notification(
-        self, notification_id: str
-    ) -> openportal.Notification:
+    def fetch_notification(self, notification_id: str) -> openportal.Notification:
         """
         Fetch the OpenPortal notification with the specified notification_id
         """
@@ -161,7 +159,7 @@ class OpenPortalBoard:
         return notification
 
     def _get_project_template(
-        self, managed_project: models.ManagedProject, details: openportal.ProjectDetails
+        self, managed_project: models.ManagedProject, details: openportal.AwardDetails
     ) -> models.ProjectTemplate:
         """
         Get the project class for the managed project.
@@ -446,7 +444,7 @@ class OpenPortalBoard:
 
         identifier = managed_project.get_remote_identifier()
         project_template: models.ProjectTemplate = managed_project.project_template
-        details: openportal.ProjectDetails = managed_project.get_details()
+        details: openportal.AwardDetails = managed_project.get_details()
 
         if identifier is None or project_template is None or details is None:
             # This is a bug - we should not have a ManagedProject without a project class
@@ -539,7 +537,7 @@ class OpenPortalBoard:
 
         identifier = managed_project.get_remote_identifier()
         project_template: models.ProjectTemplate = managed_project.project_template
-        details: openportal.ProjectDetails = managed_project.get_details()
+        details: openportal.AwardDetails = managed_project.get_details()
 
         if identifier is None or project_template is None or details is None:
             # This is a bug - we should not have a ManagedProject without a project class
@@ -607,14 +605,14 @@ class OpenPortalBoard:
         managed_project.set_project(waldur_project)
         self._get_local_identifier(managed_project)
 
-    def create_project(
+    def create_award(
         self,
         identifier: openportal.ProjectIdentifier,
-        details: openportal.ProjectDetails,
+        details: openportal.AwardDetails,
         force_request_approval: bool = False,
     ) -> openportal.ProjectMapping:
         """
-        Create a project in OpenPortal with the given identifier and details.
+        Create an award in OpenPortal with the given identifier and details.
         This returns the mapping from the identifier in the requesting portal
         to the OpenPortal project identifier used internally.
         """
@@ -625,7 +623,7 @@ class OpenPortalBoard:
                 f"Invalid project identifier: {identifier}"
             )
 
-        if not isinstance(details, openportal.ProjectDetails):
+        if not isinstance(details, openportal.AwardDetails):
             raise openportal.ManagedProjectRejectedError(
                 f"Invalid project details: {details}"
             )
@@ -763,19 +761,19 @@ class OpenPortalBoard:
         self._create_local_project(managed_project)
 
         # now force an update of the project details
-        return self.update_project(
+        return self.update_award(
             identifier=identifier,
             new_details=details,
         )
 
-    def update_project(
+    def update_award(
         self,
         identifier: openportal.ProjectIdentifier,
-        new_details: openportal.ProjectDetails,
+        new_details: openportal.AwardDetails,
         force_approve: bool = False,
     ) -> openportal.ProjectMapping:
         """
-        Update a project in OpenPortal with the given identifier and details.
+        Update an award in OpenPortal with the given identifier and details.
         This returns the mapping from the identifier in the requesting portal
         to the OpenPortal project identifier used internally.
         """
@@ -796,7 +794,7 @@ class OpenPortalBoard:
                 f"Invalid project identifier: {identifier}"
             )
 
-        if not isinstance(new_details, openportal.ProjectDetails):
+        if not isinstance(new_details, openportal.AwardDetails):
             raise openportal.ManagedProjectRejectedError(
                 f"Invalid project details: {new_details}"
             )
@@ -1087,11 +1085,11 @@ class OpenPortalBoard:
 
         return managed_project.get_mapping()
 
-    def remove_project(
+    def remove_award(
         self, identifier: openportal.ProjectIdentifier
     ) -> openportal.ProjectMapping:
         """
-        Remove a project in OpenPortal with the given identifier.
+        Remove an award in OpenPortal with the given identifier.
         This will delete the ManagedProject, but will not delete
         the project itself - this just severs the link between
         the remote portal and the site portal.
@@ -1128,12 +1126,12 @@ class OpenPortalBoard:
         # If the project was deleted, we can return None as there is no mapping anymore
         return openportal.ProjectMapping(f"{identifier}:None")
 
-    def get_project(
+    def get_award(
         self, identifier: openportal.ProjectIdentifier
-    ) -> openportal.ProjectDetails:
+    ) -> openportal.AwardDetails:
         """
-        Get a project from OpenPortal with the given identifier.
-        This returns the details of the project, e.g. its name,
+        Get an award from OpenPortal with the given identifier.
+        This returns the details of the award, e.g. its name,
         description, members etc.
         """
         if not isinstance(identifier, openportal.ProjectIdentifier):
@@ -1170,7 +1168,7 @@ class OpenPortalBoard:
                 f"ManagedProject '{managed_project}' is expired or removed"
             )
 
-        details = openportal.ProjectDetails("{}")
+        details = openportal.AwardDetails("{}")
 
         if project.name is not None:
             details.name = str(project.name).strip()

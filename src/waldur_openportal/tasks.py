@@ -1437,17 +1437,17 @@ def create_default_resources(serialized_managed_project):
                         existing_resource.delete()
 
 
-def update_project(
+def update_award(
     board: OpenPortalBoard,
     project: openportal.ProjectIdentifier,
-    details: openportal.ProjectDetails,
+    details: openportal.AwardDetails,
     force_approve: bool = False,
 ) -> openportal.ProjectMapping:
     """
     Update the project in the OpenPortal board with the given details.
     If the project does not exist, then there will be an error.
     """
-    mapping = board.update_project(project, details, force_approve=force_approve)
+    mapping = board.update_award(project, details, force_approve=force_approve)
 
     # schedule creation of default resources again in case any were missed
     try:
@@ -1468,20 +1468,20 @@ def update_project(
     return mapping
 
 
-def create_project(
+def create_award(
     board: OpenPortalBoard,
     identifier: openportal.ProjectIdentifier,
-    details: openportal.ProjectDetails,
+    details: openportal.AwardDetails,
 ) -> openportal.ProjectMapping:
     """
     Create a project in the OpenPortal board with the given identifier and details.
     """
     # first, create the project if it doesn't exist
-    mapping = board.create_project(identifier, details)
+    mapping = board.create_award(identifier, details)
 
     # next, update the details of the project to match the details provided.
     # This will also create the default resources for the project
-    mapping = update_project(board, mapping.project, details)
+    mapping = update_award(board, mapping.project, details)
 
     return mapping
 
@@ -1579,20 +1579,20 @@ def run_job(serialized_job):
     try:
         result = None
 
-        if command == "create_project":
+        if command == "create_project" or command == "create_award":
             identifier = openportal.ProjectIdentifier(args[0])
-            details = openportal.ProjectDetails(args[1])
-            result = create_project(board, identifier, details)
-        elif command == "remove_project":
+            details = openportal.AwardDetails(args[1])
+            result = create_award(board, identifier, details)
+        elif command == "remove_project" or command == "remove_award":
             identifier = openportal.ProjectIdentifier(args[0])
-            result = board.remove_project(identifier)
-        elif command == "update_project":
+            result = board.remove_award(identifier)
+        elif command == "update_project" or command == "update_award":
             identifier = openportal.ProjectIdentifier(args[0])
-            details = openportal.ProjectDetails(args[1])
-            result = update_project(board, identifier, details)
-        elif command == "get_project":
+            details = openportal.AwardDetails(args[1])
+            result = update_award(board, identifier, details)
+        elif command == "get_project" or command == "get_award":
             identifier = openportal.ProjectIdentifier(args[0])
-            result = board.get_project(identifier)
+            result = board.get_award(identifier)
         elif command == "get_projects":
             identifier = openportal.PortalIdentifier(args[0])
             result = board.get_projects(identifier)

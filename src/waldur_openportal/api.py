@@ -1516,10 +1516,10 @@ def get_api_token(request):
     # Check staff access
     user_access = "staff" if user.is_staff else "not a staff"
 
-    # Sync email with Keycloak response email
+    # Sync email with Keycloak response email - this should match the user_identifier
     email = data.get("email")
     if email and user.email != email:
-        user_email = user.email  # Sync email with response returned from Keycloak
+        user.email = str(email)  # Sync email with response returned from Keycloak
         user.save(update_fields=["email"])
 
     # Generate Waldur API token
