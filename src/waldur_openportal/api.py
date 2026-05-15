@@ -239,13 +239,13 @@ def project_spend_info(request):
 def access_for_email(request):
     """
     Return the level of access available based on an intelligent free text search query.
-    
+
     This endpoint automatically detects the search type based on the query format:
     - Email addresses (contains @)
     - Short names (alphanumeric between 5 and 20 characters)
     - Project IDs (alphanumeric, full project ID contains dot)
     - Project names (any text)
-    
+
     The aim of this API call is to allow, e.g. Keycloak, to determine whether
     an identity connected to the specified email address is authorised
     to access Waldur, and is thus allowed to log in.
@@ -258,7 +258,7 @@ def access_for_email(request):
     - q: Free text search query (required) - can be email, short_name, project_name, or project_id
 
     Note that this is only available to authenticated users, and a user
-    can only query for which they have access (i.e. a staff user can query 
+    can only query for which they have access (i.e. a staff user can query
     anything, but a non-staff user can only query their own email/short_name
     or projects they belong to)
 
@@ -325,7 +325,7 @@ def access_for_email(request):
 
     # Get the free text search query
     query = request.query_params.get("q")
-    
+
     # Also support legacy parameters for backwards compatibility
     email = request.query_params.get("email")
     short_name = request.query_params.get("short_name")
@@ -344,9 +344,11 @@ def access_for_email(request):
             query = project_id
 
     if query is None:
-        response = JsonResponse({
-            "error": "Search query parameter 'q' is required. You can search by email, short_name, project_name, or project_id."
-        })
+        response = JsonResponse(
+            {
+                "error": "Search query parameter 'q' is required. You can search by email, short_name, project_name, or project_id."
+            }
+        )
         response.status_code = status.BAD_REQUEST
         return response
 
@@ -354,9 +356,7 @@ def access_for_email(request):
     query = str(query).strip()
 
     if len(query) == 0:
-        response = JsonResponse({
-            "error": "Search query cannot be empty."
-        })
+        response = JsonResponse({"error": "Search query cannot be empty."})
         response.status_code = status.BAD_REQUEST
         return response
 
@@ -374,24 +374,26 @@ def _intelligent_search(requesting_user, query, can_query_all):
     """
     Intelligently route the search based on query format.
     Tries multiple search strategies and returns the best match.
-    
+
     Non-staff users can only search by their own email or short_name.
     Staff/support users can search by any criteria.
     """
     results = []
-    
+
     # Strategy 1: Check if it's an email (contains @)
     if "@" in query:
         logger.info(f"Detected email format in query: '{query}'")
-        
+
         # Permission check for non-staff: can only search their own email
         if not can_query_all and requesting_user.email.lower() != query.lower():
-            response = JsonResponse({
-                "error": "You can only search by your own email address. Staff users can search for any user."
-            })
+            response = JsonResponse(
+                {
+                    "error": "You can only search by your own email address. Staff users can search for any user."
+                }
+            )
             response.status_code = status.FORBIDDEN
             return response
-        
+
         # Try email search
         try:
             result = _search_by_email(requesting_user, query.lower(), can_query_all)
@@ -400,22 +402,25 @@ def _intelligent_search(requesting_user, query, can_query_all):
                 return result
         except Exception as e:
             logger.warning(f"Email search failed: {e}")
-    
+
     # Strategy 2: Check if it looks like a project ID (shortname.portal format or just shortname)
     # NON-STAFF USERS CANNOT SEARCH BY PROJECT
     if "." in query or (len(query) < 10 and not " " in query):
         logger.info(f"Attempting project ID search for query: '{query}'")
-        
+
         # Permission check: only staff can search by project
         if not can_query_all:
             # This might be a short_name, so don't block yet - let it fall through to short_name search
-            logger.info(f"Non-staff user attempted project search, will try short_name instead")
+            logger.info(
+                f"Non-staff user attempted project search, will try short_name instead"
+            )
         else:
             try:
                 result = _search_by_project_id(requesting_user, query, can_query_all)
                 if result.status_code == status.OK:
                     # Check if we got actual results (not an error response)
                     import json
+
                     data = json.loads(result.content)
                     if isinstance(data, list) and len(data) > 0:
                         return result
@@ -424,7 +429,7 @@ def _intelligent_search(requesting_user, query, can_query_all):
                         return result
             except Exception as e:
                 logger.info(f"Project ID search didn't match: {e}")
-    
+
     # Strategy 3: Try short_name search (for usernames)
     # Short names are between 5 and 20 characters, no spaces
     if not " " in query and 5 <= len(query) <= 20:
@@ -433,6 +438,7 @@ def _intelligent_search(requesting_user, query, can_query_all):
             result = _search_by_short_name(requesting_user, query, can_query_all)
             if result.status_code == status.OK:
                 import json
+
                 data = json.loads(result.content)
                 # Check if we got a real user (not "unknown" status)
                 if isinstance(data, dict) and data.get("status") != "unknown":
@@ -441,34 +447,43 @@ def _intelligent_search(requesting_user, query, can_query_all):
                         # Verify this is their own short_name
                         try:
                             userinfo = models.UserInfo.objects.get(user=requesting_user)
-                            if userinfo.shortname and userinfo.shortname.lower() != query.lower():
-                                response = JsonResponse({
-                                    "error": "You can only search by your own short name. Staff users can search for any user."
-                                })
+                            if (
+                                userinfo.shortname
+                                and userinfo.shortname.lower() != query.lower()
+                            ):
+                                response = JsonResponse(
+                                    {
+                                        "error": "You can only search by your own short name. Staff users can search for any user."
+                                    }
+                                )
                                 response.status_code = status.FORBIDDEN
                                 return response
                         except models.UserInfo.DoesNotExist:
                             # User doesn't have a short_name, so they can't search by short_name
-                            response = JsonResponse({
-                                "error": "You don't have a short name configured, so you can only search by your email address."
-                            })
+                            response = JsonResponse(
+                                {
+                                    "error": "You don't have a short name configured, so you can only search by your email address."
+                                }
+                            )
                             response.status_code = status.FORBIDDEN
                             return response
                     return result
         except Exception as e:
             logger.info(f"Short name search didn't match: {e}")
-    
+
     # Strategy 4: Try project name search (broader text search)
     # NON-STAFF USERS CANNOT SEARCH BY PROJECT
     if not can_query_all:
         # Non-staff user trying to search by project name
-        response = JsonResponse({
-            "error": "You can only search by your own email address or short name. Project searches are only available to staff users.",
-            "allowed_searches": ["your_email", "your_short_name"]
-        })
+        response = JsonResponse(
+            {
+                "error": "You can only search by your own email address or short name. Project searches are only available to staff users.",
+                "allowed_searches": ["your_email", "your_short_name"],
+            }
+        )
         response.status_code = status.FORBIDDEN
         return response
-    
+
     logger.info(f"Attempting project name search for query: '{query}'")
     try:
         result = _search_by_project_name(requesting_user, query, can_query_all)
@@ -477,20 +492,24 @@ def _intelligent_search(requesting_user, query, can_query_all):
         # If not found, that's okay - we'll return a generic not found
     except Exception as e:
         logger.info(f"Project name search didn't match: {e}")
-    
+
     # If nothing matched, return a helpful error message
     if can_query_all:
-        response = JsonResponse({
-            "error": f"No results found for query: '{query}'. Tried searching by email, project ID, short name, and project name.",
-            "query": query,
-            "searched_types": ["email", "project_id", "short_name", "project_name"]
-        })
+        response = JsonResponse(
+            {
+                "error": f"No results found for query: '{query}'. Tried searching by email, project ID, short name, and project name.",
+                "query": query,
+                "searched_types": ["email", "project_id", "short_name", "project_name"],
+            }
+        )
     else:
-        response = JsonResponse({
-            "error": f"No results found for query: '{query}'. You can only search by your own email address or short name.",
-            "query": query,
-            "allowed_searches": ["your_email", "your_short_name"]
-        })
+        response = JsonResponse(
+            {
+                "error": f"No results found for query: '{query}'. You can only search by your own email address or short name.",
+                "query": query,
+                "allowed_searches": ["your_email", "your_short_name"],
+            }
+        )
     response.status_code = status.NOT_FOUND
     return response
 
@@ -674,7 +693,9 @@ def _search_by_short_name(requesting_user, short_name, can_query_all):
             "reason": "",
         }
     )
-    logger.info(f"access_for_short_name({short_name}, {requesting_user}) {response.content}")
+    logger.info(
+        f"access_for_short_name({short_name}, {requesting_user}) {response.content}"
+    )
     response.status_code = status.OK
     return response
 
@@ -682,11 +703,11 @@ def _search_by_short_name(requesting_user, short_name, can_query_all):
 def _search_by_project_name(requesting_user, project_name, can_query_all):
     """Search for all users in a project by project name"""
     logger.info(f"Searching for project with name: '{project_name}'")
-    
+
     projects_qs = structure_models.Project.available_objects.filter(
         name__iexact=project_name
     )
-    
+
     logger.info(f"Found {projects_qs.count()} projects matching '{project_name}'")
 
     if not projects_qs.exists():
@@ -695,12 +716,10 @@ def _search_by_project_name(requesting_user, project_name, can_query_all):
             name__icontains=project_name
         )
         logger.info(f"Partial match found {projects_qs.count()} projects")
-        
+
         if not projects_qs.exists():
             response = JsonResponse(
-                {
-                    "error": f"Project with name '{project_name}' not found"
-                }
+                {"error": f"Project with name '{project_name}' not found"}
             )
             response.status_code = status.NOT_FOUND
             return response
@@ -714,24 +733,24 @@ def _search_by_project_name(requesting_user, project_name, can_query_all):
             id__in=get_connected_projects(requesting_user)
         )
         if project not in user_projects:
-            response = JsonResponse({
-                "error": "You can only query projects you are a member of"
-            })
+            response = JsonResponse(
+                {"error": "You can only query projects you are a member of"}
+            )
             response.status_code = status.FORBIDDEN
             return response
 
     # Get all active users in this project using the project's get_users method
     logger.info(f"Getting users for project: {project.name} (ID: {project.id})")
-    
+
     try:
         # Use the project's built-in method to get all users
         all_project_users = project.get_users()
         logger.info(f"Found {len(all_project_users)} total users in project")
-        
+
         # Filter for active users only
         users_in_project = [user for user in all_project_users if user.is_active]
         logger.info(f"Found {len(users_in_project)} active users in project")
-        
+
     except Exception as e:
         logger.error(f"Error getting users from project: {e}")
         users_in_project = []
@@ -755,22 +774,26 @@ def _search_by_project_name(requesting_user, project_name, can_query_all):
     for user in users_in_project:
         userinfo, _ = models.UserInfo.objects.get_or_create(user=user)
         short_name = str(userinfo.shortname).strip() if userinfo.shortname else ""
-        
+
         # Get only projects for this specific user
         projects = _get_user_projects(user)
-        
-        users_data.append({
-            "email": user.email,
-            "status": "active",
-            "short_name": short_name,
-            "projects": projects,
-            "invited_by": "",
-            "reason": "",
-        })
+
+        users_data.append(
+            {
+                "email": user.email,
+                "status": "active",
+                "short_name": short_name,
+                "projects": projects,
+                "invited_by": "",
+                "reason": "",
+            }
+        )
 
     # Return array of users for project searches
     response = JsonResponse(users_data, safe=False)
-    logger.info(f"access_for_project_name({project_name}, {requesting_user}) found {len(users_data)} users")
+    logger.info(
+        f"access_for_project_name({project_name}, {requesting_user}) found {len(users_data)} users"
+    )
     response.status_code = status.OK
     return response
 
@@ -793,9 +816,7 @@ def _search_by_project_id(requesting_user, project_id, can_query_all):
 
         if not project_info or not project_info.project:
             response = JsonResponse(
-                {
-                    "error": f"Project with ID '{project_id}' not found"
-                }
+                {"error": f"Project with ID '{project_id}' not found"}
             )
             response.status_code = status.NOT_FOUND
             return response
@@ -804,11 +825,7 @@ def _search_by_project_id(requesting_user, project_id, can_query_all):
 
     except Exception as e:
         logger.error(f"Error finding project with ID {project_id}: {e}")
-        response = JsonResponse(
-            {
-                "error": f"Project with ID '{project_id}' not found"
-            }
-        )
+        response = JsonResponse({"error": f"Project with ID '{project_id}' not found"})
         response.status_code = status.NOT_FOUND
         return response
 
@@ -818,24 +835,24 @@ def _search_by_project_id(requesting_user, project_id, can_query_all):
             id__in=get_connected_projects(requesting_user)
         )
         if project not in user_projects:
-            response = JsonResponse({
-                "error": "You can only query projects you are a member of"
-            })
+            response = JsonResponse(
+                {"error": "You can only query projects you are a member of"}
+            )
             response.status_code = status.FORBIDDEN
             return response
 
     # Get all active users in this project using the project's get_users method
     logger.info(f"Getting users for project: {project.name} (ID: {project.id})")
-    
+
     try:
         # Use the project's built-in method to get all users
         all_project_users = project.get_users()
         logger.info(f"Found {len(all_project_users)} total users in project")
-        
+
         # Filter for active users only
         users_in_project = [user for user in all_project_users if user.is_active]
         logger.info(f"Found {len(users_in_project)} active users in project")
-        
+
     except Exception as e:
         logger.error(f"Error getting users from project: {e}")
         users_in_project = []
@@ -859,21 +876,25 @@ def _search_by_project_id(requesting_user, project_id, can_query_all):
     for user in users_in_project:
         userinfo, _ = models.UserInfo.objects.get_or_create(user=user)
         short_name = str(userinfo.shortname).strip() if userinfo.shortname else ""
-        
+
         projects = _get_user_projects(user)
-        
-        users_data.append({
-            "email": user.email,
-            "status": "active",
-            "short_name": short_name,
-            "projects": projects,
-            "invited_by": "",
-            "reason": "",
-        })
+
+        users_data.append(
+            {
+                "email": user.email,
+                "status": "active",
+                "short_name": short_name,
+                "projects": projects,
+                "invited_by": "",
+                "reason": "",
+            }
+        )
 
     # Return array of users for project searches
     response = JsonResponse(users_data, safe=False)
-    logger.info(f"access_for_project_id({project_id}, {requesting_user}) found {len(users_data)} users")
+    logger.info(
+        f"access_for_project_id({project_id}, {requesting_user}) found {len(users_data)} users"
+    )
     response.status_code = status.OK
     return response
 
@@ -901,9 +922,7 @@ def _get_user_projects(user):
             portal = backend.portal()
 
             if portal is None or len(str(portal).strip()) == 0:
-                logger.warning(
-                    f"Allocation {allocation} has no portal name - skipping"
-                )
+                logger.warning(f"Allocation {allocation} has no portal name - skipping")
                 continue
 
             project = f"{project_short_name}.{portal}"
@@ -917,15 +936,15 @@ def _get_user_projects(user):
             association = utils.get_association(user=user, allocation=allocation)
             username = association.username
         except models.Association.DoesNotExist:
-            logger.warning(
-                f"Association between {user} and {allocation} not found"
-            )
+            logger.warning(f"Association between {user} and {allocation} not found")
             username = None
 
         if username is None:
             userinfo, _ = models.UserInfo.objects.get_or_create(user=user)
-            short_name_in_waldur = str(userinfo.shortname).strip() if userinfo.shortname else None
-            
+            short_name_in_waldur = (
+                str(userinfo.shortname).strip() if userinfo.shortname else None
+            )
+
             if short_name_in_waldur is not None:
                 username = f"{short_name_in_waldur}.{project_short_name}"
                 logger.warning(
@@ -951,6 +970,7 @@ def _get_user_projects(user):
         )
 
     return projects
+
 
 @extend_schema(exclude=True)
 @api_view(["GET"])
@@ -1363,17 +1383,16 @@ def fetch_notification(request):
             response.status_code = status.UNAUTHORIZED
             return response
     except Exception as e:
-        logger.error(
-            f"Error fetching notification {notification_id}: {e}"
-        )
+        logger.error(f"Error fetching notification {notification_id}: {e}")
         response = JsonResponse({})
         response.status_code = status.UNAUTHORIZED
         return response
 
-    tasks.dispatch_notification(
-        notification.event_type,
-        notification.event_argument,
-    )
+    try:
+        tasks.dispatch_notification(notification)
+    except Exception as e:
+        logger.error(f"Error dispatching notification {notification}: {e}")
+        # We still return 200 OK to avoid unnecessary retries from the bridge
 
     response = JsonResponse({})
     response.status_code = status.OK
@@ -1771,7 +1790,10 @@ def user_mapping(request):
                     result[email] = None
                     continue
                 resolved_user = email_users.get(email)
-                if resolved_user is None or resolved_user.pk not in accessible_email_user_ids:
+                if (
+                    resolved_user is None
+                    or resolved_user.pk not in accessible_email_user_ids
+                ):
                     result[email] = None
                     continue
                 result[email] = user_info

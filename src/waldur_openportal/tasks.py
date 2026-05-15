@@ -1691,7 +1691,7 @@ def run_job(serialized_job):
             )
 
 
-def dispatch_notification(event_type: str, event_argument: str):
+def dispatch_notification(notification: openportal.Notification):
     """
     Dispatch an OpenPortal bridge notification to the appropriate handler.
     Called synchronously from the fetch_notification view.
@@ -1705,71 +1705,35 @@ def dispatch_notification(event_type: str, event_argument: str):
         "award_rejected": _handle_award_rejected,
     }
 
-    handler = _NOTIFICATION_HANDLERS.get(event_type)
+    if notification.event_type is None:
+        logger.error(f"OpenPortal notification has no event type: {notification}")
+        return
+
+    handler = _NOTIFICATION_HANDLERS.get(notification.event_type)
     if handler is None:
         return
 
-    handler(event_argument)
+    handler(notification)
 
 
-def _handle_user_added(identifier: str):
-    logger.info(f"OpenPortal notification: user_added {identifier}")
+def _handle_award_added(notification: openportal.Notification):
+    logger.info(f"OpenPortal notification: {notification}")
 
 
-def _handle_user_removed(identifier: str):
-    logger.info(f"OpenPortal notification: user_removed {identifier}")
+def _handle_award_removed(notification: openportal.Notification):
+    logger.info(f"OpenPortal notification: {notification}")
 
 
-def _handle_user_changed(identifier: str):
-    logger.info(f"OpenPortal notification: user_changed {identifier}")
+def _handle_award_changed(notification: openportal.Notification):
+    logger.info(f"OpenPortal notification: {notification}")
 
 
-def _handle_user_blocked(identifier: str):
-    logger.info(f"OpenPortal notification: user_blocked {identifier}")
+def _handle_award_accepted(notification: openportal.Notification):
+    logger.info(f"OpenPortal notification: {notification}")
 
 
-def _handle_user_unblocked(identifier: str):
-    logger.info(f"OpenPortal notification: user_unblocked {identifier}")
-
-
-def _handle_project_added(identifier: str):
-    logger.info(f"OpenPortal notification: project_added {identifier}")
-
-
-def _handle_project_removed(identifier: str):
-    logger.info(f"OpenPortal notification: project_removed {identifier}")
-
-
-def _handle_project_changed(identifier: str):
-    logger.info(f"OpenPortal notification: project_changed {identifier}")
-
-
-def _handle_project_blocked(identifier: str):
-    logger.info(f"OpenPortal notification: project_blocked {identifier}")
-
-
-def _handle_project_unblocked(identifier: str):
-    logger.info(f"OpenPortal notification: project_unblocked {identifier}")
-
-
-def _handle_award_added(identifier: str):
-    logger.info(f"OpenPortal notification: award_added {identifier}")
-
-
-def _handle_award_removed(identifier: str):
-    logger.info(f"OpenPortal notification: award_removed {identifier}")
-
-
-def _handle_award_changed(identifier: str):
-    logger.info(f"OpenPortal notification: award_changed {identifier}")
-
-
-def _handle_award_accepted(identifier: str):
-    logger.info(f"OpenPortal notification: award_accepted {identifier}")
-
-
-def _handle_award_rejected(identifier: str):
-    logger.info(f"OpenPortal notification: award_rejected {identifier}")
+def _handle_award_rejected(notification: openportal.Notification):
+    logger.info(f"OpenPortal notification: {notification}")
 
 
 @shared_task(name="waldur_openportal.sync_offering_agents")
