@@ -1697,21 +1697,7 @@ def dispatch_notification(event_type: str, event_argument: str):
     Called synchronously from the fetch_notification view.
     Notifications are fire-and-forget — errors are logged but not raised.
     """
-    logger.info(
-        f"OpenPortal notification: {event_type} {event_argument}"
-    )
-
     _NOTIFICATION_HANDLERS = {
-        "user_added": _handle_user_added,
-        "user_removed": _handle_user_removed,
-        "user_changed": _handle_user_changed,
-        "user_blocked": _handle_user_blocked,
-        "user_unblocked": _handle_user_unblocked,
-        "project_added": _handle_project_added,
-        "project_removed": _handle_project_removed,
-        "project_changed": _handle_project_changed,
-        "project_blocked": _handle_project_blocked,
-        "project_unblocked": _handle_project_unblocked,
         "award_added": _handle_award_added,
         "award_removed": _handle_award_removed,
         "award_changed": _handle_award_changed,
@@ -1721,9 +1707,6 @@ def dispatch_notification(event_type: str, event_argument: str):
 
     handler = _NOTIFICATION_HANDLERS.get(event_type)
     if handler is None:
-        logger.warning(
-            f"OpenPortal - Unknown notification event type: {event_type}"
-        )
         return
 
     handler(event_argument)
@@ -1953,6 +1936,4 @@ def mark_stale_remote_projects():
             )
             logger.info(f"Marked RemoteProject {remote_project} as STALE")
         except Exception as e:
-            logger.error(
-                f"Failed to mark RemoteProject {remote_project} as STALE: {e}"
-            )
+            logger.error(f"Failed to mark RemoteProject {remote_project} as STALE: {e}")
