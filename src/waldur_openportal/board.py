@@ -1151,37 +1151,86 @@ class OpenPortalBoard:
                 f"ManagedProject for identifier '{identifier}' does not exist"
             )
 
-        if managed_project.project is None:
-            logger.error(
-                f"ManagedProject {managed_project} does not have an associated project."
-            )
-            raise openportal.OpenPortalError(
-                f"ManagedProject '{managed_project}' does not have an associated project"
-            )
+        # Start from the stored AwardDetails — this is the canonical record of
+        # what has been sent/received, including fields we don't manage locally
+        # (allocation, breakdown, award/call links, etc.).
+        details = managed_project.get_details()
 
+        # Overlay live project fields, which may be more up-to-date than the
+        # stored details if a pending update hasn't been pushed to the remote yet.
         project = managed_project.project
+        if project is not None:
+            if project.name is not None:
+                details.name = str(project.name).strip()
+            if project.description is not None:
+                details.description = str(project.description).strip()
+            if managed_project.project_template is not None:
+                details.project_template = openportal.ProjectTemplate(
+                    managed_project.project_template.name,
+                )
+            if project.start_date is not None:
+                details.start_date = project.start_date
+            if project.end_date is not None:
+                details.end_date = project.end_date
 
-        if project.is_expired or project.is_removed:
-            # we can't make any changes to this project - return an error
-            logger.error(f"ManagedProject {managed_project} is expired or removed.")
-            raise openportal.OpenPortalError(
-                f"ManagedProject '{managed_project}' is expired or removed"
-            )
+            # Merge in any project members not already listed in the stored
+            # AwardDetails (e.g. users added after the last push).
+            # Build a reverse mapping: Waldur role name → remote role name.
+            reverse_role_mapping = {}
+            if managed_project.project_template is not None:
+                for (
+                    remote_role,
+                    local_role,
+                ) in managed_project.project_template.get_role_mapping().items():
+                    reverse_role_mapping[local_role.name] = remote_role
 
-        details = openportal.AwardDetails("{}")
+            for email, waldur_role_name in utils.get_project_members(project).items():
+                remote_role = reverse_role_mapping.get(waldur_role_name, "unmapped")
+                details.add_member(email, remote_role)
 
-        if project.name is not None:
-            details.name = str(project.name).strip()
+            # Override allocation with the actual credits currently set on the
+            # project, which may differ from the stored AwardDetails if the
+            # request hasn't been fully approved yet.
+            if managed_project.project_template is not None:
+                try:
+                    actual_credits = utils.get_project_credits(project, silent=True)
 
-        if project.description is not None:
-            details.description = str(project.description).strip()
+                    # Determine which allocation unit to express the result in:
+                    # prefer the unit already in the stored AwardDetails, then
+                    # fall back to the first unit in the template's mapping.
+                    stored_allocation = details.allocation
+                    if stored_allocation is not None and stored_allocation.units:
+                        unit = stored_allocation.units
+                    else:
+                        units_mapping = managed_project.project_template.get_allocation_units_mapping()
+                        unit = next(iter(units_mapping), None)
 
-        if managed_project.project_template is not None:
-            details.project_template = openportal.ProjectTemplate(
-                managed_project.project_template.name,
-            )
-
-        # Eventually add in the users in their roles etc.
+                    if unit is not None:
+                        scale_factor = (
+                            managed_project.project_template.get_allocation_mapping_for(
+                                unit
+                            )
+                        )
+                        if scale_factor > 0:
+                            logger.info(
+                                f"Calculating actual allocation for project {identifier}: credits={actual_credits}, unit={unit}, scale_factor={scale_factor}"
+                            )
+                            actual_size = float(actual_credits) * scale_factor
+                            actual_allocation = (
+                                openportal.Allocation.from_size_and_units(
+                                    actual_size, unit
+                                )
+                            )
+                            if stored_allocation != actual_allocation:
+                                logger.info(
+                                    f"get_award {identifier}: allocation differs — "
+                                    f"stored={stored_allocation}, actual={actual_allocation}"
+                                )
+                            details.allocation = actual_allocation
+                except Exception as e:
+                    logger.warning(
+                        f"get_award {identifier}: failed to calculate actual allocation: {e}"
+                    )
 
         return details
 

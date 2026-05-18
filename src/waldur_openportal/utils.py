@@ -597,14 +597,15 @@ def get_project_members(project) -> dict[str, str]:
 
         members[email] = str(permission.role.name)
 
+    from django.contrib.contenttypes.models import ContentType
+
     invitations = user_models.Invitation.objects.filter(
         state=InvitationState.PENDING,
+        content_type=ContentType.objects.get_for_model(project),
+        object_id=project.pk,
     )
 
     for invite in invitations:
-        if invite.scope != project:
-            continue
-
         if invite.email is None:
             continue
 

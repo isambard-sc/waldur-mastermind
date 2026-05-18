@@ -2081,7 +2081,7 @@ class ManagedProject(ReviewMixin, models.Model):
         verbose_name = _("Managed Project")
         verbose_name_plural = _("Managed Projects")
 
-    # This is the JSON representation of the OpenPortal ProjectDetails
+    # This is the JSON representation of the OpenPortal AwardDetails
     # that is synced between this portal and the managing portal
     details = models.JSONField(
         verbose_name=_("project data"),
@@ -2471,9 +2471,7 @@ class ManagedProject(ReviewMixin, models.Model):
         try:
             openportal.ensure_config_loaded()
             dest = openportal.Destination(self.destination)
-            reverse_dest = openportal.Destination(
-                ".".join(reversed(dest.agents))
-            )
+            reverse_dest = openportal.Destination(".".join(reversed(dest.agents)))
             openportal.notify(f"{reverse_dest} {action} {self.identifier}")
         except Exception as e:
             logger.warning(
