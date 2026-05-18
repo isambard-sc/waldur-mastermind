@@ -1759,3 +1759,61 @@ def find_finished_projects():
             logger.warning(f"Failed to check if project {project} is finished: {e}")
 
     return finished_projects
+
+
+def fix_managed_project_destinations():
+    """
+    One-off data-fix: correct ManagedProject destinations that were stored with
+    the bridge agent name instead of the local portal name.
+
+    Incorrect: {remote_portal}.{bridge}.{resource}  e.g. brics.waldur.isambard-ai
+    Correct:   {local_portal}.{remote_portal}.{resource}  e.g. ukri.brics.isambard-ai
+
+    The local portal is the last component of the project identifier, e.g.
+    "myproject.ukri" → "ukri".  A destination is already correct when its first
+    component matches the local portal, and is skipped.
+    """
+    fixed = 0
+    skipped = 0
+    errors = 0
+
+    for mp in models.ManagedProject.objects.all():
+        try:
+            dest_parts = mp.destination.split(".")
+            if len(dest_parts) != 3:
+                logger.warning(
+                    f"fix_managed_project_destinations: unexpected destination "
+                    f"{mp.destination!r} for {mp} (expected 3 parts) — skipping"
+                )
+                skipped += 1
+                continue
+
+            # The portal is the last component of the identifier, e.g. "project.ukri" → "ukri"
+            local_portal = mp.identifier.rsplit(".", 1)[-1]
+
+            if local_portal in dest_parts:
+                skipped += 1
+                continue
+
+            correct_destination = f"{local_portal}.{dest_parts[0]}.{dest_parts[2]}"
+
+            logger.info(
+                f"fix_managed_project_destinations: {mp} "
+                f"{mp.destination!r} → {correct_destination!r}"
+            )
+
+            mp.destination = correct_destination
+            mp.save(update_fields=["destination"])
+            fixed += 1
+
+        except Exception as e:
+            logger.error(
+                f"fix_managed_project_destinations: error processing {mp}: {e}"
+            )
+            errors += 1
+
+    logger.info(
+        f"fix_managed_project_destinations complete: "
+        f"fixed={fixed}, skipped={skipped}, errors={errors}"
+    )
+    return fixed, skipped, errors

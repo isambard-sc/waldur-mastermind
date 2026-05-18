@@ -1185,6 +1185,26 @@ class OpenPortalBoard:
 
         return details
 
+    def refetch_award(
+        self, identifier: openportal.ProjectIdentifier
+    ) -> openportal.AwardDetails:
+        """
+        Fetch the current AwardDetails for the given project directly from the
+        remote portal.  Unlike get_award(), which assembles details from local
+        data to answer a remote query, this issues a live get_award command to
+        the remote portal and returns whatever it currently holds.
+
+        Raises openportal.OpenPortalError on failure.
+        """
+        from .remoteclient import RemoteOpenPortalClient
+
+        identifier = self._to_project_identifier(identifier)
+        client = RemoteOpenPortalClient(
+            instance_name=str(self.destination()),
+            project_template=None,
+        )
+        return client.get_award(identifier)
+
     def get_projects(
         self, portal: openportal.PortalIdentifier
     ) -> list[openportal.ProjectMapping]:

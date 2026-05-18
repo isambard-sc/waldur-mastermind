@@ -1020,6 +1020,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
         project.reject(request.user, comment)
+        project.notify_rejected()
 
         models.ManagedProjectAuditEntry.record(
             project,
@@ -1058,7 +1059,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
 
         logger.info(f"Deleting {project} by user {request.user}")
 
-        # Record audit entry BEFORE deletion so the FK is still valid
+        # Record audit entry and notify BEFORE deletion so the FK/fields are still valid
         models.ManagedProjectAuditEntry.record(
             project,
             models.ManagedProjectAuditEventType.DELETED,
@@ -1066,6 +1067,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
             note=f"Deleted by {request.user}",
         )
 
+        project.notify_removed()
         project.delete()
 
         return Response(status=status.HTTP_200_OK)
@@ -1120,6 +1122,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
                 )
 
             managed_project.set_project(project)
+            managed_project.notify_changed()
 
             logger.info(
                 f"Project {project.uuid} attached to ManagedProject {managed_project.identifier} "
@@ -1176,6 +1179,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
 
         old_project = managed_project.project
         managed_project.set_project(None)
+        managed_project.notify_changed()
 
         # We will need to approve any further changes to this managed project
         managed_project.set_needs_approval(True)
@@ -1234,6 +1238,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
             )
         )
         managed_project.set_details(details)
+        managed_project.notify_changed()
 
         logger.info(
             f"Note added to ManagedProject {managed_project.identifier} by user {request.user}"

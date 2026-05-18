@@ -298,6 +298,16 @@ class RemoteOpenPortalClient:
         project = self._to_project_identifier(project)
         return self.run(f"{self.destination()} get_users {project}")
 
+    def get_award(
+        self, project: openportal.ProjectIdentifier
+    ) -> openportal.AwardDetails:
+        """
+        Fetch the current AwardDetails for the given project from the remote portal.
+        Raises openportal.OpenPortalError on failure.
+        """
+        project = self._to_project_identifier(project)
+        return self.run(f"{self.destination()} get_award {project}")
+
     def run(self, command: str):
         """
         Run the passed command and await the result

@@ -13,7 +13,7 @@ from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.marketplace import models as marketplace_models
 
-from . import backend, models, utils
+from . import backend, models, remote_project_service, utils
 
 from . import op as openportal
 from .board import OpenPortalBoard
@@ -1527,6 +1527,8 @@ def managed_project_approved(serialized_managed_project):
         f"OpenPortal - Managed project {managed_project} approved - mapping is {result}"
     )
 
+    managed_project.notify_accepted()
+
 
 @shared_task(name="waldur_openportal.run_job")
 def run_job(serialized_job):
@@ -1569,7 +1571,9 @@ def run_job(serialized_job):
     job_model.state = models.Job.State.RUNNING
     job_model.save()
 
-    board = OpenPortalBoard(job.destination)
+    board = OpenPortalBoard(
+        job.forwarded_for if job.forwarded_for is not None else job.destination
+    )
 
     logger.info(f"Running job {job} - status {job.state}")
 
@@ -1691,6 +1695,80 @@ def run_job(serialized_job):
             )
 
 
+@shared_task(name="waldur_openportal.refresh_remote_award")
+def refresh_remote_award(destination: str, local_identifier: str):
+    """
+    Re-fetch the current AwardDetails for a RemoteProject from the remote portal
+    and update last_confirmed_details.  Always updates last_contact_time.
+    If the fetch fails, last_confirmed_details is left unchanged.
+
+    local_identifier is the award identifier on this portal, e.g. "awardtest.ukri".
+    The RemoteProject is located via destination + the local project slug, then the
+    remote identifier stored on that record is used for the actual fetch.
+    """
+    logger.info(
+        f"OpenPortal task.refresh_remote_award: destination={destination!r}, local_identifier={local_identifier!r}"
+    )
+
+    if not openportal.have_openportal():
+        return
+
+    openportal.ensure_config_loaded()
+
+    local_id = openportal.ProjectIdentifier(local_identifier)
+
+    if str(local_id.portal) != str(openportal.get_portal()):
+        logger.error(
+            f"refresh_remote_award: identifier {local_identifier!r} is for portal "
+            f"{local_id.portal!r}, expected {openportal.get_portal()!r} — ignoring"
+        )
+        return
+
+    try:
+        project = structure_models.Project.objects.get(slug=str(local_id.project))
+    except structure_models.Project.DoesNotExist:
+        logger.error(
+            f"refresh_remote_award: no Project found with slug {local_id.project!r}"
+        )
+        return
+
+    try:
+        destination: openportal.Destination = openportal.Destination(destination)
+    except Exception as e:
+        logger.error(f"refresh_remote_award: invalid destination {destination!r}: {e}")
+        return
+
+    # The destination is actually reversed, as we received this notification
+    # from the remote portal, so we need to reverse it back to find
+    # the RemoteProject
+    destination = openportal.Destination(".".join(reversed(destination.agents)))
+
+    try:
+        remote_project = models.RemoteProject.objects.get(
+            destination=str(destination), current_project=project
+        )
+    except models.RemoteProject.DoesNotExist:
+        logger.error(
+            f"refresh_remote_award: no RemoteProject found for "
+            f"destination={destination!r}, project slug={local_id.project!r}"
+        )
+        return
+
+    try:
+        board = OpenPortalBoard(destination)
+        details = board.refetch_award(local_id)
+        remote_project.last_confirmed_details = details.to_json()
+        remote_project.save(update_fields=["last_confirmed_details", "modified"])
+    except Exception as e:
+        logger.warning(
+            f"refresh_remote_award: could not refetch award "
+            f"{remote_project.identifier!r} from {destination!r} — "
+            f"last_confirmed_details unchanged: {e}"
+        )
+
+    remote_project_service.touch_last_contact(remote_project)
+
+
 def dispatch_notification(notification: openportal.Notification):
     """
     Dispatch an OpenPortal bridge notification to the appropriate handler.
@@ -1716,24 +1794,53 @@ def dispatch_notification(notification: openportal.Notification):
     handler(notification)
 
 
+def _schedule_refresh_award_if_local(notification: openportal.Notification):
+    """
+    Parse the notification's event_argument as a ProjectIdentifier, check that
+    it belongs to this portal, and if so schedule refresh_remote_award.
+    Returns early (without scheduling) if the identifier is for a different portal.
+    """
+    if not openportal.have_openportal():
+        return
+
+    openportal.ensure_config_loaded()
+
+    local_id = openportal.ProjectIdentifier(str(notification.event_argument))
+    if str(local_id.portal) != str(openportal.get_portal()):
+        logger.warning(
+            f"Ignoring notification {notification.event_type!r}: identifier "
+            f"{notification.event_argument!r} belongs to portal {local_id.portal!r}, "
+            f"not {openportal.get_portal()!r}"
+        )
+        return
+    refresh_remote_award.delay(
+        str(notification.destination), str(notification.event_argument)
+    )
+
+
 def _handle_award_added(notification: openportal.Notification):
     logger.info(f"OpenPortal notification: {notification}")
+    _schedule_refresh_award_if_local(notification)
 
 
 def _handle_award_removed(notification: openportal.Notification):
     logger.info(f"OpenPortal notification: {notification}")
+    _schedule_refresh_award_if_local(notification)
 
 
 def _handle_award_changed(notification: openportal.Notification):
     logger.info(f"OpenPortal notification: {notification}")
+    _schedule_refresh_award_if_local(notification)
 
 
 def _handle_award_accepted(notification: openportal.Notification):
     logger.info(f"OpenPortal notification: {notification}")
+    _schedule_refresh_award_if_local(notification)
 
 
 def _handle_award_rejected(notification: openportal.Notification):
     logger.info(f"OpenPortal notification: {notification}")
+    _schedule_refresh_awardre_if_local(notification)
 
 
 @shared_task(name="waldur_openportal.sync_offering_agents")

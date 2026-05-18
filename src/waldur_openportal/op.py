@@ -124,6 +124,7 @@ try:
         health,
         get,
         get_portal,
+        notify,
         run,
         send_result,
         sync_offerings,
@@ -243,6 +244,14 @@ except ImportError:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
+        @property
+        def destination(self):
+            _raise_no_openportal_error()
+
+        @property
+        def forwarded_for(self):
+            _raise_no_openportal_error()
+
     class Node:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
@@ -284,6 +293,14 @@ except ImportError:
 
     class ProjectIdentifier:
         def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+        @property
+        def project(self):
+            _raise_no_openportal_error()
+
+        @property
+        def portal(self):
             _raise_no_openportal_error()
 
     class ProjectMapping:
@@ -564,6 +581,9 @@ except ImportError:
         _raise_no_openportal_error()
 
     def sync_offerings(*args, **kwargs):
+        _raise_no_openportal_error()
+
+    def notify(*args, **kwargs):
         _raise_no_openportal_error()
 
     def run(*args, **kwargs):

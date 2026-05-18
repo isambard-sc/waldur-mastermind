@@ -2458,6 +2458,44 @@ class ManagedProject(ReviewMixin, models.Model):
         """
         return self.state == ReviewStates.APPROVED
 
+    def _notify(self, action: str):
+        """
+        Send an award notification back to the remote portal that submitted
+        this managed project.  The destination is reversed because we are
+        replying in the opposite direction along the routing path.
+
+        Failures are logged and swallowed so they never disrupt the caller.
+        """
+        if not openportal.have_openportal():
+            return
+        try:
+            openportal.ensure_config_loaded()
+            dest = openportal.Destination(self.destination)
+            reverse_dest = openportal.Destination(
+                ".".join(reversed(dest.agents))
+            )
+            openportal.notify(f"{reverse_dest} {action} {self.identifier}")
+        except Exception as e:
+            logger.warning(
+                f"Failed to send {action!r} notification for ManagedProject "
+                f"{self.identifier!r} to {self.destination!r}: {e}"
+            )
+
+    def notify_added(self):
+        self._notify("award_added")
+
+    def notify_changed(self):
+        self._notify("award_changed")
+
+    def notify_removed(self):
+        self._notify("award_removed")
+
+    def notify_accepted(self):
+        self._notify("award_accepted")
+
+    def notify_rejected(self):
+        self._notify("award_rejected")
+
     def __str__(self) -> str:
         try:
             return f"ManagedProject for {self.get_offering()} [{self.identifier} => {self.project}]"
