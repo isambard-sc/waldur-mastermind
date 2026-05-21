@@ -204,6 +204,18 @@ class RemoteProjectFilter(django_filters.FilterSet):
     )
     identifier = django_filters.CharFilter(lookup_expr="icontains")
     destination = django_filters.CharFilter(lookup_expr="icontains")
+    query = django_filters.CharFilter(method="filter_search")
+
+    def filter_search(self, queryset, name, value):
+        return queryset.filter(
+            Q(identifier__icontains=value)
+            | Q(destination__icontains=value)
+            | Q(current_project__name__icontains=value)
+            | Q(last_confirmed_details__name__icontains=value)
+            | Q(last_confirmed_details__description__icontains=value)
+            | Q(last_sent_details__name__icontains=value)
+            | Q(last_sent_details__description__icontains=value)
+        )
 
     class Meta:
         model = models.RemoteProject
