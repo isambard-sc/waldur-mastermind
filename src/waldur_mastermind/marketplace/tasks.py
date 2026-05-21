@@ -398,9 +398,17 @@ def notify_about_stale_resource():
 @shared_task(name="waldur_mastermind.marketplace.terminate_expired_resources")
 def terminate_expired_resources():
     """Terminate marketplace resources that have reached their end date."""
+    today = timezone.datetime.today().date()
+    grace_period_days = structure_models.PROJECT_GRACE_PERIOD_DAYS
     expired_resources = models.Resource.objects.filter(
-        end_date__lte=timezone.datetime.today(),
+        end_date__lte=today,
         state__in=(ResourceStates.OK, ResourceStates.ERRED),
+    ).exclude(
+        # Skip resources whose project is still within its grace period.
+        # Matches project.is_in_grace_period: end_date <= today <= end_date + grace_period_days
+        project__end_date__isnull=False,
+        project__end_date__lte=today,
+        project__end_date__gte=today - timedelta(days=grace_period_days),
     )
     logger.info(
         "About to terminate expired resources: %s",
@@ -408,7 +416,7 @@ def terminate_expired_resources():
     )
     utils.schedule_resources_termination(
         expired_resources,
-        termination_comment=f"Resource expired on {timezone.datetime.today()}",
+        termination_comment=f"Resource expired on {today}",
     )
 
 

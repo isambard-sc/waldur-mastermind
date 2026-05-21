@@ -398,6 +398,41 @@ class ResourceEndDateTest(test.APITransactionTestCase):
             self.assertTrue(order.state, OrderStates.EXECUTING)
             self.assertEqual(order.created_by, user)
 
+    def test_resource_not_terminated_when_project_in_grace_period(self):
+        # Project end_date has passed but grace period has not yet expired.
+        # The resource carries the same end_date as the project.
+        project = self.fixture.project
+        project.end_date = datetime.datetime(day=1, month=1, year=2020).date()
+        project.save()
+
+        with freeze_time("2020-01-10"):
+            # Grace period is 30 days, so 10 days in is still within grace.
+            self.assertTrue(project.is_in_grace_period)
+            tasks.terminate_expired_resources()
+            self.assertFalse(
+                models.Order.objects.filter(
+                    resource=self.resource,
+                    type=OrderTypes.TERMINATE,
+                ).exists()
+            )
+
+    def test_resource_terminated_when_project_past_grace_period(self):
+        # Project end_date has passed and the full grace period has also expired.
+        project = self.fixture.project
+        project.end_date = datetime.datetime(day=1, month=1, year=2020).date()
+        project.save()
+
+        with freeze_time("2020-02-01"):
+            # 31 days after end_date — past the 30-day grace period.
+            self.assertFalse(project.is_in_grace_period)
+            tasks.terminate_expired_resources()
+            self.assertTrue(
+                models.Order.objects.filter(
+                    resource=self.resource,
+                    type=OrderTypes.TERMINATE,
+                ).exists()
+            )
+
     def test_notification_about_resource_ending(self):
         self.fixture.manager
         self.fixture.admin
