@@ -231,37 +231,46 @@ def ensure_current_attachment(remote_project):
 
 def record_award_created(
     remote_project,
-    details_json,
-    allocation_value=None,
+    sent_details_json,
+    confirmed_details_json,
     attachment=None,
 ):
     """
     Called when add_project() succeeds on the remote portal
     (synchronous confirmation).
 
-    Creates a confirmed RemoteProjectAllocationEntry if allocation_value
-    is not None.
+    sent_details_json is what was sent to the remote.
+    confirmed_details_json is what was refetched from the remote after
+    confirmation — it may differ (e.g. remote added project_link, adjusted
+    allocation, or appended notes).
+
+    The allocation value is parsed directly from sent_details_json.
+
+    Creates a confirmed RemoteProjectAllocationEntry if an allocation is
+    present in sent_details_json.
     Sets: last_sent_details, last_confirmed_details,
           pending_details=None, pending_since=None,
           state=ACTIVE, last_contact_time=now,
-          current_allocation=allocation_value (if given).
+          current_allocation (if allocation present).
     Creates audit entry with event_type=AWARD_CREATED.
     """
     now = timezone.now()
+    allocation_value = _parse_allocation_from_details(sent_details_json)
 
     allocation_entry = None
     if allocation_value is not None:
         allocation_entry = models.RemoteProjectAllocationEntry.objects.create(
             remote_project=remote_project,
-            allocation=Decimal(str(allocation_value)),
+            allocation=allocation_value,
             previous_allocation=remote_project.current_allocation,
             attachment=attachment,
             source_project=remote_project.current_project,
             confirmed_at=now,
         )
 
-    remote_project.last_sent_details = details_json
-    remote_project.last_confirmed_details = details_json
+    if sent_details_json is not None:
+        remote_project.last_sent_details = sent_details_json
+    remote_project.last_confirmed_details = confirmed_details_json
     remote_project.pending_details = None
     remote_project.pending_since = None
     remote_project.pending_allocation = None
@@ -270,14 +279,14 @@ def record_award_created(
     remote_project.last_contact_time = now
 
     if allocation_value is not None:
-        remote_project.current_allocation = Decimal(str(allocation_value))
+        remote_project.current_allocation = allocation_value
 
     remote_project.save()
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
         remote_project=remote_project,
         event_type=models.RemoteProjectAuditEventType.AWARD_CREATED,
-        new_details=details_json,
+        new_details=confirmed_details_json,
         allocation_entry=allocation_entry,
     )
 
@@ -287,27 +296,29 @@ def record_award_created(
 def record_award_sent(
     remote_project,
     details_json,
-    allocation_value=None,
     attachment=None,
 ):
     """
     Called when update_award is about to be sent (before the network
     call).
 
+    The allocation value is parsed directly from details_json.
+
     Creates a pending RemoteProjectAllocationEntry (confirmed_at=None)
-    if allocation_value differs from current_allocation.
+    if the allocation differs from current_allocation.
     Sets: last_sent_details, pending_details, pending_since=now.
     Creates audit entry with event_type=AWARD_UPDATED.
     """
     now = timezone.now()
+    allocation_value = _parse_allocation_from_details(details_json)
 
     allocation_entry = None
     if allocation_value is not None:
         current = remote_project.current_allocation
-        if Decimal(str(allocation_value)) != current:
+        if allocation_value != current:
             allocation_entry = models.RemoteProjectAllocationEntry.objects.create(
                 remote_project=remote_project,
-                allocation=Decimal(str(allocation_value)),
+                allocation=allocation_value,
                 previous_allocation=current,
                 attachment=attachment,
                 source_project=remote_project.current_project,
@@ -318,7 +329,7 @@ def record_award_sent(
     remote_project.pending_details = details_json
     remote_project.pending_since = now
     if allocation_value is not None:
-        remote_project.pending_allocation = Decimal(str(allocation_value))
+        remote_project.pending_allocation = allocation_value
     remote_project.save()
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
@@ -334,21 +345,28 @@ def record_award_sent(
 
 def record_award_update_confirmed(
     remote_project,
-    details_json,
-    allocation_value=None,
+    sent_details_json,
+    confirmed_details_json,
     attachment=None,
 ):
     """
     Called when update_award is confirmed by the remote portal.
 
+    sent_details_json is what was sent to the remote.
+    confirmed_details_json is what was refetched from the remote after
+    confirmation — it may differ from what was sent.
+
+    The allocation value is parsed directly from sent_details_json.
+
     Finds the most recent unconfirmed RemoteProjectAllocationEntry and
     sets confirmed_at=now.  If none found, creates a new confirmed entry.
-    Sets: last_confirmed_details, pending_details=None,
+    Sets: last_sent_details, last_confirmed_details, pending_details=None,
           pending_since=None, state=ACTIVE, last_contact_time=now,
-          current_allocation (if given), pending_allocation=None.
+          current_allocation (if allocation present), pending_allocation=None.
     Creates audit entry with event_type=AWARD_UPDATE_CONFIRMED.
     """
     now = timezone.now()
+    allocation_value = _parse_allocation_from_details(sent_details_json)
 
     allocation_entry = None
     if allocation_value is not None:
@@ -368,14 +386,16 @@ def record_award_update_confirmed(
         else:
             allocation_entry = models.RemoteProjectAllocationEntry.objects.create(
                 remote_project=remote_project,
-                allocation=Decimal(str(allocation_value)),
+                allocation=allocation_value,
                 previous_allocation=remote_project.current_allocation,
                 attachment=attachment,
                 source_project=remote_project.current_project,
                 confirmed_at=now,
             )
 
-    remote_project.last_confirmed_details = details_json
+    if sent_details_json is not None:
+        remote_project.last_sent_details = sent_details_json
+    remote_project.last_confirmed_details = confirmed_details_json
     remote_project.pending_details = None
     remote_project.pending_since = None
     remote_project.state = models.RemoteProjectState.ACTIVE
@@ -384,14 +404,14 @@ def record_award_update_confirmed(
     remote_project.pending_allocation = None
 
     if allocation_value is not None:
-        remote_project.current_allocation = Decimal(str(allocation_value))
+        remote_project.current_allocation = allocation_value
 
     remote_project.save()
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
         remote_project=remote_project,
         event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATE_CONFIRMED),
-        new_details=details_json,
+        new_details=confirmed_details_json,
         allocation_entry=allocation_entry,
     )
 

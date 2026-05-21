@@ -1758,16 +1758,29 @@ def refresh_remote_award(destination: str, local_identifier: str):
     try:
         board = OpenPortalBoard(destination)
         details = board.refetch_award(local_id)
-        details_json = details.to_json()
-        remote_project.last_confirmed_details = json.loads(details_json) if details_json else None
+        confirmed_details_json = json.loads(details.to_json()) if details else None
 
-        remote_project.save(update_fields=["last_confirmed_details", "modified"])
+        if confirmed_details_json is not None:
+            if remote_project.state == models.RemoteProjectState.ACTIVE:
+                remote_project_service.record_award_update_confirmed(
+                    remote_project,
+                    None,
+                    confirmed_details_json,
+                )
+            else:
+                remote_project_service.record_award_created(
+                    remote_project,
+                    None,
+                    confirmed_details_json,
+                )
     except Exception as e:
         logger.warning(
             f"refresh_remote_award: could not refetch award "
             f"{remote_project.identifier!r} from {destination!r} — "
             f"last_confirmed_details unchanged: {e}"
         )
+        remote_project_service.touch_last_contact(remote_project)
+        return
 
     remote_project_service.touch_last_contact(remote_project)
 

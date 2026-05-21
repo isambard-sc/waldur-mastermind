@@ -481,6 +481,10 @@ class RemoteOpenPortalBackend(ServiceBackend):
             allocation.set_mapping(mapping)
             allocation.is_added = True
 
+        # Refetch confirmed state from the remote before saving the allocation.
+        # If this raises the allocation is not saved, so the next sync retries.
+        confirmed_details_json = json.loads(self.client.get_award(project).to_json())
+
         allocation.save()
         try:
             remote_identifier = (
@@ -501,14 +505,8 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 remote_project
             )
             details_json = json.loads(details.to_json())
-            allocation_value, _ = allocation._get_requested_allocation()
-            alloc = (
-                decimal.Decimal(str(allocation_value))
-                if allocation_value is not None
-                else None
-            )
             remote_project_service.record_award_created(
-                remote_project, details_json, alloc, attachment
+                remote_project, details_json, confirmed_details_json, attachment
             )
         except Exception as e:
             logger.warning(
@@ -577,7 +575,6 @@ class RemoteOpenPortalBackend(ServiceBackend):
         _remote_project = None
         _attachment = None
         _details_json = None
-        _alloc_value = None
         try:
             _remote_project = remote_project_service.get_or_create_remote_project(
                 allocation, destination, remote_identifier=remote_identifier
@@ -608,20 +605,20 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 _remote_project
             )
             _details_json = json.loads(project_details.to_json())
-            _alloc_value_raw, _ = allocation._get_requested_allocation()
-            _alloc_value = (
-                decimal.Decimal(str(_alloc_value_raw))
-                if _alloc_value_raw is not None
-                else None
-            )
             remote_project_service.record_award_sent(
-                _remote_project, _details_json, _alloc_value, _attachment
+                _remote_project, _details_json, _attachment
             )
         except Exception as e:
             logger.warning(f"Failed to record award_sent for {allocation}: {e}")
 
         try:
             mapping = self.client.update_project(project_identifier, project_details)
+            # Refetch confirmed state before marking the update as done.
+            # If this raises, successfully_updated() is not called so the
+            # allocation stays UPDATING and the next sync retries.
+            _confirmed_details_json = json.loads(
+                self.client.get_award(project_identifier).to_json()
+            )
             allocation.successfully_updated(version)
             allocation.update_mapping(mapping)
             allocation.state = CoreStates.OK
@@ -629,7 +626,10 @@ class RemoteOpenPortalBackend(ServiceBackend):
             try:
                 if _remote_project is not None:
                     remote_project_service.record_award_update_confirmed(
-                        _remote_project, _details_json, _alloc_value, _attachment
+                        _remote_project,
+                        _details_json,
+                        _confirmed_details_json,
+                        _attachment,
                     )
             except Exception as e:
                 logger.warning(f"Failed to record award_update_confirmed for {allocation}: {e}")
