@@ -3014,6 +3014,60 @@ class RemoteProject(core_models.UuidMixin, models.Model):
     def get_identifier(self) -> openportal.ProjectIdentifier:
         return openportal.ProjectIdentifier(self.identifier)
 
+    def award_details(self) -> "openportal.AwardDetails | None":
+        """
+        Compute the best current view of the award by merging last_sent_details
+        (our intent — authoritative for locally-authored fields and membership)
+        with last_confirmed_details (remote ground truth — authoritative for
+        project_link and any notes or members added by the remote portal).
+
+        Merge rules:
+        - Locally-authored fields (name, description, dates, template, key,
+          allocation, membership_control, allowed_domains): last_sent wins.
+        - Notes and breakdown: union from both, notes sorted chronologically.
+        - project_link: last_confirmed wins (remote portal owns its own URL).
+        - Members: last_sent is authoritative (our intent); members present in
+          last_confirmed but absent from last_sent are added (remote-added).
+
+        Returns None if neither snapshot is available.
+        """
+
+        def _load(field):
+            if field is None:
+                return None
+            if isinstance(field, str):
+                return openportal.AwardDetails.from_json(field)
+            return openportal.AwardDetails.from_json(json.dumps(field))
+
+        sent = _load(self.last_sent_details)
+        confirmed = _load(self.last_confirmed_details)
+
+        if sent is None and confirmed is None:
+            return None
+        if sent is None:
+            return confirmed
+        if confirmed is None:
+            return sent
+
+        # confirmed.merge(sent) → sent's locally-authored fields take
+        # precedence; notes and breakdown are unioned; members are replaced
+        # by sent's if sent has any.
+        result = confirmed.merge(sent)
+
+        # Remote portal owns its own project URL — always restore from confirmed.
+        if confirmed.project_link is not None:
+            result.project_link = confirmed.project_link
+
+        # Add any members the remote portal added that we never sent.
+        if sent.members is not None:
+            sent_members = sent.members
+            confirmed_members = confirmed.members or {}
+            for username, role in confirmed_members.items():
+                if username not in sent_members:
+                    result.add_member(username, role)
+
+        return result
+
     def get_extras(self) -> dict:
         """
         Return a dict compatible with AwardDetails JSON representing all

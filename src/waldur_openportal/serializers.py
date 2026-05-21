@@ -750,6 +750,7 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     last_sent_details = rf_serializers.SerializerMethodField()
     last_confirmed_details = rf_serializers.SerializerMethodField()
     pending_details = rf_serializers.SerializerMethodField()
+    award_details = rf_serializers.SerializerMethodField()
     notes = rf_serializers.SerializerMethodField()
     earliest_approve = rf_serializers.SerializerMethodField()
 
@@ -779,6 +780,7 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
             "last_sent_details",
             "last_confirmed_details",
             "pending_details",
+            "award_details",
             "pending_since",
             "notes",
             "earliest_approve",
@@ -829,6 +831,16 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
         return (
             obj.pending_details if self._is_privileged(obj) else None
         )
+
+    @extend_schema_field(rf_serializers.DictField(allow_null=True))
+    def get_award_details(self, obj):
+        import json
+        if not self._is_privileged(obj):
+            return None
+        details = obj.award_details()
+        if details is None:
+            return None
+        return json.loads(details.to_json())
 
     @extend_schema_field(rf_serializers.ListField(allow_null=True))
     def get_notes(self, obj):

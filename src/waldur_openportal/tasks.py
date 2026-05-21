@@ -1,3 +1,4 @@
+import json
 import logging
 import datetime
 import random
@@ -1757,7 +1758,9 @@ def refresh_remote_award(destination: str, local_identifier: str):
     try:
         board = OpenPortalBoard(destination)
         details = board.refetch_award(local_id)
-        remote_project.last_confirmed_details = details.to_json()
+        details_json = details.to_json()
+        remote_project.last_confirmed_details = json.loads(details_json) if details_json else None
+
         remote_project.save(update_fields=["last_confirmed_details", "modified"])
     except Exception as e:
         logger.warning(
