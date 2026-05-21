@@ -479,12 +479,14 @@ class RemoteOpenPortalBackend(ServiceBackend):
             logger.info(f"Created OpenPortal project {project} with mapping {mapping}")
             allocation.state = CoreStates.OK
             allocation.set_mapping(mapping)
-            allocation.is_added = True
 
         # Refetch confirmed state from the remote before saving the allocation.
         # If this raises the allocation is not saved, so the next sync retries.
         confirmed_details_json = json.loads(self.client.get_award(project).to_json())
 
+        # Save state and mapping now, but defer is_added until RemoteProject is
+        # recorded. If record_award_created fails, is_added stays False so the
+        # next sync retries.
         allocation.save()
         try:
             remote_identifier = (
@@ -508,6 +510,8 @@ class RemoteOpenPortalBackend(ServiceBackend):
             remote_project_service.record_award_created(
                 remote_project, details_json, confirmed_details_json, attachment
             )
+            allocation.is_added = True
+            allocation.save(update_fields=["is_added", "modified"])
         except Exception as e:
             logger.warning(
                 f"Failed to update RemoteProject record for {allocation}: {e}"
