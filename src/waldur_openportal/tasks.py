@@ -1952,7 +1952,10 @@ def fix_total_allocation():
         if project.is_expired:
             continue
 
-        utils.fix_total_allocation(project)
+        try:
+            utils.fix_total_allocation(project)
+        except Exception as e:
+            logger.error(f"Failed to fix total allocation for project {project}: {e}")
 
 
 @shared_task(name="waldur_openportal.mark_stale_remote_projects")

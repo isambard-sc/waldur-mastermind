@@ -371,6 +371,73 @@ def fix_total_allocation(project):
     set_project_credits(project, allocation, silent=True)
 
 
+def infer_allocation_from_accounting(
+    project, silent: bool = False
+) -> decimal.Decimal | None:
+    """
+    Derive what the remote award allocation should be, based solely on the
+    current accounting state (project credit balance + historical spend).
+
+    This is the inverse of fix_total_allocation: rather than updating the
+    accounting to match a known award, it works backwards from the accounting
+    to calculate the award value that the accounting is consistent with.
+
+    Returns the implied allocation size in the same units as the current award
+    (e.g. node-hours), or None if it cannot be determined.
+
+    Useful when you need to push a corrected allocation back to the remote
+    portal to bring the award into line with what Waldur's books reflect.
+    """
+    try:
+        managed_project = models.ManagedProject.objects.get(project=project)
+    except models.ManagedProject.DoesNotExist:
+        logger.error(f"Project {project} is not a managed project")
+        return None
+
+    project_template = managed_project.get_project_template()
+    if project_template is None:
+        logger.error(f"Managed project {project} has no project template")
+        return None
+
+    details = managed_project.get_details()
+    if details is None:
+        logger.error(f"Managed project {project} has no details")
+        return None
+
+    current_allocation = details.allocation
+    if current_allocation is None:
+        logger.error(f"Managed project {project} has no allocation in details")
+        return None
+
+    implied_credits = get_project_credits(project, silent=silent)
+
+    units = current_allocation.units
+    if units in project_template.allocation_units_mapping:
+        scale_factor = project_template.allocation_units_mapping[units]
+        if scale_factor <= 0:
+            logger.warning(
+                f"Non-positive scale factor ({scale_factor}) for units {units!r} "
+                f"on project {project}; cannot infer allocation."
+            )
+            return None
+        implied_size = decimal.Decimal(str(scale_factor)) * implied_credits
+    else:
+        logger.warning(
+            f"Units {units!r} not in allocation_units_mapping for project {project}; "
+            f"treating as 1:1 (credits == allocation units)."
+        )
+        implied_size = implied_credits
+
+    if not silent:
+        logger.info(
+            f"Implied allocation for project {project}: {implied_size} {units} "
+            f"(implied_credits={implied_credits}, scale_factor="
+            f"{project_template.allocation_units_mapping.get(units, 1)})"
+        )
+
+    return implied_size
+
+
 def get_project_spend_info(
     project,
     include_current_month: bool = True,
@@ -535,24 +602,48 @@ def set_project_credits(
                 f"Customer credit for {project.customer} increased to {customer_credit.value}"
             )
 
-    # Now set the credits
+    # Now set the credits, retrying once if the save fails due to insufficient
+    # customer credit (the allocated_to_projects field may be stale at pre-check
+    # time, causing the save to fail even after the pre-check top-up above).
     project_credit, created = invoice_models.ProjectCredit.objects.get_or_create(
         project=project,
     )
 
-    try:
-        project_credit.value = desired_credit_balance
-        project_credit.save(update_fields=["value"])
-        if not silent:
-            logger.info(
-                f"Project credits for project {project} set to {project_credit.value} (was {total_credits}, "
-                f"allocation: {credits}, spend: {total_spend}, change: {change_in_credits})"
-            )
-    except Exception as e:
-        logger.error(
-            f"Failed to set project credits for project {project} to {credits + change_in_credits}: {e}"
-        )
-        raise
+    for attempt in range(2):
+        try:
+            project_credit.value = desired_credit_balance
+            project_credit.save(update_fields=["value"])
+            if not silent:
+                logger.info(
+                    f"Project credits for project {project} set to {project_credit.value} (was {total_credits}, "
+                    f"allocation: {credits}, spend: {total_spend}, change: {change_in_credits})"
+                )
+            return
+        except Exception as e:
+            if attempt == 0:
+                logger.warning(
+                    f"Failed to set project credits for project {project} on first attempt: {e}. "
+                    f"Topping up customer credit and retrying."
+                )
+                customer_credit, _ = invoice_models.CustomerCredit.objects.get_or_create(
+                    customer=project.customer,
+                )
+                # Re-fetch from DB to get current values, avoiding stale cache
+                customer_credit.refresh_from_db()
+                remaining = customer_credit.value - customer_credit.allocated_to_projects
+                shortfall = change_in_credits - remaining + decimal.Decimal("0.1")
+                if shortfall > decimal.Decimal(0):
+                    customer_credit.value += shortfall
+                    customer_credit.save(update_fields=["value"])
+                    logger.warning(
+                        f"Customer credit for {project.customer} topped up by {shortfall} "
+                        f"to {customer_credit.value} before retry."
+                    )
+            else:
+                logger.error(
+                    f"Failed to set project credits for project {project} after retry: {e}"
+                )
+                raise
 
 
 def get_project_members(project) -> dict[str, str]:

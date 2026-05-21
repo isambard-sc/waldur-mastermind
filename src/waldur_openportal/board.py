@@ -1188,38 +1188,25 @@ class OpenPortalBoard:
                 remote_role = reverse_role_mapping.get(waldur_role_name, "unmapped")
                 details.add_member(email, remote_role)
 
-            # Override allocation with the actual credits currently set on the
-            # project, which may differ from the stored AwardDetails if the
-            # request hasn't been fully approved yet.
+            # Override allocation with the value inferred from current accounting,
+            # which may differ from the stored AwardDetails if the request hasn't
+            # been fully approved yet.
             if managed_project.project_template is not None:
                 try:
-                    actual_credits = utils.get_project_credits(project, silent=True)
+                    actual_size = utils.infer_allocation_from_accounting(
+                        project, silent=True
+                    )
+                    if actual_size is not None:
+                        stored_allocation = details.allocation
+                        if stored_allocation is not None and stored_allocation.units:
+                            unit = stored_allocation.units
+                        else:
+                            units_mapping = managed_project.project_template.get_allocation_units_mapping()
+                            unit = next(iter(units_mapping), None)
 
-                    # Determine which allocation unit to express the result in:
-                    # prefer the unit already in the stored AwardDetails, then
-                    # fall back to the first unit in the template's mapping.
-                    stored_allocation = details.allocation
-                    if stored_allocation is not None and stored_allocation.units:
-                        unit = stored_allocation.units
-                    else:
-                        units_mapping = managed_project.project_template.get_allocation_units_mapping()
-                        unit = next(iter(units_mapping), None)
-
-                    if unit is not None:
-                        scale_factor = (
-                            managed_project.project_template.get_allocation_mapping_for(
-                                unit
-                            )
-                        )
-                        if scale_factor > 0:
-                            logger.info(
-                                f"Calculating actual allocation for project {identifier}: credits={actual_credits}, unit={unit}, scale_factor={scale_factor}"
-                            )
-                            actual_size = float(actual_credits) * scale_factor
-                            actual_allocation = (
-                                openportal.Allocation.from_size_and_units(
-                                    actual_size, unit
-                                )
+                        if unit is not None:
+                            actual_allocation = openportal.Allocation.from_size_and_units(
+                                float(actual_size), unit
                             )
                             if stored_allocation != actual_allocation:
                                 logger.info(
