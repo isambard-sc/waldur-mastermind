@@ -3014,6 +3014,22 @@ class RemoteProject(core_models.UuidMixin, models.Model):
     def get_identifier(self) -> openportal.ProjectIdentifier:
         return openportal.ProjectIdentifier(self.identifier)
 
+    def _load_award_details(self, field) -> "openportal.AwardDetails | None":
+        if field is None:
+            return None
+        if isinstance(field, str):
+            return openportal.AwardDetails.from_json(field)
+        return openportal.AwardDetails.from_json(json.dumps(field))
+
+    def get_last_sent_details(self) -> "openportal.AwardDetails | None":
+        return self._load_award_details(self.last_sent_details)
+
+    def get_pending_details(self) -> "openportal.AwardDetails | None":
+        return self._load_award_details(self.pending_details)
+
+    def get_last_confirmed_details(self) -> "openportal.AwardDetails | None":
+        return self._load_award_details(self.last_confirmed_details)
+
     def award_details(self) -> "openportal.AwardDetails | None":
         """
         Compute the best current view of the award by merging last_sent_details
@@ -3032,15 +3048,8 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         Returns None if neither snapshot is available.
         """
 
-        def _load(field):
-            if field is None:
-                return None
-            if isinstance(field, str):
-                return openportal.AwardDetails.from_json(field)
-            return openportal.AwardDetails.from_json(json.dumps(field))
-
-        sent = _load(self.last_sent_details)
-        confirmed = _load(self.last_confirmed_details)
+        sent = self.get_last_sent_details()
+        confirmed = self.get_last_confirmed_details()
 
         if sent is None and confirmed is None:
             return None

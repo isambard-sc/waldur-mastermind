@@ -66,9 +66,56 @@ def check_managed_project_membership_control(scope, change_type):
             "Membership changes are not allowed for this managed project."
         )
     elif change_type == "roles" and not details.can_change_roles():
-        raise PermissionDenied(
-            "Role changes are not allowed for this managed project."
-        )
+        raise PermissionDenied("Role changes are not allowed for this managed project.")
+
+
+def is_domain_allowed_for_project(scope, email: str) -> bool:
+    """
+    Return whether a user with the given email address is permitted to join
+    scope based on the AwardDetails domain restrictions.
+
+    If scope is a Project linked to a ManagedProject, the ManagedProject's
+    AwardDetails (via get_details().is_domain_allowed) is authoritative and
+    RemoteProjects are not consulted.
+
+    If scope is a Project linked to one or more RemoteProjects (and no
+    ManagedProject), returns True if ANY of their last_sent AwardDetails
+    allows the domain.  A RemoteProject with no AwardDetails yet is treated
+    as unrestricted.
+
+    Returns True for any scope that is not a Project, or a Project with no
+    linked awards.
+    """
+    if not isinstance(scope, structure_models.Project):
+        return True
+
+    managed = models.ManagedProject.objects.filter(project=scope).first()
+    if managed is not None:
+        try:
+            return managed.get_details().is_domain_allowed(email)
+        except Exception as e:
+            logger.warning(
+                f"is_domain_allowed_for_project: ManagedProject check failed "
+                f"for {scope}: {e}"
+            )
+            return True
+
+    remote_projects = list(models.RemoteProject.objects.filter(current_project=scope))
+    if not remote_projects:
+        return True
+
+    for rp in remote_projects:
+        try:
+            details = rp.get_last_sent_details()
+            if details is None or details.is_domain_allowed(email):
+                return True
+        except Exception as e:
+            logger.warning(
+                f"is_domain_allowed_for_project: RemoteProject {rp.pk} check "
+                f"failed for {scope}: {e}"
+            )
+
+    return False
 
 
 def get_openportal_robot():
@@ -625,12 +672,16 @@ def set_project_credits(
                     f"Failed to set project credits for project {project} on first attempt: {e}. "
                     f"Topping up customer credit and retrying."
                 )
-                customer_credit, _ = invoice_models.CustomerCredit.objects.get_or_create(
-                    customer=project.customer,
+                customer_credit, _ = (
+                    invoice_models.CustomerCredit.objects.get_or_create(
+                        customer=project.customer,
+                    )
                 )
                 # Re-fetch from DB to get current values, avoiding stale cache
                 customer_credit.refresh_from_db()
-                remaining = customer_credit.value - customer_credit.allocated_to_projects
+                remaining = (
+                    customer_credit.value - customer_credit.allocated_to_projects
+                )
                 shortfall = change_in_credits - remaining + decimal.Decimal("0.1")
                 if shortfall > decimal.Decimal(0):
                     customer_credit.value += shortfall
