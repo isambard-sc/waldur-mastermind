@@ -288,7 +288,7 @@ class UserRoleMixin:
         role = serializer.validated_data["role"]
 
         if Feature.objects.filter(
-            key="openportal.enforce_allowed_domains", value=True
+            key="project.enforce_allowed_domains", value=True
         ).exists():
             from waldur_openportal.utils import (
                 assert_domain_allowed_for_project,
@@ -321,7 +321,7 @@ class UserRoleMixin:
         scope = self.get_object()
         validate_scope_not_soft_deleted(scope)
         if Feature.objects.filter(
-            key="openportal.enforce_allowed_domains", value=True
+            key="project.enforce_allowed_domains", value=True
         ).exists():
             from waldur_openportal.utils import check_managed_project_membership_control
 
@@ -356,7 +356,7 @@ class UserRoleMixin:
         scope = self.get_object()
         validate_scope_not_soft_deleted(scope)
         if Feature.objects.filter(
-            key="openportal.enforce_allowed_domains", value=True
+            key="project.enforce_allowed_domains", value=True
         ).exists():
             from waldur_openportal.utils import check_managed_project_membership_control
 

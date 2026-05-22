@@ -88,6 +88,11 @@ class ProjectSection(FeatureSection):
 
     show_kind_in_create_dialog = Feature("Show kind field in project create dialog.")
 
+    enforce_allowed_domains = Feature(
+        "Enforce allowed-domain restrictions from OpenPortal AwardDetails when "
+        "adding or inviting users to a project."
+    )
+
 
 class UserSection(FeatureSection):
     class Meta:

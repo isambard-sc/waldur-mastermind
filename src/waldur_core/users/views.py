@@ -45,7 +45,7 @@ class InvitationViewSet(ProtectedViewSet):
             raise PermissionDenied()
 
         if Feature.objects.filter(
-            key="openportal.enforce_allowed_domains", value=True
+            key="project.enforce_allowed_domains", value=True
         ).exists():
             from waldur_openportal.utils import (
                 assert_domain_allowed_for_project,
@@ -218,7 +218,7 @@ class InvitationViewSet(ProtectedViewSet):
                 raise ValidationError(_("User already has role within another scope."))
 
         if Feature.objects.filter(
-            key="openportal.enforce_allowed_domains", value=True
+            key="project.enforce_allowed_domains", value=True
         ).exists():
             from waldur_openportal.utils import (
                 assert_domain_allowed_for_project,

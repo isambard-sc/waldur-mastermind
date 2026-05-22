@@ -123,7 +123,7 @@ def assert_domain_allowed_for_project(scope, email: str) -> None:
     Raise PermissionDenied if the given email address is not permitted to join
     scope based on the AwardDetails domain restrictions.
 
-    Only call this when the openportal.enforce_allowed_domains feature flag is
+    Only call this when the project.enforce_allowed_domains feature flag is
     enabled — this function does not check the flag itself.
     """
     from rest_framework.exceptions import PermissionDenied
