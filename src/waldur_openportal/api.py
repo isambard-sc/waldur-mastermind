@@ -1823,3 +1823,80 @@ def user_mapping(request):
             result.update(resolved)
 
     return JsonResponse(result)
+
+
+def _get_project_allowed_domains(project):
+    """
+    Return the unified allowed_domains list for a project from its AwardDetails.
+
+    None  — no restriction (all emails permitted)
+    []    — nothing allowed
+    [...]  — restricted to the listed domain globs and/or specific addresses
+    """
+    managed = models.ManagedProject.objects.filter(project=project).first()
+    if managed is not None:
+        try:
+            return managed.get_details().allowed_domains
+        except Exception as e:
+            logger.warning(
+                f"_get_project_allowed_domains: ManagedProject check failed "
+                f"for {project}: {e}"
+            )
+            return None
+
+    remote_projects = list(
+        models.RemoteProject.objects.filter(current_project=project)
+    )
+    if not remote_projects:
+        return None
+
+    union = set()
+    for rp in remote_projects:
+        try:
+            details = rp.get_last_sent_details()
+            if details is None or details.allowed_domains is None:
+                return None  # any unrestricted RemoteProject → overall unrestricted
+            union.update(details.allowed_domains)
+        except Exception as e:
+            logger.warning(
+                f"_get_project_allowed_domains: RemoteProject {rp.pk} check "
+                f"failed for {project}: {e}"
+            )
+            return None  # fail open
+
+    return sorted(union)
+
+
+@api_view(["GET"])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def project_email_policy(request, project_uuid):
+    """
+    Return the allowed_domains list for a project derived from its AwardDetails.
+
+    Accessible to: staff, support, any member of the project, or any user
+    with a role in the customer that owns the project.
+
+    Response: {"allowed_domains": null | [] | ["*.ac.uk", "chris@example.com", ...]}
+
+    null  — no restriction (all emails permitted)
+    []    — nothing allowed
+    list  — permitted domain globs and/or specific email addresses
+    """
+    from waldur_core.permissions.utils import has_user as perm_has_user
+
+    try:
+        project = structure_models.Project.objects.get(uuid=project_uuid)
+    except structure_models.Project.DoesNotExist:
+        return JsonResponse({"detail": "Not found."}, status=404)
+
+    user = request.user
+    if not (
+        user.is_staff
+        or getattr(user, "is_support", False)
+        or perm_has_user(project.customer, user)
+        or perm_has_user(project, user)
+    ):
+        return JsonResponse({"detail": "Access denied."}, status=403)
+
+    return JsonResponse({"allowed_domains": _get_project_allowed_domains(project)})

@@ -3,6 +3,7 @@ from django.urls import re_path
 from . import views
 from .api import (
     access_for_email,
+    project_email_policy,
     project_spend_info,
     customer_spend_info,
     fetch_job,
@@ -153,6 +154,11 @@ urlpatterns = [
         r"^api/openportal/user_mapping/",
         user_mapping,
         name="user-mapping",
+    ),
+    re_path(
+        r"^api/openportal/project_email_policy/(?P<project_uuid>[0-9a-f-]+)/$",
+        project_email_policy,
+        name="project-email-policy",
     ),
     # Custom routes for ManagedProject with composite lookup
     re_path(

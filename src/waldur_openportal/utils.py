@@ -69,18 +69,18 @@ def check_managed_project_membership_control(scope, change_type):
         raise PermissionDenied("Role changes are not allowed for this managed project.")
 
 
-def is_domain_allowed_for_project(scope, email: str) -> bool:
+def is_email_allowed_for_project(scope, email: str) -> bool:
     """
     Return whether a user with the given email address is permitted to join
-    scope based on the AwardDetails domain restrictions.
+    scope based on the AwardDetails email/domain restrictions.
 
     If scope is a Project linked to a ManagedProject, the ManagedProject's
-    AwardDetails (via get_details().is_domain_allowed) is authoritative and
+    AwardDetails (via get_details().is_email_allowed) is authoritative and
     RemoteProjects are not consulted.
 
     If scope is a Project linked to one or more RemoteProjects (and no
     ManagedProject), returns True if ANY of their last_sent AwardDetails
-    allows the domain.  A RemoteProject with no AwardDetails yet is treated
+    allows the email.  A RemoteProject with no AwardDetails yet is treated
     as unrestricted.
 
     Returns True for any scope that is not a Project, or a Project with no
@@ -92,10 +92,10 @@ def is_domain_allowed_for_project(scope, email: str) -> bool:
     managed = models.ManagedProject.objects.filter(project=scope).first()
     if managed is not None:
         try:
-            return managed.get_details().is_domain_allowed(email)
+            return managed.get_details().is_email_allowed(email)
         except Exception as e:
             logger.warning(
-                f"is_domain_allowed_for_project: ManagedProject check failed "
+                f"is_email_allowed_for_project: ManagedProject check failed "
                 f"for {scope}: {e}"
             )
             return True
@@ -107,18 +107,18 @@ def is_domain_allowed_for_project(scope, email: str) -> bool:
     for rp in remote_projects:
         try:
             details = rp.get_last_sent_details()
-            if details is None or details.is_domain_allowed(email):
+            if details is None or details.is_email_allowed(email):
                 return True
         except Exception as e:
             logger.warning(
-                f"is_domain_allowed_for_project: RemoteProject {rp.pk} check "
+                f"is_email_allowed_for_project: RemoteProject {rp.pk} check "
                 f"failed for {scope}: {e}"
             )
 
     return False
 
 
-def assert_domain_allowed_for_project(scope, email: str) -> None:
+def assert_email_allowed_for_project(scope, email: str) -> None:
     """
     Raise PermissionDenied if the given email address is not permitted to join
     scope based on the AwardDetails domain restrictions.
@@ -128,7 +128,7 @@ def assert_domain_allowed_for_project(scope, email: str) -> None:
     """
     from rest_framework.exceptions import PermissionDenied
 
-    if not is_domain_allowed_for_project(scope, email):
+    if not is_email_allowed_for_project(scope, email):
         raise PermissionDenied(
             "Users with this email domain are not permitted to join this project."
         )

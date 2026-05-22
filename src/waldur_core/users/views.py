@@ -48,11 +48,11 @@ class InvitationViewSet(ProtectedViewSet):
             key="project.enforce_allowed_domains", value=True
         ).exists():
             from waldur_openportal.utils import (
-                assert_domain_allowed_for_project,
+                assert_email_allowed_for_project,
                 check_managed_project_membership_control,
             )
             check_managed_project_membership_control(scope, "membership")
-            assert_domain_allowed_for_project(
+            assert_email_allowed_for_project(
                 scope, serializer.validated_data["email"]
             )
 
@@ -221,11 +221,11 @@ class InvitationViewSet(ProtectedViewSet):
             key="project.enforce_allowed_domains", value=True
         ).exists():
             from waldur_openportal.utils import (
-                assert_domain_allowed_for_project,
+                assert_email_allowed_for_project,
                 check_managed_project_membership_control,
             )
             check_managed_project_membership_control(invitation.scope, "membership")
-            assert_domain_allowed_for_project(invitation.scope, request.user.email)
+            assert_email_allowed_for_project(invitation.scope, request.user.email)
 
         invitation.accept(request.user)
 

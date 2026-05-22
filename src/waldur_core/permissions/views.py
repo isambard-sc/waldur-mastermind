@@ -291,12 +291,12 @@ class UserRoleMixin:
             key="project.enforce_allowed_domains", value=True
         ).exists():
             from waldur_openportal.utils import (
-                assert_domain_allowed_for_project,
+                assert_email_allowed_for_project,
                 check_managed_project_membership_control,
             )
 
             check_managed_project_membership_control(scope, "membership")
-            assert_domain_allowed_for_project(scope, target_user.email)
+            assert_email_allowed_for_project(scope, target_user.email)
 
         expiration_time = serializer.validated_data.get("expiration_time")
 
