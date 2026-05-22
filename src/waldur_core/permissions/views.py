@@ -18,7 +18,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.viewsets import ReadOnlyModelViewSet
 
-from waldur_core.core.models import User
+from waldur_core.core.models import Feature, User
 from waldur_core.core.permissions import IsAdminOrReadOnly
 from waldur_core.core.utils import get_ip_address, is_uuid_like
 from waldur_core.core.views import ActionsViewSet
@@ -278,11 +278,6 @@ class UserRoleMixin:
     def add_user(self, request, uuid=None):
         scope = self.get_object()
         validate_scope_not_soft_deleted(scope)
-        try:
-            from waldur_openportal.utils import check_managed_project_membership_control
-            check_managed_project_membership_control(scope, "membership")
-        except ImportError:
-            pass
 
         serializer = serializers.UserRoleCreateSerializer(
             data=request.data, context={"scope": scope, "request": request}
@@ -291,6 +286,18 @@ class UserRoleMixin:
 
         target_user = serializer.validated_data["user"]
         role = serializer.validated_data["role"]
+
+        if Feature.objects.filter(
+            key="openportal.enforce_allowed_domains", value=True
+        ).exists():
+            from waldur_openportal.utils import (
+                assert_domain_allowed_for_project,
+                check_managed_project_membership_control,
+            )
+
+            check_managed_project_membership_control(scope, "membership")
+            assert_domain_allowed_for_project(scope, target_user.email)
+
         expiration_time = serializer.validated_data.get("expiration_time")
 
         perm = add_user(
@@ -313,11 +320,12 @@ class UserRoleMixin:
     def update_user(self, request, uuid=None):
         scope = self.get_object()
         validate_scope_not_soft_deleted(scope)
-        try:
+        if Feature.objects.filter(
+            key="openportal.enforce_allowed_domains", value=True
+        ).exists():
             from waldur_openportal.utils import check_managed_project_membership_control
+
             check_managed_project_membership_control(scope, "roles")
-        except ImportError:
-            pass
 
         serializer = serializers.UserRoleUpdateSerializer(
             data=request.data, context={"scope": scope, "request": request}
@@ -347,11 +355,12 @@ class UserRoleMixin:
     def delete_user(self, request, uuid=None):
         scope = self.get_object()
         validate_scope_not_soft_deleted(scope)
-        try:
+        if Feature.objects.filter(
+            key="openportal.enforce_allowed_domains", value=True
+        ).exists():
             from waldur_openportal.utils import check_managed_project_membership_control
+
             check_managed_project_membership_control(scope, "membership")
-        except ImportError:
-            pass
 
         serializer = serializers.UserRoleDeleteSerializer(
             data=request.data, context={"scope": scope, "request": request}

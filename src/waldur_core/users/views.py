@@ -14,6 +14,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from waldur_core.core import serializers as core_serializers
+from waldur_core.core.models import Feature
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.views import ProtectedViewSet, ReadOnlyActionsViewSet
@@ -42,11 +43,18 @@ class InvitationViewSet(ProtectedViewSet):
         scope = serializer.validated_data["scope"]
         if not can_manage_invitation_with(self.request, scope):
             raise PermissionDenied()
-        try:
-            from waldur_openportal.utils import check_managed_project_membership_control
+
+        if Feature.objects.filter(
+            key="openportal.enforce_allowed_domains", value=True
+        ).exists():
+            from waldur_openportal.utils import (
+                assert_domain_allowed_for_project,
+                check_managed_project_membership_control,
+            )
             check_managed_project_membership_control(scope, "membership")
-        except ImportError:
-            pass
+            assert_domain_allowed_for_project(
+                scope, serializer.validated_data["email"]
+            )
 
         invitation: models.Invitation = serializer.save()
         if isinstance(invitation.scope, Project):
@@ -209,11 +217,15 @@ class InvitationViewSet(ProtectedViewSet):
             if UserRole.objects.filter(user=request.user, is_active=True).exists():
                 raise ValidationError(_("User already has role within another scope."))
 
-        try:
-            from waldur_openportal.utils import check_managed_project_membership_control
+        if Feature.objects.filter(
+            key="openportal.enforce_allowed_domains", value=True
+        ).exists():
+            from waldur_openportal.utils import (
+                assert_domain_allowed_for_project,
+                check_managed_project_membership_control,
+            )
             check_managed_project_membership_control(invitation.scope, "membership")
-        except ImportError:
-            pass
+            assert_domain_allowed_for_project(invitation.scope, request.user.email)
 
         invitation.accept(request.user)
 
