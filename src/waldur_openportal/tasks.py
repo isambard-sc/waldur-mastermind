@@ -1510,7 +1510,7 @@ def managed_project_approved(serialized_managed_project):
             f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(managed_project)}"
         )
 
-    if not managed_project.is_approved:
+    if not managed_project.is_approved():
         logger.error(
             f"OpenPortal - ManagedProject {managed_project} is not approved - cannot call handler!"
         )
@@ -1522,7 +1522,7 @@ def managed_project_approved(serialized_managed_project):
     identifier = managed_project.get_remote_identifier()
     details = managed_project.get_details()
 
-    result = update_project(board, identifier, details, force_approve=True)
+    result = update_award(board, identifier, details, force_approve=True)
 
     logger.info(
         f"OpenPortal - Managed project {managed_project} approved - mapping is {result}"
