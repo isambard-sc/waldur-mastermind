@@ -607,8 +607,23 @@ class RemoteOpenPortalBackend(ServiceBackend):
             )
             allocation.successfully_updated(version)
             allocation.update_mapping(mapping)
-            allocation.state = CoreStates.OK
-            allocation.save()
+            # update_project succeeded without exception — the remote portal
+            # accepted immediately, so transition RemoteProject to ACTIVE now
+            # rather than waiting for the async award_accepted notification.
+            if _remote_project is not None:
+                try:
+                    remote_project_service.record_award_update_confirmed(
+                        _remote_project, _details_json, _confirmed_details_json
+                    )
+                except Exception as rp_e:
+                    logger.warning(
+                        f"Failed to record award_update_confirmed for {allocation}: {rp_e}"
+                    )
+                    allocation.state = CoreStates.OK
+                    allocation.save(update_fields=["state", "modified"])
+            else:
+                allocation.state = CoreStates.OK
+                allocation.save(update_fields=["state", "modified"])
         except openportal.ManagedProjectRejectedError as e:
             logger.warning(
                 f"OpenPortal project {project_identifier} is rejected: {e}. "
