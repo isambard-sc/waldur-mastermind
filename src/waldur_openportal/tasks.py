@@ -1762,7 +1762,15 @@ def refresh_remote_award(destination: str, local_identifier: str):
 
         if confirmed_details_json is not None:
             remote_project.last_confirmed_details = confirmed_details_json
-            remote_project.save(update_fields=["last_confirmed_details", "modified"])
+            remote_project_service.reconcile_allocation(remote_project)
+            remote_project.save(
+                update_fields=[
+                    "last_confirmed_details",
+                    "current_allocation",
+                    "pending_allocation",
+                    "modified",
+                ]
+            )
     except Exception as e:
         logger.warning(
             f"refresh_remote_award: could not refetch award "

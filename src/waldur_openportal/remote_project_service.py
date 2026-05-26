@@ -25,6 +25,47 @@ def _parse_allocation_from_details(details_json):
     return Decimal(m.group(1)) if m else None
 
 
+def reconcile_allocation(remote_project):
+    """
+    Derive current_allocation and pending_allocation from the details
+    we already hold, rather than tracking them through each code path.
+
+    Logic:
+      sent      = allocation parsed from last_sent_details
+      confirmed = allocation parsed from last_confirmed_details
+
+      sent != confirmed (and both present) → change in flight:
+          current_allocation  = confirmed  (what remote portal has)
+          pending_allocation  = sent       (what we asked for)
+
+      sent == confirmed, or only one present → no pending change:
+          current_allocation  = confirmed or sent (whichever is available)
+          pending_allocation  = None
+
+    This self-corrects even if a notification is missed: the next time
+    any detail is updated the fields converge to the right values.
+
+    Does NOT call save() — caller is responsible for persisting.
+    """
+    sent = _parse_allocation_from_details(remote_project.last_sent_details)
+    confirmed = _parse_allocation_from_details(remote_project.last_confirmed_details)
+
+    if sent is not None and confirmed is not None:
+        if sent != confirmed:
+            remote_project.current_allocation = confirmed
+            remote_project.pending_allocation = sent
+        else:
+            remote_project.current_allocation = confirmed
+            remote_project.pending_allocation = None
+    elif confirmed is not None:
+        remote_project.current_allocation = confirmed
+        remote_project.pending_allocation = None
+    elif sent is not None:
+        remote_project.current_allocation = sent
+        remote_project.pending_allocation = None
+    # else: no allocation data at all — leave fields unchanged
+
+
 def get_or_create_remote_project(allocation, destination: str, remote_identifier=None):
     """
     Get or create a RemoteProject for this allocation.
@@ -277,7 +318,10 @@ def record_award_created(
             )
 
         now = timezone.now()
-        allocation_value = _parse_allocation_from_details(sent_details_json)
+        allocation_value = (
+            _parse_allocation_from_details(sent_details_json)
+            or _parse_allocation_from_details(confirmed_details_json)
+        )
 
         allocation_entry = None
         if allocation_value is not None:
@@ -295,13 +339,10 @@ def record_award_created(
         remote_project.last_confirmed_details = confirmed_details_json
         remote_project.pending_details = None
         remote_project.pending_since = None
-        remote_project.pending_allocation = None
         remote_project.state = models.RemoteProjectState.ACTIVE
         remote_project.error_message = ""
         remote_project.last_contact_time = now
-
-        if allocation_value is not None:
-            remote_project.current_allocation = allocation_value
+        reconcile_allocation(remote_project)
 
         remote_project.save()
 
@@ -357,8 +398,7 @@ def record_award_sent(
     remote_project.pending_details = details_json
     remote_project.pending_since = now
     remote_project.state = models.RemoteProjectState.PENDING
-    if allocation_value is not None:
-        remote_project.pending_allocation = allocation_value
+    reconcile_allocation(remote_project)
     remote_project.save()
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
@@ -406,7 +446,10 @@ def record_award_update_confirmed(
             )
 
         now = timezone.now()
-        allocation_value = _parse_allocation_from_details(sent_details_json)
+        allocation_value = (
+            _parse_allocation_from_details(sent_details_json)
+            or _parse_allocation_from_details(confirmed_details_json)
+        )
 
         allocation_entry = None
         if allocation_value is not None:
@@ -423,7 +466,7 @@ def record_award_update_confirmed(
                 unconfirmed.confirmed_at = now
                 unconfirmed.save()
                 allocation_entry = unconfirmed
-            else:
+            elif allocation_value != remote_project.current_allocation:
                 allocation_entry = models.RemoteProjectAllocationEntry.objects.create(
                     remote_project=remote_project,
                     allocation=allocation_value,
@@ -441,10 +484,7 @@ def record_award_update_confirmed(
         remote_project.state = models.RemoteProjectState.ACTIVE
         remote_project.error_message = ""
         remote_project.last_contact_time = now
-        remote_project.pending_allocation = None
-
-        if allocation_value is not None:
-            remote_project.current_allocation = allocation_value
+        reconcile_allocation(remote_project)
 
         remote_project.save()
 
