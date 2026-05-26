@@ -89,12 +89,12 @@ def run_once_task(takeover_timeout, include_args=False):
                             )
                             return True
                         else:
-                            logger.info(
+                            logger.debug(
                                 f"OpenPortal task {lock_id} already running - skipping"
                             )
                             return False
                     else:
-                        logger.info(
+                        logger.debug(
                             f"OpenPortal task {lock_id} already running - skipping"
                         )
                         return False
@@ -188,7 +188,7 @@ def add_allocated_project(serialized_allocation):
         allocation = core_utils.deserialize_instance(serialized_allocation)
 
         if not isinstance(allocation, models.Allocation):
-            logger.info(
+            logger.debug(
                 f"Skipping allocation {allocation} - not an openportal.Allocation instance"
             )
             return
@@ -211,7 +211,7 @@ def update_user(serialized_user):
         user = core_utils.deserialize_instance(serialized_user)
 
         if not isinstance(user, User):
-            logger.info(f"Skipping user {user} - not a User instance")
+            logger.debug(f"Skipping user {user} - not a User instance")
             return
 
     for allocation in utils.get_project_allocations(user):
@@ -260,7 +260,7 @@ def delete_user(serialized_user):
         user = core_utils.deserialize_instance(serialized_user)
 
         if not isinstance(user, User):
-            logger.info(f"Skipping user {user} - not a User instance")
+            logger.debug(f"Skipping user {user} - not a User instance")
             return
 
     if not isinstance(user, User):
@@ -311,7 +311,7 @@ def sync_allocation_usage(serialized_allocation):
         allocation = core_utils.deserialize_instance(serialized_allocation)
 
         if not isinstance(allocation, models.Allocation):
-            logger.info(
+            logger.debug(
                 f"Skipping allocation {allocation} - not an Allocation instance"
             )
             return
@@ -335,7 +335,7 @@ def sync_remote_allocation_usage(serialized_allocation):
         allocation = core_utils.deserialize_instance(serialized_allocation)
 
         if not isinstance(allocation, models.RemoteAllocation):
-            logger.info(
+            logger.debug(
                 f"Skipping allocation {allocation} - not a RemoteAllocation instance"
             )
             return
@@ -372,7 +372,7 @@ def sync_remote_allocation_users(serialized_allocation):
         allocation = core_utils.deserialize_instance(serialized_allocation)
 
         if not isinstance(allocation, models.RemoteAllocation):
-            logger.info(
+            logger.debug(
                 f"Skipping allocation {allocation} - not a RemoteAllocation instance"
             )
             return
@@ -398,7 +398,7 @@ def sync_allocation_users(serialized_allocation):
         allocation = core_utils.deserialize_instance(serialized_allocation)
 
         if not isinstance(allocation, models.Allocation):
-            logger.info(
+            logger.debug(
                 f"Skipping allocation {allocation} - not an Allocation instance"
             )
             return
@@ -533,7 +533,7 @@ def sync_allocation_storage(serialized_allocation):
         allocation = core_utils.deserialize_instance(serialized_allocation)
 
         if not isinstance(allocation, models.Allocation):
-            logger.info(
+            logger.debug(
                 f"Skipping allocation {allocation} - not an Allocation instance"
             )
             return
@@ -579,7 +579,7 @@ def sync_remote_allocation_storage(serialized_allocation):
         allocation = core_utils.deserialize_instance(serialized_allocation)
 
         if not isinstance(allocation, models.RemoteAllocation):
-            logger.info(
+            logger.debug(
                 f"Skipping allocation {allocation} - not a RemoteAllocation instance"
             )
             return
@@ -659,13 +659,13 @@ def sync_allocation_limits():
 
             # For projects in grace period or past grace period, set limits to zero
             if project.is_in_grace_period:
-                logger.info(
+                logger.debug(
                     f"Project {project} is in grace period (until {project.end_date_with_grace}) - setting limits to zero"
                 )
                 credits_available = 0
             elif project.is_expired:
                 # Project is expired and past grace period
-                logger.info(
+                logger.debug(
                     f"Project {project} is expired (past grace period) - setting limits to zero"
                 )
                 credits_available = 0
@@ -698,7 +698,7 @@ def sync_allocation_limits():
                 for allocation in allocations:
                     total_spend += float(allocation.node_usage)
 
-                logger.info(
+                logger.debug(
                     f"Total spend for {project} is {total_spend} hours - {credits_available} available"
                 )
 
@@ -788,7 +788,7 @@ def sync_remote():
 
             # Skip removed projects or projects past grace period
             if project.is_removed:
-                logger.info(
+                logger.debug(
                     f"Remote allocation {remote_allocation} is for a removed project - deleting"
                 )
                 try:
@@ -801,7 +801,7 @@ def sync_remote():
 
             # Delete allocations for projects past grace period (fully expired)
             if project.is_expired and not project.is_in_grace_period:
-                logger.info(
+                logger.debug(
                     f"Remote allocation {remote_allocation} is for a project past grace period - deleting"
                 )
                 try:
@@ -838,7 +838,7 @@ def sync_remote():
                 )
                 backend.add_allocated_project(remote_allocation)
             elif remote_allocation.needs_updating():
-                logger.info(
+                logger.debug(
                     f"Remote allocation {remote_allocation} needs updating ({remote_allocation.local_version} vs {remote_allocation.remote_version}) - updating"
                 )
                 backend.update_allocated_project(remote_allocation, force_update=False)
@@ -938,7 +938,7 @@ def sync_project(serialized_project):
         project = core_utils.deserialize_instance(serialized_project)
 
         if not isinstance(project, structure_models.Project):
-            logger.info(f"Skipping project {project} - not a Project instance")
+            logger.debug(f"Skipping project {project} - not a Project instance")
             return
 
     now = datetime.datetime.now()
@@ -1082,7 +1082,7 @@ def send_notifications():
         # notification to avoid overwhelming the mail server
         for user in project.get_users():
             try:
-                logger.info(f"Sending notification to {user} in {project}")
+                logger.debug(f"Sending notification to {user} in {project}")
                 logger.debug(f"Notification subject: {notification_subject}")
                 logger.debug(f"Notification body: {notification_body}")
 
@@ -1191,7 +1191,7 @@ def update_remote_project(serialized_project):
         project = core_utils.deserialize_instance(serialized_project)
 
         if not isinstance(project, structure_models.Project):
-            logger.info(f"Skipping project {project} - not a Project instance")
+            logger.debug(f"Skipping project {project} - not a Project instance")
             return
 
     # find the remote allocations for this project
@@ -1203,7 +1203,7 @@ def update_remote_project(serialized_project):
         try:
             backend = remote_allocation.get_backend()
 
-            logger.info(f"Updating remote project {remote_allocation}")
+            logger.debug(f"Updating remote project {remote_allocation}")
 
             backend.update_allocated_project(remote_allocation)
         except Exception as e:
@@ -1225,7 +1225,7 @@ def delete_remote_project(serialized_project):
         project = core_utils.deserialize_instance(serialized_project)
 
         if not isinstance(project, structure_models.Project):
-            logger.info(f"Skipping project {project} - not a Project instance")
+            logger.debug(f"Skipping project {project} - not a Project instance")
             return
 
     # find the remote allocations for this project
@@ -1237,7 +1237,7 @@ def delete_remote_project(serialized_project):
         try:
             backend = remote_allocation.get_backend()
 
-            logger.info(f"Deleting remote project {remote_allocation}")
+            logger.debug(f"Deleting remote project {remote_allocation}")
 
             backend.delete_allocation(remote_allocation)
         except Exception as e:
@@ -1278,7 +1278,7 @@ def create_default_resources(serialized_managed_project):
         )
 
     if project.is_removed:
-        logger.info(
+        logger.debug(
             f"OpenPortal - ManagedProject {managed_project} is for a removed project"
         )
         raise ValueError(
@@ -1287,7 +1287,7 @@ def create_default_resources(serialized_managed_project):
 
     # Prevent creating resources for projects past grace period
     if project.is_expired and not project.is_in_grace_period:
-        logger.info(
+        logger.debug(
             f"OpenPortal - ManagedProject {managed_project} is for a project past grace period"
         )
         raise ValueError(
@@ -1315,7 +1315,7 @@ def create_default_resources(serialized_managed_project):
                 # that the resource is either running, or has been removed in the
                 # remote portal. DO NOT RECREATE IT.
                 have_existing = True
-                logger.info(
+                logger.debug(
                     f"OpenPortal - Found existing resource {existing_resource} for {offering} in {project}"
                 )
                 resource = existing_resource
@@ -1333,7 +1333,7 @@ def create_default_resources(serialized_managed_project):
                     break
 
         if have_existing:
-            logger.info(
+            logger.debug(
                 f"OpenPortal - Skipping creation of {offering} for {project} - already exists"
             )
 
@@ -1422,7 +1422,7 @@ def create_default_resources(serialized_managed_project):
             ):
                 if existing_resource.state == marketplace_models.Resource.States.ERRED:
                     # remove previously failed resource creation attempts
-                    logger.info(
+                    logger.debug(
                         f"OpenPortal - Removing previously failed resource {existing_resource} for {offering} in {project}"
                     )
                     existing_resource.delete()
@@ -1552,7 +1552,7 @@ def run_job(serialized_job):
     job_model = job
 
     if job_model.state != models.Job.State.PENDING:
-        logger.info(f"OpenPortal - Job {job.job_id} is not pending - skipping")
+        logger.debug(f"OpenPortal - Job {job.job_id} is not pending - skipping")
         return
 
     try:
@@ -1566,7 +1566,7 @@ def run_job(serialized_job):
         return
 
     if job.state != openportal.Status.pending():
-        logger.info(f"OpenPortal - Job {job.id} is not pending - skipping")
+        logger.debug(f"OpenPortal - Job {job_model.job_id} is not pending - skipping")
         return
 
     job_model.state = models.Job.State.RUNNING
@@ -1985,17 +1985,17 @@ def accept_remote_award(destination: str, local_identifier: str):
 
 
 def _handle_award_added(notification: openportal.Notification):
-    logger.info(f"OpenPortal notification: {notification}")
+    logger.debug(f"OpenPortal notification: {notification}")
     _schedule_refresh_award_if_local(notification)
 
 
 def _handle_award_removed(notification: openportal.Notification):
-    logger.info(f"OpenPortal notification: {notification}")
+    logger.debug(f"OpenPortal notification: {notification}")
     _schedule_refresh_award_if_local(notification)
 
 
 def _handle_award_changed(notification: openportal.Notification):
-    logger.info(f"OpenPortal notification: {notification}")
+    logger.debug(f"OpenPortal notification: {notification}")
     _schedule_refresh_award_if_local(notification)
 
 
@@ -2063,7 +2063,7 @@ def sync_board():
     for job in jobs:
         try:
             if job.state != openportal.Status.PENDING:
-                logger.info(f"Job {job.id} is not pending - skipping")
+                logger.debug(f"Job {job.id} is not pending - skipping")
                 continue
 
             logger.info(f"Processing job {job} from OpenPortal board")

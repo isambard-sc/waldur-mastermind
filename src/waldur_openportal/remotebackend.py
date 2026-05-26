@@ -65,7 +65,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
             state=CoreStates.OK, is_added=True
         ):
             if openportal_tasks.is_task_running(openportal_tasks.sync):
-                logger.info(
+                logger.debug(
                     "Task sync is already running - skipping allocation %s",
                     allocation,
                 )
@@ -141,7 +141,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
             try:
                 if not association.user_is_in_remote():
-                    logger.info(f"Adding user {user} to OpenPortal Remote Project")
+                    logger.debug(f"Adding user {user} to OpenPortal Remote Project")
 
                     self.client.add_user(
                         project=project, user=user, role=association.role
@@ -459,7 +459,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
                     )
                 return allocation
 
-            logger.info(f"Created OpenPortal project {project} with mapping {mapping}")
+            logger.debug(f"Created OpenPortal project {project} with mapping {mapping}")
             allocation.state = CoreStates.OK
             allocation.set_mapping(mapping)
 
@@ -717,7 +717,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
         if not isinstance(allocation, models.RemoteAllocation):
             raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
 
-        logger.info(f"Deleting allocation: {allocation}")
+        logger.debug(f"Deleting allocation: {allocation}")
 
         try:
             project = allocation.get_project_identifier()
@@ -912,7 +912,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
         # Negative usage_change = less usage = less cost = need to increase credit (refund)
         cost_change = usage_change * unit_price
 
-        logger.info(
+        logger.debug(
             f"Reconciliation credit adjustment for {project.name}: "
             f"usage_change={usage_change:.2f} hours, "
             f"unit_price={unit_price:.4f}, "
@@ -926,7 +926,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
         project_credit.value = project_credit.value - decimal.Decimal(cost_change)
         project_credit.save(update_fields=["value"])
 
-        logger.info(
+        logger.debug(
             f"Adjusted project credit for {project.name} from {old_credit_value:.2f} "
             f"to {project_credit.value:.2f} (change: {-cost_change:.2f})"
         )
@@ -1052,7 +1052,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
         )
 
         if created:
-            logger.info(
+            logger.debug(
                 f"Created ComponentUsage for {allocation} {month_date.year}-{month_date.month:02d} "
                 f"with {actual_usage} hours"
             )
@@ -1072,7 +1072,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 tzinfo=datetime.UTC,
             )
             component_usage.save()
-            logger.info(
+            logger.debug(
                 f"Updated ComponentUsage for {allocation} {month_date.year}-{month_date.month:02d} "
                 f"from {old_usage} to {actual_usage} hours"
             )
@@ -1280,7 +1280,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 )
 
     def pull_allocation(self, allocation):
-        logger.info(f"Pulling remote allocation: {allocation}")
+        logger.debug(f"Pulling remote allocation: {allocation}")
 
     def get_allocation_queryset(self):
         logger.debug("Getting OpenPortal allocation queryset")

@@ -360,11 +360,11 @@ def _sync_project_credits_for_project(project, created=False):
         return
 
     if project.is_expired or project.is_removed:
-        logger.info(f"Project {project} is expired or removed - skipping credit sync")
+        logger.debug(f"Project {project} is expired or removed - skipping credit sync")
         return
 
     action = "creation" if created else "update"
-    logger.info(
+    logger.debug(
         f"OpenPortal - syncing project credits for project {project} "
         f"due to allocation {action}"
     )
@@ -396,7 +396,7 @@ def _sync_project_credits_for_project(project, created=False):
                 )
                 continue
 
-        logger.info(
+        logger.debug(
             f"Total allocation for project {project}: {total_allocation} "
             f"(from {remote_allocations.count()} RemoteAllocations)"
         )
@@ -404,9 +404,9 @@ def _sync_project_credits_for_project(project, created=False):
         # Set the project credits to match the total allocation
         if total_allocation > Decimal(0):
             utils.set_project_credits(project, total_allocation)
-            logger.info(f"Set project credits for {project} to {total_allocation}")
+            logger.debug(f"Set project credits for {project} to {total_allocation}")
         else:
-            logger.info(
+            logger.debug(
                 f"No positive allocation found for project {project} - "
                 "skipping credit update"
             )

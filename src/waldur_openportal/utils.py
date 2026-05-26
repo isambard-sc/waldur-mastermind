@@ -557,7 +557,7 @@ def get_project_spend_info(
         # no need to do anything if usage == 0
 
     if not silent:
-        logger.info(
+        logger.debug(
             f"Project {project} has total credits: {total_credits}, total spend: {total_spend} "
             f"(include_current_month={include_current_month})"
         )
@@ -628,7 +628,7 @@ def set_project_credits(
     if abs(change_in_credits) < decimal.Decimal(0.01):
         # no change in credits, so nothing to do
         if not silent:
-            logger.info(
+            logger.debug(
                 f"No change in credits for project {project}: {total_credits} -> {desired_credit_balance} "
                 f"(allocation: {credits}, spend: {total_spend})"
             )

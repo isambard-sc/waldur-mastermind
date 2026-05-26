@@ -9,6 +9,13 @@ from waldur_slurm.structures import Account
 logger = logging.getLogger(__name__)
 
 
+def _trim_cmd(cmd: str, max_len: int = 128) -> str:
+    if len(cmd) <= max_len:
+        return cmd
+    half = (max_len - 3) // 2
+    return f"{cmd[:half]}...{cmd[-(max_len - 3 - half):]}"
+
+
 class OpenPortalRunner:
     """
     This class is actually responsible for running OpenPortal commands
@@ -286,7 +293,8 @@ class OpenPortalClient:
         """
         Run the passed command and await the result
         """
-        logger.debug(f"Running command '{command}'")
+        cmd_label = _trim_cmd(command)
+        logger.debug(f"Running command '{cmd_label}'")
         op_job = self._runner.run(command)
 
         now = datetime.datetime.now()
@@ -298,26 +306,26 @@ class OpenPortalClient:
             if check_time - last_update > datetime.timedelta(seconds=10):
                 total_duration = check_time - now
                 logger.warning(
-                    f"Job {command} is still running... for {total_duration}"
+                    f"Job {cmd_label} is still running... for {total_duration}"
                 )
                 last_update = check_time
 
             if check_time - now > datetime.timedelta(seconds=30):
-                logger.error(f"Job {command} is taking too long to run - skipping!")
+                logger.error(f"Job {cmd_label} is taking too long to run - skipping!")
                 break
 
         # Give the job another 100ms to finish...
         if not op_job.wait(100):
-            logger.error(f"Job {command} timed out - skipping!")
-            raise openportal.OpenPortalError(f"Job '{command}' timed out - skipping!")
+            logger.error(f"Job {cmd_label} timed out - skipping!")
+            raise openportal.OpenPortalError(f"Job '{cmd_label}' timed out - skipping!")
 
         if op_job.is_error:
-            logger.error(f"Job {command} has failed: {op_job.error_message}")
+            logger.error(f"Job {cmd_label} has failed: {op_job.error_message}")
             raise openportal.OpenPortalError(
-                f"Job '{command}' failed: {op_job.error_message}"
+                f"Job '{cmd_label}' failed: {op_job.error_message}"
             )
         else:
-            logger.debug(f"Job finished: {command} - SUCCESS")
+            logger.debug(f"Job finished: {cmd_label} - SUCCESS")
             return op_job.result
 
     def list_accounts(self) -> list[Account]:

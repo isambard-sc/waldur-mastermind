@@ -348,7 +348,7 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                 # the resource options
                 try:
                     if float(resource.options["allocation"]) != float(allocation):
-                        logger.info(
+                        logger.debug(
                             f"Updating allocation for resource {resource} to {allocation} {allocation_unit}"
                         )
                         resource.options["allocation"] = allocation
@@ -357,7 +357,7 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                     logger.warning(f"Failed to set allocation: {e}")
             else:
                 try:
-                    logger.info(
+                    logger.debug(
                         f"Recording default allocation {allocation} for resource {resource}"
                     )
                     options["allocation"] = allocation
@@ -366,7 +366,7 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                 except Exception as e:
                     logger.warning(f"Failed to set allocation: {e}")
 
-        logger.info(
+        logger.debug(
             f"Requested credits from allocation {allocation} with unit {allocation_unit}"
         )
 
@@ -439,7 +439,7 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                 user = core_models.User.objects.filter(id=user_id)
 
                 if not user.exists():
-                    logger.info(
+                    logger.debug(
                         f"Skipping non-existing user {user_id} for project {project}"
                     )
                     continue
@@ -447,17 +447,17 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                 user = user.first()
 
                 if user is None:
-                    logger.info(
+                    logger.debug(
                         f"Skipping non-existing user {user_id} for project {project}"
                     )
                     continue
 
                 if not user.is_active:
-                    logger.info(f"Skipping inactive user {user} for project {project}")
+                    logger.debug(f"Skipping inactive user {user} for project {project}")
                     continue
 
                 if user.email is None:
-                    logger.info(
+                    logger.debug(
                         f"Skipping user {user} without email for project {project}"
                     )
                     continue
@@ -465,7 +465,7 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                 email = str(user.email).strip()
 
                 if not email:
-                    logger.info(
+                    logger.debug(
                         f"Skipping user {user} with empty email for project {project}"
                     )
                     continue
@@ -523,7 +523,7 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                         )
                         continue
 
-                    logger.info(
+                    logger.debug(
                         f"Adding user {user} with role {role_name} to project {project}"
                     )
 
@@ -538,7 +538,7 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
         #        f"Failed to set allowed domains for project {project} to {allowed_domains}: {e}"
         #    )
 
-        logger.info(f"Returning project details for project {project}: {details}")
+        logger.debug(f"Returning project details for project {project}: {details}")
 
         return details
 
