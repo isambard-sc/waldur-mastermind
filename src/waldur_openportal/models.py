@@ -3131,6 +3131,42 @@ class RemoteProject(core_models.UuidMixin, models.Model):
 
         return extras
 
+    def ensure_not_erred(self):
+        """
+        If the project is in ERROR state, reset it to PENDING so that
+        subsequent writes (notes, links, etc.) are not blocked by the
+        ERRED allocation state guard.  Does nothing when not in ERROR.
+        """
+        if self.state == RemoteProjectState.ERROR:
+            self.reset_to_pending()
+
+    def reset_to_pending(self):
+        """
+        Clear a rejection error and return to PENDING state, allowing
+        the operator to make further changes or trigger a resend.
+
+        Sets RemoteProject state=PENDING and clears error_message.
+        Sets remote_allocation state=OK and clears its error_message,
+        so the state guard in update_allocated_project will pass.
+        """
+        from waldur_core.core.enums import CoreStates
+
+        self.state = RemoteProjectState.PENDING
+        self.error_message = ""
+        self.save(update_fields=["state", "error_message", "modified"])
+
+        alloc = self.remote_allocation
+        if alloc is not None:
+            alloc.state = CoreStates.OK
+            alloc.error_message = ""
+            alloc.save(update_fields=["state", "error_message", "modified"])
+
+        RemoteProjectAuditEntry.objects.create(
+            remote_project=self,
+            event_type=RemoteProjectAuditEventType.STATE_CHANGED,
+            note="Reset to pending by operator.",
+        )
+
     def record_pending(self, sent_details_json=None):
         """
         Transition to PENDING: details have been sent but confirmation

@@ -1401,6 +1401,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         """
         remote_project = self.get_object()
         self._check_write_permission(request, remote_project)
+        remote_project.ensure_not_erred()
 
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1444,6 +1445,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         """
         remote_project = self.get_object()
         self._check_write_permission(request, remote_project)
+        remote_project.ensure_not_erred()
 
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1477,6 +1479,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         """
         remote_project = self.get_object()
         self._check_write_permission(request, remote_project)
+        remote_project.ensure_not_erred()
 
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1512,6 +1515,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         """
         remote_project = self.get_object()
         self._check_write_permission(request, remote_project)
+        remote_project.ensure_not_erred()
 
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1542,6 +1546,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         """
         remote_project = self.get_object()
         self._check_write_permission(request, remote_project)
+        remote_project.ensure_not_erred()
 
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1586,6 +1591,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         """
         remote_project = self.get_object()
         self._check_write_permission(request, remote_project)
+        remote_project.ensure_not_erred()
 
         remote_project.earliest_approve = None
         remote_project.save(update_fields=["earliest_approve", "modified"])
@@ -1619,6 +1625,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
 
         remote_project = self.get_object()
         self._check_write_permission(request, remote_project)
+        remote_project.ensure_not_erred()
 
         remote_project.earliest_approve = timezone.now() + timedelta(days=36500)
         remote_project.save(update_fields=["earliest_approve", "modified"])
@@ -1632,6 +1639,48 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
                 "(earliest_approve set ~100 years ahead)"
             ),
         )
+        self._trigger_update(remote_project)
+
+        return Response(
+            serializers.RemoteProjectSerializer(
+                remote_project, context={"request": request}
+            ).data
+        )
+
+    @action(detail=True, methods=["post"], url_path="reset-to-pending")
+    def reset_to_pending(self, request, uuid=None):
+        """
+        Clear a rejection error and return the award to PENDING state.
+
+        Resets RemoteProject.state to PENDING and RemoteAllocation.state
+        to OK so that subsequent changes or a manual resend can proceed.
+        Does not send anything to the remote portal.
+        """
+        remote_project = self.get_object()
+        self._check_write_permission(request, remote_project)
+
+        remote_project.reset_to_pending()
+
+        return Response(
+            serializers.RemoteProjectSerializer(
+                remote_project, context={"request": request}
+            ).data
+        )
+
+    @action(detail=True, methods=["post"], url_path="resend-request")
+    def resend_request(self, request, uuid=None):
+        """
+        Reset to PENDING and immediately resend the current award details
+        to the remote portal.
+
+        Equivalent to reset_to_pending followed by triggering an update.
+        Use this when the operator wants to re-submit without making any
+        other changes first.
+        """
+        remote_project = self.get_object()
+        self._check_write_permission(request, remote_project)
+
+        remote_project.reset_to_pending()
         self._trigger_update(remote_project)
 
         return Response(
