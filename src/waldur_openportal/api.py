@@ -1867,6 +1867,24 @@ def _get_project_allowed_domains(project):
     return sorted(union)
 
 
+@extend_schema(
+    responses={
+        200: inline_serializer(
+            "ProjectEmailPolicyResponse",
+            fields={
+                "allowed_domains": drf_serializers.ListField(
+                    child=drf_serializers.CharField(),
+                    allow_null=True,
+                )
+            },
+        )
+    },
+    description=(
+        "Return the allowed_domains list for a project derived from its AwardDetails. "
+        "null means no restriction; [] means nothing allowed; a list contains permitted "
+        "domain globs and/or specific email addresses."
+    ),
+)
 @api_view(["GET"])
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])

@@ -356,6 +356,7 @@ def record_award_sent(
     remote_project.last_sent_details = details_json
     remote_project.pending_details = details_json
     remote_project.pending_since = now
+    remote_project.state = models.RemoteProjectState.PENDING
     if allocation_value is not None:
         remote_project.pending_allocation = allocation_value
     remote_project.save()

@@ -3202,14 +3202,14 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         """
         Transition to ACTIVE: the remote portal confirmed the award.
 
-        Delegates to record_award_update_confirmed when the project is
-        already ACTIVE (an update was confirmed), otherwise to
-        record_award_created (initial creation confirmed).  Both
-        functions also update remote_allocation to OK.
+        Delegates to record_award_update_confirmed when the project has
+        previously been confirmed (last_confirmed_details is set),
+        otherwise to record_award_created (initial creation confirmed).
+        Both functions also update remote_allocation to OK.
         """
         from waldur_openportal import remote_project_service
 
-        if self.state == RemoteProjectState.ACTIVE:
+        if self.last_confirmed_details is not None:
             remote_project_service.record_award_update_confirmed(
                 self, sent_details_json, confirmed_details_json
             )

@@ -609,16 +609,6 @@ class RemoteOpenPortalBackend(ServiceBackend):
             allocation.update_mapping(mapping)
             allocation.state = CoreStates.OK
             allocation.save()
-            try:
-                if _remote_project is not None:
-                    remote_project_service.record_award_update_confirmed(
-                        _remote_project,
-                        _details_json,
-                        _confirmed_details_json,
-                        _attachment,
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to record award_update_confirmed for {allocation}: {e}")
         except openportal.ManagedProjectRejectedError as e:
             logger.warning(
                 f"OpenPortal project {project_identifier} is rejected: {e}. "
