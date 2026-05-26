@@ -3030,59 +3030,75 @@ class RemoteProject(core_models.UuidMixin, models.Model):
     def get_last_confirmed_details(self) -> "openportal.AwardDetails | None":
         return self._load_award_details(self.last_confirmed_details)
 
-    def award_details(self) -> "openportal.AwardDetails | None":
+    def award_details(self) -> "openportal.AwardDetails":
         """
         Compute the best current view of the award by merging last_sent_details
         (our intent — authoritative for locally-authored fields and membership)
         with last_confirmed_details (remote ground truth — authoritative for
-        project_link and any notes or members added by the remote portal).
+        project_link and any notes or members added by the remote portal),
+        then layering in the current award-level extras stored on this model.
 
         Merge rules:
         - Locally-authored fields (name, description, dates, template, key,
           allocation, membership_control, allowed_domains): last_sent wins.
         - Notes and breakdown: union from both, notes sorted chronologically.
-        - project_link: last_confirmed wins (remote portal owns its own URL).
+        - project_link: last_confirmed wins (remote portal owns its own URL),
+          unless link_project is explicitly set on this RemoteProject.
         - Members: last_sent is authoritative (our intent); members present in
           last_confirmed but absent from last_sent are added (remote-added).
+        - Extras (link_*, earliest_approve, membership_control,
+          allowed_domains, breakdown): current model fields win — they may be
+          newer than the last send.
 
-        Returns None if neither snapshot is available.
+        Always returns a non-None AwardDetails.  If no snapshot exists yet,
+        returns the extras only so callers always receive a valid base.
         """
 
         sent = self.get_last_sent_details()
         confirmed = self.get_last_confirmed_details()
 
+        extras = self.get_extras()
+        extras_obj = openportal.AwardDetails.from_json(json.dumps(extras))
+
         if sent is None and confirmed is None:
-            return None
+            return extras_obj
+
         if sent is None:
-            return confirmed
-        if confirmed is None:
-            return sent
+            result = confirmed
+        elif confirmed is None:
+            result = sent
+        else:
+            # confirmed.merge(sent) → sent's locally-authored fields take
+            # precedence; notes and breakdown are unioned; members are replaced
+            # by sent's if sent has any.
+            result = confirmed.merge(sent)
 
-        # confirmed.merge(sent) → sent's locally-authored fields take
-        # precedence; notes and breakdown are unioned; members are replaced
-        # by sent's if sent has any.
-        result = confirmed.merge(sent)
+            # Remote portal owns its own project URL — always restore from
+            # confirmed (unless link_project overrides it via extras below).
+            if confirmed.project_link is not None:
+                result.project_link = confirmed.project_link
 
-        # Remote portal owns its own project URL — always restore from confirmed.
-        if confirmed.project_link is not None:
-            result.project_link = confirmed.project_link
+            # Add any members the remote portal added that we never sent.
+            if sent.members is not None:
+                sent_members = sent.members
+                confirmed_members = confirmed.members or {}
+                for username, role in confirmed_members.items():
+                    if username not in sent_members:
+                        result.add_member(username, role)
 
-        # Add any members the remote portal added that we never sent.
-        if sent.members is not None:
-            sent_members = sent.members
-            confirmed_members = confirmed.members or {}
-            for username, role in confirmed_members.items():
-                if username not in sent_members:
-                    result.add_member(username, role)
+        # Layer in current extras — these may be newer than the last send.
+        # Notes are unioned (merge deduplicates); other fields overwrite.
+        if extras:
+            result = result.merge(extras_obj)
 
         return result
 
     def get_extras(self) -> dict:
         """
         Return a dict compatible with AwardDetails JSON representing all
-        manually-set award-level extras.  This is merged into the
-        synthesised AwardDetails (from RemoteAllocation.get_project_details)
-        before each update_award call.
+        manually-set award-level extras stored on this RemoteProject.
+        Called by award_details() to layer current model state on top of
+        the snapshot merge.
         """
         extras: dict = {}
 
@@ -3114,6 +3130,57 @@ class RemoteProject(core_models.UuidMixin, models.Model):
             extras["breakdown"] = self.breakdown
 
         return extras
+
+    def record_pending(self, sent_details_json=None):
+        """
+        Transition to PENDING: details have been sent but confirmation
+        has not yet been received (e.g. awaiting human review).
+        """
+        from waldur_openportal import remote_project_service
+
+        remote_project_service.record_award_attempted(
+            self, sent_details_json or {}
+        )
+
+    def record_rejected(self, error_message, details_json=None):
+        """
+        Transition to ERROR: the remote portal rejected the award.
+
+        Delegates to record_award_update_rejected when the project is
+        already ACTIVE (an update was rejected), otherwise to
+        record_award_rejected (a create was rejected).  Both functions
+        also update remote_allocation to ERRED.
+        """
+        from waldur_openportal import remote_project_service
+
+        if self.state == RemoteProjectState.ACTIVE:
+            remote_project_service.record_award_update_rejected(
+                self, error_message
+            )
+        else:
+            remote_project_service.record_award_rejected(
+                self, details_json, error_message
+            )
+
+    def record_accepted(self, sent_details_json=None, confirmed_details_json=None):
+        """
+        Transition to ACTIVE: the remote portal confirmed the award.
+
+        Delegates to record_award_update_confirmed when the project is
+        already ACTIVE (an update was confirmed), otherwise to
+        record_award_created (initial creation confirmed).  Both
+        functions also update remote_allocation to OK.
+        """
+        from waldur_openportal import remote_project_service
+
+        if self.state == RemoteProjectState.ACTIVE:
+            remote_project_service.record_award_update_confirmed(
+                self, sent_details_json, confirmed_details_json
+            )
+        else:
+            remote_project_service.record_award_created(
+                self, sent_details_json, confirmed_details_json
+            )
 
     def __str__(self) -> str:
         return (

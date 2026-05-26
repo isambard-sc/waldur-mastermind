@@ -1761,18 +1761,8 @@ def refresh_remote_award(destination: str, local_identifier: str):
         confirmed_details_json = json.loads(details.to_json()) if details else None
 
         if confirmed_details_json is not None:
-            if remote_project.state == models.RemoteProjectState.ACTIVE:
-                remote_project_service.record_award_update_confirmed(
-                    remote_project,
-                    None,
-                    confirmed_details_json,
-                )
-            else:
-                remote_project_service.record_award_created(
-                    remote_project,
-                    None,
-                    confirmed_details_json,
-                )
+            remote_project.last_confirmed_details = confirmed_details_json
+            remote_project.save(update_fields=["last_confirmed_details", "modified"])
     except Exception as e:
         logger.warning(
             f"refresh_remote_award: could not refetch award "
@@ -1810,11 +1800,12 @@ def dispatch_notification(notification: openportal.Notification):
     handler(notification)
 
 
-def _schedule_refresh_award_if_local(notification: openportal.Notification):
+def _schedule_award_task_if_local(notification: openportal.Notification, task):
     """
     Parse the notification's event_argument as a ProjectIdentifier, check that
-    it belongs to this portal, and if so schedule refresh_remote_award.
-    Returns early (without scheduling) if the identifier is for a different portal.
+    it belongs to this portal, and if so schedule the given Celery task with
+    (destination, event_argument) arguments.
+    Returns early without scheduling if the identifier is for a different portal.
     """
     if not openportal.have_openportal():
         return
@@ -1829,9 +1820,160 @@ def _schedule_refresh_award_if_local(notification: openportal.Notification):
             f"not {openportal.get_portal()!r}"
         )
         return
-    refresh_remote_award.delay(
-        str(notification.destination), str(notification.event_argument)
+    task.delay(str(notification.destination), str(notification.event_argument))
+
+
+def _schedule_refresh_award_if_local(notification: openportal.Notification):
+    _schedule_award_task_if_local(notification, refresh_remote_award)
+
+
+@shared_task(name="waldur_openportal.reject_remote_award")
+def reject_remote_award(destination: str, local_identifier: str):
+    """
+    Find the RemoteProject for this award and transition it (and its
+    RemoteAllocation) to ERROR/ERRED state.
+    Called when the remote portal sends an award_rejected notification.
+    """
+    logger.info(
+        f"OpenPortal task.reject_remote_award: destination={destination!r},"
+        f" local_identifier={local_identifier!r}"
     )
+
+    if not openportal.have_openportal():
+        return
+
+    openportal.ensure_config_loaded()
+
+    local_id = openportal.ProjectIdentifier(local_identifier)
+
+    if str(local_id.portal) != str(openportal.get_portal()):
+        logger.error(
+            f"reject_remote_award: identifier {local_identifier!r} is for portal "
+            f"{local_id.portal!r}, expected {openportal.get_portal()!r} — ignoring"
+        )
+        return
+
+    try:
+        project = structure_models.Project.objects.get(slug=str(local_id.project))
+    except structure_models.Project.DoesNotExist:
+        logger.error(
+            f"reject_remote_award: no Project found with slug {local_id.project!r}"
+        )
+        return
+
+    try:
+        dest = openportal.Destination(destination)
+    except Exception as e:
+        logger.error(
+            f"reject_remote_award: invalid destination {destination!r}: {e}"
+        )
+        return
+
+    # Reverse the destination — the notification came from the remote portal
+    # so the routing path is already flipped relative to our RemoteProject.
+    dest = openportal.Destination(".".join(reversed(dest.agents)))
+
+    try:
+        remote_project = models.RemoteProject.objects.get(
+            destination=str(dest), current_project=project
+        )
+    except models.RemoteProject.DoesNotExist:
+        logger.error(
+            f"reject_remote_award: no RemoteProject found for "
+            f"destination={dest!r}, project slug={local_id.project!r}"
+        )
+        return
+
+    try:
+        remote_project.record_rejected("Award rejected by remote portal")
+    except Exception as e:
+        logger.warning(
+            f"reject_remote_award: failed to record rejection for "
+            f"{remote_project}: {e}"
+        )
+        return
+
+    remote_project_service.touch_last_contact(remote_project)
+
+
+@shared_task(name="waldur_openportal.accept_remote_award")
+def accept_remote_award(destination: str, local_identifier: str):
+    """
+    Find the RemoteProject for this award, refetch the confirmed details
+    from the remote portal, then transition the project (and its
+    RemoteAllocation) to ACTIVE/OK state.
+    Called when the remote portal sends an award_accepted notification.
+    """
+    logger.info(
+        f"OpenPortal task.accept_remote_award: destination={destination!r},"
+        f" local_identifier={local_identifier!r}"
+    )
+
+    if not openportal.have_openportal():
+        return
+
+    openportal.ensure_config_loaded()
+
+    local_id = openportal.ProjectIdentifier(local_identifier)
+
+    if str(local_id.portal) != str(openportal.get_portal()):
+        logger.error(
+            f"accept_remote_award: identifier {local_identifier!r} is for portal "
+            f"{local_id.portal!r}, expected {openportal.get_portal()!r} — ignoring"
+        )
+        return
+
+    try:
+        project = structure_models.Project.objects.get(slug=str(local_id.project))
+    except structure_models.Project.DoesNotExist:
+        logger.error(
+            f"accept_remote_award: no Project found with slug {local_id.project!r}"
+        )
+        return
+
+    try:
+        dest = openportal.Destination(destination)
+    except Exception as e:
+        logger.error(
+            f"accept_remote_award: invalid destination {destination!r}: {e}"
+        )
+        return
+
+    dest = openportal.Destination(".".join(reversed(dest.agents)))
+
+    try:
+        remote_project = models.RemoteProject.objects.get(
+            destination=str(dest), current_project=project
+        )
+    except models.RemoteProject.DoesNotExist:
+        logger.error(
+            f"accept_remote_award: no RemoteProject found for "
+            f"destination={dest!r}, project slug={local_id.project!r}"
+        )
+        return
+
+    confirmed_details_json = None
+    try:
+        board = OpenPortalBoard(dest)
+        details = board.refetch_award(local_id)
+        if details:
+            confirmed_details_json = json.loads(details.to_json())
+    except Exception as e:
+        logger.warning(
+            f"accept_remote_award: could not refetch award details for "
+            f"{remote_project} — accepting without confirmed details: {e}"
+        )
+
+    try:
+        remote_project.record_accepted(confirmed_details_json=confirmed_details_json)
+    except Exception as e:
+        logger.warning(
+            f"accept_remote_award: failed to record acceptance for "
+            f"{remote_project}: {e}"
+        )
+        return
+
+    remote_project_service.touch_last_contact(remote_project)
 
 
 def _handle_award_added(notification: openportal.Notification):
@@ -1851,12 +1993,12 @@ def _handle_award_changed(notification: openportal.Notification):
 
 def _handle_award_accepted(notification: openportal.Notification):
     logger.info(f"OpenPortal notification: {notification}")
-    _schedule_refresh_award_if_local(notification)
+    _schedule_award_task_if_local(notification, accept_remote_award)
 
 
 def _handle_award_rejected(notification: openportal.Notification):
     logger.info(f"OpenPortal notification: {notification}")
-    _schedule_refresh_awardre_if_local(notification)
+    _schedule_award_task_if_local(notification, reject_remote_award)
 
 
 @shared_task(name="waldur_openportal.sync_offering_agents")

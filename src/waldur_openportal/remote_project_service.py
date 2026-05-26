@@ -5,6 +5,8 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 
+from waldur_core.core.enums import CoreStates
+
 from waldur_openportal import models
 
 logger = logging.getLogger(__name__)
@@ -151,16 +153,23 @@ def record_award_rejected(remote_project, details_json, error_message):
     Called when a create_award attempt is explicitly rejected by the
     remote portal (ManagedProjectRejectedError on initial add_project).
 
-    Sets: last_sent_details, state=ERROR.
-    Creates audit entry with event_type=AWARD_REJECTED,
-    note=error_message.
+    Sets: last_sent_details (if provided), state=ERROR.
+    Updates remote_allocation to ERRED if present.
+    Creates audit entry with event_type=AWARD_REJECTED, note=error_message.
     """
     remote_project.state = models.RemoteProjectState.ERROR
-    remote_project.last_sent_details = details_json
     remote_project.error_message = error_message
-    remote_project.save(
-        update_fields=["state", "last_sent_details", "error_message", "modified"]
-    )
+    update_fields = ["state", "error_message", "modified"]
+    if details_json is not None:
+        remote_project.last_sent_details = details_json
+        update_fields.append("last_sent_details")
+    remote_project.save(update_fields=update_fields)
+
+    alloc = remote_project.remote_allocation
+    if alloc is not None:
+        alloc.error_message = error_message
+        alloc.set_erred()
+        alloc.save()
 
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
         remote_project=remote_project,
@@ -253,6 +262,7 @@ def record_award_created(
           pending_details=None, pending_since=None,
           state=ACTIVE, last_contact_time=now,
           current_allocation (if allocation present).
+    Updates remote_allocation to OK if present.
     Creates audit entry with event_type=AWARD_CREATED.
     """
     with transaction.atomic():
@@ -294,6 +304,12 @@ def record_award_created(
             remote_project.current_allocation = allocation_value
 
         remote_project.save()
+
+        alloc = remote_project.remote_allocation
+        if alloc is not None:
+            alloc.state = CoreStates.OK
+            alloc.error_message = ""
+            alloc.save(update_fields=["state", "error_message", "modified"])
 
         audit_entry = models.RemoteProjectAuditEntry.objects.create(
             remote_project=remote_project,
@@ -431,6 +447,12 @@ def record_award_update_confirmed(
 
         remote_project.save()
 
+        alloc = remote_project.remote_allocation
+        if alloc is not None:
+            alloc.state = CoreStates.OK
+            alloc.error_message = ""
+            alloc.save(update_fields=["state", "error_message", "modified"])
+
         audit_entry = models.RemoteProjectAuditEntry.objects.create(
             remote_project=remote_project,
             event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATE_CONFIRMED),
@@ -446,6 +468,7 @@ def record_award_update_rejected(remote_project, error_message, remote_response=
     Called when update_award is rejected (ManagedProjectRejectedError).
 
     Sets: state=ERROR.
+    Updates remote_allocation to ERRED if present.
     Creates audit entry with event_type=AWARD_UPDATE_REJECTED,
     remote_response=remote_response or {"error": error_message},
     note=error_message.
@@ -453,6 +476,12 @@ def record_award_update_rejected(remote_project, error_message, remote_response=
     remote_project.state = models.RemoteProjectState.ERROR
     remote_project.error_message = error_message
     remote_project.save(update_fields=["state", "error_message", "modified"])
+
+    alloc = remote_project.remote_allocation
+    if alloc is not None:
+        alloc.error_message = error_message
+        alloc.set_erred()
+        alloc.save()
 
     response_data = (
         remote_response if remote_response is not None else {"error": error_message}

@@ -312,9 +312,9 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 f"Allocation already exists: {allocation} | {project} | {details}"
             )
 
-            # Ensure a RemoteProject exists and merge its extras into
-            # details before sending, so the remote portal receives the
-            # full award specification.
+            # Ensure a RemoteProject exists and build details from it:
+            # use award_details() as the base (confirmed history + extras)
+            # then merge live Waldur data on top so local fields win.
             remote_project = None
             try:
                 _rid = (
@@ -327,16 +327,10 @@ class RemoteOpenPortalBackend(ServiceBackend):
                         allocation, destination, remote_identifier=_rid
                     )
                 )
-                extras = remote_project.get_extras()
-                if extras:
-                    details = details.merge(
-                        openportal.AwardDetails.from_json(
-                            json.dumps(extras)
-                        )
-                    )
+                details = remote_project.award_details().merge(details)
             except Exception as _rp_e:
                 logger.warning(
-                    f"Failed to prepare RemoteProject extras for"
+                    f"Failed to prepare RemoteProject for"
                     f" {allocation}: {_rp_e}"
                 )
 
@@ -345,9 +339,6 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 mapping = self.client.add_project(project, details)
             except openportal.ManagedProjectRejectedError as e:
                 logger.warning(f"OpenPortal project {project} is rejected: {e}. ")
-                allocation.error_message = str(e)
-                allocation.set_erred()
-                allocation.save()
                 try:
                     if remote_project is None:
                         _rid = (
@@ -362,14 +353,17 @@ class RemoteOpenPortalBackend(ServiceBackend):
                                 remote_identifier=_rid,
                             )
                         )
-                    remote_project_service.record_award_rejected(
-                        remote_project, json.loads(details.to_json()), str(e)
+                    remote_project.record_rejected(
+                        str(e), json.loads(details.to_json())
                     )
                 except Exception as _rp_e:
                     logger.warning(
                         f"Failed to record award rejection in RemoteProject"
                         f" for {allocation}: {_rp_e}"
                     )
+                    allocation.error_message = str(e)
+                    allocation.set_erred()
+                    allocation.save()
                 return allocation
             except Exception as e:
                 logger.warning(
@@ -390,9 +384,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
                                 remote_identifier=_rid,
                             )
                         )
-                    remote_project_service.record_award_attempted(
-                        remote_project, json.loads(details.to_json()), note=str(e)
-                    )
+                    remote_project.record_pending(json.loads(details.to_json()))
                 except Exception as _rp_e:
                     logger.warning(
                         f"Failed to create/update RemoteProject for"
@@ -403,8 +395,9 @@ class RemoteOpenPortalBackend(ServiceBackend):
             project = self.client.get_project_identifier(allocation.project)
             details = allocation.get_project_details()
 
-            # Ensure a RemoteProject exists and merge its extras into
-            # details before sending.
+            # Ensure a RemoteProject exists and build details from it:
+            # use award_details() as the base (confirmed history + extras)
+            # then merge live Waldur data on top so local fields win.
             remote_project = None
             try:
                 remote_project = (
@@ -412,16 +405,10 @@ class RemoteOpenPortalBackend(ServiceBackend):
                         allocation, destination, remote_identifier=None
                     )
                 )
-                extras = remote_project.get_extras()
-                if extras:
-                    details = details.merge(
-                        openportal.AwardDetails.from_json(
-                            json.dumps(extras)
-                        )
-                    )
+                details = remote_project.award_details().merge(details)
             except Exception as _rp_e:
                 logger.warning(
-                    f"Failed to prepare RemoteProject extras for"
+                    f"Failed to prepare RemoteProject for"
                     f" {allocation}: {_rp_e}"
                 )
 
@@ -429,9 +416,6 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 mapping = self.client.add_project(project, details)
             except openportal.ManagedProjectRejectedError as e:
                 logger.warning(f"OpenPortal project {project} is rejected: {e}. ")
-                allocation.error_message = str(e)
-                allocation.set_erred()
-                allocation.save()
                 try:
                     if remote_project is None:
                         remote_project = (
@@ -441,14 +425,17 @@ class RemoteOpenPortalBackend(ServiceBackend):
                                 remote_identifier=None,
                             )
                         )
-                    remote_project_service.record_award_rejected(
-                        remote_project, json.loads(details.to_json()), str(e)
+                    remote_project.record_rejected(
+                        str(e), json.loads(details.to_json())
                     )
                 except Exception as _rp_e:
                     logger.warning(
                         f"Failed to record award rejection in RemoteProject"
                         f" for {allocation}: {_rp_e}"
                     )
+                    allocation.error_message = str(e)
+                    allocation.set_erred()
+                    allocation.save()
                 return allocation
             except Exception as e:
                 logger.warning(
@@ -464,11 +451,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
                                 remote_identifier=None,
                             )
                         )
-                    remote_project_service.record_award_attempted(
-                        remote_project,
-                        json.loads(details.to_json()),
-                        note=str(e),
-                    )
+                    remote_project.record_pending(json.loads(details.to_json()))
                 except Exception as _rp_e:
                     logger.warning(
                         f"Failed to create pending RemoteProject for"
@@ -568,8 +551,9 @@ class RemoteOpenPortalBackend(ServiceBackend):
         project_identifier = allocation.get_project_identifier()
         project_details = allocation.get_project_details()
 
-        # Get (or create) the RemoteProject, merge its extras into
-        # project_details, and set up audit tracking — all in one place.
+        # Get (or create) the RemoteProject, then build the details to send:
+        # use award_details() as the base (confirmed history + extras) and
+        # merge live Waldur data on top so local fields win.
         destination = str(self.destination())
         remote_identifier = (
             str(allocation.get_remote_project_identifier())
@@ -583,11 +567,9 @@ class RemoteOpenPortalBackend(ServiceBackend):
             _remote_project = remote_project_service.get_or_create_remote_project(
                 allocation, destination, remote_identifier=remote_identifier
             )
-            extras = _remote_project.get_extras()
-            if extras:
-                project_details = project_details.merge(
-                    openportal.AwardDetails.from_json(json.dumps(extras))
-                )
+            project_details = _remote_project.award_details().merge(
+                project_details
+            )
         except Exception as e:
             logger.warning(
                 f"Failed to prepare RemoteProject for {allocation}: {e}"
@@ -641,16 +623,20 @@ class RemoteOpenPortalBackend(ServiceBackend):
             logger.warning(
                 f"OpenPortal project {project_identifier} is rejected: {e}. "
             )
-            allocation.error_message = str(e)
-            allocation.set_erred()
-            allocation.save()
             try:
                 if _remote_project is not None:
-                    remote_project_service.record_award_update_rejected(
-                        _remote_project, str(e)
-                    )
+                    _remote_project.record_rejected(str(e))
+                else:
+                    allocation.error_message = str(e)
+                    allocation.set_erred()
+                    allocation.save()
             except Exception as exc:
-                logger.warning(f"Failed to record award_update_rejected for {allocation}: {exc}")
+                logger.warning(
+                    f"Failed to record award_update_rejected for {allocation}: {exc}"
+                )
+                allocation.error_message = str(e)
+                allocation.set_erred()
+                allocation.save()
         except Exception as e:
             logger.warning(
                 f"Unable to update OpenPortal project {project_identifier}: {e}."
