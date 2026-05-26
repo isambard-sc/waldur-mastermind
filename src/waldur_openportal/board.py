@@ -812,7 +812,7 @@ class OpenPortalBoard:
 
             # recreate the project, but make sure to ask for approval
             # so that the site admin can reject this request
-            return self.create_project(
+            return self.create_award(
                 identifier=identifier, details=new_details, force_request_approval=True
             )
 
