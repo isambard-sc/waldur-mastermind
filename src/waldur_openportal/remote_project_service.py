@@ -242,6 +242,17 @@ def record_award_attempted(remote_project, details_json, note=""):
         update_fields.append("pending_allocation")
     remote_project.save(update_fields=update_fields)
 
+    last = (
+        models.RemoteProjectAuditEntry.objects.filter(
+            remote_project=remote_project,
+            event_type=models.RemoteProjectAuditEventType.AWARD_ATTEMPTED,
+        )
+        .order_by("-timestamp")
+        .first()
+    )
+    if last is not None and last.new_details == details_json:
+        return last
+
     audit_entry = models.RemoteProjectAuditEntry.objects.create(
         remote_project=remote_project,
         event_type=models.RemoteProjectAuditEventType.AWARD_ATTEMPTED,

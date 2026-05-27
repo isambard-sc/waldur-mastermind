@@ -943,12 +943,21 @@ class OpenPortalBoard:
         managed_project.set_details(details)
         logger.info(f"Updated ManagedProject {managed_project} with new details.")
 
-        models.ManagedProjectAuditEntry.record(
-            managed_project,
-            models.ManagedProjectAuditEventType.DETAILS_UPDATED,
-            previous_details=existing_details_dict,
-            new_details=managed_project.details,
+        last = (
+            models.ManagedProjectAuditEntry.objects.filter(
+                managed_project=managed_project,
+                event_type=models.ManagedProjectAuditEventType.DETAILS_UPDATED,
+            )
+            .order_by("-timestamp")
+            .first()
         )
+        if last is None or last.new_details != managed_project.details:
+            models.ManagedProjectAuditEntry.record(
+                managed_project,
+                models.ManagedProjectAuditEventType.DETAILS_UPDATED,
+                previous_details=existing_details_dict,
+                new_details=managed_project.details,
+            )
 
         # We still go through and check everything, in case the
         # project has moved away from the requested details
