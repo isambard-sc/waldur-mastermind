@@ -18,6 +18,14 @@ from . import utils
 logger = logging.getLogger(__name__)
 
 
+def _trim_job(job, max_len: int = 256) -> str:
+    s = str(job)
+    if len(s) <= max_len:
+        return s
+    half = (max_len - 3) // 2
+    return f"{s[:half]}...{s[-(max_len - 3 - half):]}"
+
+
 class OpenPortalBoard:
     """
     This class implements the OpenPortal job board interface,
@@ -1730,7 +1738,7 @@ class OpenPortalBoard:
         """
         Send the result of a job back to OpenPortal.
         """
-        logger.info(f"Sending result for job {job}")
+        logger.info(f"Sending result for job {_trim_job(job)}")
 
         if not isinstance(job, openportal.Job):
             raise openportal.OpenPortalError(f"Invalid job: {job}")

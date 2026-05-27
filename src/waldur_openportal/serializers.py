@@ -628,6 +628,15 @@ class RemoteProjectAuditEntrySerializer(rf_serializers.ModelSerializer):
     performed_by_uuid = rf_serializers.UUIDField(
         source="performed_by.uuid", read_only=True
     )
+    remote_project_uuid = rf_serializers.UUIDField(
+        source="remote_project.uuid", read_only=True
+    )
+    remote_project_url = rf_serializers.HyperlinkedRelatedField(
+        source="remote_project",
+        view_name="openportal-remote-project-detail",
+        lookup_field="uuid",
+        read_only=True,
+    )
 
     class Meta:
         model = models.RemoteProjectAuditEntry
@@ -639,6 +648,8 @@ class RemoteProjectAuditEntrySerializer(rf_serializers.ModelSerializer):
             "new_details",
             "performed_by_full_name",
             "performed_by_uuid",
+            "remote_project_uuid",
+            "remote_project_url",
             "remote_response",
             "note",
         )
@@ -650,6 +661,12 @@ class ManagedProjectAuditEntrySerializer(rf_serializers.ModelSerializer):
     )
     performed_by_uuid = rf_serializers.UUIDField(
         source="performed_by.uuid", read_only=True
+    )
+    managed_project_url = rf_serializers.HyperlinkedRelatedField(
+        source="managed_project",
+        view_name="openportal-managed-project-detail",
+        lookup_field="pk",
+        read_only=True,
     )
 
     class Meta:
@@ -664,6 +681,7 @@ class ManagedProjectAuditEntrySerializer(rf_serializers.ModelSerializer):
             "new_details",
             "performed_by_full_name",
             "performed_by_uuid",
+            "managed_project_url",
             "note",
         )
 
