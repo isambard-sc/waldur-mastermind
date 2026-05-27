@@ -784,7 +784,7 @@ def get_project_members(project) -> dict[str, str]:
 
         members[email] = str(invite.role.name)
 
-    logger.info(f"Current members of project {project}: {members}")
+    logger.debug(f"Current members of project {project}: {members}")
 
     return members
 
@@ -801,7 +801,7 @@ def invite_user_to_project(project, email, role, send_email: bool = True):
     if not isinstance(email, str) or not email:
         raise ValueError("email must be a non-empty string")
 
-    logger.info(
+    logger.debug(
         f"Inviting user with email {email} to project {project} with role {role} - NEEDS IMPLEMENTING"
     )
 
@@ -817,7 +817,7 @@ def invite_user_to_project(project, email, role, send_email: bool = True):
     if project.start_date and project.start_date > timezone.now().date():
         invitation.state = InvitationState.PENDING_PROJECT
 
-    logger.info(
+    logger.debug(
         f"Created invitation {invitation} for user {email} to project {project} with role {role}"
     )
 

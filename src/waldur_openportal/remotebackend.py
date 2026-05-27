@@ -613,7 +613,10 @@ class RemoteOpenPortalBackend(ServiceBackend):
             if _remote_project is not None:
                 try:
                     remote_project_service.record_award_update_confirmed(
-                        _remote_project, _details_json, _confirmed_details_json
+                        _remote_project,
+                        _details_json,
+                        _confirmed_details_json,
+                        skip_locked=False,
                     )
                 except Exception as rp_e:
                     logger.warning(

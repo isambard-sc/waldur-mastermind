@@ -17,7 +17,7 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from . import backend, models, remote_project_service, utils
 
 from . import op as openportal
-from .board import OpenPortalBoard
+from .board import OpenPortalBoard, _trim_job
 
 
 logger = logging.getLogger(__name__)
@@ -1546,7 +1546,7 @@ def run_job(serialized_job):
         job = core_utils.deserialize_instance(serialized_job)
 
     if not isinstance(job, models.Job):
-        logger.error(f"OpenPortal - {job} is not a Job instance - it is {type(job)}")
+        logger.error(f"OpenPortal - {_trim_job(job)} is not a Job instance - it is {type(job)}")
         return
 
     job_model = job
@@ -1576,7 +1576,7 @@ def run_job(serialized_job):
         job.forwarded_for if job.forwarded_for is not None else job.destination
     )
 
-    logger.info(f"Running job {job} - status {job.state}")
+    logger.info(f"Running job {_trim_job(job)} - status {job.state}")
 
     command = job.instruction.command
     args = job.instruction.arguments
@@ -2066,7 +2066,7 @@ def sync_board():
                 logger.debug(f"Job {job.id} is not pending - skipping")
                 continue
 
-            logger.info(f"Processing job {job} from OpenPortal board")
+            logger.info(f"Processing job {_trim_job(job)} from OpenPortal board")
             j = models.Job.objects.create(
                 id=str(job.id),
                 data=job.to_json(),

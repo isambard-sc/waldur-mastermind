@@ -428,6 +428,7 @@ def record_award_update_confirmed(
     sent_details_json,
     confirmed_details_json,
     attachment=None,
+    skip_locked=True,
 ):
     """
     Called when update_award is confirmed by the remote portal.
@@ -444,12 +445,16 @@ def record_award_update_confirmed(
           pending_since=None, state=ACTIVE, last_contact_time=now,
           current_allocation (if allocation present), pending_allocation=None.
     Creates audit entry with event_type=AWARD_UPDATE_CONFIRMED.
+
+    skip_locked=False should be used when the caller knows the update was
+    accepted and must reliably persist the ACTIVE transition (e.g. the
+    synchronous success path in update_allocated_project).  The default
+    True retains the original skip behaviour for background/async callers.
     """
     with transaction.atomic():
+        qs = models.RemoteProject.objects.filter(pk=remote_project.pk)
         remote_project = (
-            models.RemoteProject.objects.select_for_update(skip_locked=True)
-            .filter(pk=remote_project.pk)
-            .first()
+            qs.select_for_update(skip_locked=skip_locked).first()
         )
         if remote_project is None:
             raise RuntimeError(

@@ -72,7 +72,7 @@ def update_allocation_credits(sender, instance, force_update=False, **kwargs):
     """
     resource = instance
 
-    logger.info(f"OpenPortal - task update_allocation_credits {resource}")
+    logger.debug(f"OpenPortal - task update_allocation_credits {resource}")
 
     if not isinstance(resource, marketplace_models.Resource):
         logger.error(
@@ -88,7 +88,7 @@ def update_allocation_credits(sender, instance, force_update=False, **kwargs):
         # Check to see if there is a remote allocation associated with this resource
         uuid = str(resource.uuid)
 
-        logger.info(f"OpenPortal - checking remote allocations for resource {uuid}")
+        logger.debug(f"OpenPortal - checking remote allocations for resource {uuid}")
 
         # Track projects that need credit sync
         projects_to_sync = set()
@@ -98,7 +98,7 @@ def update_allocation_credits(sender, instance, force_update=False, **kwargs):
                 project = remote_allocation.project
 
                 if not project.is_expired or project.is_removed:
-                    logger.info(
+                    logger.debug(
                         f"OpenPortal.update_allocation_credits - updating project {project}"
                     )
 
@@ -125,8 +125,8 @@ def update_project(sender, instance, force_add=False, **kwargs):
     """
     project = instance
 
-    logger.info(f"OpenPortal - task update_project {project}")
-    logger.info(
+    logger.debug(f"OpenPortal - task update_project {project}")
+    logger.debug(
         f"OpenPortal - force_add={force_add}, changed={project.tracker.changed()}"
     )
 
@@ -149,7 +149,7 @@ def update_project(sender, instance, force_add=False, **kwargs):
         # Either the project's name or description has changed, or the
         # project has just been added to the user - we need to update the
         # project (updating is the same as adding in OpenPortal)
-        logger.info(f"OpenPortal - updating project {project}")
+        logger.debug(f"OpenPortal - updating project {project}")
 
         transaction.on_commit(
             lambda: tasks.update_remote_project.delay(
@@ -190,7 +190,7 @@ def delete_project(sender, instance, **kwargs):
         )
         managed_project.project = None
         managed_project.save(update_fields=["project"])
-        logger.info(
+        logger.debug(
             f"ManagedProject {managed_project.identifier} marked as needing approval "
             f"due to deletion of attached project: {project}"
         )
@@ -210,7 +210,7 @@ def update_user(sender, instance, force_add=False, **kwargs):
         # Either the user's unix_username has changed, or the user has
         # just been added to the project - we need to update the user
         # (updating is the same as adding in OpenPortal)
-        logger.info(f"OpenPortal - updating user {user}")
+        logger.debug(f"OpenPortal - updating user {user}")
 
         # check if this is a User type
         if not isinstance(user, User):
@@ -252,7 +252,7 @@ def role_granted(sender, instance: UserRole, **kwargs):
     an `update_user` for the user, which will ensure that the user
     is correctly added to all projects to which they should have access.
     """
-    logger.info(
+    logger.debug(
         f"OpenPortal - granting role {instance.role} for user {instance.user} in {instance.scope}"
     )
 
@@ -283,7 +283,7 @@ def role_granted(sender, instance: UserRole, **kwargs):
         return
 
     # let's just update the user...
-    logger.info(
+    logger.debug(
         f"Really sending update_user({sender}, {user}, force_add=True, **{kwargs})"
     )
     update_user(sender, user, force_add=True, **kwargs)
@@ -296,7 +296,7 @@ def role_revoked(sender, instance, **kwargs):
     OpenPortal synchronization, which will ensure that all users are
     removed from projects from which they are not allocated.
     """
-    logger.info(
+    logger.debug(
         f"OpenPortal - revoking role {instance.role} for user {instance.user} in {instance.scope}"
     )
 
@@ -322,7 +322,7 @@ def update_quotas_on_allocation_usage_update(sender, instance, created=False, **
     if not allocation.usage_changed():
         return
 
-    logger.info(f"OpenPortal - updating quotas for allocation {allocation}")
+    logger.debug(f"OpenPortal - updating quotas for allocation {allocation}")
 
     project = allocation.project
     update_quotas(project, models.Allocation.Permissions.project_path)
@@ -340,7 +340,7 @@ def update_quotas_on_remote_allocation_usage_update(
     if not allocation.usage_changed():
         return
 
-    logger.info(f"OpenPortal - updating remote quotas for allocation {allocation}")
+    logger.debug(f"OpenPortal - updating remote quotas for allocation {allocation}")
 
     project = allocation.project
     update_remote_quotas(project, models.RemoteAllocation.Permissions.project_path)
@@ -440,7 +440,7 @@ def sync_project_credits_on_remote_allocation_change(
 
 
 def update_quotas(scope, path):
-    logger.info(f"OpenPortal - updating quotas for {scope} at {path}")
+    logger.debug(f"OpenPortal - updating quotas for {scope} at {path}")
 
     qs = models.Allocation.objects.filter(**{path: scope}).values(path)
     for quota in utils.FIELD_NAMES:
@@ -452,7 +452,7 @@ def update_quotas(scope, path):
 
 
 def update_remote_quotas(scope, path):
-    logger.info(f"OpenPortal - updating remote quotas for {scope} at {path}")
+    logger.debug(f"OpenPortal - updating remote quotas for {scope} at {path}")
 
     qs = models.RemoteAllocation.objects.filter(**{path: scope}).values(path)
     for quota in utils.FIELD_NAMES:

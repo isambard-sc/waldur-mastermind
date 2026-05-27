@@ -23,7 +23,7 @@ def _trim_job(job, max_len: int = 256) -> str:
     if len(s) <= max_len:
         return s
     half = (max_len - 3) // 2
-    return f"{s[:half]}...{s[-(max_len - 3 - half):]}"
+    return f"{s[:half]}...{s[-(max_len - 3 - half) :]}"
 
 
 class OpenPortalBoard:
@@ -492,18 +492,18 @@ class OpenPortalBoard:
                 existing_managed_project = models.ManagedProject.objects.get(
                     project=existing_project,
                 )
-                logger.info(
+                logger.debug(
                     f"Found existing ManagedProject {existing_managed_project} for project {existing_project}"
                 )
             except models.ManagedProject.DoesNotExist:
-                logger.info(
+                logger.debug(
                     f"Found existing project {existing_project} without a ManagedProject"
                 )
 
                 if not (existing_project.is_expired or existing_project.is_removed):
                     # this project is not expired or removed, so we can use it
                     # as an orphaned project
-                    logger.info(
+                    logger.debug(
                         f"Using existing project {existing_project} for identifier {identifier}"
                     )
                     orphaned_existing_project = existing_project
@@ -513,7 +513,7 @@ class OpenPortalBoard:
             # We have found an existing project that does not have a ManagedProject
             # associated with it. This means that the project was created in the
             # customer, but not managed by OpenPortal.
-            logger.info(
+            logger.debug(
                 f"Using orphaned existing project {orphaned_existing_project} for identifier {identifier}"
             )
 
@@ -624,7 +624,7 @@ class OpenPortalBoard:
         This returns the mapping from the identifier in the requesting portal
         to the OpenPortal project identifier used internally.
         """
-        logger.info(f"Creating project {identifier} with details {details}")
+        logger.debug(f"Creating project {identifier} with details {details}")
 
         if not isinstance(identifier, openportal.ProjectIdentifier):
             raise openportal.ManagedProjectRejectedError(
@@ -668,7 +668,7 @@ class OpenPortalBoard:
         )
 
         if created:
-            logger.info(
+            logger.debug(
                 f"Created new ManagedProject for identifier {identifier} in {self.destination()}: {managed_project}"
             )
             models.ManagedProjectAuditEntry.record(
@@ -677,7 +677,7 @@ class OpenPortalBoard:
                 new_details=json.loads(str(details)),
             )
         else:
-            logger.info(
+            logger.debug(
                 f"Retrieved existing ManagedProject for identifier {identifier} in {self.destination()}: {managed_project}"
             )
 
@@ -785,7 +785,7 @@ class OpenPortalBoard:
         This returns the mapping from the identifier in the requesting portal
         to the OpenPortal project identifier used internally.
         """
-        logger.info(f"Updating project {identifier} with details {new_details}")
+        logger.debug(f"Updating project {identifier} with details {new_details}")
 
         today = date.today()
 
@@ -936,12 +936,12 @@ class OpenPortalBoard:
         project = managed_project.project
 
         # merge in the new details
-        logger.info(f"Merging new details into project {identifier}: {new_details}")
+        logger.debug(f"Merging new details into project {identifier}: {new_details}")
         existing_details_dict = managed_project.details
         details = managed_project.merge_details(new_details)
-        logger.info(f"New details after merge: {details}")
+        logger.debug(f"New details after merge: {details}")
         managed_project.set_details(details)
-        logger.info(f"Updated ManagedProject {managed_project} with new details.")
+        logger.debug(f"Updated ManagedProject {managed_project} with new details.")
 
         last = (
             models.ManagedProjectAuditEntry.objects.filter(
@@ -964,11 +964,9 @@ class OpenPortalBoard:
         # (or previous syncs failed to complete)
         update_fields = []
 
-        logger.info("Updating project details...")
-
         if details.name is not None:
             if details.name != project.name:
-                logger.info(
+                logger.debug(
                     f"Updating project name from {project.name} to {details.name}"
                 )
                 project.name = details.name
@@ -976,7 +974,7 @@ class OpenPortalBoard:
 
         if details.description is not None:
             if details.description != project.description:
-                logger.info(
+                logger.debug(
                     f"Updating project description from {project.description} to {details.description}"
                 )
                 project.description = details.description
@@ -984,7 +982,7 @@ class OpenPortalBoard:
 
         if details.start_date is not None:
             if details.start_date != project.start_date:
-                logger.info(
+                logger.debug(
                     f"Updating project start date from {project.start_date} to {details.start_date}"
                 )
                 project.start_date = new_details.start_date
@@ -992,14 +990,14 @@ class OpenPortalBoard:
 
         if details.end_date is not None:
             if details.end_date != project.end_date:
-                logger.info(
+                logger.debug(
                     f"Updating project end date from {project.end_date} to {details.end_date}"
                 )
                 project.end_date = details.end_date
                 update_fields.append("end_date")
 
         if len(update_fields) > 0:
-            logger.info(
+            logger.debug(
                 f"Updating project {identifier} with fields: {', '.join(update_fields)}"
             )
             project.save(update_fields=update_fields)
@@ -1027,13 +1025,13 @@ class OpenPortalBoard:
                 new_credits = decimal.Decimal(0.0)
 
             if abs(new_credits - current_credits) > decimal.Decimal(0.0):
-                logger.info(
+                logger.debug(
                     f"Allocation for project {identifier} has changed from {current_credits} to {new_credits}"
                 )
 
                 # check that we approve this allocation change
                 if project_template.action_is_rejected(allocation=float(new_credits)):
-                    logger.info(
+                    logger.debug(
                         f"{identifier} with class {project_template} is rejected as the allocation exceeds the limit."
                     )
                     managed_project.reject(
@@ -1050,13 +1048,13 @@ class OpenPortalBoard:
                     )
                     and not force_approve
                 ):
-                    logger.info(
+                    logger.debug(
                         f"{identifier} with class {project_template} requires approval for allocation changes."
                     )
                     managed_project.set_needs_approval()
                     raise openportal.ManagedProjectPendingError()
 
-                logger.info(
+                logger.debug(
                     f"Setting allocation {details.allocation} for project {identifier}"
                 )
                 utils.set_project_credits(project, new_credits)
@@ -1222,8 +1220,10 @@ class OpenPortalBoard:
                             unit = next(iter(units_mapping), None)
 
                         if unit is not None:
-                            actual_allocation = openportal.Allocation.from_size_and_units(
-                                float(actual_size), unit
+                            actual_allocation = (
+                                openportal.Allocation.from_size_and_units(
+                                    float(actual_size), unit
+                                )
                             )
                             if stored_allocation != actual_allocation:
                                 logger.info(
@@ -1288,8 +1288,6 @@ class OpenPortalBoard:
                 mappings.append(project.get_mapping())
             else:
                 mappings.append(openportal.ProjectMapping(f"{remote_identifier}:None"))
-
-        logger.info(f"Mappings for portal {portal}: {mappings}")
 
         return mappings
 
@@ -1448,7 +1446,7 @@ class OpenPortalBoard:
             cached = self._get_cached_report_for_month(project, month, year)
 
             if cached is not None:
-                logger.info(
+                logger.debug(
                     f"Using cached usage report for project {project} for {month}/{year}"
                 )
 
@@ -1482,7 +1480,7 @@ class OpenPortalBoard:
                 report += cached
             else:
                 # Fall back to building usage from InvoiceItem objects
-                logger.info(
+                logger.debug(
                     f"Fetching invoice items for project {project} for {month}/{year}"
                 )
 
@@ -1499,7 +1497,7 @@ class OpenPortalBoard:
                 for invoice_item in invoice_items:
                     usage = float(invoice_item.price)
 
-                    logger.info(f"Invoice {invoice_item} : Usage {usage}")
+                    logger.debug(f"Invoice {invoice_item} : Usage {usage}")
 
                     if usage == 0:
                         continue
@@ -1617,7 +1615,7 @@ class OpenPortalBoard:
         if not isinstance(date_range, openportal.DateRange):
             raise openportal.OpenPortalError(f"Invalid date range: {date_range}")
 
-        logger.info(
+        logger.debug(
             f"Getting storage report for project {identifier} and date range {date_range}"
         )
 
@@ -1656,9 +1654,6 @@ class OpenPortalBoard:
             managed_project.get_remote_identifier()
         )
 
-        logger.info(f"Date range: {date_range}")
-        logger.info(f"report = {report}")
-
         # Get the storage month by month
         for month_range in date_range.months:
             month = month_range.start_date.month
@@ -1671,13 +1666,13 @@ class OpenPortalBoard:
             )
 
             if not cached_records.exists():
-                logger.info(
+                logger.debug(
                     f"No cached storage report for project {project}"
                     f" for {month}/{year} - skipping"
                 )
                 continue
 
-            logger.info(
+            logger.debug(
                 f"Using cached storage report for project {project} for {month}/{year}"
             )
 
