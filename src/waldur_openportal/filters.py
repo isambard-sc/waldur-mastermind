@@ -230,6 +230,22 @@ class RemoteProjectAuditEntryFilter(django_filters.FilterSet):
         field_name="remote_project__current_project__uuid"
     )
     event_type = django_filters.CharFilter(field_name="event_type")
+    timestamp_after = django_filters.DateTimeFilter(
+        field_name="timestamp", lookup_expr="gte"
+    )
+    timestamp_before = django_filters.DateTimeFilter(
+        field_name="timestamp", lookup_expr="lte"
+    )
+    q = django_filters.CharFilter(method="filter_search", label="Search")
+
+    def filter_search(self, queryset, name, value):
+        return queryset.filter(
+            Q(note__icontains=value)
+            | Q(previous_details__icontains=value)
+            | Q(new_details__icontains=value)
+            | Q(performed_by__first_name__icontains=value)
+            | Q(performed_by__last_name__icontains=value)
+        )
 
     class Meta:
         model = models.RemoteProjectAuditEntry
@@ -253,6 +269,24 @@ class ManagedProjectAuditEntryFilter(django_filters.FilterSet):
     managed_project_identifier = django_filters.CharFilter(field_name="identifier")
     managed_project_destination = django_filters.CharFilter(field_name="destination")
     event_type = django_filters.CharFilter(field_name="event_type")
+    timestamp_after = django_filters.DateTimeFilter(
+        field_name="timestamp", lookup_expr="gte"
+    )
+    timestamp_before = django_filters.DateTimeFilter(
+        field_name="timestamp", lookup_expr="lte"
+    )
+    q = django_filters.CharFilter(method="filter_search", label="Search")
+
+    def filter_search(self, queryset, name, value):
+        return queryset.filter(
+            Q(note__icontains=value)
+            | Q(identifier__icontains=value)
+            | Q(destination__icontains=value)
+            | Q(previous_details__icontains=value)
+            | Q(new_details__icontains=value)
+            | Q(performed_by__first_name__icontains=value)
+            | Q(performed_by__last_name__icontains=value)
+        )
 
     class Meta:
         model = models.ManagedProjectAuditEntry
