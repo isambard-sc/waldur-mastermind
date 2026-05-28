@@ -846,6 +846,64 @@ def set_project_member_role(project, email, role, is_existing_member: bool = Fal
     logger.debug(f"Set role {role.name} for {email} on project {project}.")
 
 
+def refresh_remote_award(remote_project):
+    """
+    Fetch the current AwardDetails for *remote_project* from the remote portal,
+    update last_confirmed_details and reconcile allocation, then record last contact.
+
+    Returns the AwardDetails on success, or None if OpenPortal is not configured
+    or the fetch fails.
+    """
+    from . import op as openportal
+    from . import remote_project_service
+    from .board import OpenPortalBoard
+
+    if remote_project.current_project is None:
+        logger.warning(
+            f"refresh_remote_award: RemoteProject {remote_project.destination!r} "
+            f"has no current_project — skipping."
+        )
+        return None
+
+    if not openportal.have_openportal():
+        logger.warning("refresh_remote_award: OpenPortal is not configured.")
+        return None
+
+    openportal.ensure_config_loaded()
+
+    destination = openportal.Destination(str(remote_project.destination))
+    local_id = openportal.ProjectIdentifier(
+        f"{remote_project.current_project.slug}.{openportal.get_portal()}"
+    )
+
+    try:
+        board = OpenPortalBoard(destination)
+        details = board.refetch_award(local_id)
+        confirmed_details_json = json.loads(details.to_json()) if details else None
+
+        if confirmed_details_json is not None:
+            remote_project.last_confirmed_details = confirmed_details_json
+            remote_project_service.reconcile_allocation(remote_project)
+            remote_project.save(
+                update_fields=[
+                    "last_confirmed_details",
+                    "current_allocation",
+                    "pending_allocation",
+                    "modified",
+                ]
+            )
+    except Exception as e:
+        logger.warning(
+            f"refresh_remote_award: could not refetch award "
+            f"{remote_project.identifier!r} from {remote_project.destination!r}: {e}"
+        )
+        remote_project_service.touch_last_contact(remote_project)
+        return None
+
+    remote_project_service.touch_last_contact(remote_project)
+    return details
+
+
 def _sync_project_users_from_remote(
     project: structure_models.Project,
     dry_run: bool = True,
@@ -863,7 +921,6 @@ def _sync_project_users_from_remote(
     makes no changes to users or project membership.
     """
     from . import models as op_models
-    from .board import OpenPortalBoard
 
     remote_projects = op_models.RemoteProject.objects.filter(
         current_project=project,
@@ -886,13 +943,11 @@ def _sync_project_users_from_remote(
             f"{prefix}Syncing members from remote portal {remote_project.destination} "
             f"for project {project}."
         )
-        try:
-            board = OpenPortalBoard(remote_project.destination)
-            details = board.refetch_award(remote_project.identifier)
-        except Exception as e:
+        details = refresh_remote_award(remote_project)
+        if details is None:
             logger.error(
                 f"Failed to fetch award from {remote_project.destination} "
-                f"for project {project}: {e}"
+                f"for project {project}."
             )
             continue
 

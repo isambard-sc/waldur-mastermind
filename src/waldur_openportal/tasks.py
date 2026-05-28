@@ -1755,32 +1755,7 @@ def refresh_remote_award(destination: str, local_identifier: str):
         )
         return
 
-    try:
-        board = OpenPortalBoard(destination)
-        details = board.refetch_award(local_id)
-        confirmed_details_json = json.loads(details.to_json()) if details else None
-
-        if confirmed_details_json is not None:
-            remote_project.last_confirmed_details = confirmed_details_json
-            remote_project_service.reconcile_allocation(remote_project)
-            remote_project.save(
-                update_fields=[
-                    "last_confirmed_details",
-                    "current_allocation",
-                    "pending_allocation",
-                    "modified",
-                ]
-            )
-    except Exception as e:
-        logger.warning(
-            f"refresh_remote_award: could not refetch award "
-            f"{remote_project.identifier!r} from {destination!r} — "
-            f"last_confirmed_details unchanged: {e}"
-        )
-        remote_project_service.touch_last_contact(remote_project)
-        return
-
-    remote_project_service.touch_last_contact(remote_project)
+    utils.refresh_remote_award(remote_project)
 
 
 def dispatch_notification(notification: openportal.Notification):
