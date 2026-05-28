@@ -17,7 +17,7 @@ def _trim_cmd(cmd: str, max_len: int = 128) -> str:
     if len(cmd) <= max_len:
         return cmd
     half = (max_len - 3) // 2
-    return f"{cmd[:half]}...{cmd[-(max_len - 3 - half):]}"
+    return f"{cmd[:half]}...{cmd[-(max_len - 3 - half) :]}"
 
 
 class RemoteOpenPortalClient:
@@ -32,7 +32,7 @@ class RemoteOpenPortalClient:
             raise openportal.OpenPortalError("Instance name cannot be None")
 
         if project_template is None:
-            logger.warning(
+            logger.debug(
                 "Project class is not specified, using default 'default' project class"
             )
             project_template = "default"
