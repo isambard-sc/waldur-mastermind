@@ -95,6 +95,7 @@ try:
     from openportal import (
         Allocation,
         AwardDetails,
+        DomainPattern,
         DailyProjectUsageReport,
         Destination,
         Health,
@@ -181,6 +182,10 @@ except ImportError:
             return self
 
         def to_json(self):
+            _raise_no_openportal_error()
+
+    class DomainPattern:
+        def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
     class Allocation:

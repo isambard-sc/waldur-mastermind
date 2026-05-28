@@ -11,7 +11,7 @@ from rest_framework import filters as rf_filters
 from rest_framework import permissions, response, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import BasePermission
 
 from waldur_core.core.enums import ReviewStates
@@ -34,7 +34,7 @@ from waldur_core.core import utils as core_utils
 
 from waldur_core.structure.managers import filter_queryset_for_user
 
-from . import executors, filters, models, serializers, tasks
+from . import executors, filters, models, serializers, tasks, utils
 
 logger = logging.getLogger(__name__)
 
@@ -1519,6 +1519,21 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
 
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
+        from . import op as openportal
+
+        for domain in serializer.validated_data["allowed_domains"]:
+            if "@" not in domain and utils.is_likely_personal_email_address(domain):
+                raise ValidationError(
+                    {
+                        "allowed_domains": f"'{domain}' looks like a personal email address domain. "
+                        "Personal email addresses must be added one by one, not as domain patterns."
+                    }
+                )
+            try:
+                openportal.DomainPattern(domain)
+            except Exception as e:
+                raise ValidationError({"allowed_domains": str(e)}) from e
 
         remote_project.allowed_domains = serializer.validated_data["allowed_domains"]
         remote_project.save(update_fields=["allowed_domains", "modified"])
