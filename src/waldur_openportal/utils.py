@@ -10,6 +10,7 @@ from django.utils import timezone
 
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
+from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import add_user as grant_role
 from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure import models as structure_models
@@ -843,6 +844,108 @@ def set_project_member_role(project, email, role, is_existing_member: bool = Fal
 
     grant_role(project, user, role, created_by=robot)
     logger.debug(f"Set role {role.name} for {email} on project {project}.")
+
+
+def _sync_project_users_from_remote(
+    project: structure_models.Project,
+    dry_run: bool = True,
+) -> None:
+    """
+    Fetch the current award from every active RemoteProject linked to *project*
+    and add any members that exist on the remote portal but not locally.
+
+    Role names returned by the remote portal are expected to match the local
+    Role.name (or Role.description).  If no matching Role is found the user is
+    skipped and an error is logged.  Users that are already project members are
+    left untouched.
+
+    When dry_run=True (the default) the function logs what it would do but
+    makes no changes to users or project membership.
+    """
+    from . import models as op_models
+    from .board import OpenPortalBoard
+
+    remote_projects = op_models.RemoteProject.objects.filter(
+        current_project=project,
+        state__in=[
+            op_models.RemoteProjectState.ACTIVE,
+            op_models.RemoteProjectState.STALE,
+        ],
+    ).exclude(identifier__isnull=True).exclude(identifier="")
+
+    if not remote_projects.exists():
+        logger.debug(f"No active RemoteProjects found for project {project} — skipping sync.")
+        return
+
+    robot = get_openportal_robot()
+    current_members = get_project_members(project)
+    prefix = "[DRY RUN] " if dry_run else ""
+
+    for remote_project in remote_projects:
+        logger.info(
+            f"{prefix}Syncing members from remote portal {remote_project.destination} "
+            f"for project {project}."
+        )
+        try:
+            board = OpenPortalBoard(remote_project.destination)
+            details = board.refetch_award(remote_project.identifier)
+        except Exception as e:
+            logger.error(
+                f"Failed to fetch award from {remote_project.destination} "
+                f"for project {project}: {e}"
+            )
+            continue
+
+        if details.members is None:
+            logger.debug(f"Remote award for {remote_project.identifier} has no member list.")
+            continue
+
+        for email, role_name in details.members.items():
+            email = str(email).strip().lower()
+
+            if email in current_members:
+                continue
+
+            role = (
+                Role.objects.filter(name=role_name).first()
+                or Role.objects.filter(description=role_name).first()
+            )
+            if role is None:
+                logger.error(
+                    f"Role '{role_name}' not found on local portal — "
+                    f"skipping member {email} from {remote_project.destination}."
+                )
+                continue
+
+            logger.info(f"{prefix}Would add {email} to project {project} with role {role.name}.")
+
+            if not dry_run:
+                user = get_or_create_user_by_email(email)
+                grant_role(project, user, role, created_by=robot)
+                current_members[email] = role.name
+
+
+def sync_users_from_remote_portal(
+    scope: structure_models.Project | structure_models.Customer,
+    dry_run: bool = True,
+) -> None:
+    """
+    Sync project membership from remote portal(s) to the local portal.
+
+    Pass a Project to sync that project only, or a Customer to sync all of
+    its projects.  Members already present locally are left untouched; only
+    users missing from the local project are added.
+
+    dry_run=True (the default) logs intended changes without applying them.
+    Pass dry_run=False to apply changes.
+    """
+    if isinstance(scope, structure_models.Project):
+        _sync_project_users_from_remote(scope, dry_run=dry_run)
+    elif isinstance(scope, structure_models.Customer):
+        for project in structure_models.Project.objects.filter(customer=scope):
+            _sync_project_users_from_remote(project, dry_run=dry_run)
+    else:
+        raise TypeError(f"Expected Project or Customer, got {type(scope)}")
 
 
 def _user_info_dict(user):
