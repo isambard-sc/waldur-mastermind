@@ -3413,7 +3413,6 @@ class RemoteProjectAuditEventType(models.TextChoices):
         _("Award creation explicitly rejected by remote portal"),
     )
     AWARD_CREATED = "award_created", _("Award created (create_award sent)")
-    AWARD_CONFIRMED = "award_confirmed", _("Award creation confirmed by remote portal")
     AWARD_UPDATED = "award_updated", _("Award updated (update_award sent)")
     AWARD_UPDATE_CONFIRMED = (
         "award_update_confirmed",
@@ -3423,32 +3422,11 @@ class RemoteProjectAuditEventType(models.TextChoices):
         "award_update_rejected",
         _("Award update rejected by remote portal"),
     )
-    AWARD_FETCHED = (
-        "award_fetched",
-        _("Award details fetched from remote portal (get_award)"),
-    )
-
-    # Allocation changes (cross-referenced with RemoteProjectAllocationEntry)
-    ALLOCATION_CHANGED = "allocation_changed", _("Allocation changed")
-    ALLOCATION_CONFIRMED = "allocation_confirmed", _("Allocation change confirmed")
-    ALLOCATION_REJECTED = "allocation_rejected", _("Allocation change rejected")
-
-    # Local project attachment history
-    PROJECT_ATTACHED = (
-        "project_attached",
-        _("Remote project attached to a local project"),
-    )
-    PROJECT_DETACHED = (
-        "project_detached",
-        _("Remote project detached from a local project"),
-    )
-
     # State transitions
     STATE_CHANGED = "state_changed", _("State changed")
 
     # Resource lifecycle
     RESOURCE_DELETED = "resource_deleted", _("Local resource deleted")
-    RESOURCE_RESTORED = "resource_restored", _("Local resource restored / reconnected")
 
 
 class RemoteProjectAuditEntry(models.Model):
