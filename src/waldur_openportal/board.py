@@ -1063,40 +1063,32 @@ class OpenPortalBoard:
 
         # Updating membership last, as we need to know the project is ok
         if details.members is not None:
-            # Update the members of the project
             current_members = utils.get_project_members(project)
 
-            # Go through the new members and either change their role
-            # if they exist, or send an invitation to join the project
             for email, role in details.members.items():
-                # Get the matching role from the project class
                 try:
-                    role = project_template.get_local_role_for(role)
+                    local_role = project_template.get_local_role_for(role)
                 except Exception:
-                    logger.warning(
-                        f"No matching role found for {role} in {project_template}."
+                    local_role = None
+
+                if local_role is None:
+                    logger.error(
+                        f"No matching local role for '{role}' in {project_template} "
+                        f"— skipping member {email}."
                     )
-                    role = None
-
-                role_name = role.name if role else None
-
-                # Get the existing role for this user if they are already a member
-                existing_role_name = current_members.get(email, None)
-
-                if existing_role_name == role_name:
-                    # nothing to do
                     continue
 
-                if role is not None:
-                    # always send an email invitation to the user so
-                    # that they have to actively accept the role in the
-                    # project
-                    utils.invite_user_to_project(
-                        project=project,
-                        email=email,
-                        role=role,
-                        send_email=True,
-                    )
+                existing_role_name = current_members.get(email, None)
+
+                if existing_role_name == local_role.name:
+                    continue
+
+                utils.set_project_member_role(
+                    project=project,
+                    email=email,
+                    role=local_role,
+                    is_existing_member=existing_role_name is not None,
+                )
 
         return managed_project.get_mapping()
 

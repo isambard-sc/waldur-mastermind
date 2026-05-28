@@ -1,32 +1,28 @@
 import calendar
 import datetime
-import json
-import re
 import decimal
+import json
 import logging
+import re
 
 from constance import config
-
 from django.utils import timezone
 
-from waldur_core.core import utils as core_utils
 from waldur_core.core import models as core_models
+from waldur_core.core import utils as core_utils
+from waldur_core.permissions.utils import add_user as grant_role
+from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure import models as structure_models
-
 from waldur_core.structure.managers import (
     get_connected_customers,
     get_connected_projects,
     get_project_users,
 )
-
-from waldur_core.permissions.utils import get_permissions
-from waldur_core.users.enums import InvitationState
 from waldur_core.users import models as user_models
-from waldur_core.users import tasks as user_tasks
-
+from waldur_core.users.enums import InvitationState
 from waldur_mastermind.invoices import models as invoice_models
 
-from . import models, utils
+from . import models
 
 
 logger = logging.getLogger(__name__)
@@ -798,42 +794,55 @@ def get_project_members(project) -> dict[str, str]:
     return members
 
 
-def invite_user_to_project(project, email, role, send_email: bool = True):
+def get_or_create_user_by_email(email: str) -> core_models.User:
     """
-    Invite a user to the project with the specified email and role.
-    If the user already exists, update their role in the project.
-    If send_email is True, send an invitation email.
+    Return the User with the given email, creating one if none exists.
+
+    New users are created with email and username both set to the lower-cased
+    email, first_name and last_name set to "UNKNOWN" (overwritten on first login
+    by the identity provider), and an unusable password.
+    """
+    email = email.strip().lower()
+    user = core_models.User.objects.filter(email__iexact=email).first()
+    if user is not None:
+        return user
+
+    user = core_models.User(
+        username=email,
+        email=email,
+        first_name="UNKNOWN",
+        last_name="UNKNOWN",
+    )
+    user.set_unusable_password()
+    user.save()
+    logger.info(f"Created new user with email '{email}'.")
+    return user
+
+
+def set_project_member_role(project, email, role, is_existing_member: bool = False):
+    """
+    Directly add or update a user's role in a project without sending an invitation.
+
+    If is_existing_member is True, the user already has an active role on the project:
+    all their current active roles are revoked before the new one is granted.
+
+    If is_existing_member is False, the user is looked up (or created) by email and
+    added directly.
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
 
-    if not isinstance(email, str) or not email:
-        raise ValueError("email must be a non-empty string")
+    email = str(email).strip().lower()
+    robot = get_openportal_robot()
 
-    logger.debug(
-        f"Inviting user with email {email} to project {project} with role {role} - NEEDS IMPLEMENTING"
-    )
+    user = get_or_create_user_by_email(email)
 
-    invitation = user_models.Invitation.objects.create(
-        scope=project,
-        email=email,
-        role=role,
-        created_by=utils.get_openportal_robot(),
-        state=InvitationState.PENDING,
-        customer=project.customer,
-    )
+    if is_existing_member:
+        for perm in get_permissions(project, user):
+            perm.revoke(current_user=robot)
 
-    if project.start_date and project.start_date > timezone.now().date():
-        invitation.state = InvitationState.PENDING_PROJECT
-
-    logger.debug(
-        f"Created invitation {invitation} for user {email} to project {project} with role {role}"
-    )
-
-    invitation.save()
-
-    if send_email:
-        user_tasks.process_invitation.delay(invitation.uuid.hex, "OpenPortal")
+    grant_role(project, user, role, created_by=robot)
+    logger.debug(f"Set role {role.name} for {email} on project {project}.")
 
 
 def _user_info_dict(user):
