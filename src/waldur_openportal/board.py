@@ -1193,7 +1193,13 @@ class OpenPortalBoard:
 
             for email, waldur_role_name in utils.get_project_members(project).items():
                 remote_role = reverse_role_mapping.get(waldur_role_name, "unmapped")
-                details.add_member(email, remote_role)
+                try:
+                    details.add_member(email, remote_role)
+                except Exception as e:
+                    logger.error(
+                        f"get_award {identifier}: could not add member {email!r} "
+                        f"to award details — they will not appear on the remote portal: {e}"
+                    )
 
             # Override allocation with the value inferred from current accounting,
             # which may differ from the stored AwardDetails if the request hasn't
