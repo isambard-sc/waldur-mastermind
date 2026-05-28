@@ -86,6 +86,8 @@ def is_email_allowed_for_project(scope, email: str) -> bool:
     Returns True for any scope that is not a Project, or a Project with no
     linked awards.
     """
+    logging.debug(f"Checking if email {email} is allowed for project {scope}")
+
     if not isinstance(scope, structure_models.Project):
         return True
 
@@ -108,12 +110,19 @@ def is_email_allowed_for_project(scope, email: str) -> bool:
         try:
             details = rp.get_last_sent_details()
             if details is None or details.is_email_allowed(email):
+                logging.debug(
+                    f"Email {email} is allowed for project {scope} based on RemoteProject {rp.pk}"
+                )
                 return True
         except Exception as e:
             logger.warning(
                 f"is_email_allowed_for_project: RemoteProject {rp.pk} check "
                 f"failed for {scope}: {e}"
             )
+
+    logging.debug(
+        f"Email {email} is NOT allowed for project {scope} based on any RemoteProject"
+    )
 
     return False
 
