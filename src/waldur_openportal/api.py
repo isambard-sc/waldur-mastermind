@@ -1836,7 +1836,8 @@ def _get_project_allowed_domains(project):
     managed = models.ManagedProject.objects.filter(project=project).first()
     if managed is not None:
         try:
-            return managed.get_details().allowed_domains
+            domains = managed.get_details().allowed_domains
+            return None if domains is None else sorted(str(dp) for dp in domains)
         except Exception as e:
             logger.warning(
                 f"_get_project_allowed_domains: ManagedProject check failed "
@@ -1856,7 +1857,7 @@ def _get_project_allowed_domains(project):
             details = rp.get_last_sent_details()
             if details is None or details.allowed_domains is None:
                 return None  # any unrestricted RemoteProject → overall unrestricted
-            union.update(details.allowed_domains)
+            union.update(str(dp) for dp in details.allowed_domains)
         except Exception as e:
             logger.warning(
                 f"_get_project_allowed_domains: RemoteProject {rp.pk} check "
