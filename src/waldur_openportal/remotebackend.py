@@ -11,16 +11,14 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.structure.backend import ServiceBackend
 from waldur_core.structure.exceptions import ServiceBackendError
-from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.invoices import models as invoice_models
+from waldur_mastermind.marketplace import models as marketplace_models
 
-from waldur_openportal import remote_project_service
-from waldur_openportal import signals
+from waldur_openportal import remote_project_service, signals
 from waldur_openportal.remoteclient import RemoteOpenPortalClient
 
 from . import models
 from . import op as openportal
-from . import utils as openportal_utils
 
 logger = logging.getLogger(__name__)
 
@@ -113,57 +111,48 @@ class RemoteOpenPortalBackend(ServiceBackend):
             self.add_allocated_project(allocation)
             return
 
-        project = allocation.get_project_identifier()
-        remote_project = allocation.get_project_identifier()
-        logger.debug(
-            f"Syncing users for allocation: {allocation} | {project} <=> {remote_project}"
-        )
-        users = allocation.project.get_users()
-        logger.debug(f"Users for allocation: {users}")
+        logger.debug(f"Syncing users for allocation: {allocation}")
 
-        # go through and add the users who are not in OpenPortal
-        for user in users:
-            if not user.is_active:
-                logger.warning(
-                    f"Removing {user} as they are no longer listed as active"
-                )
-                continue
+        active_users = [u for u in allocation.project.get_users() if u.is_active]
+        active_user_ids = {u.id for u in active_users}
 
-            # get the association between the user and the allocation
-            try:
-                (association, _) = models.RemoteAssociation.objects.get_or_create(
+        existing_associations = {
+            ra.user_id: ra  # type: ignore[attr-defined]
+            for ra in models.RemoteAssociation.objects.filter(
+                allocation=allocation, user__isnull=False
+            )
+        }
+
+        # Create associations for users not yet tracked.
+        for user in active_users:
+            if user.id not in existing_associations:
+                association = models.RemoteAssociation.objects.create(
                     user=user, allocation=allocation
                 )
-            except models.RemoteAssociation.MultipleObjectsReturned:
-                association = openportal_utils.get_remote_association(
-                    user=user, allocation=allocation
+                signals.openportal_remote_association_created.send(
+                    models.RemoteAllocation,
+                    allocation=allocation,
+                    user=user,
+                )
+                logger.debug(f"Created RemoteAssociation for {user} on {allocation}.")
+
+        # Remove associations for users no longer in the project.
+        for user_id, association in existing_associations.items():
+            if user_id not in active_user_ids:
+                signals.openportal_remote_association_deleted.send(
+                    models.RemoteAllocation,
+                    allocation=allocation,
+                    user=association.user,
+                )
+                association.delete()
+                logger.debug(
+                    f"Deleted RemoteAssociation for user_id={user_id} on {allocation}."
                 )
 
-            try:
-                if not association.user_is_in_remote():
-                    logger.debug(f"Adding user {user} to OpenPortal Remote Project")
-
-                    self.client.add_user(
-                        project=project, user=user, role=association.role
-                    )
-
-                    logger.debug(
-                        f"Added user {user} to OpenPortal project {project} in role {association.role}"
-                    )
-
-                    association.set_user_is_in_remote(True)
-                    association.save()
-
-                    signals.openportal_association_created.send(
-                        models.RemoteAllocation,
-                        allocation=allocation,
-                        user=user,
-                    )
-            except Exception as e:
-                logger.error(f"Unable to add user {user} to OpenPortal: {e}")
-
-        # Note that we don't remove remote users - the membership is solely
-        # managed by the PI on the remote system - we only add people here
+        # Push the full current AwardDetails to the remote portal so that
+        # membership enforcement (add/remove/role changes) is applied according
+        # to the membership_control setting.
+        self.update_allocated_project(allocation, force_update=True)
 
     def assert_can_add_allocation(self, allocation: models.RemoteAllocation):
         """
@@ -322,16 +311,13 @@ class RemoteOpenPortalBackend(ServiceBackend):
                     if allocation.has_remote_project_identifier()
                     else None
                 )
-                remote_project = (
-                    remote_project_service.get_or_create_remote_project(
-                        allocation, destination, remote_identifier=_rid
-                    )
+                remote_project = remote_project_service.get_or_create_remote_project(
+                    allocation, destination, remote_identifier=_rid
                 )
                 details = remote_project.award_details().merge(details)
             except Exception as _rp_e:
                 logger.warning(
-                    f"Failed to prepare RemoteProject for"
-                    f" {allocation}: {_rp_e}"
+                    f"Failed to prepare RemoteProject for {allocation}: {_rp_e}"
                 )
 
             # add it again just to be sure
@@ -400,16 +386,13 @@ class RemoteOpenPortalBackend(ServiceBackend):
             # then merge live Waldur data on top so local fields win.
             remote_project = None
             try:
-                remote_project = (
-                    remote_project_service.get_or_create_remote_project(
-                        allocation, destination, remote_identifier=None
-                    )
+                remote_project = remote_project_service.get_or_create_remote_project(
+                    allocation, destination, remote_identifier=None
                 )
                 details = remote_project.award_details().merge(details)
             except Exception as _rp_e:
                 logger.warning(
-                    f"Failed to prepare RemoteProject for"
-                    f" {allocation}: {_rp_e}"
+                    f"Failed to prepare RemoteProject for {allocation}: {_rp_e}"
                 )
 
             try:
@@ -479,12 +462,10 @@ class RemoteOpenPortalBackend(ServiceBackend):
             )
             # Identifier now known after successful add — upgrade the
             # pending record if needed.
-            remote_project = (
-                remote_project_service.get_or_create_remote_project(
-                    allocation,
-                    destination,
-                    remote_identifier=remote_identifier,
-                )
+            remote_project = remote_project_service.get_or_create_remote_project(
+                allocation,
+                destination,
+                remote_identifier=remote_identifier,
             )
             attachment = remote_project_service.ensure_current_attachment(
                 remote_project
@@ -567,13 +548,9 @@ class RemoteOpenPortalBackend(ServiceBackend):
             _remote_project = remote_project_service.get_or_create_remote_project(
                 allocation, destination, remote_identifier=remote_identifier
             )
-            project_details = _remote_project.award_details().merge(
-                project_details
-            )
+            project_details = _remote_project.award_details().merge(project_details)
         except Exception as e:
-            logger.warning(
-                f"Failed to prepare RemoteProject for {allocation}: {e}"
-            )
+            logger.warning(f"Failed to prepare RemoteProject for {allocation}: {e}")
 
         if force_update:
             version = allocation.increment_version()
@@ -1219,9 +1196,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
         month boundaries.
         """
         if not isinstance(allocation, models.RemoteAllocation):
-            raise ServiceBackendError(
-                "Invalid allocation type %s" % type(allocation)
-            )
+            raise ServiceBackendError("Invalid allocation type %s" % type(allocation))
 
         if not allocation.is_added_to_openportal():
             allocation = self.add_allocated_project(allocation)
@@ -1261,14 +1236,12 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 report = self.client.get_storage_report(project, month)
             except openportal.OpenPortalError as e:
                 logger.warning(
-                    f"Failed to get storage report for {allocation}"
-                    f" in {month}: {e}"
+                    f"Failed to get storage report for {allocation} in {month}: {e}"
                 )
                 continue
             except Exception as e:
                 logger.error(
-                    f"Failed to get storage report for {allocation}"
-                    f" in {month}: {e}"
+                    f"Failed to get storage report for {allocation} in {month}: {e}"
                 )
                 continue
 

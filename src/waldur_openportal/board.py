@@ -1064,7 +1064,10 @@ class OpenPortalBoard:
         # Updating membership last, as we need to know the project is ok
         if details.members is not None:
             current_members = utils.get_project_members(project)
+            can_change_membership = details.can_change_membership()
+            can_change_roles = details.can_change_roles()
 
+            # Add missing members; enforce roles only when we are authoritative.
             for email, role in details.members.items():
                 try:
                     local_role = project_template.get_local_role_for(role)
@@ -1080,15 +1083,35 @@ class OpenPortalBoard:
 
                 existing_role_name = current_members.get(email, None)
 
-                if existing_role_name == local_role.name:
-                    continue
+                if existing_role_name is None:
+                    # Not a member yet — add regardless of control settings.
+                    utils.set_project_member_role(
+                        project=project,
+                        email=email,
+                        role=local_role,
+                        is_existing_member=False,
+                    )
+                elif not can_change_roles and existing_role_name != local_role.name:
+                    # Member exists with wrong role and we are authoritative on roles.
+                    utils.set_project_member_role(
+                        project=project,
+                        email=email,
+                        role=local_role,
+                        is_existing_member=True,
+                    )
 
-                utils.set_project_member_role(
-                    project=project,
-                    email=email,
-                    role=local_role,
-                    is_existing_member=existing_role_name is not None,
-                )
+            # Remove members absent from the authoritative list.
+            if not can_change_membership:
+                incoming_emails = {
+                    str(e).strip().lower() for e in details.members.keys()
+                }
+                for email in list(current_members.keys()):
+                    if email not in incoming_emails:
+                        logger.info(
+                            f"Removing {email} from project {project} "
+                            f"(not in authoritative member list)."
+                        )
+                        utils.remove_project_member(project, email)
 
         return managed_project.get_mapping()
 

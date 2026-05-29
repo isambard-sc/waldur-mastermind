@@ -783,13 +783,6 @@ class RemoteAssociation(core_models.UuidMixin):
     def __repr__(self):
         return self.__str__()
 
-    def user_is_in_remote(self) -> bool:
-        """
-        Check if the user is in the remote OpenPortal instance.
-        This is done by checking if the user has a remote project identifier.
-        """
-        logger.warning("NEED TO PROPERLY TEST IF A USER IS IN THE REMOTE INSTANCE")
-        return self.allocation.has_remote_project_identifier()
 
 
 class AllocationUserUsage(UsageMixin):

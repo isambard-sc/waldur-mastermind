@@ -846,6 +846,34 @@ def set_project_member_role(project, email, role, is_existing_member: bool = Fal
     logger.debug(f"Set role {role.name} for {email} on project {project}.")
 
 
+def remove_project_member(project, email: str) -> None:
+    """
+    Revoke all active roles and cancel any pending invitations for the user
+    with *email* on *project*.  Does nothing if no such user or membership exists.
+    """
+    from django.contrib.contenttypes.models import ContentType
+
+    if not isinstance(project, structure_models.Project):
+        raise TypeError("project must be an instance of Project")
+
+    email = str(email).strip().lower()
+    robot = get_openportal_robot()
+
+    user = core_models.User.objects.filter(email__iexact=email).first()
+    if user is not None:
+        for perm in get_permissions(project, user):
+            perm.revoke(current_user=robot)
+
+    user_models.Invitation.objects.filter(
+        state=InvitationState.PENDING,
+        content_type=ContentType.objects.get_for_model(project),
+        object_id=project.pk,
+        email__iexact=email,
+    ).update(state=InvitationState.CANCELED)
+
+    logger.debug(f"Removed {email} from project {project}.")
+
+
 def refresh_remote_award(remote_project):
     """
     Fetch the current AwardDetails for *remote_project* from the remote portal,
@@ -922,16 +950,22 @@ def _sync_project_users_from_remote(
     """
     from . import models as op_models
 
-    remote_projects = op_models.RemoteProject.objects.filter(
-        current_project=project,
-        state__in=[
-            op_models.RemoteProjectState.ACTIVE,
-            op_models.RemoteProjectState.STALE,
-        ],
-    ).exclude(identifier__isnull=True).exclude(identifier="")
+    remote_projects = (
+        op_models.RemoteProject.objects.filter(
+            current_project=project,
+            state__in=[
+                op_models.RemoteProjectState.ACTIVE,
+                op_models.RemoteProjectState.STALE,
+            ],
+        )
+        .exclude(identifier__isnull=True)
+        .exclude(identifier="")
+    )
 
     if not remote_projects.exists():
-        logger.debug(f"No active RemoteProjects found for project {project} — skipping sync.")
+        logger.debug(
+            f"No active RemoteProjects found for project {project} — skipping sync."
+        )
         return
 
     robot = get_openportal_robot()
@@ -952,7 +986,9 @@ def _sync_project_users_from_remote(
             continue
 
         if details.members is None:
-            logger.debug(f"Remote award for {remote_project.identifier} has no member list.")
+            logger.debug(
+                f"Remote award for {remote_project.identifier} has no member list."
+            )
             continue
 
         for email, role_name in details.members.items():
@@ -972,7 +1008,9 @@ def _sync_project_users_from_remote(
                 )
                 continue
 
-            logger.info(f"{prefix}Would add {email} to project {project} with role {role.name}.")
+            logger.info(
+                f"{prefix}Would add {email} to project {project} with role {role.name}."
+            )
 
             if not dry_run:
                 user = get_or_create_user_by_email(email)
@@ -1031,74 +1069,112 @@ def get_allowed_domains_for_project(project) -> list[str]:
     return sorted(allowed)
 
 
-def transition_membership_to_locked(
+def set_membership_control(
     remote_project,
+    new_control: str,
     dry_run: bool = True,
+    performed_by=None,
 ) -> None:
     """
-    Transition *remote_project* from any non-locked membership control to Locked.
+    Set the membership control on *remote_project* to *new_control*
+    (a MembershipControlChoices value).
 
-    Steps:
-      1. If already locked (model field or last_sent_details), do nothing.
-      2. Sync all remote portal members into the local project.
-      3. Rebuild allowed_domains from the current (post-sync) local members.
-      4. Set membership_control=LOCKED and allowed_domains on the RemoteProject.
-      5. Trigger an update push so the remote portal receives the new state.
+    If the control has not changed, does nothing.
 
-    dry_run=True (default) logs what would happen without making changes.
+    When the change makes membership non-changeable by the remote portal
+    (old can_change_membership() == True, new can_change_membership() == False),
+    the remote portal's current member list is first synced into the local
+    project and allowed_domains is rebuilt — merging with any already-permitted
+    domains so nothing is lost — before the lock is applied.
+
+    An audit entry is recorded after the change.  Pass performed_by to
+    attribute the change to a specific user.
+
+    dry_run=True (default) logs intended changes without applying them.
     The function is idempotent — re-running after a partial failure is safe.
     """
     from . import models as op_models
+    from . import op as openportal
     from . import tasks as op_tasks
+
+    if new_control is None:
+        new_control = op_models.MembershipControlChoices.OPEN
 
     prefix = "[DRY RUN] " if dry_run else ""
 
-    # Step 1 — already locked?
-    if remote_project.membership_control == op_models.MembershipControlChoices.LOCKED:
-        logger.info(f"{prefix}{remote_project}: membership_control already locked — nothing to do.")
-        return
-
-    sent = remote_project.get_last_sent_details()
-    if sent is not None and not sent.can_change_membership() and not sent.can_change_roles():
-        logger.info(f"{prefix}{remote_project}: last_sent_details already locked — nothing to do.")
+    if remote_project.membership_control == new_control:
+        logger.info(
+            f"{prefix}{remote_project}: membership_control already {new_control!r} — nothing to do."
+        )
         return
 
     project = remote_project.current_project
     if project is None:
-        logger.error(f"RemoteProject {remote_project} has no current_project — cannot lock.")
-        return
-
-    logger.info(
-        f"{prefix}Transitioning {remote_project} "
-        f"from {remote_project.membership_control!r} to locked."
-    )
-
-    # Step 2 — pull remote members into local project
-    logger.info(f"{prefix}Syncing users from remote portal before locking.")
-    _sync_project_users_from_remote(project, dry_run=dry_run)
-
-    # Step 3 — build domain rules from current (post-sync) members,
-    # merging with any domains already permitted so nothing is lost.
-    # Explicitly convert to str to avoid hashing issues with domain objects.
-    new_domains = {str(d) for d in get_allowed_domains_for_project(project)}
-    existing_domains = {str(d) for d in (remote_project.allowed_domains or [])}
-    allowed_domains = sorted(existing_domains | new_domains)
-    logger.info(f"{prefix}Computed allowed_domains: {allowed_domains}")
-
-    if dry_run:
-        logger.info(
-            f"{prefix}Would set membership_control=locked, "
-            f"allowed_domains={allowed_domains}, and push update."
+        logger.error(
+            f"RemoteProject {remote_project} has no current_project — cannot change membership control."
         )
         return
 
-    # Step 4 — persist new control and domain rules
-    remote_project.membership_control = op_models.MembershipControlChoices.LOCKED
-    remote_project.allowed_domains = allowed_domains
-    remote_project.save(update_fields=["membership_control", "allowed_domains", "modified"])
-    logger.info(f"Set membership_control=locked and allowed_domains on {remote_project}.")
+    # Determine whether a remote-sync is needed before applying the new control.
+    # Sync is required when the remote portal was free to change membership
+    # (old can_change_membership() == True) and will no longer be after the
+    # transition (new can_change_membership() == False).
+    try:
+        old_details = remote_project.award_details()
+        new_details_temp = openportal.AwardDetails.from_json(
+            json.dumps({"membership_control": new_control})
+        )
+        needs_sync = (
+            old_details.can_change_membership()
+            and not new_details_temp.can_change_membership()
+        )
+    except Exception as e:
+        logger.error(f"set_membership_control: failed to evaluate change for {remote_project}: {e}")
+        return
 
-    # Step 5 — push updated AwardDetails to remote portal
+    logger.info(
+        f"{prefix}Changing membership_control "
+        f"from {remote_project.membership_control!r} to {new_control!r} "
+        f"on {remote_project}"
+        + (" (sync required)" if needs_sync else "")
+        + "."
+    )
+
+    allowed_domains = None
+
+    if needs_sync:
+        logger.info(f"{prefix}Syncing users from remote portal before applying new control.")
+        _sync_project_users_from_remote(project, dry_run=dry_run)
+
+        new_domains = {str(d) for d in get_allowed_domains_for_project(project)}
+        existing_domains = {str(d) for d in (remote_project.allowed_domains or [])}
+        allowed_domains = sorted(existing_domains | new_domains)
+        logger.info(f"{prefix}Computed allowed_domains: {allowed_domains}")
+
+    if dry_run:
+        msg = f"Would set membership_control={new_control!r}"
+        if allowed_domains is not None:
+            msg += f", allowed_domains={allowed_domains}"
+        logger.info(f"{prefix}{msg}, and push update.")
+        return
+
+    remote_project.membership_control = new_control
+    save_fields = ["membership_control", "modified"]
+    if allowed_domains is not None:
+        remote_project.allowed_domains = allowed_domains
+        save_fields.append("allowed_domains")
+    remote_project.save(update_fields=save_fields)
+
+    note = f"membership_control set to {new_control!r}"
+    if needs_sync:
+        note += " (members synced from remote portal)"
+    op_models.RemoteProjectAuditEntry.objects.create(
+        remote_project=remote_project,
+        event_type=op_models.RemoteProjectAuditEventType.AWARD_UPDATED,
+        performed_by=performed_by,
+        note=note,
+    )
+
     op_tasks.update_remote_project.delay(core_utils.serialize_instance(project))
     logger.info(f"Queued update_remote_project for {project}.")
 

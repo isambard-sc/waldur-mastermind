@@ -1210,6 +1210,37 @@ def update_remote_project(serialized_project):
             logger.error(f"Failed to update remote project {remote_allocation}: {e}")
 
 
+@shared_task(name="waldur_openportal.apply_membership_control")
+def apply_membership_control(serialized_remote_project, new_control: str, performed_by_id=None):
+    """
+    Apply a membership control transition on a RemoteProject.
+    May involve a live fetch from the remote portal (if a member sync is needed),
+    so this is run asynchronously rather than blocking the API.
+    """
+    logger.info(
+        f"OpenPortal task.set_membership_control: {serialized_remote_project} -> {new_control!r}"
+    )
+
+    if isinstance(serialized_remote_project, models.RemoteProject):
+        remote_project = serialized_remote_project
+    else:
+        remote_project = core_utils.deserialize_instance(serialized_remote_project)
+        if not isinstance(remote_project, models.RemoteProject):
+            logger.error(f"set_membership_control: expected RemoteProject, got {type(remote_project)}")
+            return
+
+    performed_by = None
+    if performed_by_id is not None:
+        performed_by = User.objects.filter(id=performed_by_id).first()
+
+    utils.set_membership_control(
+        remote_project,
+        new_control=new_control,
+        dry_run=False,
+        performed_by=performed_by,
+    )
+
+
 @shared_task(name="waldur_openportal.delete_remote_project")
 def delete_remote_project(serialized_project):
     """

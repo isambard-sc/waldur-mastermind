@@ -1474,8 +1474,8 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
     )
     def set_membership_control(self, request, uuid=None):
         """
-        Set or clear the membership control policy.  Pass null to
-        reset to the default Open behaviour.
+        Queue a membership control transition.  The actual work (including any
+        remote portal sync) runs in a background task to avoid blocking the API.
         """
         remote_project = self.get_object()
         self._check_write_permission(request, remote_project)
@@ -1484,24 +1484,13 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        remote_project.membership_control = serializer.validated_data[
-            "membership_control"
-        ]
-        remote_project.save(update_fields=["membership_control", "modified"])
-
-        models.RemoteProjectAuditEntry.objects.create(
-            remote_project=remote_project,
-            event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATED),
-            performed_by=request.user,
-            note=(f"membership_control set to {remote_project.membership_control}"),
+        tasks.apply_membership_control.delay(  # type: ignore[attr-defined]
+            core_utils.serialize_instance(remote_project),
+            new_control=serializer.validated_data["membership_control"],
+            performed_by_id=request.user.id,
         )
-        self._trigger_update(remote_project)
 
-        return Response(
-            serializers.RemoteProjectSerializer(
-                remote_project, context={"request": request}
-            ).data
-        )
+        return Response(status=status.HTTP_202_ACCEPTED)
 
     @action(
         detail=True,
