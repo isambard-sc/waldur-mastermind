@@ -3035,8 +3035,8 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         Compute the best current view of the award by merging last_sent_details
         (our intent — authoritative for locally-authored fields and membership)
         with last_confirmed_details (remote ground truth — authoritative for
-        project_link and any notes or members added by the remote portal),
-        then layering in the current award-level extras stored on this model.
+        project_link), then layering in the current award-level extras stored
+        on this model.
 
         Merge rules:
         - Locally-authored fields (name, description, dates, template, key,
@@ -3044,8 +3044,9 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         - Notes and breakdown: union from both, notes sorted chronologically.
         - project_link: last_confirmed wins (remote portal owns its own URL),
           unless link_project is explicitly set on this RemoteProject.
-        - Members: last_sent is authoritative (our intent); members present in
-          last_confirmed but absent from last_sent are added (remote-added).
+        - Members: last_sent is always authoritative — the local portal's team
+          membership is the sole source of truth and is never augmented from
+          last_confirmed.
         - Extras (link_*, earliest_approve, membership_control,
           allowed_domains, breakdown): current model fields win — they may be
           newer than the last send.
@@ -3064,27 +3065,24 @@ class RemoteProject(core_models.UuidMixin, models.Model):
             return extras_obj
 
         if sent is None:
-            result = confirmed
-        elif confirmed is None:
+            sent = openportal.AwardDetails("{}")
+
+        if confirmed is None:
             result = sent
         else:
             # confirmed.merge(sent) → sent's locally-authored fields take
-            # precedence; notes and breakdown are unioned; members are replaced
-            # by sent's if sent has any.
+            # precedence; notes and breakdown are unioned.
             result = confirmed.merge(sent)
+
+            # Explicitly enforce local membership and membership_control —
+            # merge() may blend these, but last_sent is always authoritative.
+            result.members = sent.members
+            result.membership_control = sent.membership_control
 
             # Remote portal owns its own project URL — always restore from
             # confirmed (unless link_project overrides it via extras below).
             if confirmed.project_link is not None:
                 result.project_link = confirmed.project_link
-
-            # Add any members the remote portal added that we never sent.
-            if sent.members is not None:
-                sent_members = sent.members
-                confirmed_members = confirmed.members or {}
-                for username, role in confirmed_members.items():
-                    if username not in sent_members:
-                        result.add_member(username, role)
 
         # Layer in current extras — these may be newer than the last send.
         # Notes are unioned (merge deduplicates); other fields overwrite.

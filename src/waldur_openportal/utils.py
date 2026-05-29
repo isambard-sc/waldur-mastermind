@@ -1003,6 +1003,106 @@ def sync_users_from_remote_portal(
         raise TypeError(f"Expected Project or Customer, got {type(scope)}")
 
 
+def get_allowed_domains_for_project(project) -> list[str]:
+    """
+    Build an allowed_domains list from the current project members.
+
+    For institutional addresses the domain and *.domain are added.
+    For personal addresses (gmail, etc.) the full email is added instead,
+    so the individual is permitted without opening the whole consumer domain.
+
+    Returns a sorted, deduplicated list.
+    """
+    allowed: set[str] = set()
+    for user_id in get_project_users(project.id):
+        user = core_models.User.objects.filter(id=user_id, is_active=True).first()
+        if user is None:
+            continue
+        email = (user.email or "").strip().lower()
+        if not email or "@" not in email:
+            continue
+        if is_likely_personal_email_address(email):
+            allowed.add(email)
+        else:
+            domain = email.split("@")[-1]
+            if domain:
+                allowed.add(domain)
+                allowed.add(f"*.{domain}")
+    return sorted(allowed)
+
+
+def transition_membership_to_locked(
+    remote_project,
+    dry_run: bool = True,
+) -> None:
+    """
+    Transition *remote_project* from any non-locked membership control to Locked.
+
+    Steps:
+      1. If already locked (model field or last_sent_details), do nothing.
+      2. Sync all remote portal members into the local project.
+      3. Rebuild allowed_domains from the current (post-sync) local members.
+      4. Set membership_control=LOCKED and allowed_domains on the RemoteProject.
+      5. Trigger an update push so the remote portal receives the new state.
+
+    dry_run=True (default) logs what would happen without making changes.
+    The function is idempotent — re-running after a partial failure is safe.
+    """
+    from . import models as op_models
+    from . import tasks as op_tasks
+
+    prefix = "[DRY RUN] " if dry_run else ""
+
+    # Step 1 — already locked?
+    if remote_project.membership_control == op_models.MembershipControlChoices.LOCKED:
+        logger.info(f"{prefix}{remote_project}: membership_control already locked — nothing to do.")
+        return
+
+    sent = remote_project.get_last_sent_details()
+    if sent is not None and not sent.can_change_membership() and not sent.can_change_roles():
+        logger.info(f"{prefix}{remote_project}: last_sent_details already locked — nothing to do.")
+        return
+
+    project = remote_project.current_project
+    if project is None:
+        logger.error(f"RemoteProject {remote_project} has no current_project — cannot lock.")
+        return
+
+    logger.info(
+        f"{prefix}Transitioning {remote_project} "
+        f"from {remote_project.membership_control!r} to locked."
+    )
+
+    # Step 2 — pull remote members into local project
+    logger.info(f"{prefix}Syncing users from remote portal before locking.")
+    _sync_project_users_from_remote(project, dry_run=dry_run)
+
+    # Step 3 — build domain rules from current (post-sync) members,
+    # merging with any domains already permitted so nothing is lost.
+    # Explicitly convert to str to avoid hashing issues with domain objects.
+    new_domains = {str(d) for d in get_allowed_domains_for_project(project)}
+    existing_domains = {str(d) for d in (remote_project.allowed_domains or [])}
+    allowed_domains = sorted(existing_domains | new_domains)
+    logger.info(f"{prefix}Computed allowed_domains: {allowed_domains}")
+
+    if dry_run:
+        logger.info(
+            f"{prefix}Would set membership_control=locked, "
+            f"allowed_domains={allowed_domains}, and push update."
+        )
+        return
+
+    # Step 4 — persist new control and domain rules
+    remote_project.membership_control = op_models.MembershipControlChoices.LOCKED
+    remote_project.allowed_domains = allowed_domains
+    remote_project.save(update_fields=["membership_control", "allowed_domains", "modified"])
+    logger.info(f"Set membership_control=locked and allowed_domains on {remote_project}.")
+
+    # Step 5 — push updated AwardDetails to remote portal
+    op_tasks.update_remote_project.delay(core_utils.serialize_instance(project))
+    logger.info(f"Queued update_remote_project for {project}.")
+
+
 def _user_info_dict(user):
     return {
         "uuid": str(user.uuid),
