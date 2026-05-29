@@ -2191,6 +2191,12 @@ def backfill_remote_projects(dry_run: bool = False):
                 # we know about the allocation right now.  Do NOT set
                 # last_contact_time: we don't know when we last heard
                 # from the remote portal for this historical entry.
+                #
+                # Explicitly set Open so that the remote portal retains
+                # full control of its own membership during migration.
+                remote_project.membership_control = (
+                    models.MembershipControlChoices.OPEN
+                )
                 if allocation.is_added:
                     remote_project.state = models.RemoteProjectState.ACTIVE
                     alloc_value, _ = allocation._get_requested_allocation()
@@ -2198,7 +2204,7 @@ def backfill_remote_projects(dry_run: bool = False):
                         remote_project.current_allocation = decimal.Decimal(
                             str(alloc_value)
                         )
-                    remote_project.save()
+                remote_project.save()
 
                 models.RemoteProjectAuditEntry.objects.create(
                     remote_project=remote_project,
