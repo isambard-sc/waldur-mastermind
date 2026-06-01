@@ -418,6 +418,25 @@ def filter_rounds(user):
     )
 
 
+class RoundMembershipControlChoices:
+    """
+    Duplicated from waldur_openportal.models.MembershipControlChoices to avoid
+    a cross-app import in the proposal models.
+    """
+
+    OPEN = "open"
+    MEMBERS_ONLY = "members_only"
+    ROLES_ONLY = "roles_only"
+    LOCKED = "locked"
+
+    CHOICES = [
+        (OPEN, _("Open — receiving portal manages membership freely")),
+        (MEMBERS_ONLY, _("Members only — roles are authoritative")),
+        (ROLES_ONLY, _("Roles only — membership is authoritative")),
+        (LOCKED, _("Locked — both membership and roles are authoritative")),
+    ]
+
+
 class Round(
     TimeStampedModel,
     core_models.UuidMixin,
@@ -489,6 +508,18 @@ class Round(
     allocation_date = models.DateTimeField(null=True, blank=True)
     start_time = models.DateTimeField()
     cutoff_time = models.DateTimeField()
+    default_membership_control = models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        choices=RoundMembershipControlChoices.CHOICES,
+        help_text="Default membership control policy applied to RemoteProjects created from proposals in this round.",
+    )
+    default_allowed_domains = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Default list of email domain glob patterns allowed to join projects on the remote portal.",
+    )
     call = models.ForeignKey(Call, on_delete=models.PROTECT)
     proposal_set: models.Manager["Proposal"]
 
@@ -624,6 +655,11 @@ class Proposal(
         null=True,
         blank=True,
         help_text="Timestamp when the proposal was submitted",
+    )
+    notes = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Append-only list of {timestamp, author, text} notes visible only to call managers and staff.",
     )
 
     # Note: checklist_completions relationship is automatically available via ChecklistCompletion.scope

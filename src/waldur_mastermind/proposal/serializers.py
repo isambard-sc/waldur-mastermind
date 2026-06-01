@@ -518,6 +518,8 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
             "review_duration_in_days",
             "minimum_number_of_reviewers",
             "minimum_required_uploads",
+            "default_membership_control",
+            "default_allowed_domains",
         ]
         extra_kwargs = {
             "slug": {"required": False},
@@ -554,6 +556,8 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
                 "review_duration_in_days",
                 "minimum_number_of_reviewers",
                 "minimum_required_uploads",
+                "default_membership_control",
+                "default_allowed_domains",
             ]
             for field_name in sensitive_fields:
                 fields.pop(field_name, None)
@@ -1339,6 +1343,8 @@ class ProposalSerializer(
     compliance_status = serializers.SerializerMethodField()
     can_submit = serializers.SerializerMethodField()
 
+    notes = serializers.SerializerMethodField()
+
     class Meta:
         model = models.Proposal
         fields = [
@@ -1372,6 +1378,7 @@ class ProposalSerializer(
             "submitted_at",
             "compliance_status",
             "can_submit",
+            "notes",
         ]
         read_only_fields = (
             "created_by",
@@ -1538,6 +1545,22 @@ class ProposalSerializer(
         can_submit, error = obj.can_submit()
         return {"can_submit": can_submit, "error": error}
 
+    def _is_notes_privileged(self, obj):
+        request = self.context.get("request")
+        if not request:
+            return False
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if user.is_staff or getattr(user, "is_support", False):
+            return True
+        call = obj.round.call
+        return call.has_user(user, CallRole.MANAGER)
+
+    @extend_schema_field(serializers.ListField(child=serializers.DictField()))
+    def get_notes(self, obj) -> list | None:
+        return obj.notes if self._is_notes_privileged(obj) else None
+
 
 class RoundReviewerSerializer(serializers.Serializer):
     full_name = serializers.SerializerMethodField()
@@ -1552,6 +1575,11 @@ class RoundReviewerSerializer(serializers.Serializer):
 
 class ProposalApproveSerializer(serializers.Serializer):
     allocation_comment = serializers.CharField(required=False)
+
+
+class AddProposalNoteSerializer(serializers.Serializer):
+    author = serializers.CharField(max_length=255)
+    text = serializers.CharField()
 
 
 class CallRoundSerializer(serializers.HyperlinkedModelSerializer):

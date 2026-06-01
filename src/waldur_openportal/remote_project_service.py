@@ -98,13 +98,31 @@ def get_or_create_remote_project(allocation, destination: str, remote_identifier
     # Compute defaults — used when a new record is created.
     link_award, link_call = get_proposal_links_for_project(project)
     allowed_domains = get_project_member_domains(project)
+
+    # Use round-level defaults when the project came from an accepted proposal.
+    from waldur_mastermind.proposal.models import Proposal
+
+    proposal = Proposal.objects.filter(project=project).select_related("round").first()
+    round_obj = proposal.round if proposal else None
+
+    default_membership_control = (
+        round_obj.default_membership_control
+        if round_obj and round_obj.default_membership_control
+        else models.MembershipControlChoices.LOCKED
+    )
+    default_allowed_domains = (
+        round_obj.default_allowed_domains
+        if round_obj and round_obj.default_allowed_domains
+        else (allowed_domains if allowed_domains else [])
+    )
+
     creation_defaults = {
         "remote_allocation": allocation,
         "current_project": project,
         "state": models.RemoteProjectState.PENDING,
-        "membership_control": models.MembershipControlChoices.LOCKED,
+        "membership_control": default_membership_control,
         "earliest_approve": allocation.created + timedelta(hours=1),
-        "allowed_domains": allowed_domains if allowed_domains else [],
+        "allowed_domains": default_allowed_domains,
         "link_award": link_award,
         "link_call": link_call,
     }

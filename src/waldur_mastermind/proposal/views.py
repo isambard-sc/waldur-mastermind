@@ -1852,6 +1852,34 @@ class ProposalViewSet(
     return_to_applicant_permissions = [check_proposal_management_permission]
     return_to_applicant_serializer_class = serializers.ProposalApproveSerializer
 
+    @extend_schema(
+        description="Append a timestamped note to the proposal. Visible only to call managers and staff.",
+        request=serializers.AddProposalNoteSerializer,
+        responses={status.HTTP_200_OK: serializers.ProposalSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"], url_path="add-note")
+    def add_note(self, request, uuid=None):
+        proposal = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        note = {
+            "timestamp": timezone.now().isoformat(),
+            "author": serializer.validated_data["author"],
+            "text": serializer.validated_data["text"],
+        }
+        notes = list(proposal.notes or [])
+        notes.append(note)
+        proposal.notes = notes
+        proposal.save(update_fields=["notes", "modified"])
+
+        return response.Response(
+            serializers.ProposalSerializer(proposal, context={"request": request}).data
+        )
+
+    add_note_permissions = [check_proposal_management_permission]
+    add_note_serializer_class = serializers.AddProposalNoteSerializer
+
     # Checklist Integration Endpoints
     # Checklist methods are now provided by ChecklistViewSetMixin
     # - checklist: Get checklist with questions and existing answers
