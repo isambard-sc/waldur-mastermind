@@ -1871,7 +1871,7 @@ class ProposalViewSet(
         notes = list(proposal.notes or [])
         notes.append(note)
         proposal.notes = notes
-        proposal.save(update_fields=["notes", "modified"])
+        proposal.save(update_fields=["notes"])
 
         return response.Response(
             serializers.ProposalSerializer(proposal, context={"request": request}).data
