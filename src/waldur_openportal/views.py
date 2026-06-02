@@ -1341,7 +1341,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_staff:
+        if user.is_staff or user.is_support:
             return models.RemoteProject.objects.all().order_by("-created")
         accessible_projects = filter_queryset_for_user(
             structure_models.Project.objects.all(), user
@@ -1366,7 +1366,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         CustomerOwner of the organisation that owns current_project.
         """
         user = request.user
-        if user.is_staff or getattr(user, "is_support", False):
+        if user.is_staff or user.is_support:
             return
         if remote_project.current_project is None:
             raise PermissionDenied(
@@ -1693,6 +1693,26 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             ).data
         )
 
+    @action(detail=True, methods=["get"], url_path="total-usage")
+    def total_usage(self, request, uuid=None):
+        """
+        Return the total usage hours for this remote project, summed
+        across all cached monthly usage reports.
+
+        Returns 0.0 if the project has no remote identifier yet or no
+        usage reports have been cached.
+        """
+        remote_project = self.get_object()
+        if not remote_project.identifier:
+            return Response({"total_hours": 0.0})
+
+        reports = models.CachedProjectUsageReport.objects.filter(
+            project_identifier=remote_project.identifier,
+            resource=remote_project.destination,
+        )
+        total_hours = sum(float(r.get_report().total_usage.hours) for r in reports)
+        return Response({"total_hours": total_hours})
+
 
 class RemoteProjectAuditEntryViewSet(core_views.ActionsViewSet):
     """
@@ -1714,7 +1734,7 @@ class RemoteProjectAuditEntryViewSet(core_views.ActionsViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_staff:
+        if user.is_staff or user.is_support:
             return models.RemoteProjectAuditEntry.objects.all().order_by("-timestamp")
         accessible_projects = filter_queryset_for_user(
             structure_models.Project.objects.all(), user
@@ -1744,7 +1764,7 @@ class RemoteProjectAllocationEntryViewSet(core_views.ActionsViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_staff:
+        if user.is_staff or user.is_support:
             return models.RemoteProjectAllocationEntry.objects.all().order_by(
                 "-submitted_at"
             )
@@ -1785,7 +1805,7 @@ class ManagedProjectAuditEntryViewSet(core_views.ActionsViewSet):
 
         user = self.request.user
 
-        if user.is_staff or getattr(user, "is_support", False):
+        if user.is_staff or user.is_support:
             return models.ManagedProjectAuditEntry.objects.all().order_by("-timestamp")
 
         # Restrict to organisations where the user is an owner
