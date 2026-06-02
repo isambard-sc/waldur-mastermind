@@ -93,6 +93,10 @@ class ProjectSection(FeatureSection):
         "adding or inviting users to a project."
     )
 
+    show_openportal_accounting_pages = Feature(
+        "Show OpenPortal accounting pages to users in the project workspace."
+    )
+
 
 class UserSection(FeatureSection):
     class Meta:
