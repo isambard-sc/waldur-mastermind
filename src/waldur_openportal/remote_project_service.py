@@ -23,6 +23,18 @@ def _merge_notes(remote_project):
     return json.loads(merged.to_json()).get("notes") or []
 
 
+def _sync_project_link(remote_project):
+    """
+    Update link_project from last_confirmed_details.project_link.
+    Called after last_confirmed_details has been set on the in-memory object.
+    The remote portal always owns its project URL.
+    """
+    confirmed = remote_project.last_confirmed_details or {}
+    link = confirmed.get("project_link")
+    if link:
+        remote_project.link_project = link
+
+
 def _parse_allocation_from_details(details_json):
     """
     Extract the numeric allocation from an AwardDetails JSON dict.
@@ -386,6 +398,7 @@ def record_award_created(
         remote_project.last_contact_time = now
         reconcile_allocation(remote_project)
         remote_project.notes = _merge_notes(remote_project)
+        _sync_project_link(remote_project)
 
         remote_project.save()
 
@@ -534,6 +547,7 @@ def record_award_update_confirmed(
         remote_project.last_contact_time = now
         reconcile_allocation(remote_project)
         remote_project.notes = _merge_notes(remote_project)
+        _sync_project_link(remote_project)
 
         remote_project.save()
 

@@ -834,7 +834,7 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     def get_resource_uuid(self, obj):
         if obj.remote_allocation is None:
             return None
-        return obj.remote_allocation.uuid
+        return obj.remote_allocation.marketplace_uuid
 
     @extend_schema_field(rf_serializers.CharField(allow_null=True))
     def get_resource_name(self, obj):

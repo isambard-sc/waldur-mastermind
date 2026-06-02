@@ -3076,15 +3076,15 @@ class RemoteProject(core_models.UuidMixin, models.Model):
             result.members = sent.members
             result.membership_control = sent.membership_control
 
-            # Remote portal owns its own project URL — always restore from
-            # confirmed (unless link_project overrides it via extras below).
-            if confirmed.project_link is not None:
-                result.project_link = confirmed.project_link
-
         # Layer in current extras — these may be newer than the last send.
         # Notes are unioned (merge deduplicates); other fields overwrite.
         if extras:
             result = result.merge(extras_obj)
+
+        # Remote portal always owns its project URL — restore after extras
+        # so that link_project cannot silently override a confirmed value.
+        if confirmed is not None and confirmed.project_link is not None:
+            result.project_link = confirmed.project_link
 
         return result
 
@@ -3101,8 +3101,6 @@ class RemoteProject(core_models.UuidMixin, models.Model):
             extras["award"] = self.link_award
         if self.link_call:
             extras["call"] = self.link_call
-        if self.link_project:
-            extras["project_link"] = self.link_project
         if self.link_renewal:
             extras["renewal"] = self.link_renewal
         if self.notes:
