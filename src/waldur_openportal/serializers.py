@@ -738,9 +738,9 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     """
     Serializer for RemoteProject.
 
-    Privileged fields (raw AwardDetails JSON, notes, earliest_approve)
-    are only returned to staff, support, or CustomerOwner of the
-    organisation that owns current_project.  All other fields are
+    Privileged fields (raw AwardDetails JSON, notes) are only returned
+    to staff, support, or CustomerOwner of the organisation that owns
+    current_project.  All other fields (including earliest_approve) are
     visible to any authenticated user who can see the project.
     """
 
@@ -858,8 +858,6 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
 
     @extend_schema_field(OpenApiTypes.DATETIME)
     def get_earliest_approve(self, obj):
-        if not self._is_privileged(obj):
-            return None
         if obj.earliest_approve is None:
             return None
         return obj.earliest_approve.isoformat()
