@@ -912,11 +912,13 @@ def refresh_remote_award(remote_project):
         if confirmed_details_json is not None:
             remote_project.last_confirmed_details = confirmed_details_json
             remote_project_service.reconcile_allocation(remote_project)
+            remote_project.notes = remote_project_service._merge_notes(remote_project)
             remote_project.save(
                 update_fields=[
                     "last_confirmed_details",
                     "current_allocation",
                     "pending_allocation",
+                    "notes",
                     "modified",
                 ]
             )

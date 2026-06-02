@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 from decimal import Decimal
@@ -10,6 +11,16 @@ from waldur_core.core.enums import CoreStates
 from waldur_openportal import models
 
 logger = logging.getLogger(__name__)
+
+
+def _merge_notes(remote_project):
+    """
+    Return the full deduplicated notes list from award_details().
+    Called after last_confirmed_details has been set on the in-memory object
+    so that award_details() unions local and remote notes correctly.
+    """
+    merged = remote_project.award_details()
+    return json.loads(merged.to_json()).get("notes") or []
 
 
 def _parse_allocation_from_details(details_json):
@@ -374,6 +385,7 @@ def record_award_created(
         remote_project.error_message = ""
         remote_project.last_contact_time = now
         reconcile_allocation(remote_project)
+        remote_project.notes = _merge_notes(remote_project)
 
         remote_project.save()
 
@@ -521,6 +533,7 @@ def record_award_update_confirmed(
         remote_project.error_message = ""
         remote_project.last_contact_time = now
         reconcile_allocation(remote_project)
+        remote_project.notes = _merge_notes(remote_project)
 
         remote_project.save()
 

@@ -46,6 +46,10 @@ class CustomerSection(FeatureSection):
 
     show_banking_data = Feature("Display banking related data under customer profile.")
 
+    show_openportal_remote_projects = Feature(
+        "Allows to show OpenPortal Remote Projects (remotes) in an organization."
+    )
+
 
 class ProjectSection(FeatureSection):
     class Meta:

@@ -2885,8 +2885,10 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         blank=True,
         verbose_name=_("notes"),
         help_text=_(
-            "Append-only list of timestamped notes "
-            "{timestamp, author, text} communicated to the remote portal."
+            "Append-only list of timestamped notes {timestamp, author, text}. "
+            "Kept in sync with the full merged set from award_details() — "
+            "includes both locally-authored notes and any notes added by the "
+            "remote portal."
         ),
     )
 
