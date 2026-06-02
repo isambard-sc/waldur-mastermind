@@ -1,3 +1,4 @@
+import json
 import logging
 
 from django.core.validators import MinValueValidator
@@ -763,6 +764,7 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     award_details = rf_serializers.SerializerMethodField()
     notes = rf_serializers.SerializerMethodField()
     earliest_approve = rf_serializers.SerializerMethodField()
+    allocation_string = rf_serializers.SerializerMethodField()
 
     class Meta:
         model = models.RemoteProject
@@ -777,6 +779,7 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
             # Allocation
             "current_allocation",
             "pending_allocation",
+            "allocation_string",
             # Links (always visible)
             "link_award",
             "link_call",
@@ -844,13 +847,19 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
 
     @extend_schema_field(rf_serializers.DictField(allow_null=True))
     def get_award_details(self, obj):
-        import json
         if not self._is_privileged(obj):
             return None
         details = obj.award_details()
         if details is None:
             return None
         return json.loads(details.to_json())
+
+    @extend_schema_field(rf_serializers.CharField(allow_null=True))
+    def get_allocation_string(self, obj):
+        details = obj.award_details()
+        if details is None:
+            return None
+        return json.loads(details.to_json()).get("allocation")
 
     @extend_schema_field(rf_serializers.ListField(allow_null=True))
     def get_notes(self, obj):
