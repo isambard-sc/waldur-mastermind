@@ -2916,12 +2916,14 @@ class RemoteProject(core_models.UuidMixin, models.Model):
     )
 
     allowed_domains = models.JSONField(
-        default=list,
+        null=True,
         blank=True,
+        default=None,
         verbose_name=_("allowed domains"),
         help_text=_(
-            "List of email domain glob patterns allowed to join "
-            "the project on the remote portal, e.g. ['*.ac.uk']."
+            "List of email domain glob patterns allowed to join the project "
+            "on the remote portal, e.g. ['*.ac.uk']. "
+            "None means all domains are allowed."
         ),
     )
 

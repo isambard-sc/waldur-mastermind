@@ -756,6 +756,9 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     )
     has_pending_change = rf_serializers.BooleanField(read_only=True)
 
+    resource_uuid = rf_serializers.SerializerMethodField()
+    resource_name = rf_serializers.SerializerMethodField()
+
     # Privileged-only fields exposed via SerializerMethodField so that
     # unprivileged users receive null rather than a 403.
     last_sent_details = rf_serializers.SerializerMethodField()
@@ -773,6 +776,8 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
             "uuid",
             "destination",
             "identifier",
+            "resource_uuid",
+            "resource_name",
             # State
             "state",
             "state_display",
@@ -824,6 +829,18 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
         customer = obj.current_project.customer
         from waldur_core.permissions.fixtures import CustomerRole
         return customer.has_user(user, CustomerRole.OWNER)
+
+    @extend_schema_field(rf_serializers.UUIDField(allow_null=True))
+    def get_resource_uuid(self, obj):
+        if obj.remote_allocation is None:
+            return None
+        return obj.remote_allocation.uuid
+
+    @extend_schema_field(rf_serializers.CharField(allow_null=True))
+    def get_resource_name(self, obj):
+        if obj.remote_allocation is None:
+            return None
+        return obj.remote_allocation.name
 
     @extend_schema_field(rf_serializers.DictField(allow_null=True))
     def get_last_sent_details(self, obj):
