@@ -1339,7 +1339,11 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
     ]
     ordering_fields = ("created", "state", "identifier", "destination")
 
+    queryset = models.RemoteProject.objects.none()
+
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.RemoteProject.objects.none()
         user = self.request.user
         if user.is_staff or user.is_support:
             return models.RemoteProject.objects.all().order_by("-created")
@@ -1730,9 +1734,12 @@ class RemoteProjectAuditEntryViewSet(core_views.ActionsViewSet):
         "partial_update",
         "destroy",
     ]
+    queryset = models.RemoteProjectAuditEntry.objects.none()
     ordering_fields = ("timestamp", "event_type")
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.RemoteProjectAuditEntry.objects.none()
         user = self.request.user
         if user.is_staff or user.is_support:
             return models.RemoteProjectAuditEntry.objects.all().order_by("-timestamp")
@@ -1760,9 +1767,12 @@ class RemoteProjectAllocationEntryViewSet(core_views.ActionsViewSet):
         "partial_update",
         "destroy",
     ]
+    queryset = models.RemoteProjectAllocationEntry.objects.none()
     ordering_fields = ("submitted_at", "allocation")
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.RemoteProjectAllocationEntry.objects.none()
         user = self.request.user
         if user.is_staff or user.is_support:
             return models.RemoteProjectAllocationEntry.objects.all().order_by(
