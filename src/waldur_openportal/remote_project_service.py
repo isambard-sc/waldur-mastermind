@@ -141,6 +141,14 @@ def get_or_create_remote_project(allocation, destination: str, remote_identifier
     else:
         default_allowed_domains = None
 
+    if round_obj and round_obj.default_reapply_url:
+        link_renewal = {
+            "id": round_obj.default_reapply_text or "",
+            "url": round_obj.default_reapply_url,
+        }
+    else:
+        link_renewal = None
+
     creation_defaults = {
         "remote_allocation": allocation,
         "current_project": project,
@@ -150,6 +158,7 @@ def get_or_create_remote_project(allocation, destination: str, remote_identifier
         "allowed_domains": default_allowed_domains,
         "link_award": link_award,
         "link_call": link_call,
+        "link_renewal": link_renewal,
     }
 
     if remote_identifier is not None:

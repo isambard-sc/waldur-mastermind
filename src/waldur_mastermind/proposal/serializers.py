@@ -520,6 +520,8 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
             "minimum_required_uploads",
             "default_membership_control",
             "default_allowed_domains",
+            "default_reapply_url",
+            "default_reapply_text",
         ]
         extra_kwargs = {
             "slug": {"required": False},
@@ -558,6 +560,8 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
                 "minimum_required_uploads",
                 "default_membership_control",
                 "default_allowed_domains",
+                "default_reapply_url",
+                "default_reapply_text",
             ]
             for field_name in sensitive_fields:
                 fields.pop(field_name, None)

@@ -520,6 +520,17 @@ class Round(
         blank=True,
         help_text="Default list of email domain glob patterns allowed to join projects on the remote portal.",
     )
+    default_reapply_url = models.URLField(
+        null=True,
+        blank=True,
+        help_text="URL for successful applicants to reapply for new time or a follow-on application.",
+    )
+    default_reapply_text = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="Link text for the reapply URL shown to successful applicants.",
+    )
     call = models.ForeignKey(Call, on_delete=models.PROTECT)
     proposal_set: models.Manager["Proposal"]
 
