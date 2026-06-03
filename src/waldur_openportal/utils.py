@@ -1133,27 +1133,34 @@ def set_membership_control(
             and not new_details_temp.can_change_membership()
         )
     except Exception as e:
-        logger.error(f"set_membership_control: failed to evaluate change for {remote_project}: {e}")
+        logger.error(
+            f"set_membership_control: failed to evaluate change for {remote_project}: {e}"
+        )
         return
 
     logger.info(
         f"{prefix}Changing membership_control "
         f"from {remote_project.membership_control!r} to {new_control!r} "
-        f"on {remote_project}"
-        + (" (sync required)" if needs_sync else "")
-        + "."
+        f"on {remote_project}" + (" (sync required)" if needs_sync else "") + "."
     )
 
     allowed_domains = None
 
     if needs_sync:
-        logger.info(f"{prefix}Syncing users from remote portal before applying new control.")
+        logger.info(
+            f"{prefix}Syncing users from remote portal before applying new control."
+        )
         _sync_project_users_from_remote(project, dry_run=dry_run)
 
         new_domains = {str(d) for d in get_allowed_domains_for_project(project)}
         existing_domains = {str(d) for d in (remote_project.allowed_domains or [])}
         allowed_domains = sorted(existing_domains | new_domains)
         logger.info(f"{prefix}Computed allowed_domains: {allowed_domains}")
+
+    if remote_project.allowed_domains is not None and allowed_domains is None:
+        # make sure we capture any pre-existing allowed_domains if we're not
+        # already doing a sync (which will compute the merged set)
+        allowed_domains = remote_project.allowed_domains
 
     if dry_run:
         msg = f"Would set membership_control={new_control!r}"
@@ -1164,9 +1171,10 @@ def set_membership_control(
 
     remote_project.membership_control = new_control
     save_fields = ["membership_control", "modified"]
-    if allowed_domains is not None:
-        remote_project.allowed_domains = allowed_domains
-        save_fields.append("allowed_domains")
+
+    remote_project.allowed_domains = allowed_domains
+    save_fields.append("allowed_domains")
+
     remote_project.save(update_fields=save_fields)
 
     note = f"membership_control set to {new_control!r}"
@@ -1979,6 +1987,7 @@ PERSONAL_EMAIL_DOMAINS = frozenset(
         "wp.pl",
         "o2.pl",
         "interia.pl",
+        "hey.com",
     ]
 )
 
@@ -2198,9 +2207,7 @@ def backfill_remote_projects(dry_run: bool = False):
                 #
                 # Explicitly set Open so that the remote portal retains
                 # full control of its own membership during migration.
-                remote_project.membership_control = (
-                    models.MembershipControlChoices.OPEN
-                )
+                remote_project.membership_control = models.MembershipControlChoices.OPEN
                 if allocation.is_added:
                     remote_project.state = models.RemoteProjectState.ACTIVE
                     alloc_value, _ = allocation._get_requested_allocation()

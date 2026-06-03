@@ -939,6 +939,15 @@ class OpenPortalBoard:
         logger.debug(f"Merging new details into project {identifier}: {new_details}")
         existing_details_dict = managed_project.details
         details = managed_project.merge_details(new_details)
+
+        # make sure that members is None if it was passed in as None
+        if new_details.members is None:
+            details.members = None
+
+        # make sure that we only get membership control from the remote portal
+        details.membership_control = new_details.membership_control
+        details.allowed_domains = new_details.allowed_domains
+
         logger.debug(f"New details after merge: {details}")
         managed_project.set_details(details)
         logger.debug(f"Updated ManagedProject {managed_project} with new details.")
@@ -1062,9 +1071,10 @@ class OpenPortalBoard:
                 details.allocation = new_details.allocation
 
         # Updating membership last, as we need to know the project is ok
+        can_change_membership = details.can_change_membership()
+        current_members = utils.get_project_members(project)
+
         if details.members is not None:
-            current_members = utils.get_project_members(project)
-            can_change_membership = details.can_change_membership()
             can_change_roles = details.can_change_roles()
 
             # Add missing members; enforce roles only when we are authoritative.
@@ -1100,18 +1110,19 @@ class OpenPortalBoard:
                         is_existing_member=True,
                     )
 
-            # Remove members absent from the authoritative list.
-            if not can_change_membership:
-                incoming_emails = {
-                    str(e).strip().lower() for e in details.members.keys()
-                }
-                for email in list(current_members.keys()):
-                    if email not in incoming_emails:
-                        logger.info(
-                            f"Removing {email} from project {project} "
-                            f"(not in authoritative member list)."
-                        )
-                        utils.remove_project_member(project, email)
+        # need to account for details.members being None
+        # Remove members absent from the authoritative list.
+        if not can_change_membership:
+            details_members = details.members or {}
+            incoming_emails = {str(e).strip().lower() for e in details_members.keys()}
+
+            for email in list(current_members.keys()):
+                if email not in incoming_emails:
+                    logger.info(
+                        f"Removing {email} from project {project} "
+                        f"(not in authoritative member list)."
+                    )
+                    utils.remove_project_member(project, email)
 
         return managed_project.get_mapping()
 

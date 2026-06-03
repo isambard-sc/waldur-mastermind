@@ -392,19 +392,6 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
         if project.end_date is not None:
             details.end_date = project.end_date
 
-        # try:
-        # Set the award details - this is in a try block
-        # in case this feature is not supported by the current
-        # version of OpenPortal
-        #    award = openportal.AwardDetails()
-        #    award.award_id = str(project.slug)
-        #    award.link = core_utils.format_homeport_link(
-        #        "projects/{uuid}/", uuid=project.uuid.hex
-        #    )
-        #    details.award = award
-        # except Exception as e:
-        #    logger.warning(f"Failed to set award details for project {project}: {e}")
-
         # The project key is the UUID of the organisation that owns
         # the project. This way, only projects within the approved
         # organisation can create remote projects using this
@@ -432,8 +419,6 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
         # now try to add in any members for this project
         # also keeping note of the allowed email domains
         # for this project
-        # allowed_domains = set()
-
         for user_id in get_project_users(project.id):
             try:
                 user = core_models.User.objects.filter(id=user_id)
@@ -469,12 +454,6 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                         f"Skipping user {user} with empty email for project {project}"
                     )
                     continue
-
-                # if "@" in email:
-                #    domain = email.split("@")[1].strip().lower()
-                #    if domain:
-                #        allowed_domains.add(domain)
-                #        allowed_domains.add(f"*.{domain}")
 
                 # get the role name of this user in the project
                 roles = UserRole.objects.filter(
@@ -530,13 +509,6 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
                     details.add_member(email, role_name)
             except Exception as e:
                 logger.warning(f"Failed to add user {user} to project {project}: {e}")
-
-        # try:
-        #    details.allowed_domains = list(allowed_domains)
-        # except Exception as e:
-        #    logger.warning(
-        #        f"Failed to set allowed domains for project {project} to {allowed_domains}: {e}"
-        #    )
 
         logger.debug(f"Returning project details for project {project}: {details}")
 
@@ -782,7 +754,6 @@ class RemoteAssociation(core_models.UuidMixin):
 
     def __repr__(self):
         return self.__str__()
-
 
 
 class AllocationUserUsage(UsageMixin):
@@ -3074,12 +3045,15 @@ class RemoteProject(core_models.UuidMixin, models.Model):
             # Explicitly enforce local membership and membership_control —
             # merge() may blend these, but last_sent is always authoritative.
             result.members = sent.members
-            result.membership_control = sent.membership_control
 
         # Layer in current extras — these may be newer than the last send.
         # Notes are unioned (merge deduplicates); other fields overwrite.
         if extras:
             result = result.merge(extras_obj)
+
+            # explicitly control membership control locally
+            result.membership_control = extras_obj.membership_control or None
+            result.allowed_domains = extras_obj.allowed_domains or None
 
         # Remote portal always owns its project URL — restore after extras
         # so that link_project cannot silently override a confirmed value.
@@ -3167,9 +3141,7 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         """
         from waldur_openportal import remote_project_service
 
-        remote_project_service.record_award_attempted(
-            self, sent_details_json or {}
-        )
+        remote_project_service.record_award_attempted(self, sent_details_json or {})
 
     def record_rejected(self, error_message, details_json=None):
         """
@@ -3183,9 +3155,7 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         from waldur_openportal import remote_project_service
 
         if self.state == RemoteProjectState.ACTIVE:
-            remote_project_service.record_award_update_rejected(
-                self, error_message
-            )
+            remote_project_service.record_award_update_rejected(self, error_message)
         else:
             remote_project_service.record_award_rejected(
                 self, details_json, error_message

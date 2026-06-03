@@ -451,7 +451,9 @@ class RemoteOpenPortalBackend(ServiceBackend):
         # Exception: older remote portals that don't support get_award return
         # "Unknown command" — fall back to the details we just sent.
         try:
-            confirmed_details_json = json.loads(self.client.get_award(project).to_json())
+            confirmed_details_json = json.loads(
+                self.client.get_award(project).to_json()
+            )
         except openportal.OpenPortalOtherError as e:
             if "Unknown command" in str(e):
                 logger.warning(
@@ -560,7 +562,14 @@ class RemoteOpenPortalBackend(ServiceBackend):
             _remote_project = remote_project_service.get_or_create_remote_project(
                 allocation, destination, remote_identifier=remote_identifier
             )
-            project_details = _remote_project.award_details().merge(project_details)
+
+            new_project_details = _remote_project.award_details().merge(project_details)
+
+            # make sure that if members is None, this is preserved
+            if project_details.members is None:
+                new_project_details.members = None
+
+            project_details = new_project_details
         except Exception as e:
             logger.warning(f"Failed to prepare RemoteProject for {allocation}: {e}")
 
