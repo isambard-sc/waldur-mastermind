@@ -3117,16 +3117,12 @@ class RemoteProject(core_models.UuidMixin, models.Model):
             extras["renewal"] = self.link_renewal
         if self.notes:
             extras["notes"] = self.notes
-        from datetime import timedelta
 
         from django.utils import timezone as tz
 
-        earliest = (
-            self.earliest_approve
-            if self.earliest_approve is not None
-            else tz.now() - timedelta(days=1)
-        )
-        extras["earliest_approve"] = earliest.isoformat()
+        if self.earliest_approve is not None and self.earliest_approve > tz.now():
+            extras["earliest_approve"] = self.earliest_approve.isoformat()
+
         if self.membership_control:
             extras["membership_control"] = self.membership_control
         if self.allowed_domains:

@@ -89,6 +89,55 @@ def reconcile_allocation(remote_project):
     # else: no allocation data at all — leave fields unchanged
 
 
+def _get_or_create_audit_entry(
+    remote_project,
+    event_type,
+    *,
+    previous_details=None,
+    new_details=None,
+    allocation_entry=None,
+    performed_by=None,
+    remote_response=None,
+    note="",
+):
+    """
+    Return the most recent audit entry for (remote_project, event_type) if its
+    content fields match, otherwise create and return a new one.
+
+    Content identity is defined by new_details, previous_details, note, and
+    remote_response.  allocation_entry and performed_by are metadata links and
+    are not compared.
+    """
+    last = (
+        models.RemoteProjectAuditEntry.objects.filter(
+            remote_project=remote_project,
+            event_type=event_type,
+        )
+        .order_by("-timestamp")
+        .first()
+    )
+
+    if (
+        last is not None
+        and last.new_details == new_details
+        and last.previous_details == previous_details
+        and last.note == note
+        and last.remote_response == remote_response
+    ):
+        return last
+
+    return models.RemoteProjectAuditEntry.objects.create(
+        remote_project=remote_project,
+        event_type=event_type,
+        previous_details=previous_details,
+        new_details=new_details,
+        allocation_entry=allocation_entry,
+        performed_by=performed_by,
+        remote_response=remote_response,
+        note=note,
+    )
+
+
 def get_or_create_remote_project(allocation, destination: str, remote_identifier=None):
     """
     Get or create a RemoteProject for this allocation.
@@ -191,8 +240,9 @@ def get_or_create_remote_project(allocation, destination: str, remote_identifier
             changed = []
             if remote_project.remote_allocation != allocation:
                 remote_project.remote_allocation = allocation
-                remote_project.earliest_approve = allocation.created + timedelta(
-                    hours=1
+                new_ea = allocation.created + timedelta(hours=1)
+                remote_project.earliest_approve = (
+                    new_ea if new_ea > timezone.now() else None
                 )
                 changed.append("remote_allocation")
                 changed.append("earliest_approve")
@@ -227,8 +277,9 @@ def get_or_create_remote_project(allocation, destination: str, remote_identifier
                 remote_project.save()
             elif remote_project.remote_allocation != allocation:
                 remote_project.remote_allocation = allocation
+                new_ea = allocation.created + timedelta(hours=1)
                 remote_project.earliest_approve = (
-                    allocation.created + timedelta(hours=1)
+                    new_ea if new_ea > timezone.now() else None
                 )
                 remote_project.save(
                     update_fields=[
@@ -264,9 +315,9 @@ def record_award_rejected(remote_project, details_json, error_message):
         alloc.set_erred()
         alloc.save()
 
-    audit_entry = models.RemoteProjectAuditEntry.objects.create(
-        remote_project=remote_project,
-        event_type=models.RemoteProjectAuditEventType.AWARD_REJECTED,
+    audit_entry = _get_or_create_audit_entry(
+        remote_project,
+        models.RemoteProjectAuditEventType.AWARD_REJECTED,
         new_details=details_json,
         note=error_message,
     )
@@ -294,20 +345,9 @@ def record_award_attempted(remote_project, details_json, note=""):
         update_fields.append("pending_allocation")
     remote_project.save(update_fields=update_fields)
 
-    last = (
-        models.RemoteProjectAuditEntry.objects.filter(
-            remote_project=remote_project,
-            event_type=models.RemoteProjectAuditEventType.AWARD_ATTEMPTED,
-        )
-        .order_by("-timestamp")
-        .first()
-    )
-    if last is not None and last.new_details == details_json:
-        return last
-
-    audit_entry = models.RemoteProjectAuditEntry.objects.create(
-        remote_project=remote_project,
-        event_type=models.RemoteProjectAuditEventType.AWARD_ATTEMPTED,
+    audit_entry = _get_or_create_audit_entry(
+        remote_project,
+        models.RemoteProjectAuditEventType.AWARD_ATTEMPTED,
         new_details=details_json,
         note=note,
     )
@@ -381,10 +421,9 @@ def record_award_created(
             )
 
         now = timezone.now()
-        allocation_value = (
-            _parse_allocation_from_details(sent_details_json)
-            or _parse_allocation_from_details(confirmed_details_json)
-        )
+        allocation_value = _parse_allocation_from_details(
+            sent_details_json
+        ) or _parse_allocation_from_details(confirmed_details_json)
 
         allocation_entry = None
         if allocation_value is not None:
@@ -417,9 +456,9 @@ def record_award_created(
             alloc.error_message = ""
             alloc.save(update_fields=["state", "error_message", "modified"])
 
-        audit_entry = models.RemoteProjectAuditEntry.objects.create(
-            remote_project=remote_project,
-            event_type=models.RemoteProjectAuditEventType.AWARD_CREATED,
+        audit_entry = _get_or_create_audit_entry(
+            remote_project,
+            models.RemoteProjectAuditEventType.AWARD_CREATED,
             new_details=confirmed_details_json,
             allocation_entry=allocation_entry,
         )
@@ -466,9 +505,9 @@ def record_award_sent(
     reconcile_allocation(remote_project)
     remote_project.save()
 
-    audit_entry = models.RemoteProjectAuditEntry.objects.create(
-        remote_project=remote_project,
-        event_type=models.RemoteProjectAuditEventType.AWARD_UPDATED,
+    audit_entry = _get_or_create_audit_entry(
+        remote_project,
+        models.RemoteProjectAuditEventType.AWARD_UPDATED,
         previous_details=remote_project.last_confirmed_details,
         new_details=details_json,
         allocation_entry=allocation_entry,
@@ -507,19 +546,16 @@ def record_award_update_confirmed(
     """
     with transaction.atomic():
         qs = models.RemoteProject.objects.filter(pk=remote_project.pk)
-        remote_project = (
-            qs.select_for_update(skip_locked=skip_locked).first()
-        )
+        remote_project = qs.select_for_update(skip_locked=skip_locked).first()
         if remote_project is None:
             raise RuntimeError(
                 "RemoteProject is locked by another task — skipping record_award_update_confirmed"
             )
 
         now = timezone.now()
-        allocation_value = (
-            _parse_allocation_from_details(sent_details_json)
-            or _parse_allocation_from_details(confirmed_details_json)
-        )
+        allocation_value = _parse_allocation_from_details(
+            sent_details_json
+        ) or _parse_allocation_from_details(confirmed_details_json)
 
         allocation_entry = None
         if allocation_value is not None:
@@ -548,6 +584,7 @@ def record_award_update_confirmed(
 
         if sent_details_json is not None:
             remote_project.last_sent_details = sent_details_json
+
         remote_project.last_confirmed_details = confirmed_details_json
         remote_project.pending_details = None
         remote_project.pending_since = None
@@ -566,9 +603,9 @@ def record_award_update_confirmed(
             alloc.error_message = ""
             alloc.save(update_fields=["state", "error_message", "modified"])
 
-        audit_entry = models.RemoteProjectAuditEntry.objects.create(
-            remote_project=remote_project,
-            event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATE_CONFIRMED),
+        audit_entry = _get_or_create_audit_entry(
+            remote_project,
+            models.RemoteProjectAuditEventType.AWARD_UPDATE_CONFIRMED,
             new_details=confirmed_details_json,
             allocation_entry=allocation_entry,
         )
@@ -600,9 +637,9 @@ def record_award_update_rejected(remote_project, error_message, remote_response=
         remote_response if remote_response is not None else {"error": error_message}
     )
 
-    audit_entry = models.RemoteProjectAuditEntry.objects.create(
-        remote_project=remote_project,
-        event_type=(models.RemoteProjectAuditEventType.AWARD_UPDATE_REJECTED),
+    audit_entry = _get_or_create_audit_entry(
+        remote_project,
+        models.RemoteProjectAuditEventType.AWARD_UPDATE_REJECTED,
         remote_response=response_data,
         note=error_message,
     )
@@ -652,9 +689,9 @@ def record_resource_deleted(remote_project, note=""):
     remote_project.state = models.RemoteProjectState.DELETED
     remote_project.save()
 
-    audit_entry = models.RemoteProjectAuditEntry.objects.create(
-        remote_project=remote_project,
-        event_type=models.RemoteProjectAuditEventType.RESOURCE_DELETED,
+    audit_entry = _get_or_create_audit_entry(
+        remote_project,
+        models.RemoteProjectAuditEventType.RESOURCE_DELETED,
         note=note,
     )
 
