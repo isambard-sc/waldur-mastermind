@@ -2264,8 +2264,25 @@ class ManagedProject(ReviewMixin, models.Model):
             )
 
         if self.details != new_details:
+            old_details = self.details
             self.details = new_details
             self.save(update_fields=["details"])
+
+            last = (
+                ManagedProjectAuditEntry.objects.filter(
+                    managed_project=self,
+                    event_type=ManagedProjectAuditEventType.DETAILS_UPDATED,
+                )
+                .order_by("-timestamp")
+                .first()
+            )
+            if last is None or last.new_details != self.details:
+                ManagedProjectAuditEntry.record(
+                    self,
+                    ManagedProjectAuditEventType.DETAILS_UPDATED,
+                    previous_details=old_details,
+                    new_details=self.details,
+                )
 
     def get_details(self) -> openportal.ProjectDetails:
         """
@@ -2326,12 +2343,33 @@ class ManagedProject(ReviewMixin, models.Model):
     ) -> openportal.ProjectDetails:
         """
         Merge incoming details from the local portal into the existing details,
-        preserving any project_link that was set by this (remote) portal.
-        The local portal has no knowledge of the remote project URL/slug, so it
-        must never be allowed to override it.
+        with the following fields treated as authoritative from the incoming
+        details and always overriding the stored values:
+
+        - membership_control, allowed_domains: the remote portal sets membership
+          policy and it must not be softened by a merge with older stored values.
+        - award, call, renewal: link fields set by the local portal are the
+          source of truth and must replace whatever was previously stored.
+        - members: a None value explicitly means "do not manage membership" and
+          must not be overridden by stored members from a previous sync.
+
+        project_link is always set from this portal's own project reference,
+        since the local portal has no knowledge of the remote project URL/slug.
         """
         existing = self.get_details()
         merged = existing.merge(new_details)
+
+        # These fields are authoritative from the incoming details and must
+        # override the merged result.
+        merged.membership_control = new_details.membership_control
+        merged.allowed_domains = new_details.allowed_domains
+        merged.award = new_details.award
+        merged.call = new_details.call
+        merged.renewal = new_details.renewal
+
+        if new_details.members is None:
+            merged.members = None
+
         merged.project_link = self._get_project_link()
         return merged
 

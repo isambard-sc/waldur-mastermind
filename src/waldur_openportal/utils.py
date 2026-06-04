@@ -874,7 +874,31 @@ def remove_project_member(project, email: str) -> None:
     logger.debug(f"Removed {email} from project {project}.")
 
 
-def refresh_remote_award(remote_project):
+def get_local_project_identifier(project):
+    """
+    Return the local openportal.ProjectIdentifier for the passed project on
+    this portal. This is a combination of its openportal project name and the
+    portal name, e.g. "project.portal"
+    """
+    shortname = get_project_shortname(project)
+    if shortname is None:
+        logger.error(f"Project {project} has no shortname; cannot get identifier.")
+        raise ValueError(f"Project {project} has no shortname; cannot get identifier.")
+
+    from . import op as openportal
+
+    if not openportal.have_openportal():
+        logger.error("OpenPortal is not configured; cannot get project identifier.")
+        raise RuntimeError(
+            "OpenPortal is not configured; cannot get project identifier."
+        )
+
+    openportal.ensure_config_loaded()
+
+    return openportal.ProjectIdentifier(f"{shortname}.{openportal.get_portal()}")
+
+
+def refresh_remote_project(remote_project):
     """
     Fetch the current AwardDetails for *remote_project* from the remote portal,
     update last_confirmed_details and reconcile allocation, then record last contact.
@@ -888,25 +912,41 @@ def refresh_remote_award(remote_project):
 
     if remote_project.current_project is None:
         logger.warning(
-            f"refresh_remote_award: RemoteProject {remote_project.destination!r} "
+            f"refresh_remote_project: RemoteProject {remote_project.destination!r} "
             f"has no current_project — skipping."
         )
         return None
 
     if not openportal.have_openportal():
-        logger.warning("refresh_remote_award: OpenPortal is not configured.")
+        logger.warning("refresh_remote_project: OpenPortal is not configured.")
         return None
 
     openportal.ensure_config_loaded()
 
     destination = openportal.Destination(str(remote_project.destination))
-    local_id = openportal.ProjectIdentifier(
-        f"{remote_project.current_project.slug}.{openportal.get_portal()}"
-    )
+
+    try:
+        local_id = get_local_project_identifier(remote_project.current_project)
+    except Exception as e:
+        logger.warning(
+            f"refresh_remote_project: could not get local identifier for project "
+            f"{remote_project.current_project!r}: {e}"
+        )
+        return remote_project.last_confirmed_details
 
     try:
         board = OpenPortalBoard(destination)
-        details = board.refetch_award(local_id)
+
+        try:
+            details = board.refetch_award(local_id)
+        except openportal.OpenPortalUnsupportedCommandError as e:
+            logger.warning(
+                f"refresh_remote_project: remote portal does not support get_award"
+                f" for {remote_project.identifier!r} (older portal) — skipping refresh: {e}"
+            )
+            remote_project_service.touch_last_contact(remote_project)
+            return remote_project.last_confirmed_details
+
         confirmed_details_json = json.loads(details.to_json()) if details else None
 
         if confirmed_details_json is not None:
@@ -926,7 +966,7 @@ def refresh_remote_award(remote_project):
             )
     except Exception as e:
         logger.warning(
-            f"refresh_remote_award: could not refetch award "
+            f"refresh_remote_project: could not refetch award "
             f"{remote_project.identifier!r} from {remote_project.destination!r}: {e}"
         )
         remote_project_service.touch_last_contact(remote_project)
@@ -981,7 +1021,7 @@ def _sync_project_users_from_remote(
             f"{prefix}Syncing members from remote portal {remote_project.destination} "
             f"for project {project}."
         )
-        details = refresh_remote_award(remote_project)
+        details = refresh_remote_project(remote_project)
         if details is None:
             logger.error(
                 f"Failed to fetch award from {remote_project.destination} "

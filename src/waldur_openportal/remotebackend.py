@@ -448,21 +448,22 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
         # Refetch confirmed state from the remote before saving the allocation.
         # If this raises the allocation is not saved, so the next sync retries.
-        # Exception: older remote portals that don't support get_award return
-        # "Unknown command" — fall back to the details we just sent.
+        # Exception: older remote portals that don't support get_award raise
+        # OpenPortalUnsupportedCommandError — fall back to the details we just sent.
         try:
             confirmed_details_json = json.loads(
                 self.client.get_award(project).to_json()
             )
-        except openportal.OpenPortalOtherError as e:
-            if "Unknown command" in str(e):
-                logger.warning(
-                    f"Remote portal does not support get_award for {project}"
-                    f" (older portal) — using sent details as confirmed: {e}"
-                )
+        except openportal.OpenPortalUnsupportedCommandError as e:
+            logger.warning(
+                f"Remote portal does not support get_award for {project}"
+                f" (older portal) — using sent details as confirmed: {e}"
+            )
+
+            if details:
                 confirmed_details_json = json.loads(details.to_json())
             else:
-                raise
+                confirmed_details_json = json.loads("{}")
 
         # Save state and mapping now, but defer is_added until RemoteProject is
         # recorded. If record_award_created fails, is_added stays False so the
@@ -600,22 +601,20 @@ class RemoteOpenPortalBackend(ServiceBackend):
             # Refetch confirmed state before marking the update as done.
             # If this raises, successfully_updated() is not called so the
             # allocation stays UPDATING and the next sync retries.
-            # Exception: older remote portals that don't support get_award return
-            # "Unknown command" — fall back to the details we just sent.
+            # Exception: older remote portals that don't support get_award raise
+            # OpenPortalUnsupportedCommandError — fall back to the details we just sent.
             try:
                 _confirmed_details_json = json.loads(
                     self.client.get_award(project_identifier).to_json()
                 )
-            except openportal.OpenPortalOtherError as e:
-                if "Unknown command" in str(e):
-                    logger.warning(
-                        f"Remote portal does not support get_award for"
-                        f" {project_identifier} (older portal)"
-                        f" — using sent details as confirmed: {e}"
-                    )
-                    _confirmed_details_json = _details_json
-                else:
-                    raise
+            except openportal.OpenPortalUnsupportedCommandError as e:
+                logger.warning(
+                    f"Remote portal does not support get_award for"
+                    f" {project_identifier} (older portal)"
+                    f" — using sent details as confirmed: {e}"
+                )
+                _confirmed_details_json = _details_json
+
             allocation.successfully_updated(version)
             allocation.update_mapping(mapping)
             # update_project succeeded without exception — the remote portal

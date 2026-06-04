@@ -29,6 +29,10 @@ class OpenPortalOtherError(OpenPortalError):
             return self._message
 
 
+class OpenPortalUnsupportedCommandError(OpenPortalError):
+    pass
+
+
 class ManagedProjectPermissionError(OpenPortalError):
     pass
 

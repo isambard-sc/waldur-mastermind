@@ -379,7 +379,18 @@ def sync_remote_allocation_users(serialized_allocation):
 
     backend = allocation.get_backend()
 
-    allocation = backend.check_added_allocation(allocation)
+    try:
+        allocation = backend.check_added_allocation(allocation)
+    except Exception as e:
+        if str(e).find("ManagedProjectPendingError") != -1:
+            logger.debug(
+                f"Allocation {allocation} is still pending in remote portal - skipping usage sync"
+            )
+        else:
+            logger.error(f"Failed to check allocation {allocation}: {e}")
+
+        # just return for now - we can't sync usage as the project is not connected
+        return
 
     backend.sync_users(allocation)
 
@@ -435,7 +446,7 @@ def sync_remote_usage():
             logger.error(f"Failed to sync usage for {allocation}: {e}")
             fail_count += 1
 
-            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+            if fail_count > 25 and (datetime.datetime.now() - now).seconds > 600:
                 logger.error("Too many failures - aborting")
                 return
             elif (datetime.datetime.now() - now).seconds > 3600:
@@ -600,6 +611,43 @@ def sync_remote_allocation_storage(serialized_allocation):
     backend.sync_storage(allocation)
 
 
+@shared_task(name="waldur_openportal.refresh_remote_projects")
+@run_once_task(takeover_timeout=60 * 60)
+def refresh_remote_projects():
+    """
+    Refresh the details of all RemoteProjects from the remote portal.
+    This is called periodically in case we miss the updates that
+    come from push notifications
+    """
+    logger.info("OpenPortal task.refresh_remote_projects")
+    now = datetime.datetime.now()
+    fail_count = 0
+
+    remote_projects = list(models.RemoteProject.objects.all())
+
+    # randomise the order of the projects to avoid always processing in the same order and potentially
+    # leaving some projects with outdated details for a long time
+    random.shuffle(remote_projects)
+
+    for remote_project in remote_projects:
+        try:
+            utils.refresh_remote_project(remote_project)
+        except Exception as e:
+            logger.error(f"Failed to refresh remote project {remote_project}: {e}")
+            fail_count += 1
+
+            if fail_count > 25 and (datetime.datetime.now() - now).seconds > 600:
+                logger.error("Too many failures - aborting")
+                return
+            elif (datetime.datetime.now() - now).seconds > 3600:
+                logger.error("sync_remote_projects took too long - aborting")
+                return
+
+        if (datetime.datetime.now() - now).seconds > 3600:
+            logger.error("sync_remote_projects took too long - aborting")
+            return
+
+
 @shared_task(name="waldur_openportal.sync_remote_storage")
 @run_once_task(takeover_timeout=60 * 60)
 def sync_remote_storage():
@@ -621,7 +669,7 @@ def sync_remote_storage():
             logger.error(f"Failed to sync storage for {allocation}: {e}")
             fail_count += 1
 
-            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
+            if fail_count > 25 and (datetime.datetime.now() - now).seconds > 600:
                 logger.error("Too many failures - aborting")
                 return
             elif (datetime.datetime.now() - now).seconds > 3600:
@@ -1211,7 +1259,9 @@ def update_remote_project(serialized_project):
 
 
 @shared_task(name="waldur_openportal.apply_membership_control")
-def apply_membership_control(serialized_remote_project, new_control: str, performed_by_id=None):
+def apply_membership_control(
+    serialized_remote_project, new_control: str, performed_by_id=None
+):
     """
     Apply a membership control transition on a RemoteProject.
     May involve a live fetch from the remote portal (if a member sync is needed),
@@ -1226,7 +1276,9 @@ def apply_membership_control(serialized_remote_project, new_control: str, perfor
     else:
         remote_project = core_utils.deserialize_instance(serialized_remote_project)
         if not isinstance(remote_project, models.RemoteProject):
-            logger.error(f"set_membership_control: expected RemoteProject, got {type(remote_project)}")
+            logger.error(
+                f"set_membership_control: expected RemoteProject, got {type(remote_project)}"
+            )
             return
 
     performed_by = None
@@ -1577,7 +1629,9 @@ def run_job(serialized_job):
         job = core_utils.deserialize_instance(serialized_job)
 
     if not isinstance(job, models.Job):
-        logger.error(f"OpenPortal - {_trim_job(job)} is not a Job instance - it is {type(job)}")
+        logger.error(
+            f"OpenPortal - {_trim_job(job)} is not a Job instance - it is {type(job)}"
+        )
         return
 
     job_model = job
@@ -1734,6 +1788,10 @@ def refresh_remote_award(destination: str, local_identifier: str):
     and update last_confirmed_details.  Always updates last_contact_time.
     If the fetch fails, last_confirmed_details is left unchanged.
 
+    Note that the destination is reversed, as this is called by a
+    notification from the remote portal, so we need to reverse it back to find
+    the RemoteProject.
+
     local_identifier is the award identifier on this portal, e.g. "awardtest.ukri".
     The RemoteProject is located via destination + the local project slug, then the
     remote identifier stored on that record is used for the actual fetch.
@@ -1747,6 +1805,12 @@ def refresh_remote_award(destination: str, local_identifier: str):
 
     openportal.ensure_config_loaded()
 
+    try:
+        destination: openportal.Destination = openportal.Destination(destination)
+    except Exception as e:
+        logger.error(f"refresh_remote_award: invalid destination {destination!r}: {e}")
+        return
+
     local_id = openportal.ProjectIdentifier(local_identifier)
 
     if str(local_id.portal) != str(openportal.get_portal()):
@@ -1756,19 +1820,26 @@ def refresh_remote_award(destination: str, local_identifier: str):
         )
         return
 
-    try:
-        project = structure_models.Project.objects.get(slug=str(local_id.project))
-    except structure_models.Project.DoesNotExist:
-        logger.error(
-            f"refresh_remote_award: no Project found with slug {local_id.project!r}"
-        )
-        return
+    current_project = None
 
     try:
-        destination: openportal.Destination = openportal.Destination(destination)
-    except Exception as e:
-        logger.error(f"refresh_remote_award: invalid destination {destination!r}: {e}")
-        return
+        # now find the project by the shortname
+        project_info = models.ProjectInfo.objects.get(shortname=str(local_id.project))
+        current_project = project_info.project
+    except models.ProjectInfo.DoesNotExist:
+        pass
+
+    if current_project is None:
+        # look this up by the slug instead of the shortname
+        try:
+            current_project = structure_models.Project.objects.get(
+                slug=str(local_id.project)
+            )
+        except structure_models.Project.DoesNotExist:
+            logger.error(
+                f"refresh_remote_award: no Project found with slug {local_id.project!r}"
+            )
+            return
 
     # The destination is actually reversed, as we received this notification
     # from the remote portal, so we need to reverse it back to find
@@ -1777,16 +1848,16 @@ def refresh_remote_award(destination: str, local_identifier: str):
 
     try:
         remote_project = models.RemoteProject.objects.get(
-            destination=str(destination), current_project=project
+            destination=str(destination), current_project=current_project
         )
     except models.RemoteProject.DoesNotExist:
         logger.error(
             f"refresh_remote_award: no RemoteProject found for "
-            f"destination={destination!r}, project slug={local_id.project!r}"
+            f"destination={destination!r}, project ID={local_id.project!r}"
         )
         return
 
-    utils.refresh_remote_award(remote_project)
+    utils.refresh_remote_project(remote_project)
 
 
 def dispatch_notification(notification: openportal.Notification):
@@ -1878,9 +1949,7 @@ def reject_remote_award(destination: str, local_identifier: str):
     try:
         dest = openportal.Destination(destination)
     except Exception as e:
-        logger.error(
-            f"reject_remote_award: invalid destination {destination!r}: {e}"
-        )
+        logger.error(f"reject_remote_award: invalid destination {destination!r}: {e}")
         return
 
     # Reverse the destination — the notification came from the remote portal
@@ -1902,8 +1971,7 @@ def reject_remote_award(destination: str, local_identifier: str):
         remote_project.record_rejected("Award rejected by remote portal")
     except Exception as e:
         logger.warning(
-            f"reject_remote_award: failed to record rejection for "
-            f"{remote_project}: {e}"
+            f"reject_remote_award: failed to record rejection for {remote_project}: {e}"
         )
         return
 
@@ -1948,9 +2016,7 @@ def accept_remote_award(destination: str, local_identifier: str):
     try:
         dest = openportal.Destination(destination)
     except Exception as e:
-        logger.error(
-            f"accept_remote_award: invalid destination {destination!r}: {e}"
-        )
+        logger.error(f"accept_remote_award: invalid destination {destination!r}: {e}")
         return
 
     dest = openportal.Destination(".".join(reversed(dest.agents)))

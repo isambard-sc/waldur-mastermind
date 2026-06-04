@@ -787,16 +787,6 @@ class OpenPortalBoard:
         """
         logger.debug(f"Updating project {identifier} with details {new_details}")
 
-        today = date.today()
-
-        if (
-            new_details.end_date is not None
-            and new_details.end_date + timedelta(days=PROJECT_GRACE_PERIOD_DAYS) < today
-        ):
-            raise openportal.ManagedProjectRejectedError(
-                f"End date {new_details.end_date} is in the past"
-            )
-
         if not isinstance(identifier, openportal.ProjectIdentifier):
             raise openportal.ManagedProjectRejectedError(
                 f"Invalid project identifier: {identifier}"
@@ -806,6 +796,13 @@ class OpenPortalBoard:
             raise openportal.ManagedProjectRejectedError(
                 f"Invalid project details: {new_details}"
             )
+
+        today = date.today()
+
+        expired_end_date = (
+            new_details.end_date is not None
+            and new_details.end_date + timedelta(days=PROJECT_GRACE_PERIOD_DAYS) < today
+        )
 
         # Get the ManagedProject for this identifier, which must already exist
         try:
@@ -818,11 +815,28 @@ class OpenPortalBoard:
                 f"ManagedProject for identifier {identifier} and destination {self.destination()} does not exist - recreating."
             )
 
+            if expired_end_date:
+                # no point creating a new project if the end date is already expired, just reject it
+                raise openportal.ManagedProjectRejectedError(
+                    f"End date {new_details.end_date} is in the past - cannot create project."
+                )
+
             # recreate the project, but make sure to ask for approval
             # so that the site admin can reject this request
             return self.create_award(
                 identifier=identifier, details=new_details, force_request_approval=True
             )
+
+        if expired_end_date:
+            # update the details
+            managed_project.set_details(managed_project.merge_details(new_details))
+
+            managed_project.reject(
+                utils.get_openportal_robot(),
+                f"{identifier} is rejected as the end date is in the past.",
+            )
+
+            raise openportal.ManagedProjectRejectedError()
 
         project_template = managed_project.get_project_template()
 
@@ -940,33 +954,9 @@ class OpenPortalBoard:
         existing_details_dict = managed_project.details
         details = managed_project.merge_details(new_details)
 
-        # make sure that members is None if it was passed in as None
-        if new_details.members is None:
-            details.members = None
-
-        # make sure that we only get membership control from the remote portal
-        details.membership_control = new_details.membership_control
-        details.allowed_domains = new_details.allowed_domains
-
         logger.debug(f"New details after merge: {details}")
         managed_project.set_details(details)
         logger.debug(f"Updated ManagedProject {managed_project} with new details.")
-
-        last = (
-            models.ManagedProjectAuditEntry.objects.filter(
-                managed_project=managed_project,
-                event_type=models.ManagedProjectAuditEventType.DETAILS_UPDATED,
-            )
-            .order_by("-timestamp")
-            .first()
-        )
-        if last is None or last.new_details != managed_project.details:
-            models.ManagedProjectAuditEntry.record(
-                managed_project,
-                models.ManagedProjectAuditEventType.DETAILS_UPDATED,
-                previous_details=existing_details_dict,
-                new_details=managed_project.details,
-            )
 
         # We still go through and check everything, in case the
         # project has moved away from the requested details
@@ -1288,7 +1278,14 @@ class OpenPortalBoard:
             instance_name=str(self.destination()),
             project_template=None,
         )
-        return client.get_award(identifier)
+        try:
+            return client.get_award(identifier)
+        except openportal.OpenPortalOtherError as e:
+            if "Unknown command" in str(e):
+                raise openportal.OpenPortalUnsupportedCommandError(
+                    f"get_award is not supported by the remote portal (older version): {e}"
+                ) from e
+            raise
 
     def get_projects(
         self, portal: openportal.PortalIdentifier

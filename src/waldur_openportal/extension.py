@@ -119,6 +119,15 @@ class OpenPortalExtension(WaldurExtension):
                 "schedule": timedelta(hours=1),
                 "args": (),
             },
+            # This task refreshes all remote projects, making sure
+            # that we have the latest version from the remote portals,
+            # even if we missed the notification. This only needs to
+            # run a 3-4 times per day
+            "waldur-openportal-refresh-remote-projects": {
+                "task": "waldur_openportal.refresh_remote_projects",
+                "schedule": timedelta(hours=6),
+                "args": (),
+            },
         }
 
     @staticmethod
