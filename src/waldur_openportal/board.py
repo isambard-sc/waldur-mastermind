@@ -708,9 +708,8 @@ class OpenPortalBoard:
                     f"{identifier} with class {project_template} is rejected as the allocation exceeds the limit."
                 )
 
-                # Save the merged details so can debug
-                details = managed_project.get_details().merge(details)
-                managed_project.set_details(details)
+                # We should update the project details to reflect the sent state
+                managed_project.set_details(managed_project.merge_details(details))
 
                 managed_project.reject(
                     utils.get_openportal_robot(),
@@ -732,12 +731,18 @@ class OpenPortalBoard:
         # We can't do anything if the project is pending approval or canceled
         if managed_project.is_pending():
             logger.warning(f"{identifier} is pending approval!")
+            # We should update the project details to reflect the sent state
+            managed_project.set_details(managed_project.merge_details(details))
             raise openportal.ManagedProjectPendingError()
         elif managed_project.is_canceled():
             logger.warning(f"{identifier} is canceled!")
+            # We should update the project details to reflect the sent state
+            managed_project.set_details(managed_project.merge_details(details))
             raise openportal.ManagedProjectRejectedError("The project is canceled.")
         elif managed_project.is_rejected():
             logger.warning(f"{identifier} is rejected!")
+            # We should update the project details to reflect the sent state
+            managed_project.set_details(managed_project.merge_details(details))
             raise openportal.ManagedProjectRejectedError()
 
         if (
@@ -749,6 +754,9 @@ class OpenPortalBoard:
                 f"Project {identifier} with class {managed_project.project_template} requires approval for project creation"
             )
             managed_project.set_needs_approval()
+
+            # We should update the project details to reflect the sent state
+            managed_project.set_details(managed_project.merge_details(details))
 
             # Here you would typically send a notification to the admin or
             # the person responsible for approving project creation requests.
@@ -894,15 +902,23 @@ class OpenPortalBoard:
         if managed_project.is_pending():
             logger.warning(f"{identifier} is pending approval!")
 
-            # We should update the project details to reflect the pending state
+            # We should update the project details to reflect the sent state
             managed_project.set_details(managed_project.merge_details(new_details))
 
             raise openportal.ManagedProjectPendingError()
         elif managed_project.is_canceled():
             logger.warning(f"{identifier} is canceled!")
+
+            # We should update the project details to reflect the sent state
+            managed_project.set_details(managed_project.merge_details(new_details))
+
             raise openportal.ManagedProjectRejectedError("The project is canceled.")
         elif managed_project.is_rejected():
             logger.warning(f"{identifier} is rejected!")
+
+            # We should update the project details to reflect the sent state
+            managed_project.set_details(managed_project.merge_details(new_details))
+
             raise openportal.ManagedProjectRejectedError()
 
         if managed_project.project is None:
@@ -919,6 +935,10 @@ class OpenPortalBoard:
                 f"{identifier} is removed, cannot update project.",
             )
             logger.warning(f"{identifier} is removed, cannot update project.")
+
+            # We should update the project details to reflect the sent state
+            managed_project.set_details(managed_project.merge_details(new_details))
+
             raise openportal.ManagedProjectRejectedError()
 
         # Check if trying to reactivate with a future end_date
@@ -937,6 +957,10 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"{identifier} is expired, cannot update project.",
             )
+
+            # We should update the project details to reflect the sent state
+            managed_project.set_details(managed_project.merge_details(new_details))
+
             logger.warning(f"{identifier} is expired, cannot update project.")
             raise openportal.ManagedProjectRejectedError()
 
@@ -951,12 +975,7 @@ class OpenPortalBoard:
 
         # merge in the new details
         logger.debug(f"Merging new details into project {identifier}: {new_details}")
-        existing_details_dict = managed_project.details
-        details = managed_project.merge_details(new_details)
-
-        logger.debug(f"New details after merge: {details}")
-        managed_project.set_details(details)
-        logger.debug(f"Updated ManagedProject {managed_project} with new details.")
+        managed_project.set_details(managed_project.merge_details(new_details))
 
         # We still go through and check everything, in case the
         # project has moved away from the requested details

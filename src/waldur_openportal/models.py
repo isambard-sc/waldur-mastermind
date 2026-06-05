@@ -2366,6 +2366,7 @@ class ManagedProject(ReviewMixin, models.Model):
         merged.award = new_details.award
         merged.call = new_details.call
         merged.renewal = new_details.renewal
+        merged.earliest_approve = new_details.earliest_approve
 
         if new_details.members is None:
             merged.members = None
@@ -3089,9 +3090,13 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         if extras:
             result = result.merge(extras_obj)
 
-            # explicitly control membership control locally
+            # explicitly control these terms locally
             result.membership_control = extras_obj.membership_control or None
             result.allowed_domains = extras_obj.allowed_domains or None
+            result.earliest_approve = extras_obj.earliest_approve or None
+            result.call = extras_obj.call or None
+            result.award = extras_obj.award or None
+            result.renewal = extras_obj.renewal or None
 
         # Remote portal always owns its project URL — restore after extras
         # so that link_project cannot silently override a confirmed value.

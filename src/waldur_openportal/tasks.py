@@ -1788,10 +1788,6 @@ def refresh_remote_award(destination: str, local_identifier: str):
     and update last_confirmed_details.  Always updates last_contact_time.
     If the fetch fails, last_confirmed_details is left unchanged.
 
-    Note that the destination is reversed, as this is called by a
-    notification from the remote portal, so we need to reverse it back to find
-    the RemoteProject.
-
     local_identifier is the award identifier on this portal, e.g. "awardtest.ukri".
     The RemoteProject is located via destination + the local project slug, then the
     remote identifier stored on that record is used for the actual fetch.
@@ -1840,11 +1836,6 @@ def refresh_remote_award(destination: str, local_identifier: str):
                 f"refresh_remote_award: no Project found with slug {local_id.project!r}"
             )
             return
-
-    # The destination is actually reversed, as we received this notification
-    # from the remote portal, so we need to reverse it back to find
-    # the RemoteProject
-    destination = openportal.Destination(".".join(reversed(destination.agents)))
 
     try:
         remote_project = models.RemoteProject.objects.get(
@@ -1905,7 +1896,19 @@ def _schedule_award_task_if_local(notification: openportal.Notification, task):
             f"not {openportal.get_portal()!r}"
         )
         return
-    task.delay(str(notification.destination), str(notification.event_argument))
+
+    try:
+        destination = openportal.Destination(str(notification.destination))
+    except Exception as e:
+        logger.error(
+            f"Invalid destination in notification: {notification.destination!r}: {e}"
+        )
+        return
+
+    # reverse the destination as notifications are reversed
+    destination = destination.reverse()
+
+    task.delay(str(destination), str(notification.event_argument))
 
 
 def _schedule_refresh_award_if_local(notification: openportal.Notification):
@@ -1951,10 +1954,6 @@ def reject_remote_award(destination: str, local_identifier: str):
     except Exception as e:
         logger.error(f"reject_remote_award: invalid destination {destination!r}: {e}")
         return
-
-    # Reverse the destination — the notification came from the remote portal
-    # so the routing path is already flipped relative to our RemoteProject.
-    dest = openportal.Destination(".".join(reversed(dest.agents)))
 
     try:
         remote_project = models.RemoteProject.objects.get(
@@ -2018,8 +2017,6 @@ def accept_remote_award(destination: str, local_identifier: str):
     except Exception as e:
         logger.error(f"accept_remote_award: invalid destination {destination!r}: {e}")
         return
-
-    dest = openportal.Destination(".".join(reversed(dest.agents)))
 
     try:
         remote_project = models.RemoteProject.objects.get(
