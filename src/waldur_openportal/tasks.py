@@ -422,24 +422,69 @@ def sync_allocation_users(serialized_allocation):
 
 
 @shared_task(name="waldur_openportal.sync_remote_usage")
-@run_once_task(takeover_timeout=60 * 60)
 def sync_remote_usage():
     """
-    This task is called to synchronise the usage for all remote allocations
+    Dispatcher: fans out one sync_remote_usage_for_destination subtask per active
+    destination so that a down destination cannot block usage syncs for others.
     """
     logger.info("OpenPortal task.sync_remote_usage")
-    now = datetime.datetime.now()
-    fail_count = 0
 
-    allocations = list(models.RemoteAllocation.objects.filter(is_active=True))
+    service_settings_ids = list(
+        models.RemoteAllocation.objects.filter(is_active=True)
+        .values_list("service_settings_id", flat=True)
+        .distinct()
+    )
 
-    # randomise the order of the allocations to avoid always processing in the same order and potentially
-    # leaving some allocations with outdated usage for a long time
+    logger.info(
+        f"OpenPortal task.sync_remote_usage: dispatching sync for {len(service_settings_ids)} destination(s)"
+    )
+
+    for sid in service_settings_ids:
+        try:
+            sync_remote_usage_for_destination.delay(sid)
+        except Exception as e:
+            logger.error(
+                f"Failed to dispatch sync_remote_usage_for_destination for service_settings {sid}: {e}"
+            )
+
+
+@shared_task(name="waldur_openportal.sync_remote_usage_for_destination")
+@run_once_task(takeover_timeout=60 * 60, include_args=True)
+def sync_remote_usage_for_destination(service_settings_id):
+    """
+    Sync usage for all RemoteAllocations belonging to a single destination.
+    """
+    try:
+        service_settings = structure_models.ServiceSettings.objects.get(
+            pk=service_settings_id
+        )
+    except structure_models.ServiceSettings.DoesNotExist:
+        logger.error(
+            f"sync_remote_usage_for_destination: ServiceSettings {service_settings_id} does not exist"
+        )
+        return
+
+    logger.info(
+        f"OpenPortal task.sync_remote_usage_for_destination: {service_settings}"
+    )
+
+    allocations = list(
+        models.RemoteAllocation.objects.filter(
+            is_active=True, service_settings=service_settings
+        )
+    )
     random.shuffle(allocations)
 
     now = datetime.datetime.now()
+    fail_count = 0
 
     for allocation in allocations:
+        if (datetime.datetime.now() - now).seconds > 3600:
+            logger.error(
+                f"sync_remote_usage_for_destination: {service_settings} took too long - aborting"
+            )
+            return
+
         try:
             sync_remote_allocation_usage(allocation)
         except Exception as e:
@@ -447,15 +492,10 @@ def sync_remote_usage():
             fail_count += 1
 
             if fail_count > 25 and (datetime.datetime.now() - now).seconds > 600:
-                logger.error("Too many failures - aborting")
+                logger.error(
+                    f"sync_remote_usage_for_destination: {service_settings} - too many failures, aborting"
+                )
                 return
-            elif (datetime.datetime.now() - now).seconds > 3600:
-                logger.error("sync_remote_usage took too long - aborting")
-                return
-
-        if (datetime.datetime.now() - now).seconds > 3600:
-            logger.error("sync_remote_usage took too long - aborting")
-            return
 
 
 @shared_task(name="waldur_openportal.sync_customer_allocations")
@@ -983,31 +1023,72 @@ def sync_local_users():
 
 
 @shared_task(name="waldur_openportal.sync_remote_users")
-@run_once_task(takeover_timeout=60 * 60)
 def sync_remote_users():
     """
-    This task runs through all of the remote allocations and makes sure that all
-    users associated with those allocations are properly synced (e.g.
-    added or removed)
+    Dispatcher: fans out one sync_remote_users_for_destination subtask per active
+    destination so that a down destination cannot block user syncs for others.
     """
     logger.info("OpenPortal task.sync_remote_users")
-    now = datetime.datetime.now()
 
-    allocations = list(models.RemoteAllocation.objects.filter(is_active=True))
+    service_settings_ids = list(
+        models.RemoteAllocation.objects.filter(is_active=True)
+        .values_list("service_settings_id", flat=True)
+        .distinct()
+    )
 
-    # randomise the order of the allocations to avoid always processing in the same order and potentially
-    # leaving some allocations with unsynced users for a long time
+    logger.info(
+        f"OpenPortal task.sync_remote_users: dispatching sync for {len(service_settings_ids)} destination(s)"
+    )
+
+    for sid in service_settings_ids:
+        try:
+            sync_remote_users_for_destination.delay(sid)
+        except Exception as e:
+            logger.error(
+                f"Failed to dispatch sync_remote_users_for_destination for service_settings {sid}: {e}"
+            )
+
+
+@shared_task(name="waldur_openportal.sync_remote_users_for_destination")
+@run_once_task(takeover_timeout=60 * 60, include_args=True)
+def sync_remote_users_for_destination(service_settings_id):
+    """
+    Sync users for all RemoteAllocations belonging to a single destination.
+    """
+    try:
+        service_settings = structure_models.ServiceSettings.objects.get(
+            pk=service_settings_id
+        )
+    except structure_models.ServiceSettings.DoesNotExist:
+        logger.error(
+            f"sync_remote_users_for_destination: ServiceSettings {service_settings_id} does not exist"
+        )
+        return
+
+    logger.info(
+        f"OpenPortal task.sync_remote_users_for_destination: {service_settings}"
+    )
+
+    allocations = list(
+        models.RemoteAllocation.objects.filter(
+            is_active=True, service_settings=service_settings
+        )
+    )
     random.shuffle(allocations)
 
+    now = datetime.datetime.now()
+
     for allocation in allocations:
+        if (datetime.datetime.now() - now).seconds > 3600:
+            logger.error(
+                f"sync_remote_users_for_destination: {service_settings} took too long - aborting"
+            )
+            break
+
         try:
             sync_remote_allocation_users(allocation)
         except Exception as e:
             logger.error(f"Failed to sync remote users for {allocation}: {e}")
-
-        if (datetime.datetime.now() - now).seconds > 3600:
-            logger.error("sync_remote_users took too long - aborting")
-            break
 
 
 @shared_task(name="waldur_openportal.sync")
