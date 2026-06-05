@@ -806,19 +806,71 @@ def sync_allocation_limits():
 
 
 @shared_task(name="waldur_openportal.sync_remote")
-@run_once_task(takeover_timeout=60 * 60)
 def sync_remote():
     """
-    This is a full OpenPortal remote sync - this will go through all remote projects
-    and make sure that they have been created and any updates applied
+    Dispatcher: fans out one sync_remote_for_destination subtask per active destination
+    so that destinations are synced in parallel and a down destination cannot block others.
     """
     logger.info("OpenPortal task.sync_remote")
+
+    service_settings_ids = list(
+        models.RemoteAllocation.objects.filter(is_active=True)
+        .values_list("service_settings_id", flat=True)
+        .distinct()
+    )
+
+    logger.info(
+        f"OpenPortal task.sync_remote: dispatching sync for {len(service_settings_ids)} destination(s)"
+    )
+
+    for sid in service_settings_ids:
+        try:
+            sync_remote_for_destination.delay(sid)
+        except Exception as e:
+            logger.error(
+                f"Failed to dispatch sync_remote_for_destination for service_settings {sid}: {e}"
+            )
+
+
+@shared_task(name="waldur_openportal.sync_remote_for_destination")
+@run_once_task(takeover_timeout=60 * 60, include_args=True)
+def sync_remote_for_destination(service_settings_id):
+    """
+    Sync all RemoteAllocations for a single destination (ServiceSettings).
+    Allocations are shuffled so that a persistent early failure cannot starve
+    later entries across repeated sync cycles.  Failures are counted per
+    destination so that a down destination does not consume the failure budget
+    of other destinations.
+    """
+    try:
+        service_settings = structure_models.ServiceSettings.objects.get(
+            pk=service_settings_id
+        )
+    except structure_models.ServiceSettings.DoesNotExist:
+        logger.error(
+            f"sync_remote_for_destination: ServiceSettings {service_settings_id} does not exist"
+        )
+        return
+
+    logger.info(f"OpenPortal task.sync_remote_for_destination: {service_settings}")
+
+    remote_allocations = list(
+        models.RemoteAllocation.objects.filter(
+            is_active=True, service_settings=service_settings
+        )
+    )
+    random.shuffle(remote_allocations)
+
     now = datetime.datetime.now()
     fail_count = 0
 
-    # First, try to create all of the remote projects that are not
-    # already created in the remote portal
-    for remote_allocation in models.RemoteAllocation.objects.filter(is_active=True):
+    for remote_allocation in remote_allocations:
+        if (datetime.datetime.now() - now).seconds > 3600:
+            logger.error(
+                f"sync_remote_for_destination: {service_settings} took too long - aborting"
+            )
+            break
+
         try:
             project = remote_allocation.project
 
@@ -895,11 +947,10 @@ def sync_remote():
             logger.error(f"Failed to sync remote project {remote_allocation}: {e}")
             fail_count += 1
 
-            if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
-                logger.error("Too many failures - aborting")
-                break
-            elif (datetime.datetime.now() - now).seconds > 3600:
-                logger.error("sync_remote_usage took too long - aborting")
+            if fail_count > 25 and (datetime.datetime.now() - now).seconds > 600:
+                logger.error(
+                    f"sync_remote_for_destination: {service_settings} - too many failures, aborting"
+                )
                 break
 
 
