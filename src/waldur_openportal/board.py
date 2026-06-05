@@ -1076,7 +1076,22 @@ class OpenPortalBoard:
                 logger.debug(
                     f"Setting allocation {details.allocation} for project {identifier}"
                 )
-                utils.set_project_credits(project, new_credits)
+
+                # don't set credits for project's in the grace period
+                if not project.is_in_grace_period:
+                    try:
+                        utils.set_project_credits(project, new_credits)
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to set allocation for project {identifier}: {e}"
+                        )
+                        managed_project.reject(
+                            utils.get_openportal_robot(),
+                            f"Failed to set allocation for project: {e}",
+                        )
+                        raise openportal.ManagedProjectRejectedError(
+                            f"Failed to set allocation for project: {e}"
+                        )
 
         # Updating membership last, as we need to know the project is ok
         can_change_membership = details.can_change_membership()
