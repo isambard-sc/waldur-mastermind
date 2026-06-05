@@ -478,7 +478,27 @@ def infer_allocation_from_accounting(
         logger.error(f"Managed project {project} has no allocation in details")
         return None
 
-    implied_credits = get_project_credits(project, silent=silent)
+    # get the current spend information
+    (allocation_credits, total_spend) = get_project_spend_info(
+        project, silent=silent, include_current_month=False
+    )
+
+    # now get the project's starting month balance
+    try:
+        project_credit = invoice_models.ProjectCredit.objects.get(project=project)
+        month_start_balance = project_credit.value
+    except invoice_models.ProjectCredit.DoesNotExist:
+        month_start_balance = decimal.Decimal(0.0)
+
+    # The allocation should equal the starting month balance plus the total spend
+    # (excluding current month spend)
+    implied_credits = month_start_balance + total_spend
+
+    if abs(implied_credits - allocation_credits) > decimal.Decimal(1.0):
+        logger.warning(
+            f"Implied credits ({implied_credits}) for project {project} differ from current allocation credits ({allocation_credits}) by more than 1.0. "
+            f"This may indicate a discrepancy in the accounting data."
+        )
 
     units = current_allocation.units
     if units in project_template.allocation_units_mapping:
@@ -674,7 +694,7 @@ def set_project_credits(
     # Now set the credits, retrying once if the save fails due to insufficient
     # customer credit (the allocated_to_projects field may be stale at pre-check
     # time, causing the save to fail even after the pre-check top-up above).
-    project_credit, created = invoice_models.ProjectCredit.objects.get_or_create(
+    project_credit, _created = invoice_models.ProjectCredit.objects.get_or_create(
         project=project,
     )
 
