@@ -97,6 +97,11 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": timedelta(hours=1),
         "args": (),
     },
+    "purge-old-events": {
+        "task": "waldur_core.logging.purge_old_events",
+        "schedule": timedelta(days=3),
+        "args": (),
+    },
 }
 
 for ext in WaldurExtension.get_extensions():

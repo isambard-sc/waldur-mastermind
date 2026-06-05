@@ -1,8 +1,10 @@
 import logging
+import datetime
 
 from celery import shared_task
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q, QuerySet
+from django.utils import timezone
 
 from waldur_core.core.models import User
 from waldur_core.logging import backend, models, utils
@@ -98,6 +100,27 @@ def check_event(event: models.Event, hook):
             return True
 
     return False
+
+
+@shared_task(name="waldur_core.logging.purge_old_events")
+def purge_old_events(days=90, batch_size=5000):
+    logger.info(f"Starting purge of events older than {days} days")
+    cutoff = datetime.date.today() - datetime.timedelta(days=days)
+    total = 0
+    batch_count = 0
+    while True:
+        batch_ids = list(
+            Event.objects.filter(created__lt=cutoff).values_list("id", flat=True)[
+                :batch_size
+            ]
+        )
+        if not batch_ids:
+            break
+        batch_count += 1
+        logger.info(f"Deleting batch {batch_count} with {len(batch_ids)} events")
+        Event.objects.filter(id__in=batch_ids).delete()
+        total += len(batch_ids)
+    logger.info(f"Deleted {total} events older than {days} days")
 
 
 @shared_task(name="waldur_core.logging.delete_stale_event_subscriptions")

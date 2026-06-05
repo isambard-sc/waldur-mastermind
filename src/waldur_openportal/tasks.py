@@ -2152,19 +2152,29 @@ def sync_board():
 
 
 @shared_task(name="waldur_openportal.clean_stale_jobs")
-def clean_stale_jobs():
+def clean_stale_jobs(days: int = 2, batch_size: int = 5000):
     """
     This task deletes all OpenPortal jobs that were created more than
-    2 days ago - this is to prevent the database from filling up with
+    {days} days ago - this is to prevent the database from filling up with
     old jobs that are no longer relevant.
     """
     logger.info("OpenPortal task.clean_stale_jobs")
-
-    cutoff = datetime.date.today() - datetime.timedelta(days=2)
-
-    stale_jobs = models.Job.objects.filter(created__lt=cutoff)
-
-    stale_jobs.delete()
+    cutoff = datetime.date.today() - datetime.timedelta(days=days)
+    total = 0
+    batch_count = 0
+    while True:
+        batch_ids = list(
+            models.Job.objects.filter(created__lt=cutoff).values_list("id", flat=True)[
+                :batch_size
+            ]
+        )
+        if not batch_ids:
+            break
+        batch_count += 1
+        logger.info(f"Deleting batch {batch_count} with {len(batch_ids)} jobs")
+        models.Job.objects.filter(id__in=batch_ids).delete()
+        total += len(batch_ids)
+    logger.info(f"Deleted {total} jobs older than {days} days")
 
 
 @shared_task(name="waldur_openportal.fix_total_allocation")

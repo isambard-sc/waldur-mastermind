@@ -100,14 +100,14 @@ class OpenPortalExtension(WaldurExtension):
             # This task cleans up stale OpenPortal jobs from the database
             "waldur_openportal.clean_stale_jobs": {
                 "task": "waldur_openportal.clean_stale_jobs",
-                "schedule": timedelta(minutes=60 * 24),
+                "schedule": timedelta(hours=25),
                 "args": (),
             },
             # This task fixes the project credit allocation, to prevent
             # drift from what is set by the ManagedProject
             "waldur_openportal.fix_total_allocation": {
                 "task": "waldur_openportal.fix_total_allocation",
-                "schedule": timedelta(minutes=60 * 24),
+                "schedule": timedelta(hours=23),
                 "args": (),
             },
             # This task transitions ACTIVE RemoteProjects to STALE when
