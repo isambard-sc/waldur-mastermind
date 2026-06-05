@@ -975,7 +975,8 @@ class OpenPortalBoard:
 
         # merge in the new details
         logger.debug(f"Merging new details into project {identifier}: {new_details}")
-        managed_project.set_details(managed_project.merge_details(new_details))
+        details = managed_project.merge_details(new_details)
+        managed_project.set_details(details)
 
         # We still go through and check everything, in case the
         # project has moved away from the requested details
@@ -1076,8 +1077,6 @@ class OpenPortalBoard:
                     f"Setting allocation {details.allocation} for project {identifier}"
                 )
                 utils.set_project_credits(project, new_credits)
-
-                details.allocation = new_details.allocation
 
         # Updating membership last, as we need to know the project is ok
         can_change_membership = details.can_change_membership()
