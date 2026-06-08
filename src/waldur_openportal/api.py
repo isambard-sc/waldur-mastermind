@@ -1652,6 +1652,7 @@ def project_mapping(request):
     Map OpenPortal ProjectIdentifier strings to Waldur Project objects.
 
     Chain: Allocation.backend_id == identifier -> Allocation.project
+    Fallback: RemoteAllocation.backend_id == identifier -> RemoteAllocation.project
     """
     identifiers = request.query_params.getlist("identifier")
     if not identifiers:
@@ -1671,6 +1672,12 @@ def project_mapping(request):
             .select_related("project", "project__customer")
             .first()
         )
+        if allocation is None:
+            allocation = (
+                models.RemoteAllocation.objects.filter(backend_id=identifier)
+                .select_related("project", "project__customer")
+                .first()
+            )
 
         if allocation is None:
             result[identifier] = None
