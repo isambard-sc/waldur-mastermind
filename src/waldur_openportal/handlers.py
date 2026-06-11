@@ -1,5 +1,6 @@
 import logging
 import functools
+from datetime import date
 from decimal import Decimal
 
 from django.conf import settings
@@ -178,22 +179,33 @@ def delete_project(sender, instance, **kwargs):
             )
         )
 
-    # Also make sure that any connected managed project is marked as needing approval.
-    # This ensures that the site admin will be aware of the deletion and
-    # will need to approve any further changes.
+    # Handle connected managed projects. If the managed project's allocation
+    # period has already ended, notify the remote portal and delete it. If the
+    # period is still in the future (or no end date is set), detach and mark as
+    # needing approval so the site admin can re-attach it to a new project.
     managed_projects = models.ManagedProject.objects.filter(project=project)
 
     for managed_project in managed_projects:
-        managed_project.set_needs_approval(
-            True,
-            comment="Attached project was deleted.",
-        )
-        managed_project.project = None
-        managed_project.save(update_fields=["project"])
-        logger.debug(
-            f"ManagedProject {managed_project.identifier} marked as needing approval "
-            f"due to deletion of attached project: {project}"
-        )
+        end_date = managed_project.get_details().end_date
+
+        if end_date is not None and end_date <= date.today():
+            managed_project.notify_removed()
+            managed_project.delete()
+            logger.debug(
+                f"ManagedProject {managed_project.identifier} "
+                f"deleted, remote notified (expired project: {project})"
+            )
+        else:
+            managed_project.set_needs_approval(
+                True,
+                comment="Attached project was deleted.",
+            )
+            managed_project.project = None
+            managed_project.save(update_fields=["project"])
+            logger.debug(
+                f"ManagedProject {managed_project.identifier}"
+                f" marked as needing approval: project {project} deleted"
+            )
 
 
 @if_plugin_enabled
