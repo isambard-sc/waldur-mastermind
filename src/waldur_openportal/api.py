@@ -1679,11 +1679,26 @@ def project_mapping(request):
                 .first()
             )
 
+        project = None
+
         if allocation is None:
+            # look up by the openportal.models.ProjectInfo
+            shortname = (
+                str(identifier).split(".")[0] if "." in identifier else identifier
+            )
+            project_info = (
+                models.ProjectInfo.objects.filter(shortname=shortname)
+                .select_related("project", "project__customer")
+                .first()
+            )
+
+            project = project_info.project if project_info else None
+        else:
+            project = allocation.project
+
+        if project is None:
             result[identifier] = None
             continue
-
-        project = allocation.project
 
         if (
             accessible_project_ids is not None
@@ -1852,9 +1867,7 @@ def _get_project_allowed_domains(project):
             )
             return None
 
-    remote_projects = list(
-        models.RemoteProject.objects.filter(current_project=project)
-    )
+    remote_projects = list(models.RemoteProject.objects.filter(current_project=project))
     if not remote_projects:
         return None
 
