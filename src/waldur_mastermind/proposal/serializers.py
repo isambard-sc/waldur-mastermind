@@ -1265,7 +1265,10 @@ class ProtectedRoundSerializer(
 
 class ProposalDocumentationSerializer(serializers.ModelSerializer):
     file_name = serializers.CharField(source="file.name", read_only=True)
-    file_size = serializers.IntegerField(source="file.size", read_only=True)
+    file_size = serializers.SerializerMethodField(read_only=True)
+
+    def get_file_size(self, obj):
+        return obj.file.size if obj.file else None
 
     class Meta:
         model = models.ProposalDocumentation

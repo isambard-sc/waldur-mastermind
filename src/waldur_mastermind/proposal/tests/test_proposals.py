@@ -55,6 +55,15 @@ class ProposalGetTest(test.APITransactionTestCase):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_proposal_with_empty_documentation_file_should_be_visible(self):
+        models.ProposalDocumentation.objects.create(proposal=self.fixture.proposal)
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(
+            response.json()["supporting_documentation"][0]["file_size"]
+        )
+
     def create_another_call_and_proposal(self):
         another_call = factories.CallFactory(
             manager=self.fixture.manager,
