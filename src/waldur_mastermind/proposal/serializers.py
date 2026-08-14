@@ -1570,6 +1570,7 @@ class ProposalSerializer(
 
 
 class RoundReviewerSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField(read_only=True)
     full_name = serializers.SerializerMethodField()
     email = serializers.EmailField()
     accepted_proposals = serializers.IntegerField()
@@ -1577,7 +1578,7 @@ class RoundReviewerSerializer(serializers.Serializer):
     in_review_proposals = serializers.IntegerField()
 
     def get_full_name(self, obj) -> str:
-        return f"{obj.first_name} {obj.last_name}"
+        return f"{obj.first_name} {obj.last_name}".strip()
 
 
 class ProposalApproveSerializer(serializers.Serializer):
