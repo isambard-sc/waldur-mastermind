@@ -1,8 +1,10 @@
+import datetime
 from unittest import mock
 
 from ddt import data, ddt
 from django.core import mail
-from django.test import override_settings
+from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework import status, test
 
 from waldur_core.permissions.fixtures import CallRole
@@ -488,3 +490,50 @@ class ReviewerGetTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(len(response.json()))
         self.assertEqual(response.data[0]["in_review_proposals"], 1)
+
+
+class RoundFixedReviewEndDateTest(TestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.round = self.fixture.round
+
+    def test_has_fixed_review_end_date_is_false_by_default(self):
+        self.assertFalse(self.round.has_fixed_review_end_date())
+
+    def test_has_fixed_review_end_date_is_true_when_set(self):
+        self.round.fixed_review_end_date = timezone.now()
+        self.assertTrue(self.round.has_fixed_review_end_date())
+
+    def test_get_fixed_review_end_date_raises_when_not_set(self):
+        with self.assertRaises(ValueError):
+            self.round.get_fixed_review_end_date()
+
+    def test_get_fixed_review_end_date_returns_the_set_value(self):
+        expected = timezone.now()
+        self.round.fixed_review_end_date = expected
+        self.assertEqual(self.round.get_fixed_review_end_date(), expected)
+
+
+class ReviewEndDateTest(TestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.review = self.fixture.review
+
+    def test_review_end_date_is_none_when_neither_is_set(self):
+        self.review.proposal.round.review_duration_in_days = None
+        self.review.proposal.round.fixed_review_end_date = None
+        self.assertIsNone(self.review.review_end_date)
+
+    def test_review_end_date_is_computed_from_duration_when_no_fixed_date(self):
+        self.review.proposal.round.review_duration_in_days = 5
+        self.review.proposal.round.fixed_review_end_date = None
+        self.assertEqual(
+            self.review.review_end_date,
+            self.review.created + datetime.timedelta(days=5),
+        )
+
+    def test_fixed_review_end_date_takes_precedence_over_duration(self):
+        fixed_date = timezone.now() + datetime.timedelta(days=100)
+        self.review.proposal.round.review_duration_in_days = 5
+        self.review.proposal.round.fixed_review_end_date = fixed_date
+        self.assertEqual(self.review.review_end_date, fixed_date)

@@ -477,6 +477,13 @@ class ProjectAccountingSummarySerializer(rf_serializers.Serializer):
     current_month_spend = rf_serializers.DecimalField(
         max_digits=20, decimal_places=2, read_only=True
     )
+    offering_names = rf_serializers.ListField(
+        child=rf_serializers.CharField(),
+        read_only=True,
+        required=False,
+        help_text="Names of offerings currently attached to the project. "
+        "Only populated when the include_offering_names query parameter is set.",
+    )
 
     def to_representation(self, project):
         import decimal
@@ -490,6 +497,12 @@ class ProjectAccountingSummarySerializer(rf_serializers.Serializer):
             "start_date": (project.start_date or project.created.date()).isoformat(),
             "end_date": project.end_date.isoformat() if project.end_date else None,
         }
+
+        if self.context.get("include_offering_names"):
+            offering_names_by_project = self.context.get(
+                "offering_names_by_project", {}
+            )
+            data["offering_names"] = offering_names_by_project.get(project.id, [])
 
         try:
             (credits_no_current, spend_no_current) = (

@@ -493,6 +493,15 @@ class Round(
         max_length=15,
     )
     review_duration_in_days = models.PositiveIntegerField(null=True, blank=True)
+    fixed_review_end_date = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "If set, every review in this round uses this as its review_end_date "
+            "instead of created + review_duration_in_days. Set to null to revert "
+            "to the review_duration_in_days behaviour."
+        ),
+    )
     minimum_number_of_reviewers = models.PositiveIntegerField(null=True, blank=True)
     minimal_average_scoring = models.DecimalField(
         max_digits=5,
@@ -556,6 +565,15 @@ class Round(
             return self.Statuses.ENDED
         else:
             return self.Statuses.OPEN
+
+    def has_fixed_review_end_date(self) -> bool:
+        return self.fixed_review_end_date is not None
+
+    def get_fixed_review_end_date(self) -> datetime:
+        if not self.has_fixed_review_end_date():
+            raise ValueError("fixed_review_end_date is not set for this round.")
+
+        return self.fixed_review_end_date
 
     def save(self, *args, **kwargs):
         if not self.slug:
@@ -1001,12 +1019,15 @@ class Review(
 
     @property
     def review_end_date(self) -> datetime:
-        if not self.proposal.round.review_duration_in_days:
+        round = self.proposal.round
+
+        if round.has_fixed_review_end_date():
+            return round.get_fixed_review_end_date()
+
+        if not round.review_duration_in_days:
             return
 
-        return self.created + timedelta(
-            days=self.proposal.round.review_duration_in_days
-        )
+        return self.created + timedelta(days=round.review_duration_in_days)
 
 
 class ReviewComment(

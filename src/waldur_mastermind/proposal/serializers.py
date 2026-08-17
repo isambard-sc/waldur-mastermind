@@ -516,6 +516,7 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
             "allocation_date",
             "minimal_average_scoring",
             "review_duration_in_days",
+            "fixed_review_end_date",
             "minimum_number_of_reviewers",
             "minimum_required_uploads",
             "default_membership_control",
@@ -556,6 +557,7 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
                 "allocation_date",
                 "minimal_average_scoring",
                 "review_duration_in_days",
+                "fixed_review_end_date",
                 "minimum_number_of_reviewers",
                 "minimum_required_uploads",
                 "default_membership_control",
@@ -1168,6 +1170,7 @@ class ProtectedRoundSerializer(
     url = serializers.SerializerMethodField()
     proposals = serializers.SerializerMethodField()
     review_duration_in_days = serializers.IntegerField(required=False)
+    fixed_review_end_date = serializers.DateTimeField(required=False, allow_null=True)
 
     class Meta(NestedRoundSerializer.Meta):
         fields = NestedRoundSerializer.Meta.fields + ["url", "proposals"]

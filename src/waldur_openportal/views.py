@@ -1258,6 +1258,19 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         )
 
 
+@extend_schema_view(
+    list=extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="include_offering_names",
+                type=OpenApiTypes.BOOL,
+                location=OpenApiParameter.QUERY,
+                description="If true, include the offering_names field listing "
+                "the names of offerings currently attached to each project.",
+            ),
+        ],
+    ),
+)
 class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
     """
     Read-only endpoint returning accounting summaries for projects.
@@ -1272,6 +1285,11 @@ class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
     Filterable by:
       - project_uuid: return summary for a single project
       - customer_uuid: return summaries for all projects in an organisation
+      - offering_name: return summaries for projects with an attached offering
+        whose name matches (case-insensitive, partial match)
+
+    Pass include_offering_names=true to also return the offering_names field,
+    listing the names of offerings currently attached to each project.
     """
 
     queryset = structure_models.Project.objects.none()
@@ -1292,6 +1310,57 @@ class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
             return qs
         accessible_project_ids = list(get_visible_projects(user))
         return qs.filter(id__in=accessible_project_ids)
+
+    def _include_offering_names(self):
+        value = self.request.query_params.get("include_offering_names", "")
+        return value.lower() in ("true", "1", "yes")
+
+    def _get_offering_names_by_project(self, projects):
+        from waldur_mastermind.marketplace import models as marketplace_models
+        from waldur_mastermind.marketplace.enums import ResourceStates
+
+        project_ids = [project.id for project in projects]
+        rows = (
+            marketplace_models.Resource.objects.filter(
+                project_id__in=project_ids, state=ResourceStates.OK
+            )
+            .values_list("project_id", "offering__name")
+            .distinct()
+        )
+        result = {}
+        for project_id, offering_name in rows:
+            result.setdefault(project_id, []).append(offering_name)
+        return result
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["include_offering_names"] = self._include_offering_names()
+        context["offering_names_by_project"] = getattr(
+            self, "_offering_names_by_project", {}
+        )
+        return context
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        projects = page if page is not None else queryset
+        if self._include_offering_names():
+            self._offering_names_by_project = self._get_offering_names_by_project(
+                projects
+            )
+        serializer = self.get_serializer(projects, many=True)
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if self._include_offering_names():
+            self._offering_names_by_project = self._get_offering_names_by_project(
+                [instance]
+            )
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
 
 
 class UnmanagedProjectViewSet(structure_views.ProjectViewSet):
