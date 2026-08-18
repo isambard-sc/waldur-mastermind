@@ -2263,7 +2263,7 @@ def sync_board():
 
     for job in jobs:
         try:
-            if job.state != openportal.Status.PENDING:
+            if job.state != openportal.Status.pending():
                 logger.debug(f"Job {job.id} is not pending - skipping")
                 continue
 
