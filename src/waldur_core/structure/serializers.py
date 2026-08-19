@@ -354,10 +354,20 @@ class ProjectSerializer(
         if end_date is None:
             return end_date
 
-        # Only validate non-None values
-        if end_date < timezone.datetime.today().date():
+        # Setting end_date to a date within the grace period of today is
+        # allowed - it extends the grace period rather than being rejected
+        # as a "past" date.
+        today = timezone.datetime.today().date()
+        earliest_allowed = today - timezone.timedelta(
+            days=models.PROJECT_GRACE_PERIOD_DAYS
+        )
+        if end_date < earliest_allowed:
             raise serializers.ValidationError(
-                {"end_date": _("Cannot be earlier than the current date.")}
+                {
+                    "end_date": _(
+                        "Cannot be earlier than the current date, outside of the grace period."
+                    )
+                }
             )
         return end_date
 

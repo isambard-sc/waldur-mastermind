@@ -170,21 +170,34 @@ class ProjectCreateTest(test.APITransactionTestCase):
 
     def test_validate_end_date(self):
         self.client.force_authenticate(self.fixture.staff)
-        payload = self._get_valid_project_payload(self.fixture.customer)
-        payload["end_date"] = "2021-06-01"
+        grace_days = models.PROJECT_GRACE_PERIOD_DAYS
+        today = datetime.date(2021, 7, 1)
 
-        with freeze_time("2021-07-01"):
+        # A date further in the past than the grace period is rejected.
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        too_old_end_date = today - timedelta(days=grace_days + 1)
+        payload["end_date"] = too_old_end_date.isoformat()
+
+        with freeze_time(today.isoformat()):
             response = self.client.post(
                 factories.ProjectFactory.get_list_url(), payload
             )
 
             self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
             self.assertTrue(
-                "Cannot be earlier than the current date." in str(response.data)
+                "Cannot be earlier than the current date" in str(response.data)
             )
             self.assertFalse(Project.objects.filter(name=payload["name"]).exists())
 
-        with freeze_time("2021-06-01"):
+        # A date within the grace period of today is accepted - setting it
+        # extends the project's grace period rather than being rejected as
+        # a past date.
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "project_within_grace_period"
+        within_grace_end_date = today - timedelta(days=grace_days)
+        payload["end_date"] = within_grace_end_date.isoformat()
+
+        with freeze_time(today.isoformat()):
             response = self.client.post(
                 factories.ProjectFactory.get_list_url(), payload
             )
@@ -193,7 +206,25 @@ class ProjectCreateTest(test.APITransactionTestCase):
             self.assertTrue(
                 Project.objects.filter(
                     name=payload["name"],
-                    end_date=datetime.datetime(year=2021, month=6, day=1).date(),
+                    end_date=within_grace_end_date,
+                ).exists()
+            )
+
+        # The current date is, of course, still accepted.
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "project_with_current_end_date"
+        payload["end_date"] = today.isoformat()
+
+        with freeze_time(today.isoformat()):
+            response = self.client.post(
+                factories.ProjectFactory.get_list_url(), payload
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertTrue(
+                Project.objects.filter(
+                    name=payload["name"],
+                    end_date=today,
                 ).exists()
             )
 
