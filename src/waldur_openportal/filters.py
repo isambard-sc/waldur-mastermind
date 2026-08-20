@@ -156,6 +156,14 @@ class ProjectAccountingSummaryFilter(django_filters.FilterSet):
         fields = []
 
 
+class ManagedProjectAccountingSummaryFilter(django_filters.FilterSet):
+    project_uuid = django_filters.UUIDFilter(field_name="uuid")
+
+    class Meta:
+        model = structure_models.Project
+        fields = []
+
+
 class ManagedProjectFilter(django_filters.FilterSet):
     identifier = django_filters.CharFilter(
         field_name="identifier", lookup_expr="icontains"

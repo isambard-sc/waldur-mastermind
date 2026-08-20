@@ -1363,6 +1363,52 @@ class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(serializer.data)
 
 
+class ManagedProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Read-only endpoint summarising the OpenPortal award (ManagedProject)
+    currently attached to a single project: its allocation and the usage
+    counted against it, via utils.get_award_usage_info.
+
+    This is intentionally scoped to one project at a time (e.g. a dashboard
+    card), not for browsing every project's award status - computing the
+    summary walks the award's attach/detach audit trail and filters one
+    OpenPortal report per cached month, which is too costly to run
+    unfiltered across every project. list() therefore requires project_uuid;
+    retrieve() is scoped to a single project by its uuid in the URL.
+
+    Staff and support users may look up any project. Regular users may only
+    look up a project they have a membership role in (directly or via their
+    organisation/customer).
+    """
+
+    queryset = structure_models.Project.objects.none()
+    serializer_class = serializers.ManagedProjectAccountingSummarySerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.ManagedProjectAccountingSummaryFilter
+    lookup_field = "uuid"
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return structure_models.Project.objects.none()
+        from waldur_core.structure.managers import get_visible_projects
+
+        user = self.request.user
+        qs = structure_models.Project.objects.all().select_related("customer")
+        if user.is_staff or user.is_support:
+            return qs
+        accessible_project_ids = list(get_visible_projects(user))
+        return qs.filter(id__in=accessible_project_ids)
+
+    def list(self, request, *args, **kwargs):
+        if not request.query_params.get("project_uuid"):
+            return Response(
+                {"detail": _("project_uuid is required.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().list(request, *args, **kwargs)
+
+
 class UnmanagedProjectViewSet(structure_views.ProjectViewSet):
     """
     ViewSet that only matches Projects that do not have an associated ManagedProject.

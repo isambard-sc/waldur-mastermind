@@ -527,6 +527,55 @@ class ProjectAccountingSummarySerializer(rf_serializers.Serializer):
         return data
 
 
+class ManagedProjectAccountingSummarySerializer(rf_serializers.Serializer):
+    """
+    Read-only serializer summarising the OpenPortal award (ManagedProject)
+    currently attached to a project: its granted allocation and the usage
+    counted against it, both on the same credits scale used elsewhere for
+    accounting. Data is derived from utils.get_award_usage_info.
+    """
+
+    project_uuid = rf_serializers.UUIDField(source="uuid", read_only=True)
+    project_name = rf_serializers.CharField(source="name", read_only=True)
+    customer_uuid = rf_serializers.UUIDField(source="customer.uuid", read_only=True)
+    customer_name = rf_serializers.CharField(source="customer.name", read_only=True)
+    has_award = rf_serializers.BooleanField(read_only=True)
+    allocation_credits = rf_serializers.FloatField(read_only=True, allow_null=True)
+    usage_credits = rf_serializers.FloatField(read_only=True)
+    remaining_credits = rf_serializers.FloatField(read_only=True, allow_null=True)
+
+    def to_representation(self, project):
+        from . import utils as openportal_utils
+
+        data = {
+            "project_uuid": str(project.uuid),
+            "project_name": project.name,
+            "customer_uuid": str(project.customer.uuid),
+            "customer_name": project.customer.name,
+            "has_award": models.ManagedProject.objects.filter(
+                project=project
+            ).exists(),
+        }
+
+        try:
+            allocation_credits, usage_credits = openportal_utils.get_award_usage_info(
+                project
+            )
+        except Exception as e:
+            logger.error(
+                f"Error computing award usage info for project {project}: {e}"
+            )
+            allocation_credits, usage_credits = None, 0.0
+
+        data["allocation_credits"] = allocation_credits
+        data["usage_credits"] = usage_credits
+        data["remaining_credits"] = (
+            allocation_credits - usage_credits if allocation_credits is not None else None
+        )
+
+        return data
+
+
 class ProjectAttachSerializer(rf_serializers.Serializer):
     project_uuid = rf_serializers.UUIDField(
         help_text="UUID of the project to attach to this managed project"
