@@ -54,6 +54,11 @@ def register_in(router):
         views.ProposalUserViewSet,
         basename="proposal-add-user",
     )
+    router.register(
+        r"proposal-formbricks-webhook",
+        views.FormbricksWebhookViewSet,
+        basename="proposal-formbricks-webhook",
+    )
 
 
 urlpatterns = [

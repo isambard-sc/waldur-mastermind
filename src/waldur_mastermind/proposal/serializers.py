@@ -35,7 +35,7 @@ from waldur_mastermind.proposal.enums import (
     RoundStatuses,
 )
 
-from . import models
+from . import formbricks_flows, models
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +248,7 @@ class ProposalReviewSerializer(
     proposal_name = serializers.ReadOnlyField(source="proposal.name")
     proposal_uuid = serializers.UUIDField(read_only=True, source="proposal.uuid")
     proposal_slug = serializers.ReadOnlyField(source="proposal.slug")
+    form_responses = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Review
@@ -285,6 +286,7 @@ class ProposalReviewSerializer(
             "comment_project_supporting_documentation",
             "comment_resource_requests",
             "comment_team",
+            "form_responses",
             "created",
             "modified",
         )
@@ -331,6 +333,38 @@ class ProposalReviewSerializer(
                 return _("Reviewer %(index)s") % {"index": index}
 
         return _("Reviewer")
+
+    def get_form_responses(self, obj) -> list[dict] | None:
+        """Reviewer-visible Formbricks step responses for this proposal.
+
+        Returns None for calls not using the Formbricks flow. Reads
+        entirely from the stored FormStepResponse snapshot - never calls
+        Formbricks live - and only ever exposes the steps in
+        formbricks_flows.REVIEWER_VISIBLE_STEPS (never team_details or
+        compliance).
+        """
+        proposal = obj.proposal
+        if not proposal or not proposal.round.call.formbricks_flow_key:
+            return None
+
+        steps = proposal.form_step_responses.filter(
+            step_key__in=formbricks_flows.REVIEWER_VISIBLE_STEPS
+        ).order_by("step_key")
+
+        return [
+            {
+                "step_key": step.step_key,
+                "questions": [
+                    {
+                        "question_id": question_id,
+                        "label": step.question_labels.get(question_id, question_id),
+                        "answer": answer,
+                    }
+                    for question_id, answer in step.raw_response.items()
+                ],
+            }
+            for step in steps
+        ]
 
     def get_fields(self):
         fields = super().get_fields()
@@ -1584,6 +1618,34 @@ class ProposalApproveSerializer(serializers.Serializer):
 class AddProposalNoteSerializer(serializers.Serializer):
     author = serializers.CharField(max_length=255)
     text = serializers.CharField()
+
+
+class StartFormbricksFlowSerializer(serializers.Serializer):
+    """Input for ProposalViewSet.start_formbricks_flow."""
+
+    round_uuid = serializers.UUIDField(write_only=True)
+
+    def validate(self, attrs):
+        try:
+            round_obj = models.Round.objects.get(uuid=attrs["round_uuid"])
+        except models.Round.DoesNotExist:
+            raise serializers.ValidationError({"round_uuid": _("Round not found.")})
+        attrs["round"] = round_obj
+        return attrs
+
+
+class FormStepResponseSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.FormStepResponse
+        fields = (
+            "step_key",
+            "survey_id",
+            "response_id",
+            "raw_response",
+            "question_labels",
+            "created",
+            "modified",
+        )
 
 
 class CallRoundSerializer(serializers.HyperlinkedModelSerializer):

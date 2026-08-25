@@ -4,6 +4,26 @@ from waldur_core.core import WaldurExtension
 
 
 class ProposalExtension(WaldurExtension):
+    class Settings:
+        # See formbricks_flows.py / formbricks_client.py for how these are
+        # used. TODO(formbricks-setup): every value here is a placeholder -
+        # see the "Formbricks setup checklist" produced at the end of this
+        # feature's implementation.
+        WALDUR_PROPOSAL = {
+            # Public base URL of the Formbricks instance, e.g.
+            # "https://forms.example.org". No trailing slash.
+            "FORMBRICKS_BASE_URL": "https://formbricks.localhost",
+            # Shared secret configured on the Formbricks webhook itself;
+            # verifies inbound webhook signatures (formbricks_client.verify_signature).
+            "FORMBRICKS_WEBHOOK_SECRET": "",
+            # Formbricks Management API key; authenticates Waldur's outbound
+            # get_response()/get_survey() calls.
+            "FORMBRICKS_API_KEY": "",
+            # Waldur frontend URL a Lead lands on after finishing a Formbricks
+            # flow. {proposal_uuid} is substituted by views._get_formbricks_flow_complete_url.
+            "FRONTEND_FLOW_COMPLETE_URL_TEMPLATE": "https://localhost/proposals/{proposal_uuid}",
+        }
+
     @staticmethod
     def django_app():
         return "waldur_mastermind.proposal"

@@ -30,6 +30,7 @@ class CallAdmin(admin.ModelAdmin):
         "name",
         "state",
         "fixed_duration_in_days",
+        "formbricks_flow_key",
         "reviewer_identity_visible_to_submitters",
         "reviews_visible_to_submitters",
     )
@@ -53,6 +54,16 @@ class CallAdmin(admin.ModelAdmin):
                     "external_url",
                     "backend_id",
                 )
+            },
+        ),
+        (
+            "Formbricks-driven intake",
+            {
+                "fields": ("formbricks_flow_key",),
+                "description": "Set to a key from FORM_FLOWS "
+                "(waldur_mastermind/proposal/formbricks_flows.py) to use the "
+                "Formbricks flow instead of the legacy Waldur-native proposal "
+                "form for this call. Leave blank for the legacy form.",
             },
         ),
         (
@@ -86,6 +97,12 @@ class ReviewAdmin(admin.ModelAdmin):
     list_display = ("reviewer", "proposal")
 
 
+class FormStepResponseAdmin(admin.ModelAdmin):
+    list_display = ("proposal", "step_key", "survey_id", "response_id", "created")
+    list_filter = ("step_key",)
+    readonly_fields = ("raw_response", "question_labels")
+
+
 admin.site.register(models.CallManagingOrganisation)
 admin.site.register(models.Call, CallAdmin)
 admin.site.register(models.ProposalProjectRoleMapping, ProposalProjectRoleMappingAdmin)
@@ -93,3 +110,4 @@ admin.site.register(models.CallResourceTemplate)
 admin.site.register(models.Round, RoundAdmin)
 admin.site.register(models.Proposal, ProposalAdmin)
 admin.site.register(models.Review, ReviewAdmin)
+admin.site.register(models.FormStepResponse, FormStepResponseAdmin)

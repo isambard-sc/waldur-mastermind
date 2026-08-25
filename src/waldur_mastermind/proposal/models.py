@@ -239,6 +239,18 @@ class Call(
         help_text="Compliance checklist that proposals must complete before submission",
     )
 
+    # Formbricks-driven proposal intake. When set, applicants fill out the
+    # chain of Formbricks surveys defined under this key in
+    # proposal.formbricks_flows.FORM_FLOWS instead of the Waldur-native
+    # proposal form. Null means this call still uses the legacy form.
+    formbricks_flow_key = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+        help_text="Key into FORM_FLOWS selecting this call's Formbricks survey chain. "
+        "Leave blank to use the legacy Waldur-native proposal form.",
+    )
+
     objects = managers.CallManager()
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
@@ -264,7 +276,7 @@ class Call(
 
     def clean(self):
         """Prevent changing checklist if proposals exist."""
-        if self.pk and self.tracker.has_changed("compliance_checklist"):
+        if self.pk and self.tracker.has_changed("compliance_checklist_id"):
             if self.proposal_set.exists():
                 raise ValidationError(
                     "Cannot change compliance checklist when proposals exist"
@@ -819,6 +831,45 @@ class Proposal(
 
         self.state = ProposalStates.SUBMITTED
         self.save()
+
+
+class FormStepResponse(
+    TimeStampedModel,
+    core_models.UuidMixin,
+):
+    """Durable snapshot of a single Formbricks survey step submitted for a proposal.
+
+    One row per (proposal, step_key), written by the Formbricks webhook
+    handler. Stores the raw answers (raw_response) and the question labels
+    (question_labels) captured at the same moment, so a reviewer always sees
+    a question worded exactly as it was when the applicant answered it,
+    independent of the survey being edited later in Formbricks. Editing a
+    proposal never reads raw_response for prefill - it always re-fetches the
+    live Formbricks response, since long forms risk drifting out of sync
+    with the survey's current question set. This model exists purely for
+    durable reading (reviewers, and a possible future admin view of the
+    steps not shown to reviewers).
+    """
+
+    class Permissions:
+        customer_path = "proposal__round__call__manager__customer"
+
+    proposal = models.ForeignKey(
+        Proposal, on_delete=models.CASCADE, related_name="form_step_responses"
+    )
+    step_key = models.CharField(max_length=100)
+    survey_id = models.CharField(max_length=100)
+    response_id = models.CharField(max_length=100)
+    raw_response = models.JSONField(default=dict, blank=True)
+    question_labels = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        unique_together = ("proposal", "step_key")
+        verbose_name = "Form step response"
+        verbose_name_plural = "Form step responses"
+
+    def __str__(self):
+        return f"{self.step_key} response for {self.proposal}"
 
 
 class RequestedResource(

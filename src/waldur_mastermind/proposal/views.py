@@ -1,12 +1,17 @@
 import logging
 import re
+import uuid
 from datetime import datetime, timedelta
 from typing import cast
 
+from django.conf import settings as django_settings
+from django.core import exceptions as django_exceptions
 from django.db.models import OuterRef, ProtectedError, Q
 from django.db.models.functions import Coalesce
+from django.shortcuts import redirect
 from django.utils import timezone as timezone
 from django.utils.translation import gettext_lazy as _
+from django.views.decorators.csrf import csrf_exempt
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import decorators, exceptions, response, status, viewsets
@@ -27,19 +32,22 @@ from waldur_core.core.views import (
 )
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
+from waldur_core.media import models as media_models
+from waldur_core.media import views as media_views
+from waldur_core.permissions import models as permissions_models
+from waldur_core.permissions import serializers as permissions_serializers
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
 from waldur_core.permissions.utils import (
-    has_permission,
-    permission_factory,
     add_user as add_user_permission,
 )
+from waldur_core.permissions.utils import (
+    has_permission,
+    permission_factory,
+)
 from waldur_core.permissions.views import UserRoleMixin, validate_scope_not_soft_deleted
-from waldur_core.permissions import serializers as permissions_serializers
-from waldur_core.permissions import models as permissions_models
 from waldur_core.structure import filters as structure_filters
-from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import (
     filter_queryset_for_user,
     get_connected_customers,
@@ -49,6 +57,9 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.views import BaseMarketplaceView, PublicViewsetMixin
 from waldur_mastermind.proposal import (
     filters,
+    formbricks_client,
+    formbricks_flows,
+    formbricks_mapper,
     models,
     serializers,
     tasks,
@@ -60,14 +71,23 @@ from waldur_mastermind.proposal.enums import (
     ProposalStates,
     RequestedOfferingStates,
 )
-from waldur_core.media import models as media_models
-from waldur_core.media import views as media_views
 
 from .managers import get_connected_call_organizers, get_connected_calls
 from .models import Proposal
 from .serializers import ReviewSubmitSerializer
 
 logger = logging.getLogger(__name__)
+
+
+def _get_formbricks_flow_complete_url(proposal):
+    """Frontend URL a Lead lands on after finishing a Formbricks flow.
+
+    TODO(formbricks-setup): FRONTEND_FLOW_COMPLETE_URL_TEMPLATE in the
+    WALDUR_PROPOSAL setting is a placeholder - replace with the real
+    frontend base URL once known.
+    """
+    template = django_settings.WALDUR_PROPOSAL["FRONTEND_FLOW_COMPLETE_URL_TEMPLATE"]
+    return template.format(proposal_uuid=proposal.uuid)
 
 
 class CallManagingOrganisationViewSet(
@@ -1880,11 +1900,278 @@ class ProposalViewSet(
     add_note_permissions = [check_proposal_management_permission]
     add_note_serializer_class = serializers.AddProposalNoteSerializer
 
+    # --- Formbricks-driven proposal intake -----------------------------
+    #
+    # start_formbricks_flow creates the draft Proposal and grants the Lead
+    # PROPOSAL.MANAGER before Formbricks is ever involved, so "who is the
+    # Lead" never needs to be extracted from a Formbricks answer.
+    #
+    # formbricks_redirect is hit directly by the browser (each survey's own
+    # "Redirect to URL" ending in the Formbricks builder), never by the
+    # frontend's JS - it always responds with a real HTTP redirect.
+    #
+    # formbricks_edit_link is the frontend-facing counterpart: it returns a
+    # prefilled edit URL as JSON, always fetched live from Formbricks (see
+    # formbricks_client / formbricks_flows for why the stored
+    # FormStepResponse snapshot is never used for this).
+
+    @extend_schema(
+        description="Create a draft proposal for a Formbricks-driven call and "
+        "return the first survey's URL.",
+        request=serializers.StartFormbricksFlowSerializer,
+        responses={status.HTTP_201_CREATED: None},
+    )
+    @decorators.action(
+        detail=False, methods=["post"], url_path="start-formbricks-flow"
+    )
+    def start_formbricks_flow(self, request):
+        serializer = serializers.StartFormbricksFlowSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        round_obj = serializer.validated_data["round"]
+        call = round_obj.call
+
+        if not call.formbricks_flow_key:
+            raise exceptions.ValidationError(
+                "This call does not use the Formbricks flow."
+            )
+        if call.state != CallStates.ACTIVE:
+            raise exceptions.ValidationError("Call is not active.")
+
+        flow = formbricks_flows.get_flow(call.formbricks_flow_key)
+        if not flow:
+            raise exceptions.ValidationError(
+                f"No FORM_FLOWS entry configured for key {call.formbricks_flow_key!r}."
+            )
+
+        proposal = models.Proposal.objects.create(
+            name=f"Draft - {uuid.uuid4().hex[:8]}",
+            round=round_obj,
+            created_by=request.user,
+            state=ProposalStates.DRAFT,
+        )
+        proposal.add_user(
+            request.user, ProposalRole.MANAGER, created_by=request.user
+        )
+
+        first_step = flow[0]
+        redirect_url = formbricks_client.build_survey_url(
+            first_step["survey_id"],
+            proposal_uuid=str(proposal.uuid),
+            call_uuid=str(call.uuid),
+            round_uuid=str(round_obj.uuid),
+        )
+        return response.Response(
+            {"proposal_uuid": str(proposal.uuid), "redirect_url": redirect_url},
+            status=status.HTTP_201_CREATED,
+        )
+
+    @extend_schema(
+        description="Advance a Formbricks-driven proposal to its next survey. "
+        "Hit directly by Formbricks' 'Redirect to URL' survey ending - always "
+        "responds with an HTTP redirect, never JSON.",
+        request=None,
+        responses={status.HTTP_302_FOUND: None},
+    )
+    @decorators.action(detail=True, methods=["get"], url_path="formbricks-redirect")
+    def formbricks_redirect(self, request, uuid=None):
+        proposal = self.get_object()
+        call = proposal.round.call
+        flow_key = call.formbricks_flow_key
+        if not flow_key:
+            raise exceptions.ValidationError(
+                "This call does not use the Formbricks flow."
+            )
+
+        current_step = request.query_params.get("current_step")
+        if not current_step:
+            raise exceptions.ValidationError(
+                {"current_step": "This parameter is required."}
+            )
+
+        next_step = formbricks_flows.get_next_step(flow_key, current_step)
+        if next_step is None:
+            return redirect(_get_formbricks_flow_complete_url(proposal))
+
+        redirect_url = formbricks_client.build_survey_url(
+            next_step["survey_id"],
+            proposal_uuid=str(proposal.uuid),
+            call_uuid=str(call.uuid),
+            round_uuid=str(proposal.round.uuid),
+        )
+        return redirect(redirect_url)
+
+    formbricks_redirect_permissions = [is_proposal_manager]
+
+    @extend_schema(
+        description="Return a prefilled edit URL for an already-submitted "
+        "Formbricks step. Always fetches the step's current answers live "
+        "from Formbricks - never from the stored FormStepResponse snapshot.",
+        request=None,
+        responses={status.HTTP_200_OK: None},
+    )
+    @decorators.action(
+        detail=True, methods=["get"], url_path="formbricks-edit-link"
+    )
+    def formbricks_edit_link(self, request, uuid=None):
+        proposal = self.get_object()
+        if proposal.state != ProposalStates.DRAFT:
+            raise exceptions.ValidationError(
+                "Proposal can only be edited while in draft state."
+            )
+
+        call = proposal.round.call
+        flow_key = call.formbricks_flow_key
+        if not flow_key:
+            raise exceptions.ValidationError(
+                "This call does not use the Formbricks flow."
+            )
+
+        step_key = request.query_params.get("step")
+        if not step_key:
+            raise exceptions.ValidationError({"step": "This parameter is required."})
+
+        step = formbricks_flows.get_step(flow_key, step_key)
+        if step is None:
+            raise exceptions.NotFound(f"Unknown step {step_key!r} for this call.")
+
+        try:
+            form_step_response = proposal.form_step_responses.get(step_key=step_key)
+        except models.FormStepResponse.DoesNotExist:
+            raise exceptions.NotFound("This step has not been submitted yet.")
+
+        response_data = formbricks_client.get_response(
+            step["survey_id"], form_step_response.response_id
+        )
+        redirect_url = formbricks_client.build_prefilled_url(
+            step["survey_id"],
+            response_data,
+            proposal_uuid=str(proposal.uuid),
+            call_uuid=str(call.uuid),
+            round_uuid=str(proposal.round.uuid),
+        )
+        return response.Response({"redirect_url": redirect_url})
+
+    formbricks_edit_link_permissions = [is_proposal_manager]
+
     # Checklist Integration Endpoints
     # Checklist methods are now provided by ChecklistViewSetMixin
     # - checklist: Get checklist with questions and existing answers
     # - submit_answers: Submit checklist answers
     # - completion_status: Get completion status
+
+
+class FormbricksWebhookViewSet(viewsets.ViewSet):
+    """Receives Formbricks 'responseFinished' webhook events.
+
+    Unauthenticated by design - matches the AllowAny pattern used by
+    PublicCallViewSet and marketplace.MarketplaceAPIViewSet's own inbound
+    callback endpoint. Formbricks calls this server-to-server, over the
+    internal network shared by both services; authenticity is verified via
+    an HMAC signature (formbricks_client.verify_signature), not a Waldur
+    user session.
+
+    TODO(formbricks-setup): the webhook payload shape assumed below
+    (top-level "event", "data.id", "data.surveyId", "data.data") is a
+    best-effort guess, not verified against a live Formbricks instance -
+    see the "Formbricks setup checklist" produced at the end of this
+    feature's implementation.
+    """
+
+    permission_classes = (rf_permissions.AllowAny,)
+
+    @csrf_exempt
+    def create(self, request):
+        if not formbricks_client.verify_signature(request):
+            raise exceptions.PermissionDenied("Invalid webhook signature.")
+
+        payload = request.data
+        if payload.get("event") != "responseFinished":
+            # Ignore any other subscribed event type - only response
+            # completion advances the proposal flow.
+            return response.Response(status=status.HTTP_200_OK)
+
+        response_payload = payload.get("data") or {}
+        response_id = response_payload.get("id")
+        survey_id = response_payload.get("surveyId")
+        answers = response_payload.get("data") or {}
+        proposal_uuid = answers.get("proposal_uuid")
+
+        if not (response_id and survey_id and proposal_uuid):
+            logger.warning(
+                "Formbricks webhook payload missing response_id/survey_id/"
+                "proposal_uuid, ignoring: %s",
+                payload,
+            )
+            return response.Response(status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            proposal = models.Proposal.objects.get(uuid=proposal_uuid)
+        except (models.Proposal.DoesNotExist, ValueError, django_exceptions.ValidationError):
+            logger.warning(
+                "Formbricks webhook referenced unknown proposal %s", proposal_uuid
+            )
+            return response.Response(status=status.HTTP_404_NOT_FOUND)
+
+        call = proposal.round.call
+        flow_key = call.formbricks_flow_key
+        step = (
+            formbricks_flows.get_step_by_survey_id(flow_key, survey_id)
+            if flow_key
+            else None
+        )
+        if step is None:
+            logger.warning(
+                "Formbricks webhook for proposal %s referenced unknown survey "
+                "%s (flow key %r).",
+                proposal.uuid,
+                survey_id,
+                flow_key,
+            )
+            return response.Response(status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            question_labels = formbricks_client.get_survey(survey_id)
+        except Exception:
+            # Non-fatal: raw_response and the mapper matter more than a
+            # pretty label. Leave question_labels empty for this row rather
+            # than blocking storage/mapping on a schema-fetch failure.
+            logger.exception(
+                "Failed to fetch Formbricks survey schema for %s - "
+                "question_labels will be left empty for this response.",
+                survey_id,
+            )
+            question_labels = {}
+
+        models.FormStepResponse.objects.update_or_create(
+            proposal=proposal,
+            step_key=step["key"],
+            defaults={
+                "survey_id": survey_id,
+                "response_id": response_id,
+                "raw_response": answers,
+                "question_labels": question_labels,
+            },
+        )
+
+        if "mapper" in step:
+            mapper = getattr(formbricks_mapper, step["mapper"])
+            mapper(proposal, answers, step)
+            proposal.save()
+
+        flow = formbricks_flows.get_flow(flow_key)
+        if flow and flow[-1]["key"] == step["key"]:
+            previous_state = proposal.state
+            proposal.state = ProposalStates.SUBMITTED
+            proposal.submitted_at = timezone.now()
+            proposal.save()
+            tasks.notify_user_about_proposal_state_update.delay(
+                proposal.uuid, previous_state, proposal.state
+            )
+            tasks.notify_call_managers_about_new_proposal_submission.delay(
+                proposal.uuid
+            )
+
+        return response.Response(status=status.HTTP_200_OK)
 
 
 class ReviewViewSet(ActionsViewSet):
