@@ -576,6 +576,82 @@ class ManagedProjectAccountingSummarySerializer(rf_serializers.Serializer):
         return data
 
 
+class ManagedProjectAttachmentSerializer(rf_serializers.ModelSerializer):
+    """
+    Base serializer for one ManagedProjectAttachment row - one period during
+    which a project held an award. Subclassed to add either the award side
+    (for listing a project's award history) or the project side (for
+    listing an award's project history), depending on which direction is
+    being listed.
+    """
+
+    is_current = rf_serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.ManagedProjectAttachment
+        fields = ("attached_at", "detached_at", "is_current")
+
+    def get_is_current(self, attachment) -> bool:
+        return attachment.detached_at is None
+
+
+class ProjectAwardHistoryEntrySerializer(ManagedProjectAttachmentSerializer):
+    managed_project_identifier = rf_serializers.CharField(
+        source="managed_project.identifier", read_only=True
+    )
+    managed_project_destination = rf_serializers.CharField(
+        source="managed_project.destination", read_only=True
+    )
+
+    class Meta(ManagedProjectAttachmentSerializer.Meta):
+        fields = ManagedProjectAttachmentSerializer.Meta.fields + (
+            "managed_project_identifier",
+            "managed_project_destination",
+        )
+
+
+class ProjectAwardHistorySerializer(rf_serializers.Serializer):
+    """
+    Read-only serializer listing every award (ManagedProject) a project has
+    ever been connected to, and when. Data is derived from
+    Project.managed_project_attachments.
+    """
+
+    project_uuid = rf_serializers.UUIDField(source="uuid", read_only=True)
+    project_name = rf_serializers.CharField(source="name", read_only=True)
+    awards = rf_serializers.SerializerMethodField()
+
+    def get_awards(self, project):
+        attachments = project.managed_project_attachments.select_related(
+            "managed_project"
+        ).order_by("-attached_at")
+        return ProjectAwardHistoryEntrySerializer(attachments, many=True).data
+
+
+class ManagedProjectHistoryEntrySerializer(ManagedProjectAttachmentSerializer):
+    """
+    One project a given award has been connected to, and when. Used to list
+    an award's project history, already filtered (by the view) down to
+    projects the requesting user has visibility into.
+    """
+
+    project_uuid = rf_serializers.SerializerMethodField()
+    project_name = rf_serializers.SerializerMethodField()
+
+    class Meta(ManagedProjectAttachmentSerializer.Meta):
+        fields = ManagedProjectAttachmentSerializer.Meta.fields + (
+            "project_uuid",
+            "project_name",
+        )
+
+    def get_project_uuid(self, attachment) -> str | None:
+        # project is nullable (SET_NULL) - a row can outlive its project.
+        return str(attachment.project.uuid) if attachment.project else None
+
+    def get_project_name(self, attachment) -> str | None:
+        return attachment.project.name if attachment.project else None
+
+
 class ProjectAttachSerializer(rf_serializers.Serializer):
     project_uuid = rf_serializers.UUIDField(
         help_text="UUID of the project to attach to this managed project"

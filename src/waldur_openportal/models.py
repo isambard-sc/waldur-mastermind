@@ -5,8 +5,9 @@ from . import op as openportal
 
 from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models
+from django.db import models, transaction
 from django.db.models import F
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.core import validators
 
@@ -2322,6 +2323,7 @@ class ManagedProject(ReviewMixin, models.Model):
             existing_details = self.get_details()
             existing_details.project_link = None
             self.set_details(existing_details)
+            self._sync_attachment()
             return
 
         if not isinstance(project, structure_models.Project):
@@ -2337,6 +2339,129 @@ class ManagedProject(ReviewMixin, models.Model):
         existing_details = self.get_details()
         existing_details.project_link = self._get_project_link()
         self.set_details(existing_details)
+        self._sync_attachment()
+
+    def _sync_attachment(self):
+        """
+        Ensure ManagedProjectAttachment reflects self.project: close any
+        open attachment pointing at a project other than the current one
+        (or at any project, when self.project is now None), then get or
+        create the open attachment for the current project, if any.
+
+        Called from set_project() - the single place self.project changes -
+        so every attach/detach, whether via the attach()/detach() API
+        actions or the silent set_project() call made when an award is
+        first created or linked to an existing project, is tracked here.
+        """
+        now = timezone.now()
+
+        ManagedProjectAttachment.objects.filter(
+            managed_project=self, detached_at__isnull=True
+        ).exclude(project=self.project).update(detached_at=now)
+
+        if self.project is not None:
+            ManagedProjectAttachment.objects.get_or_create(
+                managed_project=self,
+                project=self.project,
+                detached_at__isnull=True,
+            )
+
+    def get_attachments(self):
+        """
+        Return this ManagedProject's attachment history
+        (ManagedProjectAttachment rows), reconstructing it from
+        ManagedProjectAuditEntry the first time it's needed - e.g. for a
+        ManagedProject that predates ManagedProjectAttachment tracking.
+        """
+        existing = self.attachments.all()
+        if existing.exists():
+            return existing
+
+        self._reconstruct_attachments_from_audit_log()
+        return self.attachments.all()
+
+    def _reconstruct_attachments_from_audit_log(self):
+        """
+        One-off, best-effort reconstruction of this ManagedProject's
+        attachment history from ManagedProjectAuditEntry, for a
+        ManagedProject that predates ManagedProjectAttachment tracking.
+        Idempotent: does nothing if attachments already exist.
+
+        ManagedProjectAuditEntry never records which project an attach or
+        detach referred to - only ManagedProject.project, a single current
+        value, does. So this can only safely reconstruct history on the
+        assumption that this ManagedProject has only ever pointed at
+        self.project. If self.project is currently None, there is no project
+        left to attribute past periods to, so nothing is reconstructed.
+
+        The very first attachment is often silent - set directly on the
+        ManagedProject when the award is created or linked to an existing
+        project, with no ManagedProjectAuditEntry recorded - so it is
+        inferred from self.created. Every later attach/detach was recorded
+        explicitly by attach()/detach().
+        """
+        if self.project is None:
+            return
+
+        with transaction.atomic():
+            # Re-check inside the transaction: this is a best-effort guard
+            # against a concurrent caller reconstructing the same history
+            # twice, not a fully race-proof lock - acceptable here since
+            # this only ever runs once per legacy ManagedProject.
+            if self.attachments.exists():
+                return
+
+            events = list(
+                ManagedProjectAuditEntry.objects.filter(
+                    managed_project=self,
+                    event_type__in=[
+                        ManagedProjectAuditEventType.PROJECT_ATTACHED,
+                        ManagedProjectAuditEventType.PROJECT_DETACHED,
+                    ],
+                )
+                .order_by("timestamp")
+                .values_list("timestamp", "event_type")
+            )
+
+            note = "Reconstructed from ManagedProjectAuditEntry."
+
+            if not events:
+                ManagedProjectAttachment.objects.create(
+                    managed_project=self,
+                    project=self.project,
+                    attached_at=self.created,
+                    note=f"{note} No attach/detach events recorded; "
+                    "inferred from ManagedProject.created.",
+                )
+                return
+
+            current_start = (
+                self.created
+                if events[0][1] == ManagedProjectAuditEventType.PROJECT_DETACHED
+                else None
+            )
+
+            for timestamp, event_type in events:
+                if event_type == ManagedProjectAuditEventType.PROJECT_DETACHED:
+                    if current_start is not None:
+                        ManagedProjectAttachment.objects.create(
+                            managed_project=self,
+                            project=self.project,
+                            attached_at=current_start,
+                            detached_at=timestamp,
+                            note=note,
+                        )
+                    current_start = None
+                else:
+                    current_start = timestamp
+
+            if current_start is not None:
+                ManagedProjectAttachment.objects.create(
+                    managed_project=self,
+                    project=self.project,
+                    attached_at=current_start,
+                    note=note,
+                )
 
     def merge_details(
         self, new_details: openportal.ProjectDetails
@@ -2502,6 +2627,72 @@ class ManagedProject(ReviewMixin, models.Model):
             return f"ManagedProject for {self.get_offering()} [{self.identifier} => {self.project}]"
         except Exception:
             return f"ManagedProject for 'null offering' [{self.identifier} => {self.project}]"
+
+
+class ManagedProjectAttachment(models.Model):
+    """
+    Records each period during which a local Waldur Project held the award
+    represented by a ManagedProject.
+
+    Written from ManagedProject.set_project() - the single place
+    ManagedProject.project changes - so every attach/detach, whether via the
+    attach()/detach() API actions or the silent set_project() call made when
+    an award is first created or linked to an existing project, is tracked
+    here. A ManagedProject that predates this tracking has its history
+    reconstructed on first read; see ManagedProject.get_attachments().
+
+    The open attachment (detached_at=None) always matches
+    ManagedProject.project (when set).
+
+    Unlike similar timestamped models elsewhere in this app, attached_at
+    uses a plain default rather than auto_now_add, so that reconstructed
+    rows can be backdated to when the attach/detach actually happened.
+    """
+
+    managed_project = models.ForeignKey(
+        to=ManagedProject,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+        verbose_name=_("managed project"),
+    )
+
+    project = models.ForeignKey(
+        to=structure_models.Project,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="managed_project_attachments",
+        verbose_name=_("project"),
+    )
+
+    attached_at = models.DateTimeField(
+        default=timezone.now,
+        verbose_name=_("attached at"),
+    )
+
+    detached_at = models.DateTimeField(
+        blank=True,
+        null=True,
+        verbose_name=_("detached at"),
+        help_text=_("Null while this is the current attachment."),
+    )
+
+    note = models.TextField(
+        blank=True,
+        verbose_name=_("note"),
+        help_text=_(
+            "Optional comment - e.g. noting this row was reconstructed from "
+            "ManagedProjectAuditEntry rather than recorded at the time."
+        ),
+    )
+
+    class Meta:
+        ordering = ["-attached_at"]
+        verbose_name = _("Managed Project Attachment")
+        verbose_name_plural = _("Managed Project Attachments")
+
+    def __str__(self) -> str:
+        status = "current" if self.detached_at is None else f"until {self.detached_at}"
+        return f"{self.managed_project} → {self.project} ({status})"
 
 
 # ---------------------------------------------------------------------------

@@ -1622,8 +1622,26 @@ class OpenPortalBoard:
         elif scale_factor != 1.0:
             report.scale_total(scale_factor)
 
-        # now filter the report to the requested date range
-        return report.filter(date_range)
+        # Filter to just the days this award was actually attached to the
+        # project, intersected with the requested range - not every day in
+        # the requested range, which may include days spent attached to a
+        # different award (or to no award at all).
+        attached_ranges = utils.get_managed_project_attached_date_ranges(
+            managed_project, date_range.start_date, date_range.end_date
+        )
+
+        if not attached_ranges:
+            return openportal.ProjectUsageReport(managed_project.get_remote_identifier())
+
+        filtered_reports = [
+            report.filter(openportal.DateRange(start, end))
+            for start, end in attached_ranges
+        ]
+
+        if len(filtered_reports) == 1:
+            return filtered_reports[0]
+
+        return openportal.ProjectUsageReport.combine(filtered_reports)
 
     def get_usage_reports(
         self, portal: openportal.PortalIdentifier, date_range: openportal.DateRange
@@ -1762,9 +1780,28 @@ class OpenPortalBoard:
             monthly.remap_project(managed_project.get_remote_identifier())
             report += monthly
 
-        # Filter to the exact requested date range (trims partial months
-        # at either end of the requested range).
-        return report.filter(date_range)
+        # Filter to just the days this award was actually attached to the
+        # project, intersected with the requested range - not every day in
+        # the requested range, which may include days spent attached to a
+        # different award (or to no award at all).
+        attached_ranges = utils.get_managed_project_attached_date_ranges(
+            managed_project, date_range.start_date, date_range.end_date
+        )
+
+        if not attached_ranges:
+            return openportal.ProjectStorageReport(
+                managed_project.get_remote_identifier()
+            )
+
+        filtered_reports = [
+            report.filter(openportal.DateRange(start, end))
+            for start, end in attached_ranges
+        ]
+
+        if len(filtered_reports) == 1:
+            return filtered_reports[0]
+
+        return openportal.ProjectStorageReport.combine(filtered_reports)
 
     def get_storage_reports(
         self, portal: openportal.PortalIdentifier, date_range: openportal.DateRange

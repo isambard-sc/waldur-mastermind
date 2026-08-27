@@ -88,6 +88,16 @@ def register_in(router):
         basename="openportal-managed-project-accounting-summary",
     )
     router.register(
+        r"openportal-project-award-history",
+        views.ProjectAwardHistoryViewSet,
+        basename="openportal-project-award-history",
+    )
+    router.register(
+        r"openportal-award-project-history",
+        views.ManagedProjectHistoryViewSet,
+        basename="openportal-award-project-history",
+    )
+    router.register(
         r"openportal-remote-projects",
         views.RemoteProjectViewSet,
         basename="openportal-remote-project",

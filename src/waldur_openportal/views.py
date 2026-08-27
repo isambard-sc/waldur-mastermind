@@ -1409,6 +1409,109 @@ class ManagedProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
         return super().list(request, *args, **kwargs)
 
 
+class ProjectAwardHistoryViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Read-only history of every award (ManagedProject) a single project has
+    ever been connected to, and when, via ManagedProjectAttachment.
+
+    Visible to staff, support, and anyone who can already see the project
+    (customer owner/viewer, or a member of the project) - once you can see
+    the project, you can see every award that has ever been connected to it,
+    so no separate per-award permission check is needed here. Compare with
+    ManagedProjectHistoryViewSet, which lists the other direction and does
+    need to filter per-row.
+
+    Scoped to one project at a time - list() requires project_uuid;
+    retrieve() is scoped by the project uuid in the URL.
+    """
+
+    queryset = structure_models.Project.objects.none()
+    serializer_class = serializers.ProjectAwardHistorySerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.ManagedProjectAccountingSummaryFilter
+    lookup_field = "uuid"
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return structure_models.Project.objects.none()
+        from waldur_core.structure.managers import get_visible_projects
+
+        user = self.request.user
+        qs = structure_models.Project.objects.all().select_related("customer")
+        if user.is_staff or user.is_support:
+            return qs
+        accessible_project_ids = list(get_visible_projects(user))
+        return qs.filter(id__in=accessible_project_ids)
+
+    def list(self, request, *args, **kwargs):
+        if not request.query_params.get("project_uuid"):
+            return Response(
+                {"detail": _("project_uuid is required.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().list(request, *args, **kwargs)
+
+
+class ManagedProjectHistoryViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Read-only history of every project a single award (ManagedProject) has
+    ever been connected to, and when, via ManagedProjectAttachment.
+
+    Requires identifier and destination - the ManagedProject's natural key,
+    since it has no uuid (compare with the identifier/destination composite
+    lookup used by ManagedProjectViewSet).
+
+    Unlike ProjectAwardHistoryViewSet, an award is not "owned" by any one
+    project, so seeing the award's identity is not enough to see every
+    project it has touched: staff and support see the full history, but
+    everyone else only sees the rows whose project they themselves have
+    visibility into (customer owner/viewer, or project member) - rows for a
+    project they can't see, or whose project has since been deleted, are
+    silently dropped rather than exposed or errored on.
+    """
+
+    queryset = models.ManagedProjectAttachment.objects.none()
+    serializer_class = serializers.ManagedProjectHistoryEntrySerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (ShortOrderingFilter,)
+    ordering_fields = ("attached_at",)
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.ManagedProjectAttachment.objects.none()
+
+        identifier = self.request.query_params.get("identifier")
+        destination = self.request.query_params.get("destination")
+        if not identifier or not destination:
+            return models.ManagedProjectAttachment.objects.none()
+
+        qs = models.ManagedProjectAttachment.objects.filter(
+            managed_project__identifier=identifier,
+            managed_project__destination=destination,
+        ).select_related("project", "managed_project")
+
+        user = self.request.user
+        if user.is_staff or user.is_support:
+            return qs
+
+        from waldur_core.structure.managers import get_visible_projects
+
+        accessible_project_ids = list(get_visible_projects(user))
+        return qs.filter(project_id__in=accessible_project_ids)
+
+    def list(self, request, *args, **kwargs):
+        if not (
+            request.query_params.get("identifier")
+            and request.query_params.get("destination")
+        ):
+            return Response(
+                {"detail": _("identifier and destination are required.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().list(request, *args, **kwargs)
+
+
 class UnmanagedProjectViewSet(structure_views.ProjectViewSet):
     """
     ViewSet that only matches Projects that do not have an associated ManagedProject.

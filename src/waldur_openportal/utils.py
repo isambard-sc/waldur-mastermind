@@ -611,61 +611,22 @@ def _get_managed_project_windows(
 ) -> list[tuple[datetime.date, datetime.date | None]]:
     """
     Return the list of (start_date, end_date) windows during which the passed
-    ManagedProject was attached to a Waldur project, merged so that touching
-    or overlapping windows (e.g. detached and reattached on the same day)
+    ManagedProject was attached to a Waldur project, merged so that windows
+    sharing a boundary day (e.g. detached and reattached on the same day)
     become a single window. end_date is None for the current, still-open
     window.
 
-    The very first attachment is often silent - set directly on the
-    ManagedProject when the award is created or linked to an existing
-    project, with no ManagedProjectAuditEntry recorded - so it is inferred
-    from managed_project.created. Every later attach/detach goes through the
-    attach()/detach() API actions and is recorded explicitly there.
-
-    A competing award that took over the project for part of the same day
-    this ManagedProject detached - and has since detached itself - leaves no
-    trace we can see, since its own link back to the project is cleared on
-    detach. Such a day is still counted here as belonging to this
-    ManagedProject. This is fine in practice: this function is only ever
-    called for the currently attached ManagedProject, so there is no other
-    report that could end up double-counting that day.
+    Backed by ManagedProject.get_attachments() (ManagedProjectAttachment
+    rows), which reconstructs history from ManagedProjectAuditEntry on first
+    read for a ManagedProject that predates that tracking.
     """
-    events = list(
-        models.ManagedProjectAuditEntry.objects.filter(
-            managed_project=managed_project,
-            event_type__in=[
-                models.ManagedProjectAuditEventType.PROJECT_ATTACHED,
-                models.ManagedProjectAuditEventType.PROJECT_DETACHED,
-            ],
+    windows = [
+        (
+            attachment.attached_at.date(),
+            attachment.detached_at.date() if attachment.detached_at else None,
         )
-        .order_by("timestamp")
-        .values_list("timestamp", "event_type")
-    )
-
-    if not events:
-        if managed_project.project_id is None:
-            return []
-        return [(managed_project.created.date(), None)]
-
-    windows: list[tuple[datetime.date, datetime.date | None]] = []
-
-    current_start = (
-        managed_project.created.date()
-        if events[0][1] == models.ManagedProjectAuditEventType.PROJECT_DETACHED
-        else None
-    )
-
-    for timestamp, event_type in events:
-        day = timestamp.date()
-        if event_type == models.ManagedProjectAuditEventType.PROJECT_DETACHED:
-            if current_start is not None:
-                windows.append((current_start, day))
-            current_start = None
-        else:
-            current_start = day
-
-    if current_start is not None:
-        windows.append((current_start, None))
+        for attachment in managed_project.get_attachments().order_by("attached_at")
+    ]
 
     return _merge_adjacent_windows(windows)
 
@@ -692,6 +653,55 @@ def _merge_adjacent_windows(
             merged.append((start, end))
 
     return merged
+
+
+def _clip_window_to_range(
+    start: datetime.date,
+    end: datetime.date | None,
+    range_start: datetime.date,
+    range_end: datetime.date,
+) -> tuple[datetime.date, datetime.date] | None:
+    """
+    Clip a (start, end) window - end may be None for a still-open window -
+    to [range_start, range_end]. Returns (clip_start, clip_end), or None if
+    the window and the range don't overlap at all.
+    """
+    window_end = end or range_end
+    clip_start = max(range_start, start)
+    clip_end = min(range_end, window_end)
+
+    if clip_start > clip_end:
+        return None
+
+    return (clip_start, clip_end)
+
+
+def get_managed_project_attached_date_ranges(
+    managed_project: "models.ManagedProject",
+    range_start: datetime.date,
+    range_end: datetime.date,
+) -> list[tuple[datetime.date, datetime.date]]:
+    """
+    Return the closed [start, end] date sub-ranges within
+    [range_start, range_end] during which managed_project was attached to a
+    project, clipped to that range. Sub-ranges with no overlap are dropped -
+    an empty result means the award was not connected to any project at any
+    point during the requested range.
+
+    Used to trim an OpenPortal usage/storage report down to only the days an
+    award was actually connected, rather than every day in a requested
+    range: report.filter() one DateRange per returned sub-range, then
+    combine() the results back into a single report.
+    """
+    windows = _get_managed_project_windows(managed_project)
+
+    clipped_ranges = []
+    for start, end in windows:
+        clipped = _clip_window_to_range(start, end, range_start, range_end)
+        if clipped is not None:
+            clipped_ranges.append(clipped)
+
+    return clipped_ranges
 
 
 def _sum_usage_over_windows(
@@ -721,12 +731,10 @@ def _sum_usage_over_windows(
         month_end = get_last_day_of_month(month_start)
 
         for start_date, end_date in windows:
-            window_end = end_date or month_end
-            overlap_start = max(month_start, start_date)
-            overlap_end = min(month_end, window_end)
-
-            if overlap_start > overlap_end:
+            clipped = _clip_window_to_range(start_date, end_date, month_start, month_end)
+            if clipped is None:
                 continue
+            overlap_start, overlap_end = clipped
 
             report = cached_report.get_report()
             date_range = openportal.DateRange(overlap_start, overlap_end)

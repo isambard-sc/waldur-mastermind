@@ -193,6 +193,79 @@ class MergeAdjacentWindowsTest(TestCase):
         self.assertEqual(utils._merge_adjacent_windows(windows), windows)
 
 
+class GetManagedProjectAttachedDateRangesTest(TestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.managed_project = _make_managed_project(self.fixture.project)
+
+    def _add_attachment(self, attached_at, detached_at=None):
+        return models.ManagedProjectAttachment.objects.create(
+            managed_project=self.managed_project,
+            project=self.fixture.project,
+            attached_at=attached_at,
+            detached_at=detached_at,
+        )
+
+    def test_never_attached_returns_no_ranges(self):
+        # self.managed_project (from setUp) already has a project set, which
+        # would trigger the get_attachments() JIT reconstruction and produce
+        # a window from .created - use a genuinely unattached one instead.
+        never_attached = _make_managed_project(project=None, identifier="never-attached")
+
+        ranges = utils.get_managed_project_attached_date_ranges(
+            never_attached, datetime.date(2026, 1, 1), datetime.date(2026, 1, 31)
+        )
+
+        self.assertEqual(ranges, [])
+
+    def test_window_fully_covering_the_range_is_clipped_to_the_range(self):
+        self._add_attachment(_dt(2025, 1, 1))
+
+        ranges = utils.get_managed_project_attached_date_ranges(
+            self.managed_project, datetime.date(2026, 1, 1), datetime.date(2026, 1, 31)
+        )
+
+        self.assertEqual(
+            ranges, [(datetime.date(2026, 1, 1), datetime.date(2026, 1, 31))]
+        )
+
+    def test_range_fully_covering_the_window_is_clipped_to_the_window(self):
+        self._add_attachment(_dt(2026, 1, 10), _dt(2026, 1, 20))
+
+        ranges = utils.get_managed_project_attached_date_ranges(
+            self.managed_project, datetime.date(2026, 1, 1), datetime.date(2026, 1, 31)
+        )
+
+        self.assertEqual(
+            ranges, [(datetime.date(2026, 1, 10), datetime.date(2026, 1, 20))]
+        )
+
+    def test_window_with_no_overlap_is_excluded(self):
+        self._add_attachment(_dt(2025, 1, 1), _dt(2025, 12, 31))
+
+        ranges = utils.get_managed_project_attached_date_ranges(
+            self.managed_project, datetime.date(2026, 1, 1), datetime.date(2026, 1, 31)
+        )
+
+        self.assertEqual(ranges, [])
+
+    def test_multiple_windows_each_clipped_independently(self):
+        self._add_attachment(_dt(2025, 12, 20), _dt(2026, 1, 10))
+        self._add_attachment(_dt(2026, 1, 20))
+
+        ranges = utils.get_managed_project_attached_date_ranges(
+            self.managed_project, datetime.date(2026, 1, 1), datetime.date(2026, 1, 31)
+        )
+
+        self.assertEqual(
+            ranges,
+            [
+                (datetime.date(2026, 1, 1), datetime.date(2026, 1, 10)),
+                (datetime.date(2026, 1, 20), datetime.date(2026, 1, 31)),
+            ],
+        )
+
+
 @contextmanager
 def _patch_report(total_hours_per_day):
     """
