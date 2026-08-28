@@ -10,9 +10,20 @@ class ProposalExtension(WaldurExtension):
         # see the "Formbricks setup checklist" produced at the end of this
         # feature's implementation.
         WALDUR_PROPOSAL = {
-            # Public base URL of the Formbricks instance, e.g.
-            # "https://forms.example.org". No trailing slash.
+            # Public base URL of the Formbricks instance, used to build the
+            # survey links a Lead's *browser* is sent to
+            # (build_survey_url/build_prefilled_url). No trailing slash.
             "FORMBRICKS_BASE_URL": "https://formbricks.localhost",
+            # Formbricks base URL reachable *from inside the waldur-mastermind
+            # containers* - used only by get_response()/get_survey(), which run
+            # server-side. Deliberately separate from FORMBRICKS_BASE_URL:
+            # "formbricks.localhost" resolves to loopback inside every
+            # container (same class of problem the webhook URL had in the
+            # other direction), so this needs the actual docker-network
+            # address instead. Verified reachable as of 2026-08-26 - tied to
+            # this docker-compose project's container naming, so it'll need
+            # updating if that changes (e.g. a different COMPOSE_PROJECT_NAME).
+            "FORMBRICKS_MANAGEMENT_API_URL": "http://waldur-docker-compose-formbricks-1:3000",
             # Shared secret configured on the Formbricks webhook itself;
             # verifies inbound webhook signatures (formbricks_client.verify_signature).
             "FORMBRICKS_WEBHOOK_SECRET": "",

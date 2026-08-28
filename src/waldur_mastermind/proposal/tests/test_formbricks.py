@@ -4,6 +4,7 @@ import hmac
 import json
 import time
 from unittest import mock
+from urllib.parse import parse_qs, urlparse
 
 from django.conf import settings
 from django.urls import reverse
@@ -26,15 +27,28 @@ PROJECT_DETAILS_STEP = {
     "field_map": {
         "q_name": "name",
         "q_summary": "project_summary",
+    },
+    "integer_field_map": {
         "q_duration": "duration_in_days",
+    },
+    "boolean_field_map": {
         "q_confidential": "project_is_confidential",
         "q_civilian": "project_has_civilian_purpose",
     },
     "resource_question_id": "q_resources",
+    # Answers are Formbricks choice *labels*, not slugs - deliberately
+    # distinct from the "test-offering" slug key below, to exercise the
+    # translation step rather than have it pass by coincidence.
+    "resource_label_to_slug": {
+        "Test Offering": "test-offering",
+    },
     "resource_options": {
         "test-offering": {
-            "attribute_field_map": {"q_num_gpus": "num_gpus"},
-            "default_attributes": {"storage_gb": 100},
+            # "allocation" (GPU-hours), not "num_gpus" - matches
+            # waldur_openportal's Resource.options["allocation"] key name.
+            # No default_attributes: storage isn't assigned by the resource.
+            "attribute_field_map": {"q_num_gpus": "allocation"},
+            "default_attributes": {},
         },
     },
     "mapper": "map_project_details",
@@ -75,6 +89,10 @@ def sign(body_bytes, webhook_id="msg_test", timestamp=None):
         ).digest()
     ).decode()
     return webhook_id, timestamp, f"v1,{signature}"
+
+
+def query_params(url):
+    return {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
 
 
 def build_payload(survey_id, response_id, data):
@@ -180,16 +198,20 @@ class WebhookMappingTest(FormbricksTestCase):
             "q_confidential": "Confidential?",
             "q_civilian": "Civilian purpose?",
             "q_resources": "Which resources?",
-            "q_num_gpus": "How many GPUs?",
+            "q_num_gpus": "How many GPU-hours do you need?",
         }
         answers = {
             "proposal_uuid": str(self.proposal.uuid),
             "q_name": "My project",
             "q_summary": "A summary",
-            "q_duration": 30,
-            "q_confidential": True,
-            "q_civilian": False,
-            "q_resources": ["test-offering"],
+            # Formbricks sends every answer as a string (or list of
+            # strings), regardless of the question type - this exercises
+            # the integer_field_map/boolean_field_map coercion, not just
+            # the plain field_map passthrough.
+            "q_duration": "30",
+            "q_confidential": "Yes",
+            "q_civilian": "No",
+            "q_resources": ["Test Offering"],
             "q_num_gpus": 4,
         }
         response = self.post_webhook(
@@ -209,9 +231,7 @@ class WebhookMappingTest(FormbricksTestCase):
         requested_resource = models.RequestedResource.objects.get(
             proposal=self.proposal
         )
-        self.assertEqual(
-            requested_resource.attributes, {"storage_gb": 100, "num_gpus": 4}
-        )
+        self.assertEqual(requested_resource.attributes, {"allocation": 4})
 
         form_step_response = models.FormStepResponse.objects.get(
             proposal=self.proposal, step_key="project_details"
@@ -219,6 +239,48 @@ class WebhookMappingTest(FormbricksTestCase):
         self.assertEqual(form_step_response.response_id, "resp-1")
         self.assertEqual(form_step_response.raw_response, answers)
         self.assertEqual(form_step_response.question_labels["q_name"], "Project title")
+
+    @mock.patch.object(formbricks_client, "get_survey")
+    def test_boolean_field_with_unexpected_value_fails_loudly(self, mock_get_survey):
+        mock_get_survey.return_value = {}
+        answers = {
+            "proposal_uuid": str(self.proposal.uuid),
+            "q_name": "My project",
+            "q_summary": "A summary",
+            "q_duration": "30",
+            "q_confidential": "Maybe",  # not "Yes"/"No" - question type may
+            "q_civilian": "No",  # have changed without updating the config.
+            "q_resources": [],
+        }
+        # Django's test client re-raises uncaught view exceptions by default
+        # (to surface the real traceback in test output) instead of turning
+        # them into a 500 response - opt out so this test can observe what a
+        # real caller (Formbricks) would actually get back.
+        self.client.raise_request_exception = False
+        response = self.post_webhook(
+            build_payload("survey-project-details", "resp-bad-bool", answers)
+        )
+        # Uncaught FormbricksMappingError surfaces as a 500 - deliberate:
+        # fail loudly rather than silently mis-map a confidentiality flag.
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @mock.patch.object(formbricks_client, "get_survey")
+    def test_integer_field_with_unexpected_value_fails_loudly(self, mock_get_survey):
+        mock_get_survey.return_value = {}
+        answers = {
+            "proposal_uuid": str(self.proposal.uuid),
+            "q_name": "My project",
+            "q_summary": "A summary",
+            "q_duration": "thirty",  # not parseable as an int
+            "q_confidential": "Yes",
+            "q_civilian": "No",
+            "q_resources": [],
+        }
+        self.client.raise_request_exception = False
+        response = self.post_webhook(
+            build_payload("survey-project-details", "resp-bad-int", answers)
+        )
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @mock.patch.object(formbricks_client, "get_survey")
     def test_step_without_mapper_is_snapshotted_but_not_mapped(self, mock_get_survey):
@@ -253,9 +315,9 @@ class WebhookMappingTest(FormbricksTestCase):
                     {
                         "q_name": "My project",
                         "q_summary": "Summary",
-                        "q_duration": 10,
-                        "q_confidential": False,
-                        "q_civilian": True,
+                        "q_duration": "10",
+                        "q_confidential": "No",
+                        "q_civilian": "Yes",
                         "q_resources": [],
                     }
                 )
@@ -352,6 +414,10 @@ class StartFormbricksFlowTest(FormbricksTestCase):
         self.assertIn(PROJECT_DETAILS_STEP["survey_id"], response.data["redirect_url"])
         self.assertIn(str(proposal.uuid), response.data["redirect_url"])
 
+        params = query_params(response.data["redirect_url"])
+        self.assertEqual(params["lead_name"], self.lead.full_name)
+        self.assertEqual(params["lead_email"], self.lead.email)
+
     def test_rejects_call_without_formbricks_flow_key(self):
         self.fixture.call.formbricks_flow_key = None
         self.fixture.call.save()
@@ -380,6 +446,10 @@ class FormbricksRedirectTest(FormbricksTestCase):
         response = self.client.get(url, {"current_step": "project_details"})
         self.assertEqual(response.status_code, status.HTTP_302_FOUND)
         self.assertIn(TEAM_DETAILS_STEP["survey_id"], response.url)
+
+        params = query_params(response.url)
+        self.assertEqual(params["lead_name"], self.lead.full_name)
+        self.assertEqual(params["lead_email"], self.lead.email)
 
     def test_last_step_redirects_to_frontend_completion_url(self):
         self.client.force_authenticate(self.lead)
@@ -435,6 +505,10 @@ class FormbricksEditLinkTest(FormbricksTestCase):
         mock_get_response.assert_called_once_with("survey-team-details", "resp-1")
         self.assertIn("current+answer", response.data["redirect_url"])
 
+        params = query_params(response.data["redirect_url"])
+        self.assertEqual(params["lead_name"], self.lead.full_name)
+        self.assertEqual(params["lead_email"], self.lead.email)
+
     def test_404_if_step_not_yet_submitted(self):
         self.client.force_authenticate(self.lead)
         url = factories.ProposalFactory.get_url(
@@ -452,6 +526,158 @@ class FormbricksEditLinkTest(FormbricksTestCase):
         )
         response = self.client.get(url, {"step": "team_details"})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_staff_user_is_forbidden(self):
+        # is_only_proposal_lead deliberately has no is_staff bypass - a
+        # staff user can view this proposal (see ProposalFormResponsesTest)
+        # but must not be able to fetch an edit link on the Lead's behalf.
+        staff_user = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(staff_user)
+        url = factories.ProposalFactory.get_url(
+            self.proposal, action="formbricks-edit-link"
+        )
+        response = self.client.get(url, {"step": "team_details"})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class FormbricksProgressTest(FormbricksTestCase):
+    def setUp(self):
+        super().setUp()
+        self.proposal = factories.ProposalFactory(
+            round=self.fixture.round, state=ProposalStates.DRAFT
+        )
+        self.lead = structure_factories.UserFactory()
+        self.proposal.add_user(self.lead, ProposalRole.MANAGER, created_by=self.lead)
+        self.url = factories.ProposalFactory.get_url(
+            self.proposal, action="formbricks-progress"
+        )
+
+    def _create_response(self, step_key, survey_id):
+        models.FormStepResponse.objects.create(
+            proposal=self.proposal,
+            step_key=step_key,
+            survey_id=survey_id,
+            response_id=f"resp-{step_key}",
+            raw_response={},
+            question_labels={},
+        )
+
+    def test_no_steps_completed_points_to_first_step(self):
+        self.client.force_authenticate(self.lead)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["completed_steps"], [])
+        self.assertEqual(response.data["next_step"]["key"], "project_details")
+        self.assertIn(
+            PROJECT_DETAILS_STEP["survey_id"], response.data["next_step"]["redirect_url"]
+        )
+        params = query_params(response.data["next_step"]["redirect_url"])
+        self.assertEqual(params["lead_name"], self.lead.full_name)
+        self.assertEqual(params["lead_email"], self.lead.email)
+
+    def test_partial_completion_reports_next_incomplete_step_in_flow_order(self):
+        self._create_response("project_details", "survey-project-details")
+        self._create_response("team_details", "survey-team-details")
+
+        self.client.force_authenticate(self.lead)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["completed_steps"], ["project_details", "team_details"]
+        )
+        self.assertEqual(response.data["next_step"]["key"], "compliance")
+
+    def test_all_steps_completed_returns_null_next_step(self):
+        for step in (
+            PROJECT_DETAILS_STEP,
+            TEAM_DETAILS_STEP,
+            COMPLIANCE_STEP,
+            ASSESSMENT_STEP,
+        ):
+            self._create_response(step["key"], step["survey_id"])
+
+        self.client.force_authenticate(self.lead)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["completed_steps"],
+            ["project_details", "team_details", "compliance", "assessment"],
+        )
+        self.assertIsNone(response.data["next_step"])
+
+    def test_staff_user_is_forbidden(self):
+        staff_user = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(staff_user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_unrelated_user_gets_404_not_403(self):
+        other_user = structure_factories.UserFactory()
+        self.client.force_authenticate(other_user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class ProposalFormResponsesTest(FormbricksTestCase):
+    """Unlike ProposalReviewSerializer.form_responses (reviewer-restricted
+    to REVIEWER_VISIBLE_STEPS), ProposalSerializer.form_responses returns
+    every stored step - it's the Lead's own data (and, by the same
+    visibility already enforced on ProposalViewSet.get_queryset, a staff
+    viewer's)."""
+
+    def setUp(self):
+        super().setUp()
+        self.proposal = factories.ProposalFactory(
+            round=self.fixture.round, state=ProposalStates.DRAFT
+        )
+        self.lead = structure_factories.UserFactory()
+        self.proposal.add_user(self.lead, ProposalRole.MANAGER, created_by=self.lead)
+
+        for step_key, survey_id in (
+            ("project_details", "survey-project-details"),
+            ("team_details", "survey-team-details"),
+            ("compliance", "survey-compliance"),
+            ("assessment", "survey-assessment"),
+        ):
+            models.FormStepResponse.objects.create(
+                proposal=self.proposal,
+                step_key=step_key,
+                survey_id=survey_id,
+                response_id=f"resp-{step_key}",
+                raw_response={"q_1": f"answer for {step_key}"},
+                question_labels={"q_1": f"question for {step_key}"},
+            )
+
+    def test_lead_sees_every_step_not_just_reviewer_visible_ones(self):
+        self.client.force_authenticate(self.lead)
+        url = factories.ProposalFactory.get_url(self.proposal)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        step_keys = {item["step_key"] for item in response.data["form_responses"]}
+        self.assertEqual(
+            step_keys, {"project_details", "team_details", "compliance", "assessment"}
+        )
+
+    def test_staff_user_can_also_view_every_step_read_only(self):
+        staff_user = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(staff_user)
+        url = factories.ProposalFactory.get_url(self.proposal)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        step_keys = {item["step_key"] for item in response.data["form_responses"]}
+        self.assertEqual(
+            step_keys, {"project_details", "team_details", "compliance", "assessment"}
+        )
+
+
+class PublicCallFormbricksFlowKeyTest(FormbricksTestCase):
+    def test_formbricks_flow_key_is_exposed_on_the_public_call(self):
+        url = factories.CallFactory.get_public_url(self.fixture.call)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["formbricks_flow_key"], TEST_FLOW_KEY)
 
 
 class ReviewerFormResponsesTest(FormbricksTestCase):

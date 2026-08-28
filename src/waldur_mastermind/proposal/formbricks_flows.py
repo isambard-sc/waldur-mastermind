@@ -10,52 +10,77 @@ Step dict shape:
                reviewer visibility (see REVIEWER_VISIBLE_STEPS), and stored
                on FormStepResponse.step_key.
     survey_id: the Formbricks survey ID for this step.
-    field_map: (optional) {formbricks_question_id: proposal_field_name}.
+    field_map / integer_field_map / boolean_field_map: (optional)
+               {formbricks_question_id: proposal_field_name}, split by the
+               type coercion each needs - Formbricks always sends answers as
+               strings (or lists of strings for multi-select), regardless of
+               the target field's real type:
+                 field_map         - used as-is (text fields).
+                 integer_field_map - parsed with int().
+                 boolean_field_map - "Yes"/"No" (case-insensitive) parsed to
+                                      True/False; anything else fails loudly.
                Only present on steps whose answers feed directly into
                Proposal fields - currently only "project_details". Steps
-               without a field_map (team_details, compliance, assessment)
-               are still snapshotted (see models.FormStepResponse) but are
-               never turned into structured Waldur data.
+               without these (team_details, compliance, assessment) are
+               still snapshotted (see models.FormStepResponse) but are never
+               turned into structured Waldur data.
     mapper:    (optional) name of a function in formbricks_mapper.py that
-               knows how to apply field_map plus any step-specific logic
-               (e.g. resource selection) to a Proposal.
-    resource_question_id / resource_options: (optional, "project_details"
-               only) - see below.
+               knows how to apply the field maps plus any step-specific
+               logic (e.g. resource selection) to a Proposal.
+    resource_question_id / resource_label_to_slug / resource_options:
+               (optional, "project_details" only) - see below.
 """
 
 PROJECT_DETAILS_STEP = {
     "key": "project_details",
     "survey_id": "cmt4q1c400004qe01zta9vmnm",
     "field_map": {
-        # "What is the title of your project?"
-        "cid9d22768jyf65hht3sakqq": "name",
-        # "Briefly summarise your project"
-        "kfxb1byod4zd0k64o8es2cn9": "project_summary",
-        # "How many days of access do you need?"
-        "g81oicc5tihv86395lclkfpz": "duration_in_days",
-        # "Is this project confidential?"
-        "uwuf2cmxqmka9u06g226vhxc": "project_is_confidential",
-        # "Does this project have a civilian purpose?"
-        "vah5dve0ku0q1acndbctfbmc": "project_has_civilian_purpose",
+        "fjxcnvv5q1ny48q2wazmq2eb": "name",  # "Project title"
+        "drihiecfnvzubpjfjc39ai6p": "project_summary",  # "Project summary"
     },
-    # Multi-select: "Which resource types would you like to request?"
-    # Options are offering slugs (stable across calls); the mapper resolves
-    # each selected slug to *this call's* RequestedOffering row, since the
-    # same project_details survey is reused across calls with different
-    # RequestedOffering rows for the "same" marketplace offering.
-    "resource_question_id": "tf4lhp5vsvc7993sx27q5ugd",
+    "integer_field_map": {
+        "otdzfok26gyprjg6cttxvas4": "duration_in_days",  # "Project duration, in days"
+    },
+    "boolean_field_map": {
+        # "Does the project involve confidential, sensitive or GDPR-protected information?"
+        "cy3gskc7izzurxbrnk4b3mc8": "project_is_confidential",
+        # "Is the project non-commercial or research only?" - not a precise
+        # match for project_has_civilian_purpose (commercial/non-commercial
+        # is a different axis from civilian/military use), but mapped here
+        # deliberately per product decision - there's no dedicated field for
+        # "non-commercial/research-only" on Proposal.
+        "xn6ybk9fk265kjgv37xx0wac": "project_has_civilian_purpose",
+    },
+    # Multi-select: "AIRR service requested". Formbricks records the
+    # selected choice's *label text* as the answer (e.g. "Isambard-AI"), not
+    # a stable id or slug - resource_label_to_slug translates that
+    # explicitly rather than deriving a slug from the label (e.g.
+    # lowercasing it), since offering slugs are real, auto-generated Waldur
+    # values free to diverge from Formbricks' label text over time.
+    "resource_question_id": "peoi4op1vjaws6c2dvigbahe",
+    "resource_label_to_slug": {
+        "Isambard-AI": "isambard-a-1",  # real Offering.slug, NOT "isambard-ai"
+        # "Zenith" is already a selectable choice on the live survey, but
+        # the backing marketplace offering doesn't exist yet (as of
+        # 2026-08-26) - deliberately no entry here. Selecting it today is
+        # safely skipped (logged as unknown), not a hard failure. Add an
+        # entry once the real offering + its RequestedOffering exist on
+        # both calls.
+    },
     "resource_options": {
-        "isambard-ai": {
+        "isambard-a-1": {
             "attribute_field_map": {
-                "j4b388ormyl4jiwajx158uel": "num_gpus",
+                # "GPUh requested" - GPU-*hours*, not a GPU count. Named
+                # "allocation" to match waldur_openportal's
+                # Resource.options["allocation"] key (see
+                # _get_requested_allocation in waldur_openportal/models.py)
+                # for forward-compatibility, even though nothing currently
+                # bridges RequestedResource.attributes into Resource.options
+                # at project-creation time - see formbricks_mapper.py.
+                "u3bpmiiaumhqqhjk9yrdet6u": "allocation",
             },
-            "default_attributes": {"storage_gb": 100},
-        },
-        "zenith": {
-            "attribute_field_map": {
-                "j4b388ormyl4jiwajx158uel": "num_gpus",
-            },
-            "default_attributes": {"storage_gb": 200},
+            # Storage isn't assigned by the resource - nothing to default.
+            "default_attributes": {},
         },
     },
     "mapper": "map_project_details",

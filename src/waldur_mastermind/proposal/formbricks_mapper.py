@@ -32,6 +32,62 @@ def _get_required(data, question_id, step_key):
     return data[question_id]
 
 
+_YES_NO = {"yes": True, "no": False}
+
+
+def _coerce_bool(value, question_id, step_key):
+    try:
+        return _YES_NO[value.strip().lower()]
+    except (AttributeError, KeyError):
+        raise FormbricksMappingError(
+            f"Question {question_id!r} in {step_key!r} response was "
+            f"{value!r} - expected 'Yes'/'No'. The question type may have "
+            f"changed in Formbricks without updating formbricks_flows.py."
+        )
+
+
+def _coerce_int(value, question_id, step_key):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise FormbricksMappingError(
+            f"Question {question_id!r} in {step_key!r} response was "
+            f"{value!r} - expected a whole number."
+        )
+
+
+def serialize_form_responses(proposal, step_keys=None):
+    """Zip each FormStepResponse's raw_response/question_labels into
+    label/value pairs, for the Lead's and reviewers' read-only display.
+
+    `step_keys`, if given, restricts which steps are included (reviewers
+    only ever see formbricks_flows.REVIEWER_VISIBLE_STEPS); omitted, every
+    stored step is returned (the Lead's own data, or a staff viewer's).
+    Returns None if the call doesn't use the Formbricks flow at all.
+    """
+    if not proposal.round.call.formbricks_flow_key:
+        return None
+
+    steps = proposal.form_step_responses.order_by("step_key")
+    if step_keys is not None:
+        steps = steps.filter(step_key__in=step_keys)
+
+    return [
+        {
+            "step_key": step.step_key,
+            "questions": [
+                {
+                    "question_id": question_id,
+                    "label": step.question_labels.get(question_id, question_id),
+                    "answer": answer,
+                }
+                for question_id, answer in step.raw_response.items()
+            ],
+        }
+        for step in steps
+    ]
+
+
 def _resolve_requested_offering(call, offering_slug):
     try:
         return proposal_models.RequestedOffering.objects.get(
@@ -64,20 +120,47 @@ def map_project_details(proposal, data, step):
         value = _get_required(data, question_id, step["key"])
         setattr(proposal, field_name, value)
 
+    for question_id, field_name in step.get("integer_field_map", {}).items():
+        value = _get_required(data, question_id, step["key"])
+        setattr(proposal, field_name, _coerce_int(value, question_id, step["key"]))
+
+    for question_id, field_name in step.get("boolean_field_map", {}).items():
+        value = _get_required(data, question_id, step["key"])
+        setattr(proposal, field_name, _coerce_bool(value, question_id, step["key"]))
+
     call = proposal.round.call
     resource_options = step["resource_options"]
+    label_to_slug = step["resource_label_to_slug"]
 
-    selected_slugs = _get_required(data, step["resource_question_id"], step["key"])
-    if isinstance(selected_slugs, str):
-        selected_slugs = [selected_slugs]
+    selected_labels = _get_required(data, step["resource_question_id"], step["key"])
+    if isinstance(selected_labels, str):
+        selected_labels = [selected_labels]
 
     selected_requested_offering_ids = []
-    for slug in selected_slugs:
+    for label in selected_labels:
+        # Formbricks records the choice's label text as the answer, not a
+        # stable id/slug - translate explicitly rather than deriving a slug
+        # from the label (e.g. lowercasing it), since offering slugs are
+        # free to diverge from Formbricks' label text over time.
+        slug = label_to_slug.get(label)
+        if slug is None:
+            logger.warning(
+                "Proposal %s selected resource option %r for call %s with no "
+                "resource_label_to_slug entry - skipping (offering may not "
+                "be wired up yet).",
+                proposal.uuid,
+                label,
+                call,
+            )
+            continue
+
         option = resource_options.get(slug)
         if option is None:
             logger.warning(
-                "Proposal %s selected unknown resource option %r for call %s - skipping.",
+                "Proposal %s selected resource option %r (slug %r) for call "
+                "%s with no matching resource_options entry - skipping.",
                 proposal.uuid,
+                label,
                 slug,
                 call,
             )

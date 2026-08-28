@@ -35,7 +35,7 @@ from waldur_mastermind.proposal.enums import (
     RoundStatuses,
 )
 
-from . import formbricks_flows, models
+from . import formbricks_flows, formbricks_mapper, models
 
 logger = logging.getLogger(__name__)
 
@@ -344,27 +344,12 @@ class ProposalReviewSerializer(
         compliance).
         """
         proposal = obj.proposal
-        if not proposal or not proposal.round.call.formbricks_flow_key:
+        if not proposal:
             return None
 
-        steps = proposal.form_step_responses.filter(
-            step_key__in=formbricks_flows.REVIEWER_VISIBLE_STEPS
-        ).order_by("step_key")
-
-        return [
-            {
-                "step_key": step.step_key,
-                "questions": [
-                    {
-                        "question_id": question_id,
-                        "label": step.question_labels.get(question_id, question_id),
-                        "answer": answer,
-                    }
-                    for question_id, answer in step.raw_response.items()
-                ],
-            }
-            for step in steps
-        ]
+        return formbricks_mapper.serialize_form_responses(
+            proposal, step_keys=formbricks_flows.REVIEWER_VISIBLE_STEPS
+        )
 
     def get_fields(self):
         fields = super().get_fields()
@@ -714,6 +699,7 @@ class PublicCallSerializer(
     resource_templates = serializers.SerializerMethodField()
     fixed_duration_in_days = serializers.ReadOnlyField()
     description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    formbricks_flow_key = serializers.ReadOnlyField()
 
     class Meta:
         model = models.Call
@@ -740,6 +726,7 @@ class PublicCallSerializer(
             "external_url",
             "reviewer_identity_visible_to_submitters",
             "reviews_visible_to_submitters",
+            "formbricks_flow_key",
         )
         view_name = "proposal-public-call-detail"
         extra_kwargs = {
@@ -1382,6 +1369,7 @@ class ProposalSerializer(
     can_submit = serializers.SerializerMethodField()
 
     notes = serializers.SerializerMethodField()
+    form_responses = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Proposal
@@ -1417,6 +1405,7 @@ class ProposalSerializer(
             "compliance_status",
             "can_submit",
             "notes",
+            "form_responses",
         ]
         read_only_fields = (
             "created_by",
@@ -1598,6 +1587,18 @@ class ProposalSerializer(
     @extend_schema_field(serializers.ListField(child=serializers.DictField()))
     def get_notes(self, obj) -> list | None:
         return obj.notes if self._is_notes_privileged(obj) else None
+
+    def get_form_responses(self, obj) -> list[dict] | None:
+        """Every stored Formbricks step response for this proposal.
+
+        Unlike ProposalReviewSerializer.form_responses (restricted to
+        formbricks_flows.REVIEWER_VISIBLE_STEPS), this returns all steps -
+        it's the Lead's own submitted data, and visibility to other users
+        is already correctly scoped by ProposalViewSet.get_queryset (staff
+        see every proposal; everyone else only proposals tied to their own
+        customer/project).
+        """
+        return formbricks_mapper.serialize_form_responses(obj)
 
 
 class RoundReviewerSerializer(serializers.Serializer):

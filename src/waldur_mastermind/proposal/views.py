@@ -44,6 +44,7 @@ from waldur_core.permissions.utils import (
 )
 from waldur_core.permissions.utils import (
     has_permission,
+    has_user,
     permission_factory,
 )
 from waldur_core.permissions.views import UserRoleMixin, validate_scope_not_soft_deleted
@@ -823,6 +824,22 @@ class ProposalViewSet(
             return
         # Check if user has MANAGE_PROPOSAL permission on this proposal
         if has_permission(user, PermissionEnum.MANAGE_PROPOSAL, obj):
+            return
+        raise exceptions.PermissionDenied()
+
+    def is_only_proposal_lead(request, view, obj=None):
+        """Like is_proposal_manager, but without the is_staff bypass.
+
+        Used for actions that act on the Lead's behalf mid-submission
+        (continuing or editing a Formbricks step) - unlike plain viewing,
+        a staff user shouldn't be able to drive someone else's in-progress
+        application. Deliberately checks role membership directly
+        (has_user) rather than has_permission(), which grants staff a
+        blanket bypass internally regardless of this function's own logic.
+        """
+        if not obj:
+            return
+        if has_user(obj, request.user, ProposalRole.MANAGER):
             return
         raise exceptions.PermissionDenied()
 
@@ -1914,6 +1931,15 @@ class ProposalViewSet(
     # prefilled edit URL as JSON, always fetched live from Formbricks (see
     # formbricks_client / formbricks_flows for why the stored
     # FormStepResponse snapshot is never used for this).
+    #
+    # formbricks_progress lets the frontend show "resume where you left
+    # off": which steps already have a FormStepResponse row, and a fresh
+    # (non-prefilled) URL for the first one that doesn't.
+    #
+    # formbricks_edit_link and formbricks_progress both use
+    # is_only_proposal_lead rather than is_proposal_manager - they act on
+    # the Lead's own in-progress submission, so unlike plain proposal
+    # viewing, a staff user shouldn't be able to invoke them too.
 
     @extend_schema(
         description="Create a draft proposal for a Formbricks-driven call and "
@@ -1959,6 +1985,7 @@ class ProposalViewSet(
             proposal_uuid=str(proposal.uuid),
             call_uuid=str(call.uuid),
             round_uuid=str(round_obj.uuid),
+            **formbricks_client.lead_hidden_fields(request.user),
         )
         return response.Response(
             {"proposal_uuid": str(proposal.uuid), "redirect_url": redirect_url},
@@ -1997,10 +2024,63 @@ class ProposalViewSet(
             proposal_uuid=str(proposal.uuid),
             call_uuid=str(call.uuid),
             round_uuid=str(proposal.round.uuid),
+            **formbricks_client.lead_hidden_fields(request.user),
         )
         return redirect(redirect_url)
 
     formbricks_redirect_permissions = [is_proposal_manager]
+
+    @extend_schema(
+        description="Report which Formbricks steps a draft proposal has "
+        "completed, and the next step's fresh survey URL (or null if every "
+        "step is done).",
+        request=None,
+        responses={status.HTTP_200_OK: None},
+    )
+    @decorators.action(detail=True, methods=["get"], url_path="formbricks-progress")
+    def formbricks_progress(self, request, uuid=None):
+        proposal = self.get_object()
+        call = proposal.round.call
+        flow_key = call.formbricks_flow_key
+        if not flow_key:
+            raise exceptions.ValidationError(
+                "This call does not use the Formbricks flow."
+            )
+
+        flow = formbricks_flows.get_flow(flow_key)
+        if not flow:
+            raise exceptions.ValidationError(
+                f"No FORM_FLOWS entry configured for key {flow_key!r}."
+            )
+
+        completed_step_keys = set(
+            proposal.form_step_responses.values_list("step_key", flat=True)
+        )
+        next_step = next(
+            (step for step in flow if step["key"] not in completed_step_keys), None
+        )
+
+        next_step_data = None
+        if next_step is not None:
+            redirect_url = formbricks_client.build_survey_url(
+                next_step["survey_id"],
+                proposal_uuid=str(proposal.uuid),
+                call_uuid=str(call.uuid),
+                round_uuid=str(proposal.round.uuid),
+                **formbricks_client.lead_hidden_fields(request.user),
+            )
+            next_step_data = {"key": next_step["key"], "redirect_url": redirect_url}
+
+        return response.Response(
+            {
+                "completed_steps": [
+                    step["key"] for step in flow if step["key"] in completed_step_keys
+                ],
+                "next_step": next_step_data,
+            }
+        )
+
+    formbricks_progress_permissions = [is_only_proposal_lead]
 
     @extend_schema(
         description="Return a prefilled edit URL for an already-submitted "
@@ -2048,10 +2128,11 @@ class ProposalViewSet(
             proposal_uuid=str(proposal.uuid),
             call_uuid=str(call.uuid),
             round_uuid=str(proposal.round.uuid),
+            **formbricks_client.lead_hidden_fields(request.user),
         )
         return response.Response({"redirect_url": redirect_url})
 
-    formbricks_edit_link_permissions = [is_proposal_manager]
+    formbricks_edit_link_permissions = [is_only_proposal_lead]
 
     # Checklist Integration Endpoints
     # Checklist methods are now provided by ChecklistViewSetMixin

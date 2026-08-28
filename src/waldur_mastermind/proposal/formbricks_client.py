@@ -5,19 +5,20 @@ calls (fetching a response's answers / a survey's question schema), and
 survey-URL builders for redirecting applicants into a fresh or prefilled
 survey.
 
-TODO(formbricks-setup): the Management API response shapes in
-get_response()/get_survey() below are still best-effort assumptions, not
-verified against a live instance - see the "Formbricks setup checklist"
-produced at the end of this feature's implementation. Webhook signing
-(below) *is* verified, against
+Webhook signing is verified against
 https://formbricks.com/docs/platform/features/integrations/webhooks -
-Formbricks implements the Standard Webhooks spec.
+Formbricks implements the Standard Webhooks spec. get_response()/get_survey()
+are verified against this deployment's live Management API (2026-08-26) -
+see their docstrings for what the real response shape actually looks like,
+which differs from what the public docs describe.
 """
 
 import base64
 import hashlib
 import hmac
+import html
 import logging
+import re
 import time
 from urllib.parse import urlencode
 
@@ -45,6 +46,15 @@ def _proposal_settings():
 
 def _base_url():
     return _proposal_settings()["FORMBRICKS_BASE_URL"].rstrip("/")
+
+
+def _management_api_base_url():
+    # Deliberately distinct from _base_url(): this one needs to be reachable
+    # from inside the waldur-mastermind containers (server-side Management
+    # API calls), whereas _base_url() needs to be reachable from a Lead's
+    # browser (survey links). See the FORMBRICKS_MANAGEMENT_API_URL comment
+    # in extension.py for why these can't be the same value.
+    return _proposal_settings()["FORMBRICKS_MANAGEMENT_API_URL"].rstrip("/")
 
 
 def _api_headers():
@@ -100,6 +110,15 @@ def verify_signature(request) -> bool:
     )
 
 
+def lead_hidden_fields(user):
+    """Hidden fields identifying the Lead, merged into every survey URL.
+
+    Lets the call manager filter/search responses inside Formbricks itself
+    by who submitted them, without cross-referencing Waldur.
+    """
+    return {"lead_name": user.full_name, "lead_email": user.email}
+
+
 def build_survey_url(survey_id, **hidden_fields):
     """URL for a fresh (non-edit) attempt at a survey.
 
@@ -134,14 +153,20 @@ def get_response(survey_id, response_id):
     (Formbricks response IDs are addressed directly) but is accepted for a
     stable call-site signature and for logging context.
 
-    TODO(formbricks-setup): verify the response JSON shape below
-    (`resp.json()["data"]["data"]`) against the real Management API.
+    Verified against a live response on this deployment: GET .../responses/{id}
+    returns {"data": {..., "data": {question_id: answer, ...}, ...}} - i.e.
+    exactly the shape assumed here. No change needed from the original
+    best-effort implementation.
     """
-    url = f"{_base_url()}/api/v1/management/responses/{response_id}"
+    url = f"{_management_api_base_url()}/api/v1/management/responses/{response_id}"
     logger.debug("Fetching Formbricks response %s (survey %s)", response_id, survey_id)
     resp = requests.get(url, headers=_api_headers(), timeout=REQUEST_TIMEOUT_SECONDS)
     resp.raise_for_status()
     return resp.json()["data"]["data"]
+
+
+def _strip_html(rich_text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", rich_text)).strip()
 
 
 def get_survey(survey_id):
@@ -149,12 +174,27 @@ def get_survey(survey_id):
 
     Returns {question_id: label}.
 
-    TODO(formbricks-setup): verify the response JSON shape below
-    (`resp.json()["data"]["questions"]`, each question's "id"/"headline"
-    keys) against the real Management API.
+    The original implementation assumed GET .../surveys/{id} returns
+    questions as a flat "data.questions" array with a plain-string
+    "headline" per question, matching the public docs. Checked against a
+    live survey on this deployment (2026-08-26) and that's wrong on this
+    version: "questions" is always an empty array. The actual question data
+    lives under "data.blocks[].elements[]", and each element's "headline"
+    is a localized rich-text object ({"<locale>": "<p>...</p>", ...}), not
+    a plain string - so labels need HTML stripped to be usable as reviewer-
+    facing text. This survey had no languages configured, so "default" is
+    used as the locale key, falling back to whatever key is present for
+    multi-language surveys.
     """
-    url = f"{_base_url()}/api/v1/management/surveys/{survey_id}"
+    url = f"{_management_api_base_url()}/api/v1/management/surveys/{survey_id}"
     resp = requests.get(url, headers=_api_headers(), timeout=REQUEST_TIMEOUT_SECONDS)
     resp.raise_for_status()
-    questions = resp.json()["data"]["questions"]
-    return {question["id"]: question["headline"] for question in questions}
+    survey = resp.json()["data"]
+
+    labels = {}
+    for block in survey.get("blocks", []):
+        for element in block.get("elements", []):
+            headline = element.get("headline") or {}
+            raw_label = headline.get("default") or next(iter(headline.values()), "")
+            labels[element["id"]] = _strip_html(raw_label)
+    return labels
