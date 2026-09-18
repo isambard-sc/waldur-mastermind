@@ -8,6 +8,7 @@ passed through a mapper.
 
 import logging
 
+from waldur_mastermind.proposal import formbricks_flows
 from waldur_mastermind.proposal import models as proposal_models
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ def _get_required(data, question_id, step_key):
     return data[question_id]
 
 
-_YES_NO = {"yes": True, "no": False}
+_YES_NO = {"yes": True, "no": False, "true": True, "false": False}
 
 
 def _coerce_bool(value, question_id, step_key):
@@ -41,8 +42,9 @@ def _coerce_bool(value, question_id, step_key):
     except (AttributeError, KeyError):
         raise FormbricksMappingError(
             f"Question {question_id!r} in {step_key!r} response was "
-            f"{value!r} - expected 'Yes'/'No'. The question type may have "
-            f"changed in Formbricks without updating formbricks_flows.py."
+            f"{value!r} - expected one of {sorted(_YES_NO)}. The question "
+            f"type may have changed in Formbricks without updating "
+            f"formbricks_flows.py."
         )
 
 
@@ -56,6 +58,20 @@ def _coerce_int(value, question_id, step_key):
         )
 
 
+# Hidden fields Waldur itself injects into every survey URL for internal
+# plumbing (see formbricks_client.lead_hidden_fields and the proposal_uuid/
+# call_uuid/round_uuid/redirect_token kwargs throughout views.py) - Formbricks
+# echoes these back as ordinary answers in the webhook payload, but they're
+# not something an applicant or reviewer submitted and shouldn't be shown
+# alongside the real question/answer pairs.
+HIDDEN_INFRASTRUCTURE_FIELDS = {
+    "proposal_uuid",
+    "call_uuid",
+    "round_uuid",
+    "redirect_token",
+}
+
+
 def serialize_form_responses(proposal, step_keys=None):
     """Zip each FormStepResponse's raw_response/question_labels into
     label/value pairs, for the Lead's and reviewers' read-only display.
@@ -65,27 +81,59 @@ def serialize_form_responses(proposal, step_keys=None):
     stored step is returned (the Lead's own data, or a staff viewer's).
     Returns None if the call doesn't use the Formbricks flow at all.
     """
-    if not proposal.round.call.formbricks_flow_key:
+    flow_key = proposal.round.call.formbricks_flow_key
+    if not flow_key:
         return None
 
-    steps = proposal.form_step_responses.order_by("step_key")
+    steps = proposal.form_step_responses.all()
     if step_keys is not None:
         steps = steps.filter(step_key__in=step_keys)
 
-    return [
-        {
-            "step_key": step.step_key,
-            "questions": [
-                {
-                    "question_id": question_id,
-                    "label": step.question_labels.get(question_id, question_id),
-                    "answer": answer,
-                }
-                for question_id, answer in step.raw_response.items()
-            ],
+    # Order by the flow's own step sequence (project_details, team_details,
+    # compliance, assessment - see formbricks_flows.FORM_FLOWS), not by
+    # step_key alphabetically ("assessment" would sort first) or by
+    # created/modified (which drifts out of submission order once any step
+    # is edited later).
+    flow = formbricks_flows.get_flow(flow_key) or []
+    flow_order = {step["key"]: index for index, step in enumerate(flow)}
+    steps = sorted(steps, key=lambda step: flow_order.get(step.step_key, len(flow)))
+
+    result = []
+    for step in steps:
+        # raw_response/question_labels are jsonb columns - Postgres doesn't
+        # preserve object key order, so iterating them directly yields an
+        # arbitrary order, not the order the applicant actually saw the
+        # questions in. question_order is a JSON *array* (order-preserving)
+        # captured separately at webhook-write time (see views.py) - sort
+        # by it instead. Falls back to raw_response's own (unordered) order
+        # for any question_id missing from it - rows written before this
+        # field existed, or if the schema fetch failed for that submission.
+        order = {
+            question_id: index
+            for index, question_id in enumerate(step.question_order)
         }
-        for step in steps
-    ]
+        questions = sorted(
+            (
+                (question_id, answer)
+                for question_id, answer in step.raw_response.items()
+                if question_id not in HIDDEN_INFRASTRUCTURE_FIELDS
+            ),
+            key=lambda pair: order.get(pair[0], len(order)),
+        )
+        result.append(
+            {
+                "step_key": step.step_key,
+                "questions": [
+                    {
+                        "question_id": question_id,
+                        "label": step.question_labels.get(question_id, question_id),
+                        "answer": answer,
+                    }
+                    for question_id, answer in questions
+                ],
+            }
+        )
+    return result
 
 
 def _resolve_requested_offering(call, offering_slug):

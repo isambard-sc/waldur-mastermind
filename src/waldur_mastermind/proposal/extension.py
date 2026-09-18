@@ -32,7 +32,7 @@ class ProposalExtension(WaldurExtension):
             "FORMBRICKS_API_KEY": "",
             # Waldur frontend URL a Lead lands on after finishing a Formbricks
             # flow. {proposal_uuid} is substituted by views._get_formbricks_flow_complete_url.
-            "FRONTEND_FLOW_COMPLETE_URL_TEMPLATE": "https://localhost/proposals/{proposal_uuid}",
+            "FRONTEND_FLOW_COMPLETE_URL_TEMPLATE": "https://localhost/proposals/{proposal_uuid}/",
         }
 
     @staticmethod

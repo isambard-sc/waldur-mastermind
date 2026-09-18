@@ -14,8 +14,10 @@ from django.utils.translation import gettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import OpenApiParameter, extend_schema
+from rest_framework import authentication as rf_authentication
 from rest_framework import decorators, exceptions, response, status, viewsets
 from rest_framework import permissions as rf_permissions
+from rest_framework.settings import api_settings
 
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist import serializers as checklist_serializers
@@ -89,6 +91,39 @@ def _get_formbricks_flow_complete_url(proposal):
     """
     template = django_settings.WALDUR_PROPOSAL["FRONTEND_FLOW_COMPLETE_URL_TEMPLATE"]
     return template.format(proposal_uuid=proposal.uuid)
+
+
+class FormbricksRedirectTokenAuthentication(rf_authentication.BaseAuthentication):
+    """Authenticates via the signed redirect_token query param, carried as a
+    Formbricks hidden field through the whole survey chain.
+
+    Only ever engages for formbricks_redirect: that action is hit by a plain
+    top-level browser GET (Formbricks' own "Redirect to URL" survey ending),
+    which can carry neither the SPA's Authorization header nor a Django
+    session cookie (ObtainAuthToken never establishes one - see
+    formbricks_client.build_redirect_token). Harmless to register on the
+    whole ViewSet: it simply returns None (deferring to the normal
+    authentication classes) whenever redirect_token isn't present, which is
+    every request except this one.
+    """
+
+    def authenticate(self, request):
+        token = request.query_params.get("redirect_token")
+        if not token:
+            return None
+
+        user_pk = formbricks_client.verify_redirect_token(token)
+        if user_pk is None:
+            raise exceptions.AuthenticationFailed(
+                "Invalid or expired redirect token."
+            )
+
+        try:
+            user = User.objects.get(pk=user_pk, is_active=True)
+        except User.DoesNotExist:
+            raise exceptions.AuthenticationFailed("Invalid redirect token.")
+
+        return (user, None)
 
 
 class CallManagingOrganisationViewSet(
@@ -786,6 +821,20 @@ class ProposalViewSet(
     filterset_class = filters.ProposalFilter
     disabled_actions = ["update", "partial_update"]
     model = models.Proposal
+    # FormbricksRedirectTokenAuthentication only engages for requests
+    # carrying a redirect_token query param (formbricks_redirect) - it's a
+    # no-op addition for every other action, which never sends one. Must
+    # come AFTER the defaults, not before: DRF's handle_exception() only
+    # consults the FIRST authenticator's authenticate_header() to decide
+    # whether an unauthenticated request gets a 401 or is downgraded to a
+    # bare 403, and this class doesn't define one (there's no sensible
+    # WWW-Authenticate challenge for "pass a signed query param") - putting
+    # it first would silently turn every plain-401 case on this ViewSet
+    # into a 403 instead.
+    authentication_classes = (
+        *api_settings.DEFAULT_AUTHENTICATION_CLASSES,
+        FormbricksRedirectTokenAuthentication,
+    )
 
     def get_queryset(self):
         return filter_queryset_for_user(
@@ -1985,6 +2034,7 @@ class ProposalViewSet(
             proposal_uuid=str(proposal.uuid),
             call_uuid=str(call.uuid),
             round_uuid=str(round_obj.uuid),
+            redirect_token=formbricks_client.build_redirect_token(request.user),
             **formbricks_client.lead_hidden_fields(request.user),
         )
         return response.Response(
@@ -1998,6 +2048,16 @@ class ProposalViewSet(
         "responds with an HTTP redirect, never JSON.",
         request=None,
         responses={status.HTTP_302_FOUND: None},
+        parameters=[
+            OpenApiParameter(
+                "current_step",
+                str,
+                OpenApiParameter.QUERY,
+                required=True,
+                description="Step key the applicant just finished, e.g. "
+                "'project_details'.",
+            ),
+        ],
     )
     @decorators.action(detail=True, methods=["get"], url_path="formbricks-redirect")
     def formbricks_redirect(self, request, uuid=None):
@@ -2024,6 +2084,12 @@ class ProposalViewSet(
             proposal_uuid=str(proposal.uuid),
             call_uuid=str(call.uuid),
             round_uuid=str(proposal.round.uuid),
+            # Mints a fresh token for the next hop, using the identity this
+            # request's own redirect_token already proved (see
+            # FormbricksRedirectTokenAuthentication) - each survey in the
+            # chain must declare redirect_token as one of its own Hidden
+            # Fields for it to keep propagating through the whole flow.
+            redirect_token=formbricks_client.build_redirect_token(request.user),
             **formbricks_client.lead_hidden_fields(request.user),
         )
         return redirect(redirect_url)
@@ -2088,6 +2154,16 @@ class ProposalViewSet(
         "from Formbricks - never from the stored FormStepResponse snapshot.",
         request=None,
         responses={status.HTTP_200_OK: None},
+        parameters=[
+            OpenApiParameter(
+                "step",
+                str,
+                OpenApiParameter.QUERY,
+                required=True,
+                description="Step key to fetch an edit link for, e.g. "
+                "'project_details'.",
+            ),
+        ],
     )
     @decorators.action(
         detail=True, methods=["get"], url_path="formbricks-edit-link"
@@ -2223,6 +2299,13 @@ class FormbricksWebhookViewSet(viewsets.ViewSet):
             )
             question_labels = {}
 
+        # question_labels here is a freshly built dict, so its key order is
+        # still the survey's actual block/element order (see get_survey) -
+        # captured into its own JSON *array* field because that order is
+        # lost once raw_response/question_labels round-trip through
+        # Postgres jsonb (see FormStepResponse.question_order).
+        question_order = list(question_labels.keys())
+
         models.FormStepResponse.objects.update_or_create(
             proposal=proposal,
             step_key=step["key"],
@@ -2231,6 +2314,7 @@ class FormbricksWebhookViewSet(viewsets.ViewSet):
                 "response_id": response_id,
                 "raw_response": answers,
                 "question_labels": question_labels,
+                "question_order": question_order,
             },
         )
 
@@ -2239,18 +2323,10 @@ class FormbricksWebhookViewSet(viewsets.ViewSet):
             mapper(proposal, answers, step)
             proposal.save()
 
-        flow = formbricks_flows.get_flow(flow_key)
-        if flow and flow[-1]["key"] == step["key"]:
-            previous_state = proposal.state
-            proposal.state = ProposalStates.SUBMITTED
-            proposal.submitted_at = timezone.now()
-            proposal.save()
-            tasks.notify_user_about_proposal_state_update.delay(
-                proposal.uuid, previous_state, proposal.state
-            )
-            tasks.notify_call_managers_about_new_proposal_submission.delay(
-                proposal.uuid
-            )
+        # Completing the last flow step no longer auto-submits the proposal -
+        # the applicant still needs a chance to add team members (see the
+        # Users section) before submitting. Submission is now an explicit
+        # action (ProposalViewSet.submit) triggered from the frontend.
 
         return response.Response(status=status.HTTP_200_OK)
 

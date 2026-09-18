@@ -862,6 +862,17 @@ class FormStepResponse(
     response_id = models.CharField(max_length=100)
     raw_response = models.JSONField(default=dict, blank=True)
     question_labels = models.JSONField(default=dict, blank=True)
+    # Postgres jsonb doesn't preserve object key order - raw_response and
+    # question_labels come back from the DB in an arbitrary (internal
+    # storage) order, not the order the applicant actually saw the
+    # questions in. A JSON *array* (unlike a jsonb object) does preserve
+    # element order, so the question IDs' survey order is captured here
+    # separately, from formbricks_client.get_survey()'s own array
+    # traversal at webhook-write time - see serialize_form_responses,
+    # which sorts by this instead of by raw_response's own (unordered)
+    # keys. Empty for rows written before this field existed, or when the
+    # schema fetch failed for that submission.
+    question_order = models.JSONField(default=list, blank=True)
 
     class Meta:
         unique_together = ("proposal", "step_key")

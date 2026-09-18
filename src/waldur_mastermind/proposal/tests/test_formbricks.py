@@ -15,7 +15,12 @@ from waldur_core.permissions.fixtures import ProposalRole
 from waldur_core.permissions.utils import has_user
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
-from waldur_mastermind.proposal import formbricks_client, formbricks_flows, models
+from waldur_mastermind.proposal import (
+    formbricks_client,
+    formbricks_flows,
+    formbricks_mapper,
+    models,
+)
 from waldur_mastermind.proposal.enums import ProposalStates, RequestedOfferingStates
 from waldur_mastermind.proposal.tests import factories, fixtures
 
@@ -241,6 +246,36 @@ class WebhookMappingTest(FormbricksTestCase):
         self.assertEqual(form_step_response.question_labels["q_name"], "Project title")
 
     @mock.patch.object(formbricks_client, "get_survey")
+    def test_boolean_field_accepts_true_false_as_well_as_yes_no(
+        self, mock_get_survey
+    ):
+        # Real Formbricks multipleChoiceSingle questions can use "True"/
+        # "False" as their choice labels rather than "Yes"/"No" - this
+        # broke project_details end-to-end in production: the mapper raised
+        # partway through boolean_field_map, so proposal.save() and the
+        # resource-creation code below it never ran at all, even though the
+        # step's raw_response had already been snapshotted successfully.
+        mock_get_survey.return_value = {}
+        answers = {
+            "proposal_uuid": str(self.proposal.uuid),
+            "q_name": "My project",
+            "q_summary": "A summary",
+            "q_duration": "30",
+            "q_confidential": "False",
+            "q_civilian": "True",
+            "q_resources": [],
+        }
+        response = self.post_webhook(
+            build_payload("survey-project-details", "resp-true-false", answers)
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.proposal.refresh_from_db()
+        self.assertEqual(self.proposal.name, "My project")
+        self.assertFalse(self.proposal.project_is_confidential)
+        self.assertTrue(self.proposal.project_has_civilian_purpose)
+
+    @mock.patch.object(formbricks_client, "get_survey")
     def test_boolean_field_with_unexpected_value_fails_loudly(self, mock_get_survey):
         mock_get_survey.return_value = {}
         answers = {
@@ -305,10 +340,15 @@ class WebhookMappingTest(FormbricksTestCase):
         self.assertEqual(self.proposal.state, ProposalStates.DRAFT)
 
     @mock.patch.object(formbricks_client, "get_survey")
-    def test_submit_fires_only_after_last_step(self, mock_get_survey):
+    def test_completing_last_step_does_not_auto_submit(self, mock_get_survey):
         mock_get_survey.return_value = {}
 
-        for step in (PROJECT_DETAILS_STEP, TEAM_DETAILS_STEP, COMPLIANCE_STEP):
+        for step in (
+            PROJECT_DETAILS_STEP,
+            TEAM_DETAILS_STEP,
+            COMPLIANCE_STEP,
+            ASSESSMENT_STEP,
+        ):
             answers = {"proposal_uuid": str(self.proposal.uuid)}
             if step is PROJECT_DETAILS_STEP:
                 answers.update(
@@ -326,18 +366,11 @@ class WebhookMappingTest(FormbricksTestCase):
             )
             self.assertEqual(response.status_code, status.HTTP_200_OK)
             self.proposal.refresh_from_db()
+            # Completing every step, including the last one, no longer
+            # auto-submits the proposal - the applicant must still be able
+            # to add team members before explicitly submitting via
+            # ProposalViewSet.submit.
             self.assertEqual(self.proposal.state, ProposalStates.DRAFT)
-
-        response = self.post_webhook(
-            build_payload(
-                ASSESSMENT_STEP["survey_id"],
-                "resp-assessment",
-                {"proposal_uuid": str(self.proposal.uuid)},
-            )
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.proposal.refresh_from_db()
-        self.assertEqual(self.proposal.state, ProposalStates.SUBMITTED)
 
     @mock.patch.object(formbricks_client, "get_survey")
     def test_editing_overwrites_the_same_row_not_a_duplicate(self, mock_get_survey):
@@ -373,6 +406,44 @@ class WebhookMappingTest(FormbricksTestCase):
         self.assertEqual(form_step_response.raw_response["q_free_text"], "v2")
         self.assertEqual(
             form_step_response.question_labels["q_free_text"], "new wording"
+        )
+
+    @mock.patch.object(formbricks_client, "get_survey")
+    def test_question_order_is_captured_from_survey_schema_and_used_for_display(
+        self, mock_get_survey
+    ):
+        # get_survey's dict order mirrors the survey's actual block/element
+        # order (see its docstring) - captured separately into
+        # question_order since Postgres jsonb doesn't preserve
+        # raw_response/question_labels' own key order once stored.
+        mock_get_survey.return_value = {
+            "q_second": "Second question",
+            "q_first": "First question",
+        }
+        self.post_webhook(
+            build_payload(
+                "survey-team-details",
+                "resp-1",
+                {
+                    "proposal_uuid": str(self.proposal.uuid),
+                    "q_first": "answer one",
+                    "q_second": "answer two",
+                },
+            )
+        )
+
+        form_step_response = models.FormStepResponse.objects.get(
+            proposal=self.proposal, step_key="team_details"
+        )
+        self.assertEqual(form_step_response.question_order, ["q_second", "q_first"])
+
+        form_responses = formbricks_mapper.serialize_form_responses(self.proposal)
+        team_details = next(
+            step for step in form_responses if step["step_key"] == "team_details"
+        )
+        self.assertEqual(
+            [q["question_id"] for q in team_details["questions"]],
+            ["q_second", "q_first"],
         )
 
     @mock.patch.object(formbricks_client, "get_survey")
@@ -458,7 +529,12 @@ class FormbricksRedirectTest(FormbricksTestCase):
         )
         response = self.client.get(url, {"current_step": "assessment"})
         self.assertEqual(response.status_code, status.HTTP_302_FOUND)
-        self.assertIn(str(self.proposal.uuid), response.url)
+        # Must include the trailing slash - homeport's route is
+        # 'proposals/:proposal_uuid/', where the slash is part of the
+        # static path segment, not just cosmetic; without it the SPA 404s.
+        self.assertEqual(
+            response.url, f"https://localhost/proposals/{self.proposal.uuid}/"
+        )
 
     def test_unrelated_user_gets_404_not_403(self):
         # A user with no connection to this proposal (not the Lead, not a
@@ -474,6 +550,78 @@ class FormbricksRedirectTest(FormbricksTestCase):
         )
         response = self.client.get(url, {"current_step": "project_details"})
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class FormbricksRedirectTokenAuthTest(FormbricksTestCase):
+    """formbricks_redirect is hit by a plain top-level browser GET triggered
+    by Formbricks' own "Redirect to URL" survey ending - it can carry
+    neither the SPA's Authorization header nor a Django session cookie
+    (ObtainAuthToken never establishes one). Every test above uses
+    force_authenticate, which bypasses the real authentication pipeline
+    entirely and would not have caught that gap - these exercise the real
+    unauthenticated-request path via FormbricksRedirectTokenAuthentication,
+    matching how Formbricks' browser redirect actually reaches this view."""
+
+    def setUp(self):
+        super().setUp()
+        self.proposal = factories.ProposalFactory(
+            round=self.fixture.round, state=ProposalStates.DRAFT
+        )
+        self.lead = structure_factories.UserFactory()
+        self.proposal.add_user(self.lead, ProposalRole.MANAGER, created_by=self.lead)
+        self.url = factories.ProposalFactory.get_url(
+            self.proposal, action="formbricks-redirect"
+        )
+
+    def test_valid_redirect_token_authenticates_without_session_or_auth_header(self):
+        token = formbricks_client.build_redirect_token(self.lead)
+        response = self.client.get(
+            self.url, {"current_step": "project_details", "redirect_token": token}
+        )
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertIn(TEAM_DETAILS_STEP["survey_id"], response.url)
+        # A fresh token for the same Lead must propagate to the next step,
+        # so the chain keeps working without ever falling back to a session.
+        self.assertIn("redirect_token", query_params(response.url))
+
+    def test_missing_redirect_token_is_rejected(self):
+        response = self.client.get(self.url, {"current_step": "project_details"})
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_invalid_redirect_token_is_rejected(self):
+        response = self.client.get(
+            self.url,
+            {"current_step": "project_details", "redirect_token": "not-a-real-token"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_redirect_token_for_a_different_user_is_not_the_lead(self):
+        # Valid signature, but the signed user isn't this proposal's Lead -
+        # authentication succeeds (the token itself is genuine), so this
+        # falls through to the same visibility gate as
+        # FormbricksRedirectTest.test_unrelated_user_gets_404_not_403: a
+        # user with no connection to the proposal can't see it at all.
+        other_user = structure_factories.UserFactory()
+        token = formbricks_client.build_redirect_token(other_user)
+        response = self.client.get(
+            self.url, {"current_step": "project_details", "redirect_token": token}
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class StartFormbricksFlowRedirectTokenTest(FormbricksTestCase):
+    def test_response_includes_a_valid_redirect_token(self):
+        lead = structure_factories.UserFactory()
+        self.client.force_authenticate(lead)
+        url = factories.ProposalFactory.get_list_url(action="start-formbricks-flow")
+        response = self.client.post(url, {"round_uuid": self.fixture.round.uuid.hex})
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        params = query_params(response.data["redirect_url"])
+        self.assertEqual(
+            formbricks_client.verify_redirect_token(params["redirect_token"]),
+            str(lead.pk),
+        )
 
 
 class FormbricksEditLinkTest(FormbricksTestCase):
@@ -659,6 +807,35 @@ class ProposalFormResponsesTest(FormbricksTestCase):
             step_keys, {"project_details", "team_details", "compliance", "assessment"}
         )
 
+    def test_hidden_infrastructure_fields_are_excluded(self):
+        # Waldur's own hidden fields (proposal_uuid, call_uuid, round_uuid,
+        # redirect_token) get echoed back by Formbricks in every step's
+        # answers - real applicant/reviewer data, not infrastructure
+        # plumbing, is all that should ever show up here.
+        step = self.proposal.form_step_responses.get(step_key="project_details")
+        step.raw_response = {
+            "proposal_uuid": str(self.proposal.uuid),
+            "call_uuid": str(self.fixture.call.uuid),
+            "round_uuid": str(self.fixture.round.uuid),
+            "redirect_token": "1:abc:def",
+            "q_1": "a real answer",
+        }
+        step.question_labels = {"q_1": "A real question"}
+        step.save()
+
+        self.client.force_authenticate(self.lead)
+        url = factories.ProposalFactory.get_url(self.proposal)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        project_details = next(
+            item
+            for item in response.data["form_responses"]
+            if item["step_key"] == "project_details"
+        )
+        question_ids = {q["question_id"] for q in project_details["questions"]}
+        self.assertEqual(question_ids, {"q_1"})
+
     def test_staff_user_can_also_view_every_step_read_only(self):
         staff_user = structure_factories.UserFactory(is_staff=True)
         self.client.force_authenticate(staff_user)
@@ -669,6 +846,26 @@ class ProposalFormResponsesTest(FormbricksTestCase):
         step_keys = {item["step_key"] for item in response.data["form_responses"]}
         self.assertEqual(
             step_keys, {"project_details", "team_details", "compliance", "assessment"}
+        )
+
+    def test_steps_are_ordered_by_flow_sequence_not_alphabetically_or_by_creation(self):
+        # step_key alphabetical order would put "assessment" first and
+        # "team_details" last; re-saving a step (bumping its `modified`
+        # timestamp) must not reorder it either - only the flow's own
+        # sequence (project_details, team_details, compliance, assessment)
+        # should determine the order returned to the Lead/reviewer.
+        assessment = self.proposal.form_step_responses.get(step_key="assessment")
+        assessment.save()
+
+        self.client.force_authenticate(self.lead)
+        url = factories.ProposalFactory.get_url(self.proposal)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        step_keys = [item["step_key"] for item in response.data["form_responses"]]
+        self.assertEqual(
+            step_keys,
+            ["project_details", "team_details", "compliance", "assessment"],
         )
 
 

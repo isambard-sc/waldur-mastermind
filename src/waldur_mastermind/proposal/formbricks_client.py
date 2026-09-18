@@ -24,8 +24,40 @@ from urllib.parse import urlencode
 
 import requests
 from django.conf import settings
+from django.core import signing
 
 logger = logging.getLogger(__name__)
+
+# Signs redirect_token, the hidden field carrying proof-of-identity through
+# the Formbricks survey chain back to formbricks_redirect. That action is
+# hit by a plain top-level browser GET (Formbricks' own "Redirect to URL"
+# survey ending) - it can't carry the SPA's Authorization header, and
+# Waldur's login flow (ObtainAuthToken) never establishes a Django session
+# either (it only ever issues a DRF token), so neither of the app's normal
+# authentication mechanisms apply here. See FormbricksRedirectTokenAuthentication.
+REDIRECT_TOKEN_SALT = "waldur_mastermind.proposal.formbricks_redirect_token"
+# A survey link (or a step's "Edit in Formbricks" link) can legitimately sit
+# unused in a browser tab/email for a long time - the applicant may start a
+# step, get interrupted, and come back days later - and submission is no
+# longer an automatic side effect of finishing the last step (see
+# ProposalViewSet.submit), so there's no reason to bound this tightly to a
+# single sitting. 30 days comfortably covers a round's whole application
+# window while still expiring eventually.
+REDIRECT_TOKEN_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+
+
+def build_redirect_token(user):
+    return signing.TimestampSigner(salt=REDIRECT_TOKEN_SALT).sign(str(user.pk))
+
+
+def verify_redirect_token(token):
+    """Return the signed user pk, or None if the token is missing/invalid/expired."""
+    try:
+        return signing.TimestampSigner(salt=REDIRECT_TOKEN_SALT).unsign(
+            token, max_age=REDIRECT_TOKEN_MAX_AGE_SECONDS
+        )
+    except signing.BadSignature:
+        return None
 
 # Standard Webhooks spec (https://www.standardwebhooks.com/) - Formbricks
 # sends all three of these on every webhook request.
@@ -104,10 +136,27 @@ def verify_signature(request) -> bool:
     provided_signatures = [
         part.split(",", 1)[1] for part in signature_header.split() if "," in part
     ]
-    return any(
+    matched = any(
         hmac.compare_digest(provided, expected_signature)
         for provided in provided_signatures
     )
+    if not matched:
+        # TEMPORARY (remove once the real mismatch is found): a live
+        # webhook is failing verification despite the secret matching on
+        # both sides - log everything needed to compare byte-for-byte
+        # against what Formbricks actually signed.
+        logger.warning(
+            "Formbricks webhook signature mismatch. webhook_id=%r "
+            "webhook_timestamp=%r signature_header=%r expected=%r "
+            "body_len=%d body=%r",
+            webhook_id,
+            webhook_timestamp,
+            signature_header,
+            expected_signature,
+            len(request.body),
+            request.body[:2000],
+        )
+    return matched
 
 
 def lead_hidden_fields(user):
