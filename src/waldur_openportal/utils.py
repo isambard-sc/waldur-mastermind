@@ -917,6 +917,77 @@ def get_remote_project_usage_report(
     return openportal.ProjectUsageReport.combine(pieces)
 
 
+def get_remote_project_storage_report(
+    remote_project: "models.RemoteProject",
+    range_start: datetime.date,
+    range_end: datetime.date,
+):
+    """The award's storage snapshots over [range_start, range_end], as one report.
+
+    The storage equivalent of get_remote_project_usage_report(), with the same
+    windows, keys and resource. A storage report is not a sum but a series of
+    dated snapshots (quota limit and usage per volume), so for each window
+    this keeps the snapshots generated on the window's days, and the combined
+    report's top-level snapshot is the latest of those.
+
+    Two ways this differs from the usage side, both learned from the library:
+
+    - Snapshots are picked by date from daily_reports(), not with filter().
+      ProjectStorageReport.filter() keeps the report's top-level (latest)
+      snapshot even when it falls outside the range, so the old project's
+      storage after the award left it would show up as the award's.
+    - combine() of reports with different project identifiers raises
+      Incompatible, so each snapshot is remapped to one common identifier.
+
+    Returns None if the award has no identity to report under yet.
+    """
+    import openportal
+
+    windows = get_remote_project_windows(remote_project)
+    label = remote_project.identifier or next(
+        (window.key for window in reversed(windows) if window.key), None
+    )
+    if label is None:
+        return None
+    common = openportal.ProjectIdentifier(label)
+
+    snapshots = []
+    for window in windows:
+        if not window.key:
+            continue
+        clipped = _clip_window_to_range(
+            window.start, window.end, range_start, range_end
+        )
+        if clipped is None:
+            continue
+        cached_reports = models.CachedProjectStorageReport.objects.filter(
+            project_identifier=window.key, resource=remote_project.destination
+        )
+        for cached_report in cached_reports:
+            month_start = datetime.date(cached_report.year, cached_report.month, 1)
+            if (
+                _clip_window_to_range(
+                    clipped[0],
+                    clipped[1],
+                    month_start,
+                    get_last_day_of_month(month_start),
+                )
+                is None
+            ):
+                continue
+            for snapshot in cached_report.get_report().daily_reports():
+                if clipped[0] <= snapshot.generated_at.date() <= clipped[1]:
+                    snapshot.remap_project(common)
+                    snapshots.append(snapshot)
+
+    if not snapshots:
+        return openportal.ProjectStorageReport(common)
+    snapshots.sort(key=lambda snapshot: snapshot.generated_at)
+    if len(snapshots) == 1:
+        return snapshots[0]
+    return openportal.ProjectStorageReport.combine(snapshots)
+
+
 def get_remote_project_total_hours(remote_project: "models.RemoteProject") -> float:
     """Every hour of usage the award has had, across every project it was on."""
     windows = get_remote_project_windows(remote_project)

@@ -2099,18 +2099,65 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             "end": end,
             "total_hours": float(report.total_usage.hours) if report else 0.0,
             "report": json.loads(report.to_json()) if report else None,
-            "windows": [
-                {
-                    "project_uuid": window.project.uuid if window.project else None,
-                    "project_name": window.project.name if window.project else None,
-                    "start": window.start,
-                    "end": window.end,
-                    "project_identifier": window.key,
-                }
-                for window in windows
-            ],
+            "windows": self._windows_data(windows),
         }
         return Response(serializers.RemoteProjectUsageReportSerializer(data).data)
+
+    @extend_schema(
+        parameters=[serializers.RemoteProjectUsageReportQuerySerializer],
+        responses={
+            status.HTTP_200_OK: serializers.RemoteProjectStorageReportSerializer
+        },
+        summary="Storage report for an award",
+        description=(
+            "The award's storage snapshots over a date range, across every "
+            "project it has been attached to. Each attachment contributes only "
+            "the snapshots taken on the days it was attached, read from its own "
+            "key. On a day the award moved, the project it moved to claims the "
+            "whole day. The report's top-level snapshot is the latest in range."
+        ),
+    )
+    @action(detail=True, methods=["get"], url_path="storage-report")
+    def storage_report(self, request, uuid=None):
+        remote_project = self.get_object()
+        query = serializers.RemoteProjectUsageReportQuerySerializer(
+            data=request.query_params
+        )
+        query.is_valid(raise_exception=True)
+
+        windows = utils.get_remote_project_windows(remote_project)
+        start = query.validated_data.get("start") or (
+            windows[0].start if windows else None
+        )
+        end = query.validated_data.get("end") or datetime.date.today()
+
+        report = None
+        if start is not None and start <= end:
+            report = utils.get_remote_project_storage_report(remote_project, start, end)
+
+        data = {
+            "start": start,
+            "end": end,
+            "latest": (
+                report.generated_at if report and not report.is_empty() else None
+            ),
+            "report": json.loads(report.to_json()) if report else None,
+            "windows": self._windows_data(windows),
+        }
+        return Response(serializers.RemoteProjectStorageReportSerializer(data).data)
+
+    @staticmethod
+    def _windows_data(windows):
+        return [
+            {
+                "project_uuid": window.project.uuid if window.project else None,
+                "project_name": window.project.name if window.project else None,
+                "start": window.start,
+                "end": window.end,
+                "project_identifier": window.key,
+            }
+            for window in windows
+        ]
 
 
 class RemoteProjectAuditEntryViewSet(core_views.ActionsViewSet):

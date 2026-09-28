@@ -1131,6 +1131,30 @@ class RemoteProjectUsageReportSerializer(rf_serializers.Serializer):
     windows = RemoteProjectUsageWindowSerializer(many=True)
 
 
+class RemoteProjectStorageReportSerializer(rf_serializers.Serializer):
+    """An award's storage, across every project it has been attached to.
+
+    Storage is a series of dated snapshots, not a total. Each window
+    contributes only the snapshots taken on its own days; the report's
+    top-level snapshot is the latest of them.
+    """
+
+    start = rf_serializers.DateField(allow_null=True)
+    end = rf_serializers.DateField(allow_null=True)
+    latest = rf_serializers.DateTimeField(
+        allow_null=True,
+        help_text="When the latest snapshot in the range was taken. Null if none.",
+    )
+    report = ProjectStorageReportField(
+        allow_null=True,
+        help_text=(
+            "The combined OpenPortal ProjectStorageReport, as JSON. The latest "
+            "snapshot is the top level; daily_reports holds the earlier ones."
+        ),
+    )
+    windows = RemoteProjectUsageWindowSerializer(many=True)
+
+
 class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     """
     Serializer for RemoteProject.
