@@ -1,8 +1,18 @@
-"""Static configuration for Formbricks-driven proposal intake.
+"""Configuration for Formbricks-driven proposal intake.
 
 Each Call that uses Formbricks (Call.formbricks_flow_key is set) maps to an
 entry in FORM_FLOWS: an ordered list of step dicts describing the chain of
 Formbricks surveys an applicant fills in, in order.
+
+FORM_FLOWS is loaded from an external YAML file
+(WALDUR_BASE_CONFIG_DIR/formbricks-flows.yaml, e.g.
+/etc/waldur/formbricks-flows.yaml) if one is mounted, same convention as
+override.conf.py/auth.yaml/etc. This lets survey/question IDs - which are
+specific to *this* Formbricks account and differ between every environment
+(the IDs below are only valid against the dev instance) - be updated per
+deployment without rebuilding the image. _DEFAULT_FORM_FLOWS below (this
+file's own dev IDs) is the fallback used when no file is mounted, e.g. local
+dev and tests.
 
 Step dict shape:
     key:       stable identifier for this step within the flow, e.g.
@@ -30,6 +40,23 @@ Step dict shape:
     resource_question_id / resource_label_to_slug / resource_options:
                (optional, "project_details" only) - see below.
 """
+
+import os
+
+import yaml
+
+_CONFIG_DIR = os.environ.get("WALDUR_BASE_CONFIG_DIR", "/etc/waldur")
+_FORM_FLOWS_PATH = os.path.join(_CONFIG_DIR, "formbricks-flows.yaml")
+
+
+class FormFlowsConfigError(Exception):
+    """FORM_FLOWS (the built-in default, or a mounted formbricks-flows.yaml)
+    is malformed. Raised at Django startup (see ProposalConfig.ready) rather
+    than left to surface as a confusing failure the first time a particular
+    step is actually used - same fail-loud philosophy as
+    formbricks_mapper.FormbricksMappingError.
+    """
+
 
 PROJECT_DETAILS_STEP = {
     "key": "project_details",
@@ -113,7 +140,7 @@ CALL_RA_ASSESSMENT_STEP = {
 
 # Keys here are arbitrary Waldur-side identifiers - set Call.formbricks_flow_key
 # to one of these keys on the real Call rows once they exist.
-FORM_FLOWS = {
+_DEFAULT_FORM_FLOWS = {
     "AIRR-GW": [
         PROJECT_DETAILS_STEP,
         TEAM_DETAILS_STEP,
@@ -128,10 +155,149 @@ FORM_FLOWS = {
     ],
 }
 
+
+def _load_form_flows():
+    if os.path.isfile(_FORM_FLOWS_PATH):
+        with open(_FORM_FLOWS_PATH, encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    return _DEFAULT_FORM_FLOWS
+
+
+FORM_FLOWS = _load_form_flows()
+
 # Steps whose FormStepResponse a reviewer is allowed to read. team_details
 # and compliance are deliberately excluded - the call manager reads those
-# directly in Formbricks.
+# directly in Formbricks. Step keys are Waldur's own stable identifiers, not
+# Formbricks IDs, so - unlike FORM_FLOWS - this doesn't vary by environment.
 REVIEWER_VISIBLE_STEPS = {"project_details", "assessment"}
+
+_FIELD_MAP_KEYS = ("field_map", "integer_field_map", "boolean_field_map")
+
+
+def validate_form_flows(form_flows):
+    """Raise FormFlowsConfigError if `form_flows` isn't well-formed.
+
+    Called once at Django startup (ProposalConfig.ready) against whatever
+    FORM_FLOWS actually loaded (built-in default or the mounted YAML) - a
+    typo in a hand-edited formbricks-flows.yaml should crash the app
+    immediately, not surface as a confusing 500 the first time some
+    particular step happens to be hit.
+
+    Deliberately does NOT check things that depend on the database (e.g.
+    resource_label_to_slug values matching a real RequestedOffering) - that
+    already fails loudly at request time via
+    formbricks_mapper.FormbricksMappingError, and can't be known at import
+    time regardless (a call's actual offerings aren't fixed yet here).
+    """
+    # Imported lazily: formbricks_mapper imports this module at its own
+    # top level (for get_flow/REVIEWER_VISIBLE_STEPS), so a module-level
+    # import here would be circular. By the time validate_form_flows()
+    # actually runs (from AppConfig.ready(), after every app is fully
+    # loaded), the cycle is moot.
+    from waldur_mastermind.proposal import formbricks_mapper
+
+    if not isinstance(form_flows, dict):
+        raise FormFlowsConfigError(
+            f"FORM_FLOWS must be a mapping of flow key to step list, got "
+            f"{type(form_flows).__name__}."
+        )
+
+    for flow_key, steps in form_flows.items():
+        if not isinstance(steps, list) or not steps:
+            raise FormFlowsConfigError(
+                f"Flow {flow_key!r} must be a non-empty list of steps."
+            )
+
+        seen_step_keys = set()
+        seen_survey_ids = set()
+
+        for step in steps:
+            if not isinstance(step, dict):
+                raise FormFlowsConfigError(
+                    f"Flow {flow_key!r} has a step that isn't a mapping: {step!r}."
+                )
+
+            step_key = step.get("key")
+            survey_id = step.get("survey_id")
+            if not isinstance(step_key, str) or not step_key:
+                raise FormFlowsConfigError(
+                    f"Flow {flow_key!r} has a step with a missing/invalid "
+                    f"'key': {step!r}."
+                )
+            if not isinstance(survey_id, str) or not survey_id:
+                raise FormFlowsConfigError(
+                    f"Flow {flow_key!r} step {step_key!r} has a missing/"
+                    f"invalid 'survey_id'."
+                )
+
+            if step_key in seen_step_keys:
+                raise FormFlowsConfigError(
+                    f"Flow {flow_key!r} has duplicate step key {step_key!r} - "
+                    f"get_step()/get_next_step() would silently only ever "
+                    f"reach the first one."
+                )
+            seen_step_keys.add(step_key)
+
+            if survey_id in seen_survey_ids:
+                raise FormFlowsConfigError(
+                    f"Flow {flow_key!r} has duplicate survey_id {survey_id!r} "
+                    f"(steps {step_key!r} and others) - an incoming webhook "
+                    f"for that survey would only ever match the first step."
+                )
+            seen_survey_ids.add(survey_id)
+
+            for map_key in _FIELD_MAP_KEYS:
+                if map_key in step and not isinstance(step[map_key], dict):
+                    raise FormFlowsConfigError(
+                        f"Flow {flow_key!r} step {step_key!r}: {map_key!r} "
+                        f"must be a mapping."
+                    )
+
+            mapper_name = step.get("mapper")
+            if mapper_name is not None:
+                mapper = getattr(formbricks_mapper, mapper_name, None)
+                if not callable(mapper):
+                    raise FormFlowsConfigError(
+                        f"Flow {flow_key!r} step {step_key!r} references "
+                        f"mapper {mapper_name!r}, which isn't a callable "
+                        f"attribute of formbricks_mapper.py."
+                    )
+
+            has_resource_config = any(
+                key in step
+                for key in (
+                    "resource_question_id",
+                    "resource_label_to_slug",
+                    "resource_options",
+                )
+            )
+            if has_resource_config:
+                for key in (
+                    "resource_question_id",
+                    "resource_label_to_slug",
+                    "resource_options",
+                ):
+                    if key not in step:
+                        raise FormFlowsConfigError(
+                            f"Flow {flow_key!r} step {step_key!r} sets some "
+                            f"resource_* keys but is missing {key!r} - all "
+                            f"three are required together."
+                        )
+                if not isinstance(step["resource_question_id"], str):
+                    raise FormFlowsConfigError(
+                        f"Flow {flow_key!r} step {step_key!r}: "
+                        f"'resource_question_id' must be a string."
+                    )
+                if not isinstance(step["resource_label_to_slug"], dict):
+                    raise FormFlowsConfigError(
+                        f"Flow {flow_key!r} step {step_key!r}: "
+                        f"'resource_label_to_slug' must be a mapping."
+                    )
+                if not isinstance(step["resource_options"], dict):
+                    raise FormFlowsConfigError(
+                        f"Flow {flow_key!r} step {step_key!r}: "
+                        f"'resource_options' must be a mapping."
+                    )
 
 
 def get_flow(flow_key):

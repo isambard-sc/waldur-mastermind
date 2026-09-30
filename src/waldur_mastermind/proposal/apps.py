@@ -7,7 +7,9 @@ class ProposalConfig(AppConfig):
     verbose_name = "Proposal"
 
     def ready(self):
-        from . import handlers, models
+        from . import formbricks_flows, handlers, models
+
+        formbricks_flows.validate_form_flows(formbricks_flows.FORM_FLOWS)
 
         # Register signal handlers
         signals.post_save.connect(
