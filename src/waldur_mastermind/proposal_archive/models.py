@@ -76,7 +76,7 @@ class ArchivedCall(ArchiveBase):
 
     class Meta:
         verbose_name = _("Archived call")
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     def __str__(self):
         return self.name
@@ -106,7 +106,7 @@ class ArchivedRound(ArchiveBase):
 
     class Meta:
         verbose_name = _("Archived round")
-        ordering = ["-start_time"]
+        ordering = ["-start_time", "id"]
 
     def __str__(self):
         return f"{self.call} / {self.slug or self.uuid}"
@@ -156,7 +156,7 @@ class ArchivedProposal(ArchiveBase):
 
     class Meta:
         verbose_name = _("Archived proposal")
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     def __str__(self):
         return self.name
@@ -188,7 +188,7 @@ class ArchivedRequestedResource(ArchiveBase):
 
     class Meta:
         verbose_name = _("Archived requested resource")
-        ordering = ["created"]
+        ordering = ["created", "id"]
 
     def __str__(self):
         return f"{self.offering_name or self.uuid}"
@@ -234,7 +234,7 @@ class ArchivedReview(ArchiveBase):
 
     class Meta:
         verbose_name = _("Archived review")
-        ordering = ["created"]
+        ordering = ["created", "id"]
 
     def __str__(self):
         return f"Review of {self.proposal_id}"
@@ -262,7 +262,7 @@ class ArchivedCallDocument(ArchiveBase):
 
     class Meta:
         verbose_name = _("Archived call document")
-        ordering = ["created"]
+        ordering = ["created", "id"]
 
 
 class ArchivedProposalDocument(ArchiveBase):
@@ -283,7 +283,7 @@ class ArchivedProposalDocument(ArchiveBase):
 
     class Meta:
         verbose_name = _("Archived proposal document")
-        ordering = ["created"]
+        ordering = ["created", "id"]
 
 
 class ArchivedMembership(ArchiveBase):
@@ -345,7 +345,7 @@ class ArchivedMembership(ArchiveBase):
 
     class Meta:
         verbose_name = _("Archived membership")
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     def __str__(self):
         return f"{self.user_username} as {self.role_name}"
