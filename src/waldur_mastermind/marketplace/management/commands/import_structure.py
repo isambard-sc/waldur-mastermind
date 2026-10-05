@@ -1668,7 +1668,10 @@ class Command(BaseCommand):
                         )
                         existing_user.backend_id = user_data.get("backend_id", "")
                         existing_user.affiliations = user_data.get("affiliations", [])
-                        existing_user.slug = user_data.get("slug", "")
+                        # A user's slug is set once (User.save refuses to
+                        # change it), so only fill one that is not set yet.
+                        if not existing_user.slug and user_data.get("slug"):
+                            existing_user.slug = user_data["slug"]
 
                         # AAI (Authentication and Authorization Infrastructure) attributes
                         if "gender" in user_data:
