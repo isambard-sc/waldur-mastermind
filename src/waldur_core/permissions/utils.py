@@ -586,15 +586,20 @@ def validate_scope_available(scope):
         raise ValidationError("Offering is not available.")
 
 
-def validate_role_grant(scope, user, role, expiration_time=None):
+def validate_role_grant(scope, user, role):
     """Validate a role can be granted to a user on scope.
 
     Mirrors the role/scope checks in UserRoleCreateSerializer.validate so
     non-DRF callers (Invitation.accept, PermissionRequest.approve) enforce the
     same invariants. Permission/auth checks stay with the caller — this helper
     only validates the (scope, user, role) triple.
+
+    The duplicate check ignores expiration: any active grant of the role counts,
+    however soon it expires. A second active row for the same (user, role, scope)
+    would break update_user and delete_user, which expect exactly one; changing
+    how long a role lasts goes through update_user instead.
     """
-    if has_user(scope, user, role, expiration_time=expiration_time, match_clones=False):
+    if has_user(scope, user, role, match_clones=False):
         raise ValidationError("User has already the same role in this scope.")
 
     if not isinstance(scope, role.content_type.model_class()):
@@ -785,6 +790,25 @@ def get_customer(scope):
         return scope.customer
 
 
+def get_role_customers(role) -> list:
+    """Organizations the role is bound to through :class:`RoleAvailability`.
+
+    A deployment-wide role has no binding and yields an empty list; an
+    organization-private role (a clone) yields exactly its owning organization.
+    The content type is resolved through ``TYPE_MAP`` so the permissions app
+    stays independent of ``structure``.
+    """
+    customer_ct = ContentType.objects.get_by_natural_key(*enums.TYPE_MAP["customer"])
+    customer_ids = list(
+        models.RoleAvailability.objects.filter(
+            role=role, content_type=customer_ct
+        ).values_list("object_id", flat=True)
+    )
+    if not customer_ids:
+        return []
+    return list(customer_ct.model_class().objects.filter(id__in=customer_ids))
+
+
 def get_valid_content_types():
     return [
         ContentType.objects.get_by_natural_key(*pair)
@@ -908,7 +932,9 @@ def validate_user_restrictions(scope, user):
 # the entity or one of its ancestors. get_scope_ancestors(offering) yields
 # [offering, offering.project, project.customer, offering.customer], which is
 # exactly what OfferingQuerySet.filter_for_user ORs over — so the unified path
-# is never narrower than the legacy path it replaces.
+# is never narrower than the legacy path it replaces. A scope type whose events
+# follow a different chain (calls and proposals) registers it with
+# logging.event_dispatch.register_event_chain, and both sides use that instead.
 
 
 def scope_keys_for(scope) -> list[tuple[int, int]]:

@@ -62,6 +62,16 @@ class ProposalExtension(WaldurExtension):
                 "schedule": timedelta(minutes=15),
                 "args": (),
             },
+            "start-evaluation-for-closed-rounds": {
+                "task": "waldur_mastermind.proposal.start_evaluation_for_closed_rounds",
+                "schedule": timedelta(hours=1),
+                "args": (),
+            },
+            "mark-expired-reviewer-pool-invitations": {
+                "task": "waldur_mastermind.proposal.mark_expired_reviewer_pool_invitations",
+                "schedule": timedelta(hours=1),
+                "args": (),
+            },
             "mark-expired-workflow-steps": {
                 "task": "waldur_mastermind.proposal.mark_expired_workflow_steps",
                 "schedule": timedelta(hours=1),

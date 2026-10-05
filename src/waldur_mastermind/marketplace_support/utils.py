@@ -8,10 +8,15 @@ from rest_framework import exceptions as rf_exceptions
 
 from waldur_core.core.utils import format_homeport_link, text2html
 from waldur_core.permissions.enums import RoleEnum
+from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import get_users
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace.enums import OrderTypes
+from waldur_mastermind.marketplace.enums import (
+    OPENSTACK_INSTANCE_OFFERING,
+    OPENSTACK_TENANT_OFFERING,
+    OrderTypes,
+)
 from waldur_mastermind.marketplace.utils import format_limits_list, get_order_url
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.support import backend as support_backend
@@ -43,6 +48,74 @@ def format_description(template_name, context):
     return template.template.render(Context(context, autoescape=False))
 
 
+def get_allocating_proposal(order):
+    """The proposal that granted this order's resource, or None.
+
+    Allocation links each requested resource to the resource it creates, so
+    the proposal is found through that link rather than inferred from the
+    project. The order author need not be the applicant -- a call can
+    attribute its orders to a call manager or a shared mailbox -- so the
+    ticket names the applicant separately.
+    """
+    if not order.resource_id:
+        return None
+    requested = (
+        proposal_models.RequestedResource.objects.filter(resource_id=order.resource_id)
+        .select_related("proposal__created_by")
+        .first()
+    )
+    return requested.proposal if requested else None
+
+
+def get_project_team(order):
+    """Active project members, for offerings that track team changes.
+
+    Membership tickets are only raised once the project holds a resource of
+    the offering, so whoever joined before it -- the whole proposal team, when
+    a call allocates -- would otherwise never be reported.
+    """
+    if not order.offering.plugin_options.get("enable_issues_for_membership_changes"):
+        return []
+    return list(
+        UserRole.objects.filter(
+            is_active=True, scope=order.project, user__is_active=True
+        )
+        .select_related("user", "role")
+        .order_by("user__first_name", "user__last_name", "user__username")
+    )
+
+
+# The OpenStack pickers submit bare backend IDs. Providers often act on the
+# ticket from a machine without copy-paste, so the ticket names each resource
+# rather than leaving them to retype and cross-check UUIDs.
+OPENSTACK_PICKER_OFFERING_TYPES = {
+    "select_openstack_tenant": OPENSTACK_TENANT_OFFERING,
+    "select_multiple_openstack_tenants": OPENSTACK_TENANT_OFFERING,
+    "select_openstack_instance": OPENSTACK_INSTANCE_OFFERING,
+    "select_multiple_openstack_instances": OPENSTACK_INSTANCE_OFFERING,
+}
+
+
+def format_openstack_picker_option(order, label, option_type, value):
+    backend_ids = value if isinstance(value, list) else [value]
+    # Scoped to the ordering customer, as the picker is, so a colliding or
+    # crafted ID cannot put another organization's resource name in the ticket.
+    names = dict(
+        marketplace_models.Resource.objects.filter(
+            project__customer_id=order.project.customer_id,
+            offering__type=OPENSTACK_PICKER_OFFERING_TYPES[option_type],
+            backend_id__in=[backend_id for backend_id in backend_ids if backend_id],
+        ).values_list("backend_id", "name")
+    )
+    entries = [
+        f"{backend_id} ({names[backend_id]})" if backend_id in names else backend_id
+        for backend_id in backend_ids
+    ]
+    if isinstance(value, list):
+        return f"{label}:\n" + "\n".join(f"- {entry}" for entry in entries)
+    return f"{label}: '{entries[0]}'"
+
+
 def format_create_description(order):
     result = []
 
@@ -57,11 +130,23 @@ def format_create_description(order):
 
         label = order.offering.options["options"].get(key, {})
         label_value = label.get("label", key)
-        result.append(f"{label_value}: '{order.attributes[key]}'")
+        option_type = label.get("type")
+        if option_type in OPENSTACK_PICKER_OFFERING_TYPES:
+            result.append(
+                format_openstack_picker_option(
+                    order, label_value, option_type, order.attributes[key]
+                )
+            )
+        else:
+            result.append(f"{label_value}: '{order.attributes[key]}'")
 
     if "description" in order.attributes:
         result.append("\n %s" % order.attributes["description"])
 
+    proposal = get_allocating_proposal(order)
+    proposal_url = proposal and format_homeport_link(
+        "proposals/{proposal_uuid}/", proposal_uuid=proposal.uuid.hex
+    )
     result.append(
         format_description(
             "create_resource_template",
@@ -69,6 +154,9 @@ def format_create_description(order):
                 "order": order,
                 "order_url": get_order_url(order),
                 "resource": order.resource,
+                "proposal": proposal,
+                "proposal_url": proposal_url,
+                "team": get_project_team(order),
             },
         )
     )
@@ -100,8 +188,8 @@ def format_create_description(order):
     return description
 
 
-# Roles to fall back through, most accountable first, when the order was placed
-# by something other than a reachable person.
+# Roles to fall back through, most accountable first, when the order names
+# nobody who can actually receive a ticket.
 CALLER_FALLBACK_PROJECT_ROLES = (
     RoleEnum.PROJECT_MANAGER,
     RoleEnum.PROJECT_ADMIN,
@@ -123,68 +211,13 @@ def _first_reachable_user(scope, role_name):
 def _reachable(user):
     """The user, if they can actually receive a ticket, else None.
 
-    Unlike ``_first_reachable_user`` this checks ``is_active`` itself: the
-    configured callers are plain foreign keys, not queried through the active
+    Unlike ``_first_reachable_user`` this checks ``is_active`` itself:
+    ``created_by`` is a plain foreign key, not read through the active
     manager.
     """
     if user and user.is_active and user.email:
         return user
     return None
-
-
-def _configured_caller(order):
-    """The person the order's call wants its tickets raised on behalf of.
-
-    Reached through ``RequestedResource``, which allocation points at the
-    resource it created. Going via the project instead would be ambiguous: a
-    project can carry more than one proposal, and the lowest-numbered one is
-    not necessarily the one that produced this resource -- or even an accepted
-    one.
-
-    None when the order did not come from a proposal, or when the configured
-    person cannot receive a ticket -- the role chain then decides, rather than
-    failing an order somebody on the project could have answered for.
-    """
-    if not order.resource_id:
-        return None
-
-    requested = (
-        proposal_models.RequestedResource.objects.filter(resource=order.resource)
-        .select_related(
-            "proposal__created_by",
-            "proposal__round__call__support_ticket_caller_user",
-        )
-        .first()
-    )
-    if requested is None:
-        return None
-
-    call = requested.proposal.round.call
-    choice = call.support_ticket_caller
-
-    if choice == call.TicketCaller.APPLICANT:
-        caller = _reachable(requested.proposal.created_by)
-    elif choice == call.TicketCaller.SPECIFIC_USER:
-        caller = _reachable(call.support_ticket_caller_user)
-    elif choice == call.TicketCaller.PROJECT_MANAGER:
-        caller = _first_reachable_user(order.project, RoleEnum.PROJECT_MANAGER)
-    elif choice == call.TicketCaller.CALL_MANAGER:
-        caller = _first_reachable_user(call, RoleEnum.CALL_MANAGER)
-    else:
-        caller = None
-
-    if caller is None:
-        # A call configured to route its tickets somewhere specific and then
-        # quietly not doing so is worth a line: shared mailboxes get closed,
-        # and the fallback below is invisible from the call's settings.
-        logger.warning(
-            "Call %s routes support tickets to '%s', but nobody reachable was "
-            "found. Falling back to the roles held on project %s.",
-            call.uuid.hex,
-            choice,
-            order.project,
-        )
-    return caller
 
 
 def resolve_issue_caller(order):
@@ -200,18 +233,15 @@ def resolve_issue_caller(order):
     that has neither -- so a caller holding no role on the project gets the
     mail but cannot open the link in it.
 
-    ``order.created_by`` is that person whenever someone placed the order
-    themselves. Automated flows place orders as a robot with no email --
-    proposal allocation, the scheduled end-date and cost-policy termination
-    sweeps, openportal's default resources -- and an SSO user provisioned
-    without an email claim is just as unusable. Both fall back to someone on
-    the project who can actually receive the ticket.
+    ``order.created_by`` is that person. Whoever placed the order themselves
+    is the obvious answer, and an order placed on somebody's behalf carries
+    the same field: a call names the author of the orders it places when it
+    grants resources (``proposal.utils.resolve_order_author``), so nothing
+    here has to know about calls.
 
-    A call configures who stands in for its own allocated resources; anything
-    else falls through the project's roles.
-
-    ``created_by`` is deliberately left alone: it records who placed the order,
-    and the marketplace approval gate reads its ``is_staff``.
+    The fallback is for an order whose author cannot receive a ticket -- an
+    SSO user provisioned without an email claim, someone deactivated since,
+    or one of the automated sweeps that still place orders as a robot.
 
     Returns None when nobody reachable can be found, so the caller can fail the
     order the same way the other backend failures in ``create_issue`` do.
@@ -220,10 +250,6 @@ def resolve_issue_caller(order):
     # has since been deactivated is refused by the backend with
     # SupportUserInactive, which is the failure this resolver exists to avoid.
     caller = _reachable(order.created_by)
-    if caller:
-        return caller
-
-    caller = _configured_caller(order)
     if caller:
         return caller
 

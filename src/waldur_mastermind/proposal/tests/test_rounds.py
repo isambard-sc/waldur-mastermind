@@ -13,7 +13,7 @@ from waldur_core.permissions.fixtures import CallRole
 from waldur_core.permissions.models import Role
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.proposal import models, tasks
-from waldur_mastermind.proposal.enums import ProposalStates
+from waldur_mastermind.proposal.enums import CallStates, ProposalStates, RoundStatuses
 from waldur_mastermind.proposal.tests import fixtures
 
 from . import factories
@@ -67,7 +67,6 @@ class RoundGetTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_round_should_not_be_visible(self, user):
@@ -75,6 +74,13 @@ class RoundGetTest(test.APITestCase):
         self.client.force_authenticate(user)
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_round_is_visible_to_organization_owner(self):
+        # CUSTOMER.OWNER carries CALL.LIST, so the owner sees their organization's calls.
+        user = self.fixture.owner
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
 @ddt
@@ -100,12 +106,16 @@ class RoundCreateTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_user_can_not_add_offering_to_call(self, user):
         response = self.create_round(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_owner_sees_but_can_not_add_offering_to_call(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.create_round("owner")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_overlapping_of_rounds(self):
         # old: ---[-]-------
@@ -189,12 +199,16 @@ class RoundUpdateTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_user_can_not_update_round(self, user):
         response = self.update_round(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_owner_sees_but_can_not_update_round(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.update_round("owner")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def update_round(self, user):
         user = getattr(self.fixture, user)
@@ -228,12 +242,16 @@ class RoundDeleteTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_user_can_not_delete_round(self, user):
         response = self.delete_round(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_owner_sees_but_can_not_delete_round(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.delete_round("owner")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def delete_round(self, user):
         user = getattr(self.fixture, user)
@@ -279,14 +297,82 @@ class RoundCloseTest(test.APITestCase):
         self.submitted_proposal.refresh_from_db()
         self.assertEqual(self.submitted_proposal.state, ProposalStates.SUBMITTED)
 
+    def test_closing_open_round_moves_cutoff_to_now_and_saves_it(self):
+        start_time = self.round.start_time
+        before = timezone.now()
+        response = self.close_round("staff")
+        after = timezone.now()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.round.refresh_from_db()
+        self.assertEqual(self.round.start_time, start_time)
+        self.assertGreaterEqual(self.round.cutoff_time, before)
+        self.assertLessEqual(self.round.cutoff_time, after)
+        self.assertEqual(self.round.status, RoundStatuses.ENDED)
+
+    def test_closed_round_is_no_longer_open_for_proposals(self):
+        call = factories.CallFactory(state=CallStates.ACTIVE)
+        call_round = factories.RoundFactory(
+            call=call,
+            start_time=timezone.now() - datetime.timedelta(days=1),
+            cutoff_time=timezone.now() + datetime.timedelta(days=10),
+        )
+        requested_offering = factories.RequestedOfferingFactory(call=call)
+        open_offerings = models.RequestedOffering.objects.open_for_proposals()
+        self.assertIn(requested_offering, open_offerings)
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            factories.RoundFactory.get_url(call, call_round, "close")
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        open_offerings = models.RequestedOffering.objects.open_for_proposals()
+        self.assertNotIn(requested_offering, open_offerings)
+
+    def test_closing_ended_round_is_refused(self):
+        cutoff_time = timezone.now() - datetime.timedelta(days=1)
+        self.round.start_time = cutoff_time - datetime.timedelta(days=10)
+        self.round.cutoff_time = cutoff_time
+        self.round.save()
+
+        response = self.close_round("staff")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Round is already closed.", str(response.data))
+
+        self.round.refresh_from_db()
+        self.assertEqual(self.round.cutoff_time, cutoff_time)
+        # Nothing is cancelled by a refused close.
+        self.draft_proposal.refresh_from_db()
+        self.assertEqual(self.draft_proposal.state, ProposalStates.DRAFT)
+
+    def test_closing_scheduled_round_is_refused(self):
+        start_time = timezone.now() + datetime.timedelta(days=1)
+        cutoff_time = start_time + datetime.timedelta(days=10)
+        self.round.start_time = start_time
+        self.round.cutoff_time = cutoff_time
+        self.round.save()
+
+        response = self.close_round("staff")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.round.refresh_from_db()
+        self.assertEqual(self.round.start_time, start_time)
+        self.assertEqual(self.round.cutoff_time, cutoff_time)
+        self.assertEqual(self.round.status, RoundStatuses.SCHEDULED)
+
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_user_can_not_close_round(self, user):
         response = self.close_round(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_owner_sees_but_can_not_close_round(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.close_round("owner")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_close_rounds_alone_is_enough(self):
         """The route asks for CLOSE_ROUNDS and nothing else.
@@ -1028,10 +1114,15 @@ class BulkRoundCreateTest(test.APITestCase):
         # Nothing extra persisted — only the seeded round remains.
         self.assertEqual(self.call.round_set.count(), seeded)
 
-    @data("user", "owner", "customer_support")
+    @data("user", "customer_support")
     def test_user_can_not_bulk_create_rounds(self, user):
         response = self._post(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
+
+    def test_owner_sees_but_can_not_bulk_create_rounds(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self._post("owner")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
         self.assertEqual(self.call.round_set.count(), 0)
 
     def test_bulk_create_after_duplicate_keeps_both_round_sets(self):

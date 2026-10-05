@@ -2,6 +2,17 @@
 
 When a notification is removed from a release, its database row is not deleted automatically. Run `waldur load_notifications <file> --prune` to report and remove notifications whose key is no longer listed below, along with any of their templates that no other notification declares and that have no operator-customised content. Customised template content is never deleted automatically.
 
+## Enabling notifications
+
+A notification that a release adds is registered disabled, unless the release says otherwise, and a disabled notification sends no email. After an upgrade, check this list for new notifications and enable the ones you need. Either list them with the value `true` in the file passed to `waldur load_notifications <file>` (in waldur-helm, `waldur.notifications` in `values.yaml`), or have a staff user enable them in the notifications list of the administration interface (the `enable` action of `/api/notification-messages/`). Keys not listed in the file keep their current state.
+
+The call-management reviewer workflow depends on these notifications, which are disabled until enabled:
+
+- `proposal.reviewer_assignment_invitation` — the email a reviewer receives when an assignment batch is sent to them
+- `proposal.assignment_expiry_reminder` — the reminder before an assignment batch expires
+- `proposal.assignment_batch_expired` — tells call managers that a batch expired without a full response
+- `proposal.reviewer_pool_invitation_expired` — tells the inviting call manager that a reviewer pool invitation expired
+
 ## WALDUR_CORE.STRUCTURE
 
 ### structure.change_email_request
@@ -1755,6 +1766,151 @@ Notifies organization owners about active resources that have not generated cost
 
 ```
 
+### marketplace.notification_resource_end_date_change_request_approved
+
+Notifies the requester when their resource end date change request is approved.
+
+#### Templates
+
+=== "marketplace/notification_resource_end_date_change_request_approved_subject.txt"
+
+```txt
+
+    End date change request approved for resource {{ resource_end_date_change_request.resource.name }}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_approved_message.txt"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}Hello!
+
+    Your request to change the end date of resource {{ resource.name }} in project {{ resource.project.name }} has been approved{% if request.reviewed_by %} by {{ request.reviewed_by.full_name|default:request.reviewed_by.username }}{% endif %}.
+
+    The new end date is {{ request.requested_end_date|date:"Y-m-d" }}.
+    {% if request.review_comment %}Review comment: {{ request.review_comment }}
+    {% endif %}
+    You can view the resource here:
+    {{ resource_url }}
+
+    Thank you!{% endwith %}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_approved_message.html"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}<p>Hello!</p>
+    <p>Your request to change the end date of resource <strong>{{ resource.name }}</strong> in project <strong>{{ resource.project.name }}</strong> has been approved{% if request.reviewed_by %} by {{ request.reviewed_by.full_name|default:request.reviewed_by.username }}{% endif %}.</p>
+    <p>The new end date is <strong>{{ request.requested_end_date|date:"Y-m-d" }}</strong>.</p>
+    {% if request.review_comment %}<p>Review comment: {{ request.review_comment }}</p>{% endif %}
+    <p>You can <a href="{{ resource_url }}">view the resource here</a>.</p>
+    <p>Thank you!</p>{% endwith %}
+
+```
+
+### marketplace.notification_resource_end_date_change_request_created
+
+Notifies users who may set the resource end date when someone requests to change it.
+
+#### Templates
+
+=== "marketplace/notification_resource_end_date_change_request_created_subject.txt"
+
+```txt
+
+    End date change request for resource {{ resource_end_date_change_request.resource.name }}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_created_message.txt"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}Hello!
+
+    {% if request.created_by %}{{ request.created_by.full_name|default:request.created_by.username }}{% if request.created_by.email %} ({{ request.created_by.email }}){% endif %}{% else %}A project member{% endif %} has requested to change the end date of a resource.
+
+    Resource: {{ resource.name }}
+    Project: {{ resource.project.name }}
+    Organization: {{ resource.project.customer.name }}
+    Current end date: {{ resource.end_date|date:"Y-m-d"|default:"not set" }}
+    Requested end date: {{ request.requested_end_date|date:"Y-m-d" }}
+    {% if request.comment %}Comment: {{ request.comment }}
+    {% endif %}
+    Please review and approve or reject the request:
+    {{ resource_url }}
+
+    Thank you!{% endwith %}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_created_message.html"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}<p>Hello!</p>
+    <p>{% if request.created_by %}{{ request.created_by.full_name|default:request.created_by.username }}{% if request.created_by.email %} ({{ request.created_by.email }}){% endif %}{% else %}A project member{% endif %} has requested to change the end date of a resource.</p>
+    <table>
+        <tr><td>Resource:</td><td><strong>{{ resource.name }}</strong></td></tr>
+        <tr><td>Project:</td><td>{{ resource.project.name }}</td></tr>
+        <tr><td>Organization:</td><td>{{ resource.project.customer.name }}</td></tr>
+        <tr><td>Current end date:</td><td>{{ resource.end_date|date:"Y-m-d"|default:"not set" }}</td></tr>
+        <tr><td>Requested end date:</td><td><strong>{{ request.requested_end_date|date:"Y-m-d" }}</strong></td></tr>
+        {% if request.comment %}<tr><td>Comment:</td><td>{{ request.comment }}</td></tr>{% endif %}
+    </table>
+    <p>Please <a href="{{ resource_url }}">review and approve or reject the request</a>.</p>
+    <p>Thank you!</p>{% endwith %}
+
+```
+
+### marketplace.notification_resource_end_date_change_request_rejected
+
+Notifies the requester when their resource end date change request is rejected.
+
+#### Templates
+
+=== "marketplace/notification_resource_end_date_change_request_rejected_subject.txt"
+
+```txt
+
+    End date change request rejected for resource {{ resource_end_date_change_request.resource.name }}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_rejected_message.txt"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}Hello!
+
+    Your request to change the end date of resource {{ resource.name }} in project {{ resource.project.name }} to {{ request.requested_end_date|date:"Y-m-d" }} has been rejected{% if request.reviewed_by %} by {{ request.reviewed_by.full_name|default:request.reviewed_by.username }}{% endif %}.
+
+    The end date remains {{ resource.end_date|date:"Y-m-d"|default:"not set" }}.
+    {% if request.review_comment %}Review comment: {{ request.review_comment }}
+    {% endif %}
+    You can view the resource here:
+    {{ resource_url }}
+
+    Thank you!{% endwith %}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_rejected_message.html"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}<p>Hello!</p>
+    <p>Your request to change the end date of resource <strong>{{ resource.name }}</strong> in project <strong>{{ resource.project.name }}</strong> to <strong>{{ request.requested_end_date|date:"Y-m-d" }}</strong> has been rejected{% if request.reviewed_by %} by {{ request.reviewed_by.full_name|default:request.reviewed_by.username }}{% endif %}.</p>
+    <p>The end date remains <strong>{{ resource.end_date|date:"Y-m-d"|default:"not set" }}</strong>.</p>
+    {% if request.review_comment %}<p>Review comment: {{ request.review_comment }}</p>{% endif %}
+    <p>You can <a href="{{ resource_url }}">view the resource here</a>.</p>
+    <p>Thank you!</p>{% endwith %}
+
+```
+
 ### marketplace.notification_resource_limit_change_request_approved
 
 Notifies the requester when their resource limit change request is approved.
@@ -2749,7 +2905,7 @@ Notification about a new comment in the issue. The recipient is issue caller.
 
 ```txt
 
-    The issue ({{ issue.key }}) you have created has a new comment
+    The issue you have created has a new comment
 
 ```
 
@@ -2852,7 +3008,7 @@ Notification about an update in the issue comment. The recipient is issue caller
 
 ```txt
 
-    Issue {{ issue.key }}. The comment has been updated
+    The comment has been updated
 
 ```
 
@@ -2896,6 +3052,62 @@ Notification about an update in the issue comment. The recipient is issue caller
     </p>
     </body>
     </html>
+
+```
+
+### support.notification_comment_updated_staff
+
+Notification to the assignee, or to all staff and support users when the ticket is unassigned, that the issue caller has edited one of their comments. Sent only by the built-in service desk.
+
+#### Templates
+
+=== "support/notification_comment_updated_staff_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] Comment edited by {{ comment.author.name|default:"the requester" }}: {{ issue.summary.strip }}
+
+```
+
+=== "support/notification_comment_updated_staff_message.txt"
+
+```txt
+
+    {{ comment.author.name|default:"The requester" }} has edited a comment on a support request.
+
+    Request: {{ issue.key }}
+    Summary: {{ issue.summary.strip }}
+    Status: {{ issue.status }}
+    {% if issue.assignee %}Assignee: {{ issue.assignee.name }}
+    {% endif %}{% if issue.customer %}Organization: {{ issue.customer.name }}
+    {% endif %}{% if issue.project %}Project: {{ issue.project.name }}
+    {% endif %}
+    Previous comment:
+    {{ old_description.strip }}
+
+    Edited comment:
+    {{ comment.description.strip }}
+
+    Open the request: {{ issue_url }}
+
+```
+
+=== "support/notification_comment_updated_staff_message.html"
+
+```txt
+
+    <p>{{ comment.author.name|default:"The requester" }} has edited a comment on a support request.</p>
+    <p><strong>Request:</strong> {{ issue.key }}<br>
+    <strong>Summary:</strong> {{ issue.summary.strip }}<br>
+    <strong>Status:</strong> {{ issue.status }}
+    {% if issue.assignee %}<br><strong>Assignee:</strong> {{ issue.assignee.name }}{% endif %}
+    {% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}
+    {% if issue.project %}<br><strong>Project:</strong> {{ issue.project.name }}{% endif %}</p>
+    <p><strong>Previous comment:</strong></p>
+    <p>{{ old_description.strip }}</p>
+    <p><strong>Edited comment:</strong></p>
+    <p>{{ comment.description.strip }}</p>
+    <p><a href="{{ issue_url }}">Open the request</a></p>
 
 ```
 
@@ -3001,7 +3213,7 @@ Notification about a feedback related to the issue. The recipient is issue calle
 
 ```txt
 
-    Please share your feedback: {{issue.key}} {{issue.summary}}
+    Please share your feedback: {{ issue.summary }}
 
 ```
 
@@ -3082,7 +3294,7 @@ Notification about an update in the issue. The recipient is issue caller.
 
 ```txt
 
-    Updated issue: {{issue.key}} {{issue.summary}}
+    Updated issue: {{ issue.summary }}
 
 ```
 
@@ -3276,7 +3488,7 @@ Notify a provider helpdesk that a routed ticket has been escalated.
 
 ```txt
 
-    [{{ issue.key }}] ESCALATED: {{ issue.summary }}
+    [{{ child_issue.key }}] ESCALATED: {{ issue.summary }}
 
 ```
 
@@ -3396,7 +3608,7 @@ Notify a provider helpdesk that a ticket previously routed to them was rerouted 
 
 ```txt
 
-    [{{ issue.key }}] Ticket withdrawn: {{ issue.summary }}
+    [{{ child_key|default:issue.key }}] Ticket withdrawn: {{ issue.summary }}
 
 ```
 
@@ -3406,7 +3618,7 @@ Notify a provider helpdesk that a ticket previously routed to them was rerouted 
 
     A support ticket previously routed to your helpdesk has been withdrawn and reassigned to a different provider.
 
-    Ticket: {{ issue.key }}
+    Ticket: {{ child_key|default:issue.key }}
     Summary: {{ issue.summary }}
 
     No further action is required on your side. If you have already opened a corresponding ticket in your system, you may close it.
@@ -3418,7 +3630,7 @@ Notify a provider helpdesk that a ticket previously routed to them was rerouted 
 ```txt
 
     <p>A support ticket previously routed to your helpdesk has been withdrawn and reassigned to a different provider.</p>
-    <p><strong>Ticket:</strong> {{ issue.key }}<br>
+    <p><strong>Ticket:</strong> {{ child_key|default:issue.key }}<br>
     <strong>Summary:</strong> {{ issue.summary }}</p>
     <p>No further action is required on your side. If you have already opened a corresponding ticket in your system, you may close it.</p>
 
@@ -3439,6 +3651,112 @@ A template used for generating the issue summary field during issue creation.
 ```
 
 ## WALDUR_MASTERMIND.PROPOSAL
+
+### proposal.assignment_batch_expired
+
+Notifies call managers that a reviewer's assignment batch expired before they responded to every proposal.
+
+#### Templates
+
+=== "proposal/assignment_batch_expired_subject.txt"
+
+```txt
+
+    Review assignments for "{{ call_name }}" expired without a response from {{ reviewer_name }}
+
+```
+
+=== "proposal/assignment_batch_expired_message.txt"
+
+```txt
+
+    Hello,
+
+    The review assignments sent to {{ reviewer_name }} for the call "{{ call_name }}" on {{ sent_at }} expired on {{ expired_at }} before every proposal was accepted or declined ({{ items_count }} proposal{{ items_count|pluralize }} in the batch).
+
+    You can extend the deadline or reassign the proposals here:
+
+    {{ assignments_url }}
+
+    This is an automated message from {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/assignment_batch_expired_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+    </head>
+    <body>
+    <p>Hello,</p>
+
+    <p>The review assignments sent to <strong>{{ reviewer_name }}</strong> for the call "<strong>{{ call_name }}</strong>" on {{ sent_at }} expired on {{ expired_at }} before every proposal was accepted or declined ({{ items_count }} proposal{{ items_count|pluralize }} in the batch).</p>
+
+    <p>You can extend the deadline or reassign the proposals here:</p>
+
+    <p><a href="{{ assignments_url }}">{{ assignments_url }}</a></p>
+
+    <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+    </body>
+    </html>
+
+```
+
+### proposal.assignment_expiry_reminder
+
+Reminds a reviewer that their assignment batch expires soon; the lead time is set per call.
+
+#### Templates
+
+=== "proposal/assignment_expiry_reminder_subject.txt"
+
+```txt
+
+    Reminder: your review assignments for "{{ call_name }}" expire soon
+
+```
+
+=== "proposal/assignment_expiry_reminder_message.txt"
+
+```txt
+
+    Dear {{ reviewer_name }},
+
+    You have been asked to review {{ items_count }} proposal{{ items_count|pluralize }} in the call "{{ call_name }}" on {{ site_name }}, and the invitation expires soon.
+
+    Please accept or decline each proposal before {{ expires_at }}:
+
+    {{ link }}
+
+    This is an automated message from {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/assignment_expiry_reminder_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+    </head>
+    <body>
+    <p>Dear {{ reviewer_name }},</p>
+
+    <p>You have been asked to review {{ items_count }} proposal{{ items_count|pluralize }} in the call "<strong>{{ call_name }}</strong>" on {{ site_name }}, and the invitation expires soon.</p>
+
+    <p>Please accept or decline each proposal before <strong>{{ expires_at }}</strong>:</p>
+
+    <p><a href="{{ link }}">{{ link }}</a></p>
+
+    <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+    </body>
+    </html>
+
+```
 
 ### proposal.new_proposal_submitted
 
@@ -4450,6 +4768,75 @@ A notification to the call managers about a rejected review.
 
 ```
 
+### proposal.reviewer_assignment_invitation
+
+Sent to a reviewer when a call manager sends them a batch of proposals to accept or decline.
+
+#### Templates
+
+=== "proposal/reviewer_assignment_invitation_subject.txt"
+
+```txt
+
+    You have {{ items_count }} proposal{{ items_count|pluralize }} to review for "{{ call_name }}"
+
+```
+
+=== "proposal/reviewer_assignment_invitation_message.txt"
+
+```txt
+
+    Dear {{ reviewer_name }},
+
+    You have been asked to review {{ items_count }} proposal{{ items_count|pluralize }} in the call "{{ call_name }}" on {{ site_name }}:
+    {% for proposal in proposals %}
+    - {{ proposal.name }}{% if proposal.summary %}
+      {{ proposal.summary }}{% endif %}{% endfor %}
+    {% if manager_notes %}
+    Note from the call manager:
+    {{ manager_notes }}
+    {% endif %}
+    Please accept or decline each proposal by {{ expires_at }}:
+
+    {{ link }}
+
+    This is an automated message from {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/reviewer_assignment_invitation_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+    </head>
+    <body>
+    <p>Dear {{ reviewer_name }},</p>
+
+    <p>You have been asked to review {{ items_count }} proposal{{ items_count|pluralize }} in the call "<strong>{{ call_name }}</strong>" on {{ site_name }}:</p>
+
+    <ul>
+    {% for proposal in proposals %}
+        <li><strong>{{ proposal.name }}</strong>{% if proposal.summary %}<br>{{ proposal.summary }}{% endif %}</li>
+    {% endfor %}
+    </ul>
+
+    {% if manager_notes %}
+    <p><strong>Note from the call manager:</strong><br>{{ manager_notes|linebreaksbr }}</p>
+    {% endif %}
+
+    <p>Please accept or decline each proposal by <strong>{{ expires_at }}</strong>:</p>
+
+    <p><a href="{{ link }}">{{ link }}</a></p>
+
+    <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+    </body>
+    </html>
+
+```
+
 ### proposal.reviewer_invitation
 
 Sent to a person invited to join the reviewer pool for a call.
@@ -4498,6 +4885,66 @@ Sent to a person invited to join the reviewer pool for a call.
     <p>If you do not yet have an account, you will need to register and create a reviewer profile before accepting.</p>
 
     <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+    </body>
+    </html>
+
+```
+
+### proposal.reviewer_pool_invitation_expired
+
+Sent once to the call manager who invited a reviewer to the pool when the invitation expires without an answer.
+
+#### Templates
+
+=== "proposal/reviewer_pool_invitation_expired_subject.txt"
+
+```txt
+
+    Reviewer pool invitation for "{{ call_name }}" has expired
+
+```
+
+=== "proposal/reviewer_pool_invitation_expired_message.txt"
+
+```txt
+
+    Dear call manager,
+
+    The invitation you sent to {{ invitee_name }} to join the reviewer pool for the call "{{ call_name }}" has expired without an answer.
+
+    Invited: {{ invited_at }}
+    Expired: {{ expired_at }}
+
+    The invitation can no longer be accepted or declined. You can send it again from the call's reviewer pool, which gives it a new expiry date:
+
+    {{ reviewer_pool_url }}
+
+    This is an automated message from {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/reviewer_pool_invitation_expired_message.html"
+
+```txt
+
+    <html>
+    <head lang="en">
+        <meta charset="UTF-8">
+        <title>Reviewer pool invitation expired</title>
+    </head>
+    <body>
+        <p>Dear call manager,</p>
+
+        <p>The invitation you sent to <strong>{{ invitee_name }}</strong> to join the reviewer pool for the call "<strong>{{ call_name }}</strong>" has expired without an answer.</p>
+
+        <ul>
+            <li><strong>Invited:</strong> {{ invited_at }}</li>
+            <li><strong>Expired:</strong> {{ expired_at }}</li>
+        </ul>
+
+        <p>The invitation can no longer be accepted or declined. You can send it again from the call's reviewer pool, which gives it a new expiry date: <a href="{{ reviewer_pool_url }}">{{ reviewer_pool_url }}</a></p>
+
+        <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
     </body>
     </html>
 

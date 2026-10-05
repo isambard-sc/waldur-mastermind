@@ -1,10 +1,12 @@
 import logging
+import secrets
 from datetime import datetime, timedelta
 from typing import Literal, cast
 
 from constance import config as constance_config
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ObjectDoesNotExist
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import MinValueValidator
 from django.db import models, transaction
@@ -44,12 +46,14 @@ from waldur_mastermind.proposal.enums import (
     COISeverityLevels,
     COIStatuses,
     COITypes,
+    EvaluationStart,
     ExpertiseProficiencyLevels,
     FinancialInterestAmountRanges,
     FinancialInterestEntityTypes,
     FinancialInterestRelationshipTypes,
     MatchingAffinityMethods,
     MatchingAlgorithms,
+    OrderAuthors,
     ProposalDisclosureLevels,
     ProposalFieldStates,
     ProposalStates,
@@ -61,12 +65,16 @@ from waldur_mastermind.proposal.enums import (
     ReviewerSuggestionStatuses,
     RoundStatuses,
     SuggestionSourceTypes,
-    SupportTicketCallers,
 )
 
 from . import managers
 
 logger = logging.getLogger(__name__)
+
+EVALUATION_START_LOCKED_MESSAGE = _(
+    "Cannot change when evaluation starts while the call has proposals that "
+    "are submitted or in review."
+)
 
 
 class CallDocument(
@@ -143,7 +151,7 @@ class Call(
     class States(CallStates):
         pass
 
-    class TicketCaller(SupportTicketCallers):
+    class OrderAuthor(OrderAuthors):
         pass
 
     manager = models.ForeignKey(CallManagingOrganisation, on_delete=models.PROTECT)
@@ -220,29 +228,46 @@ class Call(
         ),
     )
 
-    support_ticket_caller = models.CharField(
+    order_author = models.CharField(
         max_length=20,
-        choices=TicketCaller.CHOICES,
-        default=TicketCaller.APPLICANT,
+        choices=OrderAuthor.CHOICES,
+        default=OrderAuthor.APPLICANT,
         help_text=(
-            "Who helpdesk tickets for granted resources are raised for. They "
-            "receive the helpdesk's replies; reading the ticket in Waldur "
-            "also needs a role on the project. If that person has no email "
-            "address, the project's roles decide instead."
+            "Whose name the orders placed when this call grants resources "
+            "carry. That person is who a helpdesk ticket is raised for and "
+            "who Waldur's order mail is addressed to; reading the ticket in "
+            "Waldur also needs a role on the project. The call review still "
+            "authorises the spend, and the orders are still carried out with "
+            "system authority."
         ),
     )
-    support_ticket_caller_user = models.ForeignKey(
+    order_author_user = models.ForeignKey(
         core_models.User,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name="+",
         help_text=(
-            "The person tickets go to when the caller is set to a named "
-            "contact. Useful for routing a whole call to a shared mailbox. "
-            "Must hold a role on this call or on the organisation managing it."
+            "The person orders are attributed to when the author is set to a "
+            "named contact. Useful for routing a whole call to a shared "
+            "mailbox. Must hold a role on this call or on the organisation "
+            "managing it."
         ),
     )
+
+    evaluation_start = models.CharField(
+        max_length=20,
+        choices=EvaluationStart.CHOICES,
+        default=EvaluationStart.ON_SUBMISSION,
+        help_text=(
+            "When a submitted proposal's evaluation starts: at once on "
+            "submission, or for every proposal of a round together at the "
+            "round's cut-off. Cannot be changed while proposals are submitted "
+            "or in review."
+        ),
+    )
+
+    coi_configuration: "CallCOIConfiguration"
 
     objects = managers.CallManager()
     tracker = cast(FieldInstanceTracker, FieldTracker())
@@ -267,6 +292,12 @@ class Call(
     def customer(self):
         return self.manager.customer
 
+    def has_proposals_under_evaluation(self):
+        return Proposal.objects.filter(
+            round__call=self,
+            state__in=[ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW],
+        ).exists()
+
     def clean(self):
         """Prevent changing checklist or slug template if proposals exist."""
         if (
@@ -280,6 +311,12 @@ class Call(
                     "panel_chair": "Panel chair must hold the panel member role on this call."
                 }
             )
+        if (
+            self.pk
+            and self.tracker.has_changed("evaluation_start")
+            and self.has_proposals_under_evaluation()
+        ):
+            raise ValidationError({"evaluation_start": EVALUATION_START_LOCKED_MESSAGE})
         if self.pk and self.proposal_set.exists():
             if self.tracker.has_changed("compliance_checklist"):
                 raise ValidationError(
@@ -1019,6 +1056,10 @@ def filter_proposals(user):
         # requested one of their accepted offerings (not every proposal on the
         # call).
         | Q(pk__in=managers.get_offering_manager_proposals(user))
+        # A reviewer reads the proposal they are reviewing through their review,
+        # not through a call role: accepting a reviewer-pool invitation or an
+        # assignment grants none.
+        | Q(pk__in=managers.get_reviewed_proposals(user))
     )
 
 
@@ -1061,7 +1102,18 @@ class Proposal(
         related_name="+",
     )
     project_summary = models.TextField(blank=True)
-    project_duration = models.PositiveIntegerField(null=True, blank=True)
+    submitted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        editable=False,
+        help_text=(
+            "When the proposal left draft. Null for proposals submitted before "
+            "this field existed: their submission was never recorded and the "
+            "only proxy, the first workflow step instance, was backfilled by "
+            "migration for the oldest of them — so it is left empty rather "
+            "than filled with a date that reads as fact."
+        ),
+    )
 
     resources = models.ManyToManyField(RequestedOffering, through="RequestedResource")
     allocation_comment = models.CharField(blank=True, max_length=150, null=True)
@@ -1496,7 +1548,6 @@ class Review(
     comment_project_description = models.CharField(
         max_length=255, null=True, blank=True
     )
-    comment_project_duration = models.CharField(max_length=255, null=True, blank=True)
     comment_project_supporting_documentation = models.CharField(
         max_length=255, null=True, blank=True
     )
@@ -1518,6 +1569,7 @@ class Review(
     )
     coi_confirmed_at = models.DateTimeField(null=True, blank=True)
 
+    objects = managers.ReviewQuerySet.as_manager()
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
     @classmethod
@@ -1525,13 +1577,26 @@ class Review(
         return "proposal-review"
 
     @property
-    def review_end_date(self) -> datetime:
-        if not self.proposal.round.review_duration_in_days:
-            return
+    def review_end_date(self) -> datetime | None:
+        """When the review is due, or None if the round sets no review duration.
 
-        return self.created + timedelta(
+        A review created by accepting an assignment is also due no earlier than
+        its assignment batch's deadline, so extending the batch deadline moves
+        the deadline of the reviews accepted from it.
+        """
+        if not self.proposal.round.review_duration_in_days:
+            return None
+
+        end_date = self.created + timedelta(
             days=self.proposal.round.review_duration_in_days
         )
+        try:
+            batch_expires_at = self.assignment_item.batch.expires_at
+        except ObjectDoesNotExist:
+            return end_date
+        if batch_expires_at and batch_expires_at > end_date:
+            return batch_expires_at
+        return end_date
 
 
 class ReviewComment(
@@ -2297,6 +2362,11 @@ def filter_call_reviewer_pool(user):
     )
 
 
+def generate_invitation_token():
+    # A field default rather than save(), so bulk_create gets one too
+    return secrets.token_urlsafe(48)
+
+
 class CallReviewerPool(
     TimeStampedModel,
     core_models.UuidMixin,
@@ -2351,6 +2421,8 @@ class CallReviewerPool(
 
     # Assignment limits
     max_assignments = models.PositiveIntegerField(default=5)
+    # Not maintained and not read: the open assignment count is derived by
+    # ``CallReviewerPoolQuerySet.with_open_assignments`` instead.
     current_assignments = models.PositiveIntegerField(default=0)
 
     # Matching score
@@ -2365,6 +2437,7 @@ class CallReviewerPool(
         max_length=64,
         unique=True,
         blank=True,
+        default=generate_invitation_token,
     )
     invitation_expires_at = models.DateTimeField(null=True, blank=True)
 
@@ -2382,6 +2455,7 @@ class CallReviewerPool(
     )
     overridden_at = models.DateTimeField(null=True, blank=True)
 
+    objects = managers.CallReviewerPoolQuerySet.as_manager()
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Permissions:
@@ -2426,12 +2500,52 @@ class CallReviewerPool(
     def get_url_name(cls):
         return "call-reviewer-pool"
 
-    def save(self, *args, **kwargs):
-        if not self.invitation_token:
-            import secrets
+    DEFAULT_INVITATION_EXPIRATION_DAYS = 7
 
-            self.invitation_token = secrets.token_urlsafe(48)
-        super().save(*args, **kwargs)
+    @classmethod
+    def get_invitation_expires_at(cls, call) -> datetime:
+        """When a pool invitation sent now for this call stops being answerable.
+
+        Pool invitations share the call's assignment expiration setting, so a
+        manager configures one response window for both stages of reviewer
+        recruitment.
+        """
+        try:
+            days = call.assignment_configuration.assignment_expiration_days
+        except CallAssignmentConfiguration.DoesNotExist:
+            days = cls.DEFAULT_INVITATION_EXPIRATION_DAYS
+        return timezone.now() + timedelta(days=days)
+
+    @property
+    def is_invitation_expired(self) -> bool:
+        if self.invitation_status == ReviewerPoolInvitationStatuses.EXPIRED:
+            return True
+        return bool(
+            self.invitation_status == ReviewerPoolInvitationStatuses.PENDING
+            and self.invitation_expires_at
+            and self.invitation_expires_at < timezone.now()
+        )
+
+    @property
+    def invitee_name(self) -> str:
+        if self.reviewer:
+            return self.reviewer.user.full_name
+        if self.invited_user:
+            return self.invited_user.full_name
+        return self.invited_email
+
+    def get_open_assignments(self) -> int:
+        """Number of assignments currently occupying this reviewer's workload."""
+        annotated = getattr(self, "open_assignments", None)
+        if annotated is not None:
+            return annotated
+        return (
+            type(self)
+            .objects.filter(pk=self.pk)
+            .with_open_assignments()
+            .values_list("open_assignments", flat=True)
+            .get()
+        )
 
 
 class ReviewerSuggestion(
@@ -2876,7 +2990,11 @@ class CallAssignmentConfiguration(
 def filter_assignment_batches(user):
     """Filter assignment batches based on user's roles."""
     return (
-        Q(reviewer_pool_entry__reviewer__user=user)  # Reviewer's own batches
+        # Reviewer's own batches, once they have been sent
+        Q(
+            reviewer_pool_entry__reviewer__user=user,
+            status__in=AssignmentBatchStatuses.SENT_TO_REVIEWER,
+        )
         | Q(call__in=managers.get_connected_calls(user, RoleEnum.CALL_MANAGER))
     )
 
@@ -2971,6 +3089,8 @@ class AssignmentBatch(
         help_text=_("Whether manager has been notified of expiration."),
     )
 
+    items: models.Manager["AssignmentItem"]
+
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Permissions:
@@ -3046,14 +3166,18 @@ class AssignmentBatch(
         self.sent_at = timezone.now()
         self.expires_at = timezone.now() + timedelta(days=expiration_days)
         self.save(update_fields=["status", "sent_at", "expires_at"])
-
-        # TODO: Send email notification to reviewer
+        # The caller queues the invitation email
+        # (tasks.send_assignment_batch_invitation) once this returns.
 
 
 def filter_assignment_items(user):
     """Filter assignment items based on user's roles."""
     return (
-        Q(batch__reviewer_pool_entry__reviewer__user=user)  # Reviewer's own items
+        # Reviewer's own items, once their batch has been sent
+        Q(
+            batch__reviewer_pool_entry__reviewer__user=user,
+            batch__status__in=AssignmentBatchStatuses.SENT_TO_REVIEWER,
+        )
         | Q(batch__call__in=managers.get_connected_calls(user, RoleEnum.CALL_MANAGER))
     )
 

@@ -42,6 +42,15 @@ from reversion.models import Version
 
 from waldur_auth_social.models import IdentityProvider
 from waldur_core import __version__
+from waldur_core.changelog.models import ChangelogImpactAnalysis
+from waldur_core.changelog.tasks import compute_changelog_impact
+from waldur_core.changelog.utils import (
+    build_changelog_summary,
+    fetch_changelog_index,
+    get_impact_analysis_target,
+    get_latest_version,
+    get_pending_versions,
+)
 from waldur_core.core import WaldurExtension, models, permissions
 from waldur_core.core.authentication import (
     OIDC_AUTHENTICATION_METHODS,
@@ -51,7 +60,7 @@ from waldur_core.core.authentication import (
     set_authentication_method,
 )
 from waldur_core.core.exceptions import ExtensionDisabled, IncorrectStateException
-from waldur_core.core.features import FEATURES
+from waldur_core.core.features import FEATURE_DEFAULTS, FEATURES
 from waldur_core.core.fields import COUNTRIES
 from waldur_core.core.handlers import emit_user_blocked_event
 from waldur_core.core.logos import DEFAULT_LOGOS, LOGO_MAP, build_logo_url
@@ -89,7 +98,7 @@ from waldur_core.core.serializers import (
     _serialize_allowed_scopes,
 )
 from waldur_core.core.tasks import sample_table_sizes
-from waldur_core.core.utils import format_homeport_link
+from waldur_core.core.utils import format_homeport_link, get_constance_setting_type
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
 from waldur_core.logging.event_logger import get_event_groups
@@ -170,6 +179,15 @@ class ObtainAuthToken(APIView):
 
     throttle_classes = ()
     permission_classes = ()
+    # This view authenticates by credentials in the body; who the request
+    # already is, is irrelevant to it. Leaving the default authenticators on
+    # made SessionAuthentication pick up any Django `sessionid` cookie for this
+    # origin — set by Django admin, which the SPA is served alongside — and DRF
+    # then enforces CSRF on it. A login POST carries no CSRF token, so the
+    # credentials were never even read: it failed with "CSRF Failed: CSRF token
+    # missing." until the user cleared their cookies. Nothing here reads
+    # request.user, so there is nothing to authenticate.
+    authentication_classes = ()
     serializer_class = ObtainAuthTokenSerializer
 
     @extend_schema(
@@ -310,7 +328,7 @@ class ObtainAuthToken(APIView):
         token = refresh_token(user)
         user.last_login = timezone.now()
         user.save(update_fields=["last_login"])
-        set_authentication_method(request, AuthenticationMethod.LOCAL)
+        set_authentication_method(request, AuthenticationMethod.LOCAL, user)
 
         logger.debug("Returning token for successful login of user %s", user)
 
@@ -559,7 +577,8 @@ def get_feature_values():
     return {
         section["key"]: {
             feature["key"]: feature_values.get(
-                f"{section['key']}.{feature['key']}", False
+                f"{section['key']}.{feature['key']}",
+                FEATURE_DEFAULTS.get(f"{section['key']}.{feature['key']}", False),
             )
             for feature in section["items"]
         }
@@ -1910,6 +1929,74 @@ def get_latest_github_tag(timeout=5):
     return latest_tag
 
 
+# How long a PENDING/RUNNING analysis is trusted to still be in flight before
+# it's treated as stuck (worker killed mid-task, status never updated) and
+# re-queued. Also the cooldown before a FAILED analysis is retried - without
+# one, remote data that reliably makes the task fail (e.g. finding 1d before
+# it was fixed) gets it re-queued on every single /api/version/ call.
+IMPACT_ANALYSIS_RETRY_COOLDOWN = timedelta(hours=1)
+IMPACT_ANALYSIS_STALE_AGE = timedelta(hours=24)
+
+
+def _trigger_impact_analysis_if_needed(target):
+    """Schedule compute_changelog_impact when the analysis is missing, stale,
+    failed (past a cooldown), or stuck in PENDING/RUNNING past the timeout."""
+    analysis, created = ChangelogImpactAnalysis.objects.get_or_create(
+        current_version=__version__,
+        target_version=target,
+        defaults={"status": ChangelogImpactAnalysis.Status.PENDING},
+    )
+    if created:
+        compute_changelog_impact.delay(__version__, target)
+        return
+
+    now = timezone.now()
+    Status = ChangelogImpactAnalysis.Status
+
+    if analysis.status in (Status.PENDING, Status.RUNNING):
+        if now - analysis.modified < IMPACT_ANALYSIS_RETRY_COOLDOWN:
+            return  # still plausibly in flight
+    elif analysis.status == Status.FAILED:
+        if now - analysis.modified < IMPACT_ANALYSIS_RETRY_COOLDOWN:
+            return  # retry later, don't hammer a reliably-failing task
+    elif analysis.status == Status.COMPLETED:
+        is_stale = (
+            analysis.computed_at
+            and now - analysis.computed_at > IMPACT_ANALYSIS_STALE_AGE
+        )
+        if not is_stale:
+            return
+
+    analysis.status = ChangelogImpactAnalysis.Status.PENDING
+    analysis.save(update_fields=["status"])
+    compute_changelog_impact.delay(__version__, target)
+
+
+def _populate_changelog_fields(response_data):
+    """Add latest_version/changelog_summary to response_data, falling back to a
+    legacy GitHub tag check when the changelog index is unavailable."""
+    index_data = fetch_changelog_index()
+    if not index_data:
+        latest_version = get_latest_github_tag()
+        if latest_version:
+            response_data["latest_version"] = latest_version
+        return
+
+    latest_version = get_latest_version(index_data, __version__)
+    if latest_version:
+        response_data["latest_version"] = latest_version
+
+    summary = build_changelog_summary(index_data, __version__)
+    if not summary:
+        return
+    response_data["changelog_summary"] = summary
+
+    pending = get_pending_versions(__version__, index_data)
+    target = get_impact_analysis_target(pending)
+    if target:
+        _trigger_impact_analysis_if_needed(target)
+
+
 @extend_schema(
     summary="Get application version",
     description=(
@@ -1929,15 +2016,15 @@ def version_detail(request):
         "version": __version__,
     }
 
-    if (request.user.is_staff or request.user.is_support) and check_pat_support_scope(
-        request
-    ):
-        latest_version = get_latest_github_tag()
-        if latest_version:
-            response_data["latest_version"] = latest_version
+    has_extended_access = (
+        request.user.is_staff or request.user.is_support
+    ) and check_pat_support_scope(request)
+    changelog_enabled = settings.WALDUR_CORE.get("CHANGELOG_ENABLED", True)
 
-    serializer = VersionSerializer(response_data)
-    return Response(serializer.data)
+    if has_extended_access and changelog_enabled:
+        _populate_changelog_fields(response_data)
+
+    return Response(VersionSerializer(response_data).data)
 
 
 class ActionMethodMixin:
@@ -2189,36 +2276,12 @@ class SettingsMetadataView(APIView):
                 if key in settings.CONSTANCE_CONFIG:
                     default = settings.CONSTANCE_CONFIG[key][0]
                     description = settings.CONSTANCE_CONFIG[key][1].replace("'", "\\'")
-                    value_type = (
-                        len(settings.CONSTANCE_CONFIG[key]) >= 3
-                        and settings.CONSTANCE_CONFIG[key][2]
-                        or None
-                    )
-
-                    if isinstance(default, str):
-                        formatted_default = default
-                    elif default is True:
-                        formatted_default = True
-                    elif default is False:
-                        formatted_default = False
-                    else:
-                        formatted_default = default
-
-                    if value_type:
-                        formatted_type = value_type
-                    elif isinstance(default, str):
-                        formatted_type = "string"
-                    elif isinstance(default, bool):
-                        formatted_type = "boolean"
-                    elif isinstance(default, int):
-                        formatted_type = "integer"
-                    else:
-                        formatted_type = "string"
+                    formatted_type = get_constance_setting_type(key)
 
                     item_data = {
                         "key": key,
                         "description": description,
-                        "default": formatted_default,
+                        "default": default,
                         "type": formatted_type,
                     }
 

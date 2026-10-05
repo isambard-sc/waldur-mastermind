@@ -8,6 +8,7 @@ from django.test import TestCase
 
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.matrix_chat import models, tasks
+from waldur_mastermind.matrix_chat.tests import fixtures
 
 
 @mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
@@ -50,6 +51,81 @@ class CreateRoomTaskTest(TestCase):
         self.assertEqual(room.state, models.RoomStates.ERROR)
         self.assertIn("Matrix error", room.error_message)
 
+    def test_projects_sharing_a_uuid_prefix_get_distinct_aliases(self, mock_client):
+        # Sequential UUIDs (demo presets) share their leading characters; an
+        # alias built from a prefix collided and the second room got none.
+        mock_client.is_enabled.return_value = True
+
+        aliases = []
+        for uuid in (
+            "c3000000000000000000000000000001",
+            "c3000000000000000000000000000002",
+        ):
+            project = structure_factories.ProjectFactory(uuid=uuid)
+            room = models.MatrixRoom.objects.create(
+                room_name=project.name,
+                content_type=ContentType.objects.get_for_model(project),
+                object_id=project.id,
+            )
+            mock_client.create_room.return_value = (f"!{uuid}:example.com", True)
+            tasks.create_room(str(room.uuid))
+            aliases.append(mock_client.create_room.call_args.kwargs["alias_localpart"])
+
+        self.assertEqual(
+            aliases,
+            [
+                "waldur-c3000000000000000000000000000001",
+                "waldur-c3000000000000000000000000000002",
+            ],
+        )
+
+    def test_second_dispatch_leaves_the_created_room_alone(self, mock_client):
+        # Retry is offered on a room that has sat in `creating` for a few
+        # minutes, which a backfill queue makes common, so the first task may
+        # still be pending when a second one is queued.
+        mock_client.is_enabled.return_value = True
+        mock_client.create_room.return_value = ("!first:matrix.example.com", True)
+
+        project = structure_factories.ProjectFactory()
+        room = models.MatrixRoom.objects.create(
+            room_name="Test Project",
+            content_type=ContentType.objects.get_for_model(project),
+            object_id=project.id,
+        )
+
+        tasks.create_room(str(room.uuid))
+        tasks.create_room(str(room.uuid))
+
+        room.refresh_from_db()
+        self.assertEqual(room.state, models.RoomStates.ACTIVE)
+        self.assertEqual(room.room_id, "!first:matrix.example.com")
+        mock_client.create_room.assert_called_once()
+
+    def test_room_of_a_removed_project_is_not_provisioned(self, mock_client):
+        # A project removed while its room waited in the queue has already
+        # passed pre_delete, so nothing would ever archive a room made now.
+        mock_client.is_enabled.return_value = True
+
+        project = structure_factories.ProjectFactory()
+        ct = ContentType.objects.get_for_model(project)
+        room = models.MatrixRoom.objects.create(
+            room_name="Test Project",
+            content_type=ct,
+            object_id=project.id,
+        )
+        project.delete()
+
+        tasks.create_room(str(room.uuid))
+
+        room.refresh_from_db()
+        self.assertEqual(room.state, models.RoomStates.ERROR)
+        self.assertEqual(
+            room.error_message,
+            "The project was removed before its room was created, "
+            "so retrying cannot succeed.",
+        )
+        mock_client.create_room.assert_not_called()
+
     def test_skips_when_disabled(self, mock_client):
         mock_client.is_enabled.return_value = False
 
@@ -91,21 +167,22 @@ class InviteUserTaskTest(TestCase):
         mock_client.invite_user.assert_called_once_with(
             "!test:matrix.example.com", "@alice:matrix.example.com"
         )
-        # Auto-join via the user's own token succeeds against the mocked
-        # client, so the membership state lands on JOINED.
+        # The appservice accepts the invite on the user's behalf, so no user
+        # access token (and no Matrix device) is created for the join.
+        mock_client.join_room_as_user.assert_called_once_with(
+            "!test:matrix.example.com", "@alice:matrix.example.com"
+        )
+        mock_client.get_access_token_for_user.assert_not_called()
         member = models.MatrixRoomMember.objects.get(room=room, user=user)
         self.assertEqual(member.membership_state, models.MembershipStates.JOINED)
 
     def test_invite_falls_back_to_invited_when_auto_join_fails(self, mock_client):
-        # When the user's access token can't be obtained (or the join itself
-        # fails), the row is recorded as INVITED — the bot's invite is the
-        # durable side effect, and the user can accept manually later.
+        # When the join fails, the row is recorded as INVITED — the bot's
+        # invite is the durable side effect, and the user can accept later.
         mock_client.is_enabled.return_value = True
         mock_client.ensure_user_exists.return_value = "@alice:matrix.example.com"
         mock_client.get_power_level_for_scope.return_value = 0
-        mock_client.get_access_token_for_user.side_effect = RuntimeError(
-            "login unavailable"
-        )
+        mock_client.join_room_as_user.side_effect = RuntimeError("join refused")
 
         project = structure_factories.ProjectFactory()
         user = structure_factories.UserFactory(username="alice")
@@ -620,6 +697,10 @@ class StaffJoinRoomTaskTest(TestCase):
         mock_client.invite_user.assert_called_once_with(
             "!staff:matrix.example.com", "@staff:matrix.example.com"
         )
+        mock_client.join_room_as_user.assert_called_once_with(
+            "!staff:matrix.example.com", "@staff:matrix.example.com"
+        )
+        mock_client.get_access_token_for_user.assert_not_called()
         mock_client.set_power_level.assert_called_once_with(
             "!staff:matrix.example.com", "@staff:matrix.example.com", 50
         )
@@ -629,6 +710,18 @@ class StaffJoinRoomTaskTest(TestCase):
         mock_client.send_message.assert_called_once_with(
             "!staff:matrix.example.com", "Staff Member joined the room."
         )
+
+    def test_join_left_invited_when_join_fails(self, mock_client):
+        mock_client.is_enabled.return_value = True
+        mock_client.ensure_user_exists.return_value = "@staff:matrix.example.com"
+        mock_client.join_room_as_user.side_effect = RuntimeError("join refused")
+        room = self._make_room()
+        user = structure_factories.UserFactory(username="staff", is_staff=True)
+
+        tasks.staff_join_room(str(room.uuid), str(user.uuid))
+
+        member = models.MatrixRoomMember.objects.get(room=room, user=user)
+        self.assertEqual(member.membership_state, models.MembershipStates.INVITED)
 
     def test_join_skips_inactive_room(self, mock_client):
         mock_client.is_enabled.return_value = True
@@ -672,9 +765,48 @@ class StaffLeaveRoomTaskTest(TestCase):
         mock_client.send_message.assert_called_once_with(
             "!staff:matrix.example.com", "Staff Member left the room."
         )
-        mock_client.leave_room_as_self.assert_called_once()
+        mock_client.leave_room_as_user.assert_called_once_with(
+            "!staff:matrix.example.com", "@staff:matrix.example.com"
+        )
+        mock_client.get_access_token_for_user.assert_not_called()
         member.refresh_from_db()
         self.assertEqual(member.membership_state, models.MembershipStates.LEFT)
+
+
+@mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
+class SyncProjectMembersJoinTest(TestCase):
+    def test_member_left_invited_when_join_fails(self, mock_client):
+        mock_client.is_enabled.return_value = True
+        mock_client.ensure_user_exists.side_effect = (
+            lambda user: f"@{user.username}:matrix.example.com"
+        )
+        mock_client.get_power_level_for_scope.return_value = 0
+        mock_client.join_room_as_user.side_effect = RuntimeError("join refused")
+        fixture = fixtures.MatrixChatFixture()
+        admin = fixture.admin
+        room = fixture.matrix_room
+
+        tasks.sync_project_members_to_room(str(room.uuid))
+
+        member = models.MatrixRoomMember.objects.get(room=room, user=admin)
+        self.assertEqual(member.membership_state, models.MembershipStates.INVITED)
+
+    def test_project_member_is_joined_through_appservice(self, mock_client):
+        mock_client.is_enabled.return_value = True
+        mock_client.ensure_user_exists.return_value = "@admin:matrix.example.com"
+        mock_client.get_power_level_for_scope.return_value = 0
+        fixture = fixtures.MatrixChatFixture()
+        admin = fixture.admin
+        room = fixture.matrix_room
+
+        tasks.sync_project_members_to_room(str(room.uuid))
+
+        mock_client.join_room_as_user.assert_any_call(
+            room.room_id, "@admin:matrix.example.com"
+        )
+        mock_client.get_access_token_for_user.assert_not_called()
+        member = models.MatrixRoomMember.objects.get(room=room, user=admin)
+        self.assertEqual(member.membership_state, models.MembershipStates.JOINED)
 
 
 @mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")

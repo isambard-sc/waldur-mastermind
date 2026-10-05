@@ -1,14 +1,15 @@
 import logging
 import secrets
+import uuid as uuid_module
 from datetime import datetime, timedelta
 from typing import cast
 
+from constance import config
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import (
     Avg,
     Count,
-    DateTimeField,
     DurationField,
     Exists,
     ExpressionWrapper,
@@ -67,9 +68,10 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.views import BaseMarketplaceView, PublicViewsetMixin
 from waldur_mastermind.proposal import (
     affinity_scoring,
+    call_transfer,
+    exports,
     filters,
     models,
-    notification_rules,
     orcid_service,
     serializers,
     tasks,
@@ -90,20 +92,26 @@ from waldur_mastermind.proposal.enums import (
     COISeverityLevels,
     COIStatuses,
     COITypes,
+    EvaluationStart,
     ProposalFieldStates,
     ProposalStates,
     RequestedOfferingStates,
     ReviewerPoolInvitationStatuses,
     ReviewerSuggestionStatuses,
+    ReviewStates,
     RoundStatuses,
     TransitionModes,
     WorkflowStepInstanceStatuses,
 )
 from waldur_mastermind.proposal.permissions import CALL_PERMISSION_SOURCES
 
-from .managers import get_connected_call_organizers, get_connected_calls
+from .managers import (
+    get_connected_call_organizers,
+    get_connected_calls,
+    holds_live_review,
+)
 from .models import Proposal
-from .serializers import ReviewSubmitSerializer, _is_reviewer_only_view
+from .serializers import ReviewSubmitSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -116,9 +124,9 @@ def validate_round_is_open(proposal):
 
     Nothing checked the round here before, so a draft could be submitted after
     the cutoff: that notified the call managers, created the workflow step
-    instances and moved the proposal into review, only for
-    ``proposals_for_ended_rounds_should_be_cancelled`` to cancel it within the
-    hour. The deadline is now enforced at the door rather than swept up after.
+    instances and moved a late proposal into review. The deadline is enforced
+    here, at the door: ``proposals_for_ended_rounds_should_be_cancelled`` only
+    sweeps up the drafts left behind, never a proposal that was sent.
     """
     round_status = proposal.round.status
     if round_status == RoundStatuses.SCHEDULED:
@@ -129,6 +137,53 @@ def validate_round_is_open(proposal):
         raise exceptions.ValidationError(
             _("Round has closed, so the proposal can no longer be submitted.")
         )
+
+
+def check_reviewer_workload_limit(pool_entry, new_assignments, override, user):
+    """Refuse assignments that would take a reviewer above their limit.
+
+    ``pool_entry`` must be locked by the caller so that concurrent assignments
+    to the same reviewer are counted one after the other. A call manager may
+    pass ``override_workload_limit`` to assign anyway; the override is
+    recorded as an event on the call.
+    """
+    if new_assignments <= 0:
+        return
+    open_assignments = pool_entry.get_open_assignments()
+    if open_assignments + new_assignments <= pool_entry.max_assignments:
+        return
+
+    reviewer_name = (
+        pool_entry.reviewer.user.full_name
+        if pool_entry.reviewer
+        else pool_entry.invited_email
+    )
+    params = {
+        "reviewer": reviewer_name,
+        "open": open_assignments,
+        "limit": pool_entry.max_assignments,
+        "new": new_assignments,
+    }
+    if not override:
+        raise exceptions.ValidationError(
+            _(
+                "Reviewer %(reviewer)s has %(open)s open assignments and a limit "
+                "of %(limit)s, so %(new)s more would exceed it. Set "
+                "override_workload_limit to assign anyway."
+            )
+            % params
+        )
+
+    call = pool_entry.call
+    event_logger.emit(
+        f"{user.full_name or user.username} assigned {new_assignments} more "
+        f"proposal(s) to reviewer {reviewer_name} in call {call.name}, above "
+        f"the limit of {pool_entry.max_assignments} "
+        f"({open_assignments} already open).",
+        event_type=EventType.REVIEWER_WORKLOAD_LIMIT_OVERRIDDEN,
+        event_context={"call": call},
+        scopes=[_get_customer(call)],
+    )
 
 
 def validate_project_details_complete(proposal):
@@ -218,6 +273,31 @@ def validate_call_not_archived(nested_obj):
     """
     if nested_obj.call.state == CallStates.ARCHIVED:
         raise IncorrectStateException()
+
+
+def reviewers_with_email_invitation(call, reviewers):
+    """IDs of the reviewers already invited to the call by email.
+
+    An email invitation has no reviewer until it is accepted, so the
+    (call, reviewer) lookup misses it. Inviting the same person again would
+    leave two rows, and accepting the email one would then hit
+    unique_call_reviewer.
+    """
+    email_invitations = list(
+        models.CallReviewerPool.objects.filter(
+            call=call, reviewer__isnull=True
+        ).values_list("invited_user_id", "invited_email")
+    )
+    if not email_invitations:
+        return set()
+    invited_user_ids = {user_id for user_id, _ in email_invitations if user_id}
+    invited_emails = {email.lower() for _, email in email_invitations if email}
+    return {
+        reviewer.id
+        for reviewer in reviewers
+        if reviewer.user_id in invited_user_ids
+        or (reviewer.user.email and reviewer.user.email.lower() in invited_emails)
+    }
 
 
 class CallManagingOrganisationViewSet(
@@ -588,6 +668,85 @@ class PublicCallViewSet(viewsets.ReadOnlyModelViewSet):
         return response.Response(serializer.data)
 
 
+# Shared by both exports. The extension names the endpoint the value comes
+# from, as the schema validation requires of every UUID query parameter.
+def _export_uuid_parameter(name: str, operation_id: str, description: str):
+    return OpenApiParameter(
+        name,
+        OpenApiTypes.UUID,
+        OpenApiParameter.QUERY,
+        description=description,
+        extensions={"x-waldur-operation-id": operation_id},
+    )
+
+
+_EXPORT_APPLICANT_PARAMETER = _export_uuid_parameter(
+    "created_by_uuid", "users_list", "Limit the export to one applicant."
+)
+_EXPORT_REVIEWER_PARAMETER = _export_uuid_parameter(
+    "reviewer_uuid", "users_list", "Limit the export to one reviewer."
+)
+_EXPORT_PROPOSAL_PARAMETER = _export_uuid_parameter(
+    "proposal_uuid", "proposal_proposals_list", "Limit the export to one proposal."
+)
+
+_EXPORT_NAME_PARAMETER = OpenApiParameter(
+    "proposal_name",
+    OpenApiTypes.STR,
+    OpenApiParameter.QUERY,
+    description=(
+        "Limit the export to proposals whose name contains this text — the "
+        "list's search box. Named proposal_name because a bare `name` is read "
+        "by the call's own filterset."
+    ),
+)
+
+_EXPORT_ROUND_PARAMETER = OpenApiParameter(
+    "round_uuid",
+    OpenApiTypes.UUID,
+    OpenApiParameter.QUERY,
+    description="Limit the export to one round.",
+    extensions={"x-waldur-operation-id": "proposal_protected_calls_rounds_list"},
+)
+
+
+def _export_uuid(request, parameter: str) -> str | None:
+    """A UUID filter, rejected early when it is not a UUID.
+
+    Feeding a malformed value straight to the queryset raises a ValidationError
+    from deep inside Django and comes back as a 500.
+    """
+    raw = request.query_params.get(parameter)
+    if not raw:
+        return None
+    try:
+        uuid_module.UUID(raw)
+    except (TypeError, ValueError):
+        raise exceptions.ValidationError({parameter: _("Not a valid UUID.")}) from None
+    return raw
+
+
+def _export_states(request, parameter: str, choices) -> list[str]:
+    """The state filter, restricted to the states the model defines.
+
+    Named ``proposal_state`` / ``review_state`` rather than ``state``: the
+    permission check resolves the call through ``get_object()``, which still
+    runs the call's own list filterset, and a bare ``state`` there is read as a
+    *call* state and rejected.
+
+    An unknown state is refused rather than ignored: silently returning every
+    row would hand the user a file they believe is filtered.
+    """
+    states = request.query_params.getlist(parameter)
+    valid = {state for state, _label in choices}
+    unknown = [state for state in states if state not in valid]
+    if unknown:
+        raise exceptions.ValidationError(
+            {parameter: _("Unknown state: %s.") % ", ".join(sorted(unknown))}
+        )
+    return states
+
+
 class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     lookup_field = "uuid"
     serializer_class = serializers.ProtectedCallSerializer
@@ -795,6 +954,94 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         )
 
     @extend_schema(
+        operation_id="proposal_protected_calls_export_proposals",
+        description=(
+            "Download the call's proposals as CSV, one row per proposal, with "
+            "one column per requested offering component. The column set is "
+            "derived from the call, so it is the same for every row and "
+            "between exports of the same call."
+        ),
+        parameters=[
+            _EXPORT_ROUND_PARAMETER,
+            _EXPORT_APPLICANT_PARAMETER,
+            _EXPORT_NAME_PARAMETER,
+            OpenApiParameter(
+                "proposal_state",
+                OpenApiTypes.STR,
+                OpenApiParameter.QUERY,
+                many=True,
+                enum=[state for state, _label in ProposalStates.CHOICES],
+                description="Limit the export to proposals in these states.",
+            ),
+        ],
+        responses={(200, "text/csv"): OpenApiTypes.BINARY},
+        filters=False,
+    )
+    @decorators.action(detail=True, methods=["get"], url_path="export-proposals")
+    def export_proposals(self, request, uuid=None):
+        call: models.Call = self.get_object()
+        queryset = exports.proposal_queryset(
+            call,
+            round_uuid=_export_uuid(request, "round_uuid"),
+            states=_export_states(request, "proposal_state", ProposalStates.CHOICES),
+            applicant_uuid=_export_uuid(request, "created_by_uuid"),
+            name=request.query_params.get("proposal_name"),
+        )
+        schema = exports.CallExportSchema(call)
+        return exports.csv_response(
+            exports.proposal_rows(schema, queryset),
+            f"{call.slug}-proposals.csv",
+        )
+
+    export_proposals_permissions = [
+        proposal_permissions.support_can_read(
+            permission_factory(PermissionEnum.UPDATE_CALL, CALL_PERMISSION_SOURCES)
+        )
+    ]
+
+    @extend_schema(
+        operation_id="proposal_protected_calls_export_reviews",
+        description=(
+            "Download the call's reviews as CSV, one row per review. The "
+            "reviewer's private comment is never included: the export is open "
+            "to call managers, and the review API keeps that field from them."
+        ),
+        parameters=[
+            _EXPORT_ROUND_PARAMETER,
+            _EXPORT_REVIEWER_PARAMETER,
+            _EXPORT_PROPOSAL_PARAMETER,
+            _EXPORT_NAME_PARAMETER,
+            OpenApiParameter(
+                "review_state",
+                OpenApiTypes.STR,
+                OpenApiParameter.QUERY,
+                many=True,
+                enum=[state for state, _label in ReviewStates.CHOICES],
+                description="Limit the export to reviews in these states.",
+            ),
+        ],
+        responses={(200, "text/csv"): OpenApiTypes.BINARY},
+        filters=False,
+    )
+    @decorators.action(detail=True, methods=["get"], url_path="export-reviews")
+    def export_reviews(self, request, uuid=None):
+        call: models.Call = self.get_object()
+        queryset = exports.review_queryset(
+            call,
+            round_uuid=_export_uuid(request, "round_uuid"),
+            states=_export_states(request, "review_state", ReviewStates.CHOICES),
+            reviewer_uuid=_export_uuid(request, "reviewer_uuid"),
+            proposal_uuid=_export_uuid(request, "proposal_uuid"),
+            proposal_name=request.query_params.get("proposal_name"),
+        )
+        return exports.csv_response(
+            exports.review_rows(queryset),
+            f"{call.slug}-reviews.csv",
+        )
+
+    export_reviews_permissions = export_proposals_permissions
+
+    @extend_schema(
         operation_id="proposal_protected_calls_duplicate",
         description=(
             "Duplicate a call. The new call inherits the source call's "
@@ -830,6 +1077,86 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         permission_factory(PermissionEnum.CREATE_CALL, ["manager"])
     ]
     duplicate_serializer_class = serializers.DuplicateCallRequestSerializer
+
+    @extend_schema(
+        summary="Export call configuration",
+        description=(
+            "Export the call's configuration as a portable document that "
+            "import_call can recreate on another portal. Offerings, plans, "
+            "checklists and roles are referenced by name. Proposals, reviews, "
+            "reviewer pools, assignments and user references are never "
+            "exported."
+        ),
+        request=serializers.CallExportParametersSerializer,
+        responses=serializers.CallExportResponseSerializer,
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def export_call(self, request, uuid=None):
+        call = self.get_object()
+        params = serializers.CallExportParametersSerializer(data=request.data)
+        params.is_valid(raise_exception=True)
+        sections = params.sections()
+        export_data, warnings = call_transfer.export_call(call, sections)
+        return response.Response(
+            serializers.CallExportResponseSerializer(
+                {
+                    "call_uuid": call.uuid,
+                    "call_name": call.name,
+                    "export_data": export_data,
+                    "exported_sections": [s for s, on in sections.items() if on],
+                    "export_timestamp": timezone.now(),
+                    "warnings": warnings,
+                }
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    export_call_permissions = [
+        permission_factory(PermissionEnum.UPDATE_CALL, CALL_PERMISSION_SOURCES)
+    ]
+    export_call_serializer_class = serializers.CallExportParametersSerializer
+
+    @extend_schema(
+        summary="Import call configuration",
+        description=(
+            "Create a draft call under the given call managing organisation "
+            "from a document produced by export_call. References that cannot "
+            "be resolved by name on this portal are skipped and reported in "
+            "warnings. The import is atomic."
+        ),
+        request=serializers.CallImportParametersSerializer,
+        responses={201: serializers.CallImportResponseSerializer},
+    )
+    @decorators.action(detail=False, methods=["post"])
+    def import_call(self, request):
+        params = serializers.CallImportParametersSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        params.is_valid(raise_exception=True)
+        call, imported_sections, warnings = call_transfer.import_call(
+            params.validated_data["call_data"],
+            manager=params.validated_data["manager"],
+            user=request.user,
+            sections=params.sections(),
+            name=params.validated_data.get("name"),
+        )
+        return response.Response(
+            serializers.CallImportResponseSerializer(
+                {
+                    "call_uuid": call.uuid,
+                    "call_name": call.name,
+                    "imported_sections": imported_sections,
+                    "warnings": warnings,
+                }
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    # No object to check on the list route; CREATE_CALL on the target manager
+    # is enforced by CallImportParametersSerializer.validate_manager, the same
+    # split as create_permissions above.
+    import_call_permissions = []
+    import_call_serializer_class = serializers.CallImportParametersSerializer
 
     archive_validators = [
         core_validators.StateValidator(CallStates.DRAFT, CallStates.ACTIVE)
@@ -992,11 +1319,24 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         if call_round.call.state != CallStates.ACTIVE:
             raise exceptions.ValidationError(_("Call is not active."))
 
-        if call_round.start_time > timezone.now():
-            call_round.start_time = timezone.now()
-
-        if call_round.cutoff_time < timezone.now():
+        # Whether a round is open is derived from its times alone, so closing it
+        # means moving its cutoff to now -- and saving it. The status is checked
+        # under the row lock, so two concurrent closes cannot both pass.
+        with transaction.atomic():
+            call_round = models.Round.objects.select_for_update().get(pk=call_round.pk)
+            round_status = call_round.status
+            if round_status == RoundStatuses.ENDED:
+                raise exceptions.ValidationError(_("Round is already closed."))
+            if round_status == RoundStatuses.SCHEDULED:
+                # A round that has not started holds no proposals. Closing it
+                # would leave a round whose cutoff is not after its start and
+                # which overlaps whichever round is open now -- both refused
+                # when a round is created, edited or imported.
+                raise exceptions.ValidationError(
+                    _("Round has not started yet. Delete it instead of closing it.")
+                )
             call_round.cutoff_time = timezone.now()
+            call_round.save(update_fields=["cutoff_time"])
 
         utils.process_closed_round(call_round)
 
@@ -1219,7 +1559,9 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     # Call Manager Compliance Endpoints
     compliance_overview_permissions = [
-        permission_factory(PermissionEnum.UPDATE_CALL, CALL_PERMISSION_SOURCES)
+        proposal_permissions.support_can_read(
+            permission_factory(PermissionEnum.UPDATE_CALL, CALL_PERMISSION_SOURCES)
+        )
     ]
 
     @extend_schema(
@@ -1423,7 +1765,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     def _check_available_checklists_permission(request, view, obj=None):
         """Check if user has CREATE_CALL permission on call managing organization."""
         user = request.user
-        if user.is_staff:
+        if user.is_staff or user.is_support:
             return
 
         customer_uuid = request.query_params.get("customer_uuid")
@@ -1475,7 +1817,9 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
         if request.method == "GET":
             pool_members = list(
-                models.CallReviewerPool.objects.filter(call=call).select_related(
+                models.CallReviewerPool.objects.filter(call=call)
+                .with_open_assignments()
+                .select_related(
                     "reviewer",
                     "reviewer__user",
                     "invited_by",
@@ -1505,25 +1849,33 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         reviewers = models.ReviewerProfile.objects.filter(
             uuid__in=reviewer_uuids
         ).select_related("user")
-        reviewers_by_uuid = {str(r.uuid): r for r in reviewers}
+        reviewers_by_uuid = {r.uuid: r for r in reviewers}
+        email_invited_ids = reviewers_with_email_invitation(call, reviewers)
 
         created_memberships = []
-        for reviewer_uuid in reviewer_uuids:
-            reviewer = reviewers_by_uuid.get(str(reviewer_uuid))
-            if not reviewer:
-                continue
+        expires_at = models.CallReviewerPool.get_invitation_expires_at(call)
+        with transaction.atomic():
+            for reviewer_uuid in reviewer_uuids:
+                reviewer = reviewers_by_uuid.get(reviewer_uuid)
+                if not reviewer or reviewer.id in email_invited_ids:
+                    continue
 
-            membership, created = models.CallReviewerPool.objects.get_or_create(
-                call=call,
-                reviewer=reviewer,
-                defaults={
-                    "invited_by": request.user,
-                    "max_assignments": max_assignments,
-                    "invitation_expires_at": timezone.now() + timedelta(days=14),
-                },
-            )
-            if created:
-                created_memberships.append(membership)
+                membership, created = models.CallReviewerPool.objects.get_or_create(
+                    call=call,
+                    reviewer=reviewer,
+                    defaults={
+                        "invited_by": request.user,
+                        "max_assignments": max_assignments,
+                        "invitation_expires_at": expires_at,
+                    },
+                )
+                if created:
+                    created_memberships.append(membership)
+                    transaction.on_commit(
+                        lambda uuid=membership.uuid: (
+                            tasks.send_reviewer_invitation_email.delay(uuid)
+                        )
+                    )
 
         return response.Response(
             serializers.CallReviewerPoolSerializer(
@@ -1591,9 +1943,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     reviewer_pool_serializer_class = serializers.CallReviewerPoolSerializer
     reviewer_pool_permissions = [
-        permission_factory(
-            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["*", "manager"],
+        proposal_permissions.support_can_read(
+            permission_factory(
+                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+                ["*", "manager"],
+            )
         )
     ]
 
@@ -1652,6 +2006,9 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             invited_user=user,  # May be None
             invited_by=request.user,
             invitation_status=ReviewerPoolInvitationStatuses.PENDING,
+            invitation_expires_at=models.CallReviewerPool.get_invitation_expires_at(
+                call
+            ),
         )
 
         tasks.send_reviewer_invitation_email.delay(pool_member.uuid)
@@ -1745,9 +2102,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     suggestions_serializer_class = serializers.ReviewerSuggestionSerializer
     suggestions_permissions = [
-        permission_factory(
-            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["*", "manager"],
+        proposal_permissions.support_can_read(
+            permission_factory(
+                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+                ["*", "manager"],
+            )
         )
     ]
 
@@ -1761,60 +2120,77 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         """Send invitations to all confirmed suggestions."""
         call = self.get_object()
 
-        confirmed_suggestions = list(
-            models.ReviewerSuggestion.objects.filter(
-                call=call,
-                status=ReviewerSuggestionStatuses.CONFIRMED,
-            ).select_related("reviewer")
-        )
-
-        if not confirmed_suggestions:
-            return response.Response(
-                {"invitations_sent": 0},
-                status=status.HTTP_200_OK,
-            )
-
-        # Prefetch existing pool members to avoid N+1 existence checks
-        existing_pool_reviewer_ids = set(
-            models.CallReviewerPool.objects.filter(
-                call=call,
-                reviewer_id__in=[s.reviewer_id for s in confirmed_suggestions],
-            ).values_list("reviewer_id", flat=True)
-        )
-
-        # Prepare bulk operations
-        invitations_to_create = []
-        suggestions_to_update = []
-
-        for suggestion in confirmed_suggestions:
-            # Skip if already in pool
-            if suggestion.reviewer_id in existing_pool_reviewer_ids:
-                continue
-
-            # Prepare invitation for bulk create
-            invitations_to_create.append(
-                models.CallReviewerPool(
+        with transaction.atomic():
+            # Lock the suggestions so a repeated request waits and then finds
+            # them already invited instead of inviting them twice
+            confirmed_suggestions = list(
+                models.ReviewerSuggestion.objects.filter(
                     call=call,
-                    reviewer=suggestion.reviewer,
-                    invited_by=request.user,
-                    invitation_status=ReviewerPoolInvitationStatuses.PENDING,
-                    expertise_match_score=suggestion.affinity_score,
+                    status=ReviewerSuggestionStatuses.CONFIRMED,
                 )
+                .select_related("reviewer__user")
+                .select_for_update(of=("self",))
             )
 
-            # Mark suggestion for update
-            suggestion.status = ReviewerSuggestionStatuses.INVITED
-            suggestions_to_update.append(suggestion)
+            if not confirmed_suggestions:
+                return response.Response(
+                    {"invitations_sent": 0},
+                    status=status.HTTP_200_OK,
+                )
 
-        # Bulk create invitations
-        if invitations_to_create:
-            models.CallReviewerPool.objects.bulk_create(invitations_to_create)
-
-        # Bulk update suggestion statuses
-        if suggestions_to_update:
-            models.ReviewerSuggestion.objects.bulk_update(
-                suggestions_to_update, fields=["status"]
+            # Prefetch existing pool members to avoid N+1 existence checks
+            existing_pool_reviewer_ids = set(
+                models.CallReviewerPool.objects.filter(
+                    call=call,
+                    reviewer_id__in=[s.reviewer_id for s in confirmed_suggestions],
+                ).values_list("reviewer_id", flat=True)
             )
+            existing_pool_reviewer_ids |= reviewers_with_email_invitation(
+                call, [s.reviewer for s in confirmed_suggestions]
+            )
+
+            # Prepare bulk operations
+            invitations_to_create = []
+            suggestions_to_update = []
+            expires_at = models.CallReviewerPool.get_invitation_expires_at(call)
+
+            for suggestion in confirmed_suggestions:
+                # Skip if already in pool
+                if suggestion.reviewer_id in existing_pool_reviewer_ids:
+                    continue
+
+                # Prepare invitation for bulk create
+                invitations_to_create.append(
+                    models.CallReviewerPool(
+                        call=call,
+                        reviewer=suggestion.reviewer,
+                        invited_by=request.user,
+                        invitation_status=ReviewerPoolInvitationStatuses.PENDING,
+                        invitation_expires_at=expires_at,
+                        expertise_match_score=suggestion.affinity_score,
+                    )
+                )
+
+                # Mark suggestion for update
+                suggestion.status = ReviewerSuggestionStatuses.INVITED
+                suggestions_to_update.append(suggestion)
+
+            # Bulk create invitations
+            if invitations_to_create:
+                models.CallReviewerPool.objects.bulk_create(invitations_to_create)
+
+            # Bulk update suggestion statuses
+            if suggestions_to_update:
+                models.ReviewerSuggestion.objects.bulk_update(
+                    suggestions_to_update, fields=["status"]
+                )
+
+            for invitation in invitations_to_create:
+                transaction.on_commit(
+                    lambda uuid=invitation.uuid: (
+                        tasks.send_reviewer_invitation_email.delay(uuid)
+                    )
+                )
 
         return response.Response(
             {"invitations_sent": len(invitations_to_create)},
@@ -1873,9 +2249,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     coi_configuration_serializer_class = serializers.CallCOIConfigurationSerializer
     coi_configuration_permissions = [
-        permission_factory(
-            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["*", "manager"],
+        proposal_permissions.support_can_read(
+            permission_factory(
+                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+                ["*", "manager"],
+            )
         )
     ]
 
@@ -1909,9 +2287,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     conflicts_serializer_class = serializers.ConflictOfInterestSerializer
     conflicts_permissions = [
-        permission_factory(
-            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["*", "manager"],
+        proposal_permissions.support_can_read(
+            permission_factory(
+                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+                ["*", "manager"],
+            )
         )
     ]
 
@@ -1962,9 +2342,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         )
 
     conflict_summary_permissions = [
-        permission_factory(
-            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["*", "manager"],
+        proposal_permissions.support_can_read(
+            permission_factory(
+                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+                ["*", "manager"],
+            )
         )
     ]
 
@@ -2048,9 +2430,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         serializers.MatchingConfigurationSerializer
     )
     matching_configuration_permissions = [
-        permission_factory(
-            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["*", "manager"],
+        proposal_permissions.support_can_read(
+            permission_factory(
+                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+                ["*", "manager"],
+            )
         )
     ]
 
@@ -2106,9 +2490,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         return response.Response(matrix)
 
     affinity_matrix_permissions = [
-        permission_factory(
-            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["*", "manager"],
+        proposal_permissions.support_can_read(
+            permission_factory(
+                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+                ["*", "manager"],
+            )
         )
     ]
 
@@ -2139,9 +2525,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     proposed_assignments_serializer_class = serializers.ProposedAssignmentSerializer
     proposed_assignments_permissions = [
-        permission_factory(
-            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["*", "manager"],
+        proposal_permissions.support_can_read(
+            permission_factory(
+                PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+                ["*", "manager"],
+            )
         )
     ]
 
@@ -2152,6 +2540,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         responses={200: serializers.GenerateAssignmentsResponseSerializer},
     )
     @decorators.action(detail=True, methods=["post"], url_path="generate-assignments")
+    @transaction.atomic
     def generate_assignments(self, request, uuid=None):
         """
         Generate assignment batches for reviewers.
@@ -2253,8 +2642,22 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 (reviewer_id, score)
             )
 
-        # Build pool entries lookup by reviewer_id for O(1) access
-        pool_entries_list = list(pool_entries.select_related("reviewer"))
+        # Build pool entries lookup by reviewer_id for O(1) access.
+        # The entries are locked first so that a concurrent assignment to the
+        # same reviewers waits and then counts the items created here.
+        list(pool_entries.select_for_update().values_list("pk", flat=True))
+        pool_entries_list = list(
+            pool_entries.select_related("reviewer").with_open_assignments()
+        )
+        # Kept up to date as items are created, so the limit also holds for
+        # entries selected earlier in this run.
+        open_assignments = {
+            entry.id: entry.open_assignments for entry in pool_entries_list
+        }
+
+        def has_capacity(entry):
+            return open_assignments[entry.id] < entry.max_assignments
+
         pool_entries_by_reviewer = {
             entry.reviewer_id: entry for entry in pool_entries_list
         }
@@ -2318,11 +2721,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 :reviewers_per_proposal
             ]:
                 entry = pool_entries_by_reviewer.get(reviewer_id)
-                if (
-                    entry
-                    and entry.id not in selected_entry_ids
-                    and entry.current_assignments < (entry.max_assignments or 999)
-                ):
+                if entry and entry.id not in selected_entry_ids and has_capacity(entry):
                     selected_entries.append((entry, affinity_score))
                     selected_entry_ids.add(entry.id)
 
@@ -2331,9 +2730,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 for entry in eligible_entries:
                     if entry.id in selected_entry_ids:
                         continue
-                    if entry.max_assignments is None or (
-                        entry.current_assignments < entry.max_assignments
-                    ):
+                    if has_capacity(entry):
                         selected_entries.append((entry, None))
                         selected_entry_ids.add(entry.id)
                         if len(selected_entries) >= reviewers_per_proposal:
@@ -2389,6 +2786,8 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                     )
                     if has_coi:
                         item.coi_records.set(coi_list)
+                    else:
+                        open_assignments[entry.id] += 1
 
                     created_items.add(item_key)
                     items_created += 1
@@ -2446,9 +2845,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         for batch in batches:
             try:
                 batch.send_invitation(user=request.user)
-                sent_count += 1
             except Exception:
                 skipped_count += 1
+                continue
+            sent_count += 1
+            tasks.send_assignment_batch_invitation.delay(batch.uuid)
 
         return response.Response(
             {
@@ -2477,6 +2878,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     @decorators.action(
         detail=True, methods=["post"], url_path="create-manual-assignment"
     )
+    @transaction.atomic
     def create_manual_assignment(self, request, uuid=None):
         """
         Create a manual assignment batch for a specific reviewer.
@@ -2490,10 +2892,12 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         pool_entry_uuid = serializer.validated_data["reviewer_pool_entry_uuid"]
         proposal_uuids = serializer.validated_data["proposal_uuids"]
         manager_notes = serializer.validated_data.get("manager_notes", "")
+        override_workload_limit = serializer.validated_data["override_workload_limit"]
 
-        # Get the reviewer pool entry
+        # Get the reviewer pool entry, locked so that concurrent assignments
+        # to the same reviewer are checked against the limit one at a time.
         try:
-            pool_entry = models.CallReviewerPool.objects.get(
+            pool_entry = models.CallReviewerPool.objects.select_for_update().get(
                 uuid=pool_entry_uuid,
                 call=call,
                 invitation_status=models.ReviewerPoolInvitationStatuses.ACCEPTED,
@@ -2518,25 +2922,8 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 {"proposal_uuids": _("No valid proposals found.")}
             )
 
-        # Create or get existing draft batch for this reviewer
-        batch, batch_created = models.AssignmentBatch.objects.get_or_create(
-            call=call,
-            reviewer_pool_entry=pool_entry,
-            status=models.AssignmentBatchStatuses.DRAFT,
-            defaults={
-                "source": models.AssignmentSources.MANUAL,
-                "manager_notes": manager_notes,
-                "created_by": request.user,
-            },
-        )
-
-        # If batch already existed, update notes if provided
-        if not batch_created and manager_notes:
-            batch.manager_notes = manager_notes
-            batch.save(update_fields=["manager_notes"])
-
-        items_created = 0
         skipped_proposals = []
+        new_items = []
 
         for proposal in proposals:
             # Check if assignment already exists
@@ -2558,26 +2945,54 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 continue
 
             # Check for blocking COI
-            coi_records = models.ConflictOfInterest.objects.filter(
-                reviewer=pool_entry.reviewer,
-                proposal=proposal,
-                status__in=["pending", "recused"],
+            coi_records = list(
+                models.ConflictOfInterest.objects.filter(
+                    reviewer=pool_entry.reviewer,
+                    proposal=proposal,
+                    status__in=["pending", "recused"],
+                )
             )
+            new_items.append((proposal, coi_records))
 
-            # Create assignment item
+        # COI-blocked items do not add to the reviewer's workload.
+        check_reviewer_workload_limit(
+            pool_entry,
+            sum(1 for _proposal, coi_records in new_items if not coi_records),
+            override_workload_limit,
+            request.user,
+        )
+
+        # Create or get existing draft batch for this reviewer
+        batch, batch_created = models.AssignmentBatch.objects.get_or_create(
+            call=call,
+            reviewer_pool_entry=pool_entry,
+            status=models.AssignmentBatchStatuses.DRAFT,
+            defaults={
+                "source": models.AssignmentSources.MANUAL,
+                "manager_notes": manager_notes,
+                "created_by": request.user,
+            },
+        )
+
+        # If batch already existed, update notes if provided
+        if not batch_created and manager_notes:
+            batch.manager_notes = manager_notes
+            batch.save(update_fields=["manager_notes"])
+
+        for proposal, coi_records in new_items:
             item = models.AssignmentItem.objects.create(
                 batch=batch,
                 proposal=proposal,
                 affinity_score=None,  # Manual assignment - no affinity
-                has_coi=coi_records.exists(),
+                has_coi=bool(coi_records),
                 status=models.AssignmentItemStatuses.COI_BLOCKED
-                if coi_records.exists()
+                if coi_records
                 else models.AssignmentItemStatuses.PENDING,
             )
-            if coi_records.exists():
+            if coi_records:
                 item.coi_records.set(coi_records)
 
-            items_created += 1
+        items_created = len(new_items)
 
         return response.Response(
             {
@@ -2602,8 +3017,8 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         summary="Get call manager dashboard stats",
         description=(
             "Returns counts for the call manager dashboard: pending "
-            "assessments, active calls managed by the user, and overdue "
-            "reviews on calls they manage."
+            "assessments, active calls managed by the user, and reviews on "
+            "calls they manage that are due within the next few days."
         ),
         responses={200: serializers.DashboardCallManagerStatsSerializer},
     )
@@ -2620,30 +3035,18 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             round__call_id__in=managed_call_ids,
             state__in=[ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW],
         ).count()
-        # review_end_date is created + review_duration_in_days, which Postgres
-        # can evaluate directly — no need to pull every pending review into
-        # Python to compare dates.
-        overdue_reviews = (
-            models.Review.objects.filter(
-                state=models.Review.States.IN_REVIEW,
-                proposal__round__call_id__in=managed_call_ids,
-                proposal__round__review_duration_in_days__isnull=False,
-            )
-            .annotate(
-                deadline=ExpressionWrapper(
-                    F("created")
-                    + timedelta(days=1) * F("proposal__round__review_duration_in_days"),
-                    output_field=DateTimeField(),
-                )
-            )
-            .filter(deadline__lt=timezone.now())
+        due_within_days = config.PROPOSAL_DASHBOARD_REVIEWS_DUE_WITHIN_DAYS
+        reviews_due_soon = (
+            models.Review.objects.filter(proposal__round__call_id__in=managed_call_ids)
+            .due_within(due_within_days)
             .count()
         )
         return response.Response(
             {
                 "pending_assessments": pending_assessments,
                 "active_calls": active_calls,
-                "overdue_reviews": overdue_reviews,
+                "reviews_due_soon": reviews_due_soon,
+                "reviews_due_within_days": due_within_days,
             },
             status=status.HTTP_200_OK,
         )
@@ -2719,18 +3122,53 @@ class ProposalViewSet(
         if super().can_view_scope_team(user, proposal):
             return True
         call_id = proposal.round.call_id
-        return any(
+        if any(
             call_id in get_connected_calls(user, role)
             for role in (CallRole.MANAGER, CallRole.REVIEWER, CallRole.PANEL_MEMBER)
+        ):
+            return True
+        # A reviewer holding a review of this proposal but no call role (an
+        # accepted assignment grants none) evaluates it the same way.
+        return holds_live_review(user, proposal)
+
+    def _concealed_team_attributes(self, scope, request):
+        # The view instance lives for one request: resolve the viewer's
+        # concealed attributes once for both list_users hooks.
+        if not hasattr(self, "_concealed_team_attributes_cache"):
+            self._concealed_team_attributes_cache = (
+                serializers.get_concealed_applicant_attributes(request.user, scope)
+            )
+        return self._concealed_team_attributes_cache
+
+    def validate_user_roles_query(self, scope, request):
+        # A filter, search or ordering on a concealed attribute would reveal it
+        # through which rows come back, so refuse it outright.
+        concealed = self._concealed_team_attributes(scope, request)
+        if not concealed:
+            return
+        refused = serializers.get_concealed_team_member_query(
+            request.query_params, concealed
         )
+        if refused:
+            raise exceptions.ValidationError(
+                {
+                    param: _(
+                        "The call does not expose this applicant attribute to reviewers."
+                    )
+                    for param in refused
+                }
+            )
 
     def filter_user_roles_representation(self, data, scope, request):
-        # Role expiration is team-admin metadata irrelevant to evaluation, so
-        # conceal it from reviewers viewing the proposal team read-only.
-        if _is_reviewer_only_view(request.user, scope):
-            for item in data:
-                item.pop("expiration_time", None)
-        return data
+        concealed = self._concealed_team_attributes(scope, request)
+        if concealed is None:
+            return data
+        # Reviewer-only viewer. Role expiration is team-admin metadata
+        # irrelevant to evaluation; identity follows the call's applicant
+        # visibility config, exactly as on the proposal itself.
+        for item in data:
+            item.pop("expiration_time", None)
+        return serializers.filter_team_member_fields(data, concealed)
 
     # Both mixins use the default implementation (obj.checklist_completion)
     # UserChecklistMixin permissions - for proposal managers only
@@ -2881,52 +3319,20 @@ class ProposalViewSet(
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            call = proposal.round.call
-            enabled_steps = list(
-                models.CallWorkflowStep.objects.filter(call=call, is_enabled=True)
-            )
-            enabled_step_ids = {s.step for s in enabled_steps}
-            first_step_id = next(
-                (s.id for s in WORKFLOW_STEPS if s.id in enabled_step_ids), None
-            )
+            # Saved here, not below: activate_first_step() saves with
+            # update_fields and would drop anything set beforehand.
+            proposal.submitted_at = timezone.now()
+            proposal.save(update_fields=["submitted_at"])
 
-            instances_to_create = [
-                models.ProposalWorkflowStepInstance(
-                    proposal=proposal,
-                    step=step_def.id,
-                    status=(
-                        WorkflowStepInstanceStatuses.PENDING
-                        if step_def.id in enabled_step_ids
-                        else WorkflowStepInstanceStatuses.SKIPPED
-                    ),
-                )
-                for step_def in WORKFLOW_STEPS
-            ]
-            models.ProposalWorkflowStepInstance.objects.bulk_create(instances_to_create)
-
-            if first_step_id:
-                first_step = models.ProposalWorkflowStepInstance.objects.get(
-                    proposal=proposal, step=first_step_id
-                )
-                first_step.status = WorkflowStepInstanceStatuses.ACTIVE
-                first_step.started_at = timezone.now()
-                call_step = next(
-                    (s for s in enabled_steps if s.step == first_step_id), None
-                )
-                if call_step and call_step.duration_in_days:
-                    first_step.deadline = first_step.started_at + timedelta(
-                        days=call_step.duration_in_days
-                    )
-                first_step.save(update_fields=["status", "started_at", "deadline"])
-                notification_rules.dispatch_step_event(
-                    first_step, proposal_enums.NotificationRuleTriggers.STEP_STARTED
-                )
-                proposal.state = ProposalStates.IN_REVIEW
-                proposal.workflow_step = first_step_id
-            else:
+            workflow_service.create_step_instances(proposal)
+            started = None
+            if proposal.round.call.evaluation_start == EvaluationStart.ON_SUBMISSION:
+                started = workflow_service.activate_first_step(proposal)
+            if started is None:
+                # Evaluation waits for the round's cut-off, or the call has no
+                # enabled step to start.
                 proposal.state = ProposalStates.SUBMITTED
-
-            proposal.save()
+                proposal.save()
 
         tasks.notify_user_about_proposal_state_update.delay(
             proposal.uuid, previous_state, proposal.state
@@ -3800,7 +4206,9 @@ class ReviewViewSet(ActionsViewSet):
     def get_queryset(self):
         user = self.request.user
 
-        if user.is_staff:
+        # Support reads everything staff does and writes nothing; writes on
+        # this viewset are gated separately, not by queryset visibility.
+        if user.is_staff or user.is_support:
             return models.Review.objects.all().order_by("created")
 
         # Base queries for authorized users (call organizers, call managers, reviewers)
@@ -3850,7 +4258,26 @@ class ReviewViewSet(ActionsViewSet):
             raise exceptions.ValidationError(
                 _("Valid states for proposals: Draft, In Review, Submitted.")
             )
-        review: models.Review = serializer.save()
+        with transaction.atomic():
+            # A reviewer in the call's pool may not be given reviews above
+            # their assignment limit; the pool entry is locked so concurrent
+            # assignments are counted one at a time.
+            pool_entry = (
+                models.CallReviewerPool.objects.select_for_update(of=("self",))
+                .filter(
+                    call=proposal.round.call,
+                    reviewer__user=serializer.validated_data["reviewer"],
+                )
+                .first()
+            )
+            if pool_entry:
+                check_reviewer_workload_limit(
+                    pool_entry,
+                    1,
+                    serializer.validated_data.get("override_workload_limit", False),
+                    self.request.user,
+                )
+            review: models.Review = serializer.save()
         tasks.notify_reviewer_about_assignment.delay(review.uuid)
 
     def check_create_permissions(request, view, obj=None):
@@ -3968,22 +4395,13 @@ class ReviewViewSet(ActionsViewSet):
             completed=Count("id", filter=Q(state=models.Review.States.SUBMITTED)),
         )
 
-        # A deadline only exists when the round sets review_duration_in_days;
-        # annotating it lets Postgres do the filtering and the ordering.
+        # A deadline only exists when the round sets a review duration;
+        # computing it in SQL lets Postgres do the filtering and the ordering.
         reviews_with_deadline = (
-            own_reviews.filter(
-                state=models.Review.States.IN_REVIEW,
-                proposal__round__review_duration_in_days__isnull=False,
-            )
-            .annotate(
-                deadline=ExpressionWrapper(
-                    F("created")
-                    + timedelta(days=1) * F("proposal__round__review_duration_in_days"),
-                    output_field=DateTimeField(),
-                )
-            )
+            own_reviews.filter(state=models.Review.States.IN_REVIEW)
+            .with_deadline()
             .select_related("proposal", "proposal__round", "proposal__round__call")
-            .order_by("deadline")
+            .order_by("review_deadline")
         )
         # This list is embedded in an object, so it cannot be paginated the way
         # the standalone dashboard lists are. It carries its own total instead —
@@ -3997,7 +4415,7 @@ class ReviewViewSet(ActionsViewSet):
                 "proposal_name": review.proposal.name,
                 "call_uuid": review.proposal.round.call.uuid,
                 "call_name": review.proposal.round.call.name,
-                "due_date": review.deadline,
+                "due_date": review.review_end_date,
             }
             for review in reviews_with_deadline[:DASHBOARD_LIST_LIMIT]
         ]
@@ -4365,17 +4783,22 @@ class ReviewerProfileViewSet(ActionsViewSet):
                 "user__first_name", "user__last_name"
             )
         # Users can see their own profile and profiles of ACCEPTED pool members
-        # (pending invitations don't expose profiles to managers)
+        # (pending invitations don't expose profiles to managers). Support sees
+        # the accepted members of every call's pool -- what the call pages they
+        # can open show -- but not unpooled or pending profiles as staff does.
+        accepted = Q(
+            pool_memberships__invitation_status=ReviewerPoolInvitationStatuses.ACCEPTED
+        )
+        if user.is_support:
+            pooled = accepted
+        else:
+            pooled = accepted & Q(
+                pool_memberships__call__in=get_connected_calls(user, CallRole.MANAGER)
+            )
         return (
             models.ReviewerProfile.objects.filter(
                 Q(user=user)  # Own profile always visible
-                | Q(
-                    # Only ACCEPTED pool members visible to managers
-                    pool_memberships__call__in=get_connected_calls(
-                        user, CallRole.MANAGER
-                    ),
-                    pool_memberships__invitation_status=ReviewerPoolInvitationStatuses.ACCEPTED,
-                )
+                | pooled
             )
             .distinct()
             .order_by("user__first_name", "user__last_name")
@@ -4754,7 +5177,7 @@ class ConflictOfInterestViewSet(ActionsViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_staff:
+        if user.is_staff or user.is_support:
             return models.ConflictOfInterest.objects.all().order_by("-detected_at")
         # Call managers can see COIs for their calls
         return models.ConflictOfInterest.objects.filter(
@@ -5003,11 +5426,13 @@ class InvitationAcceptanceMixin:
 
     def _validate_invitation_not_expired(self, invitation: models.CallReviewerPool):
         """Validate that the invitation has not expired."""
-        if (
-            invitation.invitation_expires_at
-            and invitation.invitation_expires_at < timezone.now()
-        ):
+        if invitation.is_invitation_expired:
             raise exceptions.ValidationError(_("This invitation has expired."))
+
+    def _validate_invitation_answerable(self, invitation: models.CallReviewerPool):
+        """An invitation can be accepted or declined only while pending and in date."""
+        self._validate_invitation_not_expired(invitation)
+        self._validate_invitation_status(invitation)
 
     def _ensure_published_profile(
         self, request, invitation: models.CallReviewerPool
@@ -5100,6 +5525,26 @@ class InvitationAcceptanceMixin:
 
         return created_conflicts
 
+    def _link_profile(self, invitation: models.CallReviewerPool, profile, user) -> None:
+        """Bind an email invitation to the reviewer profile accepting it."""
+        if invitation.reviewer:
+            return
+        # The same person may also have been invited by profile; binding this
+        # row too would violate unique_call_reviewer
+        if (
+            models.CallReviewerPool.objects.filter(
+                call=invitation.call, reviewer=profile
+            )
+            .exclude(pk=invitation.pk)
+            .exists()
+        ):
+            raise exceptions.ValidationError(
+                _("You are already in this call's reviewer pool.")
+            )
+        invitation.reviewer = profile
+        if not invitation.invited_user:
+            invitation.invited_user = user
+
     def _accept_invitation(
         self, invitation: models.CallReviewerPool
     ) -> models.CallReviewerPool:
@@ -5142,7 +5587,7 @@ class CallReviewerPoolViewSet(InvitationAcceptanceMixin, ActionsViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_staff:
+        if user.is_staff or user.is_support:
             qs = models.CallReviewerPool.objects.all()
         else:
             qs = models.CallReviewerPool.objects.filter(
@@ -5158,13 +5603,17 @@ class CallReviewerPoolViewSet(InvitationAcceptanceMixin, ActionsViewSet):
                 | Q(invited_email=user.email)  # Include email-based invitations
             )
         # Add select_related to avoid N+1 on related fields
-        return qs.select_related(
-            "call",
-            "reviewer",
-            "reviewer__user",
-            "invited_by",
-            "invited_user",
-        ).order_by("call", "reviewer")
+        return (
+            qs.with_open_assignments()
+            .select_related(
+                "call",
+                "reviewer",
+                "reviewer__user",
+                "invited_by",
+                "invited_user",
+            )
+            .order_by("call", "reviewer")
+        )
 
     def get_serializer_context(self):
         """Add prefetched COI and review counts to context to avoid N+1 queries."""
@@ -5263,9 +5712,7 @@ class CallReviewerPoolViewSet(InvitationAcceptanceMixin, ActionsViewSet):
                 _("You do not have permission to accept this invitation.")
             )
 
-        # Use mixin methods for validation
-        self._validate_invitation_status(invitation)
-        self._validate_invitation_not_expired(invitation)
+        self._validate_invitation_answerable(invitation)
 
         # Profile-gating: user must have a published reviewer profile
         profile, error = self._ensure_published_profile(request, invitation)
@@ -5273,11 +5720,7 @@ class CallReviewerPoolViewSet(InvitationAcceptanceMixin, ActionsViewSet):
             error_status = error.pop("status", status.HTTP_400_BAD_REQUEST)
             return response.Response(error, status=error_status)
 
-        # Link profile to invitation if needed
-        if not invitation.reviewer:
-            invitation.reviewer = profile
-            if not invitation.invited_user:
-                invitation.invited_user = request.user
+        self._link_profile(invitation, profile, request.user)
 
         # Process optional self-declared conflicts
         # Body is the array of conflicts directly (not wrapped in a dict)
@@ -5309,7 +5752,7 @@ class CallReviewerPoolViewSet(InvitationAcceptanceMixin, ActionsViewSet):
                 _("You do not have permission to decline this invitation.")
             )
 
-        self._validate_invitation_status(invitation)
+        self._validate_invitation_answerable(invitation)
 
         serializer = serializers.InvitationDeclineSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -5380,6 +5823,66 @@ class CallReviewerPoolViewSet(InvitationAcceptanceMixin, ActionsViewSet):
         )
     ]
 
+    @extend_schema(
+        description=(
+            "Send a pending or expired pool invitation again. The invitation "
+            "returns to pending with a new expiry date from the call's "
+            "assignment configuration, and the invitee is emailed the link again."
+        ),
+        request=None,
+        responses={200: serializers.CallReviewerPoolSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"], url_path="resend-invitation")
+    def resend_invitation(self, request, uuid=None):
+        """Send a pending or expired pool invitation again."""
+        invitation = self.get_object()
+
+        with transaction.atomic():
+            invitation = models.CallReviewerPool.objects.select_for_update().get(
+                pk=invitation.pk
+            )
+            if invitation.invitation_status not in (
+                ReviewerPoolInvitationStatuses.PENDING,
+                ReviewerPoolInvitationStatuses.EXPIRED,
+            ):
+                raise exceptions.ValidationError(
+                    _("Only pending or expired invitations can be sent again.")
+                )
+            invitation.invitation_status = ReviewerPoolInvitationStatuses.PENDING
+            invitation.invitation_expires_at = (
+                models.CallReviewerPool.get_invitation_expires_at(invitation.call)
+            )
+            # A new link replaces the old one, so a copy of an earlier
+            # invitation email cannot answer the re-sent invitation.
+            invitation.invitation_token = models.generate_invitation_token()
+            invitation.save(
+                update_fields=[
+                    "invitation_status",
+                    "invitation_expires_at",
+                    "invitation_token",
+                    "modified",
+                ]
+            )
+            transaction.on_commit(
+                lambda uuid=invitation.uuid: (
+                    tasks.send_reviewer_invitation_email.delay(uuid)
+                )
+            )
+
+        return response.Response(
+            serializers.CallReviewerPoolSerializer(
+                invitation, context=self.get_serializer_context()
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    resend_invitation_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+            ["call", "call.manager"],
+        )
+    ]
+
 
 class COIDetectionJobViewSet(ReadOnlyActionsViewSet):
     """ViewSet for viewing COI detection job status."""
@@ -5423,7 +5926,7 @@ class ReviewerSuggestionViewSet(ReadOnlyActionsViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_staff:
+        if user.is_staff or user.is_support:
             return models.ReviewerSuggestion.objects.all().order_by("-affinity_score")
         return models.ReviewerSuggestion.objects.filter(
             Q(call__in=get_connected_calls(user, CallRole.MANAGER))
@@ -5575,10 +6078,7 @@ class PublicReviewerInvitationViewSet(InvitationAcceptanceMixin, viewsets.ViewSe
         invitation = self._get_invitation(token)
         call = invitation.call
 
-        is_expired = (
-            invitation.invitation_expires_at
-            and invitation.invitation_expires_at < timezone.now()
-        )
+        is_expired = invitation.is_invitation_expired
 
         # Check user's profile status if authenticated
         profile_status = None
@@ -5606,6 +6106,7 @@ class PublicReviewerInvitationViewSet(InvitationAcceptanceMixin, viewsets.ViewSe
                 "call_name": call.name,
                 "call_uuid": str(call.uuid),
                 "invitation_status": invitation.invitation_status,
+                "invited_at": invitation.invited_at,
                 "expires_at": invitation.invitation_expires_at,
                 "is_expired": is_expired,
                 "max_assignments": invitation.max_assignments,
@@ -5633,9 +6134,20 @@ class PublicReviewerInvitationViewSet(InvitationAcceptanceMixin, viewsets.ViewSe
         """Accept a reviewer invitation."""
         invitation = self._get_invitation(token)
 
-        # Use mixin methods for validation
-        self._validate_invitation_status(invitation)
-        self._validate_invitation_not_expired(invitation)
+        # An invitation bound to a reviewer is theirs alone to accept; the
+        # token by itself is not enough, as the link may have been forwarded
+        if invitation.reviewer:
+            if not request.user.is_authenticated:
+                return response.Response(
+                    {"error": _("Please log in to accept this invitation.")},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+            if invitation.reviewer.user != request.user:
+                raise exceptions.PermissionDenied(
+                    _("This invitation was sent to another reviewer.")
+                )
+
+        self._validate_invitation_answerable(invitation)
 
         # Profile-gating for email invitations
         profile, error = self._ensure_published_profile(request, invitation)
@@ -5643,11 +6155,7 @@ class PublicReviewerInvitationViewSet(InvitationAcceptanceMixin, viewsets.ViewSe
             error_status = error.pop("status", status.HTTP_400_BAD_REQUEST)
             return response.Response(error, status=error_status)
 
-        # Link profile to invitation if needed
-        if not invitation.reviewer:
-            invitation.reviewer = profile
-            if not invitation.invited_user:
-                invitation.invited_user = request.user
+        self._link_profile(invitation, profile, request.user)
 
         # Process optional self-declared conflicts
         declared_conflicts = request.data.get("declared_conflicts", [])
@@ -5672,7 +6180,7 @@ class PublicReviewerInvitationViewSet(InvitationAcceptanceMixin, viewsets.ViewSe
         """Decline a reviewer invitation."""
         invitation = self._get_invitation(token)
 
-        self._validate_invitation_status(invitation)
+        self._validate_invitation_answerable(invitation)
 
         serializer = serializers.InvitationDeclineSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -6224,7 +6732,7 @@ class AssignmentBatchViewSet(ActionsViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
         user = self.request.user
-        if user.is_staff:
+        if user.is_staff or user.is_support:
             return queryset
 
         # Filter based on user's roles
@@ -6251,8 +6759,10 @@ class AssignmentBatchViewSet(ActionsViewSet):
 
         if serializer.validated_data.get("manager_notes"):
             batch.manager_notes = serializer.validated_data["manager_notes"]
+            batch.save(update_fields=["manager_notes"])
 
         batch.send_invitation(user=request.user)
+        tasks.send_assignment_batch_invitation.delay(batch.uuid)
 
         return response.Response(
             {
@@ -6323,12 +6833,13 @@ class AssignmentBatchViewSet(ActionsViewSet):
 
         new_expires_at = serializer.validated_data["expires_at"]
         batch.expires_at = new_expires_at
+        # A new deadline earns a new reminder before it.
+        batch.reminder_sent = False
 
         # Reactivate expired batch if new deadline is in future
         if batch.status == models.AssignmentBatchStatuses.EXPIRED:
             batch.status = models.AssignmentBatchStatuses.SENT
             batch.manager_notified = False  # Reset notification flag
-            batch.reminder_sent = False  # Reset reminder flag
             # Also reactivate pending items
             batch.items.filter(status=models.AssignmentItemStatuses.EXPIRED).update(
                 status=models.AssignmentItemStatuses.PENDING
@@ -6338,21 +6849,9 @@ class AssignmentBatchViewSet(ActionsViewSet):
             update_fields=["expires_at", "status", "manager_notified", "reminder_sent"]
         )
 
-        # Sync review deadlines for accepted assignments
-        # This ensures reviews don't get auto-rejected by the expiry task
-        # before the extended deadline
-        accepted_items_with_reviews = batch.items.filter(
-            status=models.AssignmentItemStatuses.ACCEPTED,
-            review__isnull=False,
-        ).select_related("review")
-
-        for item in accepted_items_with_reviews:
-            if (
-                item.review.review_end_date
-                and item.review.review_end_date < new_expires_at
-            ):
-                item.review.review_end_date = new_expires_at
-                item.review.save(update_fields=["review_end_date"])
+        # Accepted reviews need no update: Review.review_end_date is never
+        # earlier than the deadline of the batch the review was accepted from,
+        # so the expiry task already honours the new deadline.
 
         return response.Response(
             {
@@ -6519,6 +7018,7 @@ class AssignmentItemViewSet(ActionsViewSet):
             )
             .exclude(id__in=existing_reviewers)
             .exclude(id__in=declined_reviewers)
+            .with_open_assignments()
         )
 
         # Get affinity scores for suggestions
@@ -6549,7 +7049,7 @@ class AssignmentItemViewSet(ActionsViewSet):
                     if entry.reviewer
                     else entry.invited_email,
                     "affinity_score": affinity.affinity_score if affinity else None,
-                    "current_assignments": entry.current_assignments,
+                    "current_assignments": entry.open_assignments,
                     "max_assignments": entry.max_assignments,
                 }
             )
@@ -6725,14 +7225,25 @@ class CallAssignmentConfigurationViewSet(ActionsViewSet):
     lookup_field = "uuid"
     queryset = models.CallAssignmentConfiguration.objects.all()
     serializer_class = serializers.CallAssignmentConfigurationSerializer
+    # Visibility below is any role on the call, reviewers and panel members
+    # included, so writes cannot ride on it: they need MANAGE_PROPOSAL_REVIEW.
+    unsafe_methods_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+            ["call", "call.manager"],
+        )
+    ]
+    # The serializer's `call` is read-only, so a POST could never name the call
+    # it configures and died on the NOT NULL constraint; the list route also
+    # has no object to check the permission against. Refuse it outright.
+    disabled_actions = ["create"]
 
     def get_queryset(self):
         queryset = super().get_queryset()
         user = self.request.user
-        if user.is_staff:
+        if user.is_staff or user.is_support:
             return queryset
 
-        # Only call managers can view/edit configuration
         connected_calls = get_connected_calls(user)
         return queryset.filter(call__in=connected_calls)
 
@@ -6813,21 +7324,21 @@ class MyAssignmentBatchViewSet(viewsets.ViewSet):
         except models.ReviewerProfile.DoesNotExist:
             raise exceptions.NotFound(_("Reviewer profile not found."))
 
+        # Drafts and cancelled batches were never sent to the reviewer.
         batch = get_object_or_404(
             models.AssignmentBatch,
             uuid=uuid,
             reviewer_pool_entry__reviewer=profile,
+            status__in=models.AssignmentBatchStatuses.SENT_TO_REVIEWER,
         )
 
+        disclosure = utils.proposal_disclosure_for_reviewer(batch.call)
         items = []
-        for item in batch.items.all():
+        for item in batch.items.select_related("proposal"):
             items.append(
                 {
                     "uuid": item.uuid,
-                    "proposal_uuid": item.proposal.uuid,
-                    "proposal_name": item.proposal.name,
-                    "proposal_slug": item.proposal.slug,
-                    "proposal_summary": item.proposal.project_summary or "",
+                    **utils.disclosed_proposal_fields(item, disclosure),
                     "status": item.status,
                     "status_display": item.get_status_display(),
                     "affinity_score": item.affinity_score,

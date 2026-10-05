@@ -1,6 +1,7 @@
 import datetime
 import logging
 import uuid
+from collections import Counter
 from typing import cast
 
 from constance import config
@@ -12,25 +13,32 @@ from rest_framework import serializers
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.fields import StringUUID
+from waldur_core.core.models import NAME_LENGTH
 from waldur_core.core.utils import get_system_robot
+from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import permissions as marketplace_permissions
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import OrderStates
 from waldur_mastermind.proposal import award_ids
+from waldur_mastermind.proposal import event_publishing
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal.enums import (
     AllocationTimes,
+    AssignmentItemStatuses,
     BulkRoundCadence,
     CallStates,
+    OrderAuthors,
+    ProposalDisclosureLevels,
     RequestedOfferingStates,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _requested_months(
+def requested_months(
     requested_resource: proposal_models.RequestedResource,
 ) -> int | None:
     """How many whole months the request asks for, or None when it names none.
@@ -103,7 +111,7 @@ def get_proposal_duration_months(proposal: proposal_models.Proposal) -> int | No
             requested_offering__state=RequestedOfferingStates.ACCEPTED
         ).select_related("requested_offering__offering")
         if _is_prepaid(requested_resource)
-        and (months := _requested_months(requested_resource)) is not None
+        and (months := requested_months(requested_resource)) is not None
     ]
     return max(lengths) if lengths else None
 
@@ -232,6 +240,19 @@ def granted_duration_in_days(
     return days if days > 0 else None
 
 
+def _allocated_resource_name(
+    project_name: str, offering_name: str, index: int | None = None
+) -> str:
+    """Name a granted resource after its project and offering.
+
+    The offering tells apart the resources of one allocation; a request for an
+    offering already requested is numbered. The project part is cut to fit, as
+    a project name may be longer than a resource name.
+    """
+    suffix = f" - {offering_name}" + (f" ({index})" if index else "")
+    return (project_name[: max(0, NAME_LENGTH - len(suffix))] + suffix)[:NAME_LENGTH]
+
+
 def _requested_end_date(
     requested_resource: proposal_models.RequestedResource,
     project: structure_models.Project,
@@ -251,7 +272,7 @@ def _requested_end_date(
     the offering's own termination rules — allocation must not fail over a date,
     so the resource is left open and the operator gets a warning.
     """
-    months = _requested_months(requested_resource)
+    months = requested_months(requested_resource)
     if months is None:
         return None
 
@@ -304,6 +325,83 @@ def _requested_end_date(
             exc.detail,
         )
         return None
+
+
+def resolve_order_author(proposal: proposal_models.Proposal, project):
+    """Whose name the orders for this proposal's granted resources carry.
+
+    The call review authorised the spend; this only decides who the resulting
+    orders are attributed to. That matters because it is who the service desk
+    talks to for an offering fulfilled by raising a helpdesk ticket, and who
+    Waldur addresses its order mail to -- neither of which a robot can be.
+
+    It grants nothing: the orders are still carried out with system authority
+    (``marketplace_utils.get_order_processing_user``), and reading the ticket
+    in Waldur still needs a role on the project.
+
+    A configured choice has to land on somebody who can actually be reached,
+    since being told about the order is the whole point of naming them; an
+    unreachable one is skipped in favour of the applicant, and a proposal
+    with no active applicant leaves the robot. The applicant is taken as they
+    are -- they authored the proposal whether or not they have an address,
+    and ``marketplace_support.resolve_issue_caller`` still finds somebody on
+    the project to raise the ticket for.
+    """
+    call = proposal.round.call
+    choice = call.order_author
+
+    if choice == OrderAuthors.APPLICANT:
+        author = proposal.created_by
+    elif choice == OrderAuthors.SPECIFIC_USER:
+        author = _reachable(call.order_author_user)
+    elif choice == OrderAuthors.PROJECT_MANAGER:
+        author = _first_reachable_holder(project, RoleEnum.PROJECT_MANAGER)
+    elif choice == OrderAuthors.CALL_MANAGER:
+        author = _first_reachable_holder(call, RoleEnum.CALL_MANAGER)
+    else:
+        author = None
+
+    if author is not None and author.is_active:
+        return author
+
+    if choice != OrderAuthors.APPLICANT:
+        # A call configured to attribute its orders somewhere specific and
+        # then quietly not doing so is worth a line: shared mailboxes get
+        # closed, and the fallback is invisible from the settings page.
+        logger.warning(
+            "Call %s attributes its orders to '%s', but nobody reachable "
+            "holds it. Falling back to the applicant for proposal %s.",
+            call.uuid.hex,
+            choice,
+            proposal.uuid.hex,
+        )
+        applicant = proposal.created_by
+        if applicant is not None and applicant.is_active:
+            return applicant
+
+    logger.warning(
+        "Proposal %s has no active applicant to attribute its orders to; "
+        "they are recorded against the system robot.",
+        proposal.uuid.hex,
+    )
+    return get_system_robot()
+
+
+def _reachable(user):
+    """The user, if they can be told about an order in their name, else None."""
+    if user and user.is_active and user.email:
+        return user
+    return None
+
+
+def _first_reachable_holder(scope, role_name):
+    """First active holder of ``role_name`` on ``scope`` with an email, or None.
+
+    Ordered by id so the pick is stable: a project with several managers must
+    not attribute consecutive orders to different people. ``get_users`` reads
+    through ``User.objects``, which already excludes deactivated accounts.
+    """
+    return get_users(scope, role_name).exclude(email="").order_by("id").first()
 
 
 def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
@@ -382,9 +480,19 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
         proposal.approved_by = approved_by
     proposal.save()
 
-    requested_resources = proposal.requestedresource_set.filter(
-        requested_offering__state=RequestedOfferingStates.ACCEPTED
+    # Oldest first, so repeated offerings are numbered in the order requested.
+    requested_resources = list(
+        proposal.requestedresource_set.filter(
+            requested_offering__state=RequestedOfferingStates.ACCEPTED
+        )
+        .select_related("requested_offering__offering")
+        .order_by("created", "id")
     )
+    # Model instances hash and compare by primary key.
+    offering_counts = Counter(
+        requested.requested_offering.offering for requested in requested_resources
+    )
+    offering_seen = Counter()
 
     for mapping in proposal.round.call.proposalprojectrolemapping_set.all():  # type: ignore
         users = get_users(proposal, mapping.proposal_role.name)
@@ -394,18 +502,30 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
             else:
                 continue
 
+    # Resolved once for the whole allocation: every order the call places
+    # carries the same author, and the roles it reads were assigned just above.
+    order_author = resolve_order_author(proposal, project)
+    # Whoever accepted the proposal decided on behalf of the call's managing
+    # organisation, which owns the granted project -- so they are the consumer
+    # reviewer. An automatic acceptance passes the robot, as it does for
+    # Proposal.approved_by.
+    consumer_reviewer = approved_by or get_system_robot()
+
     for requested_resource in requested_resources:
+        offering = requested_resource.requested_offering.offering
+        offering_seen[offering] += 1
+        index = offering_seen[offering] if offering_counts[offering] > 1 else None
         with transaction.atomic():
             attrs = dict(
                 project=project,
-                offering=requested_resource.requested_offering.offering,
+                offering=offering,
                 plan=requested_resource.requested_offering.plan,
                 attributes=requested_resource.attributes,
                 limits=requested_resource.limits,
             )
             resource = marketplace_models.Resource(
                 **attrs,
-                name=project.name,
+                name=_allocated_resource_name(project.name, offering.name, index),
             )
             # Before init_cost: the prepaid multiplier in Plan.get_estimate and
             # in the invoice item builder both read this field, so setting it
@@ -415,11 +535,11 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
             resource.init_cost()
             resource.save()
 
-            robot = get_system_robot()
             order = marketplace_models.Order(
                 **attrs,
                 resource=resource,
-                created_by=robot,
+                created_by=order_author,
+                placed_automatically=True,
             )
             # Hand the purchase order to the order, so the approval gate in
             # marketplace.permissions is already satisfied. Without this the
@@ -432,27 +552,34 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
                 order.attachment.name = requested_resource.attachment.name
             if requested_resource.purchase_order_reference:
                 order.request_comment = requested_resource.purchase_order_reference
+            # Record the consumer approval up front rather than leaning on a
+            # staff creator to bypass it. Accepting the proposal *is* the
+            # consumer-side decision: the granted project belongs to the call's
+            # managing organisation, so the person who accepted it is deciding
+            # on that organisation's behalf. The stamp has to be on the
+            # unsaved order -- notify_approvers_when_order_is_created reads it
+            # the moment save() fires and owns the routing from there.
+            #
+            # Not when a purchase order is still owed: that control belongs to
+            # the provider, and the gate must be free to hold the order at
+            # PENDING_CONSUMER. The call snapshots the requirement when the
+            # offering is added, so one introduced later reaches existing
+            # calls uncollected.
+            if not marketplace_permissions.order_is_held_for_purchase_order(order):
+                order.consumer_reviewed_by = consumer_reviewer
+                order.consumer_reviewed_at = timezone.now()
             order.init_cost()
             order.save()
 
             requested_resource.resource = resource
             requested_resource.save()
 
-            # No consumer approval here: order.save() above has already fired
-            # notify_approvers_when_order_is_created, and that handler owns it.
-            # The robot is staff, so the marketplace gate clears the consumer
-            # step and routes the order to provider review, PENDING_PROJECT or
-            # EXECUTING. The call review already authorised the spend, so that
-            # is the intended outcome. Approving a second time here raised
-            # TransitionNotAllowed on orders the handler had taken to
-            # EXECUTING, and queued a duplicate provider notification for the
-            # rest.
-            #
-            # The gate still leaves the order PENDING_CONSUMER when the
-            # offering requires a purchase order document and none was copied
-            # above. The call snapshots that flag when the offering is added,
-            # so a requirement introduced later reaches existing calls
-            # uncollected, and the provider's control must still hold.
+            # No second approval here: order.save() above has already fired
+            # notify_approvers_when_order_is_created, and that handler owns the
+            # routing to provider review, PENDING_PROJECT or EXECUTING.
+            # Approving again raised TransitionNotAllowed on orders the handler
+            # had taken to EXECUTING, and queued a duplicate provider
+            # notification for the rest.
             logger.info(
                 "Order %s allocated from proposal %s is %s.",
                 order.uuid,
@@ -465,8 +592,33 @@ def process_closed_round(call_round: proposal_models.Round):
     """Process a closed round: cancel draft proposals."""
     from waldur_mastermind.proposal.enums import ProposalStates
 
-    call_round.proposal_set.filter(state=ProposalStates.DRAFT).update(
-        state=ProposalStates.CANCELED
+    # Lock the drafts while reading them, so the proposals announced are exactly
+    # the rows updated: a concurrent submit holds the same row lock, and if it
+    # wins the draft is no longer selected here — no bogus draft → canceled.
+    # of=("self",) keeps the lock off the joined call and customer rows.
+    with transaction.atomic():
+        drafts = list(
+            call_round.proposal_set.select_for_update(of=("self",))
+            .filter(state=ProposalStates.DRAFT)
+            .select_related("round__call__manager__customer")
+        )
+        # A bulk update skips post_save, so announce each cancellation explicitly.
+        proposal_models.Proposal.objects.filter(
+            pk__in=[proposal.pk for proposal in drafts]
+        ).update(state=ProposalStates.CANCELED)
+        for proposal in drafts:
+            proposal.state = ProposalStates.CANCELED
+
+    # Announced outside the lock. The rows are committed as canceled by now, so
+    # the announcement is accurate either way, and the dispatcher's per-proposal
+    # consumer matching no longer runs while every draft is held FOR UPDATE --
+    # which is exactly the submit this lock exists to serialise against.
+    # Everything the payloads read is covered by the select_related above, so
+    # nothing is re-fetched here. ATOMIC_REQUESTS is off, so the block above is
+    # the outermost transaction and leaving it really does release the locks;
+    # under a future outer transaction this stays correct, just no longer shorter.
+    event_publishing.publish_proposal_state_changes(
+        (proposal, ProposalStates.DRAFT) for proposal in drafts
     )
 
 
@@ -729,3 +881,50 @@ def bulk_create_rounds(
         created.append(round_obj)
 
     return created
+
+
+def proposal_disclosure_for_reviewer(call: proposal_models.Call) -> str:
+    """How much of a proposal the call reveals to a reviewer before acceptance.
+
+    A call without a COI configuration discloses titles only, the same as the
+    configuration's default.
+    """
+    try:
+        return call.coi_configuration.invitation_proposal_disclosure
+    except proposal_models.CallCOIConfiguration.DoesNotExist:
+        return ProposalDisclosureLevels.TITLES_ONLY
+
+
+def disclosed_proposal_fields(
+    item: proposal_models.AssignmentItem, disclosure: str | None = None
+) -> dict:
+    """The proposal fields a reviewer may see for an assignment they have not
+    accepted yet.
+
+    The title (name, uuid and slug) is always shown. The summary is shown for
+    ``titles_and_summaries`` and ``full_details``; ``full_details`` currently
+    reveals nothing beyond the summary here, since the full proposal becomes
+    readable through proposal access once the assignment is accepted.
+
+    A COI-blocked item never carries more than its title, whatever the level:
+    the reviewer was kept away from that proposal because of the conflict.
+    ``proposal_summary`` is always present, empty when it is not disclosed.
+
+    Pass ``disclosure`` to avoid resolving the call's level once per item.
+    """
+    proposal = item.proposal
+    if disclosure is None:
+        disclosure = proposal_disclosure_for_reviewer(item.batch.call)
+    show_summary = item.status != AssignmentItemStatuses.COI_BLOCKED and (
+        disclosure
+        in (
+            ProposalDisclosureLevels.TITLES_AND_SUMMARIES,
+            ProposalDisclosureLevels.FULL_DETAILS,
+        )
+    )
+    return {
+        "proposal_uuid": proposal.uuid,
+        "proposal_name": proposal.name,
+        "proposal_slug": proposal.slug,
+        "proposal_summary": (proposal.project_summary or "") if show_summary else "",
+    }

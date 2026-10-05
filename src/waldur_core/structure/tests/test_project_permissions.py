@@ -333,6 +333,60 @@ class ProjectPermissionGrantTest(ProjectPermissionBaseTest):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
+    def _grant_expiring_admin(self):
+        member = factories.UserFactory()
+        self.project.add_user(
+            member,
+            ProjectRole.ADMIN,
+            expiration_time=timezone.now() + datetime.timedelta(days=10),
+        )
+        return member
+
+    def _active_admin_rows(self, member):
+        return UserRole.objects.filter(
+            user=member,
+            role__name=ProjectRole.ADMIN.name,
+            object_id=self.project.id,
+            is_active=True,
+        ).count()
+
+    def test_permanent_grant_over_an_expiring_same_role_is_rejected(self):
+        member = self._grant_expiring_admin()
+
+        response = client_add_user(
+            self.client, self.owner, member, self.project, ProjectRole.ADMIN
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data["non_field_errors"][0],
+            "User has already the same role in this scope.",
+        )
+        self.assertEqual(self._active_admin_rows(member), 1)
+
+    def test_later_expiring_grant_over_an_expiring_same_role_is_rejected(self):
+        member = self._grant_expiring_admin()
+
+        response = client_add_user(
+            self.client,
+            self.owner,
+            member,
+            self.project,
+            ProjectRole.ADMIN,
+            timezone.now() + datetime.timedelta(days=200),
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._active_admin_rows(member), 1)
+
+    def test_expiring_role_is_made_permanent_through_update_user(self):
+        member = self._grant_expiring_admin()
+
+        response = client_update_user(
+            self.client, self.owner, member, self.project, ProjectRole.ADMIN
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIsNone(response.data["expiration_time"])
+        self.assertEqual(self._active_admin_rows(member), 1)
+
 
 class ProjectPermissionRevokeTest(ProjectPermissionBaseTest):
     def setUp(self) -> None:

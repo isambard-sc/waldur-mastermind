@@ -9,7 +9,7 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
-from django.db.models import F, Q, signals
+from django.db.models import F, ProtectedError, Q, QuerySet, signals
 from django.template import Context, Template
 from django.utils import timezone
 from django.utils.timezone import now
@@ -34,10 +34,11 @@ from waldur_core.users.enums import InvitationState
 from waldur_core.users.scim import tasks as scim_tasks
 from waldur_core.users.tasks import process_invitation
 from waldur_freeipa.models import Profile
+from waldur_mastermind.common.utils import price_has_changed
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.billing import MarketplaceBillingService
 from waldur_mastermind.marketplace.enums import (
-    BASIC_OFFERING,
+    OFFERING_USER_ALLOWED_OFFERING_TYPES,
     AccountSettingSources,
     BillingTypes,
     MaintenanceState,
@@ -47,10 +48,6 @@ from waldur_mastermind.marketplace.enums import (
     OrderTypes,
     ResourceStates,
     UsageLimitAction,
-)
-from waldur_mastermind.marketplace.enums import SCRIPT_OFFERING as SCRIPT_PLUGIN_NAME
-from waldur_mastermind.marketplace.enums import (
-    SITE_AGENT_OFFERING as SITE_AGENT_PLUGIN_NAME,
 )
 from waldur_mastermind.marketplace.log import get_order_scopes
 from waldur_mastermind.marketplace.maintenance_utils import (
@@ -76,16 +73,19 @@ from waldur_mastermind.marketplace.permissions import (
 from waldur_mastermind.marketplace.secret_options import is_sensitive_key
 from waldur_mastermind.notifications.models import AdminAnnouncement
 
-from . import callbacks, log, models, order_approval, posix_ids, tasks, utils
+from . import (
+    callbacks,
+    log,
+    models,
+    order_approval,
+    posix_ids,
+    project_groups,
+    tasks,
+    utils,
+)
 from .tasks import remove_users_from_robot_accounts_on_permission_loss
 
 logger = logging.getLogger(__name__)
-
-OFFERING_USER_ALLOWED_OFFERING_TYPES = [
-    BASIC_OFFERING,
-    SITE_AGENT_PLUGIN_NAME,
-    SCRIPT_PLUGIN_NAME,
-]
 
 ROBOT_ACCOUNT_TYPE = "Robot account"
 SERVICE_ACCOUNT_TYPE = "Service account"
@@ -243,7 +243,13 @@ def notify_approvers_when_order_is_created(
         OrderStates.PENDING_PROVIDER,
     ):
         if order_should_not_be_reviewed_by_consumer(order):
-            order.review_by_consumer(order.created_by)
+            # An order can arrive with its consumer review already recorded --
+            # proposal allocation stamps the call manager who accepted the
+            # proposal. review_by_consumer overwrites both fields and saves
+            # every column, so recording it again would discard that
+            # timestamp and cost one extra UPDATE per granted resource.
+            if order.consumer_reviewed_by_id is None:
+                order.review_by_consumer(order.created_by)
             if order.project.start_date and order.project.start_date > now().date():
                 order.state = OrderStates.PENDING_PROJECT
                 order.save(update_fields=["state"])
@@ -257,7 +263,9 @@ def notify_approvers_when_order_is_created(
                     order.id,
                     order.resource,
                 )
-                tasks.process_order_on_commit(order, order.created_by)
+                tasks.process_order_on_commit(
+                    order, utils.get_order_processing_user(order)
+                )
             else:
                 order.state = OrderStates.PENDING_PROVIDER
                 order.save(update_fields=["state"])
@@ -279,12 +287,15 @@ def notify_recipients_when_order_is_created(
     auto-approve are covered too. The task re-reads the order after commit, so
     state changes made later in the creating transaction are irrelevant.
 
-    Orders nobody placed are skipped, on two signals. Import commands and the
+    Orders nobody placed are skipped, on three signals. Import commands and the
     orphan-resource reconciliation sweep insert orders directly in a terminal
     state, as audit records for work that already happened. Robots place orders
     on their own initiative: the cost-policy sweep creates one termination order
-    per over-budget resource, and openportal mirrors remote activity. Announcing
-    either as a new order would be wrong, and both arrive in bulk.
+    per over-budget resource, and openportal mirrors remote activity. And an
+    order placed automatically names the person it is for, not somebody who
+    placed it: proposal allocation, and the termination sweeps when they carry
+    an allocated resource's author over. Announcing any of these as a new order
+    would be wrong, and all of them arrive in bulk.
     """
     if get_skip_side_effects():
         return
@@ -296,6 +307,14 @@ def notify_recipients_when_order_is_created(
         return
 
     if instance.created_by is None or core_utils.is_robot_user(instance.created_by):
+        return
+
+    # An order placed automatically records the person it is for, not somebody
+    # who placed it. Proposal allocation is the case in point: announcing one
+    # new order per granted resource on allocation day is exactly the bulk
+    # this guard exists to avoid. The end-date and cost-policy sweeps land here
+    # too when they name an allocated resource's author instead of the robot.
+    if instance.placed_automatically:
         return
 
     secret_options = instance.offering.secret_options or {}
@@ -445,7 +464,14 @@ def update_resource_state_on_order_rejection_error_or_cancellation(
         return
     resource = order.resource
     if order.state in (OrderStates.REJECTED, OrderStates.CANCELED):
-        if order.type == OrderTypes.CREATE:
+        # CREATE and RESTORE both mean the resource never came up, so a refused
+        # one goes back to TERMINATED — which is also what restore_validators
+        # require, so the user can ask again. RESTORE needs saying explicitly:
+        # the restore view moves the resource TERMINATED -> CREATING before the
+        # order exists, so without this branch a refused restore would fall
+        # through to set_state_ok() and leave a resource that was never
+        # restored looking alive.
+        if order.type in (OrderTypes.CREATE, OrderTypes.RESTORE):
             resource.set_state_terminated()
             resource.save(update_fields=["state"])
 
@@ -1131,7 +1157,9 @@ def plan_component_has_been_updated(
     if created:
         return
 
-    if instance.tracker.has_changed("price"):
+    if instance.tracker.has_changed("price") and price_has_changed(
+        instance.tracker.previous("price"), instance.price
+    ):
         event_logger.emit(
             f"Current price of component {instance.component.type} in plan {instance.plan.name} has been updated.",
             event_type=EventType.MARKETPLACE_PLAN_COMPONENT_CURRENT_PRICE_UPDATED,
@@ -1144,7 +1172,9 @@ def plan_component_has_been_updated(
             },
             scopes=get_plan_component_scopes(instance),
         )
-    if instance.tracker.has_changed("future_price"):
+    if instance.tracker.has_changed("future_price") and price_has_changed(
+        instance.tracker.previous("future_price"), instance.future_price
+    ):
         event_logger.emit(
             f"Future price of component {instance.component.type} in plan {instance.plan.name} has been updated.",
             event_type=EventType.MARKETPLACE_PLAN_COMPONENT_FUTURE_PRICE_UPDATED,
@@ -1157,7 +1187,9 @@ def plan_component_has_been_updated(
             },
             scopes=get_plan_component_scopes(instance),
         )
-    if instance.tracker.has_changed("amount"):
+    if instance.tracker.has_changed("amount") and price_has_changed(
+        instance.tracker.previous("amount"), instance.amount
+    ):
         event_logger.emit(
             f"Quota of component {instance.component.type} in plan {instance.plan.name} has been updated.",
             event_type=EventType.MARKETPLACE_PLAN_COMPONENT_QUOTA_UPDATED,
@@ -2651,27 +2683,39 @@ def close_course_accounts_after_project_removal(
     if not settings.WALDUR_CORE.get("COURSE_ACCOUNT_USE_API"):
         return
 
-    course_accounts = models.CourseAccount.objects.filter(project=instance)
-    if not course_accounts.exists():
-        return
-    try:
-        api_access_token = utils.get_course_account_api_token()
-    except httpx.HTTPError:
-        logger.error(
-            "Unable to get course account API token, skipping accounts removal for project %s",
-            instance,
+    # Project.delete() defaults to a soft delete, but soft=False (Customer.delete()
+    # hard-deleting every project once none remain active, or the admin's
+    # "hard-delete soft-deleted projects" action) does a real DB delete, and
+    # CourseAccount.project is CASCADE - the row would be gone by the time a task
+    # re-read it by uuid. So the account's uuid/username/user_id are captured here,
+    # before the delete completes, and handed to the task instead of re-queried.
+    #
+    # Closing runs in a task rather than inline here because it calls a
+    # third-party API per account: looping synchronously blocked whichever
+    # caller triggered the deletion (an unrelated order state-transition
+    # request, in one observed case) on that backend's latency, with no
+    # bound on the outbound call. Batching every account from this project
+    # into one task (rather than one task per account) also means the API
+    # token is fetched once per project instead of once per account - and
+    # that fetch only ever happens inside the task, never here, so it can't
+    # reintroduce the same blocking-call-in-a-request problem for the
+    # synchronous hard-delete callers above.
+    accounts = list(
+        models.CourseAccount.objects.filter(project=instance).values(
+            "uuid", "user__username", "user_id"
         )
+    )
+    if not accounts:
         return
-
-    for course_account in course_accounts:
-        try:
-            utils.close_course_account(course_account, api_access_token)
-        except httpx.HTTPError:
-            logger.error(
-                "Unable to close course account %s from project %s",
-                course_account.user.username,
-                instance,
-            )
+    payload = [
+        {
+            "uuid": account["uuid"].hex,
+            "username": account["user__username"],
+            "user_id": account["user_id"],
+        }
+        for account in accounts
+    ]
+    transaction.on_commit(lambda: tasks.close_course_accounts_task.delay(payload))
 
 
 def log_terms_of_service_consent_granted(
@@ -3043,9 +3087,12 @@ def process_billing_on_resource_save(
 ):
     """
     Handle resource state changes and billing events.
+
+    Skipped under ``skip_side_effects()``: bulk imports and the offering merge
+    rewrite resources without meaning to terminate and reissue invoice items.
     """
     resource = instance
-    if created:
+    if created or get_skip_side_effects():
         return
 
     tracker = resource.tracker
@@ -3097,6 +3144,9 @@ def trigger_scim_sync_on_offering_endpoint_change(
     if not config.SCIM_MEMBERSHIP_SYNC_ENABLED or not scim_tasks.is_scim_configured():
         return
 
+    if not scim_tasks.offering_enables_scim_entitlements(instance.offering):
+        return
+
     if not instance.url or not instance.url.startswith("ssh://"):
         return
 
@@ -3108,6 +3158,9 @@ def trigger_scim_sync_on_offering_user_ok(
 ):
     """Trigger SCIM entitlements synchronization when OfferingUser transitions to OK with username."""
     if not config.SCIM_MEMBERSHIP_SYNC_ENABLED or not scim_tasks.is_scim_configured():
+        return
+
+    if not scim_tasks.offering_enables_scim_entitlements(instance.offering):
         return
 
     if created or not instance.tracker.has_changed("state"):
@@ -3126,6 +3179,9 @@ def trigger_scim_sync_on_resource_ok(
 ):
     """Trigger SCIM entitlements synchronization when resource transitions to OK."""
     if not config.SCIM_MEMBERSHIP_SYNC_ENABLED or not scim_tasks.is_scim_configured():
+        return
+
+    if not scim_tasks.offering_enables_scim_entitlements(instance.offering):
         return
 
     if created or not instance.tracker.has_changed("state"):
@@ -3355,6 +3411,32 @@ def log_resource_end_date_change_request_events(
         )
 
 
+def notify_about_resource_end_date_change_request(
+    sender, instance, created=False, **kwargs
+):
+    """Email approvers about a new request, and the requester about the verdict.
+
+    The events above only reach people through generic event subscriptions,
+    which send the bare event message with no context or link to act on.
+    """
+    if get_skip_side_effects():
+        return
+
+    if created:
+        task = tasks.send_resource_end_date_change_request_notification
+    elif not instance.tracker.has_changed("state"):
+        return
+    elif instance.state == ReviewStates.APPROVED:
+        task = tasks.send_resource_end_date_change_request_approved_notification
+    elif instance.state == ReviewStates.REJECTED:
+        task = tasks.send_resource_end_date_change_request_rejected_notification
+    else:
+        return
+
+    request_uuid = instance.uuid.hex
+    transaction.on_commit(lambda: task.delay(request_uuid))
+
+
 def release_posix_allocations_on_consumer_deletion(sender, instance, **kwargs):
     """Mark the deleted POSIX id consumer's identity as released.
 
@@ -3369,6 +3451,132 @@ def release_posix_allocations_on_consumer_deletion(sender, instance, **kwargs):
     intentionally tied to actual row deletion only.
     """
     posix_ids.release_posix_allocations(instance)
+
+
+def create_provider_project_group_for_resource(
+    sender, instance: Resource, created=False, **kwargs
+):
+    """Give the resource's project its POSIX group at the provider on first use.
+
+    Runs on creation and on every state change into a non-terminated state, so
+    a group missed earlier (the switch was off, no pool yet) is caught up. The
+    group outlives the project's resources: a terminated resource changes
+    nothing here.
+    """
+    if not created and not instance.tracker.has_changed("state"):
+        return
+    if instance.state == ResourceStates.TERMINATED:
+        return
+    if not project_groups.offering_type_qualifies(instance):
+        return
+    resource = instance
+    transaction.on_commit(
+        lambda: project_groups.run_safely(
+            project_groups.ensure_group_for_resource, resource
+        )
+    )
+
+
+def release_provider_project_group_gid(sender, instance, **kwargs):
+    """Release a deleted project group's GID, never to be recycled."""
+    posix_ids.release_project_group_gid(instance)
+
+
+def backfill_project_groups_when_enabled(
+    sender, instance: models.ServiceProvider, created=False, **kwargs
+):
+    """Create the groups of projects already using the provider when switched on."""
+    if not instance.project_groups_enabled:
+        return
+    if not created:
+        previous = instance.tracker.previous("account_options") or {}
+        if previous.get("project_groups_enabled"):
+            return
+    for warning in project_groups.switch_warnings(instance, instance.account_options):
+        logger.warning("Project groups enabled for %s: %s", instance, warning)
+    provider_uuid = instance.uuid.hex
+    transaction.on_commit(
+        lambda: tasks.backfill_provider_project_groups.delay(provider_uuid)
+    )
+
+
+# TimeStampedModel adds "modified" to every update_fields save.
+POOL_COUNTER_FIELDS = {"next_uid", "next_gid", "next_group_gid", "modified"}
+
+
+def backfill_project_groups_when_pool_saved(
+    sender, instance: models.PosixIdPool, created=False, **kwargs
+):
+    """Number the provider's groups whenever the pool may be able to.
+
+    A new pool first reserves the GIDs the provider's groups already carry, so
+    it never hands them out again. Then, on creation and on any update -- a
+    group or GID range added or extended -- groups still without a GID get one.
+    """
+    if not instance.service_provider_id:
+        return
+    update_fields = kwargs.get("update_fields")
+    if update_fields and set(update_fields) <= POOL_COUNTER_FIELDS:
+        # The allocator advancing a counter; the ranges are unchanged.
+        return
+    if created:
+        project_groups.register_existing_gids(instance)
+    if not instance.service_provider.project_groups_enabled:
+        return
+    provider_uuid = instance.service_provider.uuid.hex
+    transaction.on_commit(
+        lambda: tasks.backfill_provider_project_groups.delay(provider_uuid)
+    )
+
+
+def protect_pool_holding_project_group_gids(
+    sender, instance: models.PosixIdPool, origin=None, **kwargs
+):
+    """Refuse to delete a pool on its own while project groups hold GIDs from it.
+
+    Deleting the pool would take the identity rows with it while the groups
+    keep their GIDs, and a new pool would then hand the same GIDs to other
+    projects. Checked here rather than in the API so that the admin is refused
+    too. Deleting the service provider (or its organization) is different: its
+    project groups go with it, so the cascade is allowed.
+    """
+    deleting_pool_itself = isinstance(origin, models.PosixIdPool) or (
+        isinstance(origin, QuerySet) and origin.model is models.PosixIdPool
+    )
+    if not deleting_pool_itself:
+        return
+    group_ct = ContentType.objects.get_for_model(models.ServiceProviderProjectGroup)
+    held = models.PosixIdentity.objects.filter(
+        pool=instance, released_at__isnull=True, content_type=group_ct
+    ).first()
+    if held is not None:
+        # One protected object, so the API maps it to 409 Conflict.
+        raise ProtectedError(
+            f"POSIX ID pool {instance} still supplies the GIDs of project "
+            "groups; delete the service provider or move the groups first.",
+            {held},
+        )
+
+
+def create_provider_project_group_on_order_approval(
+    sender, instance: Order, created=False, **kwargs
+):
+    """A resource starts to count once its create order has been approved."""
+    order = instance
+    if order.type != OrderTypes.CREATE or not order.resource_id:
+        return
+    if not created and not order.tracker.has_changed("state"):
+        return
+    if order.state not in project_groups.APPROVED_STATES:
+        return
+    if not project_groups.offering_type_qualifies(order):
+        return
+    resource = order.resource
+    transaction.on_commit(
+        lambda: project_groups.run_safely(
+            project_groups.ensure_group_for_resource, resource
+        )
+    )
 
 
 def get_access_subnet_changes(instance):

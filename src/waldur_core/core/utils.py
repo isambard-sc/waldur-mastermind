@@ -258,7 +258,14 @@ def send_mail(
     reply_to: str | None = None,
     fail_silently: bool = False,
     connection=None,
+    headers: dict[str, str] | None = None,
 ) -> int:
+    """Send one message.
+
+    :param headers: extra message headers, e.g. the ``Message-ID`` /
+        ``In-Reply-To`` / ``References`` trio that lets a mail client group
+        several notifications about the same object into one thread.
+    """
     from waldur_core.logging.models import EmailLog
 
     from_email = from_email or settings.DEFAULT_FROM_EMAIL
@@ -271,6 +278,7 @@ def send_mail(
         bcc=bcc,
         reply_to=[reply_to],
         connection=connection,
+        headers=headers,
     )
 
     footer_text = config.COMMON_FOOTER_TEXT
@@ -312,6 +320,7 @@ def broadcast_mail(
     content_type="text/plain",
     bcc=None,
     template_variant=None,
+    headers=None,
 ):
     """
     Shorthand to format email message from template file and sent it to all recipients.
@@ -340,6 +349,7 @@ def broadcast_mail(
         notification, used where a deployment words the same event differently.
         The notification, and therefore the operator's on/off switch, is still
         the one named by ``event_type``.
+    :param headers: extra message headers passed on to every recipient's copy.
     """
     from .models import Notification
 
@@ -347,8 +357,16 @@ def broadcast_mail(
     try:
         notification = Notification.objects.get(key=notification_key)
     except Notification.DoesNotExist:
+        # Both this branch and the disabled one below drop the mail. Say so:
+        # without a log line an operator cannot tell a notification that is
+        # switched off from one that is broken, since either way the only
+        # symptom is that no mail arrives.
         logger.warning(
-            f"Notification with key '{notification_key}' does not exist. Email will not be sent."
+            "Notification '%s' is not registered, so no %s mail was sent to %s "
+            "recipient(s). Run the load_notifications command to register it.",
+            notification_key,
+            event_type,
+            len(recipient_list),
         )
         return
 
@@ -386,6 +404,7 @@ def broadcast_mail(
                         content_type=content_type,
                         bcc=bcc,
                         connection=connection,
+                        headers=headers,
                     )
                 except Exception:
                     logger.exception(
@@ -395,7 +414,12 @@ def broadcast_mail(
             connection.close()
     else:
         logger.info(
-            f"Notification with key '{notification_key}' is disabled. Email will not be sent."
+            "Notification '%s' is disabled, so no %s mail was sent to %s "
+            "recipient(s). Enable it under Administration -> Notifications, or "
+            "in the notifications file loaded by the load_notifications command.",
+            notification_key,
+            event_type,
+            len(recipient_list),
         )
 
 
@@ -1076,3 +1100,28 @@ def validate_outbound_url(url: str) -> None:
                 f"URL host {parsed.hostname!r} resolves to a non-routable "
                 f"address ({ip}); outbound webhook destinations must be public."
             )
+
+
+CONSTANCE_PYTHON_TYPE_NAMES = {
+    int: "integer",
+    float: "float",
+    bool: "boolean",
+    str: "string",
+    list: "list_field",
+}
+
+
+def get_constance_setting_type(key):
+    """Type name of a Constance setting, as reported to clients.
+
+    An explicit third element of the config tuple wins: a Python type is mapped
+    to its name, a field name from CONSTANCE_ADDITIONAL_FIELDS is used as is.
+    Otherwise the type is inferred from the default.
+    """
+    definition = settings.CONSTANCE_CONFIG[key]
+    if len(definition) >= 3 and definition[2]:
+        raw_type = definition[2]
+        if isinstance(raw_type, type):
+            return CONSTANCE_PYTHON_TYPE_NAMES.get(raw_type, raw_type.__name__)
+        return raw_type
+    return CONSTANCE_PYTHON_TYPE_NAMES.get(type(definition[0]), "string")

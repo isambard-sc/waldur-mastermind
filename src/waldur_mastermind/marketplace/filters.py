@@ -46,7 +46,7 @@ from waldur_core.structure.managers import (
     get_project_users,
 )
 from waldur_mastermind.invoices import models as invoices_models
-from waldur_mastermind.marketplace import billing_mode, plugins
+from waldur_mastermind.marketplace import billing_mode, plugins, project_groups
 from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     CourseAccountState,
@@ -64,6 +64,7 @@ from waldur_mastermind.marketplace.enums import (
 from waldur_mastermind.marketplace.managers import (
     ResourceQuerySet,
     get_connected_offerings,
+    get_connected_provider_customers_by_permission,
 )
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_openstack import models as openstack_models
@@ -831,15 +832,15 @@ class SoftwarePackageFilter(django_filters.FilterSet):
         label="Description",
         help_text="Filter packages by description (case-insensitive partial match)",
     )
-    cpu_family = django_filters.CharFilter(
+    cpu_family = LooseMultipleChoiceFilter(
         method="filter_cpu_family",
         label="CPU Family",
-        help_text="Filter packages available for specific CPU family (e.g., x86_64, aarch64)",
+        help_text="Filter packages available for any of the given CPU families (e.g., x86_64, aarch64)",
     )
-    cpu_microarchitecture = django_filters.CharFilter(
+    cpu_microarchitecture = LooseMultipleChoiceFilter(
         method="filter_cpu_microarchitecture",
         label="CPU Microarchitecture",
-        help_text="Filter packages available for specific CPU microarchitecture (e.g., generic, zen2, haswell)",
+        help_text="Filter packages available for any of the given CPU microarchitectures (e.g., generic, amd/zen3, intel/sapphirerapids)",
     )
     has_version = django_filters.CharFilter(
         method="filter_has_version",
@@ -930,18 +931,18 @@ class SoftwarePackageFilter(django_filters.FilterSet):
         """Filter packages available for specific offering."""
         return queryset.filter(catalog__offerings__offering__uuid=value).distinct()
 
-    def filter_cpu_family(self, queryset, name, value):
+    def filter_cpu_family(self, queryset, name, value: list[str]):
         """Filter packages with versions available for CPU family."""
         return queryset.filter(
             versions__targets__target_type="cpu_architecture",
-            versions__targets__target_name=value,
+            versions__targets__target_name__in=value,
         ).distinct()
 
-    def filter_cpu_microarchitecture(self, queryset, name, value):
+    def filter_cpu_microarchitecture(self, queryset, name, value: list[str]):
         """Filter packages with versions available for CPU microarchitecture."""
         return queryset.filter(
             versions__targets__target_type="cpu_architecture",
-            versions__targets__target_subtype=value,
+            versions__targets__target_subtype__in=value,
         ).distinct()
 
     def filter_has_version(self, queryset, name, value):
@@ -1029,8 +1030,8 @@ class SoftwareVersionFilter(django_filters.FilterSet):
         label="Version (exact)",
         help_text="Filter versions by exact version string",
     )
-    cpu_family = django_filters.CharFilter(method="filter_cpu_family")
-    cpu_microarchitecture = django_filters.CharFilter(
+    cpu_family = LooseMultipleChoiceFilter(method="filter_cpu_family")
+    cpu_microarchitecture = LooseMultipleChoiceFilter(
         method="filter_cpu_microarchitecture"
     )
     toolchain_families_compatibility = django_filters.CharFilter(
@@ -1094,16 +1095,16 @@ class SoftwareVersionFilter(django_filters.FilterSet):
             package__catalog__offerings__offering__uuid=value
         ).distinct()
 
-    def filter_cpu_family(self, queryset, name, value):
+    def filter_cpu_family(self, queryset, name, value: list[str]):
         return queryset.filter(
             targets__target_type="cpu_architecture",
-            targets__target_name=value,
+            targets__target_name__in=value,
         ).distinct()
 
-    def filter_cpu_microarchitecture(self, queryset, name, value):
+    def filter_cpu_microarchitecture(self, queryset, name, value: list[str]):
         return queryset.filter(
             targets__target_type="cpu_architecture",
-            targets__target_subtype=value,
+            targets__target_subtype__in=value,
         ).distinct()
 
     def filter_toolchain_families_compatibility(self, queryset, name, value):
@@ -1134,6 +1135,14 @@ class SoftwareVersionFilter(django_filters.FilterSet):
         return queryset.filter(targets__gpu_architectures__contains=[value]).distinct()
 
 
+def _iexact_any(field: str, values) -> Q:
+    """Case-insensitive match against any of the given values."""
+    query = Q()
+    for value in values:
+        query |= Q(**{f"{field}__iexact": value})
+    return query
+
+
 class SoftwareTargetFilter(django_filters.FilterSet):
     """Filter for SoftwareTarget model."""
 
@@ -1151,8 +1160,8 @@ class SoftwareTargetFilter(django_filters.FilterSet):
     offering_uuid = core_filters.RelatedUUIDFilter(
         view_name="marketplace-provider-offering-detail", method="filter_offering_uuid"
     )
-    cpu_family = django_filters.CharFilter(method="filter_cpu_family")
-    cpu_microarchitecture = django_filters.CharFilter(
+    cpu_family = LooseMultipleChoiceFilter(method="filter_cpu_family")
+    cpu_microarchitecture = LooseMultipleChoiceFilter(
         method="filter_cpu_microarchitecture"
     )
     path = django_filters.CharFilter(
@@ -1216,16 +1225,14 @@ class SoftwareTargetFilter(django_filters.FilterSet):
             version__package__catalog__offerings__offering__uuid=value
         ).distinct()
 
-    def filter_cpu_family(self, queryset, name, value):
-        return queryset.filter(
-            target_type="cpu_architecture",
-            target_name__iexact=value,
+    def filter_cpu_family(self, queryset, name, value: list[str]):
+        return queryset.filter(target_type="cpu_architecture").filter(
+            _iexact_any("target_name", value)
         )
 
-    def filter_cpu_microarchitecture(self, queryset, name, value):
-        return queryset.filter(
-            target_type="cpu_architecture",
-            target_subtype__iexact=value,
+    def filter_cpu_microarchitecture(self, queryset, name, value: list[str]):
+        return queryset.filter(target_type="cpu_architecture").filter(
+            _iexact_any("target_subtype", value)
         )
 
     def filter_has_gpu(self, queryset, name, value):
@@ -2320,6 +2327,11 @@ class OfferingUserFilter(OfferingFilterMixin, core_filters.CreatedModifiedFilter
     user_username = django_filters.CharFilter(
         field_name="user__username", lookup_expr="iexact", label="User username"
     )
+    # The account's own (POSIX) username; exact because those names are
+    # case-sensitive -- use ``query`` for a substring search.
+    username = django_filters.CharFilter(
+        field_name="username", lookup_expr="exact", label="Username"
+    )
     provider_uuid = core_filters.RelatedUUIDFilter(
         view_name="marketplace-service-provider-detail",
         field_name="offering__customer__uuid",
@@ -2422,6 +2434,9 @@ class ServiceProviderAccountFilter(core_filters.CreatedModifiedFilter):
     )
     user_username = django_filters.CharFilter(
         field_name="user__username", lookup_expr="iexact", label="User username"
+    )
+    username = django_filters.CharFilter(
+        field_name="username", lookup_expr="exact", label="Username"
     )
     provider_uuid = core_filters.RelatedUUIDFilter(
         view_name="marketplace-service-provider-detail",
@@ -2578,6 +2593,85 @@ class PosixIdPoolFilter(django_filters.FilterSet):
         return queryset.filter(
             Q(service_provider__customer__uuid=value)
             | Q(offering__customer__uuid=value)
+        )
+
+
+class ServiceProviderProjectGroupFilter(core_filters.CreatedModifiedFilter):
+    service_provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-service-provider-detail",
+        field_name="service_provider__uuid",
+        label="Service provider UUID",
+    )
+    provider_offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        method="filter_provider_offering_uuid",
+        label="Every group of the service provider that owns this offering",
+    )
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        method="filter_offering_uuid",
+        label="Groups of projects with a non-terminated resource on this offering",
+    )
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail",
+        field_name="project__uuid",
+        label="Project UUID",
+    )
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="project__customer__uuid",
+        label="UUID of the project's organization",
+    )
+    query = django_filters.CharFilter(
+        method="filter_query",
+        label="Search by group name, project name or slug, organization name or GID",
+    )
+    in_use = django_filters.BooleanFilter(field_name="in_use", label="In use")
+    name = django_filters.CharFilter(field_name="name", lookup_expr="exact")
+    gid = django_filters.NumberFilter(method="filter_gid")
+    o = django_filters.OrderingFilter(fields=("name", "gid", "created", "modified"))
+
+    class Meta:
+        model = models.ServiceProviderProjectGroup
+        fields = []
+
+    def filter_gid(self, queryset, name, value):
+        if value != int(value) or not 0 <= value <= models.PosixIdPool.MAX_ID:
+            raise rf_exceptions.ValidationError(
+                {"gid": _("Give a GID between 0 and %s.") % models.PosixIdPool.MAX_ID}
+            )
+        return queryset.filter(gid=int(value))
+
+    def filter_query(self, queryset, name, value):
+        value = value.strip()
+        condition = (
+            Q(name__icontains=value)
+            | Q(project__name__icontains=value)
+            | Q(project__slug__icontains=value)
+            | Q(project__customer__name__icontains=value)
+        )
+        if value.isdigit() and int(value) <= models.PosixIdPool.MAX_ID:
+            condition |= Q(gid=int(value))
+        return queryset.filter(condition)
+
+    def filter_provider_offering_uuid(self, queryset, name, value):
+        offering = models.Offering.objects.filter(uuid=value).first()
+        if offering is None:
+            return queryset.none()
+        return queryset.filter(service_provider__customer_id=offering.customer_id)
+
+    def filter_offering_uuid(self, queryset, name, value):
+        offering = models.Offering.objects.filter(uuid=value).first()
+        if offering is None or not project_groups.offering_qualifies(offering):
+            return queryset.none()
+        project_ids = (
+            project_groups.active_resources()
+            .filter(offering=offering)
+            .values_list("project_id", flat=True)
+        )
+        return queryset.filter(
+            service_provider__customer_id=offering.customer_id,
+            project_id__in=project_ids,
         )
 
 
@@ -2860,8 +2954,9 @@ class MarketplaceInvoiceItemsFilterBackend(BaseFilterBackend):
         if user.is_staff:
             return queryset
 
-        customer_ids = get_connected_customers(
-            user, [RoleEnum.CUSTOMER_OWNER, RoleEnum.CUSTOMER_MANAGER]
+        # Invoice items of the provider's offerings are its revenue.
+        customer_ids = get_connected_provider_customers_by_permission(
+            user, PermissionEnum.GET_SERVICE_PROVIDER_REVENUE
         )
 
         return queryset.filter(resource__offering__customer_id__in=customer_ids)
@@ -3139,8 +3234,14 @@ class MaintenanceAnnouncementOfferingTemplateFilter(django_filters.FilterSet):
 
 
 def user_extra_query(user):
-    customer_ids = get_connected_customers(
-        user, (RoleEnum.CUSTOMER_OWNER, RoleEnum.CUSTOMER_MANAGER)
+    """Let a provider see the users of the projects consuming its offerings.
+
+    Follows the permission of the provider's own user list
+    (ServiceProviderUsersViewSet) rather than a fixed set of roles, so a custom
+    provider role granting it sees the same users there and here.
+    """
+    customer_ids = get_connected_provider_customers_by_permission(
+        user, PermissionEnum.LIST_SERVICE_PROVIDER_USERS
     )
     offering_ids = models.Offering.objects.filter(
         shared=True, customer_id__in=customer_ids
@@ -3511,3 +3612,39 @@ class ResourceEndDateChangeRequestFilter(django_filters.FilterSet):
     class Meta:
         model = models.ResourceEndDateChangeRequest
         fields = []
+
+
+class OfferingMergeFilter(core_filters.CreatedModifiedFilter):
+    state = django_filters.MultipleChoiceFilter(
+        choices=models.OfferingMerge.States.CHOICES
+    )
+    source_offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="sources__uuid",
+        distinct=True,
+        label="Source offering UUID",
+    )
+    target_offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="target__uuid",
+        label="Target offering UUID",
+    )
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        method="filter_offering_uuid",
+        label="Source or target offering UUID",
+    )
+    created_by_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail",
+        field_name="created_by__uuid",
+        label="Created by UUID",
+    )
+
+    class Meta:
+        model = models.OfferingMerge
+        fields = []
+
+    def filter_offering_uuid(self, queryset, name, value):
+        return queryset.filter(
+            Q(sources__uuid=value) | Q(target__uuid=value)
+        ).distinct()

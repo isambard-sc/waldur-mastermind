@@ -1,3 +1,4 @@
+import datetime
 from unittest.mock import Mock
 
 from constance.test import override_config
@@ -531,6 +532,30 @@ class PermissionFactoryValidationTest(TestCase):
             PermissionEnum.CREATE_OFFERING, sources=["customer"]
         )
         self.assertIsNotNone(result)
+
+
+class SameRoleGrantTest(TestCase):
+    def setUp(self):
+        self.project = factories.ProjectFactory()
+        self.user = factories.UserFactory()
+
+    def test_expiring_grant_of_the_same_role_blocks_another(self):
+        self.project.add_user(
+            self.user,
+            ProjectRole.ADMIN,
+            expiration_time=timezone.now() + datetime.timedelta(days=10),
+        )
+
+        with self.assertRaisesMessage(
+            ValidationError, "User has already the same role in this scope."
+        ):
+            utils.validate_role_grant(self.project, self.user, ProjectRole.ADMIN)
+
+    def test_revoked_grant_of_the_same_role_does_not_block(self):
+        self.project.add_user(self.user, ProjectRole.ADMIN)
+        utils.delete_user(self.project, self.user, ProjectRole.ADMIN)
+
+        utils.validate_role_grant(self.project, self.user, ProjectRole.ADMIN)
 
 
 class SingleRolePerScopeTest(TestCase):

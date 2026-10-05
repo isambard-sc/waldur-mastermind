@@ -5,11 +5,13 @@ import tempfile
 from io import StringIO
 
 from django.contrib.contenttypes.models import ContentType
+from django.core.cache import cache
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
 from django.test import TestCase
 
+from waldur_core.checklist.models import ChecklistCompletion
 from waldur_core.core.models import User
 from waldur_core.permissions.models import Role, RolePermission, UserRole
 from waldur_core.structure.models import Customer, Project
@@ -45,11 +47,14 @@ from waldur_mastermind.policy.models import (
     SlurmPeriodicUsagePolicy,
 )
 from waldur_mastermind.policy.tests import factories as policy_factories
-from waldur_mastermind.proposal.enums import COITypes
+from waldur_mastermind.proposal.enums import COITypes, ProposalDisclosureLevels
 from waldur_mastermind.proposal.models import (
+    CallAssignmentConfiguration,
     CallCOIConfiguration,
     CallWorkflowStep,
+    Proposal,
     ProposalWorkflowStepInstance,
+    Review,
 )
 from waldur_mastermind.proposal.tests import factories as proposal_factories
 
@@ -1535,6 +1540,7 @@ class ImportStructureCommandTest(TestCase):
                 "name": "Test Invoice Item 1",
                 "quantity": "10.50",
                 "measured_unit": "hours",
+                "unit": "hour",
                 "unit_price": "25.00",
                 "article_code": "ITEM-001",
                 "start": "2024-03-01T00:00:00Z",
@@ -1570,6 +1576,7 @@ class ImportStructureCommandTest(TestCase):
         self.assertEqual(item1.name, "Test Invoice Item 1")
         self.assertEqual(float(item1.quantity), 10.5)
         self.assertEqual(item1.measured_unit, "hours")
+        self.assertEqual(item1.unit, "hour")
         self.assertEqual(float(item1.unit_price), 25.0)
         self.assertEqual(item1.article_code, "ITEM-001")
         self.assertIsNotNone(item1.start)
@@ -2007,6 +2014,64 @@ class ImportStructureCommandTest(TestCase):
         # Verify all credits were deleted
         self.assertEqual(CustomerCredit.objects.count(), 0)
         self.assertEqual(ProjectCredit.objects.count(), 0)
+
+    def test_offering_compliance_checklist_imported_in_same_file(self):
+        """An offering's checklist is linked although checklists import after offerings."""
+        customer = structure_factories.CustomerFactory()
+        category = marketplace_factories.CategoryFactory()
+        user = structure_factories.UserFactory()
+        data = {
+            "offerings": [
+                {
+                    "uuid": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+                    "name": "GPU offering",
+                    "type": "Marketplace.Basic",
+                    "customer_uuid": str(customer.uuid),
+                    "category_uuid": str(category.uuid),
+                    "compliance_checklist_uuid": "22222222-2222-2222-2222-222222222222",
+                }
+            ],
+            "checklists": [
+                {
+                    "uuid": "22222222-2222-2222-2222-222222222222",
+                    "name": "Eligibility",
+                    "checklist_type": "offering_compliance",
+                }
+            ],
+            "offering_users": [
+                {
+                    "uuid": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+                    "offering_uuid": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+                    "user_uuid": str(user.uuid),
+                    "state": 4,
+                }
+            ],
+        }
+        self._create_test_json(data)
+
+        self._call_import_command("-i", self.test_file_path)
+
+        offering = Offering.objects.get(uuid="dddddddd-dddd-dddd-dddd-dddddddddddd")
+        self.assertEqual(
+            str(offering.compliance_checklist.uuid.hex),
+            "22222222222222222222222222222222",
+        )
+        offering_user = OfferingUser.objects.get(offering=offering, user=user)
+        self.assertTrue(
+            ChecklistCompletion.objects.filter(
+                scope_content_type=ContentType.objects.get_for_model(OfferingUser),
+                scope_object_id=offering_user.id,
+                checklist=offering.compliance_checklist,
+            ).exists()
+        )
+
+    def test_constance_import_drops_cached_public_settings(self):
+        cache.set("API_CONFIGURATION", {"SITE_NAME": "Old"}, None)
+        self._create_test_json({"constance_settings": {"SITE_NAME": "New"}})
+
+        self._call_import_command("-i", self.test_file_path)
+
+        self.assertIsNone(cache.get("API_CONFIGURATION"))
 
     def test_checklist_basic_import_functionality(self):
         """Test that checklist categories and checklists can be imported."""
@@ -3695,6 +3760,58 @@ class ImportWorkflowEngineStateTest(TestCase):
         )
 
 
+class ImportRetiredProposalFieldsTest(TestCase):
+    """Dumps written before the proposal duration fields were dropped still
+    carry their keys; the importer must load them and ignore those keys.
+    """
+
+    PROPOSAL_UUID = "cf100000000000000000000000000001"
+    REVIEW_UUID = "cf200000000000000000000000000001"
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.test_file_path = os.path.join(self.temp_dir, "test_structure.json")
+
+    def tearDown(self):
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+
+    def test_old_duration_keys_are_ignored(self):
+        round_obj = proposal_factories.RoundFactory()
+        reviewer = structure_factories.UserFactory()
+        data = {
+            "proposals": [
+                {
+                    "uuid": self.PROPOSAL_UUID,
+                    "round_uuid": round_obj.uuid.hex,
+                    "name": "Legacy proposal",
+                    "project_summary": "Summary",
+                    "project_duration": 365,
+                    "duration_in_days": 365,
+                }
+            ],
+            "reviews": [
+                {
+                    "uuid": self.REVIEW_UUID,
+                    "proposal_uuid": self.PROPOSAL_UUID,
+                    "reviewer_uuid": reviewer.uuid.hex,
+                    "comment_project_summary": "Well written",
+                    "comment_project_duration": "Timeline seems optimistic",
+                }
+            ],
+        }
+        with open(self.test_file_path, "w") as f:
+            json.dump(data, f)
+
+        call_command("import_structure", input=self.test_file_path, stdout=StringIO())
+
+        proposal = Proposal.objects.get(uuid=self.PROPOSAL_UUID)
+        self.assertEqual(proposal.project_summary, "Summary")
+        review = Review.objects.get(uuid=self.REVIEW_UUID)
+        self.assertEqual(review.proposal, proposal)
+        self.assertEqual(review.comment_project_summary, "Well written")
+
+
 class ImportCallCOIConfigurationTest(TestCase):
     """The importer writes the COI type-handling rules straight to the ORM, so
     it has to enforce the same invariant the API serializer does (WAL-9601).
@@ -3763,3 +3880,158 @@ class ImportCallCOIConfigurationTest(TestCase):
 
         self.assertIn("unknown conflict types", output)
         self.assertIn("only be assigned to one rule", output)
+
+    def test_invitation_disclosure_level_is_imported(self):
+        self._run(invitation_proposal_disclosure=ProposalDisclosureLevels.FULL_DETAILS)
+
+        config = CallCOIConfiguration.objects.get(call=self.call)
+        self.assertEqual(
+            config.invitation_proposal_disclosure,
+            ProposalDisclosureLevels.FULL_DETAILS,
+        )
+
+    def test_unknown_invitation_disclosure_level_is_skipped(self):
+        output = self._run(invitation_proposal_disclosure="everything")
+
+        self.assertFalse(CallCOIConfiguration.objects.filter(call=self.call).exists())
+        self.assertIn("everything", output)
+
+
+class ImportCallAssignmentConfigurationTest(TestCase):
+    CONFIG_UUID = "c9100000000000000000000000000001"
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.test_file_path = os.path.join(self.temp_dir, "test_structure.json")
+        self.call = proposal_factories.CallFactory()
+
+    def tearDown(self):
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+
+    def _run(self, *args, **fields):
+        data = {
+            "call_assignment_configurations": [
+                {
+                    "uuid": self.CONFIG_UUID,
+                    "call_uuid": self.call.uuid.hex,
+                    **fields,
+                }
+            ]
+        }
+        with open(self.test_file_path, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        output = StringIO()
+        call_command(
+            "import_structure", *args, input=self.test_file_path, stdout=output
+        )
+        return output.getvalue()
+
+    def test_non_default_values_are_imported(self):
+        self._run(
+            auto_reassign_on_decline=True,
+            max_auto_reassign_attempts=5,
+            assignment_expiration_days=14,
+            send_reminder_before_expiry_days=3,
+        )
+
+        config = CallAssignmentConfiguration.objects.get(call=self.call)
+        self.assertEqual(config.uuid.hex, self.CONFIG_UUID)
+        self.assertTrue(config.auto_reassign_on_decline)
+        self.assertEqual(config.max_auto_reassign_attempts, 5)
+        self.assertEqual(config.assignment_expiration_days, 14)
+        self.assertEqual(config.send_reminder_before_expiry_days, 3)
+
+    def test_missing_fields_fall_back_to_model_defaults(self):
+        self._run(assignment_expiration_days=10)
+
+        config = CallAssignmentConfiguration.objects.get(call=self.call)
+        self.assertEqual(config.assignment_expiration_days, 10)
+        self.assertFalse(config.auto_reassign_on_decline)
+        self.assertEqual(config.max_auto_reassign_attempts, 3)
+        self.assertEqual(config.send_reminder_before_expiry_days, 2)
+
+    def test_existing_configuration_is_updated_with_update_flag(self):
+        self._run(assignment_expiration_days=10)
+        self._run("--update", assignment_expiration_days=21)
+
+        config = CallAssignmentConfiguration.objects.get(call=self.call)
+        self.assertEqual(config.assignment_expiration_days, 21)
+
+    def test_existing_configuration_is_kept_without_update_flag(self):
+        self._run(assignment_expiration_days=10)
+        self._run(assignment_expiration_days=21)
+
+        config = CallAssignmentConfiguration.objects.get(call=self.call)
+        self.assertEqual(config.assignment_expiration_days, 10)
+
+    def test_invalid_value_is_skipped(self):
+        output = self._run(assignment_expiration_days=-1)
+
+        self.assertFalse(
+            CallAssignmentConfiguration.objects.filter(call=self.call).exists()
+        )
+        self.assertIn("assignment_expiration_days", output)
+
+    def test_unknown_call_is_skipped(self):
+        self.call.delete()
+        output = self._run(assignment_expiration_days=10)
+
+        self.assertFalse(CallAssignmentConfiguration.objects.exists())
+        self.assertIn("not found", output)
+
+
+class CallConfigurationRoundTripTest(TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.export_path = os.path.join(self.temp_dir, "export.json")
+        self.call = proposal_factories.CallFactory()
+
+    def tearDown(self):
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+
+    def test_export_then_import_preserves_both_configurations(self):
+        coi = CallCOIConfiguration.objects.create(
+            call=self.call,
+            coauthorship_lookback_years=6,
+            include_same_institution=False,
+            recusal_required_types=[COITypes.INST_SAME],
+            invitation_proposal_disclosure=ProposalDisclosureLevels.TITLES_AND_SUMMARIES,
+        )
+        assignment = CallAssignmentConfiguration.objects.create(
+            call=self.call,
+            auto_reassign_on_decline=True,
+            max_auto_reassign_attempts=4,
+            assignment_expiration_days=14,
+            send_reminder_before_expiry_days=3,
+        )
+        fields = [
+            f.name
+            for model in (CallCOIConfiguration, CallAssignmentConfiguration)
+            for f in model._meta.concrete_fields
+        ]
+        self.assertIn("invitation_proposal_disclosure", fields)
+
+        def snapshot(instance):
+            return {
+                f.name: f.value_from_object(instance)
+                for f in type(instance)._meta.concrete_fields
+                if f.name not in {"id", "created", "modified"}
+            }
+
+        expected_coi = snapshot(coi)
+        expected_assignment = snapshot(assignment)
+
+        call_command("export_structure", "-o", self.export_path, stdout=StringIO())
+        CallCOIConfiguration.objects.all().delete()
+        CallAssignmentConfiguration.objects.all().delete()
+        call_command("import_structure", "-i", self.export_path, stdout=StringIO())
+
+        self.assertEqual(
+            snapshot(CallCOIConfiguration.objects.get(call=self.call)), expected_coi
+        )
+        self.assertEqual(
+            snapshot(CallAssignmentConfiguration.objects.get(call=self.call)),
+            expected_assignment,
+        )

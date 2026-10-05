@@ -7,6 +7,8 @@ from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from django.contrib.contenttypes.models import ContentType
+from django.core.cache import cache
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.db.models import F
@@ -45,6 +47,7 @@ from waldur_mastermind.invoices.models import (
     InvoiceItem,
     ProjectCredit,
 )
+from waldur_mastermind.marketplace import posix_ids
 from waldur_mastermind.marketplace.enums import (
     LimitPeriods,
     MissingUsagePolicies,
@@ -76,6 +79,7 @@ from waldur_mastermind.marketplace.models import (
     ResourceProject,
     RobotAccount,
     ServiceProvider,
+    ServiceProviderProjectGroup,
     SlurmOfferingQoS,
     SlurmPartitionQoS,
     SoftwareCatalog,
@@ -87,10 +91,12 @@ from waldur_mastermind.policy.models import (
     SlurmCommandHistory,
     SlurmPeriodicUsagePolicy,
 )
+from waldur_mastermind.proposal.enums import ProposalDisclosureLevels
 from waldur_mastermind.proposal.models import (
     AssignmentBatch,
     AssignmentItem,
     Call,
+    CallAssignmentConfiguration,
     CallCOIConfiguration,
     CallDocument,
     CallManagingOrganisation,
@@ -116,6 +122,9 @@ from waldur_mastermind.proposal.models import (
     ReviewerStats,
     ReviewerSuggestion,
     Round,
+)
+from waldur_mastermind.proposal.serializers import (
+    CallAssignmentConfigurationSerializer,
 )
 from waldur_openstack.models import Flavor, Image, Instance, Tenant, Volume
 
@@ -179,6 +188,13 @@ class Command(BaseCommand):
         waldur import_structure -i structure.json --skip-users --dry-run
         waldur import_structure -i structure.json --skip-rabbitmq-messages --skip-roles
     """
+
+    ASSIGNMENT_CONFIGURATION_FIELDS = (
+        "auto_reassign_on_decline",
+        "max_auto_reassign_attempts",
+        "assignment_expiration_days",
+        "send_reminder_before_expiry_days",
+    )
 
     @staticmethod
     def _normalize_uuid(uuid_str):
@@ -314,6 +330,12 @@ class Command(BaseCommand):
                 "errors": 0,
             },
             "posix_id_pools": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "service_provider_project_groups": {
                 "created": 0,
                 "updated": 0,
                 "skipped": 0,
@@ -512,6 +534,12 @@ class Command(BaseCommand):
             },
             "reviewer_stats": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "call_coi_configurations": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "call_assignment_configurations": {
                 "created": 0,
                 "updated": 0,
                 "skipped": 0,
@@ -988,6 +1016,14 @@ class Command(BaseCommand):
             lambda: self.import_posix_id_pools(data.get("posix_id_pools", [])),
         )
 
+        # Import provider project groups (depends on pools and projects)
+        self._safe_import(
+            "service_provider_project_groups",
+            lambda: self.import_service_provider_project_groups(
+                data.get("service_provider_project_groups", [])
+            ),
+        )
+
         # Import resource plan periods (depends on resources and plans)
         self._safe_import(
             "resource_plan_periods",
@@ -1044,6 +1080,13 @@ class Command(BaseCommand):
                 data.get("question_dependencies", [])
             ),
         )
+        # Offerings are imported before checklists, so their compliance
+        # checklist could not be resolved then. Link it now, before offering
+        # users are imported, so each gets its checklist completion.
+        self._safe_import(
+            "offerings",
+            lambda: self.link_offering_compliance_checklists(data.get("offerings", [])),
+        )
 
         # Import proposal/call management data BEFORE user_roles (user_roles may scope to Calls)
         # Dependency order: CMO -> calls -> offerings -> templates -> rounds -> proposals -> resources -> reviews
@@ -1068,6 +1111,12 @@ class Command(BaseCommand):
             "call_coi_configurations",
             lambda: self.import_call_coi_configurations(
                 data.get("call_coi_configurations", [])
+            ),
+        )
+        self._safe_import(
+            "call_assignment_configurations",
+            lambda: self.import_call_assignment_configurations(
+                data.get("call_assignment_configurations", [])
             ),
         )
         self._safe_import(
@@ -1523,8 +1572,6 @@ class Command(BaseCommand):
         if touched:
             # Drop the cached public configuration so consumers see the new
             # flag values without a backend restart.
-            from django.core.cache import cache
-
             cache.delete("API_CONFIGURATION")
 
     def import_users(self, users_data):
@@ -3207,6 +3254,25 @@ class Command(BaseCommand):
                 )
                 self.stats["offerings"]["errors"] += 1
 
+    def link_offering_compliance_checklists(self, offerings_data):
+        """Attach compliance checklists that did not exist when offerings were imported."""
+        for offering_data in offerings_data:
+            checklist_uuid = offering_data.get("compliance_checklist_uuid")
+            if not checklist_uuid or self.dry_run:
+                continue
+            checklist = Checklist.objects.filter(uuid=checklist_uuid).first()
+            if not checklist:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Offering {offering_data.get('uuid')}: compliance checklist "
+                        f"{checklist_uuid} not found"
+                    )
+                )
+                continue
+            Offering.objects.filter(
+                uuid=offering_data.get("uuid"), compliance_checklist__isnull=True
+            ).update(compliance_checklist=checklist)
+
     def import_offering_endpoints(self, endpoints_data):
         """Import offering access endpoints."""
         self.stdout.write("Importing offering endpoints...")
@@ -3870,6 +3936,9 @@ class Command(BaseCommand):
                         "min_gid": item.get("min_gid"),
                         "max_gid": item.get("max_gid"),
                         "next_gid": item.get("next_gid"),
+                        "min_group_gid": item.get("min_group_gid"),
+                        "max_group_gid": item.get("max_group_gid"),
+                        "next_group_gid": item.get("next_group_gid"),
                         "description": item.get("description", ""),
                     },
                 )
@@ -3878,6 +3947,62 @@ class Command(BaseCommand):
                 self.stats["posix_id_pools"]["errors"] += 1
                 self.stdout.write(
                     self.style.ERROR(f"Error importing POSIX ID pool: {e}")
+                )
+
+    def import_service_provider_project_groups(self, groups_data):
+        """Import provider project groups by uuid and pin their GIDs again.
+
+        The GID is recorded as the group's identity in the provider's pool, so
+        the allocator never hands it out; a GID another consumer already holds
+        is imported on the group but reported and left unreserved.
+        """
+        if not groups_data:
+            return
+        self.stdout.write("Importing provider project groups...")
+        stats = self.stats["service_provider_project_groups"]
+        sp_map = {str(sp.uuid): sp for sp in ServiceProvider.objects.all()}
+        for item in groups_data:
+            try:
+                provider = sp_map.get(
+                    self._normalize_uuid(item.get("service_provider_uuid") or "")
+                )
+                if provider is None or not item.get("uuid"):
+                    stats["errors"] += 1
+                    continue
+                project = None
+                if item.get("project_uuid"):
+                    project = Project.objects.filter(
+                        uuid=self._normalize_uuid(item["project_uuid"])
+                    ).first()
+                group, created = ServiceProviderProjectGroup.objects.update_or_create(
+                    uuid=self._normalize_uuid(item["uuid"]),
+                    defaults={
+                        "service_provider": provider,
+                        "project": project,
+                        "name": item["name"],
+                    },
+                )
+                stats["created" if created else "updated"] += 1
+                gid = item.get("gid")
+                if gid is None or group.gid == gid:
+                    continue
+                try:
+                    posix_ids.set_project_group_gid(
+                        group, gid, allow_outside_range=True
+                    )
+                except (posix_ids.PosixIdValueConflict, DjangoValidationError) as e:
+                    group.gid = gid
+                    group.save(update_fields=["gid"])
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Project group {group.name} imported with GID {gid} "
+                            f"but not reserved: {e}"
+                        )
+                    )
+            except Exception as e:
+                stats["errors"] += 1
+                self.stdout.write(
+                    self.style.ERROR(f"Error importing provider project group: {e}")
                 )
 
     def import_resource_projects(self, resource_projects_data):
@@ -5402,7 +5527,9 @@ class Command(BaseCommand):
                     "credit": credit,
                 }
 
-                # Only set start/end if provided, otherwise let model use defaults
+                # Only set unit/start/end if provided, otherwise let model use defaults
+                if item_data.get("unit"):
+                    defaults["unit"] = item_data["unit"]
                 if start is not None:
                     defaults["start"] = start
                 if end is not None:
@@ -7748,6 +7875,11 @@ class Command(BaseCommand):
             )
             self.stats["constance_settings"]["errors"] += 1
 
+        if not self.dry_run:
+            # Public settings are cached without expiry; drop them so a running
+            # backend serves the imported branding and profile attributes.
+            cache.delete("API_CONFIGURATION")
+
     def import_call_managing_organisations(self, cmo_data):
         """Import call managing organisation data."""
         self.stdout.write("Importing call managing organisations...")
@@ -8262,10 +8394,10 @@ class Command(BaseCommand):
                     "project": project,
                     "created_by": created_by,
                     "approved_by": approved_by,
-                    # Dumps written before #324 carry "duration_in_days"; the
-                    # column is gone, so the key is ignored.
+                    # Older dumps may carry "duration_in_days" or
+                    # "project_duration"; the columns are gone, so the keys
+                    # are ignored.
                     "project_summary": proposal_data.get("project_summary", ""),
-                    "project_duration": proposal_data.get("project_duration"),
                     "allocation_comment": proposal_data.get("allocation_comment", ""),
                 }
 
@@ -8517,9 +8649,8 @@ class Command(BaseCommand):
                     "comment_project_description": review_data.get(
                         "comment_project_description"
                     ),
-                    "comment_project_duration": review_data.get(
-                        "comment_project_duration"
-                    ),
+                    # Older dumps may carry "comment_project_duration"; the
+                    # column is gone, so the key is ignored.
                     "comment_project_supporting_documentation": review_data.get(
                         "comment_project_supporting_documentation"
                     ),
@@ -9345,6 +9476,16 @@ class Command(BaseCommand):
                     problems.append(
                         f"each conflict type may only be assigned to one rule ({listed})"
                     )
+                disclosure = config_data.get(
+                    "invitation_proposal_disclosure",
+                    ProposalDisclosureLevels.TITLES_ONLY,
+                )
+                known_levels = [level for level, _ in ProposalDisclosureLevels.CHOICES]
+                if disclosure not in known_levels:
+                    problems.append(
+                        f"unknown invitation disclosure level {disclosure!r} "
+                        f"(expected one of {', '.join(known_levels)})"
+                    )
                 if problems:
                     self.stdout.write(
                         self.style.WARNING(
@@ -9381,6 +9522,7 @@ class Command(BaseCommand):
                     "auto_detect_named_personnel": config_data.get(
                         "auto_detect_named_personnel", True
                     ),
+                    "invitation_proposal_disclosure": disclosure,
                 }
 
                 if not self.dry_run:
@@ -9415,6 +9557,98 @@ class Command(BaseCommand):
                     )
                 )
                 self.stats["call_coi_configurations"]["errors"] += 1
+
+    def import_call_assignment_configurations(self, configs_data):
+        """Import per-call reviewer assignment configuration data."""
+        self.stdout.write("Importing call assignment configurations...")
+        stats = self.stats["call_assignment_configurations"]
+        for config_data in configs_data:
+            try:
+                uuid = config_data.get("uuid")
+                call_uuid = config_data.get("call_uuid")
+
+                if not uuid or not call_uuid:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping call assignment config without UUID or call_uuid"
+                        )
+                    )
+                    stats["errors"] += 1
+                    continue
+
+                call = Call.objects.filter(uuid=call_uuid).first()
+                if not call:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping assignment config {uuid}: call {call_uuid} not found"
+                        )
+                    )
+                    stats["errors"] += 1
+                    continue
+
+                # Written straight to the ORM, so run the values through the
+                # API serializer's validation to reject what the API would.
+                serializer = CallAssignmentConfigurationSerializer(
+                    data={
+                        field: config_data[field]
+                        for field in self.ASSIGNMENT_CONFIGURATION_FIELDS
+                        if field in config_data
+                    }
+                )
+                if not serializer.is_valid():
+                    listed = "; ".join(
+                        f"{field}: {' '.join(str(e) for e in errors)}"
+                        for field, errors in sorted(serializer.errors.items())
+                    )
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping assignment config {uuid}: {listed}"
+                        )
+                    )
+                    stats["errors"] += 1
+                    continue
+
+                defaults = {
+                    "call": call,
+                    **{
+                        field: serializer.validated_data.get(
+                            field,
+                            CallAssignmentConfiguration._meta.get_field(
+                                field
+                            ).get_default(),
+                        )
+                        for field in self.ASSIGNMENT_CONFIGURATION_FIELDS
+                    },
+                }
+
+                existing = CallAssignmentConfiguration.objects.filter(
+                    uuid=uuid
+                ).exists()
+                if existing:
+                    if self.update_existing:
+                        if not self.dry_run:
+                            with transaction.atomic():
+                                CallAssignmentConfiguration.objects.filter(
+                                    uuid=uuid
+                                ).update(**defaults)
+                        stats["updated"] += 1
+                    else:
+                        stats["skipped"] += 1
+                else:
+                    if not self.dry_run:
+                        with transaction.atomic():
+                            CallAssignmentConfiguration.objects.create(
+                                uuid=uuid, **defaults
+                            )
+                    stats["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import call assignment config {config_data.get('uuid')}: {e}"
+                    )
+                )
+                stats["errors"] += 1
 
     def import_matching_configurations(self, configs_data):
         """Import matching configuration data."""

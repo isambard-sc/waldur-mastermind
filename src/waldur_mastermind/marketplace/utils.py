@@ -79,11 +79,12 @@ from waldur_core.structure.managers import (
     get_project_users,
 )
 from waldur_freeipa import models as freeipa_models
+from waldur_mastermind.common.serializers import strip_hidden_options
 from waldur_mastermind.common.utils import create_request, mb_to_gb
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices.structures import InvoiceResourceLimitPeriodDict
 from waldur_mastermind.invoices.utils import get_full_days
-from waldur_mastermind.marketplace import attribute_types, billing_mode
+from waldur_mastermind.marketplace import attribute_types, billing_mode, derived_limits
 from waldur_mastermind.marketplace.billing import MarketplaceBillingService
 from waldur_mastermind.marketplace.enums import (
     OPENSTACK_TENANT_OFFERING,
@@ -104,6 +105,7 @@ from waldur_mastermind.marketplace.enums import (
 from waldur_mastermind.marketplace_openstack import get_mb_component_types
 
 from . import models, plugins, posix_ids
+from . import project_groups as provider_project_groups
 from .enums import BASIC_OFFERING as BASIC_PLUGIN_NAME
 from .enums import OrderTypes
 
@@ -397,10 +399,12 @@ def validate_limit_amount(value, component):
             )
 
 
-def validate_maximum_available_limit(value, component, resource=None):
-    if not component.max_available_limit:
-        return
+def get_allocated_limit_total(component, resource=None):
+    """Sum of ``component``'s limit over the offering's other resources.
 
+    ``resource`` is the one being changed, so its own stored limit is left out
+    of the total the new value is weighed against.
+    """
     all_offering_resources = models.Resource.objects.filter(
         offering=component.offering
     ).exclude(limits={})
@@ -412,13 +416,20 @@ def validate_maximum_available_limit(value, component, resource=None):
     # against come out of a JSONField as int or float. Comparing the two is
     # fine, but subtracting is a TypeError, so the running total is carried as
     # Decimal from the start.
-    current_total_limits = sum(
+    return sum(
         (
-            decimal.Decimal(str(resource["limits"].get(component.type, 0)))
-            for resource in all_offering_resources.values("limits")
+            decimal.Decimal(str(item["limits"].get(component.type, 0)))
+            for item in all_offering_resources.values("limits")
         ),
         decimal.Decimal(0),
     )
+
+
+def validate_maximum_available_limit(value, component, resource=None):
+    if not component.max_available_limit:
+        return
+
+    current_total_limits = get_allocated_limit_total(component, resource)
 
     if (
         current_total_limits + decimal.Decimal(str(value))
@@ -543,6 +554,132 @@ def validate_limit_precision(value, component):
         raise serializers.ValidationError(message)
 
 
+def clamp_limit_value(value, component, resource=None, stored_value=None):
+    """Narrow a limit to the nearest value the component accepts.
+
+    ``validate_limits`` rejects a limit outside the component's bounds, which
+    is the right answer when a person is ordering: the request stops and they
+    correct it. The site agent has no such recourse — it has no error handling
+    for a ``set_limits`` 4xx and marks the resource as ERRED — so that route
+    narrows the value instead and logs the divergence, which is the signal that
+    the agent's limit reporting needs fixing.
+
+    ``stored_value`` is the limit the resource already holds. A clamp may
+    refuse the request, wholly or in part, but never moves the limit against
+    the direction the request asked for, so the result always lies between the
+    stored limit and the requested one.
+
+    Returns a ``(value, reason)`` pair. ``reason`` is None when the value was
+    already acceptable, otherwise it names the bound that moved it. A None
+    value means the component's own configuration leaves nothing to narrow to,
+    so the caller keeps whatever it had.
+    """
+    places = component.limit_decimal_places or 0
+    step = decimal.Decimal(1).scaleb(-places)
+
+    def truncate(amount):
+        # ROUND_FLOOR rather than ROUND_DOWN: the latter rounds toward zero, so
+        # it would raise a negative limit instead of narrowing it.
+        return amount.quantize(step, rounding=decimal.ROUND_FLOOR)
+
+    try:
+        amount = decimal.Decimal(str(value))
+        truncated = truncate(amount)
+    except (decimal.InvalidOperation, ValueError, TypeError):
+        # Not a number, or more digits than the decimal context can hold.
+        # Nothing legitimate reaches this and there is no nearest value to
+        # narrow it to.
+        return None, "precision"
+
+    reason = None
+    raw = amount
+
+    if truncated != amount:
+        amount = truncated
+        reason = "precision"
+
+    requested = amount
+
+    stored = None
+    if stored_value is not None:
+        try:
+            # Left as stored, not truncated: it is the direction boundary, not
+            # a value being proposed. A limit written before this route checked
+            # precision may be finer than the component accepts, and truncating
+            # it here would turn "refuse the request" into "shave the existing
+            # allocation".
+            stored = decimal.Decimal(str(stored_value))
+        except (decimal.InvalidOperation, ValueError, TypeError):
+            stored = None
+
+    # max_value keeps the truthiness test validate_min_max_limit uses: 0 in
+    # that column means "no maximum".
+    if component.max_value and amount > component.max_value:
+        amount = truncate(decimal.Decimal(component.max_value))
+        reason = "max_value"
+
+    if component.min_value is not None and amount < component.min_value:
+        # The bound is rounded up, since truncating it would land back below
+        # the minimum it is meant to enforce.
+        amount = decimal.Decimal(component.min_value).quantize(
+            step, rounding=decimal.ROUND_CEILING
+        )
+        reason = "min_value"
+        if component.max_value and amount > component.max_value:
+            return None, reason
+
+    # The offering-wide cap bounds the total the offering hands out, and a
+    # value at or below the stored limit adds nothing to that total. Weighing a
+    # shrink against it would refuse to let an allocation that already exceeds
+    # a lowered cap give anything back, and keep billing for capacity the
+    # backend has released.
+    if component.max_available_limit and (stored is None or amount > stored):
+        remaining = component.max_available_limit - get_allocated_limit_total(
+            component, resource
+        )
+        # The offering-wide cap is exclusive (validate_maximum_available_limit
+        # rejects a total that merely reaches it), so the ceiling is the
+        # largest step strictly below what is left.
+        ceiling = truncate(remaining)
+        if ceiling == remaining:
+            ceiling -= step
+        if amount > ceiling:
+            if ceiling < 0 or (
+                component.min_value is not None and ceiling < component.min_value
+            ):
+                return None, "max_available_limit"
+            amount = ceiling
+            reason = "max_available_limit"
+
+    if stored is not None:
+        # A bound may refuse what the request asks for, but it may not reverse
+        # it. A provider can lower a maximum or raise a minimum long after the
+        # resource was allocated, and the agent then reports a value moving the
+        # other way; clamping to the bound there would resize a working
+        # resource — and bill the customer for it — in the opposite direction
+        # from the one anybody asked for. Keeping the result between the stored
+        # limit and the requested one means the worst outcome is a refused
+        # request, with the resource holding on to what it had. The
+        # offering-wide ceiling relies on this too: growth is capped, while an
+        # allocation that already exceeds what is left is not taken away.
+        if requested < stored < raw:
+            # Truncation alone carried a growth request below the stored
+            # limit, so the interval below would accept a shrink. The request
+            # asks for a step the component does not have: refuse it.
+            amount = stored
+        else:
+            low, high = min(stored, requested), max(stored, requested)
+            if amount < low:
+                amount = low
+            elif amount > high:
+                amount = high
+
+    if reason is None:
+        return value, None
+
+    return narrow_limit_value(amount), reason
+
+
 def get_components_map(limits, offering: models.Offering, plan=None):
     """Pair each limit key with the component it belongs to.
 
@@ -570,13 +707,126 @@ def get_components_map(limits, offering: models.Offering, plan=None):
     return result
 
 
-def validate_limits(limits, offering, resource=None, is_creation=False, plan=None):
+def derived_limit_inputs(resource, new_options=None):
+    """The inputs a resource's derived limits are calculated from.
+
+    Ordered values live in the resource's attributes; a paired
+    ``component_formula`` resource option holds the value as changed since,
+    and wins, and ``new_options`` -- an order's option changes -- win over
+    both. Other resource options never do, even with the same name: they can
+    be edited without an order.
     """
+    offering = resource.offering
+    paired = derived_limits.paired_resource_options(
+        offering.resource_options, (offering.options or {}).get("options")
+    )
+    inputs = dict(resource.attributes or {})
+    for options in (resource.options or {}, new_options or {}):
+        inputs.update({name: options[name] for name in paired if name in options})
+    return inputs
+
+
+def copy_order_options_to_resource(order):
+    """Set a created resource's options from its order's current values.
+
+    The values are copied when the order is placed; an order changed since
+    (edited while pending, or by the provider at approval) must not leave the
+    resource with the value it was first ordered with.
+    """
+    resource = order.resource
+    resource_options = (order.offering.resource_options or {}).get("options")
+    if not resource or not resource_options:
+        return
+    attributes = order.attributes or {}
+    resource.options = strip_hidden_options(
+        resource_options,
+        {key: attributes[key] for key in resource_options if key in attributes},
+    )
+    resource.save(update_fields=["options"])
+
+
+def copy_order_attributes_to_resource(order):
+    """Set a created resource's attributes from its create order's current values.
+
+    Like copy_order_options_to_resource, for the order form values: they are
+    copied when the order is placed, and a value changed since (edited while
+    pending, or by the provider at approval) must replace the ordered one on
+    the resource too. Otherwise the resource keeps holding a value its order no
+    longer asks for, and a unique option counts it as taken. They are replaced,
+    not merged, so a value the change dropped does not stay behind.
+    """
+    resource = order.resource
+    if not resource:
+        return
+    resource.attributes = dict(order.attributes or {})
+    resource.save(update_fields=["attributes"])
+
+
+def changed_derived_inputs(resource, new_options):
+    """Names of the formula inputs that ``new_options`` would change on ``resource``."""
+    offering = resource.offering
+    paired = derived_limits.paired_resource_options(
+        offering.resource_options, (offering.options or {}).get("options")
+    )
+    current = derived_limit_inputs(resource)
+    return {
+        name
+        for name in paired
+        if name in (new_options or {})
+        and str(new_options[name]) != str(current.get(name))
+    }
+
+
+def apply_derived_limits(limits, offering, attributes, plan=None, fallback=None):
+    """Return ``limits`` with the offering's derived limits set by the server.
+
+    Derived limits come from ``component_formula`` and ``component_sum`` order
+    options (see ``derived_limits``). ``attributes`` holds the formula inputs;
+    ``fallback`` is what to keep for a derived limit that cannot be calculated,
+    normally the resource's current limits.
+    """
+    options = (offering.options or {}).get("options")
+    if not derived_limits.derived_components(options):
+        return limits
+    components = (
+        billing_mode.resolve_plan(plan)
+        if plan is not None
+        else billing_mode.resolve_offering(offering)
+    ).limit_components
+    return derived_limits.compute_derived_limits(
+        options, attributes, limits, components, fallback=fallback
+    )
+
+
+def validate_limits(
+    limits,
+    offering,
+    resource=None,
+    is_creation=False,
+    plan=None,
+    attributes=None,
+    fallback=None,
+):
+    """Validate requested limits and return them with derived limits applied.
+
+    Every change to a resource's limits passes through here, so this is where
+    the server sets the limits it derives from order options: a derived limit
+    sent by the client is replaced, one left out is put back, and a sum is
+    recalculated when a component it adds up changes. Callers must use the
+    returned limits.
+
     @param limits Maximum/Minimum limit-based components values and maximum available limit
     @param offering The offering being created
     @param resource Passing the resource if the limits of the resource are being updated.
     @param is_creation If True, skip the can_update_limits check (it only applies to updates).
     @param plan The plan the limits are requested under; decides which components take limits.
+    @param attributes The order options that derived limits are calculated
+        from, when the caller holds them (creating, editing or approving an
+        order). Omitted for a change to an existing resource, whose own
+        options are used; there a derived limit that cannot be calculated
+        keeps its current value.
+    @param fallback With ``attributes``: values to keep for derived limits that
+        cannot be calculated from them.
     """
     if not is_creation and not plugins.manager.can_update_limits(offering.type):
         raise serializers.ValidationError(
@@ -585,6 +835,19 @@ def validate_limits(limits, offering, resource=None, is_creation=False, plan=Non
 
     if plan is None and resource is not None:
         plan = resource.plan
+
+    if attributes is not None:
+        limits = apply_derived_limits(
+            limits, offering, attributes, plan=plan, fallback=fallback
+        )
+    elif resource is not None:
+        limits = apply_derived_limits(
+            limits,
+            offering,
+            derived_limit_inputs(resource),
+            plan=plan,
+            fallback=resource.limits,
+        )
 
     limits_validator = plugins.manager.get_limits_validator(offering.type)
     if limits_validator:
@@ -598,6 +861,185 @@ def validate_limits(limits, offering, resource=None, is_creation=False, plan=Non
         validate_limit_amount(value, component)
 
         validate_maximum_available_limit(value, component, resource)
+
+    return limits
+
+
+def get_unique_options(options):
+    """Names of the options whose values must be unique across the offering."""
+    return [
+        name
+        for name, option in (options or {}).items()
+        if isinstance(option, dict) and option.get("unique")
+    ]
+
+
+def _unique_option_candidates(option, value):
+    """Stored forms of a value that count as the same value.
+
+    Attributes are stored as submitted, so an integer option may hold 5 or "5".
+    """
+    if option.get("type") == "integer":
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return [value]
+        return [number, str(number)]
+    return [value]
+
+
+# Update orders whose new_options have not been written to the resource yet.
+PENDING_UPDATE_ORDER_STATES = (
+    OrderStates.PENDING_CONSUMER,
+    OrderStates.PENDING_PROVIDER,
+    OrderStates.PENDING_PROJECT,
+    OrderStates.PENDING_START_DATE,
+    OrderStates.EXECUTING,
+)
+
+
+def validate_unique_options(
+    offering, options, values, field, exclude_resource=None, exclude_order=None
+):
+    """Reject option values that another live resource of the offering holds.
+
+    `field` is "attributes" for the order form options and "options" for the
+    resource options. A resource counts until it is terminated. That includes
+    an ERRED one, which may still exist in the backend; a create order that
+    errs before the backend created anything, and a rejected or canceled one,
+    terminates its resource and so frees the value.
+
+    For "attributes" the create orders of live resources are checked as well:
+    an edited create order copies its attributes onto its resource (see
+    copy_order_attributes_to_resource), but orders edited before that did not.
+    For "options" the pending update orders of live resources are checked too:
+    their new_options are written only when they complete, and until then
+    they must reserve the value.
+
+    Callers that write the values must hold a lock on the offering row (see
+    lock_offering_for_unique_options), or two requests can both pass.
+    """
+    if not isinstance(values, dict):
+        return
+    options = options or {}
+    resources = models.Resource.objects.filter(offering=offering).exclude(
+        state=ResourceStates.TERMINATED
+    )
+    orders = models.Order.objects.filter(
+        offering=offering, type=OrderTypes.CREATE, resource__in=resources
+    )
+    update_orders = models.Order.objects.filter(
+        offering=offering,
+        type=OrderTypes.UPDATE,
+        state__in=PENDING_UPDATE_ORDER_STATES,
+        resource__in=resources,
+    )
+    if exclude_resource is not None:
+        resources = resources.exclude(pk=exclude_resource.pk)
+        orders = orders.exclude(resource=exclude_resource)
+        update_orders = update_orders.exclude(resource=exclude_resource)
+    if exclude_order is not None:
+        orders = orders.exclude(pk=exclude_order.pk)
+        update_orders = update_orders.exclude(pk=exclude_order.pk)
+
+    errors = {}
+    for name in get_unique_options(options):
+        value = values.get(name)
+        if value is None or value == "":
+            continue
+        candidates = _unique_option_candidates(options[name], value)
+        query = Q()
+        for candidate in candidates:
+            query |= Q(**{f"{field}__contains": {name: candidate}})
+        taken = resources.filter(query).exists()
+        if not taken and field == "attributes":
+            taken = orders.filter(query).exists()
+        if not taken and field == "options":
+            pending = Q()
+            for candidate in candidates:
+                pending |= Q(attributes__new_options__contains={name: candidate})
+            taken = update_orders.filter(pending).exists()
+        if taken:
+            errors[name] = _(
+                "This value is already used by another resource of this offering."
+            )
+    if errors:
+        raise rf_exceptions.ValidationError(errors)
+
+
+def lock_offering_for_unique_options(offering, *option_sets):
+    """Serialise writers of unique option values for one offering.
+
+    Takes a row lock only when one of the option sets has a unique option, so
+    offerings without them are not slowed down. Must run inside a transaction.
+    """
+    if any(get_unique_options(options) for options in option_sets):
+        models.Offering.objects.select_for_update().filter(pk=offering.pk).first()
+
+
+def validate_unique_order_values(
+    offering, attributes, keys=None, exclude_resource=None, exclude_order=None
+):
+    """Check the values of a create order against the offering's unique options.
+
+    The order form values are checked against unique order options. The ones
+    that also name a resource option are copied to the resource's options (see
+    copy_order_options_to_resource), so they are checked against unique
+    resource options too. `keys` limits the check to those option names, for
+    callers that change only some values.
+    """
+    attributes = attributes or {}
+    options = (offering.options or {}).get("options")
+    resource_options = (offering.resource_options or {}).get("options") or {}
+    copied = strip_hidden_options(
+        resource_options,
+        {key: attributes[key] for key in resource_options if key in attributes},
+    )
+    if keys is not None:
+        attributes = {key: value for key, value in attributes.items() if key in keys}
+        copied = {key: value for key, value in copied.items() if key in keys}
+    validate_unique_options(
+        offering,
+        options,
+        attributes,
+        "attributes",
+        exclude_resource=exclude_resource,
+        exclude_order=exclude_order,
+    )
+    validate_unique_options(
+        offering,
+        resource_options,
+        copied,
+        "options",
+        exclude_resource=exclude_resource,
+    )
+
+
+def lock_and_validate_unique_options_of_resource(resource):
+    """Reject bringing back a resource whose unique values are taken now.
+
+    A terminated resource frees its values, so by the time it is restored
+    another resource may hold them. Must run inside a transaction that also
+    makes the resource live again, so the lock covers that write.
+    """
+    offering = resource.offering
+    options = (offering.options or {}).get("options")
+    resource_options = (offering.resource_options or {}).get("options")
+    lock_offering_for_unique_options(offering, options, resource_options)
+    validate_unique_options(
+        offering,
+        options,
+        resource.attributes or {},
+        "attributes",
+        exclude_resource=resource,
+    )
+    validate_unique_options(
+        offering,
+        resource_options,
+        resource.options or {},
+        "options",
+        exclude_resource=resource,
+    )
 
 
 def validate_attributes(attributes, category):
@@ -914,6 +1356,14 @@ def move_resource(resource: models.Resource, project):
         order.project = project
         order.save(update_fields=["project"])
 
+    # The target project now uses the offering's provider. The source project
+    # keeps its group, which goes out of use if this was its last resource.
+    transaction.on_commit(
+        lambda: provider_project_groups.run_safely(
+            provider_project_groups.ensure_group_for_resource, resource
+        )
+    )
+
     for invoice_item in invoice_models.InvoiceItem.objects.filter(
         resource=resource,
         invoice__state__in=invoice_models.Invoice.States.MUTABLE_STATES,
@@ -1012,7 +1462,15 @@ def _force_approve_pending_terminate_order(pending_order):
     )
 
 
-def terminate_resource(resource, user, termination_comment=None, scheduled=False):
+def terminate_resource(
+    resource, user, termination_comment=None, scheduled=False, order_author=None
+):
+    """Place a termination order for the resource, as `user`.
+
+    `order_author` names somebody else as the person the order is for, leaving
+    `user` as the identity the work is carried out under; see
+    `ConsumerResourceViewSet.create_resource_order`.
+    """
     from waldur_mastermind.marketplace import views
 
     if scheduled:
@@ -1056,7 +1514,9 @@ def terminate_resource(resource, user, termination_comment=None, scheduled=False
         )
         return
 
-    response = create_request(view, user, {}, uuid=resource.uuid.hex)
+    response = create_request(
+        view, user, {}, uuid=resource.uuid.hex, order_author=order_author
+    )
 
     if scheduled and response and response.status_code == status.HTTP_200_OK:
         # The freshly created order may still be PENDING_CONSUMER if `user`
@@ -1072,6 +1532,37 @@ def terminate_resource(resource, user, termination_comment=None, scheduled=False
     return response
 
 
+def get_creation_order_author(resource):
+    """The person the resource's own creation order was placed for, if it was
+    placed on their behalf.
+
+    An order placed by one of the automated sweeps is nobody's doing, so the
+    only name it can carry is one decided earlier. A creation order placed
+    automatically holds that decision: a call names the author of the orders
+    it places when it grants a resource (`proposal.utils.resolve_order_author`),
+    so carrying the name over keeps the termination ticket on the same desk as
+    the creation one -- without this app having to know that calls exist.
+
+    A creation order somebody placed themselves decided nothing of the kind.
+    It says who ordered the resource, possibly years ago and possibly somebody
+    who has left the project since, and naming them would route the ticket and
+    the order mail to a person the project may no longer include. Those are
+    left to the robot and the project-role fallback, as before.
+
+    Returns None for a resource with no such creation order: one ordered by a
+    person, an imported one, or one reconciled from a backend orphan.
+    """
+    creating_order = (
+        models.Order.objects.filter(
+            resource=resource, type=OrderTypes.CREATE, placed_automatically=True
+        )
+        .select_related("created_by")
+        .order_by("created")
+        .first()
+    )
+    return creating_order.created_by if creating_order else None
+
+
 def schedule_resources_termination(resources, termination_comment=None, user=None):
     if not resources:
         return
@@ -1083,10 +1574,10 @@ def schedule_resources_termination(resources, termination_comment=None, user=Non
         # `user` would short-circuit the fallback chain on the next iteration
         # and attribute every later resource to the first resource's actor.
         #
-        # Inactive candidates are skipped: termination runs as an internal API
-        # request authenticated as the actor, and an inactive user is rejected
-        # with HTTP 401 "User inactive or deleted.", so the resource would never
-        # be terminated. The system robot is always active and is the fallback.
+        # Inactive candidates are skipped: the actor authenticates the internal
+        # termination request, and an inactive user is rejected with HTTP 401
+        # "User inactive or deleted.", so the resource would never be
+        # terminated.
         actor = next(
             (
                 candidate
@@ -1097,18 +1588,39 @@ def schedule_resources_termination(resources, termination_comment=None, user=Non
                 )
                 if candidate is not None and candidate.is_active
             ),
-            system_robot,
+            None,
         )
 
-        if not actor:
-            logger.error(
-                "User for terminating resources of project with due date does not exist."
+        if actor is not None:
+            # Somebody asked for this termination, so the request is made as
+            # them and the order is theirs, as it has always been -- including
+            # being announced to the offering's notification recipients. One
+            # who cannot approve it themselves is still force-approved below.
+            author = actor
+            response = terminate_resource(
+                resource, actor, termination_comment, scheduled=True
             )
-            return
-
-        response = terminate_resource(
-            resource, actor, termination_comment, scheduled=True
-        )
+        else:
+            # Nobody asked. A creation order placed on somebody's behalf
+            # carries the name its orders are for -- for a granted resource,
+            # the contact the call named -- and naming them is what keeps the
+            # helpdesk ticket off whoever happens to hold the first project
+            # role. They hold no role on the project in the general case, so
+            # the request is made as the robot and the order is marked
+            # placed_automatically, which keeps provisioning with the robot
+            # from there on. An inactive one can no longer be reached, and a
+            # resource somebody ordered themselves names nobody: both leave an
+            # ordinary robot-placed order, as before.
+            author = get_creation_order_author(resource)
+            if author is None or not author.is_active:
+                author = system_robot
+            response = terminate_resource(
+                resource,
+                system_robot,
+                termination_comment,
+                scheduled=True,
+                order_author=None if author == system_robot else author,
+            )
 
         if response and response.status_code != status.HTTP_200_OK:
             # Include the HTTP status and resource state so a repeating failure
@@ -1118,12 +1630,12 @@ def schedule_resources_termination(resources, termination_comment=None, user=Non
             # identically until the resource row is reconciled.
             logger.error(
                 "Terminating resource %s (state=%s, offering=%s, project=%s, "
-                "actor=%s) has failed with HTTP %s. %s",
+                "author=%s) has failed with HTTP %s. %s",
                 resource.uuid.hex,
                 resource.get_state_display(),
                 resource.offering,
                 resource.project,
-                actor,
+                author,
                 response.status_code,
                 response.rendered_content,
             )
@@ -3019,7 +3531,42 @@ def get_project_posix_groups(project):
             }
         )
 
-    rows.sort(key=lambda r: (r["offering_name"], r["kind"], r["gid"]))
+    rows.extend(_provider_project_group_rows(project))
+    rows.sort(key=lambda r: (r["offering_name"] or "", r["kind"], r["gid"] or 0))
+    return rows
+
+
+def _provider_project_group_rows(project):
+    """The project's groups at every service provider, one row each."""
+    groups = list(
+        provider_project_groups.annotate_in_use(
+            models.ServiceProviderProjectGroup.objects.filter(project=project)
+        ).select_related("service_provider__customer")
+    )
+    details = provider_project_groups.describe(groups)
+    rows = []
+    for group in groups:
+        members = details[group.pk]["members"]
+        rows.append(
+            {
+                "kind": "provider_project_group",
+                "gid": group.gid,
+                "offering_uuid": None,
+                "offering_name": None,
+                "provider_name": group.service_provider.customer.name,
+                "role": None,
+                "scope_type": None,
+                "scope_name": None,
+                "scope_uuid": None,
+                "group_uuid": group.uuid.hex,
+                "group_name": group.name,
+                "service_provider_uuid": group.service_provider.uuid.hex,
+                "in_use": group.in_use,
+                "offerings": details[group.pk]["offerings"],
+                "members": members,
+                "member_count": len(members),
+            }
+        )
     return rows
 
 
@@ -3090,6 +3637,9 @@ def get_offering_user_posix_groups(offering_user, viewer=None):
         pool = group_pools.get(group.id)
         rows.append(
             {
+                "kind": "project_group",
+                "group_name": None,
+                "service_provider_name": None,
                 "gid": int(gid),
                 "offering_name": offering.name,
                 "project_name": project.name if project else "",
@@ -3101,7 +3651,56 @@ def get_offering_user_posix_groups(offering_user, viewer=None):
                 "pool_scope": pool.scope if pool else None,
             }
         )
+    rows.extend(
+        _offering_user_provider_group_rows(
+            offering_user,
+            project_ids,
+            viewer_sees_all,
+            viewer_project_ids,
+            viewer_customer_ids,
+        )
+    )
     rows.sort(key=lambda r: r["gid"])
+    return rows
+
+
+def _offering_user_provider_group_rows(
+    offering_user, project_ids, viewer_sees_all, viewer_project_ids, viewer_customer_ids
+):
+    """Provider project groups at the offering's provider listing this account."""
+    provider = offering_user.offering.service_provider
+    if provider is None or not offering_user.username:
+        return []
+    groups = list(
+        models.ServiceProviderProjectGroup.objects.filter(
+            service_provider=provider, project_id__in=project_ids, gid__isnull=False
+        ).select_related("project__customer", "service_provider__customer")
+    )
+    details = provider_project_groups.describe(groups)
+    pool = posix_ids.provider_pool(provider)
+    rows = []
+    for group in groups:
+        if offering_user.username not in details[group.pk]["members"]:
+            continue
+        project = group.project
+        rows.append(
+            {
+                "kind": "provider_project_group",
+                "group_name": group.name,
+                "service_provider_name": provider.customer.name,
+                "gid": group.gid,
+                "offering_name": offering_user.offering.name,
+                "project_name": project.name,
+                "project_uuid": project.uuid.hex,
+                "customer_name": project.customer.name,
+                "customer_uuid": project.customer.uuid.hex,
+                "project_accessible": viewer_sees_all
+                or project.id in viewer_project_ids
+                or project.customer_id in viewer_customer_ids,
+                "pool_uuid": pool.uuid.hex if pool else None,
+                "pool_scope": pool.scope if pool else None,
+            }
+        )
     return rows
 
 
@@ -3405,6 +4004,11 @@ def build_glauth_tree(offering, *, resource_filter=None):
             }
         )
 
+    # The provider's project groups, for projects with a live resource here.
+    provider_groups, provider_user_membership = _provider_project_groups_for_offering(
+        offering, offering_users, user_project_mappings, resource_filter
+    )
+
     # Role-aware groups.
     role_groups_raw = _compute_role_groups(offering, resource_filter=resource_filter)
 
@@ -3438,6 +4042,16 @@ def build_glauth_tree(offering, *, resource_filter=None):
         memberships = []
         for g in project_groups:
             if g["gid"] in project_user_membership.get(ou.user_id, ()):
+                memberships.append(
+                    {
+                        "gid": g["gid"],
+                        "group_name": g["name"],
+                        "kind": g["kind"],
+                        "role": g["role"],
+                    }
+                )
+        for g in provider_groups:
+            if g["gid"] in provider_user_membership.get(ou.user_id, ()):
                 memberships.append(
                     {
                         "gid": g["gid"],
@@ -3509,24 +4123,111 @@ def build_glauth_tree(offering, *, resource_filter=None):
         for ra in robot_qs
     ]
 
+    extra_gids = defaultdict(set)
+    for membership in (role_user_membership, provider_user_membership):
+        for uid, gids in membership.items():
+            extra_gids[uid] |= gids
+
     return {
         "offering": {
             "uuid": offering.uuid.hex,
             "name": offering.name,
             "slug": offering.slug or "",
         },
-        "groups": project_groups + role_groups + personal_groups,
+        "groups": project_groups + provider_groups + role_groups + personal_groups,
         "users": users,
         "robot_accounts": robot_accounts,
-        # Internal: pre-computed user_id -> set[gid] for the TOML emitter.
-        # Stripped before serialisation by the view layer.
-        "_user_role_gids": {
-            uid: gids for uid, gids in role_user_membership.items() if gids
-        },
+        # Internal: pre-computed user_id -> set[gid] for the TOML emitter's
+        # otherGroups, provider project groups included. Stripped before
+        # serialisation by the view layer.
+        "_user_role_gids": {uid: gids for uid, gids in extra_gids.items() if gids},
         # Materialised list (not queryset) — keeps prefetch cache hot and
         # avoids a second SQL round-trip when the TOML emitter iterates.
         "_offering_users": offering_users,
     }
+
+
+def _provider_project_groups_for_offering(
+    offering, offering_users, user_project_mappings, resource_filter=None
+):
+    """The provider's project groups rendered into an offering's directory.
+
+    A group appears while its project uses the offering. Its members are the
+    offering's accounts of the group's members as the provider listing defines
+    them (active users, unexpired roles, live unrestricted accounts). A group
+    whose name is also an account's personal group name is left out and
+    logged: one NSS name cannot stand for two groups. Returns the groups and
+    ``user_id -> set[gid]``.
+    """
+    groups = []
+    membership = defaultdict(set)
+    provider = offering.service_provider
+    if provider is None or not provider_project_groups.offering_qualifies(offering):
+        return groups, membership
+    resources = provider_project_groups.active_resources().filter(offering=offering)
+    if resource_filter is not None:
+        resources = resources.filter(project_id=resource_filter.project_id)
+    queryset = (
+        models.ServiceProviderProjectGroup.objects.filter(
+            service_provider=provider,
+            gid__isnull=False,
+            project_id__in=resources.values("project_id"),
+        )
+        .select_related("project", "service_provider")
+        .order_by("name", "id")
+    )
+    group_list = list(queryset)
+    if not group_list:
+        return groups, membership
+    details = provider_project_groups.describe(group_list)
+
+    # project_id -> offering accounts, built once rather than per group.
+    accounts_by_project = defaultdict(list)
+    for offering_user in offering_users:
+        for project_id in user_project_mappings.get(offering_user.user_id, ()):
+            accounts_by_project[project_id].append(offering_user)
+    personal_names = {ou.username for ou in offering_users if ou.username}
+    personal_names |= set(
+        models.RobotAccount.objects.filter(resource__offering=offering).values_list(
+            "username", flat=True
+        )
+    )
+
+    for group in group_list:
+        if group.name in personal_names:
+            logger.warning(
+                "Provider project group %s (GID %s) is not rendered for offering "
+                "%s: an account of the same name has a personal group.",
+                group.name,
+                group.gid,
+                offering.uuid.hex,
+            )
+            continue
+        allowed = set(details[group.pk]["members"])
+        members = [
+            ou
+            for ou in accounts_by_project.get(group.project_id, ())
+            if ou.username in allowed
+        ]
+        for ou in members:
+            membership[ou.user_id].add(int(group.gid))
+        groups.append(
+            {
+                "gid": int(group.gid),
+                "name": group.name,
+                "kind": "provider_project",
+                "scope": {
+                    "type": "project",
+                    "uuid": group.project.uuid.hex,
+                    "name": group.project.name,
+                    "slug": group.project.slug or "",
+                    "resource_uuid": None,
+                },
+                "role": None,
+                "members": sorted({ou.username for ou in members}),
+            }
+        )
+    return groups, membership
 
 
 def _user_project_mappings(user_ids):
@@ -4216,6 +4917,30 @@ def user_offerings_mapping(offerings):
             restore_offering_user(offering_user)
 
 
+def get_order_processing_user(order: models.Order, system_robot=None):
+    """The identity an order is carried out under.
+
+    ``processors.send_request`` replays the plugin's own viewset as this user,
+    so DRF's permission classes and serializer querysets apply to them -- the
+    delete leg in particular enforces ``is_administrator`` on the project.
+    Whoever placed an order themselves necessarily holds a role there.
+
+    An order placed automatically records in ``created_by`` the person it is
+    *for*, which grants them nothing: a call can name its applicant, or a
+    grants office that holds no project role at all. Those are carried out
+    with system authority instead, as they were before the author was
+    recorded -- whoever is named, so that provisioning does not quietly
+    depend on whether that person happens to be staff.
+
+    ``system_robot`` lets a sweep resolve the robot once and hand it in:
+    ``get_system_robot`` is a ``get_or_create``, so a batch of orders would
+    otherwise pay a query each.
+    """
+    if order.placed_automatically:
+        return system_robot or core_utils.get_system_robot()
+    return order.created_by
+
+
 def order_should_not_be_reviewed_by_provider(order: models.Order):
     offering = order.offering
     user = order.consumer_reviewed_by or order.created_by
@@ -4278,6 +5003,31 @@ def get_consumer_approvers(order):
     )
 
     return approvers
+
+
+def get_resource_end_date_approvers(resource):
+    """Emails of everyone who may decide a resource end date change request.
+
+    Mirrors user_can_approve_resource_end_date_change_request: whoever holds
+    SET_RESOURCE_END_DATE on the resource's project or its customer. Which roles
+    carry that permission is set per deployment, so recipients follow it rather
+    than a fixed role such as customer owner.
+
+    Staff may approve too, but are not emailed: like project end date change
+    requests, these are the consumer organisation's own decision.
+    """
+    users = get_users_with_permission(
+        resource.project.customer, PermissionEnum.SET_RESOURCE_END_DATE
+    ) | get_users_with_permission(
+        resource.project, PermissionEnum.SET_RESOURCE_END_DATE
+    )
+
+    return list(
+        users.distinct()
+        .exclude(email="")
+        .exclude(notifications_enabled=False)
+        .values_list("email", flat=True)
+    )
 
 
 def get_provider_approvers(order):
@@ -5051,6 +5801,17 @@ def generate_mock_course_account_creation_response(
     return generate_mock_course_account_response(mock_username)
 
 
+# Explicit stand-in for httpx's implicit default (Timeout(5.0), i.e. 5s on
+# each of connect/read/write/pool) so the ceiling is visible here rather
+# than relying on a library default. NOTE: like that default, this bounds
+# each individual I/O operation, not the call's total duration - a backend
+# that trickles bytes just under this ceiling per chunk can still keep a
+# call "alive" indefinitely. That is NOT what protects gunicorn workers
+# from hanging on this call; moving the call off the request path (see
+# marketplace/tasks.py) is what does that.
+ACCOUNT_API_REQUEST_TIMEOUT = 5
+
+
 def get_account_api_token(token_url, client_id, client_secret):
     token_url = token_url.rstrip("/")
 
@@ -5069,6 +5830,7 @@ def get_account_api_token(token_url, client_id, client_secret):
             data=token_params,
             headers=token_request_headers,
             follow_redirects=True,
+            timeout=ACCOUNT_API_REQUEST_TIMEOUT,
         )
         token_response.raise_for_status()
         # Extract the token
@@ -5369,6 +6131,7 @@ def get_course_account(
             url,
             headers={"Authorization": f"Bearer {api_access_token}"},
             follow_redirects=True,
+            timeout=ACCOUNT_API_REQUEST_TIMEOUT,
         )
         response.raise_for_status()
         return response.json()
@@ -5452,6 +6215,13 @@ def move_offering(
 
     offering.customer = target_customer
     offering.save(update_fields=["customer"])
+    offering.__dict__.pop("service_provider", None)
+    # The projects using the offering now use the target provider.
+    transaction.on_commit(
+        lambda: provider_project_groups.run_safely(
+            provider_project_groups.ensure_groups_for_offering, offering
+        )
+    )
 
     if not preserve_permissions:
         for permission in get_permissions(offering):
@@ -6202,6 +6972,7 @@ def close_course_account(
             url,
             headers={"Authorization": f"Bearer {api_access_token}"},
             follow_redirects=True,
+            timeout=ACCOUNT_API_REQUEST_TIMEOUT,
         )
         response.raise_for_status()
         if response.status_code == 200:
@@ -6223,8 +6994,45 @@ def close_course_account(
         course_account.set_state_erred()
         course_account.error_message = str(error_details)
         course_account.error_traceback = traceback.format_exc()
-        course_account.save(update_fields=["error_message", "error_traceback"])
+        course_account.save(update_fields=["state", "error_message", "error_traceback"])
         raise
+
+
+def close_course_account_by_username(
+    username: str, api_access_token: str | None = None
+):
+    """Close a course account at the backend by username alone, with no local row.
+
+    Used when the local CourseAccount row is already gone - a hard project
+    or customer delete CASCADEs it away before the close task runs - but
+    the backend account still needs to be closed. Unlike close_course_account,
+    this never touches a CourseAccount instance or its state.
+    """
+    if config.ENABLE_MOCK_COURSE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for close_course_account_by_username: {username}"
+        )
+        return
+
+    if not settings.WALDUR_CORE.get("COURSE_ACCOUNT_USE_API"):
+        return
+
+    course_account_url = settings.WALDUR_CORE["COURSE_ACCOUNT_URL"]
+    if not course_account_url:
+        raise ValidationError("URL for course accounts is not configured")
+    course_account_url = course_account_url.rstrip("/")
+
+    if api_access_token is None:
+        api_access_token = get_course_account_api_token()
+
+    url = f"{course_account_url}/{username}/close"
+    response = httpx.put(
+        url,
+        headers={"Authorization": f"Bearer {api_access_token}"},
+        follow_redirects=True,
+        timeout=ACCOUNT_API_REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
 
 
 def get_viewset_from_basename(basename):
@@ -6302,7 +7110,18 @@ def validate_reallocation(source_resource, limits_to_reallocate, targets, user):
 
     source_limits = validate_source_resource(source_resource)
 
+    derived = derived_limits.derived_components(
+        (source_resource.offering.options or {}).get("options")
+    )
     for component, value in limits_to_reallocate.items():
+        if component in derived:
+            # The server sets it from the resource's order options; moving it
+            # would be undone on the target's next limit change.
+            error_validation(
+                "The limit of %(component)s is calculated from the order form "
+                "and cannot be reallocated.",
+                component=component,
+            )
         validate_source_component(component, value, source_limits)
 
     target_resource_uuids = [target["resource_uuid"] for target in targets]
@@ -6853,11 +7672,17 @@ def build_incomplete_profile_q():
     return incomplete_q
 
 
+def _active_offering_consent_q(offering, prefix=""):
+    return Q(
+        **{
+            f"{prefix}offering_consents__offering": offering,
+            f"{prefix}offering_consents__revocation_date__isnull": True,
+        }
+    )
+
+
 def filter_users_with_active_offering_consent(users, offering):
-    return users.filter(
-        offering_consents__offering=offering,
-        offering_consents__revocation_date__isnull=True,
-    ).distinct()
+    return users.filter(_active_offering_consent_q(offering)).distinct()
 
 
 def filter_offering_users_queryset_by_consent(queryset, offering=None):
@@ -6890,12 +7715,131 @@ def filter_offering_users_queryset_by_consent(queryset, offering=None):
     ).distinct()
 
 
-def should_filter_provider_resource_team_by_consent(user, offering) -> bool:
-    if user.is_staff or user.is_support:
-        return False
+def offering_consent_is_enforced(offering) -> bool:
+    """Whether the Terms of Service gate is on for this offering.
+
+    True when enforcement is enabled and the offering has an active Terms of
+    Service. It does not check whether any user has accepted those terms.
+    """
     if not config.ENFORCE_USER_CONSENT_FOR_OFFERINGS:
         return False
     return offering.has_terms_of_service()
+
+
+def get_robot_account_linkable_users(resource):
+    """Users a robot account on ``resource`` may newly link.
+
+    The same set ``RobotAccountSerializer.validate`` accepts: project and
+    organization users of the resource, narrowed to users with active consent
+    while the offering's Terms of Service gate is on.
+    """
+    users = get_resource_users(resource)
+    if offering_consent_is_enforced(resource.offering):
+        users = filter_users_with_active_offering_consent(users, resource.offering)
+    return users
+
+
+def should_filter_provider_resource_team_by_consent(user, offering) -> bool:
+    if user.is_staff or user.is_support:
+        return False
+    return offering_consent_is_enforced(offering)
+
+
+def robot_account_caller_scopes(user):
+    """Customer and project ids the caller holds a role on."""
+    return set(get_connected_customers(user)), set(get_connected_projects(user))
+
+
+def is_on_consuming_side(resource, scopes) -> bool:
+    """Whether the caller reaches the resource through its consuming project or organization."""
+    customer_ids, project_ids = scopes
+    return (
+        resource.project.customer_id in customer_ids
+        or resource.project_id in project_ids
+    )
+
+
+def is_provider_gated_for_offering(user, offering, scopes) -> bool:
+    """Whether the caller is a service provider for the offering and the consent gate is on."""
+    if not should_filter_provider_resource_team_by_consent(user, offering):
+        return False
+    customer_ids, _ = scopes
+    return offering.customer_id in customer_ids
+
+
+def should_hide_unconsented_robot_account_users(user, resource) -> bool:
+    """Hide non-consenting users when a service provider reads a robot account.
+
+    Consent gating applies only to callers who belong to the offering's provider
+    organization, under the same conditions as the provider resource team. A
+    caller who is also on the consuming side, such as the owner of an
+    organization that consumes its own offering, sees every linked user.
+    """
+    scopes = robot_account_caller_scopes(user)
+    if not is_provider_gated_for_offering(user, resource.offering, scopes):
+        return False
+    return not is_on_consuming_side(resource, scopes)
+
+
+def active_offering_consent_user_ids(users, offering):
+    users = [user for user in users if user is not None]
+    if not users:
+        return set()
+    return set(
+        filter_users_with_active_offering_consent(
+            core_models.User.objects.filter(id__in={user.id for user in users}),
+            offering,
+        ).values_list("id", flat=True)
+    )
+
+
+def users_with_active_offering_consent(users, offering):
+    users = [user for user in users if user is not None]
+    consented_ids = active_offering_consent_user_ids(users, offering)
+    return [user for user in users if user.id in consented_ids]
+
+
+def retain_robot_account_users_hidden_from_caller(
+    instance, validated_data, caller, consented_ids
+):
+    """Keep links a provider cannot see when they save a redacted payload.
+
+    The edit form sends the users and responsible user it just loaded. A
+    provider read omits people without consent, so writing that list back
+    would detach them.
+    """
+    if instance is None or not should_hide_unconsented_robot_account_users(
+        caller, instance.resource
+    ):
+        return
+    if "users" in validated_data:
+        kept = list(validated_data["users"])
+        kept_ids = {user.id for user in kept}
+        for user in instance.users.all():
+            if user.id not in consented_ids and user.id not in kept_ids:
+                kept.append(user)
+                kept_ids.add(user.id)
+        validated_data["users"] = kept
+    if "responsible_user" in validated_data and not validated_data.get(
+        "responsible_user"
+    ):
+        current = instance.responsible_user if instance.responsible_user_id else None
+        if current is not None and current.id not in consented_ids:
+            validated_data["responsible_user"] = current
+
+
+def user_roles_for_provider_caller(caller, scope, offering, user=None):
+    """Role rows on ``scope``, without users who have not accepted the offering terms."""
+    return filter_user_roles_by_offering_consent(
+        get_permissions(scope, user), caller, offering
+    )
+
+
+def filter_user_roles_by_offering_consent(queryset, user, offering):
+    """Drop role rows whose user has no active consent, for provider callers."""
+    if not should_filter_provider_resource_team_by_consent(user, offering):
+        return queryset
+    return queryset.filter(_active_offering_consent_q(offering, "user__")).distinct()
 
 
 def build_resource_team_response(resource, request, users):

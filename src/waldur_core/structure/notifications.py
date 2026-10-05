@@ -534,6 +534,19 @@ class ResourceLimitChangeRequestContext(BaseModel):
     resource_url: str = Field(description="A URL to the resource's page.")
 
 
+class ResourceEndDateChangeRequestContext(BaseModel):
+    resource_end_date_change_request: Any = Field(
+        description="The ResourceEndDateChangeRequest instance. Provides "
+        "resource_end_date_change_request.resource.name, "
+        "resource.end_date, resource.project.name, "
+        "resource.project.customer.name, requested_end_date, comment, "
+        "review_comment, created_by.full_name, reviewed_by.full_name."
+    )
+    resource_url: str = Field(
+        description="A URL to the resource's end date change requests tab."
+    )
+
+
 class MarketplaceSection(NotificationSection):
     class Meta:
         key = "marketplace"
@@ -663,6 +676,21 @@ class MarketplaceSection(NotificationSection):
         key="notification_resource_limit_change_request_rejected",
         description="Notifies the requester when their resource limit change request is rejected.",
         context_model=ResourceLimitChangeRequestContext,
+    )
+    notification_resource_end_date_change_request_created = Notification(
+        key="notification_resource_end_date_change_request_created",
+        description="Notifies users who may set the resource end date when someone requests to change it.",
+        context_model=ResourceEndDateChangeRequestContext,
+    )
+    notification_resource_end_date_change_request_approved = Notification(
+        key="notification_resource_end_date_change_request_approved",
+        description="Notifies the requester when their resource end date change request is approved.",
+        context_model=ResourceEndDateChangeRequestContext,
+    )
+    notification_resource_end_date_change_request_rejected = Notification(
+        key="notification_resource_end_date_change_request_rejected",
+        description="Notifies the requester when their resource end date change request is rejected.",
+        context_model=ResourceEndDateChangeRequestContext,
     )
 
 
@@ -818,6 +846,17 @@ class CommentAddedStaffContext(BaseModel):
     issue_url: str = Field(description="Link to the issue in Homeport.")
 
 
+class CommentUpdatedStaffContext(BaseModel):
+    issue: Any = Field(description="The Issue model instance that was commented on.")
+    comment: Any = Field(
+        description="The Comment model instance the caller edited, with its new content."
+    )
+    old_description: str = Field(
+        description="The content of the comment before the caller edited it."
+    )
+    issue_url: str = Field(description="Link to the issue in Homeport.")
+
+
 class ProviderTicketContext(BaseModel):
     issue: Any = Field(
         description="The Issue model instance routed to (or withdrawn from) the provider helpdesk."
@@ -885,6 +924,13 @@ class SupportSection(NotificationSection):
         "added. Sent only by the built-in service desk — the Atlassian, Zammad "
         "and SMAX backends notify their own agents.",
         context_model=CommentAddedStaffContext,
+    )
+    notification_comment_updated_staff = Notification(
+        key="notification_comment_updated_staff",
+        description="Notification to the assignee, or to all staff and support "
+        "users when the ticket is unassigned, that the issue caller has edited "
+        "one of their comments. Sent only by the built-in service desk.",
+        context_model=CommentUpdatedStaffContext,
     )
     notification_comment_updated = Notification(
         key="notification_comment_updated",
@@ -1190,6 +1236,65 @@ class ReviewerInvitationContext(BaseModel):
     )
 
 
+class ReviewerAssignmentInvitationContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    reviewer_name: str = Field(description="Full name (or email) of the reviewer.")
+    call_name: str = Field(description="Name of the call.")
+    proposals: list[dict[str, Any]] = Field(
+        description=(
+            "Proposals in the batch, each with `name` and `summary`. `summary` is "
+            "empty unless the call's COI configuration discloses summaries in "
+            "reviewer invitations."
+        )
+    )
+    items_count: int = Field(description="Number of proposals in the batch.")
+    expires_at: Any = Field(
+        description="Date and time by which the reviewer must respond."
+    )
+    manager_notes: str = Field(
+        description="Optional note from the call manager; may be empty."
+    )
+    link: str = Field(
+        description="URL of the reviewer's assignments page, where they accept or decline."
+    )
+
+
+class AssignmentExpiryReminderContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    reviewer_name: str = Field(description="Full name (or email) of the reviewer.")
+    call_name: str = Field(description="Name of the call.")
+    expires_at: Any = Field(description="Date and time the assignment batch expires.")
+    items_count: int = Field(description="Number of proposals in the batch.")
+    link: str = Field(
+        description="URL of the reviewer's assignments page, where they accept or decline."
+    )
+
+
+class AssignmentBatchExpiredContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    call_name: str = Field(description="Name of the call.")
+    reviewer_name: str = Field(description="Full name (or email) of the reviewer.")
+    items_count: int = Field(description="Number of proposals in the batch.")
+    sent_at: Any = Field(description="Date and time the batch was sent.")
+    expired_at: Any = Field(description="Date and time the batch expired.")
+    assignments_url: str = Field(
+        description="URL of the call's assignment management tab."
+    )
+
+
+class ReviewerPoolInvitationExpiredContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    call_name: str = Field(description="Name of the call the invitation was for.")
+    invitee_name: str = Field(
+        description="Full name of the invited reviewer, or the invited email address."
+    )
+    invited_at: Any = Field(description="When the invitation was created.")
+    expired_at: Any = Field(description="When the invitation stopped being answerable.")
+    reviewer_pool_url: str = Field(
+        description="Link to the call's reviewer pool, where the invitation can be sent again."
+    )
+
+
 class WorkflowStepEventContext(BaseModel):
     site_name: str = Field(description="Name of the site from settings.")
     trigger: str = Field(
@@ -1310,10 +1415,42 @@ class ProposalSection(NotificationSection):
         description="A notification to reviewers about a new call round opening.",
         context_model=RoundOpeningForReviewersContext,
     )
+    reviewer_assignment_invitation = Notification(
+        key="reviewer_assignment_invitation",
+        description=(
+            "Sent to a reviewer when a call manager sends them a batch of "
+            "proposals to accept or decline."
+        ),
+        context_model=ReviewerAssignmentInvitationContext,
+    )
+    assignment_expiry_reminder = Notification(
+        key="assignment_expiry_reminder",
+        description=(
+            "Reminds a reviewer that their assignment batch expires soon; the "
+            "lead time is set per call."
+        ),
+        context_model=AssignmentExpiryReminderContext,
+    )
+    assignment_batch_expired = Notification(
+        key="assignment_batch_expired",
+        description=(
+            "Notifies call managers that a reviewer's assignment batch expired "
+            "before they responded to every proposal."
+        ),
+        context_model=AssignmentBatchExpiredContext,
+    )
     reviewer_invitation = Notification(
         key="reviewer_invitation",
         description="Sent to a person invited to join the reviewer pool for a call.",
         context_model=ReviewerInvitationContext,
+    )
+    reviewer_pool_invitation_expired = Notification(
+        key="reviewer_pool_invitation_expired",
+        description=(
+            "Sent once to the call manager who invited a reviewer to the pool "
+            "when the invitation expires without an answer."
+        ),
+        context_model=ReviewerPoolInvitationExpiredContext,
     )
     reviews_complete = Notification(
         key="reviews_complete",
