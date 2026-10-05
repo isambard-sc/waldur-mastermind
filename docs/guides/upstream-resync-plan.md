@@ -951,19 +951,32 @@ the rewind removed upstream work and added none: 59 files, mostly the VMware
 pyVmomi backend rewrite, Nova instance metadata, ToS consent gating and two
 migrations (`logging.0028`, `openstack.0082`) that no longer exist here.
 
-**One consequence to be aware of.** `rc.8` predates `8a474ddcb`, which bumped
-djangorestframework to 3.18.0, so this branch ships **DRF 3.16.1**. The two
-advisories that bump addressed, both published 2026-08-05 and both affecting
-3.17.1 and earlier:
+**One consequence, now resolved.** `rc.8` predates `8a474ddcb`, which bumped
+djangorestframework to 3.18.0 and pyVmomi to 9.1.0.0, so the rewind left the
+branch on **DRF 3.16.1** and **pyVmomi 8.0.3.0.1**. Merging `rc.15` should have
+lifted both, and did not: the completeness check treats `pyproject.toml` and
+`uv.lock` as files this fork changes on purpose (it does: the `openportal`
+floor and the archive extension), so the rewind's hunks in them were kept
+along with the fork's own. They were found and corrected while merging
+`rc.21`, by checking every file the rewind touched against the new tag:
 
-| Advisory | Severity | Applies here? |
+```bash
+for f in $(git diff --name-only 8.1.3-rc.8 b00cd9b18); do
+    git diff --quiet <new-tag> HEAD -- "$f" || echo "$f"
+done
+```
+
+Only `pyproject.toml` and `uv.lock` were reported, and after the fix the lock
+differs from `rc.21` in `openportal` alone. Run this after every merge, next to
+the completeness check.
+
+So until `rc.21` the branch was exposed to the two advisories the DRF bump
+addressed, both published 2026-08-05 and both affecting 3.17.1 and earlier:
+
+| Advisory | Severity | Applied here? |
 | --- | --- | --- |
-| [CVE-2026-73228](https://github.com/encode/django-rest-framework/security/advisories/GHSA-2m8g-3cmr-wg3w) — DRF's JSON and urlencoded parsers read the request stream directly, bypassing Django's `DATA_UPLOAD_MAX_MEMORY_SIZE` on `request.data` | Moderate, CVSS 5.3 | **Yes**, but bounded. Availability only — no authentication, authorization, disclosure or integrity impact — and the local nginx caps bodies at `client_max_body_size 10M`, so the memory a request can provoke is bounded by that rather than unbounded. Multipart is unaffected, since DRF delegates it to Django. |
-| [CVE-2026-73229](https://github.com/encode/django-rest-framework/security/advisories/GHSA-g47c-3xmw-q6m2) — `AdminRenderer` calls the view's GET handler without a permission check when rendering an invalid write, disclosing GET-protected data | Moderate, CVSS 4.3 | **No.** It requires `AdminRenderer` to be enabled; Waldur's `DEFAULT_RENDERER_CLASSES` are `WaldurORJSONRenderer` and `BrowsableAPIRenderer`, and `AdminRenderer` appears nowhere in the tree. |
-
-So the residual exposure from pinning to `rc.8` is one moderate availability
-issue, already bounded by the proxy's body limit. Still worth taking the next
-release candidate or `8.1.3` promptly, since both carry the fix.
+| [CVE-2026-73228](https://github.com/encode/django-rest-framework/security/advisories/GHSA-2m8g-3cmr-wg3w) — DRF's JSON and urlencoded parsers read the request stream directly, bypassing Django's `DATA_UPLOAD_MAX_MEMORY_SIZE` on `request.data` | Moderate, CVSS 5.3 | **Yes, until rc.21**, but bounded. Availability only, and the local nginx caps bodies at `client_max_body_size 10M`. Fixed by 3.18.0. |
+| [CVE-2026-73229](https://github.com/encode/django-rest-framework/security/advisories/GHSA-g47c-3xmw-q6m2) — `AdminRenderer` calls the view's GET handler without a permission check when rendering an invalid write | Moderate, CVSS 4.3 | **No.** It requires `AdminRenderer`, which appears nowhere in the tree. |
 
 **Django, by contrast, is improved substantially by the resync.** The fork ran
 **4.2.24** (published 2025-09-03) on a branch whose extended support ended
