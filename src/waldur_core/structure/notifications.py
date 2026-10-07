@@ -1541,18 +1541,31 @@ class ProjectUsageUpdateContext(BaseModel):
     update_frequency: str = Field(
         description='How often the update is sent, in words, e.g. "fortnight".'
     )
-    end_date: Any = Field(description="The project's end date, or None.")
-    days_until_end: int | None = Field(
-        description="Days from today to the end date; None without an end date."
+    end_date: Any = Field(
+        description="The project's end date, or None. End dates are exclusive: "
+        "access ends at the start of this day."
+    )
+    last_access_date: Any = Field(
+        description="The last day the project can be used: the day before "
+        "end_date. None without an end date."
+    )
+    days_until_last_access: int | None = Field(
+        description="Days from today to last_access_date (0 means today is the "
+        "last day); None without an end date or once it has passed."
     )
     in_grace_period: bool = Field(
-        description="True once the end date has passed and the grace period runs."
+        description="True from the end date on, while the grace period runs."
     )
     grace_period_days: int = Field(
         description="Days after the end date before data is deleted."
     )
     deletion_date: Any = Field(
-        description="Date the project's data is scheduled for deletion, or None."
+        description="Date access to the data is lost and it is scheduled for "
+        "deletion: the end date plus the grace period. None without an end date."
+    )
+    data_last_access_date: Any = Field(
+        description="The last day the data can be accessed: the day before "
+        "deletion_date."
     )
     grace_change_deadline: Any = Field(
         description="Last date a change to the grace period can be requested: "
@@ -1566,7 +1579,8 @@ class ProjectUsageUpdateContext(BaseModel):
         "how it is tracking against its window, as on the HomePort award pace "
         "card: `name`, `allocation`, `used`, `used_percent`, `expected_percent`, "
         "`status` (settling, behind, on-track, ahead, exhausted or ended), "
-        "`status_label`, `start_date`, `end_date`, `remaining_days`, "
+        "`status_label`, `start_date`, `end_date` (exclusive), `last_access_date` "
+        "(the last day of the award), `remaining_days`, "
         "`actual_per_day`, `required_per_day`, `projected_total`, "
         "`projected_loss`, `projected_loss_percent` and `exhaustion_date`. "
         "Amounts are formatted strings in the allocation's own unit."

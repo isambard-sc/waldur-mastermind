@@ -7,6 +7,7 @@ card), who is sent the update, and what it says.
 import datetime
 from unittest import mock
 
+from constance.test import override_config
 from django.core import mail
 from django.test import TestCase
 
@@ -289,13 +290,15 @@ class WhatTheUpdateSaysTest(ProjectUpdateTestMixin, TestCase):
         self.award()
         context = self.context()
         self.assertEqual(context["deletion_date"], _d(2027, 1, 30))
+        self.assertEqual(context["data_last_access_date"], _d(2027, 1, 29))
         self.assertEqual(context["grace_change_deadline"], _d(2027, 1, 16))
 
         text, _ = self.body()
         self.assertIn("grace period of 30 days", text)
-        self.assertIn("scheduled for deletion on 30 January 2027", text)
+        self.assertIn("your last day to access your data will be 29 January 2027", text)
+        self.assertIn("You will lose access on 30 January 2027", text)
         self.assertIn("contact the allocator of your project", text)
-        self.assertIn("by 16 January 2027 at the latest", text)
+        self.assertIn("so no later than 16 January 2027", text)
 
     def test_without_a_grace_period_data_goes_at_the_end_date(self):
         self.project.grace_period_days = 0
@@ -303,12 +306,14 @@ class WhatTheUpdateSaysTest(ProjectUpdateTestMixin, TestCase):
         self.award()
         text, _ = self.body()
         self.assertIn("There is no grace period", text)
-        self.assertIn("deletion on 31 December 2026", text)
+        self.assertIn("copy back your data by the end of 30 December 2026", text)
+        self.assertIn("You will lose access on 31 December 2026", text)
 
     def test_in_the_grace_period_it_says_so(self):
         self.award()
         text, _ = self.body(_at(2027, 1, 20))
         self.assertIn("is now in its grace period", text)
+        self.assertIn("your last day to access your data is 29 January 2027", text)
         self.assertIn("(16 January 2027) has now passed", text)
 
     def test_each_award_is_reported_busiest_first(self):
@@ -327,6 +332,58 @@ class WhatTheUpdateSaysTest(ProjectUpdateTestMixin, TestCase):
         text, _ = self.body()
         self.assertIn("This month, 12.5 node hours have been used", text)
 
+    def test_it_points_to_the_documentation_when_there_is_some(self):
+        self.award()
+        with override_config(DOCS_URL="https://docs.example.org/"):
+            text, html = self.body()
+        self.assertIn(
+            "For more information, read the documentation at https://docs.example.org/",
+            text,
+        )
+        self.assertIn('href="https://docs.example.org/"', html)
+
     def test_it_links_to_the_project(self):
         self.award()
         self.assertIn(self.project.uuid.hex, self.context()["project_url"])
+
+
+class EndDatesAreExclusiveTest(ProjectUpdateTestMixin, TestCase):
+    """Access ends at the start of the end date, so the email names the day
+    before it wherever it tells someone how long they have - as HomePort does.
+    People read "ends on the 31st" as "I have until the 31st"."""
+
+    def body(self, now=NOON):
+        self.assertEqual(self.send(now), 1)
+        return mail.outbox[-1].body
+
+    def test_the_countdown_runs_to_the_last_day_of_access(self):
+        self.award()
+        context = self.context()
+        self.assertEqual(context["last_access_date"], _d(2026, 12, 30))
+        self.assertEqual(context["days_until_last_access"], 182)
+        text = self.body()
+        self.assertIn(
+            "The last day of access to your project is 30 December 2026, "
+            "which is in 182 days",
+            text,
+        )
+        self.assertIn("Access ends at the start of 31 December 2026", text)
+
+    def test_the_day_before_the_end_date_is_the_last_day(self):
+        self.award()
+        self.assertIn("30 December 2026, which is today", self.body(_at(2026, 12, 30)))
+
+    def test_on_the_end_date_itself_the_project_has_ended(self):
+        self.award()
+        text = self.body(_at(2026, 12, 31))
+        self.assertIn("is now in its grace period", text)
+        self.assertNotIn("The last day of access to your project", text)
+
+    def test_the_pace_names_the_last_day_of_the_award(self):
+        self.award(used=10000)
+        self.assertEqual(
+            self.context()["awards"][0]["last_access_date"], _d(2026, 12, 30)
+        )
+        text = self.body()
+        self.assertIn("by the end of 30 December 2026, the last day of the award", text)
+        self.assertNotIn("31 December 2026, the last day", text)

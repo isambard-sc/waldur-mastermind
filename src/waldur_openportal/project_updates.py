@@ -46,6 +46,8 @@ MAX_EMAILS_PER_RUN = 500
 # scheduled for deletion.
 GRACE_CHANGE_NOTICE_DAYS = 14
 
+ONE_DAY = datetime.timedelta(days=1)
+
 # Awards that are paced. Not only active ones: an award waiting on approval of
 # a change, or one whose portal has gone quiet, still has a window, an
 # allocation and the usage reported so far. An errored one's figures are not to
@@ -166,6 +168,7 @@ def award_entries(project, today: datetime.date) -> list[dict]:
                     "status_label": STATUS_LABELS[pace.status],
                     "start_date": pace.start_date,
                     "end_date": pace.end_date,
+                    "last_access_date": pace.end_date - ONE_DAY,
                     "remaining_days": pace.remaining_days,
                     "actual_per_day": _amount(pace.actual_per_day, unit, 2),
                     "required_per_day": (
@@ -220,9 +223,16 @@ def build_context(project, frequency: int, today: datetime.date) -> dict | None:
     if not awards and local is None:
         return None
 
+    # End dates are exclusive, as everywhere in Waldur: Project.is_expired is
+    # effective_end_date <= today, so on the date itself access has already
+    # gone and the last usable day is the one before. People read "ends on the
+    # 31st" as "I have until the 31st" and lose a day to it, so the email names
+    # the last day of access wherever it tells someone how long they have, as
+    # HomePort does (lastAccessDate in its core/dateUtils.ts).
     end_date = project.end_date
     deletion_date = project.get_effective_end_date()
-    in_grace_period = end_date is not None and end_date < today
+    in_grace_period = end_date is not None and end_date <= today
+    last_access_date = end_date - ONE_DAY if end_date else None
     grace_change_deadline = (
         deletion_date - datetime.timedelta(days=GRACE_CHANGE_NOTICE_DAYS)
         if deletion_date
@@ -238,14 +248,16 @@ def build_context(project, frequency: int, today: datetime.date) -> dict | None:
         "today": today,
         "update_frequency": _frequency_in_words(frequency),
         "end_date": end_date,
-        "days_until_end": (
-            (end_date - today).days
-            if end_date is not None and not in_grace_period
+        "last_access_date": last_access_date,
+        "days_until_last_access": (
+            (last_access_date - today).days
+            if last_access_date is not None and not in_grace_period
             else None
         ),
         "in_grace_period": in_grace_period,
         "grace_period_days": project.get_grace_period_days(),
         "deletion_date": deletion_date,
+        "data_last_access_date": deletion_date - ONE_DAY if deletion_date else None,
         "grace_change_deadline": grace_change_deadline,
         "grace_change_deadline_passed": (
             grace_change_deadline is not None and grace_change_deadline < today
