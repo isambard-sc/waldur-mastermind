@@ -261,7 +261,15 @@ except ImportError:
         def forwarded_for(self):
             _raise_no_openportal_error()
 
+    class Link:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
     class Node:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class Note:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
@@ -297,6 +305,10 @@ except ImportError:
             _raise_no_openportal_error()
 
     class PortalIdentifier:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class ProjectDetails:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
@@ -349,6 +361,10 @@ except ImportError:
             _raise_no_openportal_error()
 
     class Quota:
+        def __init__(self, *args, **kwargs):
+            _raise_no_openportal_error()
+
+    class Status:
         def __init__(self, *args, **kwargs):
             _raise_no_openportal_error()
 
@@ -577,6 +593,15 @@ except ImportError:
     def is_config_loaded():
         _raise_no_openportal_error()
 
+    def fetch_job(*args, **kwargs):
+        _raise_no_openportal_error()
+
+    def fetch_jobs(*args, **kwargs):
+        _raise_no_openportal_error()
+
+    def fetch_notification(*args, **kwargs):
+        _raise_no_openportal_error()
+
     def load_config(*args, **kwargs):
         _raise_no_openportal_error()
 
@@ -596,6 +621,9 @@ except ImportError:
         _raise_no_openportal_error()
 
     def run(*args, **kwargs):
+        _raise_no_openportal_error()
+
+    def send_result(*args, **kwargs):
         _raise_no_openportal_error()
 
     def ensure_config_loaded():
