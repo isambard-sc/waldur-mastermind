@@ -1567,12 +1567,22 @@ class ProjectUsageUpdateContext(BaseModel):
         description="The last day the data can be accessed: the day before "
         "deletion_date."
     )
+    days_until_deletion: int | None = Field(
+        description="Days from today to deletion_date; None without an end date."
+    )
+    grace_change_notice_days: int = Field(
+        description="How many days before deletion_date a change to the grace "
+        "period must be requested by (10)."
+    )
     grace_change_deadline: Any = Field(
         description="Last date a change to the grace period can be requested: "
-        "14 days before deletion_date. None without an end date."
+        "grace_change_notice_days before deletion_date. None without an end date."
     )
     grace_change_deadline_passed: bool = Field(
         description="True when grace_change_deadline is already in the past."
+    )
+    grace_change_deadline_is_today: bool = Field(
+        description="True when today is grace_change_deadline."
     )
     awards: list[dict[str, Any]] = Field(
         description="One entry per award held by the project, each describing "
@@ -1614,5 +1624,25 @@ class OpenPortalSection(NotificationSection):
         "end date, and when the grace period ends and data is deleted. Not sent "
         "for projects managed by a remote awarding portal, which sends its own. "
         "How often is set per project (every 14 days by default).",
+        context_model=ProjectUsageUpdateContext,
+    )
+
+    grace_period_started = Notification(
+        key="grace_period_started",
+        description="Sent to every member of a project on its end date, the "
+        "first day of its grace period: access to compute has ended, data must "
+        "be copied back now, the last day the data can be accessed, and the date "
+        "by which to contact the allocator for an extension. Same projects as "
+        "openportal.project_usage_update, sent whatever its frequency.",
+        context_model=ProjectUsageUpdateContext,
+    )
+
+    grace_period_ending = Notification(
+        key="grace_period_ending",
+        description="Sent to every member of a project 10 days before its data "
+        "is scheduled for deletion, the last day an extension to the grace "
+        "period can be requested: contact the allocator today if the data "
+        "cannot be copied back in time. Same projects as "
+        "openportal.project_usage_update, sent whatever its frequency.",
         context_model=ProjectUsageUpdateContext,
     )

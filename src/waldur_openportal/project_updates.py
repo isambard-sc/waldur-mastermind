@@ -1,9 +1,21 @@
-"""The regular project usage update emailed to project members.
+"""The emails sent to project members about their project's usage and end.
 
-Sent through Waldur's notification system as ``openportal.project_usage_update``,
-so operators can switch it on and off and override its templates like any other
-notification. How often each project receives it is set per project by
-models.ProjectNotification (every 14 days by default; 0 turns it off).
+Three notifications, each switched on and off and templated like any other:
+
+- ``openportal.project_usage_update``: the regular update. How often each
+  project receives it is set per project by models.ProjectNotification (every
+  14 days by default; 0 turns it off).
+- ``openportal.grace_period_started``: sent on the end date, the first day of
+  the grace period, telling members to copy back their data now.
+- ``openportal.grace_period_ending``: sent when the data is 10 days from
+  deletion, the last day an extension to the grace period can be requested.
+
+The two grace period emails go out on their day whatever the project's update
+frequency, and a project gets at most one of the three on any day. Which one
+has been sent needs no record of its own: every email sets
+ProjectNotification.last_notification to today, so on a grace period email's
+day a last_notification of today means it has gone. That also restarts the
+period of the regular update, so it does not follow the next day.
 
 Who gets one:
 
@@ -34,6 +46,8 @@ from . import award_pace, models, utils
 
 NOTIFICATION_APP = "openportal"
 NOTIFICATION_EVENT = "project_usage_update"
+GRACE_STARTED_EVENT = "grace_period_started"
+GRACE_ENDING_EVENT = "grace_period_ending"
 
 # Updates go out between these hours, local time, inclusive.
 OFFICE_HOURS = (10, 15)
@@ -43,8 +57,8 @@ OFFICE_HOURS = (10, 15)
 MAX_EMAILS_PER_RUN = 500
 
 # A change to the grace period has to be requested this long before the data is
-# scheduled for deletion.
-GRACE_CHANGE_NOTICE_DAYS = 14
+# scheduled for deletion. The grace_period_ending email goes out on that day.
+GRACE_CHANGE_NOTICE_DAYS = 10
 
 ONE_DAY = datetime.timedelta(days=1)
 
@@ -258,10 +272,15 @@ def build_context(project, frequency: int, today: datetime.date) -> dict | None:
         "grace_period_days": project.get_grace_period_days(),
         "deletion_date": deletion_date,
         "data_last_access_date": deletion_date - ONE_DAY if deletion_date else None,
+        "days_until_deletion": (
+            (deletion_date - today).days if deletion_date is not None else None
+        ),
+        "grace_change_notice_days": GRACE_CHANGE_NOTICE_DAYS,
         "grace_change_deadline": grace_change_deadline,
         "grace_change_deadline_passed": (
             grace_change_deadline is not None and grace_change_deadline < today
         ),
+        "grace_change_deadline_is_today": grace_change_deadline == today,
         "awards": awards,
         "local_usage": local,
         "docs_url": constance_config.DOCS_URL or "",
@@ -288,19 +307,54 @@ def is_due(notification: models.ProjectNotification, today: datetime.date) -> bo
     )
 
 
+def email_due_today(
+    project, notification: models.ProjectNotification, today: datetime.date
+) -> list[str]:
+    """The emails this project could be sent today, most urgent first."""
+    if notification.last_notification == today:
+        # Whatever was due today has gone.
+        return []
+    due = []
+    end_date = project.end_date
+    deletion_date = project.get_effective_end_date()
+    if end_date == today and deletion_date and deletion_date > today:
+        due.append(GRACE_STARTED_EVENT)
+    if (
+        deletion_date
+        and deletion_date - datetime.timedelta(days=GRACE_CHANGE_NOTICE_DAYS) == today
+    ):
+        due.append(GRACE_ENDING_EVENT)
+    if is_due(notification, today):
+        due.append(NOTIFICATION_EVENT)
+    return due
+
+
 def send_project_updates(now: datetime.datetime | None = None) -> int:
-    """Send every update that is due. Returns how many emails were sent."""
+    """Send every email that is due. Returns how many emails were sent."""
     local_now = timezone.localtime(now or timezone.now())
     if not OFFICE_HOURS[0] <= local_now.hour <= OFFICE_HOURS[1]:
         logger.debug("Not sending project updates - outside office hours")
         return 0
 
-    key = f"{NOTIFICATION_APP}.{NOTIFICATION_EVENT}"
-    if not Notification.objects.filter(key=key, enabled=True).exists():
-        # Checked up front, not left to broadcast_mail: a disabled notification
-        # sends nothing, and recording a send that did not happen would hold
-        # the project back a whole period once it is switched on.
-        logger.info("Notification '%s' is not enabled - no project updates", key)
+    # Checked up front, not left to broadcast_mail: a disabled notification
+    # sends nothing, and recording a send that did not happen would hold the
+    # project back a whole period once it is switched on. A disabled grace
+    # period email falls through to the regular update, if that is due.
+    enabled = set(
+        Notification.objects.filter(
+            key__in=[
+                f"{NOTIFICATION_APP}.{event}"
+                for event in (
+                    GRACE_STARTED_EVENT,
+                    GRACE_ENDING_EVENT,
+                    NOTIFICATION_EVENT,
+                )
+            ],
+            enabled=True,
+        ).values_list("key", flat=True)
+    )
+    if not enabled:
+        logger.info("No OpenPortal project notifications are enabled")
         return 0
 
     # Everything below is judged as of local_now, including expiry, so a run
@@ -311,7 +365,7 @@ def send_project_updates(now: datetime.datetime | None = None) -> int:
     for project in candidate_projects():
         if sent >= MAX_EMAILS_PER_RUN:
             logger.warning(
-                "Sent %s project update emails this run - the rest wait for the next",
+                "Sent %s project emails this run - the rest wait for the next",
                 sent,
             )
             break
@@ -322,7 +376,15 @@ def send_project_updates(now: datetime.datetime | None = None) -> int:
         notification, _ = models.ProjectNotification.objects.get_or_create(
             project=project
         )
-        if not is_due(notification, today):
+        event = next(
+            (
+                event
+                for event in email_due_today(project, notification, today)
+                if f"{NOTIFICATION_APP}.{event}" in enabled
+            ),
+            None,
+        )
+        if event is None:
             continue
 
         context = build_context(project, notification.frequency, today)
@@ -332,7 +394,7 @@ def send_project_updates(now: datetime.datetime | None = None) -> int:
         if not emails:
             continue
 
-        core_utils.broadcast_mail(NOTIFICATION_APP, NOTIFICATION_EVENT, context, emails)
+        core_utils.broadcast_mail(NOTIFICATION_APP, event, context, emails)
         sent += len(emails)
         notification.last_notification = today
         notification.save(update_fields=["last_notification"])

@@ -5394,6 +5394,124 @@ A daily digest notification sent to users with pending actions.
 
 ## WALDUR_OPENPORTAL
 
+### openportal.grace_period_ending
+
+Sent to every member of a project 10 days before its data is scheduled for deletion, the last day an extension to the grace period can be requested: contact the allocator today if the data cannot be copied back in time. Same projects as openportal.project_usage_update, sent whatever its frequency.
+
+#### Templates
+
+=== "openportal/grace_period_ending_subject.txt"
+
+```txt
+
+    ACTION REQUIRED: the data of your {{ site_name }} project {{ project_name }} will be deleted in {{ days_until_deletion }} days
+
+```
+
+=== "openportal/grace_period_ending_message.txt"
+
+```txt
+
+    {% if in_grace_period %}Your {{ site_name }} project "{{ project_name }}" is in its grace period.{% else %}The last day of access to your {{ site_name }} project "{{ project_name }}" is {{ last_access_date|date:"j F Y" }}.{% if grace_period_days %} It is followed by a grace period of {{ grace_period_days }} days so that you can copy back your data.{% endif %}{% endif %}
+
+    Your data will be automatically scheduled for deletion in {{ days_until_deletion }} days, on {{ deletion_date|date:"j F Y" }}. Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}.
+
+    If you do not think that you will be able to copy back all of your data in time, you must contact the allocator of your project TODAY. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. They will need evidence that you have already started copying back your data.
+
+    View your project at {{ project_url }}
+    {% if docs_url %}
+    For more information, read the documentation at {{ docs_url }}
+    {% endif %}{% if support_url %}
+    If you have any queries, please raise a ticket at {{ support_url }}
+    {% endif %}
+
+```
+
+=== "openportal/grace_period_ending_message.html"
+
+```txt
+
+    <html lang="en">
+    <head><meta charset="UTF-8"><title>The data of your {{ site_name }} project {{ project_name }} will be deleted in {{ days_until_deletion }} days</title></head>
+    <body>
+    <p>{% if in_grace_period %}Your <strong>{{ site_name }}</strong> project <strong>{{ project_name }}</strong> is in its grace period.{% else %}The last day of access to your <strong>{{ site_name }}</strong> project <strong>{{ project_name }}</strong> is {{ last_access_date|date:"j F Y" }}.{% if grace_period_days %} It is followed by a grace period of {{ grace_period_days }} days so that you can copy back your data.{% endif %}{% endif %}</p>
+    <p><strong>Your data will be automatically scheduled for deletion in {{ days_until_deletion }} days, on {{ deletion_date|date:"j F Y" }}.</strong> Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}.</p>
+    <p>If you do not think that you will be able to copy back all of your data in time, <strong>you must contact the allocator of your project TODAY</strong>. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. They will need evidence that you have already started copying back your data.</p>
+    <p><a href="{{ project_url }}">View your project</a>.</p>
+    {% if docs_url %}<p>For more information, read the <a href="{{ docs_url }}">documentation</a>.</p>{% endif %}
+    {% if support_url %}<p>If you have any queries, please <a href="{{ support_url }}">raise a ticket</a>.</p>{% endif %}
+    </body>
+    </html>
+
+```
+
+### openportal.grace_period_started
+
+Sent to every member of a project on its end date, the first day of its grace period: access to compute has ended, data must be copied back now, the last day the data can be accessed, and the date by which to contact the allocator for an extension. Same projects as openportal.project_usage_update, sent whatever its frequency.
+
+#### Templates
+
+=== "openportal/grace_period_started_subject.txt"
+
+```txt
+
+    ACTION REQUIRED: your {{ site_name }} project {{ project_name }} has ended - copy back your data now
+
+```
+
+=== "openportal/grace_period_started_message.txt"
+
+```txt
+
+    Your {{ site_name }} project "{{ project_name }}" has ended. Its last day of access was {{ last_access_date|date:"j F Y" }}.
+
+    The project is now in its grace period of {{ grace_period_days }} days so that you can copy back your data.
+
+    You MUST start copying back your data NOW.
+
+    Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}. You will lose access on {{ deletion_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.
+    {% if grace_change_deadline_is_today %}
+    If you will not be able to copy back all of your data in time, you must contact the allocator of your project TODAY. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. They will need evidence that you have already started copying back your data.
+    {% elif grace_change_deadline_passed %}
+    Your grace period cannot be extended, as changes to it need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. Please make sure that you have copied back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}.
+    {% else %}
+    If you will not be able to copy back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}, you must contact the allocator of your project no later than {{ grace_change_deadline|date:"j F Y" }}. They may be able to extend your grace period, but they will need evidence that you have already started copying back your data.
+    {% endif %}
+    View your project at {{ project_url }}
+    {% if docs_url %}
+    For more information, read the documentation at {{ docs_url }}
+    {% endif %}{% if support_url %}
+    If you have any queries, please raise a ticket at {{ support_url }}
+    {% endif %}
+
+```
+
+=== "openportal/grace_period_started_message.html"
+
+```txt
+
+    <html lang="en">
+    <head><meta charset="UTF-8"><title>Your {{ site_name }} project {{ project_name }} has ended</title></head>
+    <body>
+    <p>Your <strong>{{ site_name }}</strong> project <strong>{{ project_name }}</strong> has ended. Its last day of access was {{ last_access_date|date:"j F Y" }}.</p>
+    <p>The project is now in its grace period of {{ grace_period_days }} days so that you can copy back your data.</p>
+    <h3>You MUST start copying back your data NOW.</h3>
+    <p><strong>Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}.</strong> You will lose access on {{ deletion_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.</p>
+    {% if grace_change_deadline_is_today %}
+    <p>If you will not be able to copy back all of your data in time, <strong>you must contact the allocator of your project TODAY</strong>. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. They will need evidence that you have already started copying back your data.</p>
+    {% elif grace_change_deadline_passed %}
+    <p>Your grace period cannot be extended, as changes to it need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. Please make sure that you have copied back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}.</p>
+    {% else %}
+    <p>If you will not be able to copy back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}, <strong>you must contact the allocator of your project no later than {{ grace_change_deadline|date:"j F Y" }}</strong>. They may be able to extend your grace period, but they will need evidence that you have already started copying back your data.</p>
+    {% endif %}
+    <p><a href="{{ project_url }}">View your project</a>.</p>
+    {% if docs_url %}<p>For more information, read the <a href="{{ docs_url }}">documentation</a>.</p>{% endif %}
+    {% if support_url %}<p>If you have any queries, please <a href="{{ support_url }}">raise a ticket</a>.</p>{% endif %}
+    </body>
+    </html>
+
+```
+
 ### openportal.managed_project_rejected
 
 Sent to Project admins and Project managers when their resource allocation request is rejected.
@@ -5491,7 +5609,7 @@ A regular update sent to every member of a project holding an award or an alloca
     {% else %}
     There is no grace period: you must copy back your data by the end of {{ last_access_date|date:"j F Y" }}. You will lose access on {{ end_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.
     {% endif %}{% endif %}
-    If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be made at least 14 days before the data is scheduled for deletion, {% if grace_change_deadline_passed %}and that date ({{ grace_change_deadline|date:"j F Y" }}) has now passed.{% else %}so no later than {{ grace_change_deadline|date:"j F Y" }}.{% endif %}
+    If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion, {% if grace_change_deadline_passed %}and that date ({{ grace_change_deadline|date:"j F Y" }}) has now passed.{% else %}so no later than {{ grace_change_deadline|date:"j F Y" }}.{% endif %}
     {% endif %}
     For more detail, view your project at {{ project_url }}
     {% if docs_url %}
@@ -5542,7 +5660,7 @@ A regular update sent to every member of a project holding an award or an alloca
     <p>There is no grace period: <strong>you must copy back your data by the end of {{ last_access_date|date:"j F Y" }}</strong>. You will lose access on {{ end_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.</p>
     {% endif %}
     {% endif %}
-    <p>If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be made at least 14 days before the data is scheduled for deletion, {% if grace_change_deadline_passed %}and that date ({{ grace_change_deadline|date:"j F Y" }}) has now passed.{% else %}so no later than <strong>{{ grace_change_deadline|date:"j F Y" }}</strong>.{% endif %}</p>
+    <p>If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion, {% if grace_change_deadline_passed %}and that date ({{ grace_change_deadline|date:"j F Y" }}) has now passed.{% else %}so no later than <strong>{{ grace_change_deadline|date:"j F Y" }}</strong>.{% endif %}</p>
     {% endif %}
     <p>For more detail, <a href="{{ project_url }}">view your project</a>.</p>
     {% if docs_url %}<p>For more information, read the <a href="{{ docs_url }}">documentation</a>.</p>{% endif %}

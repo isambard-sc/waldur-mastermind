@@ -1,0 +1,12 @@
+{% if in_grace_period %}Your {{ site_name }} project "{{ project_name }}" is in its grace period.{% else %}The last day of access to your {{ site_name }} project "{{ project_name }}" is {{ last_access_date|date:"j F Y" }}.{% if grace_period_days %} It is followed by a grace period of {{ grace_period_days }} days so that you can copy back your data.{% endif %}{% endif %}
+
+Your data will be automatically scheduled for deletion in {{ days_until_deletion }} days, on {{ deletion_date|date:"j F Y" }}. Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}.
+
+If you do not think that you will be able to copy back all of your data in time, you must contact the allocator of your project TODAY. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. They will need evidence that you have already started copying back your data.
+
+View your project at {{ project_url }}
+{% if docs_url %}
+For more information, read the documentation at {{ docs_url }}
+{% endif %}{% if support_url %}
+If you have any queries, please raise a ticket at {{ support_url }}
+{% endif %}

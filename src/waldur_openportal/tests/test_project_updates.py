@@ -291,14 +291,14 @@ class WhatTheUpdateSaysTest(ProjectUpdateTestMixin, TestCase):
         context = self.context()
         self.assertEqual(context["deletion_date"], _d(2027, 1, 30))
         self.assertEqual(context["data_last_access_date"], _d(2027, 1, 29))
-        self.assertEqual(context["grace_change_deadline"], _d(2027, 1, 16))
+        self.assertEqual(context["grace_change_deadline"], _d(2027, 1, 20))
 
         text, _ = self.body()
         self.assertIn("grace period of 30 days", text)
         self.assertIn("your last day to access your data will be 29 January 2027", text)
         self.assertIn("You will lose access on 30 January 2027", text)
         self.assertIn("contact the allocator of your project", text)
-        self.assertIn("so no later than 16 January 2027", text)
+        self.assertIn("so no later than 20 January 2027", text)
 
     def test_without_a_grace_period_data_goes_at_the_end_date(self):
         self.project.grace_period_days = 0
@@ -311,10 +311,10 @@ class WhatTheUpdateSaysTest(ProjectUpdateTestMixin, TestCase):
 
     def test_in_the_grace_period_it_says_so(self):
         self.award()
-        text, _ = self.body(_at(2027, 1, 20))
+        text, _ = self.body(_at(2027, 1, 22))
         self.assertIn("is now in its grace period", text)
         self.assertIn("your last day to access your data is 29 January 2027", text)
-        self.assertIn("(16 January 2027) has now passed", text)
+        self.assertIn("(20 January 2027) has now passed", text)
 
     def test_each_award_is_reported_busiest_first(self):
         self.award(used=10000)
@@ -387,3 +387,100 @@ class EndDatesAreExclusiveTest(ProjectUpdateTestMixin, TestCase):
         text = self.body()
         self.assertIn("by the end of 30 December 2026, the last day of the award", text)
         self.assertNotIn("31 December 2026, the last day", text)
+
+
+class GracePeriodEmailsTest(ProjectUpdateTestMixin, TestCase):
+    """The end date is 31 December 2026 and the grace period 30 days, so the
+    data's last day is 29 January, it is deleted on 30 January, and the last
+    day to ask for an extension is 20 January - 10 days before deletion."""
+
+    def setUp(self):
+        super().setUp()
+        for event in ("grace_period_started", "grace_period_ending"):
+            Notification.objects.create(key=f"openportal.{event}", enabled=True)
+        self.award()
+
+    def sent(self, now):
+        before = len(mail.outbox)
+        self.send(now)
+        return mail.outbox[before:]
+
+    def grace(self, days):
+        self.project.grace_period_days = days
+        self.project.save()
+
+    def last_sent(self, day):
+        models.ProjectNotification.objects.update_or_create(
+            project=self.project, defaults={"last_notification": day}
+        )
+
+    def test_on_the_end_date_members_are_told_to_copy_back_now(self):
+        [message] = self.sent(_at(2026, 12, 31))
+        self.assertIn("has ended - copy back your data now", message.subject)
+        self.assertIn("Its last day of access was 30 December 2026", message.body)
+        self.assertIn("You MUST start copying back your data NOW", message.body)
+        self.assertIn("last day to access your data is 29 January 2027", message.body)
+        self.assertIn(
+            "allocator of your project no later than 20 January", message.body
+        )
+
+    def test_it_is_sent_once(self):
+        self.assertEqual(len(self.sent(_at(2026, 12, 31))), 1)
+        self.assertEqual(len(self.sent(_at(2026, 12, 31, hour=14))), 0)
+
+    def test_it_takes_the_place_of_an_update_due_the_same_day(self):
+        [message] = self.sent(_at(2026, 12, 31))
+        self.assertIn("has ended", message.subject)
+        # and the update's period restarts from it
+        self.assertEqual(len(self.sent(_at(2027, 1, 1))), 0)
+
+    def test_ten_days_before_deletion_members_are_told_to_contact_the_allocator(self):
+        self.last_sent(_d(2027, 1, 10))
+        [message] = self.sent(_at(2027, 1, 20))
+        self.assertIn("will be deleted in 10 days", message.subject)
+        self.assertIn("is in its grace period", message.body)
+        self.assertIn("deletion in 10 days, on 30 January 2027", message.body)
+        self.assertIn("contact the allocator of your project TODAY", message.body)
+        self.assertEqual(len(self.sent(_at(2027, 1, 20, hour=15))), 0)
+
+    def test_nothing_is_sent_on_other_days_in_the_grace_period(self):
+        self.last_sent(_d(2027, 1, 10))
+        self.assertEqual(len(self.sent(_at(2027, 1, 19))), 0)
+        self.assertEqual(len(self.sent(_at(2027, 1, 21))), 0)
+
+    def test_they_go_whatever_the_update_frequency(self):
+        models.ProjectNotification.objects.create(project=self.project, frequency=0)
+        self.assertEqual(len(self.sent(_at(2026, 12, 15))), 0)
+        self.assertEqual(len(self.sent(_at(2026, 12, 31))), 1)
+        self.assertEqual(len(self.sent(_at(2027, 1, 20))), 1)
+
+    def test_a_disabled_grace_email_leaves_the_update_to_go_out(self):
+        Notification.objects.filter(key="openportal.grace_period_started").update(
+            enabled=False
+        )
+        [message] = self.sent(_at(2026, 12, 31))
+        self.assertIn("project update", message.subject)
+
+    def test_a_ten_day_grace_period_gets_one_email_on_the_end_date(self):
+        self.grace(10)
+        [message] = self.sent(_at(2026, 12, 31))
+        self.assertIn("has ended", message.subject)
+        self.assertIn("contact the allocator of your project TODAY", message.body)
+        self.assertEqual(len(self.sent(_at(2026, 12, 31, hour=15))), 0)
+
+    def test_a_short_grace_period_is_warned_before_the_end_date(self):
+        self.grace(5)
+        [ending] = self.sent(_at(2026, 12, 26))
+        self.assertIn("will be deleted in 10 days", ending.subject)
+        self.assertIn("The last day of access to your Waldur project", ending.body)
+        self.assertIn("followed by a grace period of 5 days", ending.body)
+
+        [started] = self.sent(_at(2026, 12, 31))
+        self.assertIn("Your grace period cannot be extended", started.body)
+
+    def test_without_a_grace_period_only_the_ten_day_warning_goes(self):
+        self.grace(0)
+        [ending] = self.sent(_at(2026, 12, 21))
+        self.assertIn("deletion in 10 days, on 31 December 2026", ending.body)
+        self.assertNotIn("grace period of", ending.body)
+        self.assertEqual(len(self.sent(_at(2026, 12, 31))), 0)
