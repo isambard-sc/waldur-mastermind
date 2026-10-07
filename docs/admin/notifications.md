@@ -5443,3 +5443,112 @@ Sent to Project admins and Project managers when their resource allocation reque
     </html>
 
 ```
+
+### openportal.project_usage_update
+
+A regular update sent to every member of a project holding an award or an allocation on this portal: what has been used, whether it is ahead of or behind the pace needed to use the allocation by the end date, and when the grace period ends and data is deleted. Not sent for projects managed by a remote awarding portal, which sends its own. How often is set per project (every 14 days by default).
+
+#### Templates
+
+=== "openportal/project_usage_update_subject.txt"
+
+```txt
+
+    {{ site_name }} project update for {{ project_name }} - {{ today|date:"j F Y" }}
+
+```
+
+=== "openportal/project_usage_update_message.txt"
+
+```txt
+
+    Here is your regular update for your {{ site_name }} project "{{ project_name }}".
+    {% for award in awards %}
+    {% if awards|length > 1 %}{{ award.name }}
+    {% endif %}So far {{ award.used }} of {{ award.allocation }} has been used ({{ award.used_percent }}% of the allocation). An even spend from the start of the award on {{ award.start_date|date:"j F Y" }} would have used {{ award.expected_percent }}% by today.
+    {% if award.status == "behind" %}
+    You are BEHIND the pace needed to use the whole allocation by {{ award.end_date|date:"j F Y" }}. At your current rate of use you are projected to lose {{ award.projected_loss }} ({{ award.projected_loss_percent }}% of your allocation) at the end date, because allocation that is not used by the end date is lost.{% if award.required_per_day %} To use the rest, you would need to use {{ award.required_per_day }} per day from today.{% endif %}
+    {% elif award.status == "ahead" %}
+    You are AHEAD of the even pace for this allocation.{% if award.exhaustion_date %} At your current rate of use the allocation will run out on {{ award.exhaustion_date|date:"j F Y" }}, before the end date of {{ award.end_date|date:"j F Y" }}.{% else %} At your current rate of use the allocation will last until the end date of {{ award.end_date|date:"j F Y" }}.{% endif %}
+    {% elif award.status == "on-track" %}
+    You are ON PACE to use the whole allocation by {{ award.end_date|date:"j F Y" }}.
+    {% elif award.status == "settling" %}
+    It is too early in the award to judge whether you are ahead or behind the pace needed to use the whole allocation by {{ award.end_date|date:"j F Y" }}.
+    {% elif award.status == "exhausted" %}
+    The whole allocation has been used, with {{ award.remaining_days }} days of the award still to run.
+    {% elif award.status == "ended" %}
+    The award ended on {{ award.end_date|date:"j F Y" }}.
+    {% endif %}{% endfor %}
+    {% if local_usage %}
+    This month, {{ local_usage.usage_this_month }} node hours have been used.{% if local_usage.credit_remaining %} The project has {{ local_usage.credit_remaining }} remaining to use before the end of the project.{% endif %}
+    {% endif %}
+    {% if end_date %}{% if in_grace_period %}
+    Your project ended on {{ end_date|date:"j F Y" }} and is now in its grace period, so that you can copy back your data. This has to be done quickly, as your data is scheduled for automatic deletion on {{ deletion_date|date:"j F Y" }}.
+    {% else %}
+    Your project ends on {{ end_date|date:"j F Y" }}, which is {% if days_until_end == 0 %}today{% elif days_until_end == 1 %}tomorrow{% else %}in {{ days_until_end }} days{% endif %}. All of the allocation must be used before then.
+    {% if grace_period_days %}
+    After the end date, the project will enter a grace period of {{ grace_period_days }} days so that you can copy back your data. This has to be done quickly, as data will be automatically scheduled for deletion on {{ deletion_date|date:"j F Y" }}.
+    {% else %}
+    There is no grace period after the end date: you must copy back your data before then, as it will be automatically scheduled for deletion on {{ deletion_date|date:"j F Y" }}.
+    {% endif %}{% endif %}
+    If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be made at least 14 days before the data is scheduled for deletion, {% if grace_change_deadline_passed %}and that date ({{ grace_change_deadline|date:"j F Y" }}) has now passed.{% else %}so by {{ grace_change_deadline|date:"j F Y" }} at the latest.{% endif %}
+    {% endif %}
+    For more detail, view your project at {{ project_url }}
+    {% if docs_url %}
+    To learn more about project accounting, read the documentation at {{ docs_url }}
+    {% endif %}{% if support_url %}
+    If you have any queries, please raise a ticket at {{ support_url }}
+    {% endif %}
+    We will send you an update every {{ update_frequency }}. If you want to change how often these updates are sent, please ask the project PI to raise a request{% if support_url %} at {{ support_url }}{% endif %}.
+
+```
+
+=== "openportal/project_usage_update_message.html"
+
+```txt
+
+    <html lang="en">
+    <head><meta charset="UTF-8"><title>{{ site_name }} project update for {{ project_name }}</title></head>
+    <body>
+    <p>Here is your regular update for your <strong>{{ site_name }}</strong> project <strong>{{ project_name }}</strong>.</p>
+    {% for award in awards %}
+    {% if awards|length > 1 %}<h3>{{ award.name }}</h3>{% endif %}
+    <p>So far <strong>{{ award.used }}</strong> of {{ award.allocation }} has been used ({{ award.used_percent }}% of the allocation). An even spend from the start of the award on {{ award.start_date|date:"j F Y" }} would have used {{ award.expected_percent }}% by today.</p>
+    {% if award.status == "behind" %}
+    <p><strong>You are behind</strong> the pace needed to use the whole allocation by {{ award.end_date|date:"j F Y" }}. At your current rate of use you are projected to lose <strong>{{ award.projected_loss }} ({{ award.projected_loss_percent }}% of your allocation)</strong> at the end date, because allocation that is not used by the end date is lost.{% if award.required_per_day %} To use the rest, you would need to use {{ award.required_per_day }} per day from today.{% endif %}</p>
+    {% elif award.status == "ahead" %}
+    <p><strong>You are ahead</strong> of the even pace for this allocation.{% if award.exhaustion_date %} At your current rate of use the allocation will run out on <strong>{{ award.exhaustion_date|date:"j F Y" }}</strong>, before the end date of {{ award.end_date|date:"j F Y" }}.{% else %} At your current rate of use the allocation will last until the end date of {{ award.end_date|date:"j F Y" }}.{% endif %}</p>
+    {% elif award.status == "on-track" %}
+    <p><strong>You are on pace</strong> to use the whole allocation by {{ award.end_date|date:"j F Y" }}.</p>
+    {% elif award.status == "settling" %}
+    <p>It is too early in the award to judge whether you are ahead or behind the pace needed to use the whole allocation by {{ award.end_date|date:"j F Y" }}.</p>
+    {% elif award.status == "exhausted" %}
+    <p><strong>The whole allocation has been used</strong>, with {{ award.remaining_days }} days of the award still to run.</p>
+    {% elif award.status == "ended" %}
+    <p>The award ended on {{ award.end_date|date:"j F Y" }}.</p>
+    {% endif %}
+    {% endfor %}
+    {% if local_usage %}
+    <p>This month, <strong>{{ local_usage.usage_this_month }}</strong> node hours have been used.{% if local_usage.credit_remaining %} The project has {{ local_usage.credit_remaining }} remaining to use before the end of the project.{% endif %}</p>
+    {% endif %}
+    {% if end_date %}
+    {% if in_grace_period %}
+    <p>Your project ended on {{ end_date|date:"j F Y" }} and is now in its grace period, so that you can copy back your data. This has to be done quickly, as <strong>your data is scheduled for automatic deletion on {{ deletion_date|date:"j F Y" }}</strong>.</p>
+    {% else %}
+    <p>Your project ends on <strong>{{ end_date|date:"j F Y" }}</strong>, which is {% if days_until_end == 0 %}today{% elif days_until_end == 1 %}tomorrow{% else %}in {{ days_until_end }} days{% endif %}. All of the allocation must be used before then.</p>
+    {% if grace_period_days %}
+    <p>After the end date, the project will enter a grace period of {{ grace_period_days }} days so that you can copy back your data. This has to be done quickly, as <strong>data will be automatically scheduled for deletion on {{ deletion_date|date:"j F Y" }}</strong>.</p>
+    {% else %}
+    <p>There is no grace period after the end date: you must copy back your data before then, as <strong>it will be automatically scheduled for deletion on {{ deletion_date|date:"j F Y" }}</strong>.</p>
+    {% endif %}
+    {% endif %}
+    <p>If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be made at least 14 days before the data is scheduled for deletion, {% if grace_change_deadline_passed %}and that date ({{ grace_change_deadline|date:"j F Y" }}) has now passed.{% else %}so by <strong>{{ grace_change_deadline|date:"j F Y" }}</strong> at the latest.{% endif %}</p>
+    {% endif %}
+    <p>For more detail, <a href="{{ project_url }}">view your project</a>.</p>
+    {% if docs_url %}<p>To learn more about project accounting, read the <a href="{{ docs_url }}">documentation</a>.</p>{% endif %}
+    {% if support_url %}<p>If you have any queries, please <a href="{{ support_url }}">raise a ticket</a>.</p>{% endif %}
+    <p>We will send you an update every {{ update_frequency }}. If you want to change how often these updates are sent, please ask the project PI to raise a request{% if support_url %} at <a href="{{ support_url }}">{{ support_url }}</a>{% endif %}.</p>
+    </body>
+    </html>
+
+```

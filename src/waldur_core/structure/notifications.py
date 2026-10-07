@@ -1533,6 +1533,55 @@ class ManagedProjectRejectedContext(BaseModel):
     site_name: str = Field(description="Name of the site from settings.")
 
 
+class ProjectUsageUpdateContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    project_name: str = Field(description="Name of the project.")
+    project_url: str = Field(description="Link to the project in HomePort.")
+    today: Any = Field(description="Date the update was generated.")
+    update_frequency: str = Field(
+        description='How often the update is sent, in words, e.g. "fortnight".'
+    )
+    end_date: Any = Field(description="The project's end date, or None.")
+    days_until_end: int | None = Field(
+        description="Days from today to the end date; None without an end date."
+    )
+    in_grace_period: bool = Field(
+        description="True once the end date has passed and the grace period runs."
+    )
+    grace_period_days: int = Field(
+        description="Days after the end date before data is deleted."
+    )
+    deletion_date: Any = Field(
+        description="Date the project's data is scheduled for deletion, or None."
+    )
+    grace_change_deadline: Any = Field(
+        description="Last date a change to the grace period can be requested: "
+        "14 days before deletion_date. None without an end date."
+    )
+    grace_change_deadline_passed: bool = Field(
+        description="True when grace_change_deadline is already in the past."
+    )
+    awards: list[dict[str, Any]] = Field(
+        description="One entry per award held by the project, each describing "
+        "how it is tracking against its window, as on the HomePort award pace "
+        "card: `name`, `allocation`, `used`, `used_percent`, `expected_percent`, "
+        "`status` (settling, behind, on-track, ahead, exhausted or ended), "
+        "`status_label`, `start_date`, `end_date`, `remaining_days`, "
+        "`actual_per_day`, `required_per_day`, `projected_total`, "
+        "`projected_loss`, `projected_loss_percent` and `exhaustion_date`. "
+        "Amounts are formatted strings in the allocation's own unit."
+    )
+    local_usage: dict[str, Any] | None = Field(
+        description="For a project with allocations on this portal itself: "
+        "`usage_this_month` and `credit_remaining`, as formatted strings. None "
+        "otherwise."
+    )
+    docs_url: str = Field(description="DOCS_URL from settings; may be empty.")
+    support_url: str = Field(
+        description="SUPPORT_PORTAL_URL from settings; may be empty."
+    )
+
+
 class OpenPortalSection(NotificationSection):
     class Meta:
         key = "openportal"
@@ -1541,4 +1590,15 @@ class OpenPortalSection(NotificationSection):
         key="managed_project_rejected",
         description="Sent to Project admins and Project managers when their resource allocation request is rejected.",
         context_model=ManagedProjectRejectedContext,
+    )
+
+    project_usage_update = Notification(
+        key="project_usage_update",
+        description="A regular update sent to every member of a project holding "
+        "an award or an allocation on this portal: what has been used, whether "
+        "it is ahead of or behind the pace needed to use the allocation by the "
+        "end date, and when the grace period ends and data is deleted. Not sent "
+        "for projects managed by a remote awarding portal, which sends its own. "
+        "How often is set per project (every 14 days by default).",
+        context_model=ProjectUsageUpdateContext,
     )
