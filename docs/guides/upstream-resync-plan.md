@@ -1102,3 +1102,72 @@ sweep found the project-ending notification templates (which failed upstream's
 own test), Call-scope filtering in `logging/filters.py`, a proposal-creator
 guard in `permissions/serializers.py`, a `PROPOSAL.DELETE_PERMISSION` grant in
 `permissions.yaml`, and two stray blank lines.
+
+## 12. Known issue left unfixed: `is_in_grace_period` is a day off at both ends
+
+Recorded in October 2026 and **deliberately not fixed**, to avoid changing
+production behaviour. It is upstream code (`waldur_core`), so the same issue
+exists in every Waldur deployment.
+
+### The rule everything else follows
+
+End dates are exclusive. `Project.is_expired` is
+`effective_end_date <= today`, where `effective_end_date` is the end date
+plus the grace period. So:
+
+- on the **end date** itself, access to the project has already ended, and
+  the grace period has begun (its first day);
+- on the **effective end date** itself, access to the data has already been
+  lost, and the data is scheduled for deletion.
+
+HomePort (`lastAccessDate` in `src/core/dateUtils.ts`) and the OpenPortal
+project emails (`waldur_openportal/project_updates.py`) both follow this rule.
+
+### What `is_in_grace_period` says instead
+
+`Project.is_in_grace_period` (`src/waldur_core/structure/models.py`) is
+`end_date < today <= effective_end_date`, so it is wrong on both boundary
+days:
+
+| Day | Actually | `is_in_grace_period` | `is_expired` |
+| --- | --- | --- | --- |
+| End date | first day of the grace period | **false** | false |
+| Effective end date | access to data lost | **true** | true |
+
+On the end date the project looks fully active. On the effective end date it
+looks both expired and in its grace period.
+
+### Where that matters
+
+| Caller | Effect on the end date | Effect on the effective end date |
+| --- | --- | --- |
+| `waldur_openportal/tasks.py` `sync_allocation_limits` (`is_in_grace_period` branch) | Limits are **not** zeroed, so the project can keep computing for the day | None (limits are zero) |
+| `marketplace/tasks.py` `terminate_resources_if_project_end_date_has_been_reached` (pausing in the grace period, daily at 01:40) | Resources are **not** paused until the next day's run | None |
+| `waldur_openportal/tasks.py` `sync_remote_for_destination` (`is_expired and not is_in_grace_period`) | None | Remote allocations are deleted a day late (lenient) |
+| `waldur_openportal/board.py` award updates, `tasks.py` `create_default_resources` | Allocation changes are treated as for an active project | Updates and resource creation still accepted |
+| API (`is_in_grace_period`, `project_is_in_grace_period`), policy tasks, chat tools | Reported as not in grace | Reported as in grace |
+
+So in practice a project gets up to one extra day of compute on its end
+date, contrary to what HomePort and the emails tell its members. Removal of
+data a day late errs on the lenient side.
+
+### What is already protected from it
+
+- **HomePort** no longer trusts `is_in_grace_period` for the project profile
+  line or the grace period banner; both are computed from `end_date` and
+  `effective_end_date`.
+- **The OpenPortal project emails** never use it. `GracePeriodEmailsTest` and
+  `test_nothing_is_sent_once_access_to_the_data_is_lost` in
+  `waldur_openportal/tests/test_project_updates.py` pin both boundary days.
+
+### The fix, if it is wanted later
+
+One line, upstreamable: make `is_in_grace_period` return
+`end_date <= today < effective_end_date`. Every caller above then becomes
+correct, and the API agrees with HomePort.
+
+It changes production behaviour: on the end date, allocation limits are
+zeroed and resources paused, one day earlier than now. Before making it,
+check upstream's tests for assertions on the current boundaries, add tests
+for both boundary days, and tell users, since some will have been relying on
+the extra day.
