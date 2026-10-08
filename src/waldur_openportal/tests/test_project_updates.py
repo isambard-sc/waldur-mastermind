@@ -499,3 +499,11 @@ class GracePeriodEmailsTest(ProjectUpdateTestMixin, TestCase):
         self.assertIn("deletion in 10 days, on 31 December 2026", ending.body)
         self.assertNotIn("grace period of", ending.body)
         self.assertEqual(len(self.sent(_at(2026, 12, 31))), 0)
+
+    def test_nothing_is_sent_once_access_to_the_data_is_lost(self):
+        """30 January is the deletion date: access has gone, so no email.
+        Project.is_in_grace_period is still true that day, which is why the
+        emails work from the dates rather than from it."""
+        self.assertTrue(models.ProjectNotification.objects.count() == 0)
+        self.assertEqual(len(self.sent(_at(2027, 1, 30))), 0)
+        self.assertEqual(len(self.sent(_at(2027, 1, 29))), 1)
