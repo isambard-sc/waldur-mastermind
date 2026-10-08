@@ -15,6 +15,7 @@ classDiagram
         +string article_code
         +Offering offering [FK]
         +bool archived
+        +string billing_mode
         +int max_amount
         +OrganizationGroup organization_groups
     }
@@ -25,8 +26,8 @@ classDiagram
         +int amount
         +decimal price
         +decimal future_price
-        +int discount_threshold
-        +int discount_rate
+        +string discount_formula
+        +string discount_aggregation
     }
     class Resource {
         +int id [PK]
@@ -50,6 +51,7 @@ classDiagram
         +JSONField attributes
         +date end_date
         +User end_date_requested_by [FK]
+        +datetime end_date_updated_at
         +FSMIntegerField state
         +Project project [FK]
         +Resource parent [FK]
@@ -60,6 +62,7 @@ classDiagram
         +bool downscaled
         +bool restrict_member_access
         +bool paused
+        +string usage_limit_restriction
     }
     class Order {
         +int id [PK]
@@ -77,10 +80,13 @@ classDiagram
         +JSONField attributes
         +int type
         +Plan old_plan [FK]
+        +decimal old_cost
         +Project project [FK]
         +Resource resource [FK]
         +FSMIntegerField state
         +string output
+        +datetime output_updated_at
+        +datetime error_updated_at
         +User created_by [FK]
         +User consumer_reviewed_by [FK]
         +datetime consumer_reviewed_at
@@ -92,6 +98,18 @@ classDiagram
         +date start_date
         +string request_comment
         +file attachment
+        +string provider_message
+        +string provider_message_url
+        +file provider_message_attachment
+        +datetime provider_message_updated_at
+        +string consumer_message
+        +file consumer_message_attachment
+        +datetime consumer_message_updated_at
+        +string consumer_rejection_comment
+        +string provider_rejection_comment
+        +bool placed_automatically
+        +ProjectOrderAutoApproval auto_approved_by_rule [FK]
+        +decimal auto_approved_cost_limit_snapshot
     }
     Order "*" -- "1" Plan : old_plan
     Order "*" -- "1" Plan : plan

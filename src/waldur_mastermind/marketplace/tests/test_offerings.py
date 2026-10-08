@@ -7,21 +7,31 @@ import uuid
 from itertools import product
 from unittest import mock
 
+import reversion
 from constance.test.unittest import override_config
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
-from ddt import data, ddt, idata
+from ddt import data, ddt, idata, unpack
 from django.core.exceptions import ObjectDoesNotExist
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection as db_connection
+from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 from rest_framework import exceptions as rest_exceptions
 from rest_framework import status, test
 
 from waldur_core.checklist import enums as checklist_enums
+from waldur_core.checklist.tests import factories as checklist_factories
 from waldur_core.core import utils as core_utils
+from waldur_core.core.models import DESCRIPTION_LENGTH
 from waldur_core.core.pagination import RESULT_COUNT_HEADER
-from waldur_core.core.tests.helpers import load_json_resource
+from waldur_core.core.tests.helpers import EXPANDING_DESCRIPTION, load_json_resource
+from waldur_core.logging.enums import EventType
+from waldur_core.logging.models import Event
+from waldur_core.media.models import File
 from waldur_core.media.utils import dummy_image, dummy_svg
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
@@ -37,6 +47,9 @@ from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.invoices.tests import factories as invoices_factories
 from waldur_mastermind.marketplace import models, serializers, utils
 from waldur_mastermind.marketplace.enums import (
+    BASIC_OFFERING,
+    OPENSTACK_TENANT_OFFERING,
+    SITE_AGENT_OFFERING,
     SUPPORT_OFFERING,
     VMWARE_VM_OFFERING,
     BillingTypes,
@@ -54,12 +67,19 @@ from waldur_mastermind.marketplace.management.commands.import_offering import (
 from waldur_mastermind.marketplace.plugins import manager
 from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
+from waldur_mastermind.proposal import models as proposal_models
+from waldur_mastermind.proposal.enums import (
+    CallStates,
+    RequestedOfferingStates,
+    RoundStatuses,
+)
+from waldur_mastermind.proposal.tests import factories as proposal_factories
 
 from . import fixtures as marketplace_fixtures
 
 
 @ddt
-class OfferingGetTest(test.APITransactionTestCase):
+class OfferingGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.offering = factories.OfferingFactory(
@@ -122,7 +142,7 @@ class OfferingGetTest(test.APITransactionTestCase):
         self.assertEqual(list(response.json()[0].keys())[0], "organization_groups")
 
 
-class OfferingExtraFieldsTest(test.APITransactionTestCase):
+class OfferingExtraFieldsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.offering_1 = factories.OfferingFactory(shared=True)
@@ -139,6 +159,8 @@ class OfferingExtraFieldsTest(test.APITransactionTestCase):
         )
 
         self._check_field_after_set_of_it("total_customers", 1)
+        self._check_field_requested_via_field_param("total_customers", 1)
+        self._check_field_is_not_annotated_by_default("total_customers")
 
     def test_total_cost_estimated(self):
         self.client.force_authenticate(self.fixture.staff)
@@ -155,6 +177,8 @@ class OfferingExtraFieldsTest(test.APITransactionTestCase):
         invoice_item.save()
 
         self._check_field_after_set_of_it("total_cost_estimated", 20)
+        self._check_field_requested_via_field_param("total_cost_estimated", 20)
+        self._check_field_is_not_annotated_by_default("total_cost_estimated")
 
     def test_total_cost(self):
         self.client.force_authenticate(self.fixture.staff)
@@ -176,6 +200,22 @@ class OfferingExtraFieldsTest(test.APITransactionTestCase):
         invoice_item.invoice.save()
 
         self._check_field_after_set_of_it("total_cost", 30)
+        self._check_field_requested_via_field_param("total_cost", 30)
+        self._check_field_is_not_annotated_by_default("total_cost")
+
+    def test_extra_field_is_annotated_when_ordering_by_several_fields(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        factories.ResourceFactory(
+            offering=self.offering_2,
+            state=ResourceStates.OK,
+        )
+
+        response = self.client.get(self.url, {"o": "-total_customers,name"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()), 2)
+        self.assertEqual(response.json()[0]["total_customers"], 1)
+        self.assertEqual(response.json()[1]["total_customers"], 0)
 
     def _check_field_before_set_of_it(self, field_name):
         response = self.client.get(self.url)
@@ -186,6 +226,22 @@ class OfferingExtraFieldsTest(test.APITransactionTestCase):
         response = self.client.get(self.detail_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(field_name in response.json().keys())
+
+    def _check_field_requested_via_field_param(self, field_name, value):
+        response = self.client.get(self.url, {"field": ["uuid", field_name]})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()), 2)
+        values = [offering[field_name] for offering in response.json()]
+        self.assertEqual(sorted(values), [0, value])
+
+    def _check_field_is_not_annotated_by_default(self, field_name):
+        """Without ordering by the field and without asking for it explicitly
+        the expensive annotation is skipped, so the value is None."""
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()), 2)
+        for offering in response.json():
+            self.assertIsNone(offering[field_name])
 
     def _check_field_after_set_of_it(self, field_name, value):
         response = self.client.get(self.url, {"o": "-%s" % field_name})
@@ -201,7 +257,7 @@ class OfferingExtraFieldsTest(test.APITransactionTestCase):
         self.assertEqual(response.json()[1][field_name], value)
 
 
-class OfferingPlanInfoTest(test.APITransactionTestCase):
+class OfferingPlanInfoTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.offering = factories.OfferingFactory(shared=True)
@@ -283,13 +339,31 @@ class OfferingPlanInfoTest(test.APITransactionTestCase):
 
 
 @ddt
-class SecretOptionsTests(test.APITransactionTestCase):
+class SecretOptionsTests(test.APITestCase):
+    """Reading secret_options is gated on the permission that changes them.
+
+    Whoever may edit an offering's integration settings may read them back —
+    anything narrower means editing a field rendered empty and overwriting a
+    value that was never displayed.
+    """
+
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.offering = factories.OfferingFactory(
             shared=True, customer=self.fixture.customer, project=self.fixture.project
         )
         self.url = factories.OfferingFactory.get_url(self.offering)
+        self.update_url = factories.OfferingFactory.get_url(
+            self.offering, "update_integration"
+        )
+        # Mirrors the shipped default role permissions.
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_INTEGRATION)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING_INTEGRATION)
+
+    def _offering_manager(self):
+        user = structure_factories.UserFactory()
+        self.offering.add_user(user, OfferingRole.MANAGER)
+        return user
 
     @data("staff", "owner")
     def test_secret_options_are_visible_to_authorized_user(self, user):
@@ -307,8 +381,249 @@ class SecretOptionsTests(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse("secret_options" in response.data)
 
+    def test_secret_options_are_visible_to_offering_scoped_role(self):
+        self.client.force_authenticate(self._offering_manager())
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue("secret_options" in response.data)
 
-class OfferingFilterTest(test.APITransactionTestCase):
+    def test_secret_options_are_hidden_when_the_permission_is_not_granted(self):
+        OfferingRole.MANAGER.delete_permission(
+            PermissionEnum.UPDATE_OFFERING_INTEGRATION
+        )
+        self.client.force_authenticate(self._offering_manager())
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse("secret_options" in response.data)
+
+    @data("staff", "owner")
+    def test_everyone_who_may_write_secret_options_may_read_them(self, user):
+        """The invariant the gate exists to hold, asserted on both directions."""
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+
+        write = self.client.post(
+            self.update_url,
+            {"secret_options": {"order_notification_emails": ["ops@example.com"]}},
+        )
+        self.assertEqual(write.status_code, status.HTTP_200_OK)
+
+        read = self.client.get(self.url)
+        self.assertEqual(
+            read.data["secret_options"]["order_notification_emails"],
+            ["ops@example.com"],
+        )
+
+    def test_secret_options_are_rendered_in_a_list_for_an_entitled_row(self):
+        """A list is gated the same way a detail is, not more coarsely."""
+        self.client.force_authenticate(self.fixture.owner)
+
+        detail = self.client.get(self.url)
+        self.assertIn("secret_options", detail.data)
+
+        listing = self.client.get(factories.OfferingFactory.get_list_url())
+        self.assertEqual(listing.status_code, status.HTTP_200_OK)
+        row = next(row for row in listing.data if row["uuid"] == self.offering.uuid.hex)
+        self.assertIn("secret_options", row)
+
+    def test_a_page_is_gated_row_by_row(self):
+        """The regression: entitlement on one row used to decide the whole page."""
+        other = fixtures.ProjectFixture()
+        their_offering = factories.OfferingFactory(
+            shared=True,
+            customer=other.customer,
+            project=other.project,
+            secret_options={"order_notification_emails": ["theirs@example.com"]},
+        )
+        # Enough for filter_for_user to put their offering on the same page,
+        # without granting any provider rights over it.
+        other.customer.add_user(self.fixture.owner, CustomerRole.SUPPORT)
+
+        self.client.force_authenticate(self.fixture.owner)
+        listing = self.client.get(factories.OfferingFactory.get_list_url())
+        self.assertEqual(listing.status_code, status.HTTP_200_OK)
+        rows = {row["uuid"]: row for row in listing.data}
+        self.assertEqual(len(rows), 2)
+
+        mine = rows[self.offering.uuid.hex]
+        self.assertIn("secret_options", mine)
+
+        theirs = rows[their_offering.uuid.hex]
+        self.assertNotIn("secret_options", theirs)
+        self.assertNotIn("service_attributes", theirs)
+
+    def test_offering_scoped_writer_may_read_back_what_it_wrote(self):
+        self.client.force_authenticate(self._offering_manager())
+
+        write = self.client.post(
+            self.update_url,
+            {"secret_options": {"order_notification_emails": ["ops@example.com"]}},
+        )
+        self.assertEqual(write.status_code, status.HTTP_200_OK)
+
+        read = self.client.get(self.url)
+        self.assertEqual(
+            read.data["secret_options"]["order_notification_emails"],
+            ["ops@example.com"],
+        )
+
+
+@ddt
+class OfferingAdminFlagsTests(test.APITestCase):
+    """The detail payload says what the caller may change on this offering.
+
+    The client assembles the offering-update page from these flags. They answer
+    the question the write actions ask — the same permission over the same three
+    scopes — so a control is offered only where a save would be accepted.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(
+            shared=True, customer=self.fixture.customer, project=self.fixture.project
+        )
+        self.url = factories.OfferingFactory.get_url(self.offering)
+        # Mirrors the shipped default role permissions.
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_INTEGRATION)
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_OPTIONS)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING_INTEGRATION)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING_OPTIONS)
+
+    def _offering_manager(self):
+        user = structure_factories.UserFactory()
+        self.offering.add_user(user, OfferingRole.MANAGER)
+        return user
+
+    def _get(self, user):
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data
+
+    @data("staff", "owner")
+    def test_both_flags_are_true_for_an_authorized_user(self, user):
+        data = self._get(getattr(self.fixture, user))
+        self.assertTrue(data["can_update_integration"])
+        self.assertTrue(data["can_update_options"])
+
+    def test_both_flags_are_true_for_an_offering_scoped_role(self):
+        """The permission held on the offering itself, not on its organization."""
+        data = self._get(self._offering_manager())
+        self.assertTrue(data["can_update_integration"])
+        self.assertTrue(data["can_update_options"])
+
+    @data("customer_support", "admin", "manager")
+    def test_both_flags_are_false_for_a_user_who_may_only_read(self, user):
+        data = self._get(getattr(self.fixture, user))
+        self.assertFalse(data["can_update_integration"])
+        self.assertFalse(data["can_update_options"])
+        # The same verdict that drops the provider-only fields, so a client
+        # cannot mistake "not permitted" for "nothing configured".
+        self.assertNotIn("secret_options", data)
+        self.assertNotIn("service_attributes", data)
+
+    def test_the_two_flags_answer_independently(self):
+        """Backend ID rules are gated on options, the rest of the tab on integration."""
+        CustomerRole.OWNER.delete_permission(PermissionEnum.UPDATE_OFFERING_OPTIONS)
+        data = self._get(self.fixture.owner)
+        self.assertTrue(data["can_update_integration"])
+        self.assertFalse(data["can_update_options"])
+
+    def test_a_page_is_flagged_row_by_row(self):
+        """One entitled row must not vouch for the rest of the page."""
+        other = fixtures.ProjectFixture()
+        their_offering = factories.OfferingFactory(
+            shared=True, customer=other.customer, project=other.project
+        )
+        # Enough for filter_for_user to put their offering on the same page,
+        # without granting any provider rights over it.
+        other.customer.add_user(self.fixture.owner, CustomerRole.SUPPORT)
+
+        self.client.force_authenticate(self.fixture.owner)
+        listing = self.client.get(factories.OfferingFactory.get_list_url())
+        self.assertEqual(listing.status_code, status.HTTP_200_OK)
+        rows = {row["uuid"]: row for row in listing.data}
+
+        self.assertTrue(rows[self.offering.uuid.hex]["can_update_integration"])
+        self.assertFalse(rows[their_offering.uuid.hex]["can_update_integration"])
+        self.assertFalse(rows[their_offering.uuid.hex]["can_update_options"])
+
+    @data(
+        ("owner", status.HTTP_200_OK),
+        ("customer_support", status.HTTP_403_FORBIDDEN),
+    )
+    @unpack
+    def test_the_flag_predicts_whether_the_write_is_accepted(self, user, expected):
+        """The invariant behind the flag, asserted against the action itself."""
+        user = getattr(self.fixture, user)
+        data = self._get(user)
+
+        write = self.client.post(
+            factories.OfferingFactory.get_url(self.offering, "update_integration"),
+            {"secret_options": {"order_notification_emails": ["ops@example.com"]}},
+        )
+        self.assertEqual(write.status_code, expected)
+        self.assertEqual(data["can_update_integration"], expected == status.HTTP_200_OK)
+
+
+class OfferingQuotasVisibilityTest(test.APITestCase):
+    """Total quotas of a top-level offering are the provider's own capacity.
+
+    The public endpoint exposes them only for a child offering, whose scope is a
+    single customer's tenant; the provider view keeps them in both cases.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(
+            shared=True,
+            customer=self.fixture.customer,
+            scope=self._scope_with_quota("vcpu", limit=10, usage=4),
+        )
+        factories.PlanFactory(offering=self.offering)
+
+    def _scope_with_quota(self, name, limit, usage):
+        scope = structure_factories.ServiceSettingsFactory()
+        scope.set_quota_limit(name, limit)
+        scope.set_quota_usage(name, usage)
+        return scope
+
+    def _child_offering(self):
+        return factories.OfferingFactory(
+            shared=False,
+            customer=self.fixture.customer,
+            project=self.fixture.project,
+            parent=self.offering,
+            scope=self._scope_with_quota("vcpu", limit=6, usage=2),
+        )
+
+    def test_provider_view_exposes_total_quotas(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(factories.OfferingFactory.get_url(self.offering))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["quotas"], [{"name": "vcpu", "usage": 4, "limit": 10}]
+        )
+
+    def test_public_view_conceals_quotas_of_a_top_level_offering(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            factories.OfferingFactory.get_public_url(self.offering)
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["quotas"], [])
+
+    def test_public_view_exposes_quotas_of_a_child_offering(self):
+        child = self._child_offering()
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(factories.OfferingFactory.get_public_url(child))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["quotas"], [{"name": "vcpu", "usage": 2, "limit": 6}]
+        )
+
+
+class OfferingFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         attributes = {
@@ -513,7 +828,7 @@ class OfferingFilterTest(test.APITransactionTestCase):
         self.assertEqual(len(response.data), 3)
 
 
-class OfferingPlansFilterTest(test.APITransactionTestCase):
+class OfferingPlansFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -597,7 +912,7 @@ class OfferingPlansFilterTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingCreateTest(test.APITransactionTestCase):
+class OfferingCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -921,6 +1236,21 @@ class OfferingCreateTest(test.APITransactionTestCase):
         )
         self.assertEqual(offering.plugin_options["heappe_username"], "test_user")
 
+    def test_heappe_identifier_can_be_cleared(self):
+        """Clearing the field in Homeport submits an empty string."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"heappe_identifier": "example-cluster"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(url, {"plugin_options": {"heappe_identifier": ""}})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertEqual(offering.plugin_options["heappe_identifier"], "")
+
     def test_update_offering_plugin_options_with_openstack_max_security_groups(self):
         """Test that offering plugin options can be updated with max_security_groups"""
         offering = factories.OfferingFactory(customer=self.customer)
@@ -940,6 +1270,137 @@ class OfferingCreateTest(test.APITransactionTestCase):
         self.assertEqual(offering.plugin_options["max_instances"], 10)
         self.assertEqual(offering.plugin_options["max_volumes"], 20)
         self.assertEqual(offering.plugin_options["max_security_groups"], 15)
+
+    def test_update_offering_plugin_options_with_date_field(self):
+        """Test that plugin_options with date values can be saved without JSON serialization errors"""
+        offering = factories.OfferingFactory(customer=self.customer)
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        plugin_options = {
+            "latest_date_for_resource_termination": "2026-02-28",
+        }
+
+        response = self.client.post(url, {"plugin_options": plugin_options})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertEqual(
+            offering.plugin_options["latest_date_for_resource_termination"],
+            "2026-02-28",
+        )
+
+    def test_update_offering_plugin_options_heappe_cluster_id_allows_blank(self):
+        """Clearing heappe_cluster_id must accept empty string."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"heappe_cluster_id": "1"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(
+            url,
+            {"plugin_options": {"heappe_cluster_id": ""}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertEqual(offering.plugin_options["heappe_cluster_id"], "")
+
+    def test_update_offering_plugin_options_heappe_cluster_id_allows_null(self):
+        """Clearing heappe_cluster_id must accept null."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"heappe_cluster_id": "1"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(
+            url,
+            {"plugin_options": {"heappe_cluster_id": None}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertIsNone(offering.plugin_options["heappe_cluster_id"])
+
+    def test_update_offering_plugin_options_required_team_role_allows_blank(self):
+        """Clearing required_team_role_for_provisioning must accept empty string."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"required_team_role_for_provisioning": "PROJECT.MANAGER"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(
+            url,
+            {"plugin_options": {"required_team_role_for_provisioning": ""}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertEqual(
+            offering.plugin_options["required_team_role_for_provisioning"], ""
+        )
+
+    def test_update_offering_plugin_options_required_team_role_allows_null(self):
+        """Clearing required_team_role_for_provisioning must accept null."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"required_team_role_for_provisioning": "PROJECT.MANAGER"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(
+            url,
+            {"plugin_options": {"required_team_role_for_provisioning": None}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertIsNone(
+            offering.plugin_options["required_team_role_for_provisioning"]
+        )
+
+    def test_update_offering_plugin_options_resource_name_pattern_allows_blank(self):
+        """Clearing resource_name_pattern must accept empty string."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"resource_name_pattern": "{project_slug}-{counter}"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(
+            url,
+            {"plugin_options": {"resource_name_pattern": ""}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertEqual(offering.plugin_options["resource_name_pattern"], "")
+
+    def test_update_offering_plugin_options_resource_name_pattern_allows_null(self):
+        """Clearing resource_name_pattern must accept null."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"resource_name_pattern": "{project_slug}-{counter}"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(
+            url,
+            {"plugin_options": {"resource_name_pattern": None}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertIsNone(offering.plugin_options["resource_name_pattern"])
 
     def test_create_offering_with_minimal_information_in_draft_state(self):
         user = self.fixture.staff
@@ -968,8 +1429,87 @@ class OfferingCreateTest(test.APITransactionTestCase):
             ).get()
             self.assertEqual(offering.state, OfferingStates.DRAFT)
 
+    def test_create_offering_with_plugin_options(self):
+        plugin_options = {
+            "auto_approve_in_service_provider_projects": True,
+            "max_instances": 10,
+        }
+        response = self.create_offering(
+            "owner", add_payload={"plugin_options": plugin_options}
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
-class BaseOfferingUpdateTest(test.APITransactionTestCase):
+        offering = models.Offering.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(
+            offering.plugin_options["auto_approve_in_service_provider_projects"], True
+        )
+        self.assertEqual(offering.plugin_options["max_instances"], 10)
+
+    def test_create_offering_with_date_in_plugin_options(self):
+        plugin_options = {
+            "latest_date_for_resource_termination": "2026-02-28",
+        }
+        response = self.create_offering(
+            "owner", add_payload={"plugin_options": plugin_options}
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        offering = models.Offering.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(
+            offering.plugin_options["latest_date_for_resource_termination"],
+            "2026-02-28",
+        )
+
+    def test_create_offering_with_invalid_date_in_plugin_options(self):
+        plugin_options = {
+            "latest_date_for_resource_termination": "not-a-date",
+        }
+        response = self.create_offering(
+            "owner", add_payload={"plugin_options": plugin_options}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_create_offering_with_empty_plugin_options(self):
+        response = self.create_offering("owner", add_payload={"plugin_options": {}})
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        offering = models.Offering.objects.get(uuid=response.data["uuid"])
+        default_plugin_options = {
+            "account_name_generation_policy": None,
+            "auto_approve_marketplace_script": True,
+            "backend_id_display_label": "Backend ID",
+            "enable_display_of_order_actions_for_service_provider": True,
+            "enforce_qos": False,
+            "expose_inference_playground": False,
+            "highlight_backend_id_display": False,
+            "require_effective_id_for_highlighted_display": False,
+            "show_ssh_key_loss_warning": False,
+            "enable_posix_account": True,
+            "uid_source": "pool",
+            "gid_source": "pool",
+            "emit_display_name": False,
+            "emit_waldur_username": False,
+            "offering_user_auto_deletion": False,
+            "resource_expiration_threshold": 30,
+            "resource_project_role_group_template": (
+                "${resource_slug}_${rp_uuid_short}_${role_name}"
+            ),
+            "resource_project_role_map": {},
+            "resource_role_group_template": "${resource_slug}_${role_name}",
+            "resource_role_map": {},
+            "slurm_periodic_policy_enabled": False,
+        }
+        self.assertEqual(offering.plugin_options, default_plugin_options)
+
+    def test_create_offering_without_plugin_options_uses_default(self):
+        response = self.create_offering("owner")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        offering = models.Offering.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(offering.plugin_options, {})
+
+
+class BaseOfferingUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -1036,6 +1576,45 @@ class OfferingUpdateOverviewTest(BaseOfferingUpdateTest):
         response = self.update_overview("owner")
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    @data(OfferingStates.ACTIVE, OfferingStates.PAUSED)
+    def test_owner_can_update_offering_in_active_or_paused_state_when_management_allowed(
+        self, state
+    ):
+        # Arrange
+        self.offering.state = state
+        self.offering.save()
+
+        # Act
+        response = self.update_overview("owner")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.name, "new_offering")
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    def test_owner_can_not_update_offering_in_archived_state_when_management_allowed(
+        self,
+    ):
+        # Arrange
+        self.offering.state = OfferingStates.ARCHIVED
+        self.offering.save()
+
+        # Act
+        response = self.update_overview("owner")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    @data("customer_support", "admin", "manager")
+    def test_unauthorized_user_can_not_update_offering_when_management_allowed(
+        self, role
+    ):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+
+        response = self.update_overview(role)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
     @data(OfferingStates.ACTIVE, OfferingStates.PAUSED)
     def test_staff_can_update_offering_in_active_or_paused_state(self, state):
         # Arrange
@@ -1061,6 +1640,84 @@ class OfferingUpdateOverviewTest(BaseOfferingUpdateTest):
 
         response = self.update_overview("owner")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class OfferingDescriptionLengthTest(BaseOfferingUpdateTest):
+    """Oversized descriptions must be rejected with 400, not blow up in the database."""
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_authenticate(self.fixture.staff)
+
+    def update_overview(self, description):
+        url = factories.OfferingFactory.get_url(self.offering, "update_overview")
+        return self.client.post(
+            url, {"name": self.offering.name, "description": description}
+        )
+
+    def test_description_over_limit_is_rejected(self):
+        response = self.update_overview("a" * (DESCRIPTION_LENGTH + 904))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+
+    def test_description_expanded_by_html_clean_is_rejected(self):
+        self.assertLess(len(EXPANDING_DESCRIPTION), DESCRIPTION_LENGTH)
+
+        response = self.update_overview(EXPANDING_DESCRIPTION)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+        self.assertIn("sanitisation", str(response.data["description"]))
+
+    def test_description_within_limit_is_accepted(self):
+        response = self.update_overview("a" * DESCRIPTION_LENGTH)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(len(self.offering.description), DESCRIPTION_LENGTH)
+
+    def test_full_description_is_not_length_limited(self):
+        # full_description is backed by a TextField, so it stays unbounded.
+        url = factories.OfferingFactory.get_url(self.offering, "update_overview")
+        response = self.client.post(
+            url,
+            {
+                "name": self.offering.name,
+                "full_description": "a" * (DESCRIPTION_LENGTH * 2),
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+
+class OfferingCreateDescriptionLengthTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+        factories.ServiceProviderFactory(customer=self.customer)
+        self.category = factories.CategoryFactory()
+        self.client.force_authenticate(self.fixture.staff)
+
+    def create_offering(self, description):
+        return self.client.post(
+            factories.OfferingFactory.get_list_url(),
+            {
+                "name": "offering",
+                "category": factories.CategoryFactory.get_url(self.category),
+                "customer": structure_factories.CustomerFactory.get_url(self.customer),
+                "type": "Support.OfferingTemplate",
+                "description": description,
+            },
+        )
+
+    def test_description_over_limit_is_rejected(self):
+        response = self.create_offering("a" * (DESCRIPTION_LENGTH + 904))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+
+    def test_description_expanded_by_html_clean_is_rejected(self):
+        response = self.create_offering(EXPANDING_DESCRIPTION)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+        self.assertIn("sanitisation", str(response.data["description"]))
 
 
 @ddt
@@ -1131,7 +1788,211 @@ class OfferingUpdateAttributesTest(BaseOfferingUpdateTest):
 
 
 @ddt
-class OfferingPartialUpdateTest(test.APITransactionTestCase):
+class OfferingUpdateTypeTest(BaseOfferingUpdateTest):
+    def setUp(self):
+        super().setUp()
+        self.offering.type = BASIC_OFFERING
+        self.offering.save()
+
+    def update_type(self, target_type, role):
+        url = factories.OfferingFactory.get_url(self.offering, "update_type")
+        self.client.force_authenticate(getattr(self.fixture, role))
+        return self.client.post(url, {"type": target_type})
+
+    @data("staff", "owner")
+    def test_authorized_user_can_swap_basic_to_site_agent(self, role):
+        response = self.update_type(SITE_AGENT_OFFERING, role)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.type, SITE_AGENT_OFFERING)
+
+    @data("staff", "owner")
+    def test_authorized_user_can_swap_site_agent_to_basic(self, role):
+        self.offering.type = SITE_AGENT_OFFERING
+        self.offering.save()
+
+        response = self.update_type(BASIC_OFFERING, role)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.type, BASIC_OFFERING)
+
+    def test_target_type_outside_swap_set_is_rejected(self):
+        response = self.update_type(OPENSTACK_TENANT_OFFERING, "staff")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.type, BASIC_OFFERING)
+
+    def test_source_type_outside_swap_set_is_rejected(self):
+        self.offering.type = OPENSTACK_TENANT_OFFERING
+        self.offering.save()
+
+        response = self.update_type(BASIC_OFFERING, "staff")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.type, OPENSTACK_TENANT_OFFERING)
+
+    def test_setting_to_same_type_is_a_noop(self):
+        response = self.update_type(BASIC_OFFERING, "staff")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.type, BASIC_OFFERING)
+
+    @data("customer_support", "admin", "manager")
+    def test_unauthorized_user_cannot_change_type(self, role):
+        response = self.update_type(SITE_AGENT_OFFERING, role)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_unrelated_user_cannot_change_type(self):
+        response = self.update_type(SITE_AGENT_OFFERING, "user")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_owner_cannot_change_type_in_active_state(self):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+
+        response = self.update_type(SITE_AGENT_OFFERING, "owner")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @data(OfferingStates.ACTIVE, OfferingStates.PAUSED)
+    def test_staff_can_change_type_in_non_draft_state(self, state):
+        self.offering.state = state
+        self.offering.save()
+
+        response = self.update_type(SITE_AGENT_OFFERING, "staff")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.type, SITE_AGENT_OFFERING)
+
+    def test_archived_offering_type_cannot_be_changed(self):
+        self.offering.state = OfferingStates.ARCHIVED
+        self.offering.save()
+
+        response = self.update_type(SITE_AGENT_OFFERING, "staff")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_blocked_organization_cannot_change_type(self):
+        self.customer.blocked = True
+        self.customer.save()
+
+        response = self.update_type(SITE_AGENT_OFFERING, "owner")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_offering_users_are_preserved_across_type_change(self):
+        offering_user = factories.OfferingUserFactory(
+            offering=self.offering, username="alice"
+        )
+
+        response = self.update_type(SITE_AGENT_OFFERING, "staff")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.offering_id, self.offering.id)
+        self.assertEqual(offering_user.username, "alice")
+
+    def test_orders_are_preserved_across_type_change(self):
+        plan = factories.PlanFactory(offering=self.offering)
+        order = factories.OrderFactory(
+            offering=self.offering,
+            project=self.fixture.project,
+            plan=plan,
+            state=OrderStates.DONE,
+        )
+
+        response = self.update_type(SITE_AGENT_OFFERING, "staff")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        order.refresh_from_db()
+        self.assertEqual(order.offering_id, self.offering.id)
+        self.assertEqual(order.state, OrderStates.DONE)
+        self.assertEqual(order.plan_id, plan.id)
+
+    def test_resources_are_preserved_across_type_change(self):
+        resource = factories.ResourceFactory(
+            offering=self.offering,
+            project=self.fixture.project,
+            state=ResourceStates.OK,
+            name="my-resource",
+        )
+
+        response = self.update_type(SITE_AGENT_OFFERING, "staff")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        resource.refresh_from_db()
+        self.assertEqual(resource.offering_id, self.offering.id)
+        self.assertEqual(resource.state, ResourceStates.OK)
+        self.assertEqual(resource.name, "my-resource")
+        self.assertEqual(resource.limits, {"storage": 123})
+
+    def test_in_flight_order_and_its_graph_survive_type_change(self):
+        # An order that is still EXECUTING (and its resource being CREATED)
+        # is the worst-case scenario for a type swap: the swap is allowed by
+        # design, but the action must not mutate the connected objects in any
+        # way (state, FKs, or even trigger a save). Otherwise the in-flight
+        # work could be corrupted.
+        plan = factories.PlanFactory(offering=self.offering)
+        resource = factories.ResourceFactory(
+            offering=self.offering,
+            project=self.fixture.project,
+            plan=plan,
+            state=ResourceStates.CREATING,
+            name="in-flight",
+        )
+        order = factories.OrderFactory(
+            offering=self.offering,
+            project=self.fixture.project,
+            plan=plan,
+            resource=resource,
+            state=OrderStates.EXECUTING,
+        )
+        offering_user = factories.OfferingUserFactory(
+            offering=self.offering, username="bob"
+        )
+
+        order_modified_before = order.modified
+        resource_modified_before = resource.modified
+        offering_user_modified_before = offering_user.modified
+
+        response = self.update_type(SITE_AGENT_OFFERING, "staff")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        # The swap actually happened.
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.type, SITE_AGENT_OFFERING)
+
+        # In-flight order: state, FKs, and modified timestamp untouched.
+        order.refresh_from_db()
+        self.assertEqual(order.state, OrderStates.EXECUTING)
+        self.assertEqual(order.offering_id, self.offering.id)
+        self.assertEqual(order.resource_id, resource.id)
+        self.assertEqual(order.plan_id, plan.id)
+        self.assertEqual(order.modified, order_modified_before)
+
+        # Resource: state, FKs, and modified timestamp untouched.
+        resource.refresh_from_db()
+        self.assertEqual(resource.state, ResourceStates.CREATING)
+        self.assertEqual(resource.offering_id, self.offering.id)
+        self.assertEqual(resource.plan_id, plan.id)
+        self.assertEqual(resource.name, "in-flight")
+        self.assertEqual(resource.modified, resource_modified_before)
+
+        # OfferingUser: still attached, not re-saved.
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.offering_id, self.offering.id)
+        self.assertEqual(offering_user.username, "bob")
+        self.assertEqual(offering_user.modified, offering_user_modified_before)
+
+        # Counts: no rows added or removed.
+        self.assertEqual(models.Order.objects.filter(offering=self.offering).count(), 1)
+        self.assertEqual(
+            models.Resource.objects.filter(offering=self.offering).count(), 1
+        )
+        self.assertEqual(
+            models.OfferingUser.objects.filter(offering=self.offering).count(), 1
+        )
+
+
+@ddt
+class OfferingPartialUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -1239,8 +2100,10 @@ class OfferingPartialUpdateTest(test.APITransactionTestCase):
             .issuer_name(issuer)
             .public_key(private_key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.utcnow())
-            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+            .not_valid_before(datetime.datetime.now(datetime.UTC))
+            .not_valid_after(
+                datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=365)
+            )
             .add_extension(
                 x509.SubjectAlternativeName([x509.DNSName("localhost")]),
                 critical=False,
@@ -1322,6 +2185,65 @@ class OfferingPartialUpdateTest(test.APITransactionTestCase):
         self.offering.refresh_from_db()
         self.assertEqual(self.offering.options, options)
 
+    def test_update_options_generates_audit_log(self):
+        Event.objects.all().delete()
+        url = factories.OfferingFactory.get_url(self.offering, "update_options")
+        self.client.force_authenticate(self.fixture.owner)
+        options = {
+            "order": ["email"],
+            "options": {
+                "email": {
+                    "type": "string",
+                    "label": "email",
+                    "default": "user@example.com",
+                    "required": False,
+                }
+            },
+        }
+        response = self.client.post(url, {"options": options})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        event = Event.objects.filter(
+            event_type=EventType.MARKETPLACE_OFFERING_OPTIONS_UPDATED
+        ).first()
+        self.assertIsNotNone(event)
+        self.assertIn(self.offering.name, event.message)
+        self.assertIn("email", event.message)
+        self.assertIn("Details:", event.message)
+        self.assertEqual(event.context.get("offering_uuid"), self.offering.uuid.hex)
+        self.assertEqual(
+            event.context.get("user_username"), self.fixture.owner.username
+        )
+
+    def test_update_resource_options_generates_audit_log(self):
+        Event.objects.all().delete()
+        url = factories.OfferingFactory.get_url(
+            self.offering, "update_resource_options"
+        )
+        self.client.force_authenticate(self.fixture.owner)
+        resource_options = {
+            "order": ["storageRequest"],
+            "options": {
+                "storageRequest": {
+                    "type": "integer",
+                    "label": "Storage request (GB)",
+                    "required": True,
+                    "min": 0,
+                    "max": 102400,
+                }
+            },
+        }
+        response = self.client.post(url, {"resource_options": resource_options})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        event = Event.objects.filter(
+            event_type=EventType.MARKETPLACE_OFFERING_RESOURCE_OPTIONS_UPDATED
+        ).first()
+        self.assertIsNotNone(event)
+        self.assertIn(self.offering.name, event.message)
+        self.assertIn("storageRequest", event.message)
+        self.assertIn("Details:", event.message)
+
     @data("staff", "owner")
     def test_update_secret_options(self, user):
         url = factories.OfferingFactory.get_url(self.offering, "update_integration")
@@ -1353,7 +2275,7 @@ class OfferingPartialUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingOrganizationGroupsTest(test.APITransactionTestCase):
+class OfferingOrganizationGroupsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -1414,7 +2336,7 @@ class OfferingOrganizationGroupsTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingDeleteTest(test.APITransactionTestCase):
+class OfferingDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -1428,9 +2350,36 @@ class OfferingDeleteTest(test.APITransactionTestCase):
         factories.PlanFactory(offering=self.offering)
         CustomerRole.OWNER.add_permission(PermissionEnum.DELETE_OFFERING)
 
-    @data("staff", "owner")
-    def test_authorized_user_can_delete_offering(self, user):
-        response = self.delete_offering(user)
+    def test_staff_can_delete_offering(self):
+        response = self.delete_offering("staff")
+        self.assertEqual(
+            response.status_code, status.HTTP_204_NO_CONTENT, response.data
+        )
+        self.assertFalse(
+            models.Offering.objects.filter(customer=self.customer).exists()
+        )
+
+    def test_draft_offering_without_a_plan_can_be_deleted(self):
+        # Regression: validate_offering_has_plans previously leaked into
+        # destroy_validators via list aliasing, so a plan-less offering could
+        # not be deleted ("Offering does not have any billing plans").
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            project=self.fixture.project,
+            shared=True,
+            state=OfferingStates.DRAFT,
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(offering)
+        response = self.client.delete(url)
+        self.assertEqual(
+            response.status_code, status.HTTP_204_NO_CONTENT, response.data
+        )
+        self.assertFalse(models.Offering.objects.filter(id=offering.id).exists())
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    def test_owner_can_delete_offering_when_management_enabled(self):
+        response = self.delete_offering("owner")
         self.assertEqual(
             response.status_code, status.HTTP_204_NO_CONTENT, response.data
         )
@@ -1444,12 +2393,14 @@ class OfferingDeleteTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertTrue(models.Offering.objects.filter(customer=self.customer).exists())
 
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
     def test_offering_deleting_is_not_available_for_blocked_organization(self):
         self.customer.blocked = True
         self.customer.save()
         response = self.delete_offering("owner")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
     def test_customer_owner_can_not_delete_offering_if_it_is_not_in_draft_state(self):
         self.offering.state = OfferingStates.ACTIVE
         self.offering.save()
@@ -1460,6 +2411,7 @@ class OfferingDeleteTest(test.APITransactionTestCase):
             "Offering was not deleted since offering is not in draft state.",
         )
 
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
     def test_customer_owner_can_not_delete_offering_if_it_has_resources(self):
         self.offering.state = OfferingStates.DRAFT
         factories.ResourceFactory(offering=self.offering)
@@ -1469,6 +2421,68 @@ class OfferingDeleteTest(test.APITransactionTestCase):
             response.data["detail"], "Offering was not deleted since it has resources."
         )
 
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=False)
+    def test_sp_can_not_delete_offering_when_management_disabled(self):
+        response = self.delete_offering("owner")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(models.Offering.objects.filter(customer=self.customer).exists())
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    def test_sp_can_delete_offering_when_management_enabled(self):
+        response = self.delete_offering("owner")
+        self.assertEqual(
+            response.status_code, status.HTTP_204_NO_CONTENT, response.data
+        )
+        self.assertFalse(
+            models.Offering.objects.filter(customer=self.customer).exists()
+        )
+
+    def test_staff_cannot_delete_offering_with_active_resources_when_restriction_enabled(
+        self,
+    ):
+        self.offering.plugin_options["restrict_deletion_with_active_resources"] = True
+        self.offering.save()
+        factories.ResourceFactory(offering=self.offering, state=ResourceStates.OK)
+        response = self.delete_offering("staff")
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_staff_can_delete_offering_without_active_resources_when_restriction_enabled(
+        self,
+    ):
+        self.offering.plugin_options["restrict_deletion_with_active_resources"] = True
+        self.offering.save()
+        response = self.delete_offering("staff")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(models.Offering.objects.filter(pk=self.offering.pk).exists())
+
+    def test_staff_can_delete_offering_with_resources_when_restriction_disabled(self):
+        factories.ResourceFactory(offering=self.offering, state=ResourceStates.OK)
+        response = self.delete_offering("staff")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(models.Offering.objects.filter(pk=self.offering.pk).exists())
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    def test_owner_cannot_delete_offering_with_active_resources_when_restriction_enabled(
+        self,
+    ):
+        self.offering.plugin_options["restrict_deletion_with_active_resources"] = True
+        self.offering.save()
+        factories.ResourceFactory(offering=self.offering, state=ResourceStates.OK)
+        response = self.delete_offering("owner")
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_deletion_allowed_when_all_resources_terminated_and_restriction_enabled(
+        self,
+    ):
+        self.offering.plugin_options["restrict_deletion_with_active_resources"] = True
+        self.offering.save()
+        factories.ResourceFactory(
+            offering=self.offering, state=ResourceStates.TERMINATED
+        )
+        response = self.delete_offering("staff")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(models.Offering.objects.filter(pk=self.offering.pk).exists())
+
     def delete_offering(self, user):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
@@ -1476,6 +2490,7 @@ class OfferingDeleteTest(test.APITransactionTestCase):
         response = self.client.delete(url)
         return response
 
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
     def test_when_offering_is_deleted_related_service_setting_is_deleted(self):
         # Arrange
         self.service_settings = structure_factories.ServiceSettingsFactory(
@@ -1492,7 +2507,7 @@ class OfferingDeleteTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingAttributesTest(test.APITransactionTestCase):
+class OfferingAttributesTest(test.APITestCase):
     def setUp(self):
         self.serializer = serializers.OfferingCreateSerializer()
         self.category = factories.CategoryFactory()
@@ -1574,7 +2589,7 @@ class OfferingAttributesTest(test.APITransactionTestCase):
         )
 
 
-class OfferingQuotaTest(test.APITransactionTestCase):
+class OfferingQuotaTest(test.APITestCase):
     def get_usage(self, category):
         return category.get_quota_usage("offering_count")
 
@@ -1605,7 +2620,7 @@ class OfferingQuotaTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingStateTest(test.APITransactionTestCase):
+class OfferingStateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -1629,6 +2644,12 @@ class OfferingStateTest(test.APITransactionTestCase):
         CustomerRole.OWNER.add_permission(PermissionEnum.UNPAUSE_OFFERING)
         ServiceProviderRole.MANAGER.add_permission(PermissionEnum.UNPAUSE_OFFERING)
 
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
+        ServiceProviderRole.MANAGER.add_permission(PermissionEnum.CREATE_OFFERING)
+
+        CustomerRole.OWNER.add_permission(PermissionEnum.ARCHIVE_OFFERING)
+        ServiceProviderRole.MANAGER.add_permission(PermissionEnum.ARCHIVE_OFFERING)
+
     @data(
         "staff",
     )
@@ -1645,12 +2666,133 @@ class OfferingStateTest(test.APITransactionTestCase):
         )
         self.assertTrue("Offering does not have any billing plans." in response.data)
 
-    @data("owner", "user", "customer_support", "admin", "manager", "service_manager")
+    @data("owner", "customer_support", "admin", "manager", "service_manager")
     def test_unauthorized_user_can_not_activate_offering(self, user):
         response, offering = self.update_offering_state(user, "activate")
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(offering.state, OfferingStates.DRAFT)
 
+    def test_user_without_offering_access_can_not_activate_offering(self):
+        response, offering = self.update_offering_state("user", "activate")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(offering.state, OfferingStates.DRAFT)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    @data("staff", "owner", "service_manager")
+    def test_authorized_user_can_activate_offering_when_sp_management_enabled(
+        self, user
+    ):
+        response, offering = self.update_offering_state(user, "activate")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(offering.state, OfferingStates.ACTIVE)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    @data("customer_support", "admin", "manager")
+    def test_unauthorized_user_can_not_activate_offering_when_sp_management_enabled(
+        self, user
+    ):
+        response, offering = self.update_offering_state(user, "activate")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(offering.state, OfferingStates.DRAFT)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=False)
+    @data("owner", "service_manager")
+    def test_sp_can_not_activate_offering_when_management_disabled(self, user):
+        response, offering = self.update_offering_state(user, "activate")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(offering.state, OfferingStates.DRAFT)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=False)
+    @data("owner", "service_manager")
+    def test_sp_can_not_pause_offering_when_management_disabled(self, user):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+        response, offering = self.update_offering_state(user, "pause")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(offering.state, OfferingStates.ACTIVE)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=False)
+    @data("owner", "service_manager")
+    def test_sp_can_not_unpause_offering_when_management_disabled(self, user):
+        self.offering.state = OfferingStates.PAUSED
+        self.offering.save()
+        response, offering = self.update_offering_state(user, "unpause")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(offering.state, OfferingStates.PAUSED)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=False)
+    @data("owner", "service_manager")
+    def test_sp_can_not_archive_offering_when_management_disabled(self, user):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+        response, offering = self.update_offering_state(user, "archive")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(offering.state, OfferingStates.ACTIVE)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=False)
+    @data("owner", "service_manager")
+    def test_sp_can_not_draft_offering_when_management_disabled(self, user):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+        response, offering = self.update_offering_state(user, "draft")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(offering.state, OfferingStates.ACTIVE)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=False)
+    @data("owner", "service_manager")
+    def test_sp_can_not_make_unavailable_when_management_disabled(self, user):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+        response, offering = self.update_offering_state(user, "make_unavailable")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(offering.state, OfferingStates.ACTIVE)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    @data("owner", "service_manager")
+    def test_sp_can_pause_offering_when_management_enabled(self, user):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+        response, offering = self.update_offering_state(user, "pause")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(offering.state, OfferingStates.PAUSED)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    @data("owner", "service_manager")
+    def test_sp_can_unpause_offering_when_management_enabled(self, user):
+        self.offering.state = OfferingStates.PAUSED
+        self.offering.save()
+        response, offering = self.update_offering_state(user, "unpause")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(offering.state, OfferingStates.ACTIVE)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    @data("owner", "service_manager")
+    def test_sp_can_archive_offering_when_management_enabled(self, user):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+        response, offering = self.update_offering_state(user, "archive")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(offering.state, OfferingStates.ARCHIVED)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    @data("owner", "service_manager")
+    def test_sp_can_draft_offering_when_management_enabled(self, user):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+        response, offering = self.update_offering_state(user, "draft")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(offering.state, OfferingStates.DRAFT)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    @data("owner", "service_manager")
+    def test_sp_can_make_unavailable_when_management_enabled(self, user):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+        response, offering = self.update_offering_state(user, "make_unavailable")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(offering.state, OfferingStates.UNAVAILABLE)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
     @data("owner", "service_manager")
     def test_authorized_user_can_pause_offering(self, user):
         self.offering.state = OfferingStates.ACTIVE
@@ -1669,12 +2811,42 @@ class OfferingStateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
         self.assertEqual(offering.state, OfferingStates.ACTIVE)
 
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    @data("owner", "service_manager")
+    def test_authorized_user_can_mark_offering_unavailable(self, user):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+
+        response, offering = self.update_offering_state(user, "make_unavailable")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(offering.state, OfferingStates.UNAVAILABLE)
+
+    @data("customer_support", "admin", "manager")
+    def test_unauthorized_user_can_not_mark_offering_unavailable(self, user):
+        self.offering.state = OfferingStates.ACTIVE
+        self.offering.save()
+
+        response, offering = self.update_offering_state(user, "make_unavailable")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertEqual(offering.state, OfferingStates.ACTIVE)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
     @data("owner", "service_manager")
     def test_authorized_user_can_unpause_offering(self, user):
         self.offering.state = OfferingStates.PAUSED
         self.offering.save()
 
         response, offering = self.update_offering_state(user, "unpause")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(offering.state, OfferingStates.ACTIVE)
+
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
+    @data("owner", "service_manager")
+    def test_authorized_user_can_make_unavailable_offering_active(self, user):
+        self.offering.state = OfferingStates.UNAVAILABLE
+        self.offering.save()
+
+        response, offering = self.update_offering_state(user, "make_available")
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(offering.state, OfferingStates.ACTIVE)
 
@@ -1724,6 +2896,7 @@ class OfferingStateTest(test.APITransactionTestCase):
             response.status_code, status.HTTP_400_BAD_REQUEST, response.data
         )
 
+    @override_config(ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT=True)
     @data("owner", "service_manager")
     def test_authorized_user_can_not_unpause_offering_without_plans(self, user):
         self.plan.delete()
@@ -1746,7 +2919,7 @@ class OfferingStateTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingPublicGetTest(test.APITransactionTestCase):
+class OfferingPublicGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.offerings = [
@@ -1860,7 +3033,7 @@ class OfferingPublicGetTest(test.APITransactionTestCase):
         self.assertEqual(len(result.data), 1)
 
 
-class OfferingExportImportTest(test.APITransactionTestCase):
+class OfferingExportImportTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.temp_dir = tempfile.gettempdir()
@@ -1904,6 +3077,19 @@ class OfferingExportImportTest(test.APITransactionTestCase):
         self.assertEqual(offering.components.count(), 1)
         self.assertEqual(offering.components.first().type, "node")
 
+    def test_import_offering_with_date_in_plugin_options(self):
+        export_data = self._get_data()
+        export_data["plugin_options"] = {
+            "latest_date_for_resource_termination": "2026-12-31",
+        }
+        offering = create_offering(export_data, self.fixture.customer)
+
+        offering.refresh_from_db()
+        self.assertEqual(
+            offering.plugin_options["latest_date_for_resource_termination"],
+            "2026-12-31",
+        )
+
     def test_update_offering(self):
         export_data = self._get_data()
         offering = create_offering(export_data, self.fixture.customer)
@@ -1919,19 +3105,26 @@ class OfferingExportImportTest(test.APITransactionTestCase):
         self.assertEqual(offering.components.first().type, "new_type")
 
     def _get_data(self):
-        path = os.path.abspath(os.path.dirname(__file__))
         data = load_json_resource("offering.json", __name__)
         category = factories.CategoryFactory()
         data["category_id"] = category.id
 
         thumbnail = data.get("thumbnail")
         if thumbnail:
-            data["thumbnail"] = os.path.join(os.path.dirname(path), thumbnail)
+            # Materialize a real thumbnail in a short-path temp dir: the
+            # importer copies the file's content into storage, so the file must
+            # actually exist and its (basename-derived) stored name must stay
+            # within the field's varchar(100).
+            GIF = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+            thumbnail_path = os.path.join(self.temp_dir, thumbnail)
+            with open(thumbnail_path, "wb") as pic:
+                pic.write(base64.b64decode(GIF))
+            data["thumbnail"] = thumbnail_path
 
         return data
 
 
-class OfferingDoiTest(test.APITransactionTestCase):
+class OfferingDoiTest(test.APITestCase):
     def setUp(self):
         self.dc_resp = load_json_resource("datacite-resp.json", __name__)["data"]
         self.ref_pids = [
@@ -1984,7 +3177,7 @@ class OfferingDoiTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingThumbnailTest(test.APITransactionTestCase):
+class OfferingThumbnailTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -2071,7 +3264,134 @@ class OfferingThumbnailTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingCreateComponentsTest(test.APITransactionTestCase):
+class OfferingMarkdownImageUploadTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.offering = self.fixture.offering
+        self.offering.state = OfferingStates.DRAFT
+        self.offering.save()
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_DESCRIPTION)
+        self.url = factories.OfferingFactory.get_url(
+            self.offering, action="upload_markdown_image"
+        )
+
+    def upload_markdown_image(self):
+        return self.client.post(self.url, {"image": dummy_image()}, format="multipart")
+
+    @override_config(ENABLE_MARKDOWN_IMAGE_UPLOAD=False)
+    def test_upload_rejected_when_disabled(self):
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.upload_markdown_image()
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @override_config(ENABLE_MARKDOWN_IMAGE_UPLOAD=True)
+    @data("offering_admin", "offering_manager")
+    def test_user_without_permission_cannot_upload(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.upload_markdown_image()
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @override_config(ENABLE_MARKDOWN_IMAGE_UPLOAD=True)
+    def test_unrelated_user_cannot_upload(self):
+        user = UserFactory()
+        self.client.force_authenticate(user)
+        response = self.upload_markdown_image()
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @override_config(ENABLE_MARKDOWN_IMAGE_UPLOAD=True)
+    def test_authorized_user_can_upload_markdown_image(self):
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.upload_markdown_image()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertIn("url", response.data)
+        self.assertIn("/api/media/", response.data["url"])
+
+        file_uuid = response.data["url"].rstrip("/").split("/")[-1]
+        stored_file = File.objects.get(uuid=file_uuid)
+        self.assertTrue(stored_file.name.startswith("markdown_images/"))
+
+    @override_config(ENABLE_MARKDOWN_IMAGE_UPLOAD=True, MARKDOWN_IMAGE_MAX_SIZE_MB=0)
+    def test_oversized_image_rejected(self):
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.upload_markdown_image()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_config(ENABLE_MARKDOWN_IMAGE_UPLOAD=True)
+    def test_anonymous_user_can_view_uploaded_markdown_image(self):
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.upload_markdown_image()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        self.client.logout()
+        media_response = self.client.get(response.data["url"])
+        self.assertEqual(media_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            media_response.headers["Content-Disposition"].startswith("inline")
+        )
+
+    @override_config(ENABLE_MARKDOWN_IMAGE_UPLOAD=True)
+    def test_upload_rejected_for_archived_offering(self):
+        self.offering.state = OfferingStates.ARCHIVED
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.upload_markdown_image()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_config(ENABLE_MARKDOWN_IMAGE_UPLOAD=True)
+    def test_non_image_upload_rejected(self):
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.client.post(
+            self.url,
+            {
+                "image": SimpleUploadedFile(
+                    "notes.txt",
+                    b"plain text content",
+                    content_type="text/plain",
+                )
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_config(ENABLE_MARKDOWN_IMAGE_UPLOAD=True)
+    def test_pdf_upload_rejected(self):
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.client.post(
+            self.url,
+            {
+                "image": SimpleUploadedFile(
+                    "document.pdf",
+                    b"%PDF-1.4 not really a pdf",
+                    content_type="application/pdf",
+                )
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_config(ENABLE_MARKDOWN_IMAGE_UPLOAD=True)
+    def test_svg_upload_rejected(self):
+        svg_content = b"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg">
+  <circle cx="50" cy="50" r="40" fill="red"/>
+</svg>"""
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.client.post(
+            self.url,
+            {
+                "image": SimpleUploadedFile(
+                    "chart.svg",
+                    svg_content,
+                    content_type="image/svg+xml",
+                )
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+@ddt
+class OfferingCreateComponentsTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -2141,7 +3461,7 @@ class OfferingCreateComponentsTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingUpdateComponentsTest(test.APITransactionTestCase):
+class OfferingUpdateComponentsTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -2229,7 +3549,7 @@ class OfferingUpdateComponentsTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingRemoveComponentsTest(test.APITransactionTestCase):
+class OfferingRemoveComponentsTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -2286,7 +3606,7 @@ class OfferingRemoveComponentsTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingBackendMetadataTest(test.APITransactionTestCase):
+class OfferingBackendMetadataTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -2314,7 +3634,7 @@ class OfferingBackendMetadataTest(test.APITransactionTestCase):
 
 
 @ddt
-class ListCustomerProjectsTest(test.APITransactionTestCase):
+class ListCustomerProjectsTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.fixture.resource.state = ResourceStates.OK
@@ -2362,9 +3682,40 @@ class ListCustomerProjectsTest(test.APITransactionTestCase):
         self.assertGreaterEqual(int(headers[RESULT_COUNT_HEADER]), 15)
         self.assertIn("Link", headers)
 
+    def test_list_customer_projects_does_not_have_n_plus_one_queries(self):
+        """Query count should stay constant when more projects are added."""
+        user = self.fixture.staff
+        self.client.force_authenticate(user)
+        url = factories.OfferingFactory.get_url(
+            self.fixture.offering, "list_customer_projects"
+        )
+
+        # Measure queries with 1 project
+        with CaptureQueriesContext(db_connection) as ctx_before:
+            self.client.get(url)
+        num_queries_1 = len(ctx_before)
+
+        # Add more projects with resources
+        for _ in range(5):
+            project = structure_factories.ProjectFactory(
+                customer=self.fixture.project.customer
+            )
+            factories.ResourceFactory(
+                offering=self.fixture.offering,
+                project=project,
+                state=ResourceStates.OK,
+            )
+
+        # Measure queries with 6 projects
+        with CaptureQueriesContext(db_connection) as ctx_after:
+            self.client.get(url)
+        num_queries_6 = len(ctx_after)
+
+        self.assertEqual(num_queries_1, num_queries_6)
+
 
 @ddt
-class ListCustomerUsersTest(test.APITransactionTestCase):
+class ListCustomerUsersTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.fixture.resource.state = ResourceStates.OK
@@ -2458,7 +3809,7 @@ class ListCustomerUsersTest(test.APITransactionTestCase):
         self.assertGreaterEqual(len(response.data), 2)
 
 
-class ResourceOfferingsViewSetTest(test.APITransactionTestCase):
+class ResourceOfferingsViewSetTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.category = self.fixture.offering.category
@@ -2475,7 +3826,7 @@ class ResourceOfferingsViewSetTest(test.APITransactionTestCase):
 
 
 @ddt
-class RefreshOfferingUsernamesTest(test.APITransactionTestCase):
+class RefreshOfferingUsernamesTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.customer = self.fixture.offering_customer
@@ -2557,7 +3908,7 @@ class RefreshOfferingUsernamesTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class OrderNotificationTest(test.APITransactionTestCase):
+class OrderNotificationTest(test.APITestCase):
     def setUp(self):
         self.order = factories.OrderFactory(state=OrderStates.PENDING_PROVIDER)
 
@@ -2570,7 +3921,7 @@ class OrderNotificationTest(test.APITransactionTestCase):
         mock_notify.assert_called_once_with(self.order.uuid.hex)
 
 
-class ProviderOfferingOrdersTest(test.APITransactionTestCase):
+class ProviderOfferingOrdersTest(test.APITestCase):
     """
     This test is to check that the marketplace offering provider orders endpoint is working as expected
     """
@@ -2780,7 +4131,7 @@ class ProviderOfferingOrdersTest(test.APITransactionTestCase):
         )
 
 
-class OfferingMoveTest(test.APITransactionTestCase):
+class OfferingMoveTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -2820,7 +4171,7 @@ class OfferingMoveTest(test.APITransactionTestCase):
         self.assertEqual(self.offering.customer, self.fixture.customer)
 
 
-class OfferingComplianceChecklistSerializerTest(test.APITransactionTestCase):
+class OfferingComplianceChecklistSerializerTest(test.APITestCase):
     """Test that ProviderOfferingDetailsSerializer exposes compliance_checklist field."""
 
     def setUp(self):
@@ -2874,6 +4225,30 @@ class OfferingComplianceChecklistSerializerTest(test.APITransactionTestCase):
         # Check has_compliance_requirements field
         self.assertIn("has_compliance_requirements", response.data)
         self.assertTrue(response.data["has_compliance_requirements"])
+
+    def test_owner_sees_details_of_assigned_checklist(self):
+        checklist = checklist_factories.ChecklistFactory(
+            name="AI compute eligibility",
+            checklist_type=checklist_enums.ChecklistTypes.OFFERING_COMPLIANCE,
+        )
+        checklist_factories.QuestionFactory.create_batch(3, checklist=checklist)
+        self.offering.compliance_checklist = checklist
+        self.offering.save()
+
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.get(factories.OfferingFactory.get_url(self.offering))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        details = response.data["compliance_checklist_details"]
+        self.assertEqual(details["uuid"], checklist.uuid.hex)
+        self.assertEqual(details["name"], "AI compute eligibility")
+        self.assertEqual(details["questions_count"], 3)
+
+    def test_checklist_details_are_null_without_checklist(self):
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.get(factories.OfferingFactory.get_url(self.offering))
+
+        self.assertIsNone(response.data["compliance_checklist_details"])
 
     def test_offering_compliance_checklist_url_structure(self):
         """Test that compliance_checklist field follows proper URL structure."""
@@ -2947,3 +4322,1562 @@ class OfferingComplianceChecklistSerializerTest(test.APITransactionTestCase):
         self.assertIn("compliance_checklist", offering_without_checklist_data)
         self.assertIsNone(offering_without_checklist_data["compliance_checklist"])
         self.assertFalse(offering_without_checklist_data["has_compliance_requirements"])
+
+
+class CheckUniqueBackendIDTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(customer=self.fixture.customer)
+        self.url = factories.OfferingFactory.get_url(
+            self.offering, "check_unique_backend_id"
+        )
+
+        # Create resources with backend_ids
+        self.resource1 = factories.ResourceFactory(
+            offering=self.offering, backend_id="backend_001"
+        )
+        self.resource2 = factories.ResourceFactory(
+            offering=self.offering, backend_id="backend_002"
+        )
+
+        # Create another offering in same customer with resource
+        self.other_offering = factories.OfferingFactory(customer=self.fixture.customer)
+        self.other_resource = factories.ResourceFactory(
+            offering=self.other_offering, backend_id="backend_003"
+        )
+
+        # Create resource in different customer
+        self.different_customer = structure_factories.CustomerFactory()
+        self.different_offering = factories.OfferingFactory(
+            customer=self.different_customer
+        )
+        self.different_resource = factories.ResourceFactory(
+            offering=self.different_offering,
+            backend_id="backend_001",  # Same backend_id but different customer
+        )
+
+    def test_staff_can_check_backend_id(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url, {"backend_id": "new_backend_id"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+
+    def test_offering_manager_can_check_backend_id(self):
+        self.offering.add_user(self.fixture.owner, OfferingRole.MANAGER)
+
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.post(self.url, {"backend_id": "new_backend_id"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+
+    def test_check_unique_backend_id_within_offering(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Check existing backend_id in same offering
+        response = self.client.post(self.url, {"backend_id": "backend_001"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+        # Check non-existing backend_id
+        response = self.client.post(self.url, {"backend_id": "new_backend_id"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+
+    def test_check_unique_backend_id_across_customer_offerings(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Check with check_all_offerings=True - should find conflicts in other offerings
+        response = self.client.post(
+            self.url, {"backend_id": "backend_003", "check_all_offerings": True}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+        # Check with check_all_offerings=False - should not find conflicts in other offerings
+        response = self.client.post(
+            self.url, {"backend_id": "backend_003", "check_all_offerings": False}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+
+    def test_backend_id_isolation_between_customers(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # backend_001 exists in different customer, should not conflict
+        response = self.client.post(
+            self.url, {"backend_id": "backend_001", "check_all_offerings": True}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Should find conflict only in same customer, not in different customer
+        self.assertFalse(response.data["is_unique"])
+
+    def test_terminated_resources_are_included(self):
+        # Terminate a resource
+        self.resource1.state = ResourceStates.TERMINATED
+        self.resource1.save()
+
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Should still find the terminated resource as a conflict
+        response = self.client.post(self.url, {"backend_id": "backend_001"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+    def test_invalid_data_validation(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Missing backend_id
+        response = self.client.post(self.url, {})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Too long backend_id
+        response = self.client.post(self.url, {"backend_id": "a" * 256})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_permission_denied_for_unauthorized_user(self):
+        unauthorized_user = UserFactory()
+        self.client.force_authenticate(unauthorized_user)
+
+        response = self.client.post(self.url, {"backend_id": "test"})
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_empty_backend_id(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Empty backend_id should be rejected by validation
+        response = self.client.post(self.url, {"backend_id": ""})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_whitespace_backend_id(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Create resource with whitespace backend_id
+        factories.ResourceFactory(
+            offering=self.offering, backend_id="spaces_with_suffix"
+        )
+
+        # Check exact match
+        response = self.client.post(self.url, {"backend_id": "spaces_with_suffix"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+        # Check different value should be unique
+        response = self.client.post(
+            self.url, {"backend_id": "spaces_with_different_suffix"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+
+    def test_case_sensitivity(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # backend_id is case-sensitive
+        response = self.client.post(self.url, {"backend_id": "BACKEND_001"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            response.data["is_unique"]
+        )  # backend_001 exists, but BACKEND_001 doesn't
+
+        response = self.client.post(self.url, {"backend_id": "backend_001"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])  # exact match exists
+
+    def test_different_resource_states(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Create resources in different states with same backend_id
+        backend_id = "test_state_backend"
+
+        # Active resource
+        active_resource = factories.ResourceFactory(
+            offering=self.offering, backend_id=backend_id, state=ResourceStates.OK
+        )
+
+        response = self.client.post(self.url, {"backend_id": backend_id})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+        # Change to erred state - should still not be unique
+        active_resource.state = ResourceStates.ERRED
+        active_resource.save()
+
+        response = self.client.post(self.url, {"backend_id": backend_id})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+        # Change to creating state - should still not be unique
+        active_resource.state = ResourceStates.CREATING
+        active_resource.save()
+
+        response = self.client.post(self.url, {"backend_id": backend_id})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+    def test_customer_owner_permissions(self):
+        # Customer owner should have access through UPDATE_OFFERING permission
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.post(self.url, {"backend_id": "new_backend_id"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+
+    def test_unicode_backend_id(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Create resource with Unicode backend_id
+        unicode_backend_id = "тест_бэкенд_123_🚀"
+        factories.ResourceFactory(offering=self.offering, backend_id=unicode_backend_id)
+
+        # Check Unicode backend_id
+        response = self.client.post(self.url, {"backend_id": unicode_backend_id})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+        # Check similar but different Unicode
+        response = self.client.post(self.url, {"backend_id": "тест_бэкенд_124_🚀"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+
+    def test_special_characters_backend_id(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        special_chars = "!@#$%^&*()_+-=[]{}|;':\",./<>?"
+        factories.ResourceFactory(offering=self.offering, backend_id=special_chars)
+
+        # Check exact match
+        response = self.client.post(self.url, {"backend_id": special_chars})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+    def test_maximum_length_backend_id(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Create resource with maximum length backend_id (255 chars)
+        max_length_backend_id = "a" * 255
+        factories.ResourceFactory(
+            offering=self.offering, backend_id=max_length_backend_id
+        )
+
+        # Check exact match
+        response = self.client.post(self.url, {"backend_id": max_length_backend_id})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+        # Check one character shorter
+        response = self.client.post(self.url, {"backend_id": "a" * 254})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+
+    def test_multiple_resources_same_backend_id_same_offering(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        backend_id = "duplicate_backend"
+
+        # Create multiple resources with same backend_id in same offering
+        # Note: This might not be allowed by database constraints, but testing the check behavior
+        try:
+            factories.ResourceFactory(offering=self.offering, backend_id=backend_id)
+            factories.ResourceFactory(offering=self.offering, backend_id=backend_id)
+        except Exception:
+            # If database prevents duplicates, create just one
+            factories.ResourceFactory(offering=self.offering, backend_id=backend_id)
+
+        response = self.client.post(self.url, {"backend_id": backend_id})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+    def test_performance_with_many_resources(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Create many resources with different backend_ids
+        import time
+
+        start_time = time.time()
+
+        for i in range(100):
+            factories.ResourceFactory(
+                offering=self.offering, backend_id=f"bulk_backend_{i}"
+            )
+
+        # Check uniqueness for new backend_id - should be fast
+        response = self.client.post(self.url, {"backend_id": "unique_new_backend"})
+        end_time = time.time()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+
+        # Should complete in reasonable time (less than 10 seconds)
+        self.assertLess(end_time - start_time, 10.0)
+
+    def test_check_all_offerings_with_mixed_customers(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Create multiple customers with offerings and resources
+        customer2 = structure_factories.CustomerFactory()
+        structure_factories.CustomerFactory()
+
+        offering2 = factories.OfferingFactory(
+            customer=self.fixture.customer
+        )  # Same customer
+        offering3 = factories.OfferingFactory(customer=customer2)  # Different customer
+
+        shared_backend_id = "shared_across_customers"
+
+        # Create resources in different customers with same backend_id
+        factories.ResourceFactory(offering=offering2, backend_id=shared_backend_id)
+        factories.ResourceFactory(offering=offering3, backend_id=shared_backend_id)
+
+        # Check within customer scope - should find conflict in same customer
+        response = self.client.post(
+            self.url, {"backend_id": shared_backend_id, "check_all_offerings": True}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(
+            response.data["is_unique"]
+        )  # Found in same customer's other offering
+
+        # Check offering scope - should not find conflict (not in current offering)
+        response = self.client.post(
+            self.url, {"backend_id": shared_backend_id, "check_all_offerings": False}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])  # Not in current offering
+
+    def test_null_and_none_handling(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Backend_id field doesn't allow null values, so test string "None"
+        # Check for string "None" - should be unique since no resource has this exact string
+        response = self.client.post(self.url, {"backend_id": "None"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+
+        # Create resource with string "null"
+        factories.ResourceFactory(offering=self.offering, backend_id="null")
+
+        # Check for string "null" - should not be unique now
+        response = self.client.post(self.url, {"backend_id": "null"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+
+
+class BackendIdRulesConfigurationTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_OPTIONS)
+        self.offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+        self.url = factories.OfferingFactory.get_url(
+            self.offering, "update_backend_id_rules"
+        )
+
+    def test_staff_can_set_valid_format_rules(self):
+        self.client.force_authenticate(self.fixture.staff)
+        rules = {
+            "format": {
+                "regex": r"^[A-Z]{2}-\d{6}$",
+                "description": "Must be 2 uppercase letters, dash, 6 digits",
+            }
+        }
+        response = self.client.post(
+            self.url, {"backend_id_rules": rules}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertEqual(
+            self.offering.backend_id_rules["format"]["regex"], r"^[A-Z]{2}-\d{6}$"
+        )
+
+    def test_owner_can_set_rules(self):
+        self.client.force_authenticate(self.fixture.owner)
+        rules = {"uniqueness": {"scope": "offering"}}
+        response = self.client.post(
+            self.url, {"backend_id_rules": rules}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertEqual(
+            self.offering.backend_id_rules["uniqueness"]["scope"], "offering"
+        )
+
+    def test_set_combined_format_and_uniqueness_rules(self):
+        self.client.force_authenticate(self.fixture.staff)
+        rules = {
+            "format": {"regex": r"^RES-\d+$"},
+            "uniqueness": {"scope": "service_provider"},
+        }
+        response = self.client.post(
+            self.url, {"backend_id_rules": rules}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.backend_id_rules, rules)
+
+    def test_set_empty_rules_clears_validation(self):
+        self.offering.backend_id_rules = {"format": {"regex": r"^[A-Z]+$"}}
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url, {"backend_id_rules": {}}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.backend_id_rules, {})
+
+    def test_reject_invalid_regex(self):
+        self.client.force_authenticate(self.fixture.staff)
+        rules = {"format": {"regex": "[invalid("}}
+        response = self.client.post(
+            self.url, {"backend_id_rules": rules}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reject_dangerous_regex(self):
+        self.client.force_authenticate(self.fixture.staff)
+        # Adjacent quantifiers pattern: detected by UserDetailsMatchMixin
+        rules = {"format": {"regex": "a+?+"}}
+        response = self.client.post(
+            self.url, {"backend_id_rules": rules}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reject_too_long_regex(self):
+        self.client.force_authenticate(self.fixture.staff)
+        rules = {"format": {"regex": "a" * 201}}
+        response = self.client.post(
+            self.url, {"backend_id_rules": rules}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reject_invalid_uniqueness_scope(self):
+        self.client.force_authenticate(self.fixture.staff)
+        rules = {"uniqueness": {"scope": "invalid_scope"}}
+        response = self.client.post(
+            self.url, {"backend_id_rules": rules}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reject_unknown_top_level_keys(self):
+        self.client.force_authenticate(self.fixture.staff)
+        rules = {"format": {"regex": "^ok$"}, "unknown_key": True}
+        response = self.client.post(
+            self.url, {"backend_id_rules": rules}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reject_unknown_format_keys(self):
+        self.client.force_authenticate(self.fixture.staff)
+        rules = {"format": {"regex": "^ok$", "extra_key": "value"}}
+        response = self.client.post(
+            self.url, {"backend_id_rules": rules}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reject_unknown_uniqueness_keys(self):
+        self.client.force_authenticate(self.fixture.staff)
+        rules = {"uniqueness": {"scope": "offering", "extra": True}}
+        response = self.client.post(
+            self.url, {"backend_id_rules": rules}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_all_valid_uniqueness_scopes_accepted(self):
+        self.client.force_authenticate(self.fixture.staff)
+        for scope in [
+            "offering",
+            "offering_group",
+            "service_provider",
+            "service_provider_category",
+        ]:
+            rules = {"uniqueness": {"scope": scope}}
+            response = self.client.post(
+                self.url, {"backend_id_rules": rules}, format="json"
+            )
+            self.assertEqual(
+                response.status_code, status.HTTP_200_OK, f"Scope {scope} rejected"
+            )
+
+    def test_rules_visible_in_provider_offering_detail(self):
+        rules = {
+            "format": {"regex": r"^[A-Z]{2}-\d{6}$"},
+            "uniqueness": {"scope": "offering"},
+        }
+        self.offering.backend_id_rules = rules
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(self.offering)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["backend_id_rules"], rules)
+
+
+class BackendIdFormatValidationTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        CustomerRole.OWNER.add_permission(PermissionEnum.SET_RESOURCE_BACKEND_ID)
+        self.offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+            backend_id_rules={
+                "format": {
+                    "regex": r"^[A-Z]{2}-\d{6}$",
+                    "description": "Must be 2 uppercase letters, dash, 6 digits",
+                }
+            },
+        )
+        self.resource = factories.ResourceFactory(
+            offering=self.offering,
+            project=self.fixture.project,
+            state=ResourceStates.OK,
+        )
+        self.url = factories.ResourceFactory.get_provider_resource_url(
+            self.resource, action="set_backend_id"
+        )
+
+    def test_set_backend_id_valid_format(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url, {"backend_id": "AB-123456"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.backend_id, "AB-123456")
+
+    def test_set_backend_id_invalid_format_rejected(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url, {"backend_id": "invalid"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("backend_id", response.data)
+
+    def test_set_backend_id_empty_bypasses_validation(self):
+        self.resource.backend_id = "AB-111111"
+        self.resource.save()
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url, {"backend_id": ""})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_no_rules_allows_any_format(self):
+        self.offering.backend_id_rules = {}
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url, {"backend_id": "anything-goes"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_format_validation_error_includes_description(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url, {"backend_id": "bad"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        error_msg = str(response.data["backend_id"])
+        self.assertIn("2 uppercase letters", error_msg)
+
+
+class BackendIdUniquenessValidationTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        CustomerRole.OWNER.add_permission(PermissionEnum.SET_RESOURCE_BACKEND_ID)
+
+        self.category = factories.CategoryFactory()
+        self.other_category = factories.CategoryFactory()
+
+        self.offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+            category=self.category,
+        )
+        self.offering2 = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+            category=self.category,
+        )
+        self.offering_other_category = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+            category=self.other_category,
+        )
+
+        other_customer = structure_factories.CustomerFactory()
+        self.offering_other_provider = factories.OfferingFactory(
+            customer=other_customer,
+            state=OfferingStates.ACTIVE,
+            category=self.category,
+        )
+
+    def _create_resource(self, offering, backend_id, state=ResourceStates.OK):
+        return factories.ResourceFactory(
+            offering=offering,
+            project=self.fixture.project,
+            backend_id=backend_id,
+            state=state,
+        )
+
+    def _set_rules(self, offering, scope, include_terminated=True):
+        offering.backend_id_rules = {
+            "uniqueness": {"scope": scope, "include_terminated": include_terminated}
+        }
+        offering.save()
+
+    def _set_backend_id(self, resource, backend_id):
+        url = factories.ResourceFactory.get_provider_resource_url(
+            resource, action="set_backend_id"
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        return self.client.post(url, {"backend_id": backend_id})
+
+    # --- offering scope ---
+    def test_offering_scope_rejects_duplicate_in_same_offering(self):
+        self._set_rules(self.offering, "offering")
+        self._create_resource(self.offering, "DUP-001")
+        resource2 = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource2, "DUP-001")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_offering_scope_allows_same_id_different_offering(self):
+        self._set_rules(self.offering, "offering")
+        self._create_resource(self.offering2, "DUP-001")
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "DUP-001")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_offering_scope_includes_terminated_resources(self):
+        self._set_rules(self.offering, "offering")
+        self._create_resource(
+            self.offering, "TERM-001", state=ResourceStates.TERMINATED
+        )
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "TERM-001")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # --- include_terminated=false ---
+    def test_include_terminated_false_excludes_terminated(self):
+        self._set_rules(self.offering, "offering", include_terminated=False)
+        self._create_resource(
+            self.offering, "TERM-001", state=ResourceStates.TERMINATED
+        )
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "TERM-001")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_include_terminated_false_rejects_active_duplicate(self):
+        self._set_rules(self.offering, "offering", include_terminated=False)
+        self._create_resource(self.offering, "ACT-001", state=ResourceStates.OK)
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "ACT-001")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # --- offering_group scope ---
+    def test_offering_group_scope_rejects_duplicate_across_offerings_with_same_backend_id(
+        self,
+    ):
+        self.offering.backend_id = "vcluster-errigal"
+        self.offering.save()
+        self.offering2.backend_id = "vcluster-errigal"
+        self.offering2.save()
+        self._set_rules(self.offering, "offering_group")
+        self._create_resource(self.offering2, "RES-001")
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "RES-001")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_offering_group_scope_allows_different_offering_backend_id(self):
+        self.offering.backend_id = "vcluster-errigal"
+        self.offering.save()
+        self.offering2.backend_id = "vcluster-kay"
+        self.offering2.save()
+        self._set_rules(self.offering, "offering_group")
+        self._create_resource(self.offering2, "RES-001")
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "RES-001")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_offering_group_scope_falls_back_to_offering_when_no_backend_id(self):
+        self.offering.backend_id = ""
+        self.offering.save()
+        self._set_rules(self.offering, "offering_group")
+        self._create_resource(self.offering2, "RES-001")
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "RES-001")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    # --- service_provider scope ---
+    def test_service_provider_scope_rejects_duplicate_across_offerings(self):
+        self._set_rules(self.offering, "service_provider")
+        self._create_resource(self.offering2, "SP-001")
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "SP-001")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_service_provider_scope_allows_different_provider(self):
+        self._set_rules(self.offering, "service_provider")
+        self._create_resource(self.offering_other_provider, "SP-001")
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "SP-001")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    # --- service_provider_category scope ---
+    def test_service_provider_category_scope_rejects_same_category(self):
+        self._set_rules(self.offering, "service_provider_category")
+        self._create_resource(self.offering2, "SPC-001")  # same customer, same category
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "SPC-001")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_service_provider_category_scope_allows_different_category(self):
+        self._set_rules(self.offering, "service_provider_category")
+        self._create_resource(self.offering_other_category, "SPC-001")
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "SPC-001")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    # --- exclude_resource (updating own ID) ---
+    def test_updating_own_backend_id_to_same_value_is_allowed(self):
+        self._set_rules(self.offering, "offering")
+        resource = self._create_resource(self.offering, "MY-001")
+        response = self._set_backend_id(resource, "MY-001")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    # --- no rules configured ---
+    def test_no_uniqueness_rules_allows_duplicates(self):
+        self.offering.backend_id_rules = {}
+        self.offering.save()
+        self._create_resource(self.offering, "DUP-001")
+        resource = self._create_resource(self.offering, "")
+        response = self._set_backend_id(resource, "DUP-001")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class CheckUniqueBackendIdWithRulesTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+            backend_id_rules={
+                "format": {
+                    "regex": r"^[A-Z]{2}-\d{6}$",
+                    "description": "Must be 2 uppercase letters, dash, 6 digits",
+                },
+                "uniqueness": {"scope": "offering"},
+            },
+        )
+        self.url = factories.OfferingFactory.get_url(
+            self.offering, "check_unique_backend_id"
+        )
+        factories.ResourceFactory(
+            offering=self.offering,
+            backend_id="AB-000001",
+            state=ResourceStates.OK,
+        )
+
+    def test_use_offering_rules_valid_and_unique(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.url, {"backend_id": "CD-999999", "use_offering_rules": True}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+        self.assertTrue(response.data["is_valid_format"])
+        self.assertEqual(response.data["errors"], [])
+
+    def test_use_offering_rules_invalid_format(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.url, {"backend_id": "bad-format", "use_offering_rules": True}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_valid_format"])
+        self.assertGreater(len(response.data["errors"]), 0)
+
+    def test_use_offering_rules_not_unique(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.url, {"backend_id": "AB-000001", "use_offering_rules": True}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+        self.assertTrue(response.data["is_valid_format"])
+
+    def test_use_offering_rules_invalid_format_and_not_unique(self):
+        # Create a resource with a specific backend_id that doesn't match format
+        factories.ResourceFactory(
+            offering=self.offering,
+            backend_id="bad",
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.url, {"backend_id": "bad", "use_offering_rules": True}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+        self.assertFalse(response.data["is_valid_format"])
+
+    def test_without_use_offering_rules_returns_original_response(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.url, {"backend_id": "bad-format", "use_offering_rules": False}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Original behavior: only is_unique field
+        self.assertIn("is_unique", response.data)
+        self.assertTrue(response.data["is_unique"])
+
+    def test_no_format_rules_returns_null_is_valid_format(self):
+        self.offering.backend_id_rules = {"uniqueness": {"scope": "offering"}}
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.url, {"backend_id": "anything", "use_offering_rules": True}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["is_valid_format"])
+        self.assertTrue(response.data["is_unique"])
+
+    def test_use_offering_rules_falls_back_to_check_all_offerings_when_no_scope(self):
+        """When use_offering_rules=True but no uniqueness scope is configured,
+        check_all_offerings should still control the uniqueness check."""
+        self.offering.backend_id_rules = {
+            "format": {
+                "regex": r"^[A-Z]{2}-\d{6}$",
+                "description": "Must be 2 uppercase letters, dash, 6 digits",
+            }
+            # No uniqueness scope configured
+        }
+        self.offering.save()
+
+        # Create resource in another offering of the same customer
+        other_offering = factories.OfferingFactory(customer=self.fixture.customer)
+        factories.ResourceFactory(offering=other_offering, backend_id="XY-123456")
+
+        self.client.force_authenticate(self.fixture.staff)
+
+        # check_all_offerings=False: unique within this offering
+        response = self.client.post(
+            self.url,
+            {
+                "backend_id": "XY-123456",
+                "use_offering_rules": True,
+                "check_all_offerings": False,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_unique"])
+        self.assertTrue(response.data["is_valid_format"])
+
+        # check_all_offerings=True: not unique across customer
+        response = self.client.post(
+            self.url,
+            {
+                "backend_id": "XY-123456",
+                "use_offering_rules": True,
+                "check_all_offerings": True,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_unique"])
+        self.assertTrue(response.data["is_valid_format"])
+
+
+class ShowSshKeyLossWarningTest(test.APITestCase):
+    def test_child_offering_serves_parent_flag(self):
+        fixture = fixtures.ProjectFixture()
+        parent = factories.OfferingFactory(
+            customer=fixture.customer,
+            state=OfferingStates.ACTIVE,
+            shared=True,
+            plugin_options={"show_ssh_key_loss_warning": True},
+        )
+        child = factories.OfferingFactory(
+            customer=fixture.customer,
+            state=OfferingStates.ACTIVE,
+            parent=parent,
+        )
+        self.client.force_authenticate(fixture.staff)
+        url = factories.OfferingFactory.get_public_url(child)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["plugin_options"]["show_ssh_key_loss_warning"])
+
+
+class BackendIdRulesNotInPublicAPITest(test.APITestCase):
+    def test_backend_id_rules_not_exposed_in_public_offering(self):
+        fixture = fixtures.ProjectFixture()
+        offering = factories.OfferingFactory(
+            customer=fixture.customer,
+            state=OfferingStates.ACTIVE,
+            shared=True,
+            backend_id_rules={"format": {"regex": r"^[A-Z]+$"}},
+        )
+        self.client.force_authenticate(fixture.staff)
+        url = factories.OfferingFactory.get_public_url(offering)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("backend_id_rules", response.data)
+
+    def test_backend_id_rules_exposed_in_provider_offering(self):
+        fixture = fixtures.ProjectFixture()
+        offering = factories.OfferingFactory(
+            customer=fixture.customer,
+            state=OfferingStates.ACTIVE,
+            backend_id_rules={"format": {"regex": r"^[A-Z]+$"}},
+        )
+        self.client.force_authenticate(fixture.staff)
+        url = factories.OfferingFactory.get_url(offering)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("backend_id_rules", response.data)
+        self.assertEqual(
+            response.data["backend_id_rules"]["format"]["regex"], r"^[A-Z]+$"
+        )
+
+
+class OfferingBillingTypeClassificationTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+
+    def test_offering_with_no_components_returns_mixed(self):
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(offering)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["billing_type_classification"], "mixed")
+
+    def test_offering_with_only_limit_components_returns_limit_only(self):
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+
+        # Add limit-based components
+        factories.OfferingComponentFactory(
+            offering=offering,
+            type="cpu",
+            billing_type=BillingTypes.LIMIT,
+        )
+        factories.OfferingComponentFactory(
+            offering=offering,
+            type="ram",
+            billing_type=BillingTypes.LIMIT,
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(offering)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["billing_type_classification"], "limit_only")
+
+    def test_offering_with_only_usage_components_returns_usage_only(self):
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+
+        # Add usage-based components
+        factories.OfferingComponentFactory(
+            offering=offering,
+            type="storage",
+            billing_type=BillingTypes.USAGE,
+        )
+        factories.OfferingComponentFactory(
+            offering=offering,
+            type="network_traffic",
+            billing_type=BillingTypes.USAGE,
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(offering)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["billing_type_classification"], "usage_only")
+
+    def test_offering_with_mixed_components_returns_mixed(self):
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+
+        # Add mixed components
+        factories.OfferingComponentFactory(
+            offering=offering,
+            type="cpu",
+            billing_type=BillingTypes.LIMIT,
+        )
+        factories.OfferingComponentFactory(
+            offering=offering,
+            type="storage",
+            billing_type=BillingTypes.USAGE,
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(offering)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["billing_type_classification"], "mixed")
+
+    def test_offering_with_fixed_components_returns_mixed(self):
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+
+        # Add fixed-price components
+        factories.OfferingComponentFactory(
+            offering=offering,
+            type="monthly_fee",
+            billing_type=BillingTypes.FIXED,
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(offering)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["billing_type_classification"], "mixed")
+
+    def test_billing_type_classification_in_public_offering_endpoint(self):
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+            shared=True,
+        )
+
+        factories.OfferingComponentFactory(
+            offering=offering,
+            type="cpu",
+            billing_type=BillingTypes.LIMIT,
+        )
+
+        url = factories.OfferingFactory.get_public_url(offering)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["billing_type_classification"], "limit_only")
+
+    def test_billing_type_classification_in_offering_list(self):
+        # Create offerings with different billing types
+        offering_limit = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+        factories.OfferingComponentFactory(
+            offering=offering_limit,
+            billing_type=BillingTypes.LIMIT,
+        )
+
+        offering_usage = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+        factories.OfferingComponentFactory(
+            offering=offering_usage,
+            billing_type=BillingTypes.USAGE,
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_list_url()
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offerings = response.data
+
+        # Find the offerings and verify their classifications
+        limit_offering = next(
+            o for o in offerings if o["uuid"] == str(offering_limit.uuid)
+        )
+        usage_offering = next(
+            o for o in offerings if o["uuid"] == str(offering_usage.uuid)
+        )
+
+        self.assertEqual(limit_offering["billing_type_classification"], "limit_only")
+        self.assertEqual(usage_offering["billing_type_classification"], "usage_only")
+
+
+class RestrictedOfferingVisibilityModeTest(test.APITestCase):
+    """Tests for RESTRICTED_OFFERING_VISIBILITY_MODE setting."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        # Create a shared offering with a public plan
+        self.shared_offering = factories.OfferingFactory(
+            shared=True,
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+        self.public_plan = factories.PlanFactory(
+            offering=self.shared_offering,
+            archived=False,
+        )
+
+        # Create a shared offering with a restricted plan (org group)
+        self.org_group = structure_factories.OrganizationGroupFactory()
+        self.restricted_offering = factories.OfferingFactory(
+            shared=True,
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+        self.restricted_plan = factories.PlanFactory(
+            offering=self.restricted_offering,
+            archived=False,
+        )
+        self.restricted_plan.organization_groups.add(self.org_group)
+
+        # Create an unrelated user without memberships
+        self.unrelated_user = UserFactory()
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="show_all")
+    def test_show_all_mode_shows_all_shared_offerings(self):
+        """In show_all mode, regular users see all shared offerings."""
+        self.client.force_authenticate(self.unrelated_user)
+        url = factories.OfferingFactory.get_public_list_url()
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offering_uuids = [o["uuid"] for o in response.data]
+        self.assertIn(str(self.shared_offering.uuid), offering_uuids)
+        self.assertIn(str(self.restricted_offering.uuid), offering_uuids)
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="show_restricted_disabled")
+    def test_show_restricted_disabled_mode_shows_all_with_is_accessible(self):
+        """In show_restricted_disabled mode, all offerings shown with is_accessible field."""
+        self.client.force_authenticate(self.unrelated_user)
+        url = factories.OfferingFactory.get_public_list_url()
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offering_uuids = [o["uuid"] for o in response.data]
+        self.assertIn(str(self.shared_offering.uuid), offering_uuids)
+        self.assertIn(str(self.restricted_offering.uuid), offering_uuids)
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="show_restricted_disabled")
+    def test_is_accessible_true_for_accessible_offering(self):
+        """is_accessible should be True for offering with public plans."""
+        self.client.force_authenticate(self.unrelated_user)
+        url = factories.OfferingFactory.get_public_url(self.shared_offering)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_accessible"])
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="show_restricted_disabled")
+    def test_is_accessible_false_for_restricted_offering(self):
+        """is_accessible should be False for offering with only restricted plans."""
+        self.client.force_authenticate(self.unrelated_user)
+        url = factories.OfferingFactory.get_public_url(self.restricted_offering)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_accessible"])
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="hide_inaccessible")
+    def test_hide_inaccessible_mode_hides_restricted_offerings(self):
+        """In hide_inaccessible mode, offerings without accessible plans are hidden."""
+        self.client.force_authenticate(self.unrelated_user)
+        url = factories.OfferingFactory.get_public_list_url()
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offering_uuids = [o["uuid"] for o in response.data]
+        self.assertIn(str(self.shared_offering.uuid), offering_uuids)
+        self.assertNotIn(str(self.restricted_offering.uuid), offering_uuids)
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="hide_inaccessible")
+    def test_hide_inaccessible_mode_shows_offerings_when_user_in_org_group(self):
+        """In hide_inaccessible mode, user in org group sees restricted offerings."""
+        # Add user's customer to the org group
+        self.fixture.customer.organization_groups.add(self.org_group)
+
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.OfferingFactory.get_public_list_url()
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offering_uuids = [o["uuid"] for o in response.data]
+        self.assertIn(str(self.shared_offering.uuid), offering_uuids)
+        self.assertIn(str(self.restricted_offering.uuid), offering_uuids)
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="require_membership")
+    def test_require_membership_mode_shows_nothing_for_user_without_membership(self):
+        """In require_membership mode, user without membership sees no offerings."""
+        self.client.force_authenticate(self.unrelated_user)
+        url = factories.OfferingFactory.get_public_list_url()
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 0)
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="require_membership")
+    def test_require_membership_mode_shows_offerings_for_user_with_membership(self):
+        """In require_membership mode, user with membership sees accessible offerings."""
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.OfferingFactory.get_public_list_url()
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offering_uuids = [o["uuid"] for o in response.data]
+        # Owner should see public offering, but not restricted (not in org group)
+        self.assertIn(str(self.shared_offering.uuid), offering_uuids)
+        self.assertNotIn(str(self.restricted_offering.uuid), offering_uuids)
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="hide_inaccessible")
+    def test_staff_always_sees_all_offerings(self):
+        """Staff should always see all offerings regardless of visibility mode."""
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_public_list_url()
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offering_uuids = [o["uuid"] for o in response.data]
+        self.assertIn(str(self.shared_offering.uuid), offering_uuids)
+        self.assertIn(str(self.restricted_offering.uuid), offering_uuids)
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="require_membership")
+    def test_staff_sees_all_even_in_require_membership_mode(self):
+        """Staff should see all offerings even in require_membership mode."""
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_public_list_url()
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offering_uuids = [o["uuid"] for o in response.data]
+        self.assertIn(str(self.shared_offering.uuid), offering_uuids)
+        self.assertIn(str(self.restricted_offering.uuid), offering_uuids)
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="hide_inaccessible")
+    def test_support_always_sees_all_offerings(self):
+        """Support user should always see all offerings regardless of visibility mode."""
+        self.client.force_authenticate(self.fixture.global_support)
+        url = factories.OfferingFactory.get_public_list_url()
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offering_uuids = [o["uuid"] for o in response.data]
+        self.assertIn(str(self.shared_offering.uuid), offering_uuids)
+        self.assertIn(str(self.restricted_offering.uuid), offering_uuids)
+
+    @override_config(RESTRICTED_OFFERING_VISIBILITY_MODE="show_all")
+    def test_is_accessible_true_for_staff(self):
+        """Staff should always have is_accessible=True."""
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_public_url(self.restricted_offering)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_accessible"])
+
+
+class OfferingOpenForProposalsTest(test.APITestCase):
+    def setUp(self):
+        self.offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+
+    def get_offering(self):
+        url = factories.OfferingFactory.get_public_url(self.offering)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data
+
+    def test_not_open_without_requested_offering(self):
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_open_when_accepted_in_active_call_with_open_round(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        self.assertTrue(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_the_round_has_not_started(self):
+        """Advertising an offering whose round opens later hands the applicant
+        a deadline they cannot act on — and the write path would refuse it
+        anyway, since a proposal can only be created while its round is open.
+        """
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        # The factory default is a round starting in five days.
+        scheduled = proposal_factories.RoundFactory(call=requested_offering.call)
+        self.assertEqual(scheduled.status, RoundStatuses.SCHEDULED)
+
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_call_templates_do_not_cover_the_offering(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        proposal_factories.CallResourceTemplateFactory(
+            call=requested_offering.call,
+            requested_offering=proposal_factories.RequestedOfferingFactory(
+                call=requested_offering.call
+            ),
+        )
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_open_when_a_call_template_covers_the_offering(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        proposal_factories.CallResourceTemplateFactory(
+            call=requested_offering.call,
+            requested_offering=requested_offering,
+        )
+        self.assertTrue(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_template_covers_offering_on_another_call(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        proposal_factories.CallResourceTemplateFactory(
+            call=requested_offering.call,
+            requested_offering=proposal_factories.RequestedOfferingFactory(
+                call=requested_offering.call
+            ),
+        )
+        proposal_factories.CallResourceTemplateFactory(
+            requested_offering=requested_offering,
+        )
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_call_is_draft(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_request_is_not_accepted(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+            state=RequestedOfferingStates.REQUESTED,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_all_rounds_ended(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(
+            call=requested_offering.call,
+            start_time=timezone.now() - datetime.timedelta(days=10),
+            cutoff_time=timezone.now() - datetime.timedelta(days=5),
+        )
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_call_has_no_rounds(self):
+        proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_via_another_offering_request(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_several_live_rounds_do_not_duplicate_the_offering(self):
+        # Callers feed open_for_proposals() to Exists() and __in with no distinct().
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        for _ in range(2):
+            proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+
+        self.assertEqual(
+            proposal_models.RequestedOffering.objects.open_for_proposals().count(), 1
+        )
+
+        url = factories.OfferingFactory.get_public_list_url()
+        response = self.client.get(url, {"open_for_proposals": "true"})
+        self.assertEqual(len(response.json()), 1)
+
+    def test_falls_back_to_a_query_when_queryset_is_not_annotated(self):
+        # The script plugin and nested representations serialize unannotated rows.
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+
+        offering = models.Offering.objects.get(pk=self.offering.pk)
+        self.assertFalse(hasattr(offering, "open_for_proposals"))
+        serializer = serializers.PublicOfferingDetailsSerializer()
+        self.assertTrue(serializer.get_open_for_proposals(offering))
+
+    def test_list_does_not_run_a_query_per_offering(self):
+        self.client.force_authenticate(structure_factories.UserFactory(is_staff=True))
+        url = factories.OfferingFactory.get_public_list_url()
+        query = {"field": ["uuid", "open_for_proposals"]}
+
+        # Warm up one-off lookups so the measurements differ only in row count.
+        self.client.get(url, query)
+
+        with CaptureQueriesContext(db_connection) as ctx_one:
+            self.client.get(url, query)
+
+        for _ in range(3):
+            requested_offering = proposal_factories.RequestedOfferingFactory(
+                offering=factories.OfferingFactory(state=OfferingStates.ACTIVE),
+                call__state=CallStates.ACTIVE,
+            )
+            proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+
+        with CaptureQueriesContext(db_connection) as ctx_many:
+            response = self.client.get(url, query)
+
+        self.assertEqual(len(response.data), 4)
+        self.assertEqual(len(ctx_one), len(ctx_many))
+
+
+class OfferingHistorySecretOptionsTest(test.APITestCase):
+    """Offering history is open to support users, but secret_options is not:
+    can_see_secret_options allows only staff, owners and service managers."""
+
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.offering = self.fixture.offering
+        self.offering.secret_options = {"backend_url": "https://backend.example.com"}
+        self.offering.save(update_fields=["secret_options"])
+        with reversion.create_revision():
+            reversion.add_to_revision(self.offering)
+
+    def test_secret_options_are_not_exposed_in_history(self):
+        self.client.force_authenticate(self.fixture.global_support)
+
+        response = self.client.get(
+            factories.OfferingFactory.get_url(self.offering, "history")
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data)
+        for version in response.data:
+            self.assertNotIn("secret_options", version["serialized_data"])
+        self.assertNotIn("backend.example.com", json.dumps(response.data, default=str))
+
+
+class OfferingScopeResourceTest(test.APITestCase):
+    """If offering scope is also a scope of a marketplace resource, the resource
+    is exposed in the offering serializer. The lookup is done in detail view only."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.service_settings = structure_factories.ServiceSettingsFactory()
+        self.offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+            scope=self.service_settings,
+        )
+        self.scope_resource = factories.ResourceFactory(
+            project=self.fixture.project, scope=self.service_settings
+        )
+        self.staff = structure_factories.UserFactory(is_staff=True)
+
+    def test_scope_resource_is_exposed_in_provider_detail_view(self):
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get(factories.OfferingFactory.get_url(self.offering))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["scope_resource_uuid"], self.scope_resource.uuid.hex
+        )
+        self.assertEqual(response.data["scope_resource_name"], self.scope_resource.name)
+        self.assertTrue(
+            response.data["scope_resource"].endswith(
+                factories.ResourceFactory.get_url(self.scope_resource)
+            )
+        )
+        # The scope itself is a different object with its own URL.
+        self.assertNotEqual(response.data["scope_resource"], response.data["scope"])
+
+    def test_scope_resource_is_exposed_in_public_detail_view(self):
+        self.client.force_authenticate(self.fixture.user)
+
+        response = self.client.get(
+            factories.OfferingFactory.get_public_url(self.offering)
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["scope_resource_uuid"], self.scope_resource.uuid.hex
+        )
+        self.assertEqual(response.data["scope_resource_name"], self.scope_resource.name)
+        self.assertTrue(
+            response.data["scope_resource"].endswith(
+                factories.ResourceFactory.get_url(self.scope_resource)
+            )
+        )
+
+    def test_scope_resource_is_not_exposed_in_provider_list_view(self):
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get(
+            factories.OfferingFactory.get_list_url(),
+            {"name_exact": self.offering.name},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertIsNone(response.data[0]["scope_resource_uuid"])
+        self.assertIsNone(response.data[0]["scope_resource_name"])
+        self.assertIsNone(response.data[0]["scope_resource"])
+
+    def test_scope_resource_is_not_exposed_in_public_list_view(self):
+        self.client.force_authenticate(self.fixture.user)
+
+        response = self.client.get(
+            factories.OfferingFactory.get_public_list_url(),
+            {"name_exact": self.offering.name},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertIsNone(response.data[0]["scope_resource_uuid"])
+        self.assertIsNone(response.data[0]["scope_resource_name"])
+        self.assertIsNone(response.data[0]["scope_resource"])
+
+    def test_scope_resource_is_empty_if_scope_is_not_related_to_resource(self):
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+            scope=structure_factories.ServiceSettingsFactory(),
+        )
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get(factories.OfferingFactory.get_url(offering))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["scope_resource_uuid"])
+        self.assertIsNone(response.data["scope_resource_name"])
+        self.assertIsNone(response.data["scope_resource"])
+
+    def test_scope_resource_is_empty_if_offering_has_no_scope(self):
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer, state=OfferingStates.ACTIVE
+        )
+        # A resource without scope must not be matched against a scopeless offering.
+        factories.ResourceFactory(project=self.fixture.project)
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get(factories.OfferingFactory.get_url(offering))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["scope_resource_uuid"])
+        self.assertIsNone(response.data["scope_resource_name"])
+        self.assertIsNone(response.data["scope_resource"])

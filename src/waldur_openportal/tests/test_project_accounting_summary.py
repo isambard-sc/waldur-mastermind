@@ -1,6 +1,7 @@
 from rest_framework import status, test
 from rest_framework.reverse import reverse
 
+from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.marketplace.enums import ResourceStates
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
@@ -27,7 +28,10 @@ class ProjectAccountingSummaryTest(test.APITestCase):
         )
 
     def test_offering_name_filter_excludes_non_matching_projects(self):
-        other_project = self.fixture.project
+        # A genuinely separate project, with no matching resource attached.
+        # self.fixture.project is a cached property, so reusing it here would
+        # hand back the same object as self.project.
+        other_project = structure_factories.ProjectFactory()
         offering = marketplace_factories.OfferingFactory(name="HPC Compute")
         marketplace_factories.ResourceFactory(
             project=self.project, offering=offering, state=ResourceStates.OK

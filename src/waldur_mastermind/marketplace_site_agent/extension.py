@@ -62,4 +62,19 @@ class MarketplaceSiteAgentExtension(WaldurExtension):
                 "schedule": timedelta(hours=1),
                 "args": (),
             },
+            "cleanup-orphan-subscription-queues": {
+                "task": "waldur_core.logging.cleanup_orphan_subscription_queues",
+                "schedule": timedelta(hours=6),
+                "args": (),
+            },
+            "cleanup-stale-agent-queues": {
+                "task": "waldur_mastermind.marketplace_site_agent.cleanup_stale_agent_queues",
+                "schedule": timedelta(hours=24),
+                "args": (),
+            },
+            "cleanup-dangling-agent-queues": {
+                "task": "waldur_mastermind.marketplace_site_agent.cleanup_dangling_agent_queues",
+                "schedule": timedelta(hours=1),
+                "args": (),
+            },
         }

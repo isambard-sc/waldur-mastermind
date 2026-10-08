@@ -61,15 +61,53 @@ class InvoiceConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.create_recurring_usage_if_invoice_has_been_created,
+            handlers.create_carried_over_usage_if_invoice_has_been_created,
             sender=models.Invoice,
-            dispatch_uid="waldur_mastermind.invoices.create_recurring_usage_if_invoice_has_been_created",
+            dispatch_uid="waldur_mastermind.invoices.create_carried_over_usage_if_invoice_has_been_created",
         )
 
         signals.post_save.connect(
             handlers.log_credit,
             sender=models.CustomerCredit,
             dispatch_uid="waldur_mastermind.invoices.log_credit",
+        )
+
+        signals.post_save.connect(
+            handlers.record_credit_transaction,
+            sender=models.CustomerCredit,
+            dispatch_uid="waldur_mastermind.invoices.record_credit_transaction",
+        )
+
+        signals.post_save.connect(
+            handlers.record_credit_transaction,
+            sender=models.ProjectCredit,
+            dispatch_uid="waldur_mastermind.invoices.record_project_credit_transaction",
+        )
+
+        signals.post_save.connect(
+            handlers.log_affiliate,
+            sender=models.CustomerAffiliate,
+            dispatch_uid="waldur_mastermind.invoices.log_affiliate",
+        )
+
+        from . import signals as cost_signals
+
+        cost_signals.invoice_created.connect(
+            handlers.process_affiliate_fees,
+            sender=models.Invoice,
+            dispatch_uid="waldur_mastermind.invoices.process_affiliate_fees",
+        )
+
+        signals.pre_delete.connect(
+            handlers.delete_project_credits_with_customer_credit,
+            sender=models.CustomerCredit,
+            dispatch_uid="waldur_mastermind.invoices.delete_project_credits_with_customer_credit",
+        )
+
+        signals.post_save.connect(
+            handlers.log_project_credit,
+            sender=models.ProjectCredit,
+            dispatch_uid="waldur_mastermind.invoices.log_project_credit",
         )
 
         signals.post_save.connect(
@@ -88,4 +126,12 @@ class InvoiceConfig(AppConfig):
             handlers.refund_project_credit_on_project_removal,
             sender=structure_models.Project,
             dispatch_uid="waldur_mastermind.invoices.refund_project_credit_on_project_removal",
+        )
+
+        from waldur_core.core.handlers import create_initial_revision
+
+        signals.post_save.connect(
+            create_initial_revision,
+            sender=models.Invoice,
+            dispatch_uid="waldur_mastermind.invoices.create_initial_revision_Invoice",
         )

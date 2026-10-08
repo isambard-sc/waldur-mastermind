@@ -5,8 +5,8 @@
 Waldur implements a comprehensive Role-Based Access Control (RBAC) system that determines what actions users can perform within the platform. The authorization system consists of three core components:
 
 1. **Permissions** - Unique strings that designate specific actions (e.g., `OFFERING.CREATE`, `PROJECT.UPDATE`)
-2. **Roles** - Named collections of permissions (e.g., `CUSTOMER.OWNER`, `PROJECT.ADMIN`)
-3. **User Roles** - Assignments linking users to roles within specific scopes
+1. **Roles** - Named collections of permissions (e.g., `CUSTOMER.OWNER`, `PROJECT.ADMIN`)
+1. **User Roles** - Assignments linking users to roles within specific scopes
 
 This functionality is implemented in the `waldur_core.permissions` application and provides fine-grained access control across all platform resources.
 
@@ -72,6 +72,7 @@ Waldur supports multiple authorization scopes, each representing a different org
 | Project | `structure.Project` | Project-level permissions within an organization |
 | Offering | `marketplace.Offering` | Service offering permissions |
 | Service Provider | `marketplace.ServiceProvider` | Provider-level permissions |
+| Call Organizer | `proposal.CallManagingOrganisation` | Organization managing calls for proposals |
 | Call | `proposal.Call` | Call for proposals permissions |
 | Proposal | `proposal.Proposal` | Individual proposal permissions |
 
@@ -266,6 +267,17 @@ managers = get_users(project, role_name='PROJECT.MANAGER')
 can_update = get_users_with_permission(project, PermissionEnum.UPDATE_PROJECT)
 ```
 
+#### Counting Users
+
+Use `count_users` to get an exact count of unique users with roles in a scope (avoids double-counting users with multiple roles):
+
+```python
+from waldur_core.permissions.utils import count_users
+
+# Get exact count of unique users with roles in a scope
+user_count = count_users(customer)
+```
+
 #### Managing User Roles
 
 ```python
@@ -302,6 +314,29 @@ delete_user(
 )
 ```
 
+### User Restriction Validation
+
+Use `validate_user_restrictions` to ensure users match scope-specific restrictions before granting roles:
+
+```python
+from waldur_core.permissions.utils import validate_user_restrictions
+
+# Validate user matches customer/project restrictions
+try:
+    validate_user_restrictions(project, user)
+except ValidationError:
+    # User doesn't match email pattern, affiliation, or identity source restrictions
+    pass
+```
+
+The function checks:
+
+- **Email patterns**: User email must match at least one pattern. A pattern is a regular expression matched against the whole address, ignoring case (e.g., `.*@example\.com` matches `alice@example.com`, not `alice@example.com.attacker.net`). An invalid pattern never matches
+- **Affiliations**: User must have at least one matching affiliation
+- **Identity sources**: User must have a matching identity source
+
+For Projects, it also validates against parent Customer restrictions. User must match restrictions at each level.
+
 ### Filtering by Permissions
 
 #### Using `get_connected_customers` and `get_connected_projects`
@@ -309,6 +344,7 @@ delete_user(
 These functions return all customers/projects where the user has any role:
 
 ```python
+from waldur_core.permissions.enums import RoleEnum
 from waldur_core.structure.managers import (
     get_connected_customers,
     get_connected_projects,
@@ -330,6 +366,12 @@ can_update_projects = get_connected_projects_by_permission(
 ```
 
 ## Permission Categories
+
+> **Note on Naming Convention:**
+> - **Enum names** (used in code): `PermissionEnum.CREATE_OFFERING`
+> - **Permission values** (stored in database, shown in tables below): `"OFFERING.CREATE"`
+>
+> The enum name follows `ACTION_OBJECT` pattern while the value follows `OBJECT.ACTION` pattern.
 
 ### Offering Permissions
 
@@ -368,6 +410,32 @@ can_update_projects = get_connected_projects_by_permission(
 | `PROJECT.DELETE` | Delete projects |
 | `CUSTOMER.CREATE` | Create customers |
 | `CUSTOMER.UPDATE` | Update customer details |
+
+### Service Account Permissions
+
+| Permission | Description |
+|------------|-------------|
+| `SERVICE_ACCOUNT.MANAGE` | Manage service accounts |
+
+### Course Account Permissions
+
+| Permission | Description |
+|------------|-------------|
+| `PROJECT.COURSE_ACCOUNT_MANAGE` | Manage course accounts in projects |
+
+### OpenStack Instance Permissions
+
+| Permission | Description |
+|------------|-------------|
+| `OPENSTACK_INSTANCE.CONSOLE_ACCESS` | Access OpenStack instance console |
+| `OPENSTACK_INSTANCE.MANAGE_POWER` | Manage OpenStack instance power state |
+| `OPENSTACK_INSTANCE.MANAGE` | Full OpenStack instance management |
+
+### Offering User Permissions
+
+| Permission | Description |
+|------------|-------------|
+| `OFFERINGUSER.UPDATE_RESTRICTION` | Update offering user restrictions |
 
 ## Best Practices
 
@@ -422,7 +490,13 @@ class MyViewSet(viewsets.ModelViewSet):
 
 ### 5. Audit Role Changes
 
-Role changes are automatically logged via signals (`role_granted`, `role_updated`, `role_revoked`) with enhanced context including initiator and reason. Always pass `current_user` and optional `reason` for clear audit trails:
+Two different things are audited, with two different families of event types:
+changes to role **assignments** (who holds which role) and changes to a role
+**definition** (what the role means).
+
+#### Role assignments
+
+Assignment changes are automatically logged via signals (`role_granted`, `role_updated`, `role_revoked`) with enhanced context including initiator and reason. Always pass `current_user` and optional `reason` for clear audit trails:
 
 ```python
 # Basic usage - uses default reasons
@@ -440,10 +514,10 @@ All role change logs now include:
 
 - **`initiated_by`**: Shows either "System" (for automatic operations) or "User Name (username)" (for manual operations)
 - **`reason`**: Specific reason for the change, with automatic defaults:
-  - Manual API operations: `"Manual role assignment/removal/update via API"`
-  - Automatic expiration: `"Automatic expiration"` or `"Automatic expiration cleanup task"`
-  - Project deletion: `"Project deletion cascade"`
-  - Scope changes: `"Project moved to different customer"`, `"Offering moved to different provider"`
+   - Manual API operations: `"Manual role assignment/removal/update via API"`
+   - Automatic expiration: `"Automatic expiration"` or `"Automatic expiration cleanup task"`
+   - Project deletion: `"Project deletion cascade"`
+   - Scope changes: `"Project moved to different customer"`, `"Offering moved to different provider"`
 
 #### Common Automatic Reasons
 
@@ -456,6 +530,41 @@ The system automatically assigns these reasons when not explicitly provided:
 | Project deletion | `"Project deletion cascade"` |
 | Role expiration detection | `"Automatic expiration"` |
 | System operations without `current_user` | `"System-initiated [operation]"` |
+
+#### Role definitions
+
+Editing what a role means is a separate audit trail, emitted from
+`RoleViewSet` and from the `CustomerRoleConcealment` model handlers:
+
+| Event type | Emitted when |
+|---|---|
+| `role_definition_created` | a role is created |
+| `role_definition_updated` | its permission set, name or description changes |
+| `role_definition_deleted` | a role is deleted |
+| `role_enabled` / `role_disabled` | it is made (un)available for new grants |
+| `role_cloned` | it is copied into an organization |
+| `role_concealed` / `role_revealed` | it is hidden from, or restored to, an organization |
+
+Note that `role_updated` is **not** part of this family: it means an
+assignment's expiration time changed, and a definition change deliberately
+does not reuse it.
+
+`role_definition_updated` carries `added_permissions` and `removed_permissions`,
+plus `old_name`, `old_descriptions` and `old_content_type` / `new_content_type`
+when those changed; a request that resubmits the current definition emits
+nothing.
+
+`is_active` and the scope are writable through the update endpoint as well as
+through the dedicated actions, so they are diffed there too: disabling a role
+with a `PUT` emits `role_disabled` exactly as the `disable` action does.
+
+Events for an organization-private role are filed in that organization's feed.
+A deployment-wide role has no organization binding, so its events land in the
+global event log only.
+
+The actor is read from the request through
+`waldur_core.logging.middleware.get_event_context()`, so no `current_user`
+argument is threaded through these views.
 
 ### 6. Performance and Accuracy Guidelines
 
@@ -556,9 +665,9 @@ When designing permission-related APIs:
 
 - **Default parameters** should match the most common use case
 - **Error types** should be consistent:
-  - `AttributeError` for configuration/code errors (invalid attribute paths)
-  - `PermissionDenied` for access control failures
-  - `ValidationError` for user input errors
+   - `AttributeError` for configuration/code errors (invalid attribute paths)
+   - `PermissionDenied` for access control failures
+   - `ValidationError` for user input errors
 
 ## Testing and Debugging Permissions
 
@@ -632,7 +741,7 @@ When debugging permission problems:
    print(f"User roles: {[(r.content_object, r.role.name) for r in roles]}")
    ```
 
-2. **Verify permission assignments**:
+1. **Verify permission assignments**:
 
    ```python
    # Check if role has required permissions
@@ -641,7 +750,7 @@ When debugging permission problems:
    print(f"Role permissions: {list(permissions)}")
    ```
 
-3. **Test permission paths**:
+1. **Test permission paths**:
 
    ```python
    # Test attribute path resolution
@@ -654,7 +763,7 @@ When debugging permission problems:
        print(f"Path resolution failed: {e}")
    ```
 
-4. **Enable verbose logging**:
+1. **Enable verbose logging**:
 
    ```python
    import logging

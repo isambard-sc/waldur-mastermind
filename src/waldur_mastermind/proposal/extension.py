@@ -27,16 +27,6 @@ class ProposalExtension(WaldurExtension):
     @staticmethod
     def celery_tasks():
         return {
-            "create-reviews-if-strategy-is-after-round": {
-                "task": "waldur_mastermind.proposal.create_reviews_if_strategy_is_after_round",
-                "schedule": timedelta(hours=1),
-                "args": (),
-            },
-            "create-reviews-if-strategy-is-after-proposal": {
-                "task": "waldur_mastermind.proposal.create_reviews_if_strategy_is_after_proposal",
-                "schedule": timedelta(hours=1),
-                "args": (),
-            },
             "proposals-for-ended-rounds-should-be-cancelled": {
                 "task": "waldur_mastermind.proposal.proposals_for_ended_rounds_should_be_cancelled",
                 "schedule": timedelta(hours=1),
@@ -57,14 +47,49 @@ class ProposalExtension(WaldurExtension):
                 "schedule": timedelta(hours=1),
                 "args": (),
             },
-            "send-stale-proposal-reminders": {
-                "task": "waldur_mastermind.proposal.send_stale_proposal_reminders",
-                "schedule": timedelta(days=1),
+            "notify-proposal-creator-on-submission-deadline-approaching": {
+                "task": "waldur_mastermind.proposal.notify_proposal_creator_on_submission_deadline_approaching",
+                "schedule": timedelta(hours=24),
                 "args": (),
             },
-            "delete-stale-proposals": {
-                "task": "waldur_mastermind.proposal.delete_stale_proposals",
-                "schedule": timedelta(days=1),
+            "notify-reviewer-on-review-deadline-approaching": {
+                "task": "waldur_mastermind.proposal.notify_reviewer_on_review_deadline_approaching",
+                "schedule": timedelta(hours=24),
+                "args": (),
+            },
+            "mark-expired-assignment-batches": {
+                "task": "waldur_mastermind.proposal.mark_expired_assignment_batches",
+                "schedule": timedelta(minutes=15),
+                "args": (),
+            },
+            "start-evaluation-for-closed-rounds": {
+                "task": "waldur_mastermind.proposal.start_evaluation_for_closed_rounds",
+                "schedule": timedelta(hours=1),
+                "args": (),
+            },
+            "mark-expired-reviewer-pool-invitations": {
+                "task": "waldur_mastermind.proposal.mark_expired_reviewer_pool_invitations",
+                "schedule": timedelta(hours=1),
+                "args": (),
+            },
+            "mark-expired-workflow-steps": {
+                "task": "waldur_mastermind.proposal.mark_expired_workflow_steps",
+                "schedule": timedelta(hours=1),
+                "args": (),
+            },
+            "send-workflow-step-deadline-reminders": {
+                "task": "waldur_mastermind.proposal.send_workflow_step_deadline_reminders",
+                "schedule": timedelta(hours=24),
+                "args": (),
+            },
+            "send-assignment-expiry-reminders": {
+                "task": "waldur_mastermind.proposal.send_assignment_expiry_reminders",
+                "schedule": timedelta(hours=24),
+                "args": (),
+            },
+            "notify-managers-of-expired-batches": {
+                "task": "waldur_mastermind.proposal.notify_managers_of_expired_batches",
+                "schedule": timedelta(minutes=30),
                 "args": (),
             },
         }

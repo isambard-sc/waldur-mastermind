@@ -1,4 +1,6 @@
+import calendar
 import datetime
+import decimal
 import hashlib
 import json
 import logging
@@ -6,7 +8,6 @@ import math
 import os
 import random
 import re
-import textwrap
 import traceback
 import unicodedata
 import uuid
@@ -14,6 +15,7 @@ from collections import defaultdict
 from enum import Enum
 from functools import lru_cache
 from io import BytesIO
+from string import Template
 from typing import cast
 
 import httpx
@@ -23,9 +25,21 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage as storage
+from django.db import models as models_module
 from django.db import transaction
-from django.db.models import F, Q, Sum
+from django.db.models import (
+    Count,
+    Exists,
+    F,
+    OuterRef,
+    Prefetch,
+    Q,
+    QuerySet,
+    Subquery,
+    Sum,
+)
 from django.db.models.fields import FloatField
+from django.db.models.functions import Coalesce
 from django.db.models.functions.math import Ceil
 from django.urls import get_resolver
 from django.utils import timezone
@@ -33,57 +47,76 @@ from django.utils.translation import gettext_lazy as _
 from PIL import Image
 from rest_framework import exceptions as rf_exceptions
 from rest_framework import serializers, status
+from rest_framework.response import Response
 
 from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.models import User
+from waldur_core.core.validators import is_potentially_dangerous_regex
+from waldur_core.logging import event_dispatch, event_logger
 from waldur_core.logging import models as logging_models
 from waldur_core.logging import tasks as logging_tasks
-from waldur_core.logging import utils as logging_utils
+from waldur_core.logging.enums import EventType, ObservableObjectType
+from waldur_core.permissions import utils as permission_utils
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import (
     get_permissions,
     get_users_with_permission,
     has_permission,
+    has_user,
 )
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure.managers import (
+    get_connected_customers,
     get_connected_projects,
     get_customer_users,
     get_organization_groups,
     get_project_users,
 )
 from waldur_freeipa import models as freeipa_models
+from waldur_mastermind.common.serializers import strip_hidden_options
 from waldur_mastermind.common.utils import create_request, mb_to_gb
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices.structures import InvoiceResourceLimitPeriodDict
 from waldur_mastermind.invoices.utils import get_full_days
-from waldur_mastermind.marketplace import attribute_types
+from waldur_mastermind.marketplace import attribute_types, billing_mode, derived_limits
 from waldur_mastermind.marketplace.billing import MarketplaceBillingService
-from waldur_mastermind.marketplace.enums import REMOTE_OFFERING as REMOTE_PLUGIN_NAME
 from waldur_mastermind.marketplace.enums import (
-    SITE_AGENT_OFFERING as SITE_AGENT_PLUGIN_NAME,
-)
-from waldur_mastermind.marketplace.enums import (
+    OPENSTACK_TENANT_OFFERING,
     BillingTypes,
+    CourseAccountState,
     LimitPeriods,
     OfferingUserStates,
     OrderStates,
     ResourceStates,
     RobotAccountStates,
+    UsageLimitAction,
 )
+from waldur_mastermind.marketplace.enums import REMOTE_OFFERING as REMOTE_PLUGIN_NAME
+from waldur_mastermind.marketplace.enums import SCRIPT_OFFERING as SCRIPT_PLUGIN_NAME
+from waldur_mastermind.marketplace.enums import (
+    SITE_AGENT_OFFERING as SITE_AGENT_PLUGIN_NAME,
+)
+from waldur_mastermind.marketplace_openstack import get_mb_component_types
 
-from . import models, plugins
+from . import models, plugins, posix_ids
+from . import project_groups as provider_project_groups
 from .enums import BASIC_OFFERING as BASIC_PLUGIN_NAME
 from .enums import OrderTypes
 
 logger = logging.getLogger(__name__)
 USERNAME_ANONYMIZED_POSTFIX_LENGTH = 5
+
+# One default for the anonymized prefix, shared by the plugin-options serializer
+# and the generator, so an offering saved through the API and one that never
+# set the key produce the same names.
+DEFAULT_ANONYMIZED_PREFIX = "waldur_"
+
 USERNAME_POSTFIX_LENGTH = 2
 
 
@@ -91,8 +124,10 @@ class UsernameGenerationPolicy(Enum):
     SERVICE_PROVIDER = (
         "service_provider"  # SP should manually submit username for the offering users
     )
-    ANONYMIZED = "anonymized"  # Usernames are generated with <prefix>_<number>, e.g. "anonym_00001".
-    # The prefix must be specified in offering.plugin_options as "username_anonymized_prefix"
+    # Usernames are <prefix><posix uid>, e.g. "anonym_9001", or a per-offering
+    # counter ("anonym_00001") when no POSIX UID resolves. The prefix comes from
+    # the "username_anonymized_prefix" account setting (offering, else provider).
+    ANONYMIZED = "anonymized"
     FULL_NAME = "full_name"  # Usernames are constructed using first and last name of users with numerical suffix, e.g. "john_doe_01"
     WALDUR_USERNAME = "waldur_username"  # Using username field of User model
     FREEIPA = "freeipa"  # Using username field of waldur_freeipa.Profile model
@@ -110,6 +145,9 @@ def get_order_processor(order: models.Order):
 
     elif order.type == OrderTypes.TERMINATE:
         return plugins.manager.get_processor(offering.type, "delete_resource_processor")
+
+    elif order.type == OrderTypes.RESTORE:
+        return plugins.manager.get_processor(offering.type, "create_resource_processor")
 
 
 def process_order(order: models.Order, user):
@@ -133,20 +171,17 @@ def process_order(order: models.Order, user):
         order.error_message = str(e)
         order.error_traceback = traceback.format_exc()
         order.set_state_erred()
+        order.resource.set_state_erred()
 
-        if (
-            order.attributes.get("action") == "force_destroy"
-            and order.type == OrderTypes.TERMINATE
-            and user.is_staff
-        ):
-            order.resource.set_state_terminated()
-        else:
-            order.resource.set_state_erred()
-
+        # exc_info=True emits the full traceback to the log stream (Loki); the
+        # DB only keeps order.error_traceback, which operators cannot see while
+        # triaging from logs. The order __str__ already carries type/offering/
+        # created_by context.
         logger.error(
             f"Error processing order {order}. "
             f"Order ID: {order.id}. "
-            f"Exception: {order.error_message}."
+            f"Exception: {order.error_message}.",
+            exc_info=True,
         )
         order.resource.save(update_fields=["state"])
 
@@ -285,6 +320,13 @@ def validate_limit_amount(value, component):
     if not component.limit_amount:
         return
 
+    # `current` is summed from ComponentQuota.limit and limit_amount is a
+    # Decimal column, but the requested value comes out of a JSONField as int
+    # or float. Adding a float to a Decimal raises TypeError, which surfaced as
+    # a bare HTTP 500. Coerce via str() so 0.1 becomes Decimal("0.1") rather
+    # than its binary expansion.
+    value = decimal.Decimal(str(value))
+
     if component.limit_period == LimitPeriods.MONTH:
         current = (
             (
@@ -357,10 +399,12 @@ def validate_limit_amount(value, component):
             )
 
 
-def validate_maximum_available_limit(value, component, resource=None):
-    if not component.max_available_limit:
-        return
+def get_allocated_limit_total(component, resource=None):
+    """Sum of ``component``'s limit over the offering's other resources.
 
+    ``resource`` is the one being changed, so its own stored limit is left out
+    of the total the new value is weighed against.
+    """
     all_offering_resources = models.Resource.objects.filter(
         offering=component.offering
     ).exclude(limits={})
@@ -368,12 +412,29 @@ def validate_maximum_available_limit(value, component, resource=None):
     if resource:
         all_offering_resources = all_offering_resources.exclude(id=resource.id)
 
-    current_total_limits = sum(
-        resource["limits"].get(component.type, 0)
-        for resource in all_offering_resources.values("limits")
+    # max_available_limit is a Decimal column while the limits it is compared
+    # against come out of a JSONField as int or float. Comparing the two is
+    # fine, but subtracting is a TypeError, so the running total is carried as
+    # Decimal from the start.
+    return sum(
+        (
+            decimal.Decimal(str(item["limits"].get(component.type, 0)))
+            for item in all_offering_resources.values("limits")
+        ),
+        decimal.Decimal(0),
     )
 
-    if current_total_limits + value >= component.max_available_limit:
+
+def validate_maximum_available_limit(value, component, resource=None):
+    if not component.max_available_limit:
+        return
+
+    current_total_limits = get_allocated_limit_total(component, resource)
+
+    if (
+        current_total_limits + decimal.Decimal(str(value))
+        >= component.max_available_limit
+    ):
         error_message = "Requested %s cannot be provisioned due to offering safety limit. You can allocate up to %s of %s."
         if component.type == "cores":
             value = component.max_available_limit - current_total_limits - 1
@@ -393,36 +454,250 @@ def validate_maximum_available_limit(value, component, resource=None):
 
 
 def validate_min_max_limit(value, component):
+    # min_value is nullable, so None is "unset" and 0 is a real bound: a
+    # truthiness test made min_value=0 no bound at all, which left a negative
+    # limit orderable. max_value deliberately keeps the truthiness test —
+    # existing rows hold 0 meaning "no maximum", and the frontend agrees
+    # (offerings/store/limits.ts), so tightening it here would 400 orders the
+    # UI still offers. Changing that is a data-migration question of its own.
     if component.max_value and value > component.max_value:
         raise serializers.ValidationError(
             _("The limit %s value cannot be more than %s.")
             % (value, component.max_value)
         )
-    if component.min_value and value < component.min_value:
+    if component.min_value is not None and value < component.min_value:
         raise serializers.ValidationError(
             _("The limit %s value cannot be less than %s.")
             % (value, component.min_value)
         )
 
 
-def get_components_map(limits, offering: models.Offering):
-    valid_component_types = set(
-        offering.components.filter(
-            Q(billing_type=BillingTypes.LIMIT)
-            | Q(billing_type=BillingTypes.ONE_TIME, is_prepaid=True)
-        ).values_list("type", flat=True)
-    )
+def narrow_limit_value(value):
+    """Render a limit or bound as the JSON-native number it should be.
 
-    invalid_types = set(limits.keys()) - valid_component_types
-    if invalid_types:
+    Limits live in JSONFields and bounds are Decimal columns, but both are
+    exchanged as JSON numbers. Whole values stay int so that a limit of 5 is
+    still 5 rather than 5.0 or "5.00", which keeps payloads for integer-only
+    deployments byte-identical.
+    """
+    number = float(value)
+    return int(number) if number.is_integer() else number
+
+
+def add_limit_values(*values):
+    """Add limit values exactly, returning a JSON-native result.
+
+    Limits live in JSONFields, so they arrive as int or float, and adding
+    floats directly leaves binary-expansion noise: 1.1 + 0.3 is
+    1.4000000000000001, which validate_limit_precision then rejects for a
+    request that is arithmetically valid, and which reallocation would store as
+    a limit nobody asked for. Sum in Decimal and narrow back the way
+    LimitValueField does, so whole numbers stay int.
+    """
+    total = sum((decimal.Decimal(str(value)) for value in values), decimal.Decimal(0))
+    return narrow_limit_value(total)
+
+
+def validate_component_precision_is_supported(offering_type, limit_decimal_places):
+    """Refuse a fractional component on a backend that cannot express one.
+
+    Without this a provider could set a precision the plugin then truncates at
+    the far end — the customer is billed for 0.1 and given 0. Plugins that map a
+    limit onto an integer quota declare ``max_limit_decimal_places=0``; a plugin
+    that declares nothing is uncapped, because for a backend Waldur cannot
+    introspect the operator owns the decision.
+    """
+    if not limit_decimal_places:
+        return
+    cap = plugins.manager.get_max_limit_decimal_places(offering_type)
+    if cap is not None and limit_decimal_places > cap:
         raise serializers.ValidationError(
-            {"limits": _("Invalid types: %s") % ", ".join(invalid_types)}
+            {
+                "limit_decimal_places": _(
+                    "Offerings of type %(type)s accept at most %(cap)s decimal "
+                    "places on a component limit."
+                )
+                % {"type": offering_type, "cap": cap}
+            }
         )
 
-    components_map = {
-        component.type: component
-        for component in offering.components.filter(type__in=valid_component_types)
-    }
+
+def validate_limit_precision(value, component):
+    """Reject a limit finer than the component was configured to accept.
+
+    The serializers parse a limit as a number without deciding whether one is
+    allowed, because that answer belongs to the component: most backends map a
+    limit onto an integer quota and would truncate a fraction silently at the
+    far end. Enforcing it here covers every route into `limits` at once —
+    ordering, updating, renewing, reallocating, a limit change request and a
+    proposal resource template.
+    """
+    places = component.limit_decimal_places or 0
+    exponent = decimal.Decimal(1).scaleb(-places)
+    amount = decimal.Decimal(str(value))
+    try:
+        truncated = amount.quantize(exponent, rounding=decimal.ROUND_DOWN)
+    except decimal.InvalidOperation:
+        # More digits than the decimal context can hold. Nothing legitimate
+        # reaches this, and letting it through would be an uncaught 500.
+        raise serializers.ValidationError(
+            _("The limit %s value is out of range.") % value
+        )
+    if amount != truncated:
+        if places == 0:
+            message = _("The limit %s value must be a whole number.") % value
+        else:
+            message = _(
+                "The limit %(value)s value cannot have more than "
+                "%(places)s decimal places."
+            ) % {"value": value, "places": places}
+        raise serializers.ValidationError(message)
+
+
+def clamp_limit_value(value, component, resource=None, stored_value=None):
+    """Narrow a limit to the nearest value the component accepts.
+
+    ``validate_limits`` rejects a limit outside the component's bounds, which
+    is the right answer when a person is ordering: the request stops and they
+    correct it. The site agent has no such recourse — it has no error handling
+    for a ``set_limits`` 4xx and marks the resource as ERRED — so that route
+    narrows the value instead and logs the divergence, which is the signal that
+    the agent's limit reporting needs fixing.
+
+    ``stored_value`` is the limit the resource already holds. A clamp may
+    refuse the request, wholly or in part, but never moves the limit against
+    the direction the request asked for, so the result always lies between the
+    stored limit and the requested one.
+
+    Returns a ``(value, reason)`` pair. ``reason`` is None when the value was
+    already acceptable, otherwise it names the bound that moved it. A None
+    value means the component's own configuration leaves nothing to narrow to,
+    so the caller keeps whatever it had.
+    """
+    places = component.limit_decimal_places or 0
+    step = decimal.Decimal(1).scaleb(-places)
+
+    def truncate(amount):
+        # ROUND_FLOOR rather than ROUND_DOWN: the latter rounds toward zero, so
+        # it would raise a negative limit instead of narrowing it.
+        return amount.quantize(step, rounding=decimal.ROUND_FLOOR)
+
+    try:
+        amount = decimal.Decimal(str(value))
+        truncated = truncate(amount)
+    except (decimal.InvalidOperation, ValueError, TypeError):
+        # Not a number, or more digits than the decimal context can hold.
+        # Nothing legitimate reaches this and there is no nearest value to
+        # narrow it to.
+        return None, "precision"
+
+    reason = None
+    raw = amount
+
+    if truncated != amount:
+        amount = truncated
+        reason = "precision"
+
+    requested = amount
+
+    stored = None
+    if stored_value is not None:
+        try:
+            # Left as stored, not truncated: it is the direction boundary, not
+            # a value being proposed. A limit written before this route checked
+            # precision may be finer than the component accepts, and truncating
+            # it here would turn "refuse the request" into "shave the existing
+            # allocation".
+            stored = decimal.Decimal(str(stored_value))
+        except (decimal.InvalidOperation, ValueError, TypeError):
+            stored = None
+
+    # max_value keeps the truthiness test validate_min_max_limit uses: 0 in
+    # that column means "no maximum".
+    if component.max_value and amount > component.max_value:
+        amount = truncate(decimal.Decimal(component.max_value))
+        reason = "max_value"
+
+    if component.min_value is not None and amount < component.min_value:
+        # The bound is rounded up, since truncating it would land back below
+        # the minimum it is meant to enforce.
+        amount = decimal.Decimal(component.min_value).quantize(
+            step, rounding=decimal.ROUND_CEILING
+        )
+        reason = "min_value"
+        if component.max_value and amount > component.max_value:
+            return None, reason
+
+    # The offering-wide cap bounds the total the offering hands out, and a
+    # value at or below the stored limit adds nothing to that total. Weighing a
+    # shrink against it would refuse to let an allocation that already exceeds
+    # a lowered cap give anything back, and keep billing for capacity the
+    # backend has released.
+    if component.max_available_limit and (stored is None or amount > stored):
+        remaining = component.max_available_limit - get_allocated_limit_total(
+            component, resource
+        )
+        # The offering-wide cap is exclusive (validate_maximum_available_limit
+        # rejects a total that merely reaches it), so the ceiling is the
+        # largest step strictly below what is left.
+        ceiling = truncate(remaining)
+        if ceiling == remaining:
+            ceiling -= step
+        if amount > ceiling:
+            if ceiling < 0 or (
+                component.min_value is not None and ceiling < component.min_value
+            ):
+                return None, "max_available_limit"
+            amount = ceiling
+            reason = "max_available_limit"
+
+    if stored is not None:
+        # A bound may refuse what the request asks for, but it may not reverse
+        # it. A provider can lower a maximum or raise a minimum long after the
+        # resource was allocated, and the agent then reports a value moving the
+        # other way; clamping to the bound there would resize a working
+        # resource — and bill the customer for it — in the opposite direction
+        # from the one anybody asked for. Keeping the result between the stored
+        # limit and the requested one means the worst outcome is a refused
+        # request, with the resource holding on to what it had. The
+        # offering-wide ceiling relies on this too: growth is capped, while an
+        # allocation that already exceeds what is left is not taken away.
+        if requested < stored < raw:
+            # Truncation alone carried a growth request below the stored
+            # limit, so the interval below would accept a shrink. The request
+            # asks for a step the component does not have: refuse it.
+            amount = stored
+        else:
+            low, high = min(stored, requested), max(stored, requested)
+            if amount < low:
+                amount = low
+            elif amount > high:
+                amount = high
+
+    if reason is None:
+        return value, None
+
+    return narrow_limit_value(amount), reason
+
+
+def get_components_map(limits, offering: models.Offering, plan=None):
+    """Pair each limit key with the component it belongs to.
+
+    Only components whose quantity is a user-requested limit under ``plan``
+    (or under the stored component types when no plan is given) are valid
+    keys; anything else is rejected.
+    """
+    components_map = (
+        billing_mode.resolve_plan(plan).limit_components
+        if plan is not None
+        else billing_mode.resolve_offering(offering).limit_components
+    )
+
+    invalid_types = set(limits.keys()) - set(components_map)
+    if invalid_types:
+        raise serializers.ValidationError(
+            {"limits": _("Invalid types: %s") % ", ".join(sorted(invalid_types))}
+        )
 
     result = []
     for key, value in limits.items():
@@ -432,27 +707,339 @@ def get_components_map(limits, offering: models.Offering):
     return result
 
 
-def validate_limits(limits, offering, resource=None):
+def derived_limit_inputs(resource, new_options=None):
+    """The inputs a resource's derived limits are calculated from.
+
+    Ordered values live in the resource's attributes; a paired
+    ``component_formula`` resource option holds the value as changed since,
+    and wins, and ``new_options`` -- an order's option changes -- win over
+    both. Other resource options never do, even with the same name: they can
+    be edited without an order.
     """
+    offering = resource.offering
+    paired = derived_limits.paired_resource_options(
+        offering.resource_options, (offering.options or {}).get("options")
+    )
+    inputs = dict(resource.attributes or {})
+    for options in (resource.options or {}, new_options or {}):
+        inputs.update({name: options[name] for name in paired if name in options})
+    return inputs
+
+
+def copy_order_options_to_resource(order):
+    """Set a created resource's options from its order's current values.
+
+    The values are copied when the order is placed; an order changed since
+    (edited while pending, or by the provider at approval) must not leave the
+    resource with the value it was first ordered with.
+    """
+    resource = order.resource
+    resource_options = (order.offering.resource_options or {}).get("options")
+    if not resource or not resource_options:
+        return
+    attributes = order.attributes or {}
+    resource.options = strip_hidden_options(
+        resource_options,
+        {key: attributes[key] for key in resource_options if key in attributes},
+    )
+    resource.save(update_fields=["options"])
+
+
+def copy_order_attributes_to_resource(order):
+    """Set a created resource's attributes from its create order's current values.
+
+    Like copy_order_options_to_resource, for the order form values: they are
+    copied when the order is placed, and a value changed since (edited while
+    pending, or by the provider at approval) must replace the ordered one on
+    the resource too. Otherwise the resource keeps holding a value its order no
+    longer asks for, and a unique option counts it as taken. They are replaced,
+    not merged, so a value the change dropped does not stay behind.
+    """
+    resource = order.resource
+    if not resource:
+        return
+    resource.attributes = dict(order.attributes or {})
+    resource.save(update_fields=["attributes"])
+
+
+def changed_derived_inputs(resource, new_options):
+    """Names of the formula inputs that ``new_options`` would change on ``resource``."""
+    offering = resource.offering
+    paired = derived_limits.paired_resource_options(
+        offering.resource_options, (offering.options or {}).get("options")
+    )
+    current = derived_limit_inputs(resource)
+    return {
+        name
+        for name in paired
+        if name in (new_options or {})
+        and str(new_options[name]) != str(current.get(name))
+    }
+
+
+def apply_derived_limits(limits, offering, attributes, plan=None, fallback=None):
+    """Return ``limits`` with the offering's derived limits set by the server.
+
+    Derived limits come from ``component_formula`` and ``component_sum`` order
+    options (see ``derived_limits``). ``attributes`` holds the formula inputs;
+    ``fallback`` is what to keep for a derived limit that cannot be calculated,
+    normally the resource's current limits.
+    """
+    options = (offering.options or {}).get("options")
+    if not derived_limits.derived_components(options):
+        return limits
+    components = (
+        billing_mode.resolve_plan(plan)
+        if plan is not None
+        else billing_mode.resolve_offering(offering)
+    ).limit_components
+    return derived_limits.compute_derived_limits(
+        options, attributes, limits, components, fallback=fallback
+    )
+
+
+def validate_limits(
+    limits,
+    offering,
+    resource=None,
+    is_creation=False,
+    plan=None,
+    attributes=None,
+    fallback=None,
+):
+    """Validate requested limits and return them with derived limits applied.
+
+    Every change to a resource's limits passes through here, so this is where
+    the server sets the limits it derives from order options: a derived limit
+    sent by the client is replaced, one left out is put back, and a sum is
+    recalculated when a component it adds up changes. Callers must use the
+    returned limits.
+
     @param limits Maximum/Minimum limit-based components values and maximum available limit
     @param offering The offering being created
     @param resource Passing the resource if the limits of the resource are being updated.
+    @param is_creation If True, skip the can_update_limits check (it only applies to updates).
+    @param plan The plan the limits are requested under; decides which components take limits.
+    @param attributes The order options that derived limits are calculated
+        from, when the caller holds them (creating, editing or approving an
+        order). Omitted for a change to an existing resource, whose own
+        options are used; there a derived limit that cannot be calculated
+        keeps its current value.
+    @param fallback With ``attributes``: values to keep for derived limits that
+        cannot be calculated from them.
     """
-    if not plugins.manager.can_update_limits(offering.type):
+    if not is_creation and not plugins.manager.can_update_limits(offering.type):
         raise serializers.ValidationError(
             {"limits": _("Limits update is not supported for this resource.")}
+        )
+
+    if plan is None and resource is not None:
+        plan = resource.plan
+
+    if attributes is not None:
+        limits = apply_derived_limits(
+            limits, offering, attributes, plan=plan, fallback=fallback
+        )
+    elif resource is not None:
+        limits = apply_derived_limits(
+            limits,
+            offering,
+            derived_limit_inputs(resource),
+            plan=plan,
+            fallback=resource.limits,
         )
 
     limits_validator = plugins.manager.get_limits_validator(offering.type)
     if limits_validator:
         limits_validator(limits)
 
-    for component, value in get_components_map(limits, offering):
+    for component, value in get_components_map(limits, offering, plan):
+        validate_limit_precision(value, component)
+
         validate_min_max_limit(value, component)
 
         validate_limit_amount(value, component)
 
         validate_maximum_available_limit(value, component, resource)
+
+    return limits
+
+
+def get_unique_options(options):
+    """Names of the options whose values must be unique across the offering."""
+    return [
+        name
+        for name, option in (options or {}).items()
+        if isinstance(option, dict) and option.get("unique")
+    ]
+
+
+def _unique_option_candidates(option, value):
+    """Stored forms of a value that count as the same value.
+
+    Attributes are stored as submitted, so an integer option may hold 5 or "5".
+    """
+    if option.get("type") == "integer":
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return [value]
+        return [number, str(number)]
+    return [value]
+
+
+# Update orders whose new_options have not been written to the resource yet.
+PENDING_UPDATE_ORDER_STATES = (
+    OrderStates.PENDING_CONSUMER,
+    OrderStates.PENDING_PROVIDER,
+    OrderStates.PENDING_PROJECT,
+    OrderStates.PENDING_START_DATE,
+    OrderStates.EXECUTING,
+)
+
+
+def validate_unique_options(
+    offering, options, values, field, exclude_resource=None, exclude_order=None
+):
+    """Reject option values that another live resource of the offering holds.
+
+    `field` is "attributes" for the order form options and "options" for the
+    resource options. A resource counts until it is terminated. That includes
+    an ERRED one, which may still exist in the backend; a create order that
+    errs before the backend created anything, and a rejected or canceled one,
+    terminates its resource and so frees the value.
+
+    For "attributes" the create orders of live resources are checked as well:
+    an edited create order copies its attributes onto its resource (see
+    copy_order_attributes_to_resource), but orders edited before that did not.
+    For "options" the pending update orders of live resources are checked too:
+    their new_options are written only when they complete, and until then
+    they must reserve the value.
+
+    Callers that write the values must hold a lock on the offering row (see
+    lock_offering_for_unique_options), or two requests can both pass.
+    """
+    if not isinstance(values, dict):
+        return
+    options = options or {}
+    resources = models.Resource.objects.filter(offering=offering).exclude(
+        state=ResourceStates.TERMINATED
+    )
+    orders = models.Order.objects.filter(
+        offering=offering, type=OrderTypes.CREATE, resource__in=resources
+    )
+    update_orders = models.Order.objects.filter(
+        offering=offering,
+        type=OrderTypes.UPDATE,
+        state__in=PENDING_UPDATE_ORDER_STATES,
+        resource__in=resources,
+    )
+    if exclude_resource is not None:
+        resources = resources.exclude(pk=exclude_resource.pk)
+        orders = orders.exclude(resource=exclude_resource)
+        update_orders = update_orders.exclude(resource=exclude_resource)
+    if exclude_order is not None:
+        orders = orders.exclude(pk=exclude_order.pk)
+        update_orders = update_orders.exclude(pk=exclude_order.pk)
+
+    errors = {}
+    for name in get_unique_options(options):
+        value = values.get(name)
+        if value is None or value == "":
+            continue
+        candidates = _unique_option_candidates(options[name], value)
+        query = Q()
+        for candidate in candidates:
+            query |= Q(**{f"{field}__contains": {name: candidate}})
+        taken = resources.filter(query).exists()
+        if not taken and field == "attributes":
+            taken = orders.filter(query).exists()
+        if not taken and field == "options":
+            pending = Q()
+            for candidate in candidates:
+                pending |= Q(attributes__new_options__contains={name: candidate})
+            taken = update_orders.filter(pending).exists()
+        if taken:
+            errors[name] = _(
+                "This value is already used by another resource of this offering."
+            )
+    if errors:
+        raise rf_exceptions.ValidationError(errors)
+
+
+def lock_offering_for_unique_options(offering, *option_sets):
+    """Serialise writers of unique option values for one offering.
+
+    Takes a row lock only when one of the option sets has a unique option, so
+    offerings without them are not slowed down. Must run inside a transaction.
+    """
+    if any(get_unique_options(options) for options in option_sets):
+        models.Offering.objects.select_for_update().filter(pk=offering.pk).first()
+
+
+def validate_unique_order_values(
+    offering, attributes, keys=None, exclude_resource=None, exclude_order=None
+):
+    """Check the values of a create order against the offering's unique options.
+
+    The order form values are checked against unique order options. The ones
+    that also name a resource option are copied to the resource's options (see
+    copy_order_options_to_resource), so they are checked against unique
+    resource options too. `keys` limits the check to those option names, for
+    callers that change only some values.
+    """
+    attributes = attributes or {}
+    options = (offering.options or {}).get("options")
+    resource_options = (offering.resource_options or {}).get("options") or {}
+    copied = strip_hidden_options(
+        resource_options,
+        {key: attributes[key] for key in resource_options if key in attributes},
+    )
+    if keys is not None:
+        attributes = {key: value for key, value in attributes.items() if key in keys}
+        copied = {key: value for key, value in copied.items() if key in keys}
+    validate_unique_options(
+        offering,
+        options,
+        attributes,
+        "attributes",
+        exclude_resource=exclude_resource,
+        exclude_order=exclude_order,
+    )
+    validate_unique_options(
+        offering,
+        resource_options,
+        copied,
+        "options",
+        exclude_resource=exclude_resource,
+    )
+
+
+def lock_and_validate_unique_options_of_resource(resource):
+    """Reject bringing back a resource whose unique values are taken now.
+
+    A terminated resource frees its values, so by the time it is restored
+    another resource may hold them. Must run inside a transaction that also
+    makes the resource live again, so the lock covers that write.
+    """
+    offering = resource.offering
+    options = (offering.options or {}).get("options")
+    resource_options = (offering.resource_options or {}).get("options")
+    lock_offering_for_unique_options(offering, options, resource_options)
+    validate_unique_options(
+        offering,
+        options,
+        resource.attributes or {},
+        "attributes",
+        exclude_resource=resource,
+    )
+    validate_unique_options(
+        offering,
+        resource_options,
+        resource.options or {},
+        "options",
+        exclude_resource=resource,
+    )
 
 
 def validate_attributes(attributes, category):
@@ -506,11 +1093,16 @@ def create_offering_components(offering, custom_components=None):
         models.OfferingComponent.objects.create(
             offering=offering,
             parent=category_components.get(component_data.type, None),
+            # A component the plugin provides is billed the way the plan says.
+            billed_per_plan=True,
             **component_data._asdict(),
         )
 
     if custom_components:
         for component_data in custom_components:
+            validate_component_precision_is_supported(
+                offering.type, component_data.get("limit_decimal_places")
+            )
             models.OfferingComponent.objects.create(offering=offering, **component_data)
 
 
@@ -549,6 +1141,13 @@ def get_marketplace_offering_name(serializer, scope) -> str | None:
         return
 
 
+def get_marketplace_offering_type(serializer, scope) -> str | None:
+    try:
+        return models.Resource.objects.get(scope=scope).offering.type
+    except ObjectDoesNotExist:
+        return
+
+
 def get_marketplace_category_uuid(serializer, scope) -> str | None:
     try:
         return models.Resource.objects.get(scope=scope).offering.category.uuid.hex
@@ -561,6 +1160,28 @@ def get_marketplace_category_name(serializer, scope) -> str | None:
         return models.Resource.objects.get(scope=scope).offering.category.title
     except ObjectDoesNotExist:
         return
+
+
+def annotate_scope_resource(queryset):
+    """Annotate offerings with the marketplace resource sharing their scope.
+
+    An offering may be scoped to an object which is itself backed by a
+    marketplace resource: for example, per-tenant offerings for creation of
+    instances and volumes are scoped to an OpenStack tenant, and the tenant is
+    the scope of a marketplace resource too. Both models keep the scope in the
+    same (content_type, object_id) pair, so the resource is resolved with a
+    subquery instead of a per-object generic foreign key lookup.
+
+    Offerings without a scope have content_type set to NULL, which never
+    matches a scopeless resource, since NULL is not equal to NULL in SQL.
+    """
+    scope_resources = models.Resource.objects.filter(
+        content_type=OuterRef("content_type"), object_id=OuterRef("object_id")
+    )
+    return queryset.annotate(
+        scope_resource_uuid=Subquery(scope_resources.values("uuid")[:1]),
+        scope_resource_name=Subquery(scope_resources.values("name")[:1]),
+    )
 
 
 def get_marketplace_resource_uuid(serializer, scope) -> str | None:
@@ -588,14 +1209,14 @@ def get_marketplace_resource_state(serializer, scope) -> str | None:
 
 def get_is_usage_based(serializer, scope) -> bool | None:
     try:
-        return models.Resource.objects.get(scope=scope).offering.is_usage_based
+        return models.Resource.objects.get(scope=scope).is_usage_based
     except ObjectDoesNotExist:
         return
 
 
 def get_is_limit_based(serializer, scope) -> bool | None:
     try:
-        return models.Resource.objects.get(scope=scope).offering.is_limit_based
+        return models.Resource.objects.get(scope=scope).is_limit_based
     except ObjectDoesNotExist:
         return
 
@@ -607,6 +1228,9 @@ def add_marketplace_offering(sender, fields, **kwargs):
 
     fields["marketplace_offering_name"] = serializers.SerializerMethodField()
     setattr(sender, "get_marketplace_offering_name", get_marketplace_offering_name)
+
+    fields["marketplace_offering_type"] = serializers.SerializerMethodField()
+    setattr(sender, "get_marketplace_offering_type", get_marketplace_offering_type)
 
     fields["marketplace_offering_plugin_options"] = serializers.SerializerMethodField()
     setattr(
@@ -732,9 +1356,17 @@ def move_resource(resource: models.Resource, project):
         order.project = project
         order.save(update_fields=["project"])
 
+    # The target project now uses the offering's provider. The source project
+    # keeps its group, which goes out of use if this was its last resource.
+    transaction.on_commit(
+        lambda: provider_project_groups.run_safely(
+            provider_project_groups.ensure_group_for_resource, resource
+        )
+    )
+
     for invoice_item in invoice_models.InvoiceItem.objects.filter(
         resource=resource,
-        invoice__state=invoice_models.Invoice.States.PENDING,
+        invoice__state__in=invoice_models.Invoice.States.MUTABLE_STATES,
         project=old_project,
     ):
         start_invoice = invoice_item.invoice
@@ -746,7 +1378,7 @@ def move_resource(resource: models.Resource, project):
             ),
         )
 
-        if target_invoice.state != invoice_models.Invoice.States.PENDING:
+        if target_invoice.state not in invoice_models.Invoice.States.MUTABLE_STATES:
             raise MoveResourceException(
                 "Resource moving is not possible, "
                 "because invoice items moving is not possible."
@@ -794,20 +1426,58 @@ def get_invoice_item_for_component_usage(component_usage: models.ComponentUsage)
 
 
 def serialize_resource_limit_period(
-    start: datetime.datetime, end: datetime.datetime, quantity: int
+    start: datetime.datetime, end: datetime.datetime, quantity: float
 ) -> InvoiceResourceLimitPeriodDict:
     billing_periods = get_full_days(start, end)
+    # quantity stays as passed in — it goes back into a JSONField, where a
+    # Decimal is not encodable. The total is only ever read back as a string,
+    # so compute it in Decimal to keep a fractional quantity out of its binary
+    # expansion: 0.1 * 3 must render as 0.3, not 0.30000000000000004.
+    total = decimal.Decimal(str(quantity)) * billing_periods
     return {
         "start": start.isoformat(),
         "end": end.isoformat(),
         "quantity": quantity,
         "billing_periods": billing_periods,
-        "total": str(quantity * billing_periods),
+        "total": str(total),
     }
 
 
-def terminate_resource(resource, user, termination_comment=None, scheduled=False):
+def _force_approve_pending_terminate_order(pending_order):
+    """Approve a stuck PENDING_CONSUMER terminate order as the system robot.
+
+    Used by the scheduled end-date termination path so a resource past its
+    end date is terminated even if the order's creator lacks APPROVE_ORDER.
+    The order's `created_by` is left untouched — only who reviewed it changes.
+
+    Local import: order_approval.py imports this module (utils) at module
+    scope, and views.py imports both — importing either back here at module
+    level would be circular, so both stay function-local, confined to this
+    one helper.
+    """
+    from waldur_mastermind.marketplace import order_approval
+
+    order_approval.confirm_pending_terminate_order(
+        pending_order, core_utils.get_system_robot()
+    )
+
+
+def terminate_resource(
+    resource, user, termination_comment=None, scheduled=False, order_author=None
+):
+    """Place a termination order for the resource, as `user`.
+
+    `order_author` names somebody else as the person the order is for, leaving
+    `user` as the identity the work is carried out under; see
+    `ConsumerResourceViewSet.create_resource_order`.
+    """
     from waldur_mastermind.marketplace import views
+
+    if scheduled:
+        pending_order = get_pending_consumer_terminate_order(resource)
+        if pending_order:
+            _force_approve_pending_terminate_order(pending_order)
+            return
 
     view = views.ConsumerResourceViewSet.as_view({"post": "terminate"})
 
@@ -832,35 +1502,141 @@ def terminate_resource(resource, user, termination_comment=None, scheduled=False
         )
         return
 
-    return create_request(view, user, {}, uuid=resource.uuid.hex)
+    if models.Order.objects.filter(
+        resource=resource,
+        state=OrderStates.ERRED,
+        type=OrderTypes.TERMINATE,
+        modified__gte=timezone.now() - datetime.timedelta(days=1),
+    ).exists():
+        logger.info(
+            "Skipping terminate for resource %s — recent ERRED terminate order exists.",
+            resource,
+        )
+        return
+
+    response = create_request(
+        view, user, {}, uuid=resource.uuid.hex, order_author=order_author
+    )
+
+    if scheduled and response and response.status_code == status.HTTP_200_OK:
+        # The freshly created order may still be PENDING_CONSUMER if `user`
+        # couldn't get it approved themselves (e.g. no APPROVE_ORDER). Force
+        # it through now rather than waiting for tomorrow's sweep to catch it
+        # via the pending_order branch above.
+        new_pending_order = models.Order.objects.filter(
+            uuid=response.data.get("order_uuid"), state=OrderStates.PENDING_CONSUMER
+        ).first()
+        if new_pending_order:
+            _force_approve_pending_terminate_order(new_pending_order)
+
+    return response
+
+
+def get_creation_order_author(resource):
+    """The person the resource's own creation order was placed for, if it was
+    placed on their behalf.
+
+    An order placed by one of the automated sweeps is nobody's doing, so the
+    only name it can carry is one decided earlier. A creation order placed
+    automatically holds that decision: a call names the author of the orders
+    it places when it grants a resource (`proposal.utils.resolve_order_author`),
+    so carrying the name over keeps the termination ticket on the same desk as
+    the creation one -- without this app having to know that calls exist.
+
+    A creation order somebody placed themselves decided nothing of the kind.
+    It says who ordered the resource, possibly years ago and possibly somebody
+    who has left the project since, and naming them would route the ticket and
+    the order mail to a person the project may no longer include. Those are
+    left to the robot and the project-role fallback, as before.
+
+    Returns None for a resource with no such creation order: one ordered by a
+    person, an imported one, or one reconciled from a backend orphan.
+    """
+    creating_order = (
+        models.Order.objects.filter(
+            resource=resource, type=OrderTypes.CREATE, placed_automatically=True
+        )
+        .select_related("created_by")
+        .order_by("created")
+        .first()
+    )
+    return creating_order.created_by if creating_order else None
 
 
 def schedule_resources_termination(resources, termination_comment=None, user=None):
     if not resources:
         return
 
+    system_robot = core_utils.get_system_robot()
+
     for resource in resources:
-        user = (
-            user
-            or resource.end_date_requested_by
-            or resource.project.end_date_requested_by
-            or core_utils.get_system_robot()
+        # A separate `actor` variable per iteration is required: rebinding
+        # `user` would short-circuit the fallback chain on the next iteration
+        # and attribute every later resource to the first resource's actor.
+        #
+        # Inactive candidates are skipped: the actor authenticates the internal
+        # termination request, and an inactive user is rejected with HTTP 401
+        # "User inactive or deleted.", so the resource would never be
+        # terminated.
+        actor = next(
+            (
+                candidate
+                for candidate in (
+                    user,
+                    resource.end_date_requested_by,
+                    resource.project.end_date_requested_by,
+                )
+                if candidate is not None and candidate.is_active
+            ),
+            None,
         )
 
-        if not user:
-            logger.error(
-                "User for terminating resources of project with due date does not exist."
+        if actor is not None:
+            # Somebody asked for this termination, so the request is made as
+            # them and the order is theirs, as it has always been -- including
+            # being announced to the offering's notification recipients. One
+            # who cannot approve it themselves is still force-approved below.
+            author = actor
+            response = terminate_resource(
+                resource, actor, termination_comment, scheduled=True
             )
-            return
-
-        response = terminate_resource(
-            resource, user, termination_comment, scheduled=True
-        )
+        else:
+            # Nobody asked. A creation order placed on somebody's behalf
+            # carries the name its orders are for -- for a granted resource,
+            # the contact the call named -- and naming them is what keeps the
+            # helpdesk ticket off whoever happens to hold the first project
+            # role. They hold no role on the project in the general case, so
+            # the request is made as the robot and the order is marked
+            # placed_automatically, which keeps provisioning with the robot
+            # from there on. An inactive one can no longer be reached, and a
+            # resource somebody ordered themselves names nobody: both leave an
+            # ordinary robot-placed order, as before.
+            author = get_creation_order_author(resource)
+            if author is None or not author.is_active:
+                author = system_robot
+            response = terminate_resource(
+                resource,
+                system_robot,
+                termination_comment,
+                scheduled=True,
+                order_author=None if author == system_robot else author,
+            )
 
         if response and response.status_code != status.HTTP_200_OK:
+            # Include the HTTP status and resource state so a repeating failure
+            # is diagnosable from the log alone. A 404 here means the terminate
+            # view could not resolve the resource by uuid (e.g. it is already
+            # gone on the backend) — retrying the daily sweep will keep failing
+            # identically until the resource row is reconciled.
             logger.error(
-                "Terminating resource %s has failed. %s",
+                "Terminating resource %s (state=%s, offering=%s, project=%s, "
+                "author=%s) has failed with HTTP %s. %s",
                 resource.uuid.hex,
+                resource.get_state_display(),
+                resource.offering,
+                resource.project,
+                author,
+                response.status_code,
                 response.rendered_content,
             )
 
@@ -900,7 +1676,7 @@ def get_service_provider_user_ids(user, service_provider, customer=None):
     )
     if user.is_authenticated and not user.is_staff and not user.is_support:
         qs = qs.filter(user__is_active=True)
-    return qs.values_list("user_id", flat=True).distinct()
+    return qs.order_by().values_list("user_id", flat=True).distinct()
 
 
 def get_plan_period(resource, date):
@@ -913,6 +1689,64 @@ def get_plan_period(resource, date):
         .order_by("start")
         .last()
     )
+
+
+def get_plan_period_for_billing(resource: models.Resource, date):
+    """Resolve the plan period a usage recorded for the billing month of ``date``
+    should be attached to.
+
+    Site agents report usage dated to the first of the billing month. A resource
+    that became active mid-month has a :class:`ResourcePlanPeriod` starting after
+    that date, so the point-in-time :func:`get_plan_period` lookup misses it and
+    the usage would be stored with ``plan_period=None`` (suppressing billing).
+
+    Resolution order:
+
+    1. Exact point-in-time match at ``date`` (unchanged behaviour).
+    2. Any plan period overlapping the billing month ``[month_start, month_end]``
+       — this catches mid-month resources. The invoice item start is clamped to
+       ``max(plan_period.start, month_start)`` downstream, so a mid-month
+       resource is only charged from when it became active.
+    3. If the resource is billable and active but has *no* plan period at all
+       (e.g. it reached OK without a ``CREATING -> OK`` transition) and this is
+       the current billing month, create one so current usage can be billed.
+       Historical (past-month) backfills are intentionally left unresolved.
+    """
+    plan_period = get_plan_period(resource, date)
+    if plan_period is not None:
+        return plan_period
+
+    month_start = core_utils.month_start(date)
+    month_end = core_utils.month_end(date)
+    plan_period = (
+        models.ResourcePlanPeriod.objects.filter(resource=resource)
+        .filter(Q(start__lte=month_end) | Q(start__isnull=True))
+        .filter(Q(end__gte=month_start) | Q(end__isnull=True))
+        .order_by("start")
+        .last()
+    )
+    if plan_period is not None:
+        return plan_period
+
+    if (
+        resource.plan
+        and resource.state in [ResourceStates.OK, ResourceStates.UPDATING]
+        and month_start == core_utils.month_start(timezone.now())
+        and not models.ResourcePlanPeriod.objects.filter(resource=resource).exists()
+    ):
+        logger.info(
+            "Creating missing Resource Plan Period for resource %s (UUID: %s)",
+            resource.name,
+            resource.uuid.hex,
+        )
+        plan_period = models.ResourcePlanPeriod.objects.create(
+            resource=resource,
+            plan=resource.plan,
+            start=resource.created,
+            end=None,
+        )
+
+    return plan_period
 
 
 def get_or_create_plan_period(resource: models.Resource, date):
@@ -938,15 +1772,99 @@ def get_or_create_plan_period(resource: models.Resource, date):
     return plan_period
 
 
-def import_current_usages(resource):
-    date = datetime.date.today()
+def get_or_create_plan_period_for_historical_backfill(resource: models.Resource, date):
+    """Resolve or create the plan period for a historical billing month.
 
-    for component_type, component_usage in resource.current_usages.items():
-        try:
-            offering_component = models.OfferingComponent.objects.get(
-                offering=resource.offering, type=component_type
+    Mirrors ``get_plan_period_for_billing``'s overlap resolution, but —
+    unlike that function — will also create a missing
+    :class:`ResourcePlanPeriod` for a PAST billing month, not just the
+    current one.
+
+    This is intentionally a separate function, not a relaxed version of
+    ``get_plan_period_for_billing``: ordinary live usage-reporting API calls
+    must keep refusing to retroactively fabricate billing history for a past
+    month. Only an explicit, staff-triggered backfill
+    (the ``rebill_historical_usage`` management command) should ever call
+    this.
+    """
+    plan_period = get_plan_period(resource, date)
+    if plan_period is not None:
+        return plan_period
+
+    month_start = core_utils.month_start(date)
+    month_end = core_utils.month_end(date)
+    plan_period = (
+        models.ResourcePlanPeriod.objects.filter(resource=resource)
+        .filter(Q(start__lte=month_end) | Q(start__isnull=True))
+        .filter(Q(end__gte=month_start) | Q(end__isnull=True))
+        .order_by("start")
+        .last()
+    )
+    if plan_period is not None:
+        return plan_period
+
+    if resource.plan and resource.state in [
+        ResourceStates.OK,
+        ResourceStates.UPDATING,
+    ]:
+        # Bound the fabricated period so it can never overlap an existing
+        # one: cap its end at the next later period's start (if any), and
+        # its start at the previous earlier period's end (if any). Without
+        # this, an open-ended (`end=None`) period created here for a gap
+        # that has OTHER periods on either side would overlap them,
+        # corrupting get_plan_period's point-in-time resolution for dates
+        # outside this historical month too.
+        following_start = (
+            models.ResourcePlanPeriod.objects.filter(
+                resource=resource, start__gte=month_end
             )
-        except models.OfferingComponent.DoesNotExist:
+            .order_by("start")
+            .values_list("start", flat=True)
+            .first()
+        )
+        preceding_end = (
+            models.ResourcePlanPeriod.objects.filter(
+                resource=resource, end__lte=month_start
+            )
+            .order_by("-end")
+            .values_list("end", flat=True)
+            .first()
+        )
+        start = (
+            max(resource.created, preceding_end) if preceding_end else resource.created
+        )
+        logger.warning(
+            "Creating missing historical Resource Plan Period for resource %s "
+            "(UUID: %s) covering %s using its CURRENT plan (%s) -- the plan "
+            "actually active during that historical month could not be "
+            "determined from existing ResourcePlanPeriod records and may "
+            "differ.",
+            resource.name,
+            resource.uuid.hex,
+            month_start,
+            resource.plan,
+        )
+        plan_period = models.ResourcePlanPeriod.objects.create(
+            resource=resource,
+            plan=resource.plan,
+            start=start,
+            end=following_start,
+        )
+
+    return plan_period
+
+
+def import_current_usages(resource, usages=None, hourly_accumulation=False):
+    now = timezone.now()
+    date = now.date()
+    if usages is None:
+        usages = resource.current_usages
+
+    resolved = billing_mode.resolve_for_resource(resource)
+
+    for component_type, component_usage in usages.items():
+        effective = resolved.get(component_type)
+        if effective is None:
             logger.warning(
                 "Skipping current usage synchronization because related "
                 "OfferingComponent does not exist."
@@ -954,36 +1872,889 @@ def import_current_usages(resource):
                 resource.id,
             )
             continue
+        offering_component = effective.component
 
-        plan_period = get_plan_period(resource, date)
+        # Resolve with the datetime: plan periods open and close at the
+        # switch instant, so on the day of a plan switch a date-based
+        # lookup would still land on the previous period.
+        plan_period = get_plan_period_for_billing(resource, now)
+        billing_period = core_utils.month_start(date)
 
+        use_accumulation = (
+            hourly_accumulation and effective.billing_type == BillingTypes.USAGE
+        )
+
+        if use_accumulation:
+            _accumulate_hourly_usage(
+                resource,
+                offering_component,
+                component_usage,
+                plan_period,
+                billing_period,
+                date,
+                now,
+            )
+        else:
+            _update_high_watermark_usage(
+                resource,
+                offering_component,
+                component_usage,
+                plan_period,
+                billing_period,
+                date,
+            )
+
+
+def _get_current_usage_row(resource, offering_component, billing_period, plan_period):
+    """The ComponentUsage row that the current report must update.
+
+    Rows are identified by plan period as well as month: after a plan switch
+    the pre-switch row stays attached to the old period (and is invoiced at
+    that plan's prices) while a fresh row accumulates under the new one.
+    Consecutive periods of the same plan within a month share one row, which
+    the caller re-points to the current period. A legacy row without a plan
+    period is adopted rather than duplicated, and deleted when it duplicates
+    the current period's row. Rows of another plan are never touched.
+
+    A report that resolves to no plan period (a date before any period of
+    the resource) cannot be attributed to a plan, so the month keeps a
+    single row: legacy duplicates are folded into it.
+    """
+    rows = models.ComponentUsage.objects.filter(
+        resource=resource,
+        component=offering_component,
+        billing_period=billing_period,
+    )
+    if plan_period is None:
+        existing = rows.filter(plan_period__isnull=True).first() or rows.first()
+        if existing is not None:
+            rows.exclude(pk=existing.pk).delete()
+        return existing
+    existing = rows.filter(plan_period=plan_period).first()
+    if existing is not None:
+        rows.filter(plan_period__isnull=True).delete()
+        return existing
+    existing = rows.filter(plan_period__plan=plan_period.plan).first()
+    if existing is not None:
+        return existing
+    return rows.filter(plan_period__isnull=True).first()
+
+
+def _update_high_watermark_usage(
+    resource, offering_component, component_usage, plan_period, billing_period, date
+):
+    """Original high-watermark logic: usage = max(new, existing)."""
+    existing = _get_current_usage_row(
+        resource, offering_component, billing_period, plan_period
+    )
+    if existing:
+        existing.plan_period = plan_period
+        existing.usage = max(component_usage, existing.usage)
+        existing.save()
+    else:
+        models.ComponentUsage.objects.create(
+            resource=resource,
+            component=offering_component,
+            billing_period=billing_period,
+            plan_period=plan_period,
+            usage=component_usage,
+            date=date,
+        )
+
+
+def _accumulate_hourly_usage(
+    resource,
+    offering_component,
+    component_usage,
+    plan_period,
+    billing_period,
+    date,
+    now,
+):
+    """Hourly accumulation: usage += current_value × hours_since_last_poll."""
+    # Read last poll time from the persistent poll record
+    poll_record = models.ComponentUsagePollRecord.objects.filter(
+        resource=resource,
+        component=offering_component,
+    ).first()
+
+    if poll_record and poll_record.last_poll_time:
+        elapsed_seconds = (now - poll_record.last_poll_time).total_seconds()
+        elapsed_hours = min(elapsed_seconds / 3600.0, 24.0)
+    else:
+        # First poll for this resource+component — default to 1 hour
+        elapsed_hours = 1.0
+
+    increment = decimal.Decimal(str(component_usage)) * decimal.Decimal(
+        str(elapsed_hours)
+    )
+
+    existing = _get_current_usage_row(
+        resource, offering_component, billing_period, plan_period
+    )
+    if existing:
+        existing.plan_period = plan_period
+        new_total = existing.usage + increment
+        existing.usage = new_total
+        existing.save()
+    else:
+        new_total = increment
+        models.ComponentUsage.objects.create(
+            resource=resource,
+            component=offering_component,
+            billing_period=billing_period,
+            plan_period=plan_period,
+            usage=new_total,
+            date=date,
+        )
+
+    # Upsert the poll record for staff observability and next-poll timestamp
+    models.ComponentUsagePollRecord.objects.update_or_create(
+        resource=resource,
+        component=offering_component,
+        defaults={
+            "last_poll_time": now,
+            "raw_usage": component_usage,
+            "elapsed_hours": decimal.Decimal(str(round(elapsed_hours, 2))),
+            "increment": increment,
+            "accumulated_total": new_total,
+            "billing_period": billing_period,
+        },
+    )
+
+
+def get_current_period_usage(resource, limit_period=None):
+    """Get per-component usage for a resource in the current period.
+
+    Shared between the resource serializer (panel display) and the
+    SLURM policy (QOS enforcement), ensuring both show the same numbers.
+
+    Always queries ComponentUsage records as the source of truth.
+    For each component, the effective period is determined by:
+    1. The ``limit_period`` argument (if provided)
+    2. The component's own ``limit_period`` field
+
+    Args:
+        resource: Marketplace Resource instance
+        limit_period: Override period for all components.
+            If None, each component's own limit_period is used.
+
+    Returns:
+        dict[str, float]: Component type → aggregated usage amount
+    """
+    result = {}
+
+    for effective in billing_mode.resolve_for_resource(resource).components.values():
+        component = effective.component
+        effective_period = limit_period or effective.limit_period
+
+        usages = models.ComponentUsage.objects.filter(
+            resource=resource, component=component
+        )
+
+        if effective_period in (None, LimitPeriods.MONTH):
+            month_start = core_utils.month_start(datetime.date.today())
+            usages = usages.filter(billing_period=month_start)
+        elif effective_period == LimitPeriods.QUARTERLY:
+            quarter_start = core_utils.get_current_quarter_start()
+            quarter_end = core_utils.get_current_quarter_end()
+            usages = usages.filter(
+                billing_period__gte=quarter_start, billing_period__lte=quarter_end
+            )
+        elif effective_period == LimitPeriods.ANNUAL:
+            usages = usages.filter(billing_period__year__gte=datetime.date.today().year)
+        elif effective_period == LimitPeriods.TOTAL:
+            pass  # Sum all usages
+
+        # After a switch between a usage plan and a limit plan the month holds
+        # rows of both semantics (accumulated core-hours next to a peak core
+        # count). Only rows billed the same way as the current plan count.
+        rows = [
+            row
+            for row in usages.select_related("plan_period__plan")
+            if billing_mode.resolve_component(
+                component, row.plan_period.plan if row.plan_period else resource.plan
+            ).billing_type
+            == effective.billing_type
+        ]
+        if effective.billing_type == BillingTypes.USAGE:
+            # Accumulated usage: every row adds up, including the rows of
+            # two plan periods that share one month after a plan switch.
+            total = sum(row.usage for row in rows)
+        else:
+            # High-water mark: one peak per month, then summed over months.
+            peaks = {}
+            for row in rows:
+                peaks[row.billing_period] = max(
+                    peaks.get(row.billing_period, 0), row.usage
+                )
+            total = sum(peaks.values())
+
+        result[component.type] = float(total)
+
+    return result
+
+
+def get_effective_component_limit(resource, component):
+    """The limit reported usage is checked against for a LIMIT component.
+
+    The per-resource limit (``resource.limits[component.type]``, set when the
+    resource is ordered) takes precedence, falling back to the offering
+    component's ``limit_amount``. Returns ``None`` when neither is set. A limit
+    of 0 is treated as unset, matching the previous ``limit_amount`` behaviour.
+    """
+    resource_limit = (resource.limits or {}).get(component.type)
+    if resource_limit:
+        return resource_limit
+    return component.limit_amount or None
+
+
+def is_usage_over_component_limit(resource):
+    """Whether current-period reported usage reaches any limit component's limit.
+
+    Only limit-based components (``billing_type == LIMIT``) are considered, and
+    each is compared against its effective limit — the per-resource limit when
+    set, otherwise the component's ``limit_amount`` (see
+    ``get_effective_component_limit``). Uses ``get_current_period_usage`` so each
+    component is compared over its own ``limit_period`` (month / quarter /
+    annual / total).
+    """
+    period_usage = get_current_period_usage(resource)
+    for effective in billing_mode.resolve_for_resource(resource).components.values():
+        # Only components the resource's plan bills as limits are enforced:
+        # under a usage plan the accumulated core-hours are not a quota.
+        if effective.billing_type != BillingTypes.LIMIT:
+            continue
+        component = effective.component
+        limit = get_effective_component_limit(resource, component)
+        if limit and period_usage.get(component.type, 0) >= limit:
+            return True
+    return False
+
+
+_USAGE_LIMIT_EVENT_TYPES = {
+    ("paused", True): EventType.REQUEST_PAUSING,
+    ("paused", False): EventType.RESET_PAUSING,
+    ("downscaled", True): EventType.REQUEST_DOWNSCALING,
+    ("downscaled", False): EventType.RESET_DOWNSCALING,
+}
+
+
+def _emit_usage_limit_event(resource, flag, applied):
+    if applied:
+        message = (
+            "Resource {resource_name} has been "
+            + ("paused" if flag == "paused" else "downscaled")
+            + " because reported usage reached the component limit."
+        )
+    else:
+        message = (
+            "Resource {resource_name} has been "
+            + ("unpaused" if flag == "paused" else "restored from downscaling")
+            + " because reported usage dropped below the component limit."
+        )
+    event_logger.emit(
+        message,
+        event_type=_USAGE_LIMIT_EVENT_TYPES[(flag, applied)],
+        event_context={"resource": resource},
+        scopes=[resource, resource.project, resource.project.customer],
+    )
+
+
+def evaluate_usage_limit_restriction(resource):
+    """Pause/downscale a resource when reported usage reaches a component limit.
+
+    Enabled per offering via ``plugin_options["action_on_usage_limit"]``
+    (``pause`` or ``downscale``). When the current-period reported usage of any
+    component reaches or exceeds that component's ``limit_amount``, the matching
+    flag (``paused`` or ``downscaled``) is set; when usage falls back below every
+    limit, a restriction previously applied here is lifted. Restrictions applied
+    for other reasons (manual, grace period, budget policy) are never touched —
+    tracked via ``Resource.usage_limit_restriction``.
+    """
+    offering = resource.offering
+    action = offering.plugin_options.get("action_on_usage_limit")
+    if action not in UsageLimitAction.FLAG:
+        return
+    if resource.state in (
+        ResourceStates.TERMINATING,
+        ResourceStates.TERMINATED,
+    ):
+        return
+
+    flag = UsageLimitAction.FLAG[action]
+    over_limit = is_usage_over_component_limit(resource)
+
+    with transaction.atomic():
+        locked = models.Resource.objects.select_for_update().get(pk=resource.pk)
+
+        if over_limit and locked.usage_limit_restriction != flag:
+            update_fields = {flag, "usage_limit_restriction"}
+            stale = locked.usage_limit_restriction
+            if stale and stale != flag:
+                # Offering switched action while a resource carried the old
+                # restriction (e.g. pause -> downscale): clear the old flag.
+                setattr(locked, stale, False)
+                update_fields.add(stale)
+                _emit_usage_limit_event(locked, stale, applied=False)
+            setattr(locked, flag, True)
+            locked.usage_limit_restriction = flag
+            locked.save(update_fields=list(update_fields))
+            _emit_usage_limit_event(locked, flag, applied=True)
+        elif not over_limit and locked.usage_limit_restriction == flag:
+            setattr(locked, flag, False)
+            locked.usage_limit_restriction = ""
+            locked.save(update_fields=[flag, "usage_limit_restriction"])
+            _emit_usage_limit_event(locked, flag, applied=False)
+
+
+def get_components_usage_data(resources, for_current_month=False):
+    """Aggregate per-component usage and limit stats across resources.
+
+    Used by the Customer/Project stats endpoints. All usage data is
+    sourced from ComponentUsage records (not current_usages snapshot).
+
+    Child offerings (OpenStack VM/Volume sub-offerings) are excluded so that
+    VPC-level allocation and individual-VM usage are not double-counted.
+    OpenStack RAM and storage values are stored in MB; they are divided by
+    1024 before returning so the caller always receives GB.
+    """
+    MB_COMPONENT_TYPES = get_mb_component_types()
+
+    # Exclude child offerings (OpenStack VM/Volume) — their component usages
+    # overlap with the parent tenant offering and must not be summed together.
+    resources = resources.filter(offering__parent__isnull=True)
+
+    offerings = models.Offering.objects.filter(
+        id__in=resources.values_list("offering_id", flat=True)
+    ).distinct()
+
+    components = (
+        models.OfferingComponent.objects.filter(offering__in=offerings)
+        .select_related("offering")
+        .distinct()
+    )
+
+    # Key by (component_type, billing_type) to avoid mixing usage and limit
+    # components that share the same type name across different offerings.
+    component_usage = defaultdict(float)
+    component_limit = defaultdict(float)
+    component_limit_usage = defaultdict(float)
+
+    current_date = datetime.date.today()
+
+    for resource in resources:
+        usage_components = resource.offering.components.filter(
+            billing_type=BillingTypes.USAGE
+        )
+        limit_components = resource.offering.components.filter(
+            billing_type=BillingTypes.LIMIT
+        )
+
+        for component_type, limit in resource.limits.items():
+            if limit is None:
+                continue
+            # Assign limit to the correct billing_type bucket
+            if limit_components.filter(type=component_type).exists():
+                key = (component_type, BillingTypes.LIMIT)
+            elif usage_components.filter(type=component_type).exists():
+                key = (component_type, BillingTypes.USAGE)
+            else:
+                key = (component_type, BillingTypes.LIMIT)
+            component_limit[key] += float(limit)
+
+        for component in usage_components:
+            key = (component.type, BillingTypes.USAGE)
+            if for_current_month:
+                usages = models.ComponentUsage.objects.filter(
+                    resource=resource,
+                    component=component,
+                    billing_period__year=current_date.year,
+                    billing_period__month=current_date.month,
+                )
+                total_usage = usages.aggregate(total=Sum("usage"))["total"] or 0
+                component_usage[key] += float(total_usage)
+            else:
+                latest = (
+                    models.ComponentUsage.objects.filter(
+                        resource=resource, component=component
+                    )
+                    .order_by("-billing_period")
+                    .first()
+                )
+                if latest:
+                    component_usage[key] += float(latest.usage)
+
+        limit_override = LimitPeriods.MONTH if for_current_month else None
+        limit_period_usage = get_current_period_usage(
+            resource, limit_period=limit_override
+        )
+        for component in limit_components:
+            key = (component.type, BillingTypes.LIMIT)
+            component_limit_usage[key] += limit_period_usage.get(component.type, 0)
+
+    components_data = {}
+    # Track keys whose values need MB→GB conversion (OpenStack offerings only).
+    # Only marked when the first-writing component belongs to an OpenStack tenant
+    # offering, so a non-OpenStack offering that happens to share the same
+    # (type, billing_type) key is never incorrectly divided by 1024.
+    openstack_mb_keys: set[tuple[str, str]] = set()
+    for component in components:
+        key = (component.type, component.billing_type)
+        if key not in components_data:
+            components_data[key] = {
+                "type": component.type,
+                "name": component.name,
+                "description": component.description,
+                "measured_unit": component.measured_unit,
+                "billing_type": component.billing_type,
+                "usage": component_usage.get(key, 0),
+                "limit_usage": component_limit_usage.get(key, 0),
+                "limit": component_limit.get(key, None),
+                "offering_name": component.offering.name,
+                "offering_uuid": component.offering.uuid.hex,
+            }
+            if (
+                component.offering.type == OPENSTACK_TENANT_OFFERING
+                and component.type in MB_COMPONENT_TYPES
+            ):
+                openstack_mb_keys.add(key)
+
+    # OpenStack persists RAM and storage in MB; convert to GB for the caller.
+    for key in openstack_mb_keys:
+        data = components_data[key]
+        data["usage"] = round(data["usage"] / 1024, 2)
+        data["limit_usage"] = round(data["limit_usage"] / 1024, 2)
+        if data["limit"] is not None:
+            data["limit"] = round(data["limit"] / 1024, 2)
+        if data["measured_unit"] == "MB":
+            data["measured_unit"] = "GB"
+
+    return list(components_data.values())
+
+
+def _resolve_period_bounds(limit_period, today=None, period_offset=0):
+    """Return (start_date, end_date, label) for the given limit period.
+
+    `start`/`end` are inclusive `date` objects suitable for filtering
+    `ComponentUsage.billing_period` (which is always the first day of the
+    month). `TOTAL` returns (None, None, "Total") to mean "no time bound".
+
+    `period_offset` shifts the window backward by N periods — 0 is the
+    current period, -1 the previous, etc. TOTAL ignores the offset since
+    there is no concept of a "previous lifetime".
+    """
+    today = today or datetime.date.today()
+
+    if limit_period == LimitPeriods.QUARTERLY:
+        # Build the current quarter from today, then rewind by `offset` quarters.
+        current_q = (today.month - 1) // 3 + 1
+        target_q = current_q + period_offset
+        target_year = today.year
+        # Normalize quarter into [1, 4], rolling year as needed.
+        while target_q < 1:
+            target_q += 4
+            target_year -= 1
+        while target_q > 4:
+            target_q -= 4
+            target_year += 1
+        start_month = (target_q - 1) * 3 + 1
+        start = datetime.date(target_year, start_month, 1)
+        end_month = start_month + 2
+        last_day = calendar.monthrange(target_year, end_month)[1]
+        end = datetime.date(target_year, end_month, last_day)
+        return start, end, f"Q{target_q} {target_year}"
+
+    if limit_period == LimitPeriods.ANNUAL:
+        target_year = today.year + period_offset
+        return (
+            datetime.date(target_year, 1, 1),
+            datetime.date(target_year, 12, 31),
+            str(target_year),
+        )
+
+    if limit_period == LimitPeriods.TOTAL:
+        return None, None, "Total"
+
+    # MONTH or unspecified — shift the month back by `offset` months.
+    target_year = today.year
+    target_month = today.month + period_offset
+    while target_month < 1:
+        target_month += 12
+        target_year -= 1
+    while target_month > 12:
+        target_month -= 12
+        target_year += 1
+    start = datetime.date(target_year, target_month, 1)
+    label = start.strftime("%b %Y")
+    return start, start, label
+
+
+def get_components_usage_data_per_offering(resources):
+    """Aggregate per-component usage and limit stats per offering.
+
+    One row per (offering, component_type, billing_type). Each row's
+    `usage` / `limit_usage` is computed using the offering's own
+    `limit_period` — quarterly offerings report quarter-to-date,
+    yearly report year-to-date, total report lifetime, monthly report
+    current month. The current period bounds are returned alongside
+    each row so callers can render period-correct labels.
+
+    Child offerings (OpenStack VM/Volume sub-offerings) are excluded to
+    prevent double-counting with the parent tenant offering.
+    OpenStack RAM and storage values are stored in MB; they are divided
+    by 1024 before returning so the caller always receives GB.
+    """
+    today = datetime.date.today()
+    MB_COMPONENT_TYPES = get_mb_component_types()
+
+    # Exclude child offerings (OpenStack VM/Volume) — same rationale as
+    # get_components_usage_data: VPC-level and VM-level usages must not be summed.
+    resources = resources.filter(offering__parent__isnull=True)
+
+    resources_by_offering = defaultdict(list)
+    for resource in resources:
+        resources_by_offering[resource.offering_id].append(resource)
+
+    if not resources_by_offering:
+        return []
+
+    components = (
+        models.OfferingComponent.objects.filter(
+            offering_id__in=list(resources_by_offering.keys())
+        )
+        .select_related("offering")
+        .distinct()
+    )
+
+    rows = []
+    for component in components:
+        offering = component.offering
+        offering_resources = resources_by_offering.get(offering.id, [])
+        if not offering_resources:
+            continue
+
+        period_start, period_end, period_label = _resolve_period_bounds(
+            component.limit_period or LimitPeriods.MONTH, today
+        )
+
+        usage_qs = models.ComponentUsage.objects.filter(
+            resource__in=offering_resources, component=component
+        )
+        if period_start is not None:
+            usage_qs = usage_qs.filter(billing_period__gte=period_start)
+        if period_end is not None:
+            usage_qs = usage_qs.filter(billing_period__lte=period_end)
+        period_usage = float(usage_qs.aggregate(total=Sum("usage"))["total"] or 0)
+
+        # Sum resource.limits[component.type] across the offering's resources.
+        # Track presence so we emit None when no limit is set anywhere.
+        total_limit = 0.0
+        any_limit = False
+        for resource in offering_resources:
+            limit_val = (resource.limits or {}).get(component.type)
+            if limit_val is None:
+                continue
+            try:
+                total_limit += float(limit_val)
+                any_limit = True
+            except (TypeError, ValueError):
+                continue
+
+        if component.billing_type == BillingTypes.USAGE:
+            usage = period_usage
+            limit_usage = 0.0
+        elif component.billing_type == BillingTypes.LIMIT:
+            usage = 0.0
+            limit_usage = period_usage
+        else:
+            usage = 0.0
+            limit_usage = 0.0
+
+        # OpenStack persists RAM and storage in MB; convert to GB for the caller.
+        measured_unit = component.measured_unit
+        limit_value = total_limit if any_limit else None
+        if (
+            offering.type == OPENSTACK_TENANT_OFFERING
+            and component.type in MB_COMPONENT_TYPES
+        ):
+            usage = round(usage / 1024, 2)
+            limit_usage = round(limit_usage / 1024, 2)
+            if limit_value is not None:
+                limit_value = round(limit_value / 1024, 2)
+            if measured_unit == "MB":
+                measured_unit = "GB"
+
+        rows.append(
+            {
+                "type": component.type,
+                "name": component.name,
+                "description": component.description,
+                "measured_unit": measured_unit,
+                "billing_type": component.billing_type,
+                "usage": usage,
+                "limit_usage": limit_usage,
+                "limit": limit_value,
+                "offering_name": offering.name,
+                "offering_uuid": offering.uuid.hex,
+                "limit_period": component.limit_period,
+                "current_period_label": period_label,
+                "current_period_start": period_start,
+                "current_period_end": period_end,
+            }
+        )
+
+    return rows
+
+
+def _select_offering_component(offering, component_type=None):
+    """Pick the component the chart should track.
+
+    LIMIT-billed components are preferred since they're the ones a cap is
+    meaningful against. If `component_type` is given, narrow to that type
+    first. Returns None if the offering has no matching component.
+    """
+    components = list(offering.components.all())
+    if component_type:
+        components = [c for c in components if c.type == component_type]
+    if not components:
+        return None
+    return next(
+        (c for c in components if c.billing_type == BillingTypes.LIMIT),
+        components[0],
+    )
+
+
+def _sum_offering_limits(resources, component_type):
+    """Sum per-resource limits for one component type across the queryset.
+
+    Returns the float total, or None if no resource declared a limit for
+    that component type (so the caller can render "no cap" rather than 0).
+    """
+    total = 0.0
+    any_limit = False
+    for resource in resources:
+        limit_val = (resource.limits or {}).get(component_type)
+        if limit_val is None:
+            continue
         try:
-            component_usage_object = models.ComponentUsage.objects.get(
-                resource=resource,
-                component=offering_component,
-                billing_period=core_utils.month_start(date),
-                plan_period=plan_period,
-            )
-            component_usage_object.usage = max(
-                component_usage, component_usage_object.usage
-            )
-            component_usage_object.save()
-        except models.ComponentUsage.DoesNotExist:
-            models.ComponentUsage.objects.create(
-                resource=resource,
-                component=offering_component,
-                usage=component_usage,
-                date=date,
-                billing_period=core_utils.month_start(date),
-                plan_period=plan_period,
-            )
+            total += float(limit_val)
+            any_limit = True
+        except (TypeError, ValueError):
+            continue
+    return total if any_limit else None
+
+
+def _offering_usage_envelope(
+    offering, component, period_start, period_end, period_label, today, limit
+):
+    """Common metadata block shared by the timeseries and by-project payloads."""
+    return {
+        "offering_uuid": offering.uuid.hex,
+        "offering_name": offering.name,
+        "type": component.type,
+        "name": component.name,
+        "measured_unit": component.measured_unit,
+        "billing_type": component.billing_type,
+        "limit_period": component.limit_period,
+        "limit": limit,
+        "current_period_label": period_label,
+        "current_period_start": period_start,
+        "current_period_end": period_end,
+        "today": today,
+    }
+
+
+def get_offering_usage_timeseries(
+    resources, offering, component_type=None, period_offset=0
+):
+    """Return monthly usage buckets for an offering's component.
+
+    `resources` should already be scoped to a customer/project and to
+    the given offering. Buckets cover the component's current
+    `limit_period` (quarter / year / lifetime / current month) and are
+    keyed by `ComponentUsage.billing_period` (always month-start).
+
+    When `component_type` is given, that type is selected; otherwise
+    the offering's first LIMIT-billed component is preferred (it is
+    the one whose cap the chart is most useful against), falling back
+    to the first defined component.
+
+    `period_offset` shifts the window backward by N periods so callers
+    can request a prior quarter / year / month.
+    """
+    today = datetime.date.today()
+
+    component = _select_offering_component(offering, component_type)
+    if component is None:
+        return None
+
+    effective_period = component.limit_period or LimitPeriods.MONTH
+
+    if effective_period == LimitPeriods.MONTH:
+        # A monthly cap resets every month, so cumulating across months
+        # has no meaning. Widen the window to a rolling 6 months ending
+        # at today's month so the chart shows a usable trend.
+        end = datetime.date(
+            today.year, today.month, calendar.monthrange(today.year, today.month)[1]
+        )
+        start_month = today.month - 5
+        start_year = today.year
+        while start_month < 1:
+            start_month += 12
+            start_year -= 1
+        period_start = datetime.date(start_year, start_month, 1)
+        period_end = end
+        period_label = "Last 6 months"
+    else:
+        period_start, period_end, period_label = _resolve_period_bounds(
+            effective_period, today, period_offset
+        )
+
+    usage_qs = models.ComponentUsage.objects.filter(
+        resource__in=resources, component=component
+    )
+    if period_start is not None:
+        usage_qs = usage_qs.filter(billing_period__gte=period_start)
+    if period_end is not None:
+        usage_qs = usage_qs.filter(billing_period__lte=period_end)
+
+    bucketed = (
+        usage_qs.values("billing_period")
+        .annotate(total=Sum("usage"))
+        .order_by("billing_period")
+    )
+    buckets = [
+        {"billing_period": b["billing_period"], "usage": float(b["total"] or 0)}
+        for b in bucketed
+    ]
+
+    return {
+        **_offering_usage_envelope(
+            offering,
+            component,
+            period_start,
+            period_end,
+            period_label,
+            today,
+            _sum_offering_limits(resources, component.type),
+        ),
+        "buckets": buckets,
+    }
+
+
+def get_offering_usage_by_project(
+    resources, offering, component_type=None, period_offset=0
+):
+    """Return per-project usage breakdown for an offering's component.
+
+    Same period semantics as `get_offering_usage_timeseries`. Each project
+    that has at least one resource of the offering gets an entry with its
+    in-period total `usage` and a `buckets` list of monthly contributions.
+    Projects are ordered by `usage` descending so the caller can paginate
+    or top-N from the front. `period_offset` shifts the window backward
+    by N periods (same semantics as the timeseries endpoint).
+    """
+    today = datetime.date.today()
+
+    component = _select_offering_component(offering, component_type)
+    if component is None:
+        return None
+
+    period_start, period_end, period_label = _resolve_period_bounds(
+        component.limit_period or LimitPeriods.MONTH, today, period_offset
+    )
+
+    usage_qs = models.ComponentUsage.objects.filter(
+        resource__in=resources, component=component
+    ).select_related("resource__project")
+    if period_start is not None:
+        usage_qs = usage_qs.filter(billing_period__gte=period_start)
+    if period_end is not None:
+        usage_qs = usage_qs.filter(billing_period__lte=period_end)
+
+    by_project: dict[int, dict] = {}
+    total_usage = 0.0
+    for cu in usage_qs:
+        project = cu.resource.project
+        usage_val = float(cu.usage or 0)
+        total_usage += usage_val
+        entry = by_project.setdefault(
+            project.id,
+            {
+                "project_uuid": project.uuid.hex,
+                "project_name": project.name,
+                "usage": 0.0,
+                "_buckets": defaultdict(float),
+            },
+        )
+        entry["usage"] += usage_val
+        entry["_buckets"][cu.billing_period] += usage_val
+
+    projects = []
+    for entry in by_project.values():
+        bucket_dict = entry.pop("_buckets")
+        entry["buckets"] = [
+            {"billing_period": k, "usage": v} for k, v in sorted(bucket_dict.items())
+        ]
+        projects.append(entry)
+    projects.sort(key=lambda p: p["usage"], reverse=True)
+
+    return {
+        **_offering_usage_envelope(
+            offering,
+            component,
+            period_start,
+            period_end,
+            period_label,
+            today,
+            _sum_offering_limits(resources, component.type),
+        ),
+        "total_usage": total_usage,
+        "projects": projects,
+    }
 
 
 def format_limits_list(components_map, limits):
-    return ", ".join(
-        f"{components_map[key].name or components_map[key].type}: {value}"
-        for key, value in limits.items()
-    )
+    def format_label(key):
+        component = components_map.get(key)
+        if component is None:
+            return key
+        return component.name or component.type
+
+    return ", ".join(f"{format_label(key)}: {value}" for key, value in limits.items())
+
+
+def format_order_attributes(order) -> list[tuple[str, str]]:
+    """
+    Label/value pairs of the order attributes, labelled as in the offering form.
+
+    Attributes declared secret by the plugin are left out.
+    """
+    options = (order.offering.options or {}).get("options") or {}
+    result = []
+    for key, value in order.safe_attributes.items():
+        option = options.get(key) or {}
+        result.append((option.get("label") or key, value))
+    return result
+
+
+def format_order_limits(order) -> list[tuple[str, str]]:
+    """Label/value pairs of the order limits, with the measured unit appended."""
+    components_map = order.offering.get_limit_components(order.plan)
+    result = []
+    for key, value in (order.limits or {}).items():
+        component = components_map.get(key)
+        if component is None:
+            result.append((key, str(value)))
+            continue
+        result.append(
+            (
+                component.name or component.type,
+                f"{value} {component.measured_unit}".strip(),
+            )
+        )
+    return result
 
 
 def get_resource_users(resource):
@@ -992,37 +2763,6 @@ def get_resource_users(resource):
     return core_models.User.objects.filter(
         id__in=project_user_ids.union(customer_user_ids)
     )
-
-
-def generate_uidnumber_and_primary_group(offering):
-    initial_uidnumber = int(offering.plugin_options.get("initial_uidnumber", 5000))
-    initial_primarygroup_number = int(
-        offering.plugin_options.get("initial_primarygroup_number", 5000)
-    )
-
-    offering_user_last_uidnumber = (
-        models.OfferingUser.objects.exclude(backend_metadata=None)
-        .filter(backend_metadata__has_key="uidnumber")
-        .order_by("backend_metadata__uidnumber")
-        .values_list("backend_metadata__uidnumber", flat=True)
-        .last()
-    ) or initial_uidnumber
-
-    robot_account_last_uidnumber = (
-        models.RobotAccount.objects.exclude(backend_metadata=None)
-        .filter(backend_metadata__has_key="uidnumber")
-        .order_by("backend_metadata__uidnumber")
-        .values_list("backend_metadata__uidnumber", flat=True)
-        .last()
-    ) or initial_uidnumber
-
-    last_uidnumber = max([offering_user_last_uidnumber, robot_account_last_uidnumber])
-
-    offset = last_uidnumber - initial_uidnumber + 1
-    uidnumber = initial_uidnumber + offset
-    primarygroup = initial_primarygroup_number + offset
-
-    return uidnumber, primarygroup
 
 
 def count_customers_number_change(service_provider):
@@ -1121,21 +2861,90 @@ def generate_offering_password_hash(offering: models.Offering):
 def setup_linux_related_data(
     instance: models.OfferingUser | models.RobotAccount, offering
 ):
-    uidnumber = instance.backend_metadata.get("uidnumber")
-    primarygroup = instance.backend_metadata.get("primarygroup")
+    if not offering.plugin_options.get("enable_posix_account", True):
+        # Username-only offering: do not manage a POSIX/LDAP account.
+        return
 
-    if not uidnumber or not primarygroup:
-        uidnumber, primarygroup = generate_uidnumber_and_primary_group(offering)
-
-        instance.backend_metadata["uidnumber"] = uidnumber
-        instance.backend_metadata["primarygroup"] = primarygroup
+    # Fill the UID and the primary GID independently. Each is filled only when it
+    # is actually missing, so a value already present in backend_metadata
+    # (including a manual override) is never overwritten by filling the other.
+    # A value is sourced either from the offering's pool (default) or, when the
+    # offering's uid_source/gid_source is 'user_attribute', from the Waldur user's
+    # uid_number/primary_gid (e.g. populated from an OIDC claim).
+    plugin_options = offering.plugin_options or {}
+    sources = {
+        posix_ids.UID: plugin_options.get("uid_source", "pool"),
+        posix_ids.GID: plugin_options.get("gid_source", "pool"),
+    }
+    # Only OfferingUser is tied to a Waldur user; robot accounts always use the pool.
+    user = getattr(instance, "user", None)
+    for key, namespace, label, user_attr in (
+        ("uidnumber", posix_ids.UID, "UID", "uid_number"),
+        ("primarygroup", posix_ids.GID, "primary GID", "primary_gid"),
+    ):
+        if instance.backend_metadata.get(key):
+            continue
+        if sources[namespace] == "user_attribute":
+            value = getattr(user, user_attr, None) if user is not None else None
+            if value is None:
+                logger.warning(
+                    "%s source is the user attribute for offering %s, but %s %s "
+                    "has no %s; left without a %s.",
+                    label,
+                    offering,
+                    instance.__class__.__name__,
+                    instance.pk,
+                    user_attr,
+                    label,
+                )
+                continue
+            instance.backend_metadata[key] = value
+            continue
+        value = posix_ids.allocate(offering, namespace, instance)
+        if value is None:
+            # No POSIX ID pool covers this offering for this namespace — skip the
+            # assignment. The account keeps its homedir/shell but stays out of
+            # GLAuth for this identifier until a provider defines a pool.
+            logger.warning(
+                "No POSIX ID pool configured for offering %s; %s %s left without a %s.",
+                offering,
+                instance.__class__.__name__,
+                instance.pk,
+                label,
+            )
+            continue
+        instance.backend_metadata[key] = value
 
     login_shell = instance.backend_metadata.get("loginShell")
     if not login_shell:
-        instance.backend_metadata["loginShell"] = "/bin/bash"
+        instance.backend_metadata["loginShell"] = offering.resolve_account_setting(
+            "login_shell", "/bin/bash"
+        )
 
-    homedir_prefix = offering.plugin_options.get("homedir_prefix", "/home/")
-    instance.backend_metadata["homeDir"] = f"{homedir_prefix}{instance.username}"
+    if instance.username:
+        # Derived from the username, so it is only meaningful once one exists —
+        # an account materialised before its username is known keeps no homeDir
+        # rather than a "/home/None" placeholder.
+        homedir_prefix = offering.resolve_account_setting("homedir_prefix", "/home/")
+        instance.backend_metadata["homeDir"] = f"{homedir_prefix}{instance.username}"
+
+
+def offering_owns_pricing(offering: models.Offering) -> bool:
+    """Whether plans and prices belong to this offering rather than to its parent.
+
+    A child offering is an implementation detail of its parent — the OpenStack
+    per-tenant Instance and Volume offerings are the case in point: they carry no
+    components of their own, and both ordering and the API resolve the parent's
+    plans anyway. Plans, prices, quotas and discounts have nothing to act on
+    there, so the surfaces that manage them are refused rather than silently
+    ignored.
+
+    Being non-billable is a separate matter and deliberately not covered here: a
+    top-level offering that is not invoiced still needs a plan of its own, since
+    activation requires one (see offering_has_plans) and there is no parent to
+    inherit it from.
+    """
+    return offering.parent_id is None
 
 
 def get_plans_available_for_user(
@@ -1161,79 +2970,197 @@ def get_plans_available_for_user(
             | Q(organization_groups__in=get_organization_groups(user))
         )
 
-    return qs
+    return _with_plan_serialization_hints(qs)
 
 
-def generate_glauth_records_for_offering_users(offering, offering_users):
-    user_records = []
+def _with_plan_serialization_hints(qs):
+    """Preload what BasePlanSerializer reads for every plan.
 
-    for offering_user in offering_users:
+    Six of its method fields iterate ``plan.components.all()`` and dereference
+    ``component``, and ``get_resources_count`` counts resources per plan, so
+    without this the cost grows with plans x components.
+
+    This belongs on the plan queryset rather than on the offering queryset:
+    callers reach plans through this helper, which applies its own
+    ``.filter()`` for organization groups, and a filter discards any prefetch
+    cache built further up.
+    """
+    resources_count = (
+        models.Resource.objects.filter(plan=OuterRef("pk"))
+        .order_by()
+        .values("plan")
+        .annotate(total=Count("*"))
+        .values("total")
+    )
+    return qs.prefetch_related(
+        Prefetch(
+            "components",
+            queryset=models.PlanComponent.objects.select_related("component"),
+        ),
+        "organization_groups",
+    ).annotate(
+        # Subquery yields NULL when a plan has no resources; the .count() this
+        # replaces yielded 0.
+        resources_count=Coalesce(Subquery(resources_count), 0),
+    )
+
+
+def generate_glauth_records_for_offering_users(
+    offering, offering_users, extra_user_gids=None
+):
+    """
+    Generate GLauth config records for offering users.
+
+    ``extra_user_gids`` (optional): mapping of ``user_id -> set[int gids]``
+    of role-aware group gids to merge into each user's ``otherGroups``
+    on top of the project-mapped ones derived here. See
+    ``build_glauth_tree`` for the source.
+
+    This function is optimized to minimize database queries by:
+    - Expecting offering_users to have user and sshpublickey_set prefetched
+    - Batch querying user-to-project mappings
+    - Batch querying project-to-group-gid mappings
+    - Batch querying users with active resources
+    """
+    extra_user_gids = extra_user_gids or {}
+    # Convert to list to allow multiple iterations
+    offering_users_list = list(offering_users)
+    if not offering_users_list:
+        return {"users": [], "groups": []}
+
+    # Collect all user IDs for batch queries
+    user_ids = [ou.user_id for ou in offering_users_list]
+
+    # Batch query: user_id -> list of project_ids
+    project_content_type = ContentType.objects.get_for_model(structure_models.Project)
+    user_project_mappings = defaultdict(set)
+    for user_role in UserRole.objects.filter(
+        is_active=True,
+        user_id__in=user_ids,
+        content_type=project_content_type,
+    ).values("user_id", "object_id"):
+        user_project_mappings[user_role["user_id"]].add(user_role["object_id"])
+
+    # Collect all project IDs that any user has access to
+    all_project_ids = set()
+    for project_ids in user_project_mappings.values():
+        all_project_ids.update(project_ids)
+
+    # Batch query: project_id -> list of gids from OfferingUserGroup
+    project_gid_mappings = defaultdict(set)
+    if all_project_ids:
+        for group in models.OfferingUserGroup.objects.filter(
+            projects__id__in=all_project_ids
+        ).prefetch_related("projects"):
+            gid = group.backend_metadata.get("gid")
+            if gid is not None:
+                for project in group.projects.all():
+                    if project.id in all_project_ids:
+                        project_gid_mappings[project.id].add(str(gid))
+
+    # Batch query: users with active (non-terminated) resources in this offering
+    users_with_active_resources = set(
+        models.Resource.objects.filter(
+            offering=offering,
+            project_id__in=all_project_ids,
+        )
+        .exclude(state=ResourceStates.TERMINATED)
+        .values_list("project_id", flat=True)
+    )
+    # Map user_id -> has_active_resource
+    users_with_access = set()
+    for user_id, project_ids in user_project_mappings.items():
+        if project_ids & users_with_active_resources:
+            users_with_access.add(user_id)
+
+    password_sha256 = generate_offering_password_hash(offering)
+    users = []
+    groups = []
+
+    for offering_user in offering_users_list:
         user = offering_user.user
         username = offering_user.username
-        if "uidnumber" not in offering_user.backend_metadata:
+        # Never emit an LDAP record for an account without a username
+        # (covers both "" and NULL). The queryset already excludes these,
+        # but guard here too so a blank can never render an empty-name entry.
+        if not username:
             logger.warning(
-                "OfferingUser %s does not have uidnumber in backend_metadata, skipping generation of glauth record",
+                "OfferingUser %s has no username, skipping generation of glauth record",
                 offering_user,
             )
             continue
+        metadata = offering_user.backend_metadata or {}
+        # A complete POSIX account needs all four attributes. A partial set (e.g.
+        # a UID assigned by an override while a primary GID is still missing)
+        # must be skipped rather than crash the whole sync with a KeyError.
+        required = ("uidnumber", "primarygroup", "loginShell", "homeDir")
+        if not all(key in metadata for key in required):
+            logger.warning(
+                "OfferingUser %s is missing POSIX attributes %s, skipping "
+                "generation of glauth record",
+                offering_user,
+                [key for key in required if key not in metadata],
+            )
+            continue
 
-        uidnumber = offering_user.backend_metadata["uidnumber"]
-        primarygroup = offering_user.backend_metadata["primarygroup"]
-        login_shell = offering_user.backend_metadata["loginShell"]
-        home_dir = offering_user.backend_metadata["homeDir"]
+        uidnumber = metadata["uidnumber"]
+        primarygroup = metadata["primarygroup"]
+        login_shell = metadata["loginShell"]
+        home_dir = metadata["homeDir"]
 
-        ssh_keys = [
-            f'"{ssh_key.public_key}"' for ssh_key in user.sshpublickey_set.all()
-        ]
-        ssh_keys_line = ",\n    ".join(ssh_keys)
+        # Use pre-computed user-to-project-to-gid mapping
+        user_project_ids = user_project_mappings.get(user.id, set())
+        group_ids = set()
+        for project_id in user_project_ids:
+            group_ids.update(project_gid_mappings.get(project_id, set()))
+        # Merge in role-aware gids supplied by build_glauth_tree.
+        for gid in extra_user_gids.get(user.id, ()):
+            group_ids.add(str(gid))
+        other_groups = sorted([int(gid) for gid in group_ids])
 
-        password_sha256 = generate_offering_password_hash(offering)
+        # Use pre-computed access check
+        user_disabled_status = user.id not in users_with_access
 
-        user_projects = get_connected_projects(user)
+        custom_attributes = {
+            "preferredUsername": [username],
+        }
+        if offering.plugin_options.get("emit_display_name"):
+            custom_attributes["displayName"] = [user.get_full_name()]
+        if offering.plugin_options.get("emit_waldur_username"):
+            custom_attributes["waldurUsername"] = [user.username]
 
-        group_ids = models.OfferingUserGroup.objects.filter(
-            projects__in=user_projects
-        ).values_list("backend_metadata__gid", flat=True)
-        group_ids = [str(gid) for gid in group_ids]
+        user_dict = {
+            # Use the offering-scoped username as the GLAuth account name (LDAP
+            # cn), matching robot accounts, the personal-group name, homeDir and
+            # the JSON tree view. It is the unique, POSIX-facing login identity;
+            # the Waldur username is not unique across offering users and cannot
+            # be used as a login name (GLAuth cannot filter on custom
+            # attributes, so preferredUsername is unusable as an NSS key). The
+            # human identity stays available via givenname/sn/mail and the
+            # optional waldurUsername attribute.
+            "name": username,
+            "givenname": user.first_name,
+            "sn": user.last_name,
+            "mail": user.email,
+            "uidnumber": int(uidnumber),
+            "primarygroup": int(primarygroup),
+            "otherGroups": other_groups,
+            "sshkeys": [ssh_key.public_key for ssh_key in user.sshpublickey_set.all()],
+            "loginShell": login_shell,
+            "homeDir": home_dir,
+            "passsha256": password_sha256,
+            "disabled": user_disabled_status,
+            "customattributes": custom_attributes,
+        }
 
-        other_groups = ", ".join(group_ids)
+        group_dict = {
+            "name": username,
+            "gidnumber": int(primarygroup),
+        }
+        users.append(user_dict)
+        groups.append(group_dict)
 
-        user_disabled_status = "false"
-        # Check if user has access to non-terminated resources in offering
-        has_access = is_user_related_to_offering(offering, user)
-        if not has_access:
-            user_disabled_status = "true"
-
-        record = textwrap.dedent(
-            f"""
-        [[users]]
-          name = "{user.get_username()}"
-          givenname="{user.first_name}"
-          sn="{user.last_name}"
-          mail = "{user.email}"
-          uidnumber = {uidnumber}
-          primarygroup = {primarygroup}
-          otherGroups = [{other_groups}]
-          sshkeys = [{ssh_keys_line}]
-          loginShell = "{login_shell}"
-          homeDir = "{home_dir}"
-          passsha256 = "{password_sha256}"
-          disabled = {user_disabled_status}
-            [[users.customattributes]]
-            preferredUsername = ["{username}"]
-        """
-        )
-
-        record += textwrap.dedent(
-            f"""
-        [[groups]]
-          name = "{username}"
-          gidnumber = {primarygroup}
-        """
-        )
-        user_records.append(record)
-
-    return user_records
+    return {"users": users, "groups": groups}
 
 
 def generate_glauth_records_for_robot_accounts(offering, robot_accounts):
@@ -1244,44 +3171,1095 @@ def generate_glauth_records_for_robot_accounts(offering, robot_accounts):
     ]
     robot_accounts = robot_accounts.filter(state__in=valid_states)
 
-    robot_account_records = []
+    users = []
+    groups = []
     for robot_account in robot_accounts:
-        ssh_keys = robot_account.keys
-        ssh_keys_line = ",\n    ".join(ssh_keys)
-
         username = robot_account.username
-        uidnumber = robot_account.backend_metadata["uidnumber"]
-        primarygroup = robot_account.backend_metadata["primarygroup"]
-        login_shell = robot_account.backend_metadata["loginShell"]
-        home_dir = robot_account.backend_metadata["homeDir"]
+        # Skip accounts without a username — an empty name yields a broken
+        # LDAP record.
+        if not username:
+            logger.warning(
+                "RobotAccount %s has no username, skipping generation of glauth record",
+                robot_account,
+            )
+            continue
+
+        metadata = robot_account.backend_metadata or {}
+        # Skip robot accounts without a full POSIX attribute set (e.g. created
+        # before any range was configured) rather than crash the whole sync.
+        required = ("uidnumber", "primarygroup", "loginShell", "homeDir")
+        if not all(key in metadata for key in required):
+            logger.warning(
+                "RobotAccount %s is missing POSIX attributes %s, skipping "
+                "generation of glauth record",
+                robot_account,
+                [key for key in required if key not in metadata],
+            )
+            continue
+
+        uidnumber = metadata["uidnumber"]
+        primarygroup = metadata["primarygroup"]
+        login_shell = metadata["loginShell"]
+        home_dir = metadata["homeDir"]
         password_sha256 = generate_offering_password_hash(offering)
 
-        record = textwrap.dedent(
-            f"""
-        [[users]]
-          name = "{username}"
-          uidnumber = {uidnumber}
-          primarygroup = {primarygroup}
-          sshkeys = ["{ssh_keys_line}"]
-          loginShell = "{login_shell}"
-          homeDir = "{home_dir}"
-          passsha256 = "{password_sha256}"
-            [[users.customattributes]]
-            preferredUsername = ["{username}"]
-        """
+        user_dict = {
+            "name": username,
+            "uidnumber": int(uidnumber),
+            "primarygroup": int(primarygroup),
+            "sshkeys": list(robot_account.keys),
+            "loginShell": login_shell,
+            "homeDir": home_dir,
+            "passsha256": password_sha256,
+            "customattributes": {
+                "preferredUsername": [username],
+            },
+        }
+
+        group_dict = {
+            "name": username,
+            "gidnumber": int(primarygroup),
+        }
+
+        users.append(user_dict)
+        groups.append(group_dict)
+
+    return {"users": users, "groups": groups}
+
+
+# --------------------------------------------------------------------------
+# Role-aware glauth groups + structured tree builder
+# --------------------------------------------------------------------------
+
+
+def _render_role_group_name(template_str, **variables):
+    """Render an LDAP/glauth group name from a string.Template.
+
+    Missing variables substitute to the empty string (``safe_substitute``)
+    so an operator's template that mentions ``${project_name}`` still
+    renders when the scope is a Resource and not a ResourceProject.
+    """
+    return Template(template_str).safe_substitute(**variables)
+
+
+def _ensure_role_group(offering, scope, role):
+    """Get-or-create an OfferingRoleGroup row, allocating a gid if new.
+
+    Returns the row. Safe under concurrent role assignments — the
+    offering row is locked while we allocate. When no role-group-gid range
+    is configured the row is created without a gid (and stays out of
+    GLAuth) until a provider defines one.
+    """
+    with transaction.atomic():
+        models.Offering.objects.select_for_update().get(pk=offering.pk)
+        ct = ContentType.objects.get_for_model(scope.__class__)
+        rg, created = models.OfferingRoleGroup.objects.get_or_create(
+            offering=offering,
+            content_type=ct,
+            object_id=scope.pk,
+            role=role,
+        )
+        if created or "gid" not in (rg.backend_metadata or {}):
+            gid = posix_ids.allocate(offering, posix_ids.GID, rg)
+            if gid is not None:
+                rg.backend_metadata = {**(rg.backend_metadata or {}), "gid": gid}
+                rg.save(update_fields=["backend_metadata"])
+            else:
+                logger.warning(
+                    "No POSIX ID pool configured for offering %s; role group "
+                    "%s left without a gid.",
+                    offering,
+                    rg.pk,
+                )
+        return rg
+
+
+def _glauth_scope_dict(scope):
+    """Serialise a Resource / ResourceProject scope for the JSON tree."""
+    if isinstance(scope, models.Resource):
+        return {
+            "type": "resource",
+            "uuid": scope.uuid.hex,
+            "name": scope.name,
+            "slug": scope.slug or "",
+            "resource_uuid": None,
+        }
+    if isinstance(scope, models.ResourceProject):
+        return {
+            "type": "resource_project",
+            "uuid": scope.uuid.hex,
+            "name": scope.name,
+            "slug": None,
+            "resource_uuid": scope.resource.uuid.hex,
+        }
+    raise TypeError(f"Unsupported glauth scope: {type(scope)!r}")
+
+
+def _compute_role_groups(offering, *, resource_filter=None):
+    """Walk Resources + ResourceProjects + UserRoles and emit role groups.
+
+    ``resource_filter``: ``None`` for offering-wide, or a ``Resource``
+    instance to restrict the walk to one resource + its RPs.
+
+    Returns a list of dicts: ``{gid, name, kind, scope, role,
+    member_user_ids}`` where ``scope`` is the dict from
+    ``_glauth_scope_dict``. The set of emitted groups depends on
+    ``plugin_options['resource_role_map']`` and
+    ``plugin_options['resource_project_role_map']`` — roles outside
+    the maps are skipped (mirrors MR 433's translator).
+    """
+    plugin_options = offering.plugin_options or {}
+    resource_role_map = plugin_options.get("resource_role_map") or {}
+    rp_role_map = plugin_options.get("resource_project_role_map") or {}
+    if not resource_role_map and not rp_role_map:
+        return []
+
+    resource_template = plugin_options.get(
+        "resource_role_group_template", "${resource_slug}_${role_name}"
+    )
+    rp_template = plugin_options.get(
+        "resource_project_role_group_template",
+        "${resource_slug}_${rp_uuid_short}_${role_name}",
+    )
+
+    if resource_filter is not None:
+        resources_qs = models.Resource.objects.filter(pk=resource_filter.pk)
+    else:
+        resources_qs = models.Resource.objects.filter(offering=offering).exclude(
+            state=ResourceStates.TERMINATED
+        )
+    resources_qs = resources_qs.select_related("project", "project__customer")
+    resources = list(resources_qs)
+    if not resources:
+        return []
+
+    resource_ct = ContentType.objects.get_for_model(models.Resource)
+    rp_ct = ContentType.objects.get_for_model(models.ResourceProject)
+
+    rps_by_resource = defaultdict(list)
+    if rp_role_map:
+        rp_qs = models.ResourceProject.available_objects.filter(
+            resource__in=resources
+        ).select_related("resource")
+        for rp in rp_qs:
+            rps_by_resource[rp.resource_id].append(rp)
+
+    # Batch-fetch UserRoles for all scopes in two queries (one per ct).
+    resource_user_roles = defaultdict(list)
+    if resource_role_map:
+        resource_ids = [r.pk for r in resources]
+        for ur in UserRole.objects.filter(
+            is_active=True,
+            content_type=resource_ct,
+            object_id__in=resource_ids,
+            role__is_system_role=False,
+        ).select_related("user", "role"):
+            resource_user_roles[ur.object_id].append(ur)
+
+    rp_user_roles = defaultdict(list)
+    if rp_role_map:
+        all_rp_ids = [rp.pk for rps in rps_by_resource.values() for rp in rps]
+        if all_rp_ids:
+            for ur in UserRole.objects.filter(
+                is_active=True,
+                content_type=rp_ct,
+                object_id__in=all_rp_ids,
+                role__is_system_role=False,
+            ).select_related("user", "role"):
+                rp_user_roles[ur.object_id].append(ur)
+
+    out = []
+    for resource in resources:
+        resource_slug = resource.slug or ""
+        customer = resource.project.customer if resource.project else None
+        customer_slug = customer.slug if customer else ""
+        project_slug = resource.project.slug if resource.project else ""
+
+        if resource_role_map:
+            out.extend(
+                _emit_groups_for_scope(
+                    offering=offering,
+                    scope=resource,
+                    user_roles=resource_user_roles.get(resource.pk, []),
+                    role_map=resource_role_map,
+                    template_str=resource_template,
+                    template_vars=dict(
+                        resource_slug=resource_slug,
+                        customer_slug=customer_slug,
+                        project_slug=project_slug,
+                    ),
+                    kind="resource_role",
+                )
+            )
+
+        if rp_role_map:
+            for rp in rps_by_resource.get(resource.pk, []):
+                rp_uuid = rp.uuid.hex
+                out.extend(
+                    _emit_groups_for_scope(
+                        offering=offering,
+                        scope=rp,
+                        user_roles=rp_user_roles.get(rp.pk, []),
+                        role_map=rp_role_map,
+                        template_str=rp_template,
+                        template_vars=dict(
+                            resource_slug=resource_slug,
+                            customer_slug=customer_slug,
+                            project_slug=project_slug,
+                            rp_uuid=rp_uuid,
+                            rp_uuid_short=rp_uuid[:8],
+                            project_name=rp.name or "",
+                        ),
+                        kind="resource_project_role",
+                    )
+                )
+
+    return out
+
+
+def _emit_groups_for_scope(
+    *, offering, scope, user_roles, role_map, template_str, template_vars, kind
+):
+    """Group UserRoles by role, render group name, ensure persistence."""
+    by_role = defaultdict(list)
+    for ur in user_roles:
+        if ur.role.name not in role_map:
+            continue
+        by_role[ur.role].append(ur)
+
+    emitted = []
+    for role, urs in by_role.items():
+        member_user_ids = {ur.user_id for ur in urs}
+        member_usernames = sorted({ur.user.username for ur in urs if ur.user.username})
+        if not member_user_ids:
+            continue
+        rg = _ensure_role_group(offering, scope, role)
+        gid = int(rg.backend_metadata["gid"])
+        name = _render_role_group_name(
+            template_str, role_name=role_map[role.name], **template_vars
+        )
+        emitted.append(
+            {
+                "gid": gid,
+                "name": name,
+                "kind": kind,
+                "scope": _glauth_scope_dict(scope),
+                "role": role.name,
+                "member_user_ids": member_user_ids,
+                "members": member_usernames,
+            }
+        )
+    return emitted
+
+
+def get_project_posix_groups(project):
+    """Return every POSIX group GID assigned to a project, across all offerings.
+
+    A project accumulates GIDs through two independent mechanisms:
+
+    - **project_group** (``project_group_gid``): one per offering whose
+      ``OfferingUserGroup`` covers the project;
+    - **role_group** (``role_group_gid``): one per resource / resource-project
+      role group whose scope belongs to the project.
+
+    Returns a flat list of dicts (one per assigned GID) for a read-only
+    project-side rollup.
+    """
+    rows = []
+
+    project_groups = (
+        models.OfferingUserGroup.objects.filter(projects=project)
+        .select_related("offering", "offering__customer")
+        .prefetch_related("projects")
+    )
+    for group in project_groups:
+        gid = (group.backend_metadata or {}).get("gid")
+        if gid is None:
+            continue
+        rows.append(
+            {
+                "kind": "project_group",
+                "gid": int(gid),
+                "offering_uuid": group.offering.uuid.hex,
+                "offering_name": group.offering.name,
+                "provider_name": group.offering.customer.name,
+                "role": None,
+                "scope_type": None,
+                "scope_name": None,
+                "scope_uuid": None,
+            }
         )
 
-        record += textwrap.dedent(
-            f"""
-        [[groups]]
-          name = "{username}"
-          gidnumber = {primarygroup}
-        """
+    resource_ct = ContentType.objects.get_for_model(models.Resource)
+    rp_ct = ContentType.objects.get_for_model(models.ResourceProject)
+    resource_ids = list(
+        models.Resource.objects.filter(project=project).values_list("id", flat=True)
+    )
+    rp_ids = list(
+        models.ResourceProject.objects.filter(resource__project=project).values_list(
+            "id", flat=True
+        )
+    )
+    role_groups = (
+        models.OfferingRoleGroup.objects.filter(
+            Q(content_type=resource_ct, object_id__in=resource_ids)
+            | Q(content_type=rp_ct, object_id__in=rp_ids)
+        )
+        .select_related("offering", "offering__customer", "role")
+        .prefetch_related("scope")
+    )
+    for role_group in role_groups:
+        gid = (role_group.backend_metadata or {}).get("gid")
+        if gid is None:
+            continue
+        scope = role_group.scope
+        rows.append(
+            {
+                "kind": "role_group",
+                "gid": int(gid),
+                "offering_uuid": role_group.offering.uuid.hex,
+                "offering_name": role_group.offering.name,
+                "provider_name": role_group.offering.customer.name,
+                "role": role_group.role.name,
+                "scope_type": (
+                    "resource"
+                    if role_group.content_type_id == resource_ct.id
+                    else "resource_project"
+                ),
+                "scope_name": getattr(scope, "name", "") or "",
+                "scope_uuid": scope.uuid.hex if scope is not None else None,
+            }
         )
 
-        robot_account_records.append(record)
+    rows.extend(_provider_project_group_rows(project))
+    rows.sort(key=lambda r: (r["offering_name"] or "", r["kind"], r["gid"] or 0))
+    return rows
 
-    return robot_account_records
+
+def _provider_project_group_rows(project):
+    """The project's groups at every service provider, one row each."""
+    groups = list(
+        provider_project_groups.annotate_in_use(
+            models.ServiceProviderProjectGroup.objects.filter(project=project)
+        ).select_related("service_provider__customer")
+    )
+    details = provider_project_groups.describe(groups)
+    rows = []
+    for group in groups:
+        members = details[group.pk]["members"]
+        rows.append(
+            {
+                "kind": "provider_project_group",
+                "gid": group.gid,
+                "offering_uuid": None,
+                "offering_name": None,
+                "provider_name": group.service_provider.customer.name,
+                "role": None,
+                "scope_type": None,
+                "scope_name": None,
+                "scope_uuid": None,
+                "group_uuid": group.uuid.hex,
+                "group_name": group.name,
+                "service_provider_uuid": group.service_provider.uuid.hex,
+                "in_use": group.in_use,
+                "offerings": details[group.pk]["offerings"],
+                "members": members,
+                "member_count": len(members),
+            }
+        )
+    return rows
+
+
+def get_offering_user_posix_groups(offering_user, viewer=None):
+    """Return the project group GIDs an offering user belongs to.
+
+    A user is a member of a project group when they have a role on one of the
+    group's projects. Returns one row per matching project group GID — the
+    shared GIDs that appear in the user's GLAuth ``otherGroups``.
+
+    Each row carries the owning organization and a ``project_accessible`` flag
+    saying whether ``viewer`` (the requesting user) may open the project — used
+    to decide whether to render the project as a link. With no ``viewer`` the
+    flag stays ``False``.
+    """
+    offering = offering_user.offering
+    project_ids = list(get_connected_projects(offering_user.user))
+    if not project_ids:
+        return []
+
+    viewer_sees_all = bool(viewer and (viewer.is_staff or viewer.is_support))
+    if viewer and not viewer_sees_all:
+        viewer_project_ids = set(get_connected_projects(viewer))
+        viewer_customer_ids = set(get_connected_customers(viewer))
+    else:
+        viewer_project_ids = viewer_customer_ids = set()
+
+    groups = list(
+        models.OfferingUserGroup.objects.filter(
+            offering=offering, projects__id__in=project_ids
+        )
+        .prefetch_related("projects__customer")
+        .distinct()
+    )
+
+    # Map each group to the pool its GID was allocated from (if any), so the row
+    # can show pool provenance like the per-user UID/GID table does. Scoped to
+    # the offering's currently resolved pool: a group may legally hold an active
+    # identity in more than one pool (the active-consumer constraint is per
+    # pool), and an unscoped lookup would keep whichever row came last.
+    group_ct = ContentType.objects.get_for_model(models.OfferingUserGroup)
+    resolved_pool = models.PosixIdPool.resolve(offering)
+    group_identities = models.PosixIdentity.objects.filter(
+        content_type=group_ct,
+        object_id__in=[group.id for group in groups],
+        released_at__isnull=True,
+    ).select_related("pool")
+    if resolved_pool is not None:
+        group_identities = group_identities.filter(pool=resolved_pool)
+    group_pools = {identity.object_id: identity.pool for identity in group_identities}
+
+    rows = []
+    for group in groups:
+        gid = (group.backend_metadata or {}).get("gid")
+        if gid is None:
+            continue
+        project = next((p for p in group.projects.all() if p.id in project_ids), None)
+        customer = project.customer if project else None
+        if project is None:
+            accessible = False
+        elif viewer_sees_all:
+            accessible = True
+        else:
+            accessible = (
+                project.id in viewer_project_ids
+                or project.customer_id in viewer_customer_ids
+            )
+        pool = group_pools.get(group.id)
+        rows.append(
+            {
+                "kind": "project_group",
+                "group_name": None,
+                "service_provider_name": None,
+                "gid": int(gid),
+                "offering_name": offering.name,
+                "project_name": project.name if project else "",
+                "project_uuid": project.uuid.hex if project else None,
+                "customer_name": customer.name if customer else None,
+                "customer_uuid": customer.uuid.hex if customer else None,
+                "project_accessible": accessible,
+                "pool_uuid": pool.uuid.hex if pool else None,
+                "pool_scope": pool.scope if pool else None,
+            }
+        )
+    rows.extend(
+        _offering_user_provider_group_rows(
+            offering_user,
+            project_ids,
+            viewer_sees_all,
+            viewer_project_ids,
+            viewer_customer_ids,
+        )
+    )
+    rows.sort(key=lambda r: r["gid"])
+    return rows
+
+
+def _offering_user_provider_group_rows(
+    offering_user, project_ids, viewer_sees_all, viewer_project_ids, viewer_customer_ids
+):
+    """Provider project groups at the offering's provider listing this account."""
+    provider = offering_user.offering.service_provider
+    if provider is None or not offering_user.username:
+        return []
+    groups = list(
+        models.ServiceProviderProjectGroup.objects.filter(
+            service_provider=provider, project_id__in=project_ids, gid__isnull=False
+        ).select_related("project__customer", "service_provider__customer")
+    )
+    details = provider_project_groups.describe(groups)
+    pool = posix_ids.provider_pool(provider)
+    rows = []
+    for group in groups:
+        if offering_user.username not in details[group.pk]["members"]:
+            continue
+        project = group.project
+        rows.append(
+            {
+                "kind": "provider_project_group",
+                "group_name": group.name,
+                "service_provider_name": provider.customer.name,
+                "gid": group.gid,
+                "offering_name": offering_user.offering.name,
+                "project_name": project.name,
+                "project_uuid": project.uuid.hex,
+                "customer_name": project.customer.name,
+                "customer_uuid": project.customer.uuid.hex,
+                "project_accessible": viewer_sees_all
+                or project.id in viewer_project_ids
+                or project.customer_id in viewer_customer_ids,
+                "pool_uuid": pool.uuid.hex if pool else None,
+                "pool_scope": pool.scope if pool else None,
+            }
+        )
+    return rows
+
+
+# Distinguishes "the caller did not resolve a pool" from "the caller resolved
+# this offering to no pool at all".
+_UNSET = object()
+
+
+def _posix_pool_scope_name(pool) -> str | None:
+    if pool is None:
+        return None
+    if pool.offering_id:
+        return pool.offering.name
+    if pool.service_provider_id:
+        return pool.service_provider.customer.name
+    return None
+
+
+def get_offerings_sharing_pool(user, pool, exclude_offering_id=None):
+    """Offerings of ``user`` whose accounts resolve to ``pool``.
+
+    A user identity is shared, so this is the set of accounts that carry the same
+    UID and primary GID. Ordered by name for a stable report.
+
+    Accounts soft-deleted into ``OfferingUserStates.DELETED`` are included on
+    purpose: release is tied to actual row deletion, so such an account is
+    exactly why the value is still reserved, and hiding it would leave the
+    reservation unexplained.
+    """
+    if user is None or pool is None:
+        return []
+    offerings = []
+    for offering_user in models.OfferingUser.objects.filter(user=user).select_related(
+        "offering"
+    ):
+        offering = offering_user.offering
+        if offering.id == exclude_offering_id:
+            continue
+        if not posix_ids.pool_sourced_namespaces(offering):
+            continue
+        resolved = models.PosixIdPool.resolve(offering)
+        if resolved is not None and resolved.pk == pool.pk:
+            offerings.append({"uuid": offering.uuid.hex, "name": offering.name})
+    offerings.sort(key=lambda item: item["name"])
+    return offerings
+
+
+def get_offering_user_posix_allocations(
+    offering_user, resolved_pool=_UNSET, shared_offerings=None
+):
+    """Return the offering user's POSIX identifiers and their originating pool.
+
+    One row per identifier (UID, primary GID) present in ``backend_metadata``.
+    The row carries the pool that tracks the value and its scope, plus the other
+    offerings of the same user that share it — the value belongs to the user
+    within the pool, not to this single account. ``pool_uuid`` is ``None`` when
+    the value is not tracked by a pool (e.g. seeded manually).
+
+    ``resolved_pool`` and ``shared_offerings`` let a caller that already walked
+    the user's accounts pass what it knows, instead of making this function walk
+    them again per account. ``resolved_pool=None`` is a real answer — "this
+    offering resolves to no pool" — and is honoured; omitting it resolves here.
+    """
+    metadata = offering_user.backend_metadata or {}
+    identifiers = [
+        (posix_ids.UID, metadata.get("uidnumber")),
+        (posix_ids.GID, metadata.get("primarygroup")),
+    ]
+
+    pool = (
+        models.PosixIdPool.resolve(offering_user.offering)
+        if resolved_pool is _UNSET
+        else resolved_pool
+    )
+    identity = None
+    if pool is not None:
+        identity = (
+            models.PosixIdentity.objects.filter(
+                pool=pool,
+                released_at__isnull=True,
+                **posix_ids.principal_filter(offering_user),
+            )
+            .select_related("pool__offering", "pool__service_provider__customer")
+            .first()
+        )
+    pool = identity.pool if identity else None
+    if shared_offerings is not None:
+        shared_with = [
+            offering
+            for offering in shared_offerings
+            if offering["uuid"] != offering_user.offering.uuid.hex
+        ]
+    else:
+        shared_with = get_offerings_sharing_pool(
+            offering_user.user, pool, exclude_offering_id=offering_user.offering_id
+        )
+
+    rows = []
+    for namespace, value in identifiers:
+        if value is None:
+            continue
+        tracked = identity is not None and getattr(identity, namespace) == int(value)
+        rows.append(
+            {
+                "namespace": namespace,
+                "value": int(value),
+                "pool_uuid": pool.uuid.hex if (tracked and pool) else None,
+                "scope": pool.scope if (tracked and pool) else None,
+                "scope_name": _posix_pool_scope_name(pool) if tracked else None,
+                "shared_with_offerings": shared_with if tracked else [],
+            }
+        )
+    return rows
+
+
+def get_user_posix_identities(offering_users, viewer=None):
+    """Consolidate a user's POSIX identities across all their offering accounts.
+
+    One row per ``(pool, namespace, value)`` — personal UID / primary GID and
+    each project group GID — carrying the offerings that use it. A user's UID is
+    allocated once per pool, so the accounts on every offering of a provider that
+    has no override pool collapse into a single row. An offering with its own
+    pool resolves elsewhere and therefore appears as a separate row.
+
+    Values not tracked by any pool cannot be proven to be the same allocation, so
+    they are never merged across offerings.
+    """
+    offering_users = list(offering_users)
+    # Resolve each offering's pool once, then derive the sharing sets from that
+    # single pass: resolving per identifier per account would make the endpoint
+    # quadratic in the number of the user's accounts.
+    pool_by_offering = {}
+    for offering_user in offering_users:
+        offering = offering_user.offering
+        if offering.id in pool_by_offering:
+            continue
+        pool_by_offering[offering.id] = (
+            models.PosixIdPool.resolve(offering)
+            if posix_ids.pool_sourced_namespaces(offering)
+            else None
+        )
+    sharing = defaultdict(list)
+    for offering_user in offering_users:
+        offering = offering_user.offering
+        pool = pool_by_offering[offering.id]
+        if pool is None:
+            continue
+        entry = {"uuid": offering.uuid.hex, "name": offering.name}
+        if entry not in sharing[pool.pk]:
+            sharing[pool.pk].append(entry)
+    for entries in sharing.values():
+        entries.sort(key=lambda item: item["name"])
+
+    rows = {}
+    order = []
+
+    def add(key, namespace, value, context, pool_uuid, scope, offering):
+        row = rows.get(key)
+        if row is None:
+            row = {
+                "namespace": namespace,
+                "value": value,
+                "context": context,
+                "pool_uuid": pool_uuid,
+                "pool_scope": scope,
+                "offerings": [],
+            }
+            rows[key] = row
+            order.append(key)
+        if all(item["uuid"] != offering.uuid.hex for item in row["offerings"]):
+            row["offerings"].append({"uuid": offering.uuid.hex, "name": offering.name})
+
+    for offering_user in offering_users:
+        offering = offering_user.offering
+        pool = pool_by_offering[offering.id]
+        allocations = get_offering_user_posix_allocations(
+            offering_user,
+            resolved_pool=pool,
+            shared_offerings=sharing[pool.pk] if pool is not None else [],
+        )
+        for allocation in allocations:
+            pool_uuid = allocation["pool_uuid"]
+            key = (
+                pool_uuid or f"untracked:{offering.uuid.hex}",
+                allocation["namespace"],
+                allocation["value"],
+                None,
+            )
+            add(
+                key,
+                allocation["namespace"],
+                allocation["value"],
+                None,
+                pool_uuid,
+                allocation["scope"],
+                offering,
+            )
+        for group in get_offering_user_posix_groups(offering_user, viewer=viewer):
+            pool_uuid = group["pool_uuid"]
+            key = (
+                pool_uuid or f"untracked:{offering.uuid.hex}",
+                posix_ids.GID,
+                group["gid"],
+                group["project_uuid"],
+            )
+            add(
+                key,
+                posix_ids.GID,
+                group["gid"],
+                group["project_name"],
+                pool_uuid,
+                group["pool_scope"],
+                offering,
+            )
+
+    for row in rows.values():
+        row["offerings"].sort(key=lambda item: item["name"])
+        # Deprecated compatibility projection: the endpoint used to return one
+        # row per offering. Keeping the singular fields populated from the first
+        # sharing offering makes the SDK bump additive, so a client that has not
+        # migrated to `offerings` yet keeps rendering a name instead of a blank.
+        first = row["offerings"][0] if row["offerings"] else None
+        row["offering_name"] = first["name"] if first else None
+        row["offering_uuid"] = first["uuid"] if first else None
+    return [rows[key] for key in order]
+
+
+def build_glauth_tree(offering, *, resource_filter=None):
+    """Build the structured glauth view for an offering (or one resource).
+
+    Single source of truth shared by the TOML emitters and the JSON
+    ``glauth_tree`` endpoints.
+
+    ``resource_filter``: ``None`` for offering-wide; or a ``Resource``
+    instance to scope users to ``resource.project`` and groups to one
+    resource and its ResourceProjects.
+    """
+    # Offering users: queryset same as the existing endpoints. Exclude
+    # accounts without a username — both "" and NULL, since the field is
+    # nullable and ``.exclude(username="")`` alone does not drop NULL.
+    # When ToS enforcement is on, also drop users without active consent so
+    # LDAP export does not disclose PII after revoke / without consent.
+    offering_users_qs = (
+        models.OfferingUser.objects.filter(offering=offering)
+        .exclude(username="")
+        .exclude(username__isnull=True)
+        .select_related("user")
+        .prefetch_related("user__sshpublickey_set")
+    )
+    offering_users_qs = filter_offering_users_queryset_by_consent(
+        offering_users_qs, offering=offering
+    )
+    if resource_filter is not None:
+        # Mirror Resource.glauth_users_config which scopes to project users.
+        user_ids = get_project_users(resource_filter.project_id)
+        offering_users_qs = offering_users_qs.filter(user__id__in=user_ids)
+
+    offering_users = list(offering_users_qs)
+
+    # Project-mapped (existing) groups.
+    project_groups = []
+    project_user_membership = defaultdict(set)
+    user_project_mappings = _user_project_mappings(
+        [ou.user_id for ou in offering_users]
+    )
+    project_groups_qs = models.OfferingUserGroup.objects.filter(
+        offering=offering
+    ).prefetch_related("projects")
+    for oug in project_groups_qs:
+        gid = (oug.backend_metadata or {}).get("gid")
+        if gid is None:
+            continue
+        projects = list(oug.projects.all())
+        if resource_filter is not None and not any(
+            p.id == resource_filter.project_id for p in projects
+        ):
+            continue
+        scope_project = projects[0] if projects else None
+        member_user_ids = set()
+        for uid, pids in user_project_mappings.items():
+            if any(p.id in pids for p in projects):
+                member_user_ids.add(uid)
+                project_user_membership[uid].add(int(gid))
+        member_usernames = sorted(
+            {ou.user.username for ou in offering_users if ou.user_id in member_user_ids}
+        )
+        project_groups.append(
+            {
+                "gid": int(gid),
+                "name": str(gid),
+                "kind": "project",
+                "scope": {
+                    "type": "project",
+                    "uuid": scope_project.uuid.hex if scope_project else "",
+                    "name": scope_project.name if scope_project else "",
+                    "slug": getattr(scope_project, "slug", "") or "",
+                    "resource_uuid": None,
+                },
+                "role": None,
+                "members": member_usernames,
+            }
+        )
+
+    # The provider's project groups, for projects with a live resource here.
+    provider_groups, provider_user_membership = _provider_project_groups_for_offering(
+        offering, offering_users, user_project_mappings, resource_filter
+    )
+
+    # Role-aware groups.
+    role_groups_raw = _compute_role_groups(offering, resource_filter=resource_filter)
+
+    # Stitch user -> gids and order groups deterministically.
+    role_user_membership = defaultdict(set)
+    role_groups = []
+    for g in sorted(
+        role_groups_raw,
+        key=lambda g: (g["scope"]["type"], g["scope"]["uuid"], g["role"] or ""),
+    ):
+        for uid in g["member_user_ids"]:
+            role_user_membership[uid].add(g["gid"])
+        # The internal _emit_groups_for_scope dict carries member_user_ids;
+        # strip it before exposing.
+        role_groups.append({k: v for k, v in g.items() if k != "member_user_ids"})
+
+    # Users with membership rollup.
+    users_with_active_resources = _users_with_active_resources(offering, offering_users)
+    users = []
+    # Per-user personal groups: the TOML emitter writes one ``[[groups]]`` block
+    # per user (name = username, gid = primarygroup), and glauth serves these as
+    # posixGroup entries. Surface them in the tree too so the JSON view matches
+    # what an ``ldapsearch`` actually returns rather than silently dropping the
+    # per-user groups. They are folded into each user's ``gidNumber`` in the UI,
+    # so they carry no ``memberships`` rollup.
+    personal_groups = []
+    for ou in offering_users:
+        if not ou.username:
+            continue
+        meta = ou.backend_metadata or {}
+        memberships = []
+        for g in project_groups:
+            if g["gid"] in project_user_membership.get(ou.user_id, ()):
+                memberships.append(
+                    {
+                        "gid": g["gid"],
+                        "group_name": g["name"],
+                        "kind": g["kind"],
+                        "role": g["role"],
+                    }
+                )
+        for g in provider_groups:
+            if g["gid"] in provider_user_membership.get(ou.user_id, ()):
+                memberships.append(
+                    {
+                        "gid": g["gid"],
+                        "group_name": g["name"],
+                        "kind": g["kind"],
+                        "role": g["role"],
+                    }
+                )
+        for g in role_groups:
+            if g["gid"] in role_user_membership.get(ou.user_id, ()):
+                memberships.append(
+                    {
+                        "gid": g["gid"],
+                        "group_name": g["name"],
+                        "kind": g["kind"],
+                        "role": g["role"],
+                    }
+                )
+        users.append(
+            {
+                "username": ou.username,
+                "uidnumber": meta.get("uidnumber"),
+                "disabled": ou.user_id not in users_with_active_resources,
+                "personal_group": meta.get("primarygroup"),
+                "mail": ou.user.email or "",
+                "givenname": ou.user.first_name or "",
+                "sn": ou.user.last_name or "",
+                "login_shell": meta.get("loginShell") or "",
+                "home_dir": meta.get("homeDir") or "",
+                "ssh_keys": [k.public_key for k in ou.user.sshpublickey_set.all()],
+                "memberships": memberships,
+            }
+        )
+
+        primarygroup = meta.get("primarygroup")
+        if primarygroup is not None:
+            personal_groups.append(
+                {
+                    "gid": int(primarygroup),
+                    "name": ou.username,
+                    "kind": "personal",
+                    "scope": {
+                        "type": "user",
+                        "uuid": ou.user.uuid.hex,
+                        "name": ou.username,
+                        "slug": "",
+                        "resource_uuid": None,
+                    },
+                    "role": None,
+                    "members": [ou.username],
+                }
+            )
+
+    # Robot accounts (no group memberships in current model — surfaced flat).
+    robot_qs = models.RobotAccount.objects.filter(resource__offering=offering).filter(
+        state__in=[RobotAccountStates.OK, RobotAccountStates.REQUESTED_DELETION]
+    )
+    if resource_filter is not None:
+        robot_qs = robot_qs.filter(resource=resource_filter)
+    robot_accounts = [
+        {
+            "username": ra.username,
+            "uidnumber": (ra.backend_metadata or {}).get("uidnumber"),
+            "personal_group": (ra.backend_metadata or {}).get("primarygroup"),
+            "login_shell": (ra.backend_metadata or {}).get("loginShell") or "",
+            "home_dir": (ra.backend_metadata or {}).get("homeDir") or "",
+            "ssh_keys": list(ra.keys) if ra.keys else [],
+        }
+        for ra in robot_qs
+    ]
+
+    extra_gids = defaultdict(set)
+    for membership in (role_user_membership, provider_user_membership):
+        for uid, gids in membership.items():
+            extra_gids[uid] |= gids
+
+    return {
+        "offering": {
+            "uuid": offering.uuid.hex,
+            "name": offering.name,
+            "slug": offering.slug or "",
+        },
+        "groups": project_groups + provider_groups + role_groups + personal_groups,
+        "users": users,
+        "robot_accounts": robot_accounts,
+        # Internal: pre-computed user_id -> set[gid] for the TOML emitter's
+        # otherGroups, provider project groups included. Stripped before
+        # serialisation by the view layer.
+        "_user_role_gids": {uid: gids for uid, gids in extra_gids.items() if gids},
+        # Materialised list (not queryset) — keeps prefetch cache hot and
+        # avoids a second SQL round-trip when the TOML emitter iterates.
+        "_offering_users": offering_users,
+    }
+
+
+def _provider_project_groups_for_offering(
+    offering, offering_users, user_project_mappings, resource_filter=None
+):
+    """The provider's project groups rendered into an offering's directory.
+
+    A group appears while its project uses the offering. Its members are the
+    offering's accounts of the group's members as the provider listing defines
+    them (active users, unexpired roles, live unrestricted accounts). A group
+    whose name is also an account's personal group name is left out and
+    logged: one NSS name cannot stand for two groups. Returns the groups and
+    ``user_id -> set[gid]``.
+    """
+    groups = []
+    membership = defaultdict(set)
+    provider = offering.service_provider
+    if provider is None or not provider_project_groups.offering_qualifies(offering):
+        return groups, membership
+    resources = provider_project_groups.active_resources().filter(offering=offering)
+    if resource_filter is not None:
+        resources = resources.filter(project_id=resource_filter.project_id)
+    queryset = (
+        models.ServiceProviderProjectGroup.objects.filter(
+            service_provider=provider,
+            gid__isnull=False,
+            project_id__in=resources.values("project_id"),
+        )
+        .select_related("project", "service_provider")
+        .order_by("name", "id")
+    )
+    group_list = list(queryset)
+    if not group_list:
+        return groups, membership
+    details = provider_project_groups.describe(group_list)
+
+    # project_id -> offering accounts, built once rather than per group.
+    accounts_by_project = defaultdict(list)
+    for offering_user in offering_users:
+        for project_id in user_project_mappings.get(offering_user.user_id, ()):
+            accounts_by_project[project_id].append(offering_user)
+    personal_names = {ou.username for ou in offering_users if ou.username}
+    personal_names |= set(
+        models.RobotAccount.objects.filter(resource__offering=offering).values_list(
+            "username", flat=True
+        )
+    )
+
+    for group in group_list:
+        if group.name in personal_names:
+            logger.warning(
+                "Provider project group %s (GID %s) is not rendered for offering "
+                "%s: an account of the same name has a personal group.",
+                group.name,
+                group.gid,
+                offering.uuid.hex,
+            )
+            continue
+        allowed = set(details[group.pk]["members"])
+        members = [
+            ou
+            for ou in accounts_by_project.get(group.project_id, ())
+            if ou.username in allowed
+        ]
+        for ou in members:
+            membership[ou.user_id].add(int(group.gid))
+        groups.append(
+            {
+                "gid": int(group.gid),
+                "name": group.name,
+                "kind": "provider_project",
+                "scope": {
+                    "type": "project",
+                    "uuid": group.project.uuid.hex,
+                    "name": group.project.name,
+                    "slug": group.project.slug or "",
+                    "resource_uuid": None,
+                },
+                "role": None,
+                "members": sorted({ou.username for ou in members}),
+            }
+        )
+    return groups, membership
+
+
+def _user_project_mappings(user_ids):
+    """user_id -> set(project_id) for active project-scope user roles."""
+    project_ct = ContentType.objects.get_for_model(structure_models.Project)
+    mapping = defaultdict(set)
+    if not user_ids:
+        return mapping
+    for ur in UserRole.objects.filter(
+        is_active=True, user_id__in=user_ids, content_type=project_ct
+    ).values("user_id", "object_id"):
+        mapping[ur["user_id"]].add(ur["object_id"])
+    return mapping
+
+
+def _users_with_active_resources(offering, offering_users):
+    """Return the set of user_ids that have access to a non-terminated resource."""
+    user_ids = [ou.user_id for ou in offering_users]
+    user_project_mappings = _user_project_mappings(user_ids)
+    all_project_ids = {pid for pids in user_project_mappings.values() for pid in pids}
+    if not all_project_ids:
+        return set()
+    active_project_ids = set(
+        models.Resource.objects.filter(
+            offering=offering, project_id__in=all_project_ids
+        )
+        .exclude(state=ResourceStates.TERMINATED)
+        .values_list("project_id", flat=True)
+    )
+    return {
+        uid for uid, pids in user_project_mappings.items() if pids & active_project_ids
+    }
 
 
 def sanitize_name(name):
@@ -1292,8 +4270,36 @@ def sanitize_name(name):
     return name
 
 
-def create_anonymized_username(offering):
-    prefix = offering.plugin_options.get("username_anonymized_prefix", "walduruser_")
+def resolve_posix_uid(user, offering, account=None) -> int | None:
+    """The POSIX UID ``user`` holds (or is now given) on ``offering``, if any.
+
+    Mirrors the UID half of :func:`setup_linux_related_data`: a value already
+    recorded on ``account`` (including an operator's override) wins, then the
+    user attribute when the offering sources UIDs from it, else the pool.
+    ``posix_ids.allocate`` is idempotent and keyed on the Waldur user, so calling
+    this before the account row exists hands out the same number the row later
+    receives. Returns ``None`` when nothing resolves: POSIX accounts are off,
+    no pool covers the offering, or the user carries no ``uid_number``.
+    """
+    if account is not None and (account.backend_metadata or {}).get("uidnumber"):
+        return account.backend_metadata["uidnumber"]
+    plugin_options = offering.plugin_options or {}
+    if not plugin_options.get("enable_posix_account", True):
+        return None
+    if plugin_options.get("uid_source", "pool") == "user_attribute":
+        return user.uid_number
+    # The allocator only needs the principal behind the consumer, which for a
+    # user account is the Waldur user -- so an unsaved row is enough to ask with.
+    consumer = (
+        account
+        if account is not None
+        else models.OfferingUser(offering=offering, user=user)
+    )
+    return posix_ids.allocate(offering, posix_ids.UID, consumer)
+
+
+def _next_counter_username(offering, prefix):
+    """Historical per-offering counter: the highest ``<prefix>NNNNN`` plus one."""
     previous_users = models.OfferingUser.objects.filter(
         offering=offering, username__istartswith=prefix
     ).order_by("username")
@@ -1306,6 +4312,33 @@ def create_anonymized_username(offering):
         number = "0".zfill(USERNAME_ANONYMIZED_POSTFIX_LENGTH)
 
     return f"{prefix}{number}"
+
+
+def create_anonymized_username(user, offering, account=None):
+    """``<prefix><uid>``: the name is a pure function of the user's POSIX identity.
+
+    A counter scoped to one offering and a UID scoped to the provider disagree as
+    soon as two offerings share a directory -- the same person gets two names for
+    one UID, and two people can get one name. Deriving the name from the UID makes
+    it unique wherever the UID is, stable for the person, and identical on every
+    offering that draws from the same pool, so regenerating it is a no-op.
+
+    Without a resolvable UID the per-offering counter is kept as a fallback, and
+    the gap is logged rather than hidden.
+    """
+    prefix = offering.resolve_account_setting(
+        "username_anonymized_prefix", DEFAULT_ANONYMIZED_PREFIX
+    )
+    uid = resolve_posix_uid(user, offering, account)
+    if uid is not None:
+        return f"{prefix}{uid}"
+    logger.warning(
+        "No POSIX UID resolves for user %s on offering %s; falling back to the "
+        "per-offering counter for the anonymized username.",
+        user,
+        offering,
+    )
+    return _next_counter_username(offering, prefix)
 
 
 def create_username_from_full_name(user, offering):
@@ -1336,8 +4369,14 @@ def create_username_from_freeipa_profile(user):
         return profiles.first().username
 
 
-def generate_username(user, offering):
-    username_generation_policy = offering.plugin_options.get(
+def generate_username(user, offering, account=None):
+    """The username ``user`` gets on ``offering`` under its generation policy.
+
+    ``account`` is the row being named (an OfferingUser or the
+    ServiceProviderAccount backing it) when one exists; the anonymized policy
+    reads the POSIX identity already recorded on it.
+    """
+    username_generation_policy = offering.resolve_account_setting(
         "username_generation_policy", UsernameGenerationPolicy.SERVICE_PROVIDER.value
     )
 
@@ -1345,7 +4384,7 @@ def generate_username(user, offering):
         return ""
 
     if username_generation_policy == UsernameGenerationPolicy.ANONYMIZED.value:
-        return create_anonymized_username(offering)
+        return create_anonymized_username(user, offering, account)
 
     if username_generation_policy == UsernameGenerationPolicy.FULL_NAME.value:
         return create_username_from_full_name(user, offering)
@@ -1360,6 +4399,474 @@ def generate_username(user, offering):
         return user.details.get("site_username", "")
 
     return ""
+
+
+def get_or_create_provider_account(user, offering):
+    """The provider-level account backing this user's access to ``offering``.
+
+    Returns ``None`` when the offering is not in provider scope, or its customer
+    has no ServiceProvider row — the caller then keeps the historical
+    per-offering behaviour.
+
+    The account is named and given its POSIX identity once; a second offering of
+    the same provider finds the existing row, which is the whole point. Because
+    ``posix_ids.principal_filter`` keys on the Waldur user, the UID and primary
+    GID here are the same ones the user's offering accounts already hold.
+    """
+    if not offering.uses_provider_accounts:
+        return None
+    provider = offering.service_provider
+    if provider is None:
+        logger.warning(
+            "Offering %s asks for provider-level accounts but its customer is not "
+            "a service provider; falling back to a per-offering account.",
+            offering,
+        )
+        return None
+
+    account, created = models.ServiceProviderAccount.objects.get_or_create(
+        service_provider=provider, user=user
+    )
+    if not account.username:
+        username = generate_username(user, offering, account)
+        if username:
+            account.username = username
+            account.state = OfferingUserStates.OK
+
+    # Only mint the POSIX identity while the account is still missing it.
+    # setup_linux_related_data rewrites homeDir unconditionally from the
+    # offering's own homedir_prefix, so running it for every offering would let
+    # the second one move a shared account's home -- and would silently discard
+    # an operator's override, which the offering-user API is careful to keep.
+    needs_posix_identity = created or not (account.backend_metadata or {}).get(
+        "uidnumber"
+    )
+    if needs_posix_identity:
+        setup_linux_related_data(account, offering)
+    account.save()
+    if created:
+        logger.info("The provider account %s has been created", account)
+    return account
+
+
+def create_offering_user(user, offering, username=None, state=None):
+    """Create this user's account on ``offering``, backed when the provider owns it.
+
+    Under provider scope the account belongs to the ServiceProvider and the row
+    created here is only the association that reads through it: username, UID,
+    primary GID and home directory are decided once, on the provider account.
+    Outside provider scope the historical per-offering behaviour is kept.
+
+    ``username`` and ``state`` are what the caller would have used on its own --
+    a remote sync knows the remote's name, the Rancher handler uses the Waldur
+    username. Both are ignored under provider scope, where the provider account
+    is the only thing entitled to decide them.
+
+    Every creator has to go through here rather than calling
+    ``OfferingUser.objects.create``: a row created unbacked on a provider-scoped
+    offering stays unbacked until someone runs an adoption, which is the whole
+    divergence provider scope exists to remove.
+
+    Returns ``(offering_user, created)``.
+    """
+    provider_account = get_or_create_provider_account(user, offering)
+    if provider_account is not None:
+        offering_user, created = models.OfferingUser.objects.get_or_create(
+            offering=offering,
+            user=user,
+            defaults={"service_provider_account": provider_account},
+        )
+        if created:
+            logger.info(
+                "The offering user %s has been created, backed by %s",
+                offering_user,
+                provider_account,
+            )
+        elif not offering_user.is_provider_backed:
+            # defaults apply only on insert, so a row that predates provider
+            # scope would stay unbacked for ever and the same person would hold
+            # a backed and an unbacked account at the same provider.
+            offering_user.service_provider_account = provider_account
+            offering_user.pull_from_provider_account()
+            offering_user.save(
+                update_fields=[
+                    "service_provider_account",
+                    "username",
+                    "backend_metadata",
+                ]
+            )
+            logger.info(
+                "The offering user %s has been adopted by %s",
+                offering_user,
+                provider_account,
+            )
+        return offering_user, created
+
+    if username is None:
+        # The row does not exist yet; the generator only needs the principal
+        # behind it, and a UID it allocates now is the one the saved row reads
+        # back in setup_linux_related_data.
+        username = generate_username(
+            user, offering, models.OfferingUser(offering=offering, user=user)
+        )
+    if state is None:
+        state = (
+            OfferingUserStates.OK if username else OfferingUserStates.CREATION_REQUESTED
+        )
+    offering_user, created = models.OfferingUser.objects.get_or_create(
+        offering=offering,
+        user=user,
+        defaults={"username": username, "state": state},
+    )
+    if created:
+        setup_linux_related_data(offering_user, offering)
+        offering_user.save(update_fields=["backend_metadata"])
+        logger.info("The offering user %s has been created", offering_user)
+    return offering_user, created
+
+
+def restore_provider_account(account) -> bool:
+    """Bring a provider account that was on its way out back to OK.
+
+    Returns whether anything changed. The username and POSIX identity are kept:
+    a provider that parks departing entries re-enables them by name and uid, so
+    minting new ones here would leave it a stranger to re-enable.
+    """
+    if account.state not in OfferingUserStates.DELETION_FLOW_STATES:
+        return False
+    old_state = account.get_state_display()
+    account.restore()
+    account.save(update_fields=["state"])
+    logger.info(
+        "The provider account %s has been restored from %s because the user "
+        "regained access to one of the provider's offerings.",
+        account,
+        old_state,
+    )
+    return True
+
+
+def restore_offering_user(offering_user) -> bool:
+    """Bring a departed member's account back when they regain access.
+
+    Returns whether anything changed; an account that is not in the deletion
+    flow is left alone.
+
+    The account comes back under the name it already has. Waldur-named policies
+    (anonymized, waldur_username, ...) go straight to OK -- the name is a stable
+    function of the person, and a provider that parked the directory entry on
+    departure re-enables it when it sees the account live again. The same holds
+    for an account whose deletion was only requested or begun under the
+    service_provider policy. Only a service_provider-named account that was
+    fully deleted, or one that never got a name, goes back to the provider as a
+    creation request, since nothing is left to re-enable.
+
+    A provider-backed row reads through its ServiceProviderAccount, so that is
+    restored first and the row re-pulls its identity from it.
+    """
+    if offering_user.state not in OfferingUserStates.DELETION_FLOW_STATES:
+        return False
+    old_state = offering_user.get_state_display()
+    offering = offering_user.offering
+
+    if offering_user.is_provider_backed:
+        restore_provider_account(offering_user.service_provider_account)
+        offering_user.pull_from_provider_account()
+
+    policy = offering.resolve_account_setting(
+        "username_generation_policy", UsernameGenerationPolicy.SERVICE_PROVIDER.value
+    )
+    waldur_named = policy != UsernameGenerationPolicy.SERVICE_PROVIDER.value
+    if waldur_named and not offering_user.username:
+        offering_user.username = generate_username(
+            offering_user.user, offering, offering_user
+        )
+
+    if offering_user.username and (
+        waldur_named or offering_user.state != OfferingUserStates.DELETED
+    ):
+        offering_user.restore()
+        what = "restored"
+    else:
+        offering_user.state = OfferingUserStates.CREATION_REQUESTED
+        what = "requested again"
+    # No update_fields: a username filled in above has to land too, and a full
+    # save is what fires the state-change event the directory writers act on.
+    offering_user.save()
+    event_logger.emit(
+        f"Account for user {offering_user.user.username} in offering "
+        f"{offering.name} has been {what} (was {old_state}, now "
+        f"{offering_user.get_state_display()}) because the user regained project access.",
+        event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
+        event_context={"offering_user": offering_user},
+        scopes=[offering, offering.customer],
+    )
+    return True
+
+
+def provider_username_conflicts(service_provider, offerings=None) -> list[dict]:
+    """Users whose offering accounts at this provider disagree about the username.
+
+    Adopting provider-level accounts collapses each user's offering accounts onto
+    one username. Where they already agree that is silent; where they differ, one
+    of the names has to lose, and renaming a live POSIX account orphans every file
+    it owns -- so the choice belongs to an operator, not to a tie-break rule here.
+
+    Each candidate is reported with the evidence needed to choose: how many of the
+    provider's offerings use it, whether any of those accounts belongs to a user
+    with a live resource, and the home directory recorded for it.
+
+    ``offerings`` narrows the check to those offerings of the provider, such as
+    the ones sharing accounts once a single offering joins them.
+    """
+    offering_users = (
+        models.OfferingUser.objects.filter(
+            offering__customer_id=service_provider.customer_id
+        )
+        .exclude(username="")
+        .exclude(username__isnull=True)
+        .select_related("user", "offering")
+    )
+    if offerings is not None:
+        offering_users = offering_users.filter(offering__in=offerings)
+
+    by_user: dict[int, list] = defaultdict(list)
+    for offering_user in offering_users:
+        by_user[offering_user.user_id].append(offering_user)
+
+    conflicts = []
+    for accounts in by_user.values():
+        usernames = {account.username for account in accounts}
+        if len(usernames) < 2:
+            continue
+
+        # Resolved per offering, because "has a live resource" is a fact about the
+        # offering the account belongs to, not about the provider as a whole.
+        active_by_offering = {}
+        for account in accounts:
+            if account.offering_id not in active_by_offering:
+                active_by_offering[account.offering_id] = _users_with_active_resources(
+                    account.offering, [account]
+                )
+
+        candidates = []
+        for username in sorted(usernames):
+            matching = [a for a in accounts if a.username == username]
+            candidates.append(
+                {
+                    "username": username,
+                    "offering_count": len(matching),
+                    "offering_uuids": sorted(a.offering.uuid.hex for a in matching),
+                    "has_active_resources": any(
+                        a.user_id in active_by_offering[a.offering_id] for a in matching
+                    ),
+                    "home_directories": sorted(
+                        {
+                            (a.backend_metadata or {}).get("homeDir")
+                            for a in matching
+                            if (a.backend_metadata or {}).get("homeDir")
+                        }
+                    ),
+                }
+            )
+
+        user = accounts[0].user
+        conflicts.append(
+            {
+                "user_uuid": user.uuid.hex,
+                "user_username": user.username,
+                "user_full_name": user.full_name,
+                "candidates": candidates,
+            }
+        )
+
+    return sorted(conflicts, key=lambda c: c["user_username"] or "")
+
+
+def adopt_provider_accounts(
+    service_provider, resolutions: dict | None = None, offerings=None
+) -> dict:
+    """Back every offering account at this provider with a provider-level account.
+
+    ``resolutions`` maps a user uuid hex to the username an operator chose for a
+    conflicted user. Users whose accounts already agree need no entry and are
+    adopted without input.
+
+    Refuses outright while any conflict is unresolved: adopting half a provider
+    would leave the rest silently on the old per-offering behaviour, which is
+    worse than not starting.
+
+    ``offerings`` narrows the adoption to those offerings of the provider, as
+    when a single offering joins the ones already sharing accounts.
+    """
+    resolutions = resolutions or {}
+    with transaction.atomic():
+        # Lock the provider row so a concurrent adoption (or a username edit that
+        # would create a fresh conflict) serialises behind this one: checking
+        # conflicts outside the transaction that resolves them is a TOCTOU.
+        service_provider = models.ServiceProvider.objects.select_for_update().get(
+            pk=service_provider.pk
+        )
+        return _adopt_provider_accounts_locked(service_provider, resolutions, offerings)
+
+
+def _validate_adoption(service_provider, by_user, resolutions, offerings) -> None:
+    """Refuse an adoption whose surviving usernames are not valid choices.
+
+    A resolution must be one of the usernames reported for that user, and no
+    two people may end up with one name at the provider -- neither two adopted
+    now nor one of them and an existing provider account. Checked before
+    anything is written, so a bad choice is a 400 that changes nothing instead
+    of a unique-constraint failure half way through.
+    """
+    candidates = {
+        conflict["user_uuid"]: {c["username"] for c in conflict["candidates"]}
+        for conflict in provider_username_conflicts(service_provider, offerings)
+    }
+    invalid = {
+        user_uuid: [
+            _("%(username)s is not one of this user's usernames at the provider.")
+            % {"username": username}
+        ]
+        for user_uuid, username in resolutions.items()
+        if user_uuid in candidates and username not in candidates[user_uuid]
+    }
+    if invalid:
+        raise serializers.ValidationError({"resolutions": invalid})
+
+    planned = defaultdict(set)
+    for accounts in by_user.values():
+        user = accounts[0].user
+        chosen = resolutions.get(user.uuid.hex) or next(
+            (a.username for a in accounts if a.username), ""
+        )
+        if chosen:
+            planned[chosen.lower()].add(user.id)
+    clashes = {name for name, user_ids in planned.items() if len(user_ids) > 1}
+    for name, user_ids in planned.items():
+        if (
+            models.ServiceProviderAccount.objects.filter(
+                service_provider=service_provider, username__iexact=name
+            )
+            .exclude(user_id__in=user_ids)
+            .exists()
+        ):
+            clashes.add(name)
+    if clashes:
+        raise serializers.ValidationError(
+            {
+                "usernames": sorted(clashes),
+                "detail": _(
+                    "Adopting would give these usernames to more than one person "
+                    "at this provider. Rename one of the accounts first."
+                ),
+            }
+        )
+
+
+def _adopt_provider_accounts_locked(
+    service_provider, resolutions: dict, offerings=None
+) -> dict:
+    """The body of :func:`adopt_provider_accounts`, run under the provider lock."""
+    unresolved = [
+        conflict
+        for conflict in provider_username_conflicts(service_provider, offerings)
+        if conflict["user_uuid"] not in resolutions
+    ]
+    if unresolved:
+        # DRF's, not Django's: this surfaces straight to the operator as the
+        # response body, and the conflict report is the useful half of it.
+        raise serializers.ValidationError(
+            {
+                "conflicts": unresolved,
+                "detail": _(
+                    "Some users hold different usernames on different offerings of "
+                    "this provider. Choose the surviving username for each before "
+                    "adopting provider-level accounts."
+                ),
+            }
+        )
+
+    adopted = 0
+    backed = 0
+    offering_users = models.OfferingUser.objects.filter(
+        offering__customer_id=service_provider.customer_id,
+        service_provider_account__isnull=True,
+    ).select_related("user")
+    if offerings is not None:
+        offering_users = offering_users.filter(offering__in=offerings)
+
+    by_user: dict[int, list] = defaultdict(list)
+    for offering_user in offering_users:
+        by_user[offering_user.user_id].append(offering_user)
+
+    _validate_adoption(service_provider, by_user, resolutions, offerings)
+
+    for accounts in by_user.values():
+        user = accounts[0].user
+        chosen = resolutions.get(user.uuid.hex)
+        if chosen is None:
+            # No conflict, so any of them is the same answer.
+            chosen = next((a.username for a in accounts if a.username), "")
+
+        account, created = models.ServiceProviderAccount.objects.get_or_create(
+            service_provider=service_provider,
+            user=user,
+            defaults={"username": chosen},
+        )
+        if created:
+            adopted += 1
+        source = next((a for a in accounts if a.username == chosen), accounts[0])
+        if not account.backend_metadata:
+            account.backend_metadata = dict(source.backend_metadata or {})
+        if account.username != chosen:
+            account.username = chosen
+        account.state = source.state
+        account.save()
+
+        for offering_user in accounts:
+            offering_user.service_provider_account = account
+            offering_user.pull_from_provider_account()
+            offering_user.save(
+                update_fields=[
+                    "service_provider_account",
+                    "username",
+                    "backend_metadata",
+                ]
+            )
+            backed += 1
+
+    logger.info(
+        "Adopted %d provider account(s) at %s, backing %d offering account(s)",
+        adopted,
+        service_provider,
+        backed,
+    )
+    return {"adopted": adopted, "backed": backed}
+
+
+def propagate_provider_account(account) -> int:
+    """Push a provider account's values down onto every offering user backing it.
+
+    The columns on OfferingUser are a cache of the parent, not a second source of
+    truth: ``OfferingUserFilter`` searches ``backend_metadata__uidnumber`` and the
+    model orders by ``username``, so both have to follow. Returns how many rows
+    actually changed.
+    """
+    updated = 0
+    for offering_user in account.offering_users.all():
+        if offering_user.pull_from_provider_account():
+            offering_user.save(
+                update_fields=["username", "backend_metadata", "modified"]
+            )
+            updated += 1
+    if updated:
+        logger.info(
+            "Propagated provider account %s to %d offering user(s)",
+            account.uuid.hex,
+            updated,
+        )
+    return updated
 
 
 def user_offerings_mapping(offerings):
@@ -1396,20 +4903,42 @@ def user_offerings_mapping(offerings):
                     user_offerings_set.add((user, offering))
 
     for user, offering in user_offerings_set:
-        if not models.OfferingUser.objects.filter(
+        offering_user = models.OfferingUser.objects.filter(
             user=user, offering=offering
-        ).exists():
-            username = generate_username(user, offering)
-            # Set state to OK when username is known at creation time
-            state = (
-                OfferingUserStates.OK
-                if username
-                else OfferingUserStates.CREATION_REQUESTED
-            )
-            models.OfferingUser.objects.create(
-                user=user, offering=offering, username=username, state=state
-            )
-            logger.info("Offering user %s has been created.")
+        ).first()
+        if offering_user is None:
+            # create_offering_user generates the username and sets the state
+            # to OK when one is known at creation time.
+            offering_user, _ = create_offering_user(user, offering)
+        else:
+            # The member still holds a live resource here, so an account on its
+            # way out -- however far along -- is brought back rather than left to
+            # finish deleting.
+            restore_offering_user(offering_user)
+
+
+def get_order_processing_user(order: models.Order, system_robot=None):
+    """The identity an order is carried out under.
+
+    ``processors.send_request`` replays the plugin's own viewset as this user,
+    so DRF's permission classes and serializer querysets apply to them -- the
+    delete leg in particular enforces ``is_administrator`` on the project.
+    Whoever placed an order themselves necessarily holds a role there.
+
+    An order placed automatically records in ``created_by`` the person it is
+    *for*, which grants them nothing: a call can name its applicant, or a
+    grants office that holds no project role at all. Those are carried out
+    with system authority instead, as they were before the author was
+    recorded -- whoever is named, so that provisioning does not quietly
+    depend on whether that person happens to be staff.
+
+    ``system_robot`` lets a sweep resolve the robot once and hand it in:
+    ``get_system_robot`` is a ``get_or_create``, so a batch of orders would
+    otherwise pay a query each.
+    """
+    if order.placed_automatically:
+        return system_robot or core_utils.get_system_robot()
+    return order.created_by
 
 
 def order_should_not_be_reviewed_by_provider(order: models.Order):
@@ -1446,6 +4975,11 @@ def order_should_not_be_reviewed_by_provider(order: models.Order):
             or user_is_service_provider_offering_manager
         )
 
+    if offering.type == SCRIPT_PLUGIN_NAME:
+        # If auto_approve_marketplace_script is False, always require manual provider approval
+        # This applies to all users including service provider owners and staff
+        return offering.plugin_options.get("auto_approve_marketplace_script", True)
+
     return True
 
 
@@ -1471,6 +5005,31 @@ def get_consumer_approvers(order):
     return approvers
 
 
+def get_resource_end_date_approvers(resource):
+    """Emails of everyone who may decide a resource end date change request.
+
+    Mirrors user_can_approve_resource_end_date_change_request: whoever holds
+    SET_RESOURCE_END_DATE on the resource's project or its customer. Which roles
+    carry that permission is set per deployment, so recipients follow it rather
+    than a fixed role such as customer owner.
+
+    Staff may approve too, but are not emailed: like project end date change
+    requests, these are the consumer organisation's own decision.
+    """
+    users = get_users_with_permission(
+        resource.project.customer, PermissionEnum.SET_RESOURCE_END_DATE
+    ) | get_users_with_permission(
+        resource.project, PermissionEnum.SET_RESOURCE_END_DATE
+    )
+
+    return list(
+        users.distinct()
+        .exclude(email="")
+        .exclude(notifications_enabled=False)
+        .values_list("email", flat=True)
+    )
+
+
 def get_provider_approvers(order):
     users = User.objects.none()
 
@@ -1493,6 +5052,119 @@ def get_provider_approvers(order):
     return approvers
 
 
+def _as_string_list(value, option_name: str) -> list[str]:
+    """The string members of a list-valued option, or an empty list.
+
+    The serializer guarantees a list of strings, but secret_options is also
+    editable as raw JSON in the Django admin, which bypasses it. A bare string
+    there would iterate per character, and a mixed list would reach sorted() as
+    a TypeError, so anything that is not a string is dropped.
+    """
+    if not isinstance(value, list):
+        if value:
+            logger.warning(
+                "Expected a list in %s, got %s: %s", option_name, type(value), value
+            )
+        return []
+    members = [member for member in value if isinstance(member, str)]
+    if len(members) != len(value):
+        logger.warning("Ignoring non-string members of %s: %s", option_name, value)
+    return members
+
+
+def _get_users_holding_roles(scope, role_names) -> QuerySet:
+    user_ids = UserRole.objects.filter(
+        is_active=True, scope=scope, role__name__in=role_names
+    ).values_list("user_id", flat=True)
+    return User.objects.filter(id__in=user_ids)
+
+
+def get_new_order_notification_recipients(order) -> list[str]:
+    """Addresses configured on the offering to be notified about a new order.
+
+    Explicit addresses are taken as configured: there is no user behind them, so
+    they cannot be filtered by notifications_enabled. Role names are resolved on
+    the provider organization and on the offering itself, and the users behind
+    them are filtered like in get_provider_approvers.
+    """
+    secret_options = order.offering.secret_options or {}
+    emails = set(
+        _as_string_list(
+            secret_options.get("order_notification_emails"),
+            "order_notification_emails",
+        )
+    )
+    role_names = _as_string_list(
+        secret_options.get("order_notification_roles"), "order_notification_roles"
+    )
+
+    if role_names:
+        users = _get_users_holding_roles(
+            order.offering.customer, role_names
+        ) | _get_users_holding_roles(order.offering, role_names)
+
+        emails.update(
+            users.distinct()
+            .exclude(email="")
+            .exclude(notifications_enabled=False)
+            .values_list("email", flat=True)
+        )
+
+    return sorted(emails)
+
+
+def check_pending_order_exists(resource):
+    return models.Order.objects.filter(
+        resource=resource,
+        state__in=(
+            OrderStates.PENDING_CONSUMER,
+            OrderStates.PENDING_PROVIDER,
+            OrderStates.EXECUTING,
+        ),
+    ).exists()
+
+
+def get_pending_consumer_terminate_order(resource):
+    return (
+        models.Order.objects.filter(
+            resource=resource,
+            type=OrderTypes.TERMINATE,
+            state=OrderStates.PENDING_CONSUMER,
+        )
+        .select_related("offering", "project__customer")
+        .order_by("-created")
+        .first()
+    )
+
+
+def can_update_offering_in_any_scope(request, offering) -> bool:
+    """True if the caller holds UPDATE_OFFERING on the offering, its customer,
+    or that customer's service provider.
+
+    ``has_permission`` matches ``UserRole.scope`` exactly and never walks
+    ancestors, so all three scopes have to be named: OFFERING.MANAGER holds the
+    permission on the offering, CUSTOMER.OWNER on the customer, and
+    SERVICE_PROVIDER.MANAGER on the service provider. This is the same set
+    ``permission_factory(UPDATE_OFFERING, ["*", "customer",
+    "customer.serviceprovider"])`` accepts on ProviderOfferingViewSet.
+
+    Use this where a bool is wanted; ``views.can_update_offering`` is the
+    permission_factory-style callable that raises and additionally applies the
+    ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT config and a draft-state rule.
+    """
+    return any(
+        has_permission(request, PermissionEnum.UPDATE_OFFERING, scope)
+        for scope in (
+            offering,
+            offering.customer,
+            # Not every customer has a service provider record, and a bare
+            # attribute access would raise. `has_permission` treats a None scope
+            # as False.
+            getattr(offering.customer, "serviceprovider", None),
+        )
+    )
+
+
 def refresh_integration_agent_status(request, agent_type):
     user_agent = core_utils.get_user_agent(request)
     if "waldur-site-agent" not in user_agent:
@@ -1507,12 +5179,20 @@ def refresh_integration_agent_status(request, agent_type):
 
     if offering is None:
         logger.warning(
-            "Offering with UUID %s doesn't exist, skipping integration status update"
+            "Offering with UUID %s doesn't exist, skipping integration status update",
+            offering_uuid,
         )
         return
 
-    if not has_permission(request, PermissionEnum.UPDATE_OFFERING, offering.customer):
-        logger.error("User doesn't have permission for offering management")
+    if not can_update_offering_in_any_scope(request, offering):
+        logger.warning(
+            "User %s lacks UPDATE_OFFERING permission on offering %s (%s); "
+            "skipping %s integration status update",
+            getattr(request.user, "username", request.user),
+            offering.name,
+            offering_uuid,
+            agent_type,
+        )
         return
 
     integration_status, _ = models.IntegrationStatus.objects.get_or_create(
@@ -1540,9 +5220,18 @@ def validate_end_date(
     offering: models.Offering,
     created_date: datetime.date,
     end_date: datetime.date | None = None,
+    *,
+    start_date: datetime.date | None = None,
+    project_end_date: datetime.date | None = None,
 ) -> None | datetime.date:
     """
     Validate or compute the resource end date based on plugin options.
+
+    Offset base is order ``start_date`` when it is later than ``created_date``
+    (delayed provisioning), otherwise ``created_date``. Max and default
+    dates are also capped by ``latest_date_for_resource_termination`` and
+    ``project_end_date`` when set.
+
     Raises ValidationError if constraints are violated or configuration is invalid.
     """
 
@@ -1553,19 +5242,37 @@ def validate_end_date(
     default_offset = options.get("default_resource_termination_offset_in_days")
 
     latest_date = parse_date(options.get("latest_date_for_resource_termination"))
+    today = timezone.now().date()
+    offset_base = (
+        start_date if start_date and start_date > created_date else created_date
+    )
 
     if end_date:
-        if end_date and end_date < timezone.datetime.today().date():
+        if end_date < today:
             raise serializers.ValidationError(
                 {"end_date": _("Cannot be earlier than the current date.")}
+            )
+
+        if start_date and end_date < start_date:
+            raise serializers.ValidationError(
+                {"end_date": _("End date cannot be earlier than the start date.")}
             )
 
         if latest_date and end_date > latest_date:
             raise serializers.ValidationError(
                 {"end_date": _("End date exceeds global termination limit.")}
             )
+        if project_end_date and end_date > project_end_date:
+            raise serializers.ValidationError(
+                {
+                    "end_date": _(
+                        "End date cannot be later than the project end date (%(project_end_date)s)."
+                    )
+                    % {"project_end_date": project_end_date}
+                }
+            )
         if isinstance(max_offset, int):
-            if end_date > created_date + datetime.timedelta(days=max_offset):
+            if end_date > offset_base + datetime.timedelta(days=max_offset):
                 raise serializers.ValidationError(
                     {"end_date": _("End date exceeds maximum allowed offset.")}
                 )
@@ -1579,11 +5286,74 @@ def validate_end_date(
             {"end_date": _("Missing default termination offset configuration.")}
         )
 
-    termination_date = created_date + datetime.timedelta(days=default_offset)
-    if latest_date:
-        return min(termination_date, latest_date)
-    else:
-        return termination_date
+    termination_date = offset_base + datetime.timedelta(days=default_offset)
+    caps = [d for d in (latest_date, project_end_date) if d]
+    return min([termination_date, *caps]) if caps else termination_date
+
+
+def offering_allows_end_date_change_requests(offering: models.Offering) -> bool:
+    """Whether this offering accepts end date change requests.
+
+    When enabled, users who may not set the date themselves can ask for it, and
+    whoever holds the permission — or an external approval system acting on
+    their behalf — decides.
+
+    Prepaid offerings are excluded whatever the option says: they extend through
+    the renewal action, which enforces duration bounds and charges upfront, and
+    an arbitrary-date path would bypass both.
+    """
+    if offering.components.filter(is_prepaid=True).exists():
+        return False
+    return bool(
+        _displayed_plugin_options(offering).get(
+            "enable_resource_end_date_change_requests"
+        )
+    )
+
+
+def _displayed_plugin_options(offering: models.Offering) -> dict:
+    """The plugin options the API shows for this offering.
+
+    A child offering is rendered with its parent's plugin options (see
+    ``ProviderOfferingDetailsSerializer.get_fields``), so a consumer-facing
+    switch read from the child's own options would disagree with what the UI
+    shows and would not be editable where the UI edits it.
+    """
+    source = offering.parent if offering.parent_id else offering
+    return source.plugin_options or {}
+
+
+def offering_allows_limit_change_requests(offering: models.Offering) -> bool:
+    """Whether this offering accepts resource limit change requests.
+
+    Off unless the offering opts in. When enabled, users who may not change the
+    limits themselves can ask for new ones, and holders of the limits
+    permission decide; approval submits an update order.
+    """
+    return bool(
+        _displayed_plugin_options(offering).get("enable_resource_limit_change_requests")
+    )
+
+
+def validate_end_date_for_resource(resource: models.Resource, end_date):
+    """Validate a requested end date against the resource and its offering.
+
+    Wraps validate_end_date with the arguments derived from the resource, so the
+    request path and the approval path apply identical rules. Termination
+    offsets are measured from the creation order's start date when provisioning
+    was delayed, same as at order creation time.
+    """
+    if not end_date:
+        raise serializers.ValidationError({"end_date": _("End date is required.")})
+
+    creation_order = resource.creation_order
+    return validate_end_date(
+        offering=resource.offering,
+        created_date=resource.created.date(),
+        end_date=end_date,
+        start_date=creation_order.start_date if creation_order else None,
+        project_end_date=resource.project.end_date if resource.project else None,
+    )
 
 
 def sync_component_user_usage(allocation_user_usage, plugin_name):
@@ -1642,9 +5412,141 @@ def sync_component_user_usage(allocation_user_usage, plugin_name):
             logger.info("%s has been updated, new usage: %s", component_usage, usage)
 
 
-def generate_resource_name(
-    project: structure_models.Project, offering: models.Offering
+def update_component_quota(allocation, plugin_name):
+    """Shared handler for syncing allocation component quotas to marketplace resources.
+
+    Used by marketplace_openportal and marketplace_openportal_remote
+    plugins to update ComponentQuota, ComponentUsage, and Resource.limits when an
+    allocation's usage or limit fields change.
+    """
+    from waldur_mastermind.marketplace.plugins import manager
+
+    try:
+        resource = models.Resource.objects.get(scope=allocation)
+    except models.Resource.DoesNotExist:
+        return
+
+    new_limits = {}
+    new_usages = {}
+    for component in manager.get_components(plugin_name):
+        usage = float(getattr(allocation, component.type + "_usage"))
+        limit = float(getattr(allocation, component.type + "_limit"))
+
+        try:
+            offering_component = models.OfferingComponent.objects.get(
+                offering=resource.offering, type=component.type
+            )
+        except models.OfferingComponent.DoesNotExist:
+            logger.warning(
+                "Skipping Allocation synchronization because "
+                "marketplace.OfferingComponent does not exist. "
+                "Allocation ID: %s",
+                allocation.id,
+            )
+            continue
+
+        new_limits[component.type] = limit
+        new_usages[component.type] = usage
+        models.ComponentQuota.objects.update_or_create(
+            resource=resource,
+            component=offering_component,
+            defaults={"limit": limit, "usage": usage},
+        )
+
+        plan_periods = models.ResourcePlanPeriod.objects.filter(
+            resource=resource, end=None
+        )
+
+        if not plan_periods.exists():
+            logger.warning(
+                "Skipping component usage synchronization because valid "
+                "ResourcePlanPeriod is not found. "
+                "Allocation: %s, Resource: %s",
+                allocation,
+                resource,
+            )
+            continue
+
+        if plan_periods.count() > 1:
+            logger.warning(
+                "More than one active ResourcePlanPeriod found for "
+                "Allocation: %s, Resource: %s. Using the first plan only.",
+                allocation,
+                resource,
+            )
+
+        plan_period = plan_periods.first()
+
+        date = timezone.now()
+        models.ComponentUsage.objects.update_or_create(
+            resource=resource,
+            component=offering_component,
+            billing_period=core_utils.month_start(date),
+            plan_period=plan_period,
+            defaults={"usage": usage, "date": date},
+        )
+
+    if resource.limits != new_limits:
+        logger.debug(
+            "Syncing limits for %s. Allocation ID: %s. Old limits: %s. New limits: %s",
+            plugin_name,
+            allocation.id,
+            resource.limits,
+            new_limits,
+        )
+        resource.limits = new_limits
+        resource.save(update_fields=["limits"])
+
+
+class SafeFormatDict(dict):
+    """A dict subclass that returns empty string for missing keys during str.format_map()."""
+
+    def __missing__(self, key):
+        return ""
+
+
+def render_resource_name_pattern(
+    pattern, project, offering, plan=None, attributes=None
 ):
+    resource_count = models.Resource.objects.filter(
+        project=project, offering=offering
+    ).count()
+    context = SafeFormatDict(
+        customer_name=project.customer.name,
+        customer_slug=project.customer.slug,
+        project_name=project.name,
+        project_slug=project.slug,
+        offering_name=offering.name,
+        offering_slug=offering.slug,
+        plan_name=plan.name if plan else "",
+        counter=str(resource_count + 1) if resource_count else "",
+        attributes=SafeFormatDict(attributes or {}),
+    )
+    result = pattern.format_map(context)
+    result = result.lower()
+    result = re.sub(r"[^A-Za-z0-9.-]", "-", result)
+    return core_utils.remove_duplicate_hyphens(result).strip("-")
+
+
+def generate_resource_name(
+    project: structure_models.Project,
+    offering: models.Offering,
+    plan=None,
+    attributes=None,
+):
+    pattern = (offering.plugin_options or {}).get("resource_name_pattern")
+    if pattern:
+        try:
+            return render_resource_name_pattern(
+                pattern, project, offering, plan=plan, attributes=attributes
+            )
+        except (KeyError, ValueError, IndexError):
+            logger.warning(
+                "Failed to render resource_name_pattern %r for offering %s, falling back to default.",
+                pattern,
+                offering.uuid,
+            )
+
     resource_count = models.Resource.objects.filter(
         project=project, offering=offering
     ).count()
@@ -1654,6 +5556,8 @@ def generate_resource_name(
         offering.slug,
     ]
     result = "-".join(parts)
+    result = result.lower()
+    result = result.replace("_", "-")
 
     if resource_count:
         result += "-" + str(resource_count + 1)
@@ -1663,21 +5567,31 @@ def generate_resource_name(
 
 def notification_about_project_ending(end_date):
     projects_by_recipient = defaultdict(list)
-    expired_projects = structure_models.Project.available_objects.exclude(
+
+    # Find projects where the effective end date (including grace period) matches the target date
+    candidate_projects = structure_models.Project.available_objects.exclude(
         end_date__isnull=True
-    ).filter(end_date=end_date)
+    )
+    expired_projects = []
+
+    for project in candidate_projects:
+        effective_end_date = project.get_effective_end_date()
+        if effective_end_date == end_date:
+            expired_projects.append(project)
 
     # If there are no expired projects, we don't need to send notifications
-    if not expired_projects.exists():
-        logger.info("No projects found with end_date=%s", end_date)
+    if not expired_projects:
+        logger.info("No projects found with effective_end_date=%s", end_date)
         return
 
     for project in expired_projects:
         logger.info(
-            "Project %s (uuid=%s) has end_date=%s",
+            "Project %s (uuid=%s) has end_date=%s, grace_period=%d days, effective_end_date=%s",
             project.name,
             project.uuid,
             project.end_date,
+            project.get_grace_period_days(),
+            project.get_effective_end_date(),
         )
         project_users = (
             project.get_users().exclude(email="").exclude(notifications_enabled=False)
@@ -1697,6 +5611,10 @@ def notification_about_project_ending(end_date):
             project.url = core_utils.format_homeport_link(
                 "projects/{project_uuid}/", project_uuid=project.uuid.hex
             )
+
+        for project in projects:
+            project.grace_period_days = project.get_grace_period_days()
+            project.effective_end_date = project.get_effective_end_date()
 
         context = {
             "projects": projects,
@@ -1883,6 +5801,17 @@ def generate_mock_course_account_creation_response(
     return generate_mock_course_account_response(mock_username)
 
 
+# Explicit stand-in for httpx's implicit default (Timeout(5.0), i.e. 5s on
+# each of connect/read/write/pool) so the ceiling is visible here rather
+# than relying on a library default. NOTE: like that default, this bounds
+# each individual I/O operation, not the call's total duration - a backend
+# that trickles bytes just under this ceiling per chunk can still keep a
+# call "alive" indefinitely. That is NOT what protects gunicorn workers
+# from hanging on this call; moving the call off the request path (see
+# marketplace/tasks.py) is what does that.
+ACCOUNT_API_REQUEST_TIMEOUT = 5
+
+
 def get_account_api_token(token_url, client_id, client_secret):
     token_url = token_url.rstrip("/")
 
@@ -1901,6 +5830,7 @@ def get_account_api_token(token_url, client_id, client_secret):
             data=token_params,
             headers=token_request_headers,
             follow_redirects=True,
+            timeout=ACCOUNT_API_REQUEST_TIMEOUT,
         )
         token_response.raise_for_status()
         # Extract the token
@@ -1956,6 +5886,19 @@ def rotate_service_account_api_key(service_account: models.ScopedServiceAccount)
         raise
 
 
+def get_scope_offering_identifiers(resource_queryset) -> list[str]:
+    """Return each resource's offering backend_id, falling back to slug if not yet set.
+
+    backend_id is only populated once a processing agent has provisioned the
+    resource, so a project/customer with not-yet-provisioned resources still
+    needs the slug fallback.
+    """
+    offering_ids = set(
+        resource_queryset.values_list("offering__backend_id", "offering__slug")
+    )
+    return list({backend_id or slug for backend_id, slug in offering_ids})
+
+
 def post_service_account_to_url(
     url: str, service_account: dict, owner_username: str = "", scope_type: str = ""
 ):
@@ -1966,25 +5909,20 @@ def post_service_account_to_url(
             customer = project.customer
             scope_name = project.name
             scope_slug = project.slug
-            scope_offering_slugs = []
-            offering_slugs = set(
-                project.resource_set.exclude(
-                    state=ResourceStates.TERMINATED
-                ).values_list("offering__slug", flat=True)
+            scope_offering_slugs = get_scope_offering_identifiers(
+                project.resource_set.exclude(state=ResourceStates.TERMINATED)
             )
         elif scope_type == "customer":
             customer: structure_models.Customer = service_account["customer"]
             scope_name = customer.name
             scope_slug = customer.slug
-            offering_slugs = set(
-                models.Resource.objects.exclude(state=ResourceStates.TERMINATED)
-                .filter(project__customer=customer)
-                .values_list("offering__slug", flat=True)
+            scope_offering_slugs = get_scope_offering_identifiers(
+                models.Resource.objects.exclude(state=ResourceStates.TERMINATED).filter(
+                    project__customer=customer
+                )
             )
         else:
             raise ValueError(f"Unsupported service account type: {scope_type}")
-
-        scope_offering_slugs = list(offering_slugs)
 
         payload = {
             "ownerUsername": owner_username,
@@ -2005,6 +5943,36 @@ def post_service_account_to_url(
     except (httpx.HTTPError, ValueError, KeyError) as e:
         logger.error("Request to %s failed: %s", url, e)
         raise
+
+
+def extract_error_details_from_httpx_error(exc: httpx.HTTPError) -> str:
+    """Extract error details from an HTTPx error depending on the error type.
+
+    Always includes the HTTP status code so a stored error_message is
+    identifiable even when the backend's body is empty, unparseable, or
+    just an opaque wrapper - without this, `str(exc)` on a raw
+    HTTPStatusError only shows the generic "Server error '500 ...'"
+    request-line text, discarding whatever detail the backend actually
+    returned (or forcing a crash here if that detail isn't valid JSON).
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return str(exc)
+
+    response = exc.response
+    status_code = response.status_code
+    if not response.text:
+        return f"Status code: {status_code}, empty body"
+
+    try:
+        body = response.json()
+    except ValueError:
+        return f"Status code: {status_code}, message: {response.text}"
+
+    message = body
+    if isinstance(body, dict):
+        message = body.get("detail") or body.get("message") or body
+
+    return f"Status code: {status_code}, message: {message}"
 
 
 def create_service_account(service_account: dict, owner_username: str, scope_type: str):
@@ -2033,11 +6001,7 @@ def create_service_account(service_account: dict, owner_username: str, scope_typ
         )
         return response.json()
     except (httpx.HTTPError, ValueError) as exc:
-        error_details = (
-            exc.response.json()
-            if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
-            else exc
-        )
+        error_details = extract_error_details_from_httpx_error(exc)
         logger.error(
             "Unable to create a service account for %s",
             error_details,
@@ -2094,11 +6058,7 @@ def close_service_account(service_account: models.ScopedServiceAccount):
             service_account.set_state_closed()
             service_account.save(update_fields=["state"])
     except (httpx.HTTPError, ValueError) as exc:
-        error_details = (
-            exc.response.json()
-            if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
-            else exc
-        )
+        error_details = extract_error_details_from_httpx_error(exc)
         logger.error(
             "Unable to close the service account %s: %s",
             service_account.username,
@@ -2171,6 +6131,7 @@ def get_course_account(
             url,
             headers={"Authorization": f"Bearer {api_access_token}"},
             follow_redirects=True,
+            timeout=ACCOUNT_API_REQUEST_TIMEOUT,
         )
         response.raise_for_status()
         return response.json()
@@ -2220,11 +6181,7 @@ def update_service_account(service_account: models.ScopedServiceAccount):
         response.raise_for_status()
         return response.json()
     except (httpx.HTTPError, ValueError) as exc:
-        error_details = (
-            exc.response.json()
-            if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
-            else exc
-        )
+        error_details = extract_error_details_from_httpx_error(exc)
         logger.error(
             "Unable to update service account %s: %s",
             service_account.username,
@@ -2258,6 +6215,13 @@ def move_offering(
 
     offering.customer = target_customer
     offering.save(update_fields=["customer"])
+    offering.__dict__.pop("service_provider", None)
+    # The projects using the offering now use the target provider.
+    transaction.on_commit(
+        lambda: provider_project_groups.run_safely(
+            provider_project_groups.ensure_groups_for_offering, offering
+        )
+    )
 
     if not preserve_permissions:
         for permission in get_permissions(offering):
@@ -2269,15 +6233,303 @@ def move_offering(
     logger.info("Offering %s has been moved to provider %s", offering, target_customer)
 
 
+def _identity_manager_matches_offering_user(
+    subscriber: User,
+    message_payload: dict,
+) -> bool:
+    """Check if an identity manager should receive this OFFERING_USER event.
+
+    Returns True when the subscriber is an identity manager whose managed_isds
+    overlap with the offering user's linked user's active_isds.
+
+    NOTE (WAL-10115): this access rule exists ONLY on the legacy path. The
+    unified EventConsumer path authorizes bindings via UserRole on the scope
+    chain, which an identity manager does not hold — so they currently cannot
+    migrate, and deleting the legacy block (WAL-10111) would cut their
+    OFFERING_USER delivery with no route forward. WAL-10111 must not land
+    before WAL-10115.
+    """
+    if not subscriber.is_identity_manager:
+        return False
+
+    managed_isds = subscriber.managed_isds or []
+    if not managed_isds:
+        return False
+
+    target_user_uuid = message_payload.get("user_uuid")
+    if not target_user_uuid:
+        return False
+
+    target_user = User.objects.filter(uuid=target_user_uuid).first()
+    if not target_user:
+        return False
+
+    active_isds = target_user.active_isds or []
+    return bool(set(managed_isds) & set(active_isds))
+
+
+def _enrich_order_payload(payload: dict) -> dict:
+    """Add full order context to reduce agent API lookups."""
+    order_uuid = payload.get("order_uuid")
+    if not order_uuid:
+        return payload
+    try:
+        order = models.Order.objects.select_related(
+            "resource", "resource__offering", "resource__plan", "project"
+        ).get(uuid=order_uuid)
+    except models.Order.DoesNotExist:
+        return payload
+    payload["order_type"] = order.get_type_display()
+    payload["resource_uuid"] = order.resource.uuid.hex
+    payload["resource_backend_id"] = order.resource.backend_id
+    payload["resource_name"] = order.resource.name
+    payload["project_uuid"] = order.project.uuid.hex
+    payload["project_name"] = order.project.name
+    payload["attributes"] = order.safe_attributes
+    payload["limits"] = order.resource.limits or {}
+    if order.resource.plan:
+        payload["plan_uuid"] = order.resource.plan.uuid.hex
+    return payload
+
+
+def _enrich_resource_payload(payload: dict) -> dict:
+    """Add project + resource context to resource update messages."""
+    resource_uuid = payload.get("resource_uuid")
+    if not resource_uuid:
+        return payload
+    try:
+        resource = models.Resource.objects.select_related("project").get(
+            uuid=resource_uuid
+        )
+    except models.Resource.DoesNotExist:
+        return payload
+    payload["resource_name"] = resource.name
+    payload["resource_state"] = resource.get_state_display()
+    payload["project_uuid"] = resource.project.uuid.hex
+    payload["project_name"] = resource.project.name
+    payload["limits"] = resource.limits or {}
+    return payload
+
+
+def _enrich_user_role_payload(payload: dict) -> dict:
+    """Add user profile basics to reduce user detail lookups."""
+    user_uuid = payload.get("user_uuid")
+    if not user_uuid:
+        return payload
+    try:
+        # all_objects, not objects: User.objects is UserActiveManager and hides
+        # inactive users. Offboarding typically deactivates the user and revokes
+        # their roles together, so filtering them out would strip the email and
+        # full name from exactly the role_revoked event a backend needs in order
+        # to deprovision the account.
+        user = User.all_objects.get(uuid=user_uuid)
+    except User.DoesNotExist:
+        return payload
+    payload["user_email"] = user.email
+    payload["user_full_name"] = user.full_name
+    return payload
+
+
+AGENT_PAYLOAD_ENRICHERS = {
+    ObservableObjectType.ORDER: _enrich_order_payload,
+    ObservableObjectType.RESOURCE: _enrich_resource_payload,
+    ObservableObjectType.USER_ROLE: _enrich_user_role_payload,
+}
+
+
+def _resolve_event_project(message_payload):
+    """The consumer-side project this event concerns, if the payload names one.
+
+    Note (deliberate divergence from the legacy consumer-access rule): the
+    legacy path only resolved a customer when the project still had a
+    NON-terminated resource on the offering. Deriving the project straight from
+    the order/resource is simpler and more accurate — it means a project-bound
+    consumer also hears about its LAST resource being terminated, which the
+    legacy narrowing dropped. See docs/design/pubsub-architecture.md.
+    """
+    project_uuid = message_payload.get("project_uuid")
+    if project_uuid:
+        return structure_models.Project.objects.filter(uuid=project_uuid).first()
+
+    order_uuid = message_payload.get("order_uuid")
+    if order_uuid:
+        order = (
+            models.Order.objects.filter(uuid=order_uuid)
+            .select_related("project")
+            .first()
+        )
+        return order.project if order else None
+
+    resource_uuid = message_payload.get("resource_uuid")
+    if resource_uuid:
+        resource = (
+            models.Resource.objects.filter(uuid=resource_uuid)
+            .select_related("project")
+            .first()
+        )
+        return resource.project if resource else None
+
+    return None
+
+
+def _resolve_event_scope_keys(offering, message_payload, affected_object):
+    """(content_type_id, object_id) pairs this event belongs to.
+
+    Always the offering's own chain — offering, its project, that project's
+    customer, the offering's customer — which is exactly what
+    ``OfferingQuerySet.filter_for_user`` ORs over, so a consumer bound anywhere
+    in that chain matches. Plus the consumer-side project (and its customer)
+    when the payload identifies one.
+    """
+    keys = set(permission_utils.scope_keys_for(offering))
+    project = _resolve_event_project(message_payload)
+    if project is not None:
+        keys.update(permission_utils.scope_keys_for(project))
+    return list(keys)
+
+
+# Event types where consumer access is determined by payload content.
+# Scoped via order_uuid → order.project.customer
+_CONSUMER_ORDER_EVENTS = {ObservableObjectType.ORDER}
+# Scoped via resource_uuid → resource.project.customer
+_CONSUMER_RESOURCE_EVENTS = {
+    ObservableObjectType.RESOURCE,
+    ObservableObjectType.RESOURCE_PERIODIC_LIMITS,
+    ObservableObjectType.RESOURCE_API_KEY_ROTATION,
+    ObservableObjectType.RESOURCE_END_DATE_CHANGE_REQUEST,
+}
+# Scoped via project_uuid in payload
+_CONSUMER_PROJECT_SCOPED_EVENTS = {
+    ObservableObjectType.USER_ROLE,
+    ObservableObjectType.SERVICE_ACCOUNT,
+    ObservableObjectType.COURSE_ACCOUNT,
+}
+
+
+def _resolve_event_consumer_customer(
+    offering: models.Offering,
+    message_payload: dict,
+    affected_object: ObservableObjectType,
+) -> structure_models.Customer | None:
+    """Resolve which consumer customer an event belongs to.
+
+    Returns the customer that owns the project associated with the event,
+    or None if the event type is not consumer-visible or cannot be resolved.
+    Only resources with non-terminated state on the given offering are considered.
+    """
+    project = None
+
+    # Projects with active (non-terminated) resources on this offering
+    active_project_ids = (
+        models.Resource.objects.filter(offering=offering)
+        .exclude(state=ResourceStates.TERMINATED)
+        .values_list("project_id", flat=True)
+    )
+
+    if affected_object in _CONSUMER_ORDER_EVENTS:
+        order_uuid = message_payload.get("order_uuid")
+        if order_uuid:
+            order = (
+                models.Order.objects.filter(uuid=order_uuid)
+                .select_related("project__customer")
+                .first()
+            )
+            if order and order.project_id in set(active_project_ids):
+                project = order.project
+    elif affected_object in _CONSUMER_RESOURCE_EVENTS:
+        resource_uuid = message_payload.get("resource_uuid")
+        if resource_uuid:
+            resource = (
+                models.Resource.objects.filter(
+                    uuid=resource_uuid,
+                    offering=offering,
+                    project_id__in=active_project_ids,
+                )
+                .select_related("project__customer")
+                .first()
+            )
+            if resource:
+                project = resource.project
+    elif affected_object in _CONSUMER_PROJECT_SCOPED_EVENTS:
+        event_project_uuid = message_payload.get("project_uuid")
+        if event_project_uuid:
+            project = (
+                structure_models.Project.objects.filter(
+                    uuid=event_project_uuid,
+                    id__in=active_project_ids,
+                )
+                .select_related("customer")
+                .first()
+            )
+    elif affected_object == ObservableObjectType.OFFERING_USER:
+        offering_user_uuid = message_payload.get("user_uuid")
+        if offering_user_uuid:
+            project_ct = ContentType.objects.get_for_model(structure_models.Project)
+            role = UserRole.objects.filter(
+                content_type=project_ct,
+                object_id__in=active_project_ids,
+                user__uuid=offering_user_uuid,
+                is_active=True,
+            ).first()
+            if role:
+                project = (
+                    structure_models.Project.objects.filter(id=role.object_id)
+                    .select_related("customer")
+                    .first()
+                )
+
+    if project:
+        return project.customer
+    return None
+
+
+def prepare_provider_account_messages(
+    account,
+    message_payload: dict,
+) -> list[dict[str, str]]:
+    """Build ``service_provider_account`` messages for one provider account.
+
+    The sibling of :func:`prepare_messages` for events that have no offering.
+    A provider account belongs to the provider, not to any one of its offerings,
+    so the event is anchored on the provider's **customer** -- which is the key
+    ``get_scope_ancestors`` already yields for every offering of that provider,
+    so a consumer bound there receives both this and the per-offering events.
+
+    The legacy per-offering subscription path does not apply: its queue name is
+    built from an offering uuid, and this event has none.
+    """
+    customer = account.service_provider.customer
+    scope_keys = permission_utils.scope_keys_for(customer)
+
+    def _build_payload():
+        payload = dict(message_payload)
+        payload["service_provider_uuid"] = account.service_provider.uuid.hex
+        payload["customer_uuid"] = customer.uuid.hex
+        payload["object_type"] = ObservableObjectType.SERVICE_PROVIDER_ACCOUNT.value
+        return payload
+
+    dispatch_result = event_dispatch.build_messages(
+        scope_keys,
+        _build_payload,
+        ObservableObjectType.SERVICE_PROVIDER_ACCOUNT,
+        include_global=True,
+    )
+    return dispatch_result.messages
+
+
 def prepare_messages(
     offering: models.Offering,
     message_payload: dict,
-    affected_object: logging_utils.ObservableObjectType,
+    affected_object: ObservableObjectType,
 ) -> list[dict[str, str]]:
     """Helper function to prepare event messages for marketplace events.
 
     Generates event messages for users who have subscribed to events related to marketplace
     offerings they have access to. Each message includes a vhost, topic and payload.
+
+    For OFFERING_USER events, identity managers whose managed_isds overlap with
+    the linked user's active_isds also receive the event, even without direct
+    offering access.
 
     Args:
         offering: Marketplace offering instance to generate messages for
@@ -2309,27 +6561,117 @@ def prepare_messages(
         affected_object.value,
         offering,
     )
-    event_subscriptions = logging_models.EventSubscription.objects.filter(
+    messages_to_send = []
+
+    # Cheap no-op short-circuit. prepare_messages fires on essentially every
+    # marketplace signal across every tenant; on an install (or object type) with
+    # nothing listening on EITHER path, skip the several-query scope-key
+    # resolution below and return immediately. Two indexed EXISTS replace ~5-7
+    # queries when idle. Any unified consumer (global or bound) has
+    # queue_created=True, so a single EXISTS covers them all.
+    legacy_subscriptions = logging_models.EventSubscription.objects.filter(
         observable_objects__contains=[{"object_type": affected_object.value}]
     )
+    has_unified_consumer = (
+        logging_models.EventConsumer.objects.filter(queue_created=True)
+        .exclude(rmq_username="")
+        .exists()
+    )
+    if not has_unified_consumer and not legacy_subscriptions.exists():
+        return messages_to_send
 
-    if not event_subscriptions.exists():
-        logger.debug(
-            "No event subscriptions exist for %s, skipping message sending",
-            affected_object.value,
-        )
-        return []
+    # --- Unified consumer queues (scope bindings / dispatch) ---
+    # Resolved FIRST because the legacy loop below must skip any user already
+    # covered here (no double-delivery). Marketplace resolves the event's
+    # scope-keys; waldur_core matches them against the indexed bindings and
+    # re-authorizes each recipient — core stays free of marketplace imports.
+    scope_keys = _resolve_event_scope_keys(offering, message_payload, affected_object)
 
-    messages_to_send = []
+    def _build_consumer_payload():
+        payload = dict(message_payload)
+        payload["offering_uuid"] = offering.uuid.hex
+        payload["object_type"] = affected_object.value
+        enricher = AGENT_PAYLOAD_ENRICHERS.get(affected_object)
+        return enricher(payload) if enricher else payload
+
+    # Global (bindingless, staff/support) consumers receive marketplace events
+    # through this path too — an empty scope means "everything", so an IdM/IGA
+    # sync account gets orders, resources, offering users, etc. USER_ROLE is the
+    # single exception: it is a user-centric event the CORE dispatcher already
+    # delivers to globals on the role_granted/revoked signal, and this path emits
+    # USER_ROLE only on a manual project re-sync — so including globals here as
+    # well would deliver it to them twice. Core owns USER_ROLE for globals; this
+    # path owns the marketplace object types for them. (All other marketplace
+    # types are emitted ONLY here, so a global receives each exactly once.)
+    dispatch_result = event_dispatch.build_messages(
+        scope_keys,
+        _build_consumer_payload,
+        affected_object,
+        include_global=affected_object != ObservableObjectType.USER_ROLE,
+    )
+    messages_to_send.extend(dispatch_result.messages)
+    consumer_covered_user_ids = dispatch_result.user_ids
+
+    # --- Legacy: per-offering subscription queues (DEPRECATED) ---
+    # Superseded by the unified EventConsumer path above; left untouched so
+    # existing consumers keep working. Users already covered by a unified queue
+    # are skipped below (no double-delivery). Delete this whole block, and the
+    # suppression it needs, when the legacy path is retired — WAL-10111.
+    event_subscriptions = legacy_subscriptions  # queryset built for the short-circuit
+
+    # Resolve the event's target customer for consumer access checks.
+    # Computed once (outside the loop) since it depends only on the payload,
+    # not the subscribing user. Skipped when there are no legacy subscriptions.
+    event_consumer_customer = (
+        _resolve_event_consumer_customer(offering, message_payload, affected_object)
+        if event_subscriptions.exists()
+        else None
+    )
+
     for event_subscription in event_subscriptions:
         user = event_subscription.user
+        if user.id in consumer_covered_user_ids:
+            # A unified consumer queue supersedes the legacy path for this user.
+            continue
         logger.info("Processing subscription for user %s", user)
 
         # Check if user has access to offering
         linked_offerings = models.Offering.objects.all().filter_for_user(user)
         if not linked_offerings.filter(id=offering.id).exists():
+            # Consumer access: the event's target customer must be one of
+            # the user's connected customers.
+            # get_connected_customers returns a flat QuerySet of customer IDs.
+            has_consumer_access = (
+                event_consumer_customer is not None
+                and event_consumer_customer.id in set(get_connected_customers(user))
+            )
+            if not has_consumer_access:
+                # Identity managers can receive OFFERING_USER events for users
+                # whose active_isds overlap with the manager's managed_isds.
+                if not (
+                    affected_object == ObservableObjectType.OFFERING_USER
+                    and _identity_manager_matches_offering_user(user, message_payload)
+                ):
+                    logger.debug(
+                        "The user %s does not have access to the offering %s",
+                        user,
+                        offering,
+                    )
+                    continue
+
+        # Check if queue is registered (receiver must request queue creation first)
+        queue_exists = logging_models.EventSubscriptionQueue.objects.filter(
+            event_subscription=event_subscription,
+            offering_uuid=offering.uuid,
+            object_type=affected_object.value,
+        ).exists()
+
+        if not queue_exists:
             logger.debug(
-                "The user %s does not have access to the offering %s", user, offering
+                "Queue not registered for subscription %s, offering %s, type %s. Skipping.",
+                event_subscription.uuid.hex,
+                offering.uuid.hex,
+                affected_object.value,
             )
             continue
 
@@ -2344,6 +6686,83 @@ def prepare_messages(
     return messages_to_send
 
 
+def publish_offering_resources_sync_request(offering: models.Offering, user) -> bool:
+    """
+    Send a message to RabbitMQ requesting a full reconciliation of all offering
+    resources by the connected site agents (e.g. to restore backend accounts
+    after the provider backend has lost state).
+
+    Returns True if at least one agent subscription received the request.
+    """
+    logger.info(
+        "Requesting synchronization of all resources for offering %s by user %s",
+        offering,
+        user,
+    )
+
+    payload = {
+        "requested_by_user_uuid": user.uuid.hex,
+    }
+    messages = prepare_messages(
+        offering,
+        payload,
+        ObservableObjectType.OFFERING_RESOURCES_SYNC,
+    )
+    if not messages:
+        return False
+    logging_tasks.publish_messages.delay(messages)
+    return True
+
+
+def _log_api_key_rotation(api_key: models.ResourceApiKey) -> None:
+    """Log a rotation command with the identifiers useful for support triage."""
+    resource = api_key.resource
+    project = resource.project
+    customer = project.customer
+    logger.info(
+        "API key rotation requested for key %s of resource %s (%s), "
+        "project %s (%s), organization %s (%s)",
+        api_key.uuid.hex,
+        resource.name,
+        resource.uuid.hex,
+        project.name,
+        project.uuid.hex,
+        customer.name,
+        customer.uuid.hex,
+    )
+
+
+def publish_api_key_event(api_key: models.ResourceApiKey) -> bool:
+    """Ask connected site agents to rotate a resource API key.
+
+    The agent owns key generation: this only sends a slim command (no key
+    material). Rotation is the only command — the key count is fixed at
+    provisioning and a rotation replaces a value in place — so the action is not
+    a parameter. The agent performs the backend change and reports back via the
+    provider endpoints. Returns True if at least one agent subscription received
+    the command.
+    """
+    resource = api_key.resource
+    _log_api_key_rotation(api_key)
+    payload = {
+        "resource_uuid": resource.uuid.hex,
+        "resource_backend_id": resource.backend_id,
+        "api_key_uuid": api_key.uuid.hex,
+        "client_id": api_key.client_id,
+        # Still on the wire: the agent dispatches on it and rejects anything else.
+        "action": "rotate",
+    }
+    messages = prepare_messages(
+        resource.offering,
+        payload,
+        ObservableObjectType.RESOURCE_API_KEY_ROTATION,
+    )
+    if not messages:
+        return False
+    transaction.on_commit(lambda: logging_tasks.publish_messages.delay(messages))
+    return True
+
+
 def publish_backend_resource_request(request: models.BackendResourceRequest):
     """
     Send a message to RabbitMQ requesting a list of resources for the offering.
@@ -2356,7 +6775,7 @@ def publish_backend_resource_request(request: models.BackendResourceRequest):
     messages = prepare_messages(
         request.offering,
         payload,
-        logging_utils.ObservableObjectType.IMPORTABLE_RESOURCES,
+        ObservableObjectType.IMPORTABLE_RESOURCES,
     )
     if messages:
         logging_tasks.publish_messages.delay(messages)
@@ -2372,12 +6791,8 @@ def post_course_account_to_url(
         if api_access_token is None:
             api_access_token = get_course_account_api_token()
         project: structure_models.Project = course_account["project"]
-        offering_slugs = list(
-            set(
-                project.resource_set.exclude(
-                    state=ResourceStates.TERMINATED
-                ).values_list("offering__slug", flat=True)
-            )
+        offering_slugs = get_scope_offering_identifiers(
+            project.resource_set.exclude(state=ResourceStates.TERMINATED)
         )
 
         payload = {
@@ -2428,11 +6843,7 @@ def create_course_account(
         )
         return response.json()
     except (httpx.HTTPError, ValueError) as exc:
-        error_details = (
-            exc.response.json()
-            if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
-            else exc
-        )
+        error_details = extract_error_details_from_httpx_error(exc)
         logger.error(
             "Unable to create a course account for %s",
             error_details,
@@ -2471,6 +6882,7 @@ def create_multiple_course_accounts(
         api_access_token = get_course_account_api_token()
     except (httpx.HTTPError, ValueError, KeyError) as e:
         logger.error("Request to %s failed: %s", course_account_url, e)
+        return course_accounts_created
 
     for course_account_data in course_accounts_data:
         try:
@@ -2501,6 +6913,18 @@ def create_multiple_course_accounts(
 def close_course_account(
     course_account: models.CourseAccount, api_access_token: str | None = None
 ):
+    # Already closed — nothing to do. CLOSED is terminal and the FSM forbids
+    # CLOSED→CLOSED, so re-entry (e.g. via project pre_delete signal after a
+    # prior manual close) would raise TransitionNotAllowed and bubble up as 500.
+    if course_account.state == CourseAccountState.CLOSED:
+        return
+
+    # No backend account was ever created — nothing to close remotely.
+    if course_account.user is None:
+        course_account.set_state_closed()
+        course_account.save(update_fields=["state"])
+        return
+
     if config.ENABLE_MOCK_COURSE_ACCOUNT_BACKEND:
         logger.info(
             f"Mock mode enabled for delete_course_account: {course_account.user.username}"
@@ -2537,7 +6961,10 @@ def close_course_account(
             course_account.save(update_fields=["state"])
             if user:
                 user.is_active = False
-                user.save(update_fields=["is_active"])
+                user.deactivation_reason = (
+                    f"Course account {course_account.uuid} not found at backend"
+                )
+                user.save(update_fields=["is_active", "deactivation_reason"])
             return
 
         url = f"{course_account_url}/{username}/close"
@@ -2545,6 +6972,7 @@ def close_course_account(
             url,
             headers={"Authorization": f"Bearer {api_access_token}"},
             follow_redirects=True,
+            timeout=ACCOUNT_API_REQUEST_TIMEOUT,
         )
         response.raise_for_status()
         if response.status_code == 200:
@@ -2552,13 +6980,12 @@ def close_course_account(
             course_account.save(update_fields=["state"])
             if user:
                 user.is_active = False
-                user.save(update_fields=["is_active"])
+                user.deactivation_reason = (
+                    f"Course account {course_account.uuid} closed"
+                )
+                user.save(update_fields=["is_active", "deactivation_reason"])
     except (httpx.HTTPError, ValueError) as exc:
-        error_details = (
-            exc.response.json()
-            if isinstance(exc, httpx.HTTPStatusError) and exc.response.text
-            else exc
-        )
+        error_details = extract_error_details_from_httpx_error(exc)
         logger.error(
             "Unable to close the course account %s: %s",
             course_account.email,
@@ -2567,8 +6994,45 @@ def close_course_account(
         course_account.set_state_erred()
         course_account.error_message = str(error_details)
         course_account.error_traceback = traceback.format_exc()
-        course_account.save(update_fields=["error_message", "error_traceback"])
+        course_account.save(update_fields=["state", "error_message", "error_traceback"])
         raise
+
+
+def close_course_account_by_username(
+    username: str, api_access_token: str | None = None
+):
+    """Close a course account at the backend by username alone, with no local row.
+
+    Used when the local CourseAccount row is already gone - a hard project
+    or customer delete CASCADEs it away before the close task runs - but
+    the backend account still needs to be closed. Unlike close_course_account,
+    this never touches a CourseAccount instance or its state.
+    """
+    if config.ENABLE_MOCK_COURSE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for close_course_account_by_username: {username}"
+        )
+        return
+
+    if not settings.WALDUR_CORE.get("COURSE_ACCOUNT_USE_API"):
+        return
+
+    course_account_url = settings.WALDUR_CORE["COURSE_ACCOUNT_URL"]
+    if not course_account_url:
+        raise ValidationError("URL for course accounts is not configured")
+    course_account_url = course_account_url.rstrip("/")
+
+    if api_access_token is None:
+        api_access_token = get_course_account_api_token()
+
+    url = f"{course_account_url}/{username}/close"
+    response = httpx.put(
+        url,
+        headers={"Authorization": f"Bearer {api_access_token}"},
+        follow_redirects=True,
+        timeout=ACCOUNT_API_REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
 
 
 def get_viewset_from_basename(basename):
@@ -2634,3 +7098,865 @@ def get_model_serializer(model: type):
     except (AttributeError, KeyError, TypeError):
         logger.debug("Unable to resolve model serializer %s", model)
         return None
+
+
+def validate_reallocation(source_resource, limits_to_reallocate, targets, user):
+    """
+    Validate reallocation of resource limits from source to target resources.
+    """
+
+    if not limits_to_reallocate or not targets:
+        error_validation("Limits to reallocate and targets cannot be empty.")
+
+    source_limits = validate_source_resource(source_resource)
+
+    derived = derived_limits.derived_components(
+        (source_resource.offering.options or {}).get("options")
+    )
+    for component, value in limits_to_reallocate.items():
+        if component in derived:
+            # The server sets it from the resource's order options; moving it
+            # would be undone on the target's next limit change.
+            error_validation(
+                "The limit of %(component)s is calculated from the order form "
+                "and cannot be reallocated.",
+                component=component,
+            )
+        validate_source_component(component, value, source_limits)
+
+    target_resource_uuids = [target["resource_uuid"] for target in targets]
+
+    if source_resource.uuid in target_resource_uuids:
+        error_validation("Source resource cannot be a target resource.")
+
+    target_resources = models.Resource.objects.filter(uuid__in=target_resource_uuids)
+    for target_resource in target_resources:
+        if target_resource.offering != source_resource.offering:
+            error_validation(
+                "Target resource %(name)s must be from the same offering as the source resource.",
+                name=target_resource.name,
+            )
+        if target_resource.state != ResourceStates.OK:
+            error_validation(
+                "Target resource %(name)s must be in OK state.",
+                name=target_resource.name,
+            )
+
+        if check_pending_order_exists(target_resource):
+            error_validation(
+                "Target resource %(name)s has pending orders.",
+                name=target_resource.name,
+            )
+    found_uuids = {resource.uuid for resource in target_resources}
+    missing_uuids = set(target_resource_uuids) - found_uuids
+    if missing_uuids:
+        error_validation(
+            "Target resources with UUIDs %(uuids)s do not exist.",
+            uuids=", ".join(str(uuid) for uuid in missing_uuids),
+        )
+
+    total_allocated = defaultdict(int)
+
+    for target_data in targets:
+        target_uuid = target_data["resource_uuid"]
+        target_resource = target_resources.get(uuid=target_uuid)
+        if not target_resource:
+            error_validation(
+                "Target resource with UUID %(uuid)s not found.",
+                uuid=target_uuid,
+            )
+        validate_target_allocation(
+            target_data, target_resource, source_limits, user, total_allocated
+        )
+
+    # Validate total allocated matches what's being reallocated
+    for component, total_to_reallocate in limits_to_reallocate.items():
+        total_allocated_for_component = total_allocated.get(component, 0)
+        if total_allocated_for_component > total_to_reallocate:
+            error_validation(
+                "Total allocated %(total)s for component %(component)s "
+                "exceeds reallocated amount %(reallocated)s.",
+                total=total_allocated_for_component,
+                component=component,
+                reallocated=total_to_reallocate,
+            )
+        if total_allocated_for_component < total_to_reallocate:
+            error_validation(
+                "Total allocated %(total)s for component %(component)s "
+                "is less than reallocated amount %(reallocated)s. "
+                "All allocated limits must sum to the reallocated amount.",
+                total=total_allocated_for_component,
+                component=component,
+                reallocated=total_to_reallocate,
+            )
+
+
+def validate_source_resource(source_resource):
+    if source_resource.state != ResourceStates.OK:
+        error_validation("Source resource must be in OK state to reallocate limits.")
+
+    if check_pending_order_exists(source_resource):
+        error_validation(
+            "Source resource has pending orders. Cannot reallocate limits."
+        )
+
+    if not source_resource.limits:
+        error_validation("Source resource has no limits to reallocate.")
+
+    source_limits = source_resource.limits
+    validate_limits(source_limits, source_resource.offering, source_resource)
+    return source_limits
+
+
+def error_validation(message, **params):
+    raise serializers.ValidationError(_(message) % params)
+
+
+def validate_source_component(component, value, source_limits):
+    if component not in source_limits:
+        error_validation(
+            "Component %(component)s is not present in source resource limits.",
+            component=component,
+        )
+
+    if value <= 0:
+        error_validation(
+            "Reallocated limit for %(component)s must be positive.",
+            component=component,
+        )
+
+    available = source_limits.get(component, 0)
+
+    if value > available:
+        error_validation(
+            "Cannot reallocate %(value)s of %(component)s. "
+            "Source resource only has %(available)s available.",
+            value=value,
+            component=component,
+            available=available,
+        )
+
+
+def validate_target_allocation(
+    target_data, target_resource, source_limits, user, total_allocated
+):
+    target_uuid = target_data["resource_uuid"]
+    allocated_limits = target_data.get("allocated_limits", {})
+
+    if not allocated_limits:
+        error_validation(
+            "Target resource %(uuid)s has no allocated limits specified.",
+            uuid=target_uuid,
+        )
+
+    if not has_permission(
+        user, PermissionEnum.UPDATE_RESOURCE_LIMITS, target_resource.project
+    ) and not has_permission(
+        user, PermissionEnum.UPDATE_RESOURCE_LIMITS, target_resource.project.customer
+    ):
+        error_validation(
+            "User does not have permission to update target resource %(name)s limits.",
+            name=target_resource.name,
+        )
+
+    # Each target gets its own order, so order creation must be authorized per
+    # target as well. Targets come from the request body rather than the
+    # action's object, so the view's permission check does not cover them.
+    if not has_permission(
+        user, PermissionEnum.CREATE_ORDER, target_resource.project
+    ) and not has_permission(
+        user, PermissionEnum.CREATE_ORDER, target_resource.project.customer
+    ):
+        error_validation(
+            "User does not have permission to create orders for target resource %(name)s.",
+            name=target_resource.name,
+        )
+
+    target_limits = target_resource.limits or {}
+    validate_limits(target_limits, target_resource.offering, target_resource)
+
+    if set(target_limits.keys()) != set(source_limits.keys()):
+        error_validation(
+            "Target resource %(name)s must have the same components as the source resource.",
+            name=target_resource.name,
+        )
+
+    for component, allocated_value in allocated_limits.items():
+        if allocated_value <= 0:
+            error_validation(
+                "Allocated limit for %(component)s in target %(name)s must be positive.",
+                component=component,
+                name=target_resource.name,
+            )
+
+        new_target_limits = target_limits.copy()
+        new_target_limits[component] = add_limit_values(
+            target_limits.get(component, 0), allocated_value
+        )
+
+        try:
+            validate_limits(
+                new_target_limits, target_resource.offering, target_resource
+            )
+        except serializers.ValidationError as e:
+            error_validation(
+                "Target resource %(name)s cannot accept allocated limits for %(component)s: %(error)s",
+                name=target_resource.name,
+                component=component,
+                error=str(e),
+            )
+
+        total_allocated[component] = add_limit_values(
+            total_allocated[component], allocated_value
+        )
+
+
+def calculate_new_limits(current_limits, allocated_limits, subtract=False):
+    """
+    Calculate new limits by adding or subtracting delta from current limits.
+    """
+    new_limits = current_limits.copy() if current_limits else {}
+
+    for component, allocated_value in allocated_limits.items():
+        current_value = new_limits.get(component, 0)
+        if subtract:
+            new_limits[component] = max(
+                0, add_limit_values(current_value, -allocated_value)
+            )
+        else:
+            new_limits[component] = add_limit_values(current_value, allocated_value)
+
+    return new_limits
+
+
+VALID_UNIQUENESS_SCOPES = {
+    "offering",
+    "offering_group",
+    "service_provider",
+    "service_provider_category",
+}
+
+
+def validate_backend_id_rules(rules):
+    """Validate the JSON structure of backend_id_rules. Raises rest_framework ValidationError."""
+    if not isinstance(rules, dict):
+        raise rf_exceptions.ValidationError(
+            {"backend_id_rules": "Must be a JSON object."}
+        )
+
+    allowed_keys = {"format", "uniqueness"}
+    unknown_keys = set(rules.keys()) - allowed_keys
+    if unknown_keys:
+        raise rf_exceptions.ValidationError(
+            {"backend_id_rules": f"Unknown keys: {', '.join(sorted(unknown_keys))}"}
+        )
+
+    if "format" in rules:
+        fmt = rules["format"]
+        if not isinstance(fmt, dict):
+            raise rf_exceptions.ValidationError(
+                {"backend_id_rules": "format must be a JSON object."}
+            )
+        fmt_allowed = {"regex", "description"}
+        fmt_unknown = set(fmt.keys()) - fmt_allowed
+        if fmt_unknown:
+            raise rf_exceptions.ValidationError(
+                {
+                    "backend_id_rules": f"Unknown keys in format: {', '.join(sorted(fmt_unknown))}"
+                }
+            )
+        regex = fmt.get("regex")
+        if regex is not None:
+            if not isinstance(regex, str):
+                raise rf_exceptions.ValidationError(
+                    {"backend_id_rules": "format.regex must be a string."}
+                )
+            if is_potentially_dangerous_regex(regex):
+                raise rf_exceptions.ValidationError(
+                    {
+                        "backend_id_rules": "format.regex is potentially dangerous (too long or contains nested/adjacent quantifiers)."
+                    }
+                )
+            try:
+                re.compile(regex)
+            except re.error as e:
+                raise rf_exceptions.ValidationError(
+                    {
+                        "backend_id_rules": f"format.regex is not a valid regular expression: {e}"
+                    }
+                )
+
+    if "uniqueness" in rules:
+        uniq = rules["uniqueness"]
+        if not isinstance(uniq, dict):
+            raise rf_exceptions.ValidationError(
+                {"backend_id_rules": "uniqueness must be a JSON object."}
+            )
+        uniq_allowed = {"scope", "include_terminated"}
+        uniq_unknown = set(uniq.keys()) - uniq_allowed
+        if uniq_unknown:
+            raise rf_exceptions.ValidationError(
+                {
+                    "backend_id_rules": f"Unknown keys in uniqueness: {', '.join(sorted(uniq_unknown))}"
+                }
+            )
+        scope = uniq.get("scope")
+        if scope is not None and scope not in VALID_UNIQUENESS_SCOPES:
+            raise rf_exceptions.ValidationError(
+                {
+                    "backend_id_rules": f"uniqueness.scope must be one of: {', '.join(sorted(VALID_UNIQUENESS_SCOPES))}"
+                }
+            )
+        include_terminated = uniq.get("include_terminated")
+        if include_terminated is not None and not isinstance(include_terminated, bool):
+            raise rf_exceptions.ValidationError(
+                {"backend_id_rules": "uniqueness.include_terminated must be a boolean."}
+            )
+
+
+def validate_backend_id_format(backend_id, offering):
+    """Check backend_id against the offering's format regex. Raises ValidationError if invalid."""
+    rules = offering.backend_id_rules or {}
+    fmt = rules.get("format", {})
+    regex = fmt.get("regex")
+    if not regex:
+        return
+
+    if is_potentially_dangerous_regex(regex):
+        # Skip validation for dangerous patterns
+        return
+
+    try:
+        if not re.fullmatch(regex, backend_id):
+            description = fmt.get("description", f"Must match pattern: {regex}")
+            raise rf_exceptions.ValidationError(
+                {"backend_id": f"Invalid format. {description}"}
+            )
+    except re.error:
+        # Skip validation for invalid patterns
+        return
+
+
+def validate_backend_id_uniqueness(backend_id, offering, exclude_resource=None):
+    """Check backend_id uniqueness per the offering's scope config. Raises ValidationError if not unique."""
+    rules = offering.backend_id_rules or {}
+    uniq = rules.get("uniqueness", {})
+    scope = uniq.get("scope")
+    if not scope:
+        return
+
+    include_terminated = uniq.get("include_terminated", True)
+
+    queryset = models.Resource.objects.filter(backend_id=backend_id)
+
+    if not include_terminated:
+        queryset = queryset.exclude(state=ResourceStates.TERMINATED)
+
+    if scope == "offering":
+        queryset = queryset.filter(offering=offering)
+    elif scope == "offering_group":
+        if offering.backend_id:
+            queryset = queryset.filter(offering__backend_id=offering.backend_id)
+        else:
+            queryset = queryset.filter(offering=offering)
+    elif scope == "service_provider":
+        queryset = queryset.filter(offering__customer=offering.customer)
+    elif scope == "service_provider_category":
+        queryset = queryset.filter(
+            offering__customer=offering.customer,
+            offering__category=offering.category,
+        )
+    else:
+        return
+
+    if exclude_resource is not None:
+        queryset = queryset.exclude(pk=exclude_resource.pk)
+
+    if queryset.exists():
+        raise rf_exceptions.ValidationError(
+            {"backend_id": "This backend_id is already in use."}
+        )
+
+
+def validate_backend_id(backend_id, offering, exclude_resource=None):
+    """Run all backend_id validations. Skips if backend_id is empty."""
+    if not backend_id:
+        return
+    validate_backend_id_format(backend_id, offering)
+    validate_backend_id_uniqueness(
+        backend_id, offering, exclude_resource=exclude_resource
+    )
+
+
+# Mapping from User model field names to attribute "gate" names
+# used by OfferingUserAttributeConfig (expose_<attribute_name>).
+# Shared between handlers.py (pub/sub) and profile completeness filtering.
+USER_FIELD_TO_ATTRIBUTE = {
+    "first_name": "full_name",
+    "last_name": "full_name",
+    "email": "email",
+    "phone_number": "phone_number",
+    "organization": "organization",
+    "job_title": "job_title",
+    "affiliations": "affiliations",
+    "gender": "gender",
+    "civil_number": "civil_number",
+    "birth_date": "birth_date",
+    "personal_title": "personal_title",
+    "place_of_birth": "place_of_birth",
+    "address": "address",
+    "country_of_residence": "country_of_residence",
+    "nationality": "nationality",
+    "nationalities": "nationalities",
+    "organization_country": "organization_country",
+    "organization_type": "organization_type",
+    "eduperson_assurance": "eduperson_assurance",
+    "identity_source": "identity_source",
+    "registration_method": "registration_method",
+    "uid_number": "uid_number",
+    "primary_gid": "primary_gid",
+}
+
+
+def _is_user_field_empty(user, field_name):
+    """Check if a User model field value is considered empty.
+
+    - CharField/EmailField: "" or None
+    - JSONField: [] or None
+    - PositiveSmallIntegerField/DateField: None
+    """
+    value = getattr(user, field_name, None)
+    if value is None:
+        return True
+    if isinstance(value, str) and value == "":
+        return True
+    if isinstance(value, list) and value == []:
+        return True
+    return False
+
+
+def get_missing_profile_attributes(user, exposed_attributes):
+    """Return list of attribute names the user hasn't filled in.
+
+    Args:
+        user: User model instance
+        exposed_attributes: list of attribute names (e.g. ["email", "full_name"])
+
+    Returns:
+        List of attribute names that are empty on the user's profile.
+    """
+    attr_to_fields = _build_attribute_to_user_fields()
+    missing = []
+    for attr_name in exposed_attributes:
+        user_fields = attr_to_fields.get(attr_name)
+        if not user_fields:
+            continue
+        if len(user_fields) > 1:
+            # full_name: incomplete only when ALL sub-fields are empty
+            if all(_is_user_field_empty(user, uf) for uf in user_fields):
+                missing.append(attr_name)
+        else:
+            if _is_user_field_empty(user, user_fields[0]):
+                missing.append(attr_name)
+    return missing
+
+
+def _build_attribute_to_user_fields():
+    """Invert USER_FIELD_TO_ATTRIBUTE: attribute_name -> [user_field_names]."""
+    result = defaultdict(list)
+    for user_field, attr_name in USER_FIELD_TO_ATTRIBUTE.items():
+        result[attr_name].append(user_field)
+    # username is not in USER_FIELD_TO_ATTRIBUTE (not change-tracked)
+    if "username" not in result:
+        result["username"] = ["username"]
+    return dict(result)
+
+
+def _is_field_empty_q(user_field_name):
+    """Return a Q object that matches when the given User field is empty.
+
+    The "empty" definition depends on the field type:
+    - CharField/EmailField: "" or NULL
+    - JSONField: [] or NULL
+    - PositiveSmallIntegerField/DateField: NULL
+    """
+    from waldur_core.core.models import User
+
+    field = User._meta.get_field(user_field_name)
+    prefix = f"user__{user_field_name}"
+
+    if isinstance(field, models_module.CharField | models_module.EmailField):
+        return Q(**{prefix: ""}) | Q(**{f"{prefix}__isnull": True})
+    elif isinstance(field, models_module.JSONField):
+        return Q(**{prefix: []}) | Q(**{f"{prefix}__isnull": True})
+    else:
+        # DateField, PositiveSmallIntegerField, etc.
+        return Q(**{f"{prefix}__isnull": True})
+
+
+def user_can_see_resource_order_workflow(user, resource) -> bool:
+    """Return whether ``user`` may see ``order_in_progress`` / ``creation_order``.
+
+    Visible to consumer project/customer members and to service providers with
+    access to the resource's offering. Hidden from users whose only connection
+    is a direct Resource or ResourceProject role.
+    """
+    if not user or not user.is_authenticated:
+        return False
+    if user.is_staff or user.is_support:
+        return True
+    if resource.project_id in get_connected_projects(user):
+        return True
+    if resource.project.customer_id in get_connected_customers(user):
+        return True
+    return (
+        models.Resource.objects.filter(pk=resource.pk)
+        .filter_for_service_provider(user)
+        .exists()
+    )
+
+
+def is_resource_project_only_viewer(user, resource) -> bool:
+    """True when ``user`` can only see ``resource`` via a ResourceProject role.
+
+    Returns False for staff/support, for users with project/customer roles on
+    the consuming side, and for users with a direct UserRole on the resource.
+    """
+    if not user or not user.is_authenticated:
+        return False
+    if user.is_staff or user.is_support:
+        return False
+    project = resource.project
+    if get_connected_projects(user).filter(id=project.id).exists():
+        return False
+    if get_connected_customers(user).filter(id=project.customer_id).exists():
+        return False
+    if has_user(resource, user):
+        return False
+    rp_ids = models.ResourceProject.available_objects.filter(
+        resource=resource
+    ).values_list("id", flat=True)
+    if not rp_ids:
+        return False
+    rp_ct = ContentType.objects.get_for_model(models.ResourceProject)
+    return UserRole.objects.filter(
+        user=user, is_active=True, content_type=rp_ct, object_id__in=list(rp_ids)
+    ).exists()
+
+
+def build_incomplete_profile_q():
+    """Build a Q object matching OfferingUsers with incomplete profiles.
+
+    An OfferingUser is "incomplete" when:
+    1. The offering has an OfferingUserAttributeConfig
+    2. At least one exposed attribute's corresponding User field(s) are empty
+
+    For `full_name`, both first_name AND last_name must be empty for it
+    to be considered incomplete (since full_name = first_name + last_name).
+    """
+    attr_to_fields = _build_attribute_to_user_fields()
+    incomplete_q = Q()
+
+    for attr_name, user_fields in attr_to_fields.items():
+        config_flag = f"offering__user_attribute_config__expose_{attr_name}"
+
+        if len(user_fields) > 1:
+            # full_name case: both first_name AND last_name must be empty
+            all_empty = Q()
+            for uf in user_fields:
+                all_empty &= _is_field_empty_q(uf)
+            incomplete_q |= Q(**{config_flag: True}) & all_empty
+        else:
+            incomplete_q |= Q(**{config_flag: True}) & _is_field_empty_q(user_fields[0])
+
+    return incomplete_q
+
+
+def _active_offering_consent_q(offering, prefix=""):
+    return Q(
+        **{
+            f"{prefix}offering_consents__offering": offering,
+            f"{prefix}offering_consents__revocation_date__isnull": True,
+        }
+    )
+
+
+def filter_users_with_active_offering_consent(users, offering):
+    return users.filter(_active_offering_consent_q(offering)).distinct()
+
+
+def filter_offering_users_queryset_by_consent(queryset, offering=None):
+    """Exclude OfferingUsers without active consent when ToS enforcement is on.
+
+    Mirrors the predicate used by ``get_allowed_offering_users_for_user`` /
+    ``list_customer_users``: keep rows for offerings without an active ToS, or
+    where the linked user has an unrevoked consent for that offering.
+
+    When ``offering`` is passed (single-offering callers such as glauth), skip
+    the filter entirely if that offering has no active ToS.
+    """
+    if not config.ENFORCE_USER_CONSENT_FOR_OFFERINGS:
+        return queryset
+
+    if offering is not None:
+        if not offering.has_terms_of_service():
+            return queryset
+        return queryset.filter(
+            user__offering_consents__offering=offering,
+            user__offering_consents__revocation_date__isnull=True,
+        ).distinct()
+
+    return queryset.filter(
+        ~Q(offering__terms_of_service_configs__is_active=True)
+        | Q(
+            user__offering_consents__offering=F("offering"),
+            user__offering_consents__revocation_date__isnull=True,
+        )
+    ).distinct()
+
+
+def offering_consent_is_enforced(offering) -> bool:
+    """Whether the Terms of Service gate is on for this offering.
+
+    True when enforcement is enabled and the offering has an active Terms of
+    Service. It does not check whether any user has accepted those terms.
+    """
+    if not config.ENFORCE_USER_CONSENT_FOR_OFFERINGS:
+        return False
+    return offering.has_terms_of_service()
+
+
+def get_robot_account_linkable_users(resource):
+    """Users a robot account on ``resource`` may newly link.
+
+    The same set ``RobotAccountSerializer.validate`` accepts: project and
+    organization users of the resource, narrowed to users with active consent
+    while the offering's Terms of Service gate is on.
+    """
+    users = get_resource_users(resource)
+    if offering_consent_is_enforced(resource.offering):
+        users = filter_users_with_active_offering_consent(users, resource.offering)
+    return users
+
+
+def should_filter_provider_resource_team_by_consent(user, offering) -> bool:
+    if user.is_staff or user.is_support:
+        return False
+    return offering_consent_is_enforced(offering)
+
+
+def robot_account_caller_scopes(user):
+    """Customer and project ids the caller holds a role on."""
+    return set(get_connected_customers(user)), set(get_connected_projects(user))
+
+
+def is_on_consuming_side(resource, scopes) -> bool:
+    """Whether the caller reaches the resource through its consuming project or organization."""
+    customer_ids, project_ids = scopes
+    return (
+        resource.project.customer_id in customer_ids
+        or resource.project_id in project_ids
+    )
+
+
+def is_provider_gated_for_offering(user, offering, scopes) -> bool:
+    """Whether the caller is a service provider for the offering and the consent gate is on."""
+    if not should_filter_provider_resource_team_by_consent(user, offering):
+        return False
+    customer_ids, _ = scopes
+    return offering.customer_id in customer_ids
+
+
+def should_hide_unconsented_robot_account_users(user, resource) -> bool:
+    """Hide non-consenting users when a service provider reads a robot account.
+
+    Consent gating applies only to callers who belong to the offering's provider
+    organization, under the same conditions as the provider resource team. A
+    caller who is also on the consuming side, such as the owner of an
+    organization that consumes its own offering, sees every linked user.
+    """
+    scopes = robot_account_caller_scopes(user)
+    if not is_provider_gated_for_offering(user, resource.offering, scopes):
+        return False
+    return not is_on_consuming_side(resource, scopes)
+
+
+def active_offering_consent_user_ids(users, offering):
+    users = [user for user in users if user is not None]
+    if not users:
+        return set()
+    return set(
+        filter_users_with_active_offering_consent(
+            core_models.User.objects.filter(id__in={user.id for user in users}),
+            offering,
+        ).values_list("id", flat=True)
+    )
+
+
+def users_with_active_offering_consent(users, offering):
+    users = [user for user in users if user is not None]
+    consented_ids = active_offering_consent_user_ids(users, offering)
+    return [user for user in users if user.id in consented_ids]
+
+
+def retain_robot_account_users_hidden_from_caller(
+    instance, validated_data, caller, consented_ids
+):
+    """Keep links a provider cannot see when they save a redacted payload.
+
+    The edit form sends the users and responsible user it just loaded. A
+    provider read omits people without consent, so writing that list back
+    would detach them.
+    """
+    if instance is None or not should_hide_unconsented_robot_account_users(
+        caller, instance.resource
+    ):
+        return
+    if "users" in validated_data:
+        kept = list(validated_data["users"])
+        kept_ids = {user.id for user in kept}
+        for user in instance.users.all():
+            if user.id not in consented_ids and user.id not in kept_ids:
+                kept.append(user)
+                kept_ids.add(user.id)
+        validated_data["users"] = kept
+    if "responsible_user" in validated_data and not validated_data.get(
+        "responsible_user"
+    ):
+        current = instance.responsible_user if instance.responsible_user_id else None
+        if current is not None and current.id not in consented_ids:
+            validated_data["responsible_user"] = current
+
+
+def user_roles_for_provider_caller(caller, scope, offering, user=None):
+    """Role rows on ``scope``, without users who have not accepted the offering terms."""
+    return filter_user_roles_by_offering_consent(
+        get_permissions(scope, user), caller, offering
+    )
+
+
+def filter_user_roles_by_offering_consent(queryset, user, offering):
+    """Drop role rows whose user has no active consent, for provider callers."""
+    if not should_filter_provider_resource_team_by_consent(user, offering):
+        return queryset
+    return queryset.filter(_active_offering_consent_q(offering, "user__")).distinct()
+
+
+def build_resource_team_response(resource, request, users):
+    from waldur_mastermind.marketplace import (
+        models,
+        serializers,
+    )  # to avoid circular import
+
+    project = resource.project
+    offering = resource.offering
+
+    permissions_qs = get_permissions(project).select_related("role")
+    permissions_map = {}
+    for perm in permissions_qs:
+        if perm.user_id not in permissions_map:
+            permissions_map[perm.user_id] = perm
+
+    offering_users_qs = models.OfferingUser.objects.filter(
+        offering=offering, user__in=users
+    )
+    offering_users_map = {ou.user_id: ou for ou in offering_users_qs}
+
+    return Response(
+        serializers.ProjectUserSerializer(
+            instance=users,
+            many=True,
+            context={
+                "project": project,
+                "offering": offering,
+                "request": request,
+                "permissions_map": permissions_map,
+                "offering_users_map": offering_users_map,
+            },
+        ).data,
+        status=status.HTTP_200_OK,
+    )
+
+
+def _live_resource_exists():
+    """Scopes whose organization still runs something on the offering.
+
+    A scope survives the termination of the last resource so that
+    re-provisioning restores protection without reconfiguration. It must not
+    keep reaching the exported allow-list though: an external firewall would go
+    on trusting those addresses for a service the organization has stopped
+    using.
+    """
+    return Q(
+        Exists(
+            models.Resource.objects.filter(
+                project__customer_id=OuterRef("access_subnet__customer_id"),
+                offering_id=OuterRef("offering_id"),
+            ).exclude(state=models.Resource.States.TERMINATED)
+        )
+    )
+
+
+def aggregate_access_subnets(offering_uuids=None, include_organization_subnets=False):
+    """Collect the access-subnet allow-list for the given offerings.
+
+    ``offering_uuids=None`` means all offerings. Returns a dict with the
+    consumer (customer x offering) subnets, the provider-default offering
+    subnets, the organization-level subnets of customers owning non-terminated
+    resources of the offerings (empty unless ``include_organization_subnets``),
+    and ``packed`` — all of the above collapsed into the minimal CIDR list.
+
+    Consumer entries are reported per (customer, offering) pair rather than per
+    resource: the list is defined at that grain, so expanding it across every
+    resource would multiply the payload without adding information.
+    """
+    consumer_subnets = (
+        models.AccessSubnetOfferingScope.objects.exclude(
+            access_subnet__inet__isnull=True
+        )
+        .filter(_live_resource_exists())
+        .select_related("access_subnet", "access_subnet__customer", "offering")
+        .order_by("access_subnet__inet")
+    )
+    offering_defaults = (
+        models.OfferingAccessSubnet.objects.exclude(inet__isnull=True)
+        .select_related("offering")
+        .order_by("inet")
+    )
+    if offering_uuids is not None:
+        consumer_subnets = consumer_subnets.filter(offering__uuid__in=offering_uuids)
+        offering_defaults = offering_defaults.filter(offering__uuid__in=offering_uuids)
+
+    if include_organization_subnets:
+        resources = models.Resource.objects.exclude(
+            state=models.Resource.States.TERMINATED
+        )
+        if offering_uuids is not None:
+            resources = resources.filter(offering__uuid__in=offering_uuids)
+        customer_ids = resources.values_list(
+            "project__customer_id", flat=True
+        ).distinct()
+        organization_subnets = (
+            structure_models.AccessSubnet.objects.exclude(inet__isnull=True)
+            # Portal-scoped only, preserving what this flag meant before the
+            # two lists merged: "also trust the addresses this organization
+            # signs in from". Offering scopes arrive through consumer_subnets.
+            .filter(customer_id__in=customer_ids, applies_to_portal=True)
+            .select_related("customer")
+            .order_by("inet")
+        )
+    else:
+        organization_subnets = structure_models.AccessSubnet.objects.none()
+
+    inets = (
+        [scope.access_subnet.inet for scope in consumer_subnets]
+        + [subnet.inet for subnet in offering_defaults]
+        + [subnet.inet for subnet in organization_subnets]
+    )
+    packed = [str(network) for network in core_utils.merge_access_subnets(inets)]
+    return {
+        "consumer_subnets": consumer_subnets,
+        "offering_defaults": offering_defaults,
+        "organization_subnets": organization_subnets,
+        "packed": packed,
+    }

@@ -1,12 +1,16 @@
 import logging
 from typing import cast
 
+from celery import shared_task
 from django.core.exceptions import ObjectDoesNotExist
+from django.db import models as models_q
 from django.db import transaction
 
 from waldur_core.core import utils as core_utils
+from waldur_core.core.middleware import get_skip_side_effects
 from waldur_mastermind.common import mixins as common_mixins
 from waldur_mastermind.invoices import models as invoice_models
+from waldur_mastermind.marketplace import billing_discount, billing_mode
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.billing_utils import (
     convert_quantity,
@@ -18,6 +22,20 @@ from waldur_mastermind.marketplace.enums import (
 
 logger = logging.getLogger(__name__)
 
+# Relations that _run_billing and the policy handlers walk for every usage.
+# One billing task is queued per ComponentUsage save, so each of these is a
+# separate round-trip per row unless it is loaded up front.
+BILLING_RELATED_FIELDS = (
+    "resource__project",
+    "resource__offering",
+    "component",
+    # The billing-mode resolver reads the component's offering type and the
+    # plan of the period; both would otherwise be lazy-loaded per usage row.
+    "component__offering",
+    "plan_period",
+    "plan_period__plan",
+)
+
 
 class BillingUsageProcessor:
     """
@@ -27,15 +45,16 @@ class BillingUsageProcessor:
 
     @classmethod
     @transaction.atomic
-    def update_invoice_when_usage_is_reported(
+    def _run_billing(
         cls,
-        sender,
-        instance: marketplace_models.ComponentUsage,
-        created=False,
-        **kwargs,
+        component_usage: marketplace_models.ComponentUsage,
+        *,
+        created: bool,
     ):
         """
-        Handles billing when component usage is reported, with integrated prepaid logic.
+        Run billing for a ComponentUsage. Callers must have filtered out the
+        import path (``skip_side_effects``) and no-op saves
+        (``tracker.has_changed("usage")``), so this method assumes work to do.
 
         This method acts as a dispatcher based on the component's configuration:
 
@@ -57,20 +76,9 @@ class BillingUsageProcessor:
 
             Requires valid plan period for proper billing period calculation.
             Creates invoice items with usage-based quantities and pricing.
-
-        Args:
-            sender: Signal sender (model class)
-            instance: ComponentUsage instance that triggered the signal
-            created: Whether the usage record was just created
-            **kwargs: Additional signal arguments
         """
-        component_usage = instance
         resource = component_usage.resource
         offering_component = component_usage.component
-
-        # Ignore signal if usage value has not changed
-        if not created and not component_usage.tracker.has_changed("usage"):
-            return
 
         plan_period = component_usage.plan_period
         if not plan_period:
@@ -84,14 +92,16 @@ class BillingUsageProcessor:
             f"component '{offering_component.type}'. Reported usage: {component_usage.usage}"
         )
 
-        if offering_component.is_prepaid:
+        effective = billing_mode.resolve_component(offering_component, plan_period.plan)
+
+        if effective.is_prepaid:
             cls._process_prepaid_usage(component_usage)
-        elif offering_component.billing_type == BillingTypes.USAGE:
+        elif effective.billing_type == BillingTypes.USAGE:
             cls._create_or_update_usage_invoice_item(
                 resource=resource,
                 offering_component=offering_component,
                 usage_to_bill=component_usage.usage,
-                date=component_usage.date,
+                date=component_usage.billing_period,
                 plan_period=plan_period,
             )
 
@@ -143,10 +153,28 @@ class BillingUsageProcessor:
                 resource=resource,
                 offering_component=offering_component.overage_component,
                 usage_to_bill=overage_amount,
-                date=component_usage.date,
+                date=component_usage.billing_period,
                 plan_period=plan_period,
                 is_overage=True,
             )
+
+    @staticmethod
+    def _periods_of_month(plan_period, date):
+        """Periods of the same resource overlapping the month of ``date``."""
+        month_start = core_utils.month_start(date)
+        month_end = core_utils.month_end(date)
+        return (
+            marketplace_models.ResourcePlanPeriod.objects.filter(
+                resource=plan_period.resource
+            )
+            .filter(models_q.Q(start__isnull=True) | models_q.Q(start__lte=month_end))
+            .filter(models_q.Q(end__isnull=True) | models_q.Q(end__gte=month_start))
+        )
+
+    @classmethod
+    def _is_only_plan_period_of_month(cls, plan_period, date) -> bool:
+        others = cls._periods_of_month(plan_period, date).exclude(pk=plan_period.pk)
+        return not others.exists()
 
     @classmethod
     def _create_or_update_usage_invoice_item(
@@ -169,36 +197,116 @@ class BillingUsageProcessor:
         customer = resource.project.customer
         invoice, _ = MarketplaceBillingService.get_or_create_invoice(customer, date)
 
-        # Try to find an existing invoice item for this component in the current period
-        item = invoice.items.filter(
-            resource=resource,
-            details__offering_component_type=offering_component.type,
-        ).first()
-
-        try:
-            plan_component = plan.components.get(component=offering_component)
-        except ObjectDoesNotExist:
-            logger.error(
-                f"PlanComponent for component '{offering_component.type}' not found "
-                f"in plan '{plan.name}' for resource '{resource.uuid}'. Cannot bill usage."
+        if invoice.state not in invoice_models.Invoice.States.MUTABLE_STATES:
+            logger.warning(
+                "Skipping usage update for resource '%s' and component '%s' "
+                "because invoice %s-%02d is already in '%s' state.",
+                resource.uuid,
+                offering_component.type,
+                invoice.year,
+                invoice.month,
+                invoice.state,
             )
             return
 
+        # Try to find an existing invoice item for this component in the current
+        # period. Compensation items copy the main item's `details` wholesale
+        # (see MonthlyCompensation.calculate_current_compensations), so they
+        # also carry `offering_component_type` and can match this lookup by
+        # accident. Disambiguate with `unit_price__gte=0`: a real cost item's
+        # price is never negative, while compensation items (only created
+        # `if credit_compensation:`, i.e. nonzero) and discount items (only
+        # created `if discount_amount > 0`) are always created with strictly
+        # negative unit_price -- a hard domain invariant, unlike JSON detail
+        # keys such as `is_compensation`, which older rows may not carry.
+        candidates = invoice.items.filter(
+            resource=resource,
+            details__offering_component_type=offering_component.type,
+            unit_price__gte=0,
+        )
+        # One item per plan: after a mid-month plan switch the usage accrued
+        # under the old plan keeps its own item at the old price, while
+        # consecutive periods of the same plan continue one item.
+        same_plan_periods = [
+            period.uuid.hex
+            for period in cls._periods_of_month(plan_period, date).filter(plan=plan)
+        ]
+        item = candidates.filter(
+            details__plan_period_uuid__in=same_plan_periods or [plan_period.uuid.hex]
+        ).first()
+        if item is None:
+            # Legacy usage items carry no plan period. Adopt the one that names
+            # this plan, or any one when no other period shares the month;
+            # never a limit item (those carry resource_limit_periods) that a
+            # plan switch just closed.
+            legacy = candidates.exclude(details__has_key="plan_period_uuid").exclude(
+                details__has_key="resource_limit_periods"
+            )
+            item = legacy.filter(details__plan_uuid=plan.uuid.hex).first()
+            if item is None and cls._is_only_plan_period_of_month(plan_period, date):
+                item = legacy.first()
+
+        try:
+            plan_component = plan.components.get(component=offering_component)
+            unit_price = plan_component.price
+        except ObjectDoesNotExist:
+            # PlanComponent not found - use price 0 to still track usage
+            plan_component = None
+            unit_price = 0
+            if get_skip_side_effects():
+                logger.debug(
+                    f"PlanComponent for component '{offering_component.type}' not found "
+                    f"in plan '{plan.name}' for resource '{resource.uuid}' during import. Using price 0."
+                )
+            else:
+                logger.warning(
+                    f"PlanComponent for component '{offering_component.type}' not found "
+                    f"in plan '{plan.name}' for resource '{resource.uuid}'. Using price 0."
+                )
+
         converted_usage = convert_quantity(
-            usage_to_bill, resource.offering.type, offering_component.type
+            usage_to_bill,
+            resource.offering.type,
+            offering_component.type,
+            billing_type=billing_mode.resolve_component(
+                offering_component, plan
+            ).billing_type,
         )
 
         if item:
+            old_quantity = item.quantity
             item.quantity = converted_usage
-            item.save(update_fields=["quantity"])
+            update_fields = ["quantity"]
+            if item.details.get("plan_period_uuid") != plan_period.uuid.hex:
+                # An adopted legacy item is keyed to its period from now on.
+                item.details["plan_period_uuid"] = plan_period.uuid.hex
+                update_fields.append("details")
+            # Keep the aggregation volume in sync with re-reported usage; the
+            # org-aggregated discount is materialized at invoice finalization.
+            if plan_component is not None and not is_overage:
+                item.details[billing_discount.DISCOUNT_USAGE_KEY] = float(
+                    converted_usage
+                )
+                update_fields.append("details")
+            item.save(update_fields=update_fields)
             logger.info(
-                f"Updated invoice item {item.pk} for resource '{resource.uuid}'. New quantity: {item.quantity}"
+                f"Updated invoice item {item.pk} for resource '{resource.uuid}'. "
+                f"Quantity: {old_quantity} -> {item.quantity}"
             )
         else:
             # Create a new invoice item
-            details = get_component_details(resource, plan_component)
+            details = get_component_details(
+                resource,
+                plan_component,
+                offering_component=offering_component,
+                plan=plan,
+            )
+            details["plan_period_uuid"] = plan_period.uuid.hex
             if is_overage:
                 details["is_overage"] = True  # Add a flag for reporting
+            elif plan_component is not None:
+                # Record the volume feeding the org-aggregated volume discount.
+                details[billing_discount.DISCOUNT_USAGE_KEY] = float(converted_usage)
 
             month_start = core_utils.month_start(date)
             month_end = core_utils.month_end(date)
@@ -210,21 +318,27 @@ class BillingUsageProcessor:
             )
             end = min(plan_period.end, month_end) if plan_period.end else month_end
 
-            item_name = f"{resource.name} / {offering_component.name}"
+            item_name = (
+                f"{resource.name} ({resource.offering.name} / {plan.name}) / "
+                f"{offering_component.name}"
+            )
             if is_overage:
                 item_name += " (Overage)"
 
             invoice_models.InvoiceItem.objects.create(
                 resource=resource,
+                plan_component=plan_component,
                 project=resource.project,
                 invoice=invoice,
                 start=start,
                 end=end,
                 details=details,
-                unit_price=plan_component.price,
+                unit_price=unit_price,
                 quantity=converted_usage,
                 unit=common_mixins.UnitPriceMixin.Units.QUANTITY,
-                measured_unit=offering_component.measured_unit,
+                measured_unit=billing_mode.resolve_component(
+                    offering_component, plan
+                ).measured_unit,
                 article_code=offering_component.article_code or plan.article_code,
                 name=item_name,
             )
@@ -232,3 +346,84 @@ class BillingUsageProcessor:
                 f"Created new invoice item for resource '{resource.uuid}' and "
                 f"component '{offering_component.type}' with quantity {converted_usage}."
             )
+
+
+@shared_task(name="waldur_mastermind.marketplace.process_component_usage_billing")
+def process_component_usage_billing(
+    component_usage_id: int, created: bool, usage_changed: bool
+):
+    """
+    Async billing + policy fan-out for a single ComponentUsage save.
+
+    Loads the row by id, optionally re-runs billing (when the usage value
+    has actually changed), then fires every policy handler that used to
+    attach to ComponentUsage.post_save directly. All RabbitMQ publishes now
+    happen here, on a celery worker, so gunicorn is never blocked by a
+    stalled broker.
+
+    The policy handlers fire on every save (not just usage-field changes)
+    to match the pre-existing semantics — they used to be independently
+    wired to post_save and ran regardless of which field changed. The
+    billing branch is gated on ``usage_changed`` because re-billing for a
+    non-usage save (e.g. billing_period change) is wasteful.
+
+    Idempotent: re-running ``_run_billing`` for the same usage is safe
+    because ``_create_or_update_usage_invoice_item`` does upsert by
+    (resource, component, billing_period).
+    """
+    from waldur_mastermind.policy import handlers as policy_handlers
+
+    try:
+        usage = marketplace_models.ComponentUsage.objects.select_related(
+            *BILLING_RELATED_FIELDS
+        ).get(pk=component_usage_id)
+    except marketplace_models.ComponentUsage.DoesNotExist:
+        logger.info(
+            "ComponentUsage %s no longer exists; skipping async billing",
+            component_usage_id,
+        )
+        return
+
+    if usage_changed:
+        BillingUsageProcessor._run_billing(usage, created=created)
+
+    # Fire every handler that used to be wired directly to ComponentUsage
+    # post_save in policy/apps.py (those with trigger_class=ComponentUsage).
+    # These fire on every save to match the pre-MR semantics.
+    policy_handlers.offering_usage_policy_trigger_handler(
+        sender=marketplace_models.ComponentUsage,
+        instance=usage,
+        created=created,
+    )
+    policy_handlers.slurm_periodic_usage_policy_trigger_handler(
+        sender=marketplace_models.ComponentUsage,
+        instance=usage,
+        created=created,
+    )
+    policy_handlers.customer_component_usage_policy_trigger_handler(
+        sender=marketplace_models.ComponentUsage,
+        instance=usage,
+        created=created,
+    )
+
+
+def schedule_component_usage_billing(
+    sender,
+    instance: marketplace_models.ComponentUsage,
+    created: bool = False,
+    **kwargs,
+):
+    """
+    Thin post_save handler — schedules the async billing+policy task on commit.
+    """
+    if get_skip_side_effects():
+        return
+    usage_changed = created or instance.tracker.has_changed("usage")
+    usage_id = instance.pk
+    transaction.on_commit(
+        lambda: process_component_usage_billing.delay(
+            component_usage_id=usage_id,
+            created=created,
+            usage_changed=usage_changed,
+        )
+    )

@@ -22,6 +22,8 @@ from waldur_core.permissions.fixtures import (
     ProjectRole,
     ServiceProviderRole,
 )
+from waldur_core.quotas.models import QuotaUsage
+from waldur_core.structure.handlers import update_customer_users_count
 from waldur_core.structure.models import AccessSubnet, Customer, Project
 from waldur_core.structure.tests import factories, fixtures
 from waldur_core.structure.tests.utils import (
@@ -29,11 +31,15 @@ from waldur_core.structure.tests.utils import (
     client_delete_user,
     client_update_user,
 )
-from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
+from waldur_mastermind.marketplace.enums import (
+    BillingTypes,
+    LimitPeriods,
+    ResourceStates,
+)
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
-class CustomerBaseTest(test.APITransactionTestCase):
+class CustomerBaseTest(test.APITestCase):
     def setUp(self):
         CustomerRole.OWNER.add_permission(PermissionEnum.LIST_PROJECTS)
 
@@ -45,6 +51,11 @@ class CustomerBaseTest(test.APITransactionTestCase):
             query_string = urlencode({"field": fields}, doseq=True)
             url += f"?{query_string}"
         return url
+
+    def _get_customer_contact_url(self, customer):
+        return "http://testserver" + reverse(
+            "customer-contact", kwargs={"uuid": customer.uuid.hex}
+        )
 
     def _get_project_url(self, project):
         return "http://testserver" + reverse(
@@ -102,41 +113,6 @@ class CustomerListTest(CustomerBaseTest):
         self.client.force_authenticate(user=getattr(self.fixture, user))
         self._check_customer_in_list(customer, False)
 
-    # Nested objects filtration tests
-    @data("admin", "manager", "member")
-    def test_user_can_see_project_he_has_a_role_in_within_customer(self, user):
-        self.client.force_authenticate(user=getattr(self.fixture, user))
-
-        response = self.client.get(
-            self._get_customer_url(self.fixture.customer, fields=["projects", "url"])
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        project_urls = set([project["url"] for project in response.data["projects"]])
-        self.assertIn(
-            self._get_project_url(self.fixture.project),
-            project_urls,
-            "User should see project",
-        )
-
-    @data("admin", "manager", "member")
-    def test_user_cannot_see_project_he_has_no_role_in_within_customer(self, user):
-        self.client.force_authenticate(user=getattr(self.fixture, user))
-
-        non_seen_project = factories.ProjectFactory(customer=self.fixture.customer)
-
-        response = self.client.get(
-            self._get_customer_url(self.fixture.customer, fields=["projects", "url"])
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        project_urls = set([project["url"] for project in response.data["projects"]])
-        self.assertNotIn(
-            self._get_project_url(non_seen_project),
-            project_urls,
-            "User should not see project",
-        )
-
     @data("staff", "global_support")
     def test_user_can_access_all_customers_if_he_is_staff(self, user):
         self.client.force_authenticate(user=getattr(self.fixture, user))
@@ -166,6 +142,47 @@ class CustomerListTest(CustomerBaseTest):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["projects_count"], 0)
+
+    def test_filter_customers_by_current_user_has_project_create_permission(self):
+        """Test that filter returns only customers where user has CREATE_PROJECT permission."""
+        # Setup: Create customers and grant permission
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT)
+
+        customer_with_permission = factories.CustomerFactory()
+        factories.CustomerFactory()
+        factories.CustomerFactory()
+
+        user = factories.UserFactory()
+        customer_with_permission.add_user(user, CustomerRole.OWNER)
+
+        # Authenticate as user and filter
+        self.client.force_authenticate(user)
+        url = factories.CustomerFactory.get_list_url()
+
+        response = self.client.get(
+            url, {"current_user_has_project_create_permission": "true"}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], customer_with_permission.uuid.hex)
+
+    def test_filter_customers_staff_sees_all_regardless_of_permission(self):
+        """Test that staff users see all customers regardless of filter value."""
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT)
+
+        factories.CustomerFactory()
+        factories.CustomerFactory()
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.CustomerFactory.get_list_url()
+
+        # With filter=true, staff should see all
+        response = self.client.get(
+            url, {"current_user_has_project_create_permission": "true"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(len(response.data), 2)
 
     # Helper methods
     def _check_user_list_access_customers(self, customer, test_function):
@@ -546,7 +563,55 @@ class CustomerUpdateTest(BaseCustomerMutationTest):
         self.assertIn("project_metadata_checklist", response.data)
 
 
-class CustomerQuotasTest(test.APITransactionTestCase):
+class CustomerContactUpdateTest(CustomerBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.fixture = fixtures.ProjectFixture()
+        self.url = self._get_customer_contact_url(self.fixture.customer)
+        self.payload = {
+            "contact_details": "Updated contact details",
+            "email": "contact@example.com",
+            "phone_number": "+372000000",
+            "homepage": "http://example.com",
+            "notification_emails": "contact@example.com,alt@example.com",
+        }
+
+    def test_owner_can_update_contact_details_with_contact_permission(self):
+        CustomerRole.OWNER.delete_permission(PermissionEnum.UPDATE_CUSTOMER)
+        CustomerRole.OWNER.add_permission(PermissionEnum.CUSTOMER_CONTACT_UPDATE)
+        self.client.force_authenticate(user=self.fixture.owner)
+
+        response = self.client.post(self.url, self.payload)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.fixture.customer.refresh_from_db()
+        self.assertEqual(self.fixture.customer.email, self.payload["email"])
+        self.assertEqual(
+            self.fixture.customer.contact_details, self.payload["contact_details"]
+        )
+
+    def test_owner_can_update_contact_details_with_update_permission(self):
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_CUSTOMER)
+        CustomerRole.OWNER.delete_permission(PermissionEnum.CUSTOMER_CONTACT_UPDATE)
+        self.client.force_authenticate(user=self.fixture.owner)
+
+        response = self.client.post(self.url, self.payload)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.fixture.customer.refresh_from_db()
+        self.assertEqual(self.fixture.customer.email, self.payload["email"])
+
+    def test_owner_cannot_update_contact_details_without_permissions(self):
+        CustomerRole.OWNER.delete_permission(PermissionEnum.UPDATE_CUSTOMER)
+        CustomerRole.OWNER.delete_permission(PermissionEnum.CUSTOMER_CONTACT_UPDATE)
+        self.client.force_authenticate(user=self.fixture.owner)
+
+        response = self.client.post(self.url, self.payload)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class CustomerQuotasTest(test.APITestCase):
     def setUp(self):
         self.customer = factories.CustomerFactory()
         self.staff = factories.UserFactory(is_staff=True)
@@ -628,8 +693,80 @@ class CustomerQuotasTest(test.APITransactionTestCase):
         self.assertEqual(value, self.customer.get_quota_usage(name))
 
 
+class UpdateCustomerUsersCountTest(test.APITestCase):
+    """Test the bulk update_customer_users_count handler used by recalculate_quotas."""
+
+    def test_updates_user_count_for_direct_customer_users(self):
+        customer = factories.CustomerFactory()
+        user = factories.UserFactory()
+        customer.add_user(user, CustomerRole.OWNER)
+
+        # Reset quota to test bulk recalculation
+        QuotaUsage.objects.filter(scope=customer, name="nc_user_count").delete()
+        self.assertEqual(customer.get_quota_usage("nc_user_count"), 0)
+
+        # Trigger bulk recalculation
+        update_customer_users_count(sender=None)
+
+        self.assertEqual(customer.get_quota_usage("nc_user_count"), 1)
+
+    def test_updates_user_count_for_project_users(self):
+        customer = factories.CustomerFactory()
+        project = factories.ProjectFactory(customer=customer)
+        user = factories.UserFactory()
+        project.add_user(user, ProjectRole.ADMIN)
+
+        # Reset quota to test bulk recalculation
+        QuotaUsage.objects.filter(scope=customer, name="nc_user_count").delete()
+        self.assertEqual(customer.get_quota_usage("nc_user_count"), 0)
+
+        # Trigger bulk recalculation
+        update_customer_users_count(sender=None)
+
+        self.assertEqual(customer.get_quota_usage("nc_user_count"), 1)
+
+    def test_counts_unique_users_across_customer_and_project_roles(self):
+        customer = factories.CustomerFactory()
+        project = factories.ProjectFactory(customer=customer)
+        user = factories.UserFactory()
+
+        # Same user has both customer and project roles
+        customer.add_user(user, CustomerRole.OWNER)
+        project.add_user(user, ProjectRole.ADMIN)
+
+        # Reset quota to test bulk recalculation
+        QuotaUsage.objects.filter(scope=customer, name="nc_user_count").delete()
+
+        # Trigger bulk recalculation
+        update_customer_users_count(sender=None)
+
+        # User should only be counted once
+        self.assertEqual(customer.get_quota_usage("nc_user_count"), 1)
+
+    def test_updates_multiple_customers_in_batch(self):
+        customers = [factories.CustomerFactory() for _ in range(3)]
+        for i, customer in enumerate(customers):
+            for _ in range(i + 1):
+                user = factories.UserFactory()
+                customer.add_user(user, CustomerRole.OWNER)
+
+        # Reset all quotas
+        QuotaUsage.objects.filter(name="nc_user_count").delete()
+
+        # Trigger bulk recalculation
+        update_customer_users_count(sender=None)
+
+        # Verify each customer has correct count
+        for i, customer in enumerate(customers):
+            self.assertEqual(
+                customer.get_quota_usage("nc_user_count"),
+                i + 1,
+                f"Customer {i} should have {i + 1} users",
+            )
+
+
 @ddt
-class CustomerUsersListTest(test.APITransactionTestCase):
+class CustomerUsersListTest(test.APITestCase):
     all_users = (
         "staff",
         "owner",
@@ -864,7 +1001,7 @@ class CustomerUsersListTest(test.APITransactionTestCase):
 
 
 @ddt
-class AccountingIsRunningFilterTest(test.APITransactionTestCase):
+class AccountingIsRunningFilterTest(test.APITestCase):
     def setUp(self):
         self.enabled_customers = factories.CustomerFactory.create_batch(2)
         future_date = timezone.now() + timezone.timedelta(days=1)
@@ -1029,7 +1166,7 @@ class CustomerBlockedTest(CustomerBaseTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class CustomerOrganizationGroupFilterTest(test.APITransactionTestCase):
+class CustomerOrganizationGroupFilterTest(test.APITestCase):
     def setUp(self):
         self.organization_group = factories.OrganizationGroupFactory()
         self.customer1 = factories.CustomerFactory()
@@ -1068,19 +1205,26 @@ class CustomerOrganizationGroupFilterTest(test.APITransactionTestCase):
                 self.assertEqual(len(response.data), 0)
 
 
-class CustomerInetFilterTest(test.APITransactionTestCase):
+class CustomerInetFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
         self.customer.save()
 
+        # Explicitly portal-scoped: an entry only restricts sign-in when it says
+        # it applies to the portal, so an unscoped one would leave the customer
+        # visible and this test would assert nothing.
         self.access_subnet = AccessSubnet.objects.create(
-            customer=self.customer, inet="128.0.0.0/16"
+            customer=self.customer, inet="128.0.0.0/16", applies_to_portal=True
         )
 
-        self.patcher = mock.patch("waldur_core.structure.managers.core_utils")
+        # Patch only get_ip_address; normalize_ip_address must run for real so
+        # the filter receives a canonical IP string (or None), matching production.
+        self.patcher = mock.patch(
+            "waldur_core.structure.managers.core_utils.get_ip_address"
+        )
         self.mock = self.patcher.start()
-        self.mock.get_ip_address.return_value = "127.0.0.1"
+        self.mock.return_value = "127.0.0.1"
 
         self.url = factories.CustomerFactory.get_list_url()
 
@@ -1111,18 +1255,20 @@ class CustomerInetFilterTest(test.APITransactionTestCase):
         self.assertEqual(len(response.data), 1)
 
     def test_filter_breaks_if_ip_address_is_not_defined(self):
-        self.mock.get_ip_address.return_value = None
+        self.mock.return_value = None
 
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.get(self.url)
         self.assertEqual(len(response.data), 1)
 
 
-class CustomerResourceQuotasTest(test.APITransactionTestCase):
+@freeze_time("2025-06-01")
+class CustomerResourceQuotasTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CustomerFixture()
-        self.current_date = timezone.now()
-        self.previous_month_date = timezone.now() - datetime.timedelta(days=60)
+        # Use fixed dates within the same year to ensure ANNUAL limit period tests work correctly
+        self.current_date = datetime.datetime(2025, 10, 15, tzinfo=datetime.UTC)
+        self.previous_month_date = datetime.datetime(2025, 8, 15, tzinfo=datetime.UTC)
         self.customer = self.fixture.customer
         self.empty_customer = factories.CustomerFactory()
         self.project1 = factories.ProjectFactory(customer=self.customer)
@@ -1167,11 +1313,14 @@ class CustomerResourceQuotasTest(test.APITransactionTestCase):
             offering=self.offering,
             limits={"disk": 100},
         )
+        self.current_billing_period = datetime.date(2025, 10, 1)
+        self.previous_billing_period = datetime.date(2025, 8, 1)
         self.limit_usage = marketplace_factories.ComponentUsageFactory(
             resource=self.limit_based_resource,
             component=self.limit_based_component,
             usage=10,
             date=self.current_date,
+            billing_period=self.current_billing_period,
         )
         # create another limit_usage with 2 months back date
         marketplace_factories.ComponentUsageFactory(
@@ -1179,6 +1328,7 @@ class CustomerResourceQuotasTest(test.APITransactionTestCase):
             component=self.limit_based_component,
             usage=15,
             date=self.previous_month_date,
+            billing_period=self.previous_billing_period,
         )
         # create new usages for current month
         self.current_month_cpu_usage1 = marketplace_factories.ComponentUsageFactory(
@@ -1186,18 +1336,21 @@ class CustomerResourceQuotasTest(test.APITransactionTestCase):
             component=self.component1,  # CPU component
             usage=5,
             date=self.current_date,
+            billing_period=self.current_billing_period,
         )
         self.previous_month_cpu_usage1 = marketplace_factories.ComponentUsageFactory(
             resource=self.resource1,
             component=self.component1,  # CPU component
             usage=3,
             date=self.previous_month_date,
+            billing_period=self.previous_billing_period,
         )
         self.current_month_cpu_usage2 = marketplace_factories.ComponentUsageFactory(
             resource=self.resource2,
             component=self.component1,  # CPU component
             usage=2,
             date=self.current_date,
+            billing_period=self.current_billing_period,
         )
 
         self.current_month_ram_usage1 = marketplace_factories.ComponentUsageFactory(
@@ -1205,18 +1358,21 @@ class CustomerResourceQuotasTest(test.APITransactionTestCase):
             component=self.component2,  # RAM component
             usage=10,
             date=self.current_date,
+            billing_period=self.current_billing_period,
         )
         self.previous_month_ram_usage1 = marketplace_factories.ComponentUsageFactory(
             resource=self.resource1,
             component=self.component2,  # RAM component
             usage=8,
             date=self.previous_month_date,
+            billing_period=self.previous_billing_period,
         )
         self.current_month_ram_usage2 = marketplace_factories.ComponentUsageFactory(
             resource=self.resource2,
             component=self.component2,
             usage=4,
             date=self.current_date,
+            billing_period=self.current_billing_period,
         )
         self.url = factories.CustomerFactory.get_url(self.customer, "stats")
 
@@ -1236,17 +1392,21 @@ class CustomerResourceQuotasTest(test.APITransactionTestCase):
         cpu_component = next(
             component for component in components if component["type"] == "cpu"
         )
-        self.assertEqual(cpu_component["usage"], 3)
+        # current_usages is derived from the latest ComponentUsage per component:
+        # resource1 cpu=5 (current month), resource2 cpu=2 → sum=7
+        self.assertEqual(cpu_component["usage"], 7)
         self.assertEqual(cpu_component["limit"], 12)
         self.assertEqual(cpu_component["measured_unit"], "vCPU")
         # Check component stats for RAM
         ram_component = next(
             component for component in components if component["type"] == "ram"
         )
-        self.assertEqual(ram_component["usage"], 6)
+        # resource1 ram=10 (current month), resource2 ram=4 → sum=14
+        self.assertEqual(ram_component["usage"], 14)
         self.assertEqual(ram_component["limit"], 24)
         self.assertEqual(ram_component["measured_unit"], "GB")
 
+    @freeze_time("2025-10-15")
     def test_customer_with_resources_for_current_month(self):
         self.client.force_authenticate(self.fixture.staff)
 
@@ -1278,6 +1438,7 @@ class CustomerResourceQuotasTest(test.APITransactionTestCase):
         self.assertEqual(ram_component["limit"], 24)
         self.assertEqual(ram_component["measured_unit"], "GB")
 
+    @freeze_time("2025-10-15")
     def test_customer_with_limit_based_resources(self):
         self.client.force_authenticate(self.fixture.staff)
         response = self.client.get(self.url)
@@ -1286,10 +1447,12 @@ class CustomerResourceQuotasTest(test.APITransactionTestCase):
         disk_component = next(
             component for component in components if component["type"] == "disk"
         )
+        # disk is limit-based, so "usage" (for usage-based components) is 0
         self.assertEqual(disk_component["usage"], 0)
         self.assertEqual(disk_component["limit_usage"], 25)
         self.assertEqual(disk_component["measured_unit"], "GB")
 
+    @freeze_time("2025-10-15")
     def test_customer_with_limit_based_resources_for_current_month(self):
         self.client.force_authenticate(self.fixture.staff)
 
@@ -1305,7 +1468,60 @@ class CustomerResourceQuotasTest(test.APITransactionTestCase):
         self.assertEqual(disk_component["measured_unit"], "GB")
 
 
-class CustomerListHeadOptimizationTest(test.APITransactionTestCase):
+class CustomerProvidersTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.CustomerFixture()
+        self.customer = self.fixture.customer
+        self.empty_customer = factories.CustomerFactory()
+
+        self.project = factories.ProjectFactory(customer=self.customer)
+        self.service_provider = marketplace_factories.ServiceProviderFactory()
+        self.offering = marketplace_factories.OfferingFactory(
+            customer=self.service_provider.customer
+        )
+        self.resource = marketplace_factories.ResourceFactory(
+            project=self.project,
+            offering=self.offering,
+            state=ResourceStates.OK,
+        )
+
+        self.terminated_service_provider = (
+            marketplace_factories.ServiceProviderFactory()
+        )
+        self.terminated_offering = marketplace_factories.OfferingFactory(
+            customer=self.terminated_service_provider.customer
+        )
+        marketplace_factories.ResourceFactory(
+            project=self.project,
+            offering=self.terminated_offering,
+            state=ResourceStates.TERMINATED,
+        )
+
+        self.url = factories.CustomerFactory.get_url(self.customer, "providers")
+
+    def test_customer_with_no_resources(self):
+        self.client.force_authenticate(self.fixture.staff)
+        url = reverse("customer-providers", kwargs={"uuid": self.empty_customer.uuid})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, [])
+
+    def test_customer_with_active_resource_returns_its_provider(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        provider_uuids = {item["uuid"] for item in response.data}
+        self.assertEqual(provider_uuids, {self.service_provider.uuid.hex})
+
+    def test_provider_of_terminated_resource_is_excluded(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        provider_uuids = {item["uuid"] for item in response.data}
+        self.assertNotIn(self.terminated_service_provider.uuid.hex, provider_uuids)
+
+
+class CustomerListHeadOptimizationTest(test.APITestCase):
     def test_head_query_count_does_not_depend_on_queryset_size(self):
         self.client.force_authenticate(user=factories.UserFactory(is_staff=True))
 
@@ -1330,7 +1546,7 @@ class CustomerListHeadOptimizationTest(test.APITransactionTestCase):
         self.assertEqual(second_pass_queryset_size, 6)
 
 
-class CustomerDefaultTaxPercentValidationTest(test.APITransactionTestCase):
+class CustomerDefaultTaxPercentValidationTest(test.APITestCase):
     def setUp(self):
         self.customer = factories.CustomerFactory()
         self.staff = factories.UserFactory(is_staff=True)
@@ -1569,3 +1785,180 @@ class CustomerDescriptionTest(BaseCustomerMutationTest):
 
         with self.assertRaises(ValidationError):
             customer.full_clean()
+
+
+class CustomerAddressFieldsTest(BaseCustomerMutationTest):
+    """Test cases for the Customer address fields functionality."""
+
+    def test_address_fields_are_visible_in_get_response(self):
+        """Test that all address fields are visible in GET response."""
+        customer = factories.CustomerFactory(
+            city="Tallinn",
+            state="Harjumaa",
+            parish="Kesklinn",
+            street="Vabaduse väljak",
+            house_nr="10",
+            apartment_nr="5A",
+            household="Building A",
+        )
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        response = self.client.get(self._get_customer_url(customer))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("city", response.data)
+        self.assertIn("state", response.data)
+        self.assertIn("parish", response.data)
+        self.assertIn("street", response.data)
+        self.assertIn("house_nr", response.data)
+        self.assertIn("apartment_nr", response.data)
+        self.assertIn("household", response.data)
+        self.assertEqual(response.data["city"], "Tallinn")
+        self.assertEqual(response.data["state"], "Harjumaa")
+        self.assertEqual(response.data["parish"], "Kesklinn")
+        self.assertEqual(response.data["street"], "Vabaduse väljak")
+        self.assertEqual(response.data["house_nr"], "10")
+        self.assertEqual(response.data["apartment_nr"], "5A")
+        self.assertEqual(response.data["household"], "Building A")
+
+    def test_address_fields_are_updatable(self):
+        """Test that staff can update address fields."""
+        customer = factories.CustomerFactory()
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        payload = {
+            "city": "Tartu",
+            "state": "Tartumaa",
+            "parish": "Vanemuine",
+            "street": "Rüütli",
+            "house_nr": "23",
+            "apartment_nr": "1B",
+            "household": "Building C",
+        }
+
+        response = self.client.patch(self._get_customer_url(customer), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["city"], "Tartu")
+        self.assertEqual(response.data["state"], "Tartumaa")
+        self.assertEqual(response.data["parish"], "Vanemuine")
+        self.assertEqual(response.data["street"], "Rüütli")
+        self.assertEqual(response.data["house_nr"], "23")
+        self.assertEqual(response.data["apartment_nr"], "1B")
+        self.assertEqual(response.data["household"], "Building C")
+
+        # Verify in database
+        customer.refresh_from_db()
+        self.assertEqual(customer.city, "Tartu")
+        self.assertEqual(customer.state, "Tartumaa")
+
+    def test_address_fields_can_be_blank(self):
+        """Test that address fields can be blank."""
+        customer = factories.CustomerFactory(
+            city="",
+            state="",
+            parish="",
+            street="",
+            house_nr="",
+            apartment_nr="",
+            household="",
+        )
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        response = self.client.get(self._get_customer_url(customer))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["city"], "")
+        self.assertEqual(response.data["state"], "")
+        self.assertEqual(response.data["parish"], "")
+        self.assertEqual(response.data["street"], "")
+        self.assertEqual(response.data["house_nr"], "")
+        self.assertEqual(response.data["apartment_nr"], "")
+        self.assertEqual(response.data["household"], "")
+
+    def test_update_individual_address_field(self):
+        """Test updating a single address field at a time."""
+        customer = factories.CustomerFactory(city="", state="")
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        # Update only city
+        response = self.client.patch(
+            self._get_customer_url(customer), {"city": "Tallinn"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["city"], "Tallinn")
+        self.assertEqual(response.data["state"], "")
+
+        # Update only state
+        response = self.client.patch(
+            self._get_customer_url(customer), {"state": "Harjumaa"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["city"], "Tallinn")
+        self.assertEqual(response.data["state"], "Harjumaa")
+
+    def test_create_customer_with_address_fields(self):
+        """Test creating a customer with address fields."""
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        payload = self._get_valid_payload()
+        payload.update(
+            {
+                "city": "Pärnu",
+                "state": "Pärnumaa",
+                "street": "Karja",
+                "house_nr": "14",
+            }
+        )
+
+        response = self.client.post(factories.CustomerFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["city"], "Pärnu")
+        self.assertEqual(response.data["state"], "Pärnumaa")
+        self.assertEqual(response.data["street"], "Karja")
+        self.assertEqual(response.data["house_nr"], "14")
+
+        # Verify in database
+        customer = Customer.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(customer.city, "Pärnu")
+        self.assertEqual(customer.state, "Pärnumaa")
+
+    def test_address_fields_max_length(self):
+        """Test that address fields respect their maximum length."""
+        customer = factories.CustomerFactory()
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        # city, state, parish, house_nr, apartment_nr are max_length=100
+        # street is max_length=200, household is max_length=100
+        test_cases = [
+            {"city": "A" * 100},  # Valid
+            {"state": "B" * 100},  # Valid
+            {"parish": "C" * 100},  # Valid
+            {"street": "D" * 200},  # Valid
+            {"house_nr": "E" * 100},  # Valid
+            {"apartment_nr": "F" * 100},  # Valid
+            {"household": "G" * 100},  # Valid
+        ]
+
+        for payload in test_cases:
+            response = self.client.patch(self._get_customer_url(customer), payload)
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_200_OK,
+                f"Failed to update with payload: {payload}",
+            )
+
+    def test_owner_can_update_address_fields_with_permission(self):
+        """Test that owner can update address fields with UPDATE_CUSTOMER permission."""
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_CUSTOMER)
+        self.client.force_authenticate(user=self.fixture.owner)
+
+        response = self.client.patch(
+            self._get_customer_url(self.fixture.customer),
+            {"city": "Tallinn", "state": "Harjumaa"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["city"], "Tallinn")
+        self.assertEqual(response.data["state"], "Harjumaa")

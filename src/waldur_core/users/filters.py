@@ -50,34 +50,19 @@ class InvitationFilterBackend(BaseFilterBackend):
             if not permission:
                 continue
             scopes = get_scope_ids(user, content_type, permission=permission)
-
-            # Special handling for Call invitations - only show to managers, not reviewers
-            if content_type.model == 'call' and content_type.app_label == 'proposal':
-                from waldur_core.permissions.enums import RoleEnum
-                from waldur_core.permissions.utils import get_users
-
-                # Filter to only include Calls where user is a manager
-                from waldur_mastermind.proposal import models as proposal_models
-                call_manager_scopes = []
-                for call_id in scopes:
-                    try:
-                        call = proposal_models.Call.objects.get(id=call_id)
-                        # Check if user is a Call Manager (not just a reviewer)
-                        if call.has_user(user, RoleEnum.CALL_MANAGER):
-                            call_manager_scopes.append(call_id)
-                    except proposal_models.Call.DoesNotExist:
-                        pass
-                scopes = call_manager_scopes
-
             subquery |= Q(content_type=content_type, object_id__in=scopes)
 
         return queryset.filter(subquery).distinct()
 
 
 class BaseInvitationFilter(django_filters.FilterSet):
-    role_uuid = django_filters.UUIDFilter(field_name="role__uuid")
+    role_uuid = core_filters.RelatedUUIDFilter(
+        view_name="role-detail", field_name="role__uuid"
+    )
     role_name = django_filters.CharFilter(field_name="role__name")
-    customer_uuid = django_filters.UUIDFilter(field_name="customer__uuid")
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="customer__uuid"
+    )
     scope_type = django_filters.CharFilter(method="filter_by_scope_type")
 
     class Meta:
@@ -132,7 +117,7 @@ class GroupInvitationFilter(BaseInvitationFilter):
 
 
 class InvitationFilter(BaseInvitationFilter):
-    state = django_filters.MultipleChoiceFilter(choices=InvitationState.CHOICES)
+    state = django_filters.MultipleChoiceFilter(choices=InvitationState.choices)
     email = django_filters.CharFilter(lookup_expr="icontains")
     email_exact = django_filters.CharFilter(lookup_expr="iexact", field_name="email")
     scope_name = django_filters.CharFilter(method="filter_by_scope_name")
@@ -248,9 +233,15 @@ class PermissionRequestScopeFilterBackend(InvitationScopeFilterBackend):
 
 class PermissionRequestFilter(django_filters.FilterSet):
     state = core_filters.ReviewStateFilter()
-    customer_uuid = django_filters.UUIDFilter(field_name="invitation__customer__uuid")
-    invitation = django_filters.UUIDFilter(field_name="invitation__uuid")
-    created_by = django_filters.UUIDFilter(field_name="created_by__uuid")
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="invitation__customer__uuid"
+    )
+    invitation = core_filters.RelatedUUIDFilter(
+        view_name="user-invitation-detail", field_name="invitation__uuid"
+    )
+    created_by = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="created_by__uuid"
+    )
     o = django_filters.OrderingFilter(fields=("state", "created"))
 
     class Meta:
@@ -261,14 +252,24 @@ class PermissionRequestFilter(django_filters.FilterSet):
         ]
 
 
-def filter_pending_invitations(user):
-    subquery = Q(state=InvitationState.PENDING) & (
+def filter_invitations_for_recipient(user, states):
+    subquery = Q(state__in=states) & (
         Q(civil_number="") | Q(civil_number=user.civil_number)
     )
     if settings.WALDUR_CORE["VALIDATE_INVITATION_EMAIL"]:
         subquery = subquery & Q(email=user.email)
 
     return subquery
+
+
+def filter_pending_invitations(user):
+    return filter_invitations_for_recipient(user, [InvitationState.PENDING])
+
+
+def filter_inactive_invitations_for_recipient(user):
+    return filter_invitations_for_recipient(
+        user, [InvitationState.EXPIRED, InvitationState.CANCELED]
+    )
 
 
 def filter_by_connected_scopes(user):
@@ -293,4 +294,5 @@ class VisibleInvitationFilter(BaseFilterBackend):
             return queryset
         subquery1 = filter_pending_invitations(request.user)
         subquery2 = filter_by_connected_scopes(request.user)
-        return queryset.filter(subquery1 | subquery2)
+        subquery3 = filter_inactive_invitations_for_recipient(request.user)
+        return queryset.filter(subquery1 | subquery2 | subquery3)

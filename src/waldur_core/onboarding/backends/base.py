@@ -31,6 +31,20 @@ class ValidationRequest:
     additional_params: dict[str, Any] = field(default_factory=dict)
 
 
+class ErrorCode:
+    NOT_AUTHORIZED = "NOT_AUTHORIZED"
+    PERSON_NOT_LISTED = "PERSON_NOT_LISTED"
+    # More than one signatory matched the queried person (e.g. two board
+    # members with the same name) and the backend can't tell them apart on
+    # the identifiers available — escalate rather than guess.
+    AMBIGUOUS_MATCH = "AMBIGUOUS_MATCH"
+    API_ERROR = "API_ERROR"
+    UNKNOWN_ERROR = "UNKNOWN_ERROR"
+    COMPANY_NOT_FOUND = "COMPANY_NOT_FOUND"
+    NO_BACKEND_AVAILABLE = "NO_BACKEND_AVAILABLE"
+    CONFIGURATION_ERROR = "CONFIGURATION_ERROR"
+
+
 @dataclass
 class ValidationResult:
     """Standardized response from company validation."""
@@ -76,6 +90,50 @@ class CompanyRegistryBackend(ABC):
     @abstractmethod
     def get_required_fields(cls) -> list[str]:
         """Return list of required fields in ValidationRequest for this backend."""
+        pass
+
+    @classmethod
+    @abstractmethod
+    def get_person_identifier_fields(cls) -> dict[str, Any]:
+        """
+        Return specification of person identifier fields required by this backend.
+
+        Returns:
+            Dictionary describing the person identifier structure:
+            - For simple string identifiers (civil_number):
+              {
+                  "type": "string",
+                  "field": "civil_number",
+                  "label": "Personal ID (isikukood)",
+                  "description": "Estonian personal identification code",
+                  "example": "38001085718"
+              }
+            - For composite identifiers (first_name, last_name, birth_date):
+              {
+                  "type": "object",
+                  "fields": {
+                      "first_name": {
+                          "type": "string",
+                          "label": "First Name",
+                          "required": True,
+                          "example": "John"
+                      },
+                      "last_name": {
+                          "type": "string",
+                          "label": "Last Name",
+                          "required": True,
+                          "example": "Doe"
+                      },
+                      "birth_date": {
+                          "type": "date",
+                          "label": "Date of Birth",
+                          "required": True,
+                          "format": "YYYY-MM-DD",
+                          "example": "1980-01-08"
+                      }
+                  }
+              }
+        """
         pass
 
     @classmethod
@@ -178,6 +236,43 @@ class BackendRegistry:
 
         return None
 
+    def find_backend_by_method(
+        self, validation_method: str
+    ) -> CompanyRegistryBackend | None:
+        """
+        Find backend by its validation method name.
+
+        Args:
+            validation_method: Method name (e.g., 'ariregister', 'wirtschaftscompass')
+
+        Returns:
+            Backend instance or None if not found
+        """
+        for backend_class in self._backends:
+            backend_instance = backend_class()
+            if backend_instance.get_validation_method() == validation_method:
+                return backend_instance
+
+        return None
+
+    def get_person_identifier_fields_for_method(
+        self, validation_method: str
+    ) -> dict[str, Any] | None:
+        """
+        Get person identifier field specification for a specific validation method.
+
+        Args:
+            validation_method: Method name (e.g., 'ariregister', 'wirtschaftscompass')
+
+        Returns:
+            Dictionary with person identifier field specification or None if not found
+        """
+        for backend_class in self._backends:
+            if backend_class.get_validation_method() == validation_method:
+                return backend_class.get_person_identifier_fields()
+
+        return None
+
     def validate_company(self, request: ValidationRequest) -> ValidationResult:
         """
         Validate company using the best available backend.
@@ -197,7 +292,7 @@ class BackendRegistry:
                 company_data={},
                 user_roles=[],
                 raw_response={},
-                error_code="NO_BACKEND_AVAILABLE",
+                error_code=ErrorCode.NO_BACKEND_AVAILABLE,
                 error_message=f"No validation backend available for country {request.country}",
             )
 
@@ -213,7 +308,7 @@ class BackendRegistry:
                 company_data={},
                 user_roles=[],
                 raw_response={},
-                error_code="BACKEND_ERROR",
+                error_code=ErrorCode.API_ERROR,
                 error_message=f"Backend error: {str(e)}",
             )
 

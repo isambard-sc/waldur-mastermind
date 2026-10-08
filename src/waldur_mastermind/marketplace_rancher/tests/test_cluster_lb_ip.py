@@ -13,7 +13,7 @@ from waldur_rancher import models as rancher_models
 from waldur_rancher.tests import fixtures
 
 
-class ManagedRancherClusterIPTest(test.APITransactionTestCase):
+class ManagedRancherClusterIPTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.RancherFixture()
         self.neutron_client_patcher = mock.patch(
@@ -92,6 +92,11 @@ class ManagedRancherClusterIPTest(test.APITransactionTestCase):
         self.url = os_factories.InstanceFactory.get_url(
             self.instance, "update_floating_ips"
         )
+
+    def tearDown(self):
+        super().tearDown()
+        self.neutron_client_patcher.stop()
+        self.keystone_session_patcher.stop()
 
     @override_settings(task_always_eager=True)
     def test_public_ip_is_created_for_cluster(self):

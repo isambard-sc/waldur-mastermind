@@ -1,13 +1,18 @@
+import hashlib
 import logging
 import re
+import secrets
+from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 from django.apps import apps
 from django.conf import settings
+from django.conf import settings as django_settings
 from django.contrib.auth.models import PermissionsMixin, UserManager
 from django.core import validators
+from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.template.defaultfilters import slugify
 from django.utils import timezone as django_timezone
@@ -22,12 +27,22 @@ from rest_framework.authtoken.models import Token
 from reversion import revisions as reversion
 
 from waldur_core.core import managers as core_managers
+from waldur_core.core.enums import GENDER_CHOICES as _GENDER_CHOICES_RAW
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.fields import JSONField, UUIDField
 from waldur_core.core.utils import normalize_unicode, send_mail
 from waldur_core.core.validators import (
+    is_potentially_dangerous_regex,
+    matches_access_email_pattern,
+    normalize_network_acl,
+    validate_gender,
+    validate_iso_3166_alpha2,
     validate_name,
+    validate_nationalities,
+    validate_personal_title,
     validate_phone_number,
+    validate_refeds_assurance_list,
+    validate_schac_organization_type,
     validate_ssh_public_key,
 )
 from waldur_core.logging.mixins import LoggableMixin
@@ -43,6 +58,20 @@ DESCRIPTION_LENGTH = 4096
 NAME_LENGTH = 150
 
 USERNAME_REGEX = r"^[a-zA-Z0-9_.][a-zA-Z0-9_.-]*[a-zA-Z0-9_.$-]?$"
+
+# Portal-wide switch: the user slug holds the OpenPortal username rather than
+# a slug generated from the account name. Declared in core.features under
+# UserSection; read here and by waldur_openportal.utils.sync_user_slugs().
+OPENPORTAL_IDENTIFIER_FEATURE = "user.show_openportal_identifier"
+
+# Deployment-wide switch: this Waldur is an application and awards portal, so
+# Project.slug is the award identifier (0251-4064-4677-1) rather than a copy of
+# the OpenPortal project shortname. Declared in core.features under
+# WaldurDeploymentSection; read by waldur_openportal wherever a project slug
+# would otherwise be written from a shortname.
+APPLICATION_PORTAL_FEATURE = "deployment.application_portal_only"
+
+GENDER_CHOICES = [(code, _(label)) for code, label in _GENDER_CHOICES_RAW]
 
 
 class DescribableMixin(models.Model):
@@ -92,10 +121,21 @@ class SlugMixin(models.Model):
         abstract = True
 
     def save(self, *args, **kwargs):
-        if not self.slug:
+        if not self.slug and self.should_generate_slug():
             self.slug = self.generate_slug()
 
         super().save(*args, **kwargs)
+
+    def should_generate_slug(self) -> bool:
+        """
+        Whether an empty slug should be filled in from the source field.
+
+        True for every model whose slug is its own to invent. A model whose
+        slug is a copy of a value authored elsewhere overrides this, so that
+        "empty" keeps meaning "not set yet" instead of being replaced by a
+        guess - see User.
+        """
+        return True
 
     def generate_slug(self):
         slug_source = getattr(self, self.get_slug_source_field())
@@ -287,6 +327,13 @@ class User(
 
     id: int
 
+    # Overrides SlugMixin.slug to allow NULL. With
+    # OPENPORTAL_IDENTIFIER_FEATURE on, the slug holds the user's OpenPortal
+    # username and NULL is the meaningful state "not chosen yet" - distinct
+    # from a generated slug that only looks like one. Overriding a field
+    # inherited from an abstract base is sanctioned by Django.
+    slug = models.SlugField(blank=True, null=True, default=None)
+
     username = models.CharField(
         _("username"),
         max_length=128,
@@ -337,6 +384,30 @@ class User(
             "Designates whether the user is allowed to manage remote user identities."
         ),
     )
+    can_use_personal_access_tokens = models.BooleanField(
+        default=False,
+        help_text=_(
+            "Designates whether the user is allowed to create and use "
+            "personal access tokens."
+        ),
+    )
+    deactivation_reason = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text=_(
+            "Reason why the user was deactivated. Visible to staff and support."
+        ),
+    )
+    is_admin_deactivated = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text=_(
+            "Designates that the user was deactivated by an administrator and "
+            "must not be reactivated automatically by the role-sync task. "
+            "Visible to staff and support."
+        ),
+    )
     notifications_enabled = models.BooleanField(
         default=True,
         help_text=_(
@@ -359,6 +430,22 @@ class User(
         blank=True,
         help_text=_("Indicates what identity provider was used."),
     )
+    uid_number = models.PositiveBigIntegerField(
+        null=True,
+        blank=True,
+        help_text=_(
+            "POSIX UID from the identity provider; used when an offering's "
+            "uid_source is 'user_attribute'."
+        ),
+    )
+    primary_gid = models.PositiveBigIntegerField(
+        null=True,
+        blank=True,
+        help_text=_(
+            "POSIX primary GID from the identity provider; used when an "
+            "offering's gid_source is 'user_attribute'."
+        ),
+    )
     agreement_date = models.DateTimeField(
         _("agreement date"),
         blank=True,
@@ -379,28 +466,125 @@ class User(
     backend_id = models.CharField(max_length=255, blank=True)
     first_name = models.CharField(_("first name"), max_length=100, blank=True)
     last_name = models.CharField(_("last name"), max_length=100, blank=True)
-    unix_username = models.CharField(
-        verbose_name=_("UNIX username"),
-        max_length=50,
-        unique=True,
-        null=True,
-        help_text=_(
-            "A short, unique name for you. It will be used to form your local username on any systems. Should only contain lower-case letters and digits and must start with a letter."
-        ),
-        validators=[
-            validators.RegexValidator(
-                regex=r"^[a-z][a-z0-9]+$",
-                message="Must start with a letter and only contain numbers and letters.",
-            ),
-            validators.RegexValidator(
-                regex=r"(admin)|(root)$",
-                inverse_match=True,
-            ),
-            validators.MinLengthValidator(5),
-            validators.MaxLengthValidator(20),
-        ],
-    )
     birth_date = models.DateField(_("birth date"), null=True, blank=True)
+
+    # Identity Bridge fields
+    attribute_sources = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Per-attribute source and freshness tracking. "
+            "Format: {'field_name': {'source': 'isd:<name>', 'timestamp': 'ISO8601'}}."
+        ),
+    )
+    managed_isds = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_(
+            "List of ISD source identifiers this user can manage via Identity Bridge. "
+            "E.g., ['isd:puhuri', 'isd:fenix']. Non-empty list implies identity manager role."
+        ),
+    )
+    active_isds = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_(
+            "List of ISDs that have asserted this user exists. "
+            "User is deactivated when this becomes empty."
+        ),
+    )
+
+    # AAI (Authentication and Authorization Infrastructure) attributes
+    # Personal identity (from passport/IdP)
+    gender = models.CharField(
+        _("gender"),
+        max_length=10,
+        null=True,
+        blank=True,
+        choices=GENDER_CHOICES,
+        validators=[validate_gender],
+        help_text=_("User's gender (male, female, or unknown)"),
+    )
+    personal_title = models.CharField(
+        _("personal title"),
+        max_length=50,
+        blank=True,
+        validators=[validate_personal_title],
+        help_text=_("Honorific title (Mr, Ms, Dr, Prof, etc.)"),
+    )
+    place_of_birth = models.CharField(
+        _("place of birth"),
+        max_length=255,
+        blank=True,
+    )
+    address = models.CharField(
+        _("address"),
+        max_length=255,
+        blank=True,
+    )
+
+    # Geographic (ISO 3166-1 alpha-2)
+    country_of_residence = models.CharField(
+        _("country of residence"),
+        max_length=2,
+        blank=True,
+        validators=[validate_iso_3166_alpha2],
+    )
+    nationality = models.CharField(
+        _("nationality"),
+        max_length=2,
+        blank=True,
+        validators=[validate_iso_3166_alpha2],
+        help_text=_("Primary citizenship (ISO 3166-1 alpha-2 code)"),
+    )
+    nationalities = models.JSONField(
+        default=list,
+        blank=True,
+        validators=[validate_nationalities],
+        help_text=_("List of all citizenships (ISO 3166-1 alpha-2 codes)"),
+    )
+
+    # Organization extended
+    organization_country = models.CharField(
+        _("organization country"),
+        max_length=2,
+        blank=True,
+        validators=[validate_iso_3166_alpha2],
+    )
+    organization_type = models.CharField(
+        _("organization type"),
+        max_length=255,
+        blank=True,
+        validators=[validate_schac_organization_type],
+        help_text=_("SCHAC URN (e.g., urn:schac:homeOrganizationType:int:university)"),
+    )
+    organization_registry_code = models.CharField(
+        _("organization registry code"),
+        max_length=255,
+        blank=True,
+        help_text=_("Company registration code of the user's organization, if known"),
+    )
+    organization_vat_code = models.CharField(
+        _("organization VAT code"),
+        max_length=20,
+        blank=True,
+        help_text=_("VAT code of the user's organization"),
+    )
+    organization_address = models.CharField(
+        _("organization address"),
+        max_length=255,
+        blank=True,
+        help_text=_("Postal address of the user's organization"),
+    )
+
+    # Identity assurance (from IdP only)
+    eduperson_assurance = models.JSONField(
+        default=list,
+        blank=True,
+        validators=[validate_refeds_assurance_list],
+        help_text=_("REFEDS assurance profile URIs from identity provider"),
+    )
+
     query_field = models.CharField(max_length=300, blank=True)
     WHITELIST_FIELDS = [
         "is_superuser",
@@ -417,9 +601,28 @@ class User(
         "preferred_language",
         "backend_id",
         "is_identity_manager",
+        "can_use_personal_access_tokens",
         "affiliations",
         "first_name",
         "last_name",
+        # User profile attributes
+        "gender",
+        "personal_title",
+        "place_of_birth",
+        "address",
+        "country_of_residence",
+        "nationality",
+        "nationalities",
+        "organization_country",
+        "organization_type",
+        "organization_registry_code",
+        "organization_vat_code",
+        "organization_address",
+        "eduperson_assurance",
+        "managed_isds",
+        "active_isds",
+        "uid_number",
+        "primary_gid",
     ]
 
     @property
@@ -446,6 +649,17 @@ class User(
         verbose_name_plural = _("users")
         ordering = ["username"]
 
+    @property
+    def should_protect_user_details(self) -> bool:
+        """Return True if user profile fields (like organization) must be read-only."""
+
+        protected_methods = django_settings.WALDUR_CORE[
+            "PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS"
+        ]
+        return bool(
+            self.registration_method and self.registration_method in protected_methods
+        )
+
     def save(self, *args, **kwargs):
         if "update_fields" in kwargs and "query_field" not in kwargs["update_fields"]:
             update_fields = set(kwargs["update_fields"])
@@ -453,44 +667,39 @@ class User(
             kwargs["update_fields"] = update_fields
         self.query_field = normalize_unicode(self.full_name)
 
-        # The unix_username cannot be changed after creation as external systems may already depend on it.
-        prev = self.tracker.previous("unix_username")
-        if self.tracker.has_changed("unix_username") and prev:
-            new = self.unix_username
-            raise ValueError(
-                _(
-                    f"Cannot change unix_username of user ('{prev}' → '{new}') after creation."
-                )
+        # The slug is set once and never changes. It holds the user's local
+        # (POSIX) username: waldur_openportal.UserInfo.set_shortname() writes
+        # it, refusing to change a shortname that is already set because
+        # external systems form account names from it and cannot follow a
+        # rename. The slug is a copy of that, so it has to be just as fixed -
+        # otherwise the authoritative value stays put while the copy everyone
+        # reads drifts away from it.
+        #
+        # set_shortname() announces its own writes by setting
+        # _syncing_to_userinfo, a flag that already existed for this purpose
+        # and was never read. Bulk reconciliation
+        # (waldur_openportal.utils) sets it too.
+        if (
+            self.pk
+            and not getattr(self, "_syncing_to_userinfo", False)
+            and self.tracker.has_changed("slug")
+            and self.tracker.previous("slug")
+        ):
+            raise ValidationError(
+                {
+                    "slug": _(
+                        "Cannot change the local username of %(user)s from "
+                        "'%(old)s' to '%(new)s' once it is set."
+                    )
+                    % {
+                        "user": self.username,
+                        "old": self.tracker.previous("slug"),
+                        "new": self.slug,
+                    }
+                }
             )
 
-        # Capture whether unix_username changed BEFORE saving (tracker resets after save)
-        unix_username_changed = self.tracker.has_changed("unix_username")
-
         super().save(*args, **kwargs)
-
-        # Sync unix_username changes to UserInfo.shortname and User.slug
-        # Use _syncing_to_userinfo flag to prevent circular updates
-        if (
-            unix_username_changed
-            and self.unix_username
-            and not getattr(self, "_syncing_to_userinfo", False)
-        ):
-            try:
-                from waldur_openportal.models import UserInfo
-
-                user_info = UserInfo.objects.filter(user=self).first()
-                if user_info:
-                    # UserInfo exists - sync through set_shortname which will update slug
-                    if user_info.shortname != self.unix_username:
-                        user_info.set_shortname(self.unix_username)
-                else:
-                    # UserInfo doesn't exist yet - directly update slug to match unix_username
-                    if self.slug != self.unix_username:
-                        User.objects.filter(pk=self.pk).update(slug=self.unix_username)
-            except Exception:
-                # waldur_openportal may not be installed - still update slug
-                if self.slug != self.unix_username:
-                    User.objects.filter(pk=self.pk).update(slug=self.unix_username)
 
     def get_log_fields(self):
         return (
@@ -545,6 +754,20 @@ class User(
     @classmethod
     def get_slug_source_field(cls):
         return "username"
+
+    def should_generate_slug(self) -> bool:
+        """
+        With OPENPORTAL_IDENTIFIER_FEATURE on, an unset slug stays unset.
+
+        The slug is then a copy of the user's OpenPortal username
+        (waldur_openportal UserInfo.shortname), which the user chooses once
+        and which nothing else can supply. Inventing one from the username -
+        SlugMixin's default - would put a value in front of the people who
+        read the slug as that identifier, and it would be the wrong one.
+        With the feature off, the slug is an ordinary generated slug and this
+        model behaves as it always has.
+        """
+        return not is_feature_enabled(OPENPORTAL_IDENTIFIER_FEATURE)
 
 
 class ImpersonatedUser(User):
@@ -700,7 +923,7 @@ class SshPublicKey(TimeStampedModel, LoggableMixin, UuidMixin, models.Model):
         unique_together = ("user", "name")
         verbose_name = _("SSH public key")
         verbose_name_plural = _("SSH public keys")
-        ordering = ["name"]
+        ordering = ["name", "id"]
 
     def save(
         self, force_insert=False, force_update=False, using=None, update_fields=None
@@ -722,7 +945,12 @@ class SshPublicKey(TimeStampedModel, LoggableMixin, UuidMixin, models.Model):
                 "fingerprint_md5", "fingerprint_sha256", "fingerprint_sha512"
             )
 
-        super().save(force_insert, force_update, using, update_fields)
+        super().save(
+            force_insert=force_insert,
+            force_update=force_update,
+            using=using,
+            update_fields=update_fields,
+        )
 
     def __str__(self):
         return f"{self.name} - {self.fingerprint_sha512}, user: {self.user.username}, {self.user.full_name}"
@@ -768,24 +996,30 @@ class StateMixin(ErrorMessageMixin, ConcurrentTransitionMixin):
 
     state = FSMIntegerField(
         default=CoreStates.CREATION_SCHEDULED,
-        choices=CoreStates.CHOICES,
+        choices=CoreStates.choices,
     )
 
     @transition(
-        field=state, source=CoreStates.CREATION_SCHEDULED, target=CoreStates.CREATING
+        field=state,
+        source=[CoreStates.CREATION_SCHEDULED, CoreStates.CREATING],
+        target=CoreStates.CREATING,
     )
     def begin_creating(self):
         pass
 
     @transition(
-        field=state, source=CoreStates.UPDATE_SCHEDULED, target=CoreStates.UPDATING
+        field=state,
+        source=[CoreStates.UPDATE_SCHEDULED, CoreStates.UPDATING],
+        target=CoreStates.UPDATING,
     )
     def begin_updating(self):
         if hasattr(self, "update_triggered"):
             self.update_triggered = django_timezone.now()
 
     @transition(
-        field=state, source=CoreStates.DELETION_SCHEDULED, target=CoreStates.DELETING
+        field=state,
+        source=[CoreStates.DELETION_SCHEDULED, CoreStates.DELETING],
+        target=CoreStates.DELETING,
     )
     def begin_deleting(self):
         pass
@@ -882,20 +1116,38 @@ class Feature(models.Model):
     value = models.BooleanField(default=False)
 
 
+def is_feature_enabled(key: str) -> bool:
+    """
+    Whether a core feature flag is on.
+
+    Features are almost always read by homeport to decide what to render;
+    this is for the rare flag that also decides what the backend stores. One
+    indexed lookup on a table of a few dozen rows, read at the point of use
+    so that flipping the flag takes effect immediately.
+    """
+    return Feature.objects.filter(key=key, value=True).exists()
+
+
+@reversion.register()
 class NotificationTemplate(UuidMixin, NameMixin, TimeStampedModel):
     """
     Model for storing notification templates.
 
-    Stores template paths for different notification types.
-    Used by the notification system to render email and other notifications.
+    Stores template paths for different notification types, along with the
+    DB-stored content override served by DatabaseTemplateLoader. Blank content
+    means no override is stored and the filesystem template is used as-is.
     """
 
     path = models.CharField(
-        _("path"), max_length=150, help_text=_("Example: 'flatpages/default.html'")
+        _("path"),
+        max_length=150,
+        unique=True,
+        help_text=_("Example: 'flatpages/default.html'"),
     )
+    content = models.TextField(_("content"), blank=True, default="")
 
     class Meta:
-        ordering = ["name", "path"]
+        ordering = ["name", "path", "id"]
 
     def __str__(self):
         return self.path
@@ -912,7 +1164,7 @@ class Notification(UuidMixin, DescribableMixin, TimeStampedModel):
 
     key = models.CharField(max_length=255, unique=True, blank=False)
     enabled = models.BooleanField(
-        default=True, help_text=_("Indicates if notification is enabled or disabled")
+        default=False, help_text=_("Indicates if notification is enabled or disabled")
     )
     templates = models.ManyToManyField(NotificationTemplate)
 
@@ -945,6 +1197,47 @@ class ActionMixin(StateMixin):
         return [model for model in apps.get_models() if issubclass(model, cls)]
 
 
+@dataclass
+class FilterCheckResult:
+    """Per-filter outcome for a single rule+user evaluation."""
+
+    name: str
+    configured: bool
+    matched: bool
+    user_value: Any = None
+    rule_value: Any = None
+    reason: str = ""
+
+
+@dataclass
+class RuleEvaluationResult:
+    """Structured outcome of evaluating one rule against one user."""
+
+    matched: bool
+    filter_results: list[FilterCheckResult] = field(default_factory=list)
+
+
+# User columns a claim lookup may fall back to when the claim is not present in
+# ``User.details``. Restricted to identity-provider-sourced profile attributes:
+# the claim name is administrator-supplied, and a bare ``getattr`` would happily
+# read ``password`` or ``is_staff``.
+_CLAIM_FALLBACK_USER_FIELDS = frozenset(
+    {
+        "affiliations",
+        "country_of_residence",
+        "eduperson_assurance",
+        "identity_source",
+        "job_title",
+        "nationalities",
+        "nationality",
+        "organization",
+        "organization_country",
+        "organization_type",
+        "registration_method",
+    }
+)
+
+
 class UserDetailsMatchMixin(models.Model):
     class Meta:
         abstract = True
@@ -957,39 +1250,352 @@ class UserDetailsMatchMixin(models.Model):
         default=list,
         blank=True,
     )
+    user_identity_sources = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="List of allowed identity sources (identity providers).",
+    )
+
+    # AAI-based filtering fields
+    user_nationalities = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_(
+            "List of allowed nationality codes (ISO 3166-1 alpha-2). "
+            "User must have one of these."
+        ),
+    )
+    user_organization_types = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_(
+            "List of allowed organization type URNs (SCHAC). User must match one."
+        ),
+    )
+    user_assurance_levels = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_("List of required assurance URIs. User must have ALL of these."),
+    )
 
     @classmethod
-    def get_objects_by_user_patterns(cls, user: User, required=True):
-        items = []
-        for item in cls.objects.all():
-            if (
-                not required
-                and not item.user_email_patterns
-                and not item.user_affiliations
+    def evaluate_for_user(
+        cls, item, user: "User", required: bool = True
+    ) -> RuleEvaluationResult:
+        """Evaluate a single rule against a user and return a structured breakdown.
+
+        Mirrors the semantics of :meth:`get_objects_by_user_patterns`:
+
+        * basic filters (email patterns, affiliations, identity sources) use OR
+          logic — any configured-and-matched filter passes the group;
+        * if no basic filter is configured, the group passes by default;
+        * AAI filters (nationality OR, organization type OR, assurance level AND)
+          are additional requirements — each configured filter must pass;
+        * when ``required=False`` and the rule has no filters configured at all,
+          the rule matches regardless.
+        """
+        filter_results: list[FilterCheckResult] = []
+
+        # Basic filters (OR group) — affiliations
+        user_affiliations = set(user.affiliations or [])
+        rule_affiliations = set(item.user_affiliations or [])
+        affiliations_configured = bool(rule_affiliations)
+        affiliations_matched = bool(user_affiliations & rule_affiliations)
+        filter_results.append(
+            FilterCheckResult(
+                name="affiliations",
+                configured=affiliations_configured,
+                matched=affiliations_matched,
+                user_value=sorted(user_affiliations) if user_affiliations else [],
+                rule_value=sorted(rule_affiliations) if rule_affiliations else [],
+                reason=(
+                    "Not configured"
+                    if not affiliations_configured
+                    else (
+                        "User affiliation intersects rule"
+                        if affiliations_matched
+                        else "No user affiliation is listed by the rule"
+                    )
+                ),
+            )
+        )
+
+        # Basic filters (OR group) — email patterns
+        email_patterns = list(item.user_email_patterns or [])
+        email_configured = bool(email_patterns)
+        email_matched = email_configured and any(
+            cls._is_pattern_match(pattern, user.email) for pattern in email_patterns
+        )
+        filter_results.append(
+            FilterCheckResult(
+                name="email_patterns",
+                configured=email_configured,
+                matched=email_matched,
+                user_value=user.email or "",
+                rule_value=email_patterns,
+                reason=(
+                    "Not configured"
+                    if not email_configured
+                    else (
+                        "User email matches a configured pattern"
+                        if email_matched
+                        else "User email does not match any configured pattern"
+                    )
+                ),
+            )
+        )
+
+        # Basic filters (OR group) — identity sources
+        identity_sources = list(item.user_identity_sources or [])
+        identity_configured = bool(identity_sources)
+        identity_matched = (
+            identity_configured and user.identity_source in identity_sources
+        )
+        filter_results.append(
+            FilterCheckResult(
+                name="identity_sources",
+                configured=identity_configured,
+                matched=identity_matched,
+                user_value=user.identity_source or "",
+                rule_value=identity_sources,
+                reason=(
+                    "Not configured"
+                    if not identity_configured
+                    else (
+                        "User identity source is allowed"
+                        if identity_matched
+                        else "User identity source is not in the allowed list"
+                    )
+                ),
+            )
+        )
+
+        any_basic_configured = (
+            affiliations_configured or email_configured or identity_configured
+        )
+        basic_match = (not any_basic_configured) or (
+            affiliations_matched or email_matched or identity_matched
+        )
+
+        # AAI filter — nationality (OR group)
+        nationalities = list(item.user_nationalities or [])
+        nat_configured = bool(nationalities)
+        user_nat = getattr(user, "nationality", "") or ""
+        user_nats = getattr(user, "nationalities", []) or []
+        all_user_nats = ({user_nat} | set(user_nats)) - {""}
+        nat_matched = (not nat_configured) or bool(all_user_nats & set(nationalities))
+        filter_results.append(
+            FilterCheckResult(
+                name="nationalities",
+                configured=nat_configured,
+                matched=nat_matched,
+                user_value=sorted(all_user_nats) if all_user_nats else [],
+                rule_value=nationalities,
+                reason=(
+                    "Not configured"
+                    if not nat_configured
+                    else (
+                        "User nationality is in the allowed list"
+                        if nat_matched
+                        else "User has no nationality in the allowed list"
+                    )
+                ),
+            )
+        )
+
+        # AAI filter — organization type (OR group)
+        org_types = list(item.user_organization_types or [])
+        org_type_configured = bool(org_types)
+        user_org_type = getattr(user, "organization_type", "") or ""
+        org_type_matched = (not org_type_configured) or (user_org_type in org_types)
+        filter_results.append(
+            FilterCheckResult(
+                name="organization_types",
+                configured=org_type_configured,
+                matched=org_type_matched,
+                user_value=user_org_type,
+                rule_value=org_types,
+                reason=(
+                    "Not configured"
+                    if not org_type_configured
+                    else (
+                        "User organization type is in the allowed list"
+                        if org_type_matched
+                        else "User organization type is not in the allowed list"
+                    )
+                ),
+            )
+        )
+
+        # AAI filter — assurance levels (AND group: user must have ALL required)
+        assurance = list(item.user_assurance_levels or [])
+        assurance_configured = bool(assurance)
+        user_assurance = set(getattr(user, "eduperson_assurance", []) or [])
+        required_assurance = set(assurance)
+        assurance_matched = (not assurance_configured) or required_assurance.issubset(
+            user_assurance
+        )
+        filter_results.append(
+            FilterCheckResult(
+                name="assurance_levels",
+                configured=assurance_configured,
+                matched=assurance_matched,
+                user_value=sorted(user_assurance) if user_assurance else [],
+                rule_value=assurance,
+                reason=(
+                    "Not configured"
+                    if not assurance_configured
+                    else (
+                        "User holds all required assurance levels"
+                        if assurance_matched
+                        else "User is missing one or more required assurance levels"
+                    )
+                ),
+            )
+        )
+
+        # Claim filter (AND across claim names, OR within one claim's values).
+        # Deliberately not part of the basic OR group: a rule that grants a role
+        # off an identity provider claim must not be satisfied by an unrelated
+        # email match. Only models that declare `user_claims` carry it.
+        claims = getattr(item, "user_claims", None) or {}
+        claims_configured = bool(claims)
+        claims_matched = True
+        claims_user_value: dict[str, list] = {}
+        unmatched_claims: list[str] = []
+        for claim_name, accepted in claims.items():
+            present = cls._get_user_claim_values(user, claim_name)
+            claims_user_value[claim_name] = present
+            if not any(
+                cls._is_claim_value_match(pattern, value)
+                for pattern in (accepted or [])
+                for value in present
             ):
-                items.append(item)
+                claims_matched = False
+                unmatched_claims.append(claim_name)
+        filter_results.append(
+            FilterCheckResult(
+                name="claims",
+                configured=claims_configured,
+                matched=claims_matched,
+                user_value=claims_user_value,
+                rule_value=claims,
+                reason=(
+                    "Not configured"
+                    if not claims_configured
+                    else (
+                        "User claims satisfy every configured claim"
+                        if claims_matched
+                        else "User does not carry an accepted value for: "
+                        + ", ".join(unmatched_claims)
+                    )
+                ),
+            )
+        )
 
-            if set(user.affiliations or []) & set(item.user_affiliations) or any(
-                cls._is_pattern_match(pattern, user.email)
-                for pattern in item.user_email_patterns
-            ):
-                items.append(item)
+        aai_match = nat_matched and org_type_matched and assurance_matched
 
-        return items
+        any_configured = any_basic_configured or bool(
+            nationalities or org_types or assurance or claims
+        )
 
+        if not required and not any_configured:
+            return RuleEvaluationResult(matched=True, filter_results=filter_results)
+
+        return RuleEvaluationResult(
+            matched=bool(basic_match and aai_match and claims_matched),
+            filter_results=filter_results,
+        )
+
+    @staticmethod
+    def _get_user_claim_values(user: "User", claim: str) -> list:
+        """Values a user carries for an identity provider claim.
+
+        ``User.details`` holds the raw claims listed in
+        ``IdentityProvider.extra_fields`` and is therefore the primary source.
+        A claim whose name matches a mapped ``User`` column (``affiliations``,
+        ``organization``, …) falls back to that column, so a deployment that
+        maps the claim through ``attribute_mapping`` instead of ``extra_fields``
+        still matches. Scalars are normalised to a single-element list.
+        """
+        raw = (user.details or {}).get(claim)
+        if raw in (None, "", []) and claim in _CLAIM_FALLBACK_USER_FIELDS:
+            raw = getattr(user, claim, None)
+        if raw in (None, "", []):
+            return []
+        if isinstance(raw, list | tuple | set):
+            return [value for value in raw if value not in (None, "")]
+        return [raw]
+
+    @staticmethod
+    def _is_claim_value_match(pattern, value) -> bool:
+        """Exact match, or prefix match when the pattern ends in ``*``.
+
+        Deliberately not a regex: unlike ``user_email_patterns`` this field
+        decides whether a role is granted, so it stays off the ReDoS surface.
+        The prefix form covers entitlement URNs, which commonly carry a
+        trailing ``#authority`` fragment
+        (``urn:mace:example.org:group:hpc-*``).
+        """
+        if not isinstance(pattern, str) or not isinstance(value, str):
+            return False
+        if pattern.endswith("*"):
+            prefix = pattern[:-1]
+            return bool(prefix) and value.startswith(prefix)
+        return pattern == value
+
+    @classmethod
+    def get_objects_by_user_patterns(cls, user: "User", required=True):
+        return [
+            item
+            for item in cls.objects.all()
+            if cls.evaluate_for_user(item, user, required=required).matched
+        ]
+
+    @staticmethod
+    def _is_potentially_dangerous_pattern(pattern: str) -> bool:
+        """Check if a regex pattern might cause ReDoS."""
+        return is_potentially_dangerous_regex(pattern)
+
+    @staticmethod
     def _is_pattern_match(pattern, email):
-        """Safely check if email matches pattern, handling invalid regex patterns."""
-        if not pattern or not isinstance(pattern, str):
-            return False
-        try:
-            return bool(re.match(pattern, email))
-        except re.error as e:
-            logger.warning("Invalid regex pattern '%s': %s", pattern, e)
-            return False
+        """Whether ``email`` matches ``pattern``, with access-control semantics.
+
+        Every caller decides access. Auto-provisioning rules grant roles, and
+        membership restrictions, invitations and call eligibility decide who may
+        join. So this delegates to :func:`matches_access_email_pattern`: the whole
+        address must match, case-insensitively, and an invalid or potentially
+        dangerous pattern never matches. Matching only at the start would let
+        ``.*@example\\.com`` admit ``alice@example.com.attacker.net``.
+        """
+        return matches_access_email_pattern([pattern], email)
+
+    @staticmethod
+    def _suggest_regex_for_wildcard(pattern) -> str | None:
+        """The regex equivalent of a wildcard pattern, or None if it isn't one.
+
+        A pattern counts as a wildcard when it has a ``*`` and no other regex
+        metacharacter apart from ``.``. A broken regex such as ``(.*@x`` is
+        left alone, because escaping it would produce a misleading suggestion.
+
+        Each ``*`` becomes ``.*`` and everything else is escaped. The result
+        ends with ``$`` unless the wildcard ended with ``*``, so
+        ``*@example.org`` becomes ``.*@example\\.org$``. ``_is_pattern_match``
+        already matches the whole address, so the ``$`` is redundant here. It is
+        kept because the suggestion is meant to be copied, and it stays correct
+        wherever the regex ends up.
+        """
+        if not isinstance(pattern, str) or "*" not in pattern:
+            return None
+        if re.search(r"[\\^$+?()\[\]{}|]", pattern):
+            return None
+        regex = ".*".join(re.escape(part) for part in pattern.split("*"))
+        return regex if pattern.endswith("*") else regex + "$"
 
     @staticmethod
     def validate_user_email_patterns(patterns: list) -> None:
         invalid_patterns = []
+        dangerous_patterns = []
 
         for pattern in patterns:
             if not pattern or not isinstance(pattern, str):
@@ -999,8 +1605,156 @@ class UserDetailsMatchMixin(models.Model):
                 re.compile(pattern)
             except re.error:
                 invalid_patterns.append(pattern)
+                continue
 
+            # Check for ReDoS patterns
+            if UserDetailsMatchMixin._is_potentially_dangerous_pattern(pattern):
+                dangerous_patterns.append(pattern)
+
+        errors = []
         if invalid_patterns:
-            raise serializers.ValidationError(
-                f"Invalid regex patterns: {invalid_patterns}"
+            errors.append(f"Invalid regex patterns: {invalid_patterns}")
+            # The usual mistake is a shell-style wildcard such as
+            # "*@example.org", which is not a valid regex. Suggest the regex
+            # that means the same thing, rather than leaving the administrator
+            # to work out why an obvious pattern is rejected.
+            for pattern in invalid_patterns:
+                suggestion = UserDetailsMatchMixin._suggest_regex_for_wildcard(pattern)
+                if suggestion:
+                    errors.append(
+                        "Patterns are regular expressions, not wildcards: "
+                        f"use '{suggestion}' instead of '{pattern}'."
+                    )
+        if dangerous_patterns:
+            errors.append(
+                f"Potentially dangerous patterns (nested quantifiers or too long): {dangerous_patterns}"
             )
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+
+class AvailableMixin(models.Model):
+    class Meta:
+        abstract = True
+
+    can_be_managed = models.BooleanField(default=True)
+
+
+class BackendMissingMixin(models.Model):
+    """
+    Mixin for resources that may disappear from the backend.
+
+    Records the moment a resource was first observed as missing, so that a fresh
+    disappearance can be told apart from a long-dead leftover. The field is
+    cleared as soon as the resource is seen at the backend again.
+    """
+
+    class Meta:
+        abstract = True
+
+    backend_missing_since = models.DateTimeField(null=True, blank=True)
+
+
+class DailyTableSizeHistory(models.Model):
+    """
+    Stores daily snapshots of database table sizes for trend analysis.
+    Used to detect abnormal growth patterns that may indicate bugs.
+    """
+
+    table_name = models.CharField(max_length=150, db_index=True)
+    date = models.DateField(db_index=True)
+    total_size = models.BigIntegerField(
+        help_text="Total size including indexes in bytes"
+    )
+    data_size = models.BigIntegerField(help_text="Data-only size in bytes")
+    row_estimate = models.BigIntegerField(null=True, help_text="Estimated row count")
+
+    class Meta:
+        unique_together = ("table_name", "date")
+        verbose_name = "Daily table size history"
+        verbose_name_plural = "Daily table size history"
+        ordering = ["-date", "table_name", "id"]
+
+    def __str__(self):
+        return f"{self.table_name} ({self.date})"
+
+
+class PersonalAccessToken(UuidMixin, NameMixin, TimeStampedModel):
+    """Named, scoped, time-limited token for programmatic API access.
+
+    The full token is shown only once at creation. Only the SHA-256 hash
+    is stored; lookup is by hash (indexed, unique).
+    """
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="personal_access_tokens",
+    )
+    token_prefix = models.CharField(max_length=10)
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    scopes = models.JSONField(default=list)
+    # List of {"content_type_id": int, "object_id": int}.
+    # Empty list = no entity restriction (the permission allowlist still applies).
+    allowed_scopes = models.JSONField(default=list, blank=True)
+    # List of canonical CIDR strings. Empty list = no network restriction.
+    allowed_networks = models.JSONField(
+        default=list, blank=True, validators=[normalize_network_acl]
+    )
+    expires_at = models.DateTimeField()
+    is_active = models.BooleanField(default=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    last_used_ip = models.GenericIPAddressField(null=True, blank=True)
+    use_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["-created", "id"]
+
+    def __str__(self):
+        return f"{self.name} ({self.token_prefix}...)"
+
+    @staticmethod
+    def generate_token(expires_at):
+        """Return (full_token, prefix, sha256_hex).
+
+        Token format: ``w_<unix_timestamp>_<random>`` so that expiry
+        is visible by inspecting the token string.
+        """
+        ts = int(expires_at.timestamp())
+        raw = secrets.token_urlsafe(32)  # 256 bits
+        full_token = f"w_{ts}_{raw}"
+        prefix = full_token[:8]
+        token_hash = hashlib.sha256(full_token.encode()).hexdigest()
+        return full_token, prefix, token_hash
+
+    @property
+    def is_expired(self):
+        return django_timezone.now() >= self.expires_at
+
+
+class TokenExchangeCode(UuidMixin, TimeStampedModel):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    # Either token (preferred, references the canonical Token row) or
+    # external_token (for OIDC access-token pass-through) carries the secret.
+    token = models.ForeignKey(
+        "authtoken.Token",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="exchange_codes",
+    )
+    external_token = models.CharField(max_length=500, blank=True, default="")
+
+    class Meta:
+        verbose_name = _("token exchange code")
+        verbose_name_plural = _("token exchange codes")
+
+    @classmethod
+    def generate_code(cls, user, token=None, external_token=""):
+        if token is None and not external_token:
+            raise ValueError("token or external_token is required")
+        return cls.objects.create(user=user, token=token, external_token=external_token)
+
+    def resolve_token_key(self):
+        return self.token.key if self.token_id else self.external_token

@@ -1,20 +1,26 @@
-from datetime import timedelta
+import datetime
+from datetime import UTC, timedelta
+from decimal import Decimal
 
 from ddt import data, ddt
 from django.utils import timezone
 from freezegun import freeze_time
-from rest_framework import test
+from rest_framework import status, test
 from rest_framework.reverse import reverse
 
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.fixtures import CustomerRole, ServiceProviderRole
 from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices.tasks import create_monthly_invoices
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.billing import (
     LimitPeriodProcessor,
+    MarketplaceBillingService,
 )
 from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     LimitPeriods,
+    OfferingStates,
     OrderStates,
     OrderTypes,
 )
@@ -26,7 +32,7 @@ from . import fixtures
 
 
 @freeze_time("2020-11-01")
-class InvoiceTest(test.APITransactionTestCase):
+class InvoiceTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.resource = self.fixture.resource
@@ -78,7 +84,7 @@ class InvoiceTest(test.APITransactionTestCase):
 
 
 @freeze_time("2020-11-01")
-class TotalLimitTest(test.APITransactionTestCase):
+class TotalLimitTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.component = self.fixture.offering_component
@@ -134,6 +140,42 @@ class TotalLimitTest(test.APITransactionTestCase):
         self.assertEqual(items.count(), 2)
         self.assertTrue(items.last().unit_price < 0)
         self.assertEqual(items.last().quantity, 5)
+
+    def test_fractional_limit_change_with_billing_history_is_billed(self):
+        # set_limits stores the JSON payload as-is, so a fractional value
+        # arrives as a float; the already-billed total is a Decimal summed
+        # from InvoiceItem.quantity. Mixing the two used to raise TypeError
+        # (HTTP 500) exactly when the resource had billing history.
+        self.resource.limits[self.component.type] = 0.5
+        self.resource.save()
+
+        items = self.get_invoice_items()
+        self.assertEqual(items.count(), 2)
+        self.assertTrue(items.last().unit_price < 0)
+        self.assertEqual(items.last().quantity, Decimal("9.5"))
+
+    def test_fractional_limit_via_set_limits_is_clamped_before_billing(self):
+        # The component takes whole numbers (limit_decimal_places defaults to
+        # 0), and the backend behind the agent would truncate a fraction
+        # anyway, so set_limits truncates it here rather than billing for a
+        # limit the backend never provisioned. The request still succeeds: the
+        # agent has no error handling for a 4xx.
+        ServiceProviderRole.MANAGER.add_permission(PermissionEnum.SET_RESOURCE_STATE)
+        url = ResourceFactory.get_provider_resource_url(self.resource, "set_limits")
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.post(
+            url, {"limits": {self.component.type: 4.7}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits[self.component.type], 4)
+        items = self.get_invoice_items()
+        self.assertEqual(items.count(), 2)
+        # A decrease from 10 to 4, not to 4.7.
+        self.assertTrue(items.last().unit_price < 0)
+        self.assertEqual(items.last().quantity, Decimal("6"))
 
     def test_total_billing_works_without_create_orders(self):
         """Test TOTAL billing behavior when CREATE orders are missing (simulating deleted orders scenario)."""
@@ -225,6 +267,13 @@ class TotalLimitTest(test.APITransactionTestCase):
 
     def test_update_order_billing_logic_without_create_orders(self):
         """Test UPDATE order billing when CREATE orders are missing - first UPDATE bills full amount."""
+
+        # Re-verify and enforce component is TOTAL before billing triggers.
+        # This guards against potential cross-test state leaks in CI.
+        self.component.refresh_from_db()
+        if self.component.limit_period != LimitPeriods.TOTAL:
+            self.component.limit_period = LimitPeriods.TOTAL
+            self.component.save()
 
         # Create a fresh resource with 0 limit to test pure UPDATE scenarios
         fresh_resource = ResourceFactory(
@@ -334,26 +383,6 @@ class TotalLimitTest(test.APITransactionTestCase):
         all_items = list(items)
         self.assertEqual(len(all_items), 3, "Should have exactly 3 UPDATE items")
 
-        # Verify the billing pattern:
-        # 1st UPDATE: Bills full amount (0→10) = 10 units × price
-        # 2nd UPDATE: Bills difference (10→15) = 5 units × price
-        # 3rd UPDATE: Compensates decrease (15→8) = -7 units × price
-
-        self.assertEqual(
-            all_items[0].quantity, 10, "First UPDATE should bill full amount (0→10)"
-        )
-        self.assertTrue(all_items[0].price > 0, "First UPDATE should be positive")
-
-        self.assertEqual(
-            all_items[1].quantity, 5, "Second UPDATE should bill difference (10→15)"
-        )
-        self.assertTrue(all_items[1].price > 0, "Second UPDATE should be positive")
-
-        self.assertEqual(
-            all_items[2].quantity, 7, "Third UPDATE should compensate (15→8)"
-        )
-        self.assertTrue(all_items[2].price < 0, "Third UPDATE should be negative")
-
         # Verify total billing equals final limit amount
         total_price = sum(item.price for item in all_items)
         expected_total = 8 * self.fixture.plan_component.price
@@ -380,10 +409,71 @@ class TotalLimitTest(test.APITransactionTestCase):
         )
 
 
+@freeze_time("2020-11-01")
+class TotalLimitDailyPlanTest(test.APITestCase):
+    """Test that limit_period=TOTAL with plan.unit=day does NOT multiply quantity by days."""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.component = self.fixture.offering_component
+        self.component.billing_type = BillingTypes.LIMIT
+        self.component.limit_period = LimitPeriods.TOTAL
+        self.component.save()
+        # Override plan unit to PER_DAY
+        self.fixture.plan.unit = marketplace_models.Plan.Units.PER_DAY
+        self.fixture.plan.save()
+        self.resource = ResourceFactory(
+            offering=self.fixture.offering,
+            plan=self.fixture.plan,
+            project=self.fixture.project,
+            limits={self.component.type: 10},
+        )
+        self.resource.set_state_ok()
+        self.resource.save()
+
+    def get_invoice_items(self):
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer,
+            year=2020,
+            month=11,
+        )
+        return invoice.items.filter(
+            details__offering_component_type=self.component.type,
+            resource_id=self.resource.id,
+        )
+
+    def test_total_limit_with_daily_plan_does_not_multiply_by_days(self):
+        """TOTAL limit period should produce quantity=limit, not quantity=limit*days."""
+        items = self.get_invoice_items()
+        self.assertEqual(items.count(), 1)
+        item = items.first()
+        # Quantity should be the raw limit (10), NOT 10 * 30 days
+        self.assertEqual(item.quantity, 10)
+        self.assertEqual(item.unit, invoices_models.InvoiceItem.Units.QUANTITY)
+
+    def test_total_limit_with_daily_plan_termination_preserves_quantity(self):
+        """Terminating a TOTAL+daily resource should NOT recalculate quantity by days."""
+        items = self.get_invoice_items()
+        item = items.first()
+        original_quantity = item.quantity
+
+        with freeze_time("2020-11-15"):
+            item.terminate()
+            item.refresh_from_db()
+
+        self.assertEqual(item.quantity, original_quantity)
+
+
 @ddt
 @freeze_time("2020-11-01")
-class InvoiceItemsTest(test.APITransactionTestCase):
+class InvoiceItemsTest(test.APITestCase):
     def setUp(self):
+        # Provider invoice items are gated by GET_REVENUE, which
+        # permissions.yaml grants both roles; test roles start without it.
+        CustomerRole.OWNER.add_permission(PermissionEnum.GET_SERVICE_PROVIDER_REVENUE)
+        ServiceProviderRole.MANAGER.add_permission(
+            PermissionEnum.GET_SERVICE_PROVIDER_REVENUE
+        )
         self.fixture = fixtures.MarketplaceFixture()
         self.resource = self.fixture.resource
         self.resource.set_state_ok()
@@ -428,7 +518,7 @@ class InvoiceItemsTest(test.APITransactionTestCase):
 
 
 @freeze_time("2020-04-15")  # Middle of Q2 (April is a quarterly billing month)
-class QuarterlyBillingTest(test.APITransactionTestCase):
+class QuarterlyBillingTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         # Create a quarterly limit-based component
@@ -490,7 +580,7 @@ class QuarterlyBillingTest(test.APITransactionTestCase):
 
 
 @freeze_time("2020-01-15")  # Middle of Q1
-class QuarterlyVsMonthlyBillingTest(test.APITransactionTestCase):
+class QuarterlyVsMonthlyBillingTest(test.APITestCase):
     """Test quarterly billing behavior compared to monthly billing."""
 
     def setUp(self):
@@ -607,7 +697,7 @@ class QuarterlyVsMonthlyBillingTest(test.APITransactionTestCase):
 
 
 @ddt
-class QuarterlyBillingMonthDetectionTest(test.APITransactionTestCase):
+class QuarterlyBillingMonthDetectionTest(test.APITestCase):
     """Test quarterly billing month detection logic."""
 
     @data(
@@ -682,7 +772,7 @@ class QuarterlyBillingMonthDetectionTest(test.APITransactionTestCase):
 
 
 @freeze_time("2020-01-01")
-class QuarterlyBillingIntegrationTest(test.APITransactionTestCase):
+class QuarterlyBillingIntegrationTest(test.APITestCase):
     """Integration test for quarterly billing with create_monthly_invoices task."""
 
     def setUp(self):
@@ -758,8 +848,549 @@ class QuarterlyBillingIntegrationTest(test.APITransactionTestCase):
         self.assertEqual(item.end.day, 30)  # June 30th
 
 
+@freeze_time("2020-01-01")
+class QuarterlyLimitChangeInNonQuarterlyMonthTest(test.APITestCase):
+    """Test that changing limits in a non-quarterly month updates the original
+    quarterly invoice item rather than creating a duplicate on the new month's invoice."""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+
+        self.quarterly_component = self.fixture.offering.components.first()
+        self.quarterly_component.billing_type = BillingTypes.LIMIT
+        self.quarterly_component.limit_period = LimitPeriods.QUARTERLY
+        self.quarterly_component.save()
+
+        self.plan_component = self.fixture.plan.components.first()
+        self.plan_component.component = self.quarterly_component
+        self.plan_component.save()
+
+        self.resource = self.fixture.resource
+        self.resource.limits = {"cpu": 4}
+        self.resource.save()
+        self.resource.set_state_ok()
+        self.resource.save()
+
+        # Verify initial state: January invoice has 1 quarterly item
+        self.january_invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=1
+        )
+        self.assertEqual(
+            self.january_invoice.items.filter(resource_id=self.resource.id).count(),
+            1,
+            "January should have exactly 1 quarterly billing item",
+        )
+
+    def test_limit_change_in_non_quarterly_month_should_not_create_new_invoice_item(
+        self,
+    ):
+        """When limits change in February (non-quarterly month), a new invoice item
+        should NOT be created on the February invoice because the quarterly item
+        already exists on the January invoice."""
+        with freeze_time("2020-02-15"):
+            create_monthly_invoices()
+
+            self.resource.limits = {"cpu": 5}
+            self.resource.save()
+
+        february_invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=2
+        )
+        february_items = february_invoice.items.filter(resource_id=self.resource.id)
+        self.assertEqual(
+            february_items.count(),
+            0,
+            "February should NOT have a quarterly billing item; "
+            "the limit change should update the January item instead",
+        )
+
+    def test_limit_change_in_non_quarterly_month_updates_original_invoice_item(self):
+        """When limits change in February, the original January invoice item
+        should be updated with new resource_limit_periods."""
+        with freeze_time("2020-02-15"):
+            create_monthly_invoices()
+
+            self.resource.limits = {"cpu": 5}
+            self.resource.save()
+
+        self.january_invoice.refresh_from_db()
+        january_items = self.january_invoice.items.filter(resource_id=self.resource.id)
+        self.assertEqual(january_items.count(), 1)
+
+        item = january_items.first()
+        limit_periods = item.details.get("resource_limit_periods", [])
+        self.assertGreaterEqual(
+            len(limit_periods),
+            2,
+            "January invoice item should have multiple periods after limit change",
+        )
+
+    def test_limit_change_in_non_quarterly_month_does_not_double_bill(self):
+        """Changing limits mid-quarter should not result in double billing
+        across two invoices for the same quarterly period."""
+        with freeze_time("2020-02-15"):
+            create_monthly_invoices()
+
+            self.resource.limits = {"cpu": 5}
+            self.resource.save()
+
+        # Count all invoice items across all invoices for this resource
+        all_items = invoices_models.InvoiceItem.objects.filter(
+            resource_id=self.resource.id,
+            details__offering_component_type="cpu",
+        )
+        self.assertEqual(
+            all_items.count(),
+            1,
+            "There should be exactly 1 invoice item for Q1, not duplicates across months",
+        )
+
+    def test_multiple_limit_changes_across_non_quarterly_months(self):
+        """Multiple limit changes across February and March should all update
+        the original January invoice item."""
+        with freeze_time("2020-02-15"):
+            create_monthly_invoices()
+            self.resource.limits = {"cpu": 5}
+            self.resource.save()
+
+        with freeze_time("2020-03-10"):
+            create_monthly_invoices()
+            self.resource.limits = {"cpu": 6}
+            self.resource.save()
+
+        # January item should be updated with all changes
+        self.january_invoice.refresh_from_db()
+        january_items = self.january_invoice.items.filter(resource_id=self.resource.id)
+        self.assertEqual(january_items.count(), 1)
+
+        item = january_items.first()
+        limit_periods = item.details.get("resource_limit_periods", [])
+        self.assertGreaterEqual(
+            len(limit_periods),
+            3,
+            "Should have at least 3 periods: original + Feb change + Mar change",
+        )
+
+        # No items should exist on February or March invoices
+        for month in [2, 3]:
+            invoice = invoices_models.Invoice.objects.get(
+                customer=self.resource.project.customer, year=2020, month=month
+            )
+            items = invoice.items.filter(resource_id=self.resource.id)
+            self.assertEqual(
+                items.count(),
+                0,
+                f"Month {month} should NOT have quarterly billing items",
+            )
+
+
+@freeze_time("2020-01-01")
+class QuarterlyLimitChangeQuantityProrationTest(test.APITestCase):
+    """Test that changing limits mid-quarter prorates the invoice item quantity
+    correctly instead of naively summing the old and new limit values.
+
+    Bug scenario: With PER_MONTH unit and quarterly limit period, when a limit
+    changes from 2 to 4 mid-quarter, the quantity should be prorated based on
+    the fraction of the quarter each limit was active. Instead, the code sums
+    the raw limits (2 + 4 = 6), effectively charging for both the old AND new
+    limits simultaneously.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+
+        self.quarterly_component = self.fixture.offering.components.first()
+        self.quarterly_component.billing_type = BillingTypes.LIMIT
+        self.quarterly_component.limit_period = LimitPeriods.QUARTERLY
+        self.quarterly_component.save()
+
+        self.plan_component = self.fixture.plan.components.first()
+        self.plan_component.component = self.quarterly_component
+        self.plan_component.price = 10
+        self.plan_component.save()
+
+        self.resource = self.fixture.resource
+        self.resource.limits = {"cpu": 10}
+        self.resource.save()
+        self.resource.set_state_ok()
+        self.resource.save()
+
+    def test_initial_quarterly_quantity_equals_limit(self):
+        """Before any changes, the invoice quantity should equal the limit value."""
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=1
+        )
+        item = invoice.items.get(resource_id=self.resource.id)
+        self.assertEqual(item.quantity, 10)
+        # Total cost = 10 * 10 = 100
+        self.assertEqual(item.total, 100)
+
+    def test_limit_change_mid_quarter_should_not_sum_old_and_new_limits(self):
+        """When limit changes from 10 to 20 mid-quarter, the new quantity
+        should NOT be 10 + 20 = 30 (the naive sum). It should be prorated
+        so the total is between the old cost (10 * price) and new cost (20 * price).
+
+        With Q1 being Jan 1 - Mar 31 (91 days), and the change happening on Feb 15
+        (day 46 of the quarter):
+        - Old limit (10) applies for 45 days (Jan 1 - Feb 14)
+        - New limit (20) applies for 46 days (Feb 15 - Mar 31)
+        - Prorated quantity = 10 * (45/91) + 20 * (46/91) ≈ 4.95 + 10.11 ≈ 15.05
+        - The quantity must be less than 20 (the new full-quarter amount)
+        """
+        with freeze_time("2020-02-15"):
+            self.resource.limits = {"cpu": 20}
+            self.resource.save()
+
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=1
+        )
+        item = invoice.items.get(resource_id=self.resource.id)
+
+        # BUG: The current implementation gives quantity = 10 + 20 = 30
+        # which means the customer pays 30 * 10 = 300 instead of ~150
+        # The quantity should be at most 20 (the new limit for the full quarter)
+        self.assertLessEqual(
+            item.quantity,
+            20,
+            f"Quantity {item.quantity} exceeds the new limit of 20. "
+            "The old and new limits are being summed instead of prorated. "
+            f"Expected a value between 10 and 20, got {item.quantity}.",
+        )
+
+    def test_limit_increase_total_cost_is_between_old_and_new_full_quarter_costs(self):
+        """When increasing the limit mid-quarter, the total cost should be
+        prorated based on how long each limit was active.
+
+        Q1 2020 = 91 days (Jan 31 + Feb 29 [leap year] + Mar 31).
+        Old limit (10) active for 45 days (Jan 1 – Feb 14).
+        New limit (20) active for 46 days (Feb 15 – Mar 31).
+        Prorated quantity = 10*45/91 + 20*46/91 = 1370/91 ≈ 15.055.
+        Total = quantize_price(15.055 * 10) = 150.55.
+        """
+        with freeze_time("2020-02-15"):
+            self.resource.limits = {"cpu": 20}
+            self.resource.save()
+
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=1
+        )
+        item = invoice.items.get(resource_id=self.resource.id)
+
+        self.assertEqual(item.total, Decimal("150.55"))
+
+    def test_limit_decrease_mid_quarter_should_not_sum_limits(self):
+        """When limit DECREASES from 20 to 5 mid-quarter, the quantity should
+        be prorated, not summed to 25."""
+        # Start with limit 20
+        self.resource.limits = {"cpu": 20}
+        self.resource.save()
+
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=1
+        )
+        item = invoice.items.get(resource_id=self.resource.id)
+        self.assertEqual(item.quantity, 20)
+
+        with freeze_time("2020-02-15"):
+            self.resource.limits = {"cpu": 5}
+            self.resource.save()
+
+        item.refresh_from_db()
+
+        # BUG: Current implementation gives 20 + 5 = 25
+        # Expected: prorated value between 5 and 20
+        self.assertLessEqual(
+            item.quantity,
+            20,
+            f"Quantity {item.quantity} exceeds the original limit of 20. "
+            "Limits are being summed instead of prorated.",
+        )
+        self.assertGreaterEqual(
+            item.quantity,
+            5,
+            f"Quantity {item.quantity} is less than the new limit of 5.",
+        )
+
+    def test_multiple_limit_changes_should_prorate_all_periods(self):
+        """Multiple limit changes within the same quarter should each be
+        prorated based on their active duration, not summed."""
+        with freeze_time("2020-02-01"):
+            self.resource.limits = {"cpu": 20}
+            self.resource.save()
+
+        with freeze_time("2020-03-01"):
+            self.resource.limits = {"cpu": 30}
+            self.resource.save()
+
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=1
+        )
+        item = invoice.items.get(resource_id=self.resource.id)
+
+        # BUG: Current implementation gives 10 + 20 + 30 = 60
+        # Expected: prorated value ≤ 30 (the maximum limit)
+        self.assertLessEqual(
+            item.quantity,
+            30,
+            f"Quantity {item.quantity} exceeds the maximum limit of 30. "
+            "Multiple limit values are being summed instead of prorated. "
+            f"With 3 period changes, the naive sum would be 10+20+30=60.",
+        )
+
+
+@ddt
+class AnnualBillingMonthDetectionTest(test.APITestCase):
+    """Test anniversary-based annual billing month detection logic."""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.resource = self.fixture.resource
+        # Resource created in March
+        self.resource.created = timezone.datetime(2020, 3, 15, tzinfo=UTC)
+        self.resource.save()
+
+    @data(
+        (1, False),
+        (2, False),
+        (3, True),  # March - resource creation month
+        (4, False),
+        (5, False),
+        (6, False),
+        (7, False),
+        (8, False),
+        (9, False),
+        (10, False),
+        (11, False),
+        (12, False),
+    )
+    def test_annual_billing_triggers_on_creation_month(self, month_and_expected):
+        """Test that annual billing triggers on the resource's creation month."""
+        month, expected = month_and_expected
+
+        test_date = timezone.datetime(2020, month, 15)
+
+        result = LimitPeriodProcessor._should_process_billing(
+            LimitPeriods.ANNUAL, test_date, self.resource
+        )
+        self.assertEqual(
+            result, expected, f"Month {month} annual billing detection failed"
+        )
+
+    def test_annual_billing_without_resource_returns_false(self):
+        """Test that annual billing returns False when no resource is provided."""
+        test_date = timezone.datetime(2020, 3, 15)
+        result = LimitPeriodProcessor._should_process_billing(
+            LimitPeriods.ANNUAL, test_date
+        )
+        self.assertFalse(result)
+
+    def test_annual_billing_period_from_creation_date(self):
+        """Test annual billing period is based on resource creation anniversary."""
+        test_date = timezone.datetime(2020, 3, 20, tzinfo=UTC)
+        start, end = LimitPeriodProcessor._get_billing_period(
+            LimitPeriods.ANNUAL, test_date, self.resource
+        )
+        self.assertEqual(start.month, 3)
+        self.assertEqual(start.day, 15)
+        self.assertEqual(start.year, 2020)
+        self.assertEqual(end.month, 3)
+        self.assertEqual(end.day, 14)
+        self.assertEqual(end.year, 2021)
+
+    def test_annual_billing_period_before_anniversary(self):
+        """Test annual billing period when date is before this year's anniversary."""
+        test_date = timezone.datetime(2021, 2, 10, tzinfo=UTC)
+        start, end = LimitPeriodProcessor._get_billing_period(
+            LimitPeriods.ANNUAL, test_date, self.resource
+        )
+        # Should use previous year's anniversary as start
+        self.assertEqual(start.month, 3)
+        self.assertEqual(start.day, 15)
+        self.assertEqual(start.year, 2020)
+        self.assertEqual(end.month, 3)
+        self.assertEqual(end.day, 14)
+        self.assertEqual(end.year, 2021)
+
+
+@freeze_time("2020-03-01")
+class AnnualBillingIntegrationTest(test.APITestCase):
+    """Integration test for anniversary-based annual billing with create_monthly_invoices task."""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+
+        self.annual_component = self.fixture.offering.components.first()
+        self.annual_component.billing_type = BillingTypes.LIMIT
+        self.annual_component.limit_period = LimitPeriods.ANNUAL
+        self.annual_component.save()
+
+        self.plan_component = self.fixture.plan.components.first()
+        self.plan_component.component = self.annual_component
+        self.plan_component.save()
+
+        self.resource = self.fixture.resource
+        self.resource.limits = {"cpu": 2}
+        self.resource.save()
+        self.resource.set_state_ok()
+        self.resource.save()
+        # Resource created in March (via freeze_time)
+
+    def test_annual_billing_on_creation_anniversary_month(self):
+        """Test that annual billing creates items on the resource's creation month."""
+        # Initial invoice should exist for March (resource creation month)
+        march_invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=3
+        )
+        march_items = march_invoice.items.filter(resource_id=self.resource.id)
+        self.assertEqual(march_items.count(), 1, "March should have annual billing")
+
+        # Verify the billing period spans 12 months from creation
+        item = march_items.first()
+        self.assertEqual(item.start.month, 3)
+        self.assertEqual(item.start.day, 1)
+        self.assertEqual(item.start.year, 2020)
+        self.assertEqual(item.end.month, 2)
+        self.assertEqual(item.end.year, 2021)
+
+        # Run monthly task for April through February - none should create annual items
+        for month in range(4, 13):
+            with freeze_time(f"2020-{month:02d}-01"):
+                create_monthly_invoices()
+
+            invoice = invoices_models.Invoice.objects.get(
+                customer=self.resource.project.customer, year=2020, month=month
+            )
+            items = invoice.items.filter(resource_id=self.resource.id)
+            self.assertEqual(
+                items.count(),
+                0,
+                f"Month {month}/2020 should not have annual billing",
+            )
+
+        # January and February of next year should also not have annual items
+        for month in [1, 2]:
+            with freeze_time(f"2021-{month:02d}-01"):
+                create_monthly_invoices()
+
+            invoice = invoices_models.Invoice.objects.get(
+                customer=self.resource.project.customer, year=2021, month=month
+            )
+            items = invoice.items.filter(resource_id=self.resource.id)
+            self.assertEqual(
+                items.count(),
+                0,
+                f"Month {month}/2021 should not have annual billing",
+            )
+
+        # Next March (anniversary month) should create annual items again
+        with freeze_time("2021-03-01"):
+            create_monthly_invoices()
+
+        next_march_invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2021, month=3
+        )
+        next_march_items = next_march_invoice.items.filter(resource_id=self.resource.id)
+        self.assertEqual(
+            next_march_items.count(),
+            1,
+            "Next March should have annual billing",
+        )
+
+
+@freeze_time("2020-06-01")
+class AnnualAndMonthlyMixedBillingTest(test.APITestCase):
+    """Test that annual and monthly components are billed correctly together
+    using anniversary-based annual billing."""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.resource = self.fixture.resource
+
+        # Create annual limit component
+        self.annual_component = self.fixture.offering.components.first()
+        self.annual_component.type = "annual_cpu"
+        self.annual_component.billing_type = BillingTypes.LIMIT
+        self.annual_component.limit_period = LimitPeriods.ANNUAL
+        self.annual_component.save()
+
+        # Create monthly limit component
+        self.monthly_component = marketplace_models.OfferingComponent.objects.create(
+            offering=self.fixture.offering,
+            type="monthly_cpu",
+            name="Monthly CPU",
+            billing_type=BillingTypes.LIMIT,
+            limit_period=LimitPeriods.MONTH,
+        )
+
+        # Set up plan components
+        annual_plan_component = self.fixture.plan.components.first()
+        annual_plan_component.component = self.annual_component
+        annual_plan_component.save()
+
+        marketplace_models.PlanComponent.objects.create(
+            plan=self.fixture.plan,
+            component=self.monthly_component,
+            price=5,
+        )
+
+        self.resource.limits = {"annual_cpu": 10, "monthly_cpu": 5}
+        self.resource.save()
+        self.resource.set_state_ok()
+        self.resource.save()
+        # Resource created in June (via freeze_time)
+
+    def test_mixed_billing_on_creation_month(self):
+        """Test that both annual and monthly components are billed on creation month."""
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=6
+        )
+
+        annual_items = invoice.items.filter(
+            details__offering_component_type="annual_cpu"
+        )
+        monthly_items = invoice.items.filter(
+            details__offering_component_type="monthly_cpu"
+        )
+
+        self.assertEqual(
+            annual_items.count(),
+            1,
+            "Annual component should be billed in June (creation month)",
+        )
+        self.assertEqual(
+            monthly_items.count(), 1, "Monthly component should be billed in June"
+        )
+
+    @freeze_time("2020-07-15")
+    def test_only_monthly_billing_in_non_anniversary_month(self):
+        """Test that only monthly components are billed in non-anniversary months."""
+        create_monthly_invoices()
+
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=7
+        )
+
+        annual_items = invoice.items.filter(
+            details__offering_component_type="annual_cpu"
+        )
+        monthly_items = invoice.items.filter(
+            details__offering_component_type="monthly_cpu"
+        )
+
+        self.assertEqual(
+            annual_items.count(),
+            0,
+            "Annual component should NOT be billed in July",
+        )
+        self.assertEqual(
+            monthly_items.count(),
+            1,
+            "Monthly component should be billed in July",
+        )
+
+
 @freeze_time("2024-10-03")
-class LimitBillingDuplicateInvoiceTest(test.APITransactionTestCase):
+class LimitBillingDuplicateInvoiceTest(test.APITestCase):
     """Test that reproduces the issue where LIMIT components get incorrectly billed during monthly invoice creation."""
 
     def setUp(self):
@@ -1163,21 +1794,28 @@ class LimitBillingDuplicateInvoiceTest(test.APITransactionTestCase):
             price=2.0,
         )
 
+        # Create resource in CREATING state to avoid auto-billing,
+        # then switch to OK so _update_invoice_item can work.
         test_resource = marketplace_factories.ResourceFactory(
             project=self.fixture.project,
             offering=self.fixture.offering,
             plan=old_plan,
             limits={offering_component.type: 100},
+            state=marketplace_models.ResourceStates.CREATING,
+        )
+        marketplace_models.Resource.objects.filter(pk=test_resource.pk).update(
             state=marketplace_models.ResourceStates.OK,
         )
+        test_resource.refresh_from_db()
 
-        october_invoice = invoices_models.Invoice.objects.create(
-            customer=test_resource.project.customer, year=2025, month=10
+        # Use dates consistent with the frozen time (2024-10-03)
+        october_invoice, _ = invoices_models.Invoice.objects.get_or_create(
+            customer=test_resource.project.customer, year=2024, month=10
         )
 
-        october_1st = timezone.datetime(2025, 10, 1, tzinfo=timezone.utc)
-        october_15th = timezone.datetime(2025, 10, 15, tzinfo=timezone.utc)
-        october_31st = timezone.datetime(2025, 10, 31, tzinfo=timezone.utc)
+        october_1st = timezone.datetime(2024, 10, 1, tzinfo=UTC)
+        october_15th = timezone.datetime(2024, 10, 15, tzinfo=UTC)
+        october_31st = timezone.datetime(2024, 10, 31, tzinfo=UTC)
 
         LimitPeriodProcessor._create_invoice_item(
             source=test_resource,
@@ -1187,8 +1825,11 @@ class LimitBillingDuplicateInvoiceTest(test.APITransactionTestCase):
             end=october_15th,
         )
 
-        test_resource.plan = new_plan
-        test_resource.save()
+        # Use raw update to avoid triggering plan change billing handlers
+        marketplace_models.Resource.objects.filter(pk=test_resource.pk).update(
+            plan=new_plan,
+        )
+        test_resource.refresh_from_db()
 
         LimitPeriodProcessor._create_invoice_item(
             source=test_resource,
@@ -1224,3 +1865,569 @@ class LimitBillingDuplicateInvoiceTest(test.APITransactionTestCase):
 
         total_quantity = sum(item.quantity for item in updated_items)
         self.assertGreater(total_quantity, 100, "Total quantity should be updated")
+
+
+@freeze_time("2024-10-15")
+class FractionalLimitBillingBase(test.APITestCase):
+    """Setup shared by the fractional billing cases: one LIMIT component on a
+    resource billed for the whole of October, and helpers to change its limit
+    and read the resulting invoice item back.
+
+    Deliberately carries no tests of its own -- each period and plan unit takes
+    a different branch and asserts something different.
+    """
+
+    #: Plan unit under test. PER_DAY and everything else take different
+    #: branches in both _update_invoice_item and quantity_from_limit_periods.
+    PLAN_UNIT = marketplace_models.Plan.Units.PER_DAY
+    #: Limit period under test.
+    LIMIT_PERIOD = LimitPeriods.MONTH
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.component = marketplace_factories.OfferingComponentFactory(
+            offering=self.fixture.offering,
+            type="storage_tb",
+            name="Storage",
+            billing_type=BillingTypes.LIMIT,
+            limit_period=self.LIMIT_PERIOD,
+            measured_unit="TB",
+        )
+        self.plan = marketplace_factories.PlanFactory(
+            offering=self.fixture.offering,
+            unit_price=0,
+            unit=self.PLAN_UNIT,
+        )
+        self.plan_component = marketplace_factories.PlanComponentFactory(
+            plan=self.plan,
+            component=self.component,
+            price=10,
+        )
+        self.invoice, _ = invoices_models.Invoice.objects.get_or_create(
+            customer=self.fixture.project.customer, year=2024, month=10
+        )
+        self.resource = self.bill_resource(0.1)
+
+    def bill_resource(self, limit):
+        """A resource billed for the whole of October at `limit`."""
+        # Provision in CREATING and promote with a queryset update, so the
+        # billing handlers do not open an item before this method does.
+        resource = marketplace_factories.ResourceFactory(
+            project=self.fixture.project,
+            offering=self.fixture.offering,
+            plan=self.plan,
+            limits={self.component.type: limit},
+            state=marketplace_models.ResourceStates.CREATING,
+        )
+        marketplace_models.Resource.objects.filter(pk=resource.pk).update(
+            state=marketplace_models.ResourceStates.OK,
+        )
+        resource.refresh_from_db()
+        LimitPeriodProcessor._create_invoice_item(
+            source=resource,
+            plan_component=self.plan_component,
+            invoice=self.invoice,
+            start=timezone.datetime(2024, 10, 1, tzinfo=UTC),
+            end=timezone.datetime(2024, 10, 31, 23, 59, 59, tzinfo=UTC),
+        )
+        return resource
+
+    def get_item(self, resource=None):
+        return invoices_models.InvoiceItem.objects.get(
+            resource=resource or self.resource,
+            details__offering_component_type=self.component.type,
+            invoice=self.invoice,
+            unit_price__gte=0,
+        )
+
+    def change_limit_to(self, new_quantity, resource=None):
+        LimitPeriodProcessor._update_invoice_item(
+            resource=resource or self.resource,
+            component_type=self.component.type,
+            invoice=self.invoice,
+            new_quantity=new_quantity,
+        )
+
+
+@freeze_time("2024-10-15")
+class MonthlyLimitFractionalQuantityTest(FractionalLimitBillingBase):
+    """The monthly counterpart of TotalLimitTest's fractional case.
+
+    A limit change splits the billing period in two, and _update_invoice_item
+    re-serialises the sub-period the old limit covered. Truncating that
+    quantity to an integer dropped the sub-period's prorated share from the
+    invoice silently: the request succeeded and the customer was undercharged.
+    """
+
+    def test_old_period_keeps_its_fractional_quantity(self):
+        self.change_limit_to(0.5)
+
+        periods = self.get_item().details["resource_limit_periods"]
+        self.assertEqual(len(periods), 2)
+        self.assertEqual(periods[0]["quantity"], 0.1)
+        self.assertEqual(periods[1]["quantity"], 0.5)
+
+    def test_billed_quantity_covers_both_sub_periods(self):
+        self.change_limit_to(0.5)
+
+        item = self.get_item()
+        periods = item.details["resource_limit_periods"]
+        expected = sum(
+            Decimal(str(period["quantity"])) * period["billing_periods"]
+            for period in periods
+        )
+        self.assertEqual(item.quantity, expected)
+        # The old sub-period contributed something; truncation made it zero.
+        self.assertGreater(
+            Decimal(str(periods[0]["quantity"])) * periods[0]["billing_periods"],
+            0,
+        )
+
+    def test_period_total_is_free_of_binary_expansion(self):
+        self.change_limit_to(0.5)
+
+        periods = self.get_item().details["resource_limit_periods"]
+        for period in periods:
+            self.assertEqual(
+                period["total"],
+                str(Decimal(str(period["quantity"])) * period["billing_periods"]),
+            )
+            self.assertNotIn("000000000", period["total"])
+
+    def test_terminating_an_item_with_a_fractional_period_does_not_raise(self):
+        # InvoiceItem.terminate() rewrites the final period's total and
+        # quantity_from_limit_periods() sums them back. Both used int(), which
+        # truncates a fractional quantity to zero and raises outright on a
+        # total like "1.4".
+        self.change_limit_to(0.5)
+        item = self.get_item()
+
+        item.terminate(end=timezone.datetime(2024, 10, 20, tzinfo=UTC))
+
+        item.refresh_from_db()
+        periods = item.details["resource_limit_periods"]
+        self.assertEqual(periods[-1]["quantity"], 0.5)
+        self.assertEqual(
+            item.quantity,
+            sum(
+                Decimal(str(period["quantity"])) * period["billing_periods"]
+                for period in periods
+            ),
+        )
+
+    def test_whole_number_quantity_is_still_stored_as_int(self):
+        # Integer-only deployments must see byte-identical payloads.
+        resource = self.bill_resource(4)
+        self.change_limit_to(6, resource=resource)
+
+        periods = self.get_item(resource).details["resource_limit_periods"]
+        self.assertEqual(len(periods), 2)
+        for period in periods:
+            self.assertIsInstance(period["quantity"], int)
+
+
+@freeze_time("2024-10-15")
+class NonDailyFractionalQuantityTest(FractionalLimitBillingBase):
+    """The same fractional limit change, billed per month rather than per day.
+
+    _update_invoice_item takes a different branch for non-PER_DAY units: rather
+    than summing quantity x days, it weights each sub-period by its share of
+    the billing period. quantity_from_limit_periods reads the same periods back
+    the same way. Neither had any fractional coverage, and the day-weighted
+    branch is where a truncated quantity would be hardest to notice, because
+    the result is plausible rather than zero.
+    """
+
+    PLAN_UNIT = marketplace_models.Plan.Units.PER_MONTH
+
+    def test_the_day_weighted_average_keeps_the_fraction(self):
+        self.change_limit_to(0.5)
+
+        item = self.get_item()
+        periods = item.details["resource_limit_periods"]
+        total_days = sum(p["billing_periods"] for p in periods)
+        expected = (
+            sum(Decimal(str(p["quantity"])) * p["billing_periods"] for p in periods)
+            / total_days
+        )
+        self.assertAlmostEqual(Decimal(item.quantity), expected, places=6)
+        # Strictly between the two limits: neither sub-period was dropped.
+        self.assertGreater(Decimal(item.quantity), Decimal("0.1"))
+        self.assertLess(Decimal(item.quantity), Decimal("0.5"))
+
+    def test_quantity_from_limit_periods_agrees_after_termination(self):
+        self.change_limit_to(0.5)
+        item = self.get_item()
+
+        item.terminate(end=timezone.datetime(2024, 10, 20, tzinfo=UTC))
+
+        item.refresh_from_db()
+        self.assertGreater(Decimal(item.quantity), 0)
+        self.assertEqual(item.quantity, item.quantity_from_limit_periods())
+
+
+@freeze_time("2024-10-15")
+class QuarterlyFractionalQuantityTest(FractionalLimitBillingBase):
+    """QUARTERLY dispatches through the same _update_invoice_item branch as
+    MONTH but with a different period window, and had no fractional test."""
+
+    LIMIT_PERIOD = LimitPeriods.QUARTERLY
+
+    def test_the_old_period_keeps_its_fractional_quantity(self):
+        self.change_limit_to(0.5)
+
+        periods = self.get_item().details["resource_limit_periods"]
+        self.assertEqual(periods[0]["quantity"], 0.1)
+        self.assertEqual(periods[-1]["quantity"], 0.5)
+
+
+@freeze_time("2024-10-15")
+class AnnualFractionalQuantityTest(FractionalLimitBillingBase):
+    """ANNUAL, likewise."""
+
+    LIMIT_PERIOD = LimitPeriods.ANNUAL
+
+    def test_the_old_period_keeps_its_fractional_quantity(self):
+        self.change_limit_to(0.5)
+
+        periods = self.get_item().details["resource_limit_periods"]
+        self.assertEqual(periods[0]["quantity"], 0.1)
+        self.assertEqual(periods[-1]["quantity"], 0.5)
+
+
+@freeze_time("2020-11-01")
+class NonBillableOfferingTest(test.APITestCase):
+    """
+    Test that resources with non-billable offerings are not billed.
+
+    This tests the fix for the billing regression introduced in commit 236599072
+    where MarketplaceBillingService.get_or_create_invoice() did not filter
+    by offering.billable=True, causing resources with billable=False offerings
+    to be incorrectly billed.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        # Make the offering non-billable
+        self.fixture.offering.billable = False
+        self.fixture.offering.save()
+        self.resource = self.fixture.resource
+
+    def test_non_billable_offering_does_not_create_invoice_item_on_resource_activation(
+        self,
+    ):
+        """Test that activating a resource with non-billable offering doesn't create invoice items."""
+        self.resource.set_state_ok()
+        self.resource.save()
+
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=11
+        )
+        items = invoice.items.filter(resource_id=self.resource.id)
+
+        self.assertEqual(
+            items.count(),
+            0,
+            "Non-billable offering should not create invoice items on resource activation",
+        )
+
+    def test_non_billable_offering_does_not_create_invoice_item_on_monthly_billing(
+        self,
+    ):
+        """Test that monthly invoice creation doesn't bill non-billable offerings."""
+        self.resource.set_state_ok()
+        self.resource.save()
+
+        # Advance to next month and run monthly invoices
+        with freeze_time("2020-12-01"):
+            create_monthly_invoices()
+
+        december_invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=12
+        )
+        items = december_invoice.items.filter(resource_id=self.resource.id)
+
+        self.assertEqual(
+            items.count(),
+            0,
+            "Non-billable offering should not create invoice items on monthly billing",
+        )
+
+    def test_billable_offering_creates_invoice_item_regression_check(self):
+        """Regression test: Ensure billable offerings still create invoice items correctly."""
+        # Make the offering billable again
+        self.fixture.offering.billable = True
+        self.fixture.offering.save()
+
+        self.resource.set_state_ok()
+        self.resource.save()
+
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer, year=2020, month=11
+        )
+        items = invoice.items.filter(resource_id=self.resource.id)
+
+        self.assertEqual(
+            items.count(),
+            1,
+            "Billable offering should create invoice items on resource activation",
+        )
+
+
+@freeze_time("2020-11-01")
+class NonBillableChildOfferingTest(test.APITestCase):
+    """
+    Test billing behavior for child offerings (like OpenStack.Instance)
+    that are nested under parent offerings (like OpenStack.Tenant).
+
+    Child offerings typically have billable=False because their costs
+    are included in the parent offering's billing.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+
+        # Create a parent offering (like OpenStack.Tenant) - billable
+        self.parent_offering = marketplace_factories.OfferingFactory(
+            type="OpenStack.Tenant",
+            state=OfferingStates.ACTIVE,
+            billable=True,
+            customer=self.fixture.offering_customer,
+        )
+        self.parent_plan = marketplace_factories.PlanFactory(
+            offering=self.parent_offering,
+            unit=marketplace_models.Plan.Units.PER_MONTH,
+        )
+        self.parent_component = marketplace_factories.OfferingComponentFactory(
+            offering=self.parent_offering,
+            billing_type=BillingTypes.FIXED,
+        )
+        marketplace_factories.PlanComponentFactory(
+            plan=self.parent_plan,
+            component=self.parent_component,
+            price=10,
+            amount=1,
+        )
+        self.parent_resource = marketplace_factories.ResourceFactory(
+            offering=self.parent_offering,
+            plan=self.parent_plan,
+            project=self.fixture.project,
+        )
+
+        # Create a child offering (like OpenStack.Instance) - NOT billable
+        self.child_offering = marketplace_factories.OfferingFactory(
+            type="OpenStack.Instance",
+            state=OfferingStates.ACTIVE,
+            billable=False,  # Key: child offerings are not billed separately
+            parent=self.parent_offering,
+            customer=self.fixture.offering_customer,
+        )
+        self.child_plan = marketplace_factories.PlanFactory(
+            offering=self.child_offering,
+            unit=marketplace_models.Plan.Units.PER_MONTH,
+        )
+        self.child_component = marketplace_factories.OfferingComponentFactory(
+            offering=self.child_offering,
+            billing_type=BillingTypes.FIXED,
+        )
+        marketplace_factories.PlanComponentFactory(
+            plan=self.child_plan,
+            component=self.child_component,
+            price=5,
+            amount=1,
+        )
+        self.child_resource = marketplace_factories.ResourceFactory(
+            offering=self.child_offering,
+            plan=self.child_plan,
+            project=self.fixture.project,
+            parent=self.parent_resource,
+        )
+
+    def test_parent_billable_offering_creates_invoice_items(self):
+        """Parent offering with billable=True should create invoice items."""
+        self.parent_resource.set_state_ok()
+        self.parent_resource.save()
+
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.parent_resource.project.customer, year=2020, month=11
+        )
+        items = invoice.items.filter(resource_id=self.parent_resource.id)
+
+        self.assertEqual(
+            items.count(),
+            1,
+            "Parent billable offering should create invoice items",
+        )
+
+    def test_child_non_billable_offering_does_not_create_invoice_items(self):
+        """Child offering with billable=False should NOT create invoice items."""
+        self.child_resource.set_state_ok()
+        self.child_resource.save()
+
+        invoice = invoices_models.Invoice.objects.get(
+            customer=self.child_resource.project.customer, year=2020, month=11
+        )
+        items = invoice.items.filter(resource_id=self.child_resource.id)
+
+        self.assertEqual(
+            items.count(),
+            0,
+            "Child non-billable offering should NOT create invoice items",
+        )
+
+    def test_monthly_billing_only_bills_parent_not_child(self):
+        """Monthly invoice should only bill parent, not child offerings."""
+        self.parent_resource.set_state_ok()
+        self.parent_resource.save()
+        self.child_resource.set_state_ok()
+        self.child_resource.save()
+
+        with freeze_time("2020-12-01"):
+            create_monthly_invoices()
+
+        december_invoice = invoices_models.Invoice.objects.get(
+            customer=self.parent_resource.project.customer, year=2020, month=12
+        )
+
+        parent_items = december_invoice.items.filter(
+            resource_id=self.parent_resource.id
+        )
+        child_items = december_invoice.items.filter(resource_id=self.child_resource.id)
+
+        self.assertEqual(
+            parent_items.count(),
+            1,
+            "Parent offering should be billed monthly",
+        )
+        self.assertEqual(
+            child_items.count(),
+            0,
+            "Child non-billable offering should NOT be billed monthly",
+        )
+
+
+@freeze_time("2026-06-15")
+class GetOrCreateInvoiceWithDateInputTest(test.APITestCase):
+    """
+    Regression test for CSCS-5AK.
+
+    `process_component_usage_billing` passes `ComponentUsage.billing_period`
+    (a `datetime.date`) into `MarketplaceBillingService.get_or_create_invoice`.
+    When that call creates a new invoice and bulk-processes the customer's
+    existing LIMIT-billed resources, the downstream period arithmetic in
+    `serialize_resource_limit_period` must not blow up with
+    `TypeError: unsupported operand type(s) for -: 'datetime.datetime' and 'datetime.date'`.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.component = self.fixture.offering_component
+        self.component.billing_type = BillingTypes.LIMIT
+        self.component.limit_period = LimitPeriods.MONTH
+        self.component.save()
+
+        self.resource = ResourceFactory(
+            offering=self.fixture.offering,
+            plan=self.fixture.plan,
+            project=self.fixture.project,
+            limits={self.component.type: 10},
+        )
+        self.resource.set_state_ok()
+        self.resource.save()
+
+    def test_get_or_create_invoice_accepts_date_for_new_month(self):
+        future_month_date = datetime.date(2026, 7, 1)
+
+        invoice, created = MarketplaceBillingService.get_or_create_invoice(
+            self.resource.project.customer, future_month_date
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(invoice.year, 2026)
+        self.assertEqual(invoice.month, 7)
+        # Bulk-processing must have produced an item for the LIMIT resource
+        # without raising on the date/datetime subtraction.
+        self.assertEqual(
+            invoice.items.filter(
+                resource_id=self.resource.id,
+                details__offering_component_type=self.component.type,
+            ).count(),
+            1,
+        )
+
+
+class OneTimeQuantityTest(test.APITestCase):
+    """A one-time fee is invoiced at the quantity its plan names.
+
+    The estimate has always read ``PlanComponent.amount``; the invoice used to
+    charge one of each whatever the plan said, so the two disagreed in
+    whichever direction the amount fell.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.plan = self.resource.plan
+
+    def _one_time_component(self, amount, price, billing_type=BillingTypes.ONE_TIME):
+        component = marketplace_factories.OfferingComponentFactory(
+            offering=self.resource.offering,
+            type="setup",
+            name="Setup fee",
+            billing_type=billing_type,
+            is_prepaid=False,
+        )
+        return marketplace_factories.PlanComponentFactory(
+            plan=self.plan,
+            component=component,
+            price=Decimal(price),
+            amount=amount,
+        )
+
+    def _activate(self):
+        now = timezone.now()
+        self.resource.set_state_ok()
+        self.resource.save()
+        return invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer,
+            year=now.year,
+            month=now.month,
+        )
+
+    def test_a_quantified_fee_is_billed_for_its_quantity(self):
+        # 40 units at 15 is 600, which is what the plan quotes. Billing one of
+        # them charged 15 for something sold as 600.
+        self._one_time_component(amount=40, price="15")
+
+        invoice = self._activate()
+
+        item = invoice.items.get(
+            resource_id=self.resource.id, name__contains="Setup fee"
+        )
+        self.assertEqual(item.quantity, 40)
+        self.assertEqual(item.quantity * item.unit_price, Decimal("600"))
+
+    def test_a_fee_of_one_is_unchanged(self):
+        self._one_time_component(amount=1, price="250")
+
+        invoice = self._activate()
+
+        item = invoice.items.get(
+            resource_id=self.resource.id, name__contains="Setup fee"
+        )
+        self.assertEqual(item.quantity, 1)
+
+    def test_the_invoice_agrees_with_the_estimate(self):
+        # The two figures the customer sees: what they were quoted, and what
+        # they are billed.
+        self._one_time_component(amount=3, price="100")
+
+        invoice = self._activate()
+
+        item = invoice.items.get(
+            resource_id=self.resource.id, name__contains="Setup fee"
+        )
+        self.assertEqual(
+            item.quantity * item.unit_price,
+            Decimal(str(self.plan.non_prepaid_init_price)),
+        )

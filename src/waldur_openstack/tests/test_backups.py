@@ -14,7 +14,7 @@ from . import factories, fixtures
 
 
 @ddt
-class BackupDeleteTest(test.APITransactionTestCase):
+class BackupDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
 
@@ -33,7 +33,7 @@ class BackupDeleteTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
-class BackupListPermissionsTest(test.APITransactionTestCase):
+class BackupListPermissionsTest(test.APITestCase):
     def get_users_and_expected_results(self):
         """
         Return list or generator of dictionaries with such keys:
@@ -79,7 +79,7 @@ class BackupListPermissionsTest(test.APITransactionTestCase):
                     self.assertEqual(actual[key], value)
 
 
-class BackupPermissionsTest(test.APITransactionTestCase):
+class BackupPermissionsTest(test.APITestCase):
     def setUp(self):
         super().setUp()
         self.fixture = fixtures.OpenStackFixture()
@@ -148,7 +148,7 @@ class BackupPermissionsTest(test.APITransactionTestCase):
                 )
 
 
-class BackupSourceFilterTest(test.APITransactionTestCase):
+class BackupSourceFilterTest(test.APITestCase):
     def test_filter_backup_by_scope(self):
         user = structure_factories.UserFactory.create(is_staff=True)
 
@@ -174,7 +174,7 @@ class BackupSourceFilterTest(test.APITransactionTestCase):
         )
 
 
-class BackupRestorationTest(test.APITransactionTestCase):
+class BackupRestorationTest(test.APITestCase):
     def setUp(self):
         user = structure_factories.UserFactory(is_staff=True)
         self.client.force_authenticate(user=user)
@@ -251,6 +251,28 @@ class BackupRestorationTest(test.APITransactionTestCase):
         response = self.client.post(self.url, self._get_valid_payload())
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_restored_volume_inherits_bootable_flag_of_its_source_volume(self):
+        # Without the inherited flag the restored instance has no system volume
+        # and create_instance fails its `volumes.get(bootable=True)` guard.
+        for volume in self.backup.instance.volumes.all():
+            self.backup.snapshots.add(
+                factories.SnapshotFactory(
+                    project=self.fixture.project,
+                    tenant=self.tenant,
+                    state=CoreStates.OK,
+                    source_volume=volume,
+                    size=volume.size,
+                )
+            )
+
+        response = self.client.post(self.url, self._get_valid_payload())
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        restored_instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(2, restored_instance.volumes.count())
+        restored_system_volume = restored_instance.volumes.get(bootable=True)
+        self.assertTrue(restored_system_volume.source_snapshot.source_volume.bootable)
 
     def test_security_groups_cannot_be_associated_if_they_belong_to_another_tenant(
         self,

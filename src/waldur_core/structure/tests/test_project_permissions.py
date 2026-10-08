@@ -1,5 +1,6 @@
 import datetime
 
+from constance.test import override_config
 from django.utils import timezone
 from rest_framework import status, test
 
@@ -15,7 +16,7 @@ from waldur_core.structure.tests.utils import (
 )
 
 
-class ProjectPermissionBaseTest(test.APITransactionTestCase):
+class ProjectPermissionBaseTest(test.APITestCase):
     def setUp(self) -> None:
         super().setUp()
 
@@ -76,6 +77,34 @@ class ProjectPermissionListTest(ProjectPermissionBaseTest):
             self.client, factories.UserFactory(is_staff=True), project
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class ProjectPermissionListQueryTest(ProjectPermissionBaseTest):
+    def test_list_users_does_not_make_n_plus_one_queries(self):
+        """Regression test for CSCS-287: N+1 queries on role and user tables.
+
+        The list_users action also runs a single combined SQL EXISTS to
+        check that the caller has a role on the scope tree (see
+        ``_user_can_view_scope_team`` in waldur_core.permissions.views) —
+        that adds two queries on top of the original 8-query budget.
+        """
+        owner = factories.UserFactory()
+        customer = factories.CustomerFactory()
+        project = factories.ProjectFactory(customer=customer)
+        customer.add_user(owner, CustomerRole.OWNER)
+
+        # Add several users to the project to trigger N+1
+        for _ in range(5):
+            project.add_user(factories.UserFactory(), ProjectRole.ADMIN)
+
+        self.client.force_authenticate(user=owner)
+        url = factories.ProjectFactory.get_url(project) + "list_users/"
+
+        with self.assertNumQueries(10):
+            response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(len(response.data), 5)  # 5 admins
 
 
 class ProjectPermissionGrantTest(ProjectPermissionBaseTest):
@@ -237,6 +266,126 @@ class ProjectPermissionGrantTest(ProjectPermissionBaseTest):
             ProjectRole.ADMIN,
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_customer_owner_cannot_grant_second_project_manager(self):
+        self.project.add_user(factories.UserFactory(), ProjectRole.MANAGER)
+
+        response = client_add_user(
+            self.client,
+            self.owner,
+            factories.UserFactory(),
+            self.project,
+            ProjectRole.MANAGER,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data["non_field_errors"][0],
+            "Project already has an active project manager.",
+        )
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_cannot_grant_second_role_when_multiple_roles_disabled(self):
+        member = factories.UserFactory()
+        self.project.add_user(member, ProjectRole.MANAGER)
+
+        response = client_add_user(
+            self.client, self.owner, member, self.project, ProjectRole.ADMIN
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data["non_field_errors"][0],
+            "User already has role within this scope.",
+        )
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=False)
+    def test_can_grant_second_role_when_multiple_roles_enabled(self):
+        member = factories.UserFactory()
+        self.project.add_user(member, ProjectRole.MANAGER)
+
+        response = client_add_user(
+            self.client, self.owner, member, self.project, ProjectRole.ADMIN
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_same_role_is_rejected_when_multiple_roles_disabled(self):
+        member = factories.UserFactory()
+        self.project.add_user(member, ProjectRole.ADMIN)
+
+        response = client_add_user(
+            self.client, self.owner, member, self.project, ProjectRole.ADMIN
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data["non_field_errors"][0],
+            "User has already the same role in this scope.",
+        )
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_can_grant_role_in_another_project_when_multiple_roles_disabled(self):
+        member = factories.UserFactory()
+        self.project.add_user(member, ProjectRole.MANAGER)
+        other_project = factories.ProjectFactory(customer=self.customer)
+
+        response = client_add_user(
+            self.client, self.owner, member, other_project, ProjectRole.ADMIN
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def _grant_expiring_admin(self):
+        member = factories.UserFactory()
+        self.project.add_user(
+            member,
+            ProjectRole.ADMIN,
+            expiration_time=timezone.now() + datetime.timedelta(days=10),
+        )
+        return member
+
+    def _active_admin_rows(self, member):
+        return UserRole.objects.filter(
+            user=member,
+            role__name=ProjectRole.ADMIN.name,
+            object_id=self.project.id,
+            is_active=True,
+        ).count()
+
+    def test_permanent_grant_over_an_expiring_same_role_is_rejected(self):
+        member = self._grant_expiring_admin()
+
+        response = client_add_user(
+            self.client, self.owner, member, self.project, ProjectRole.ADMIN
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data["non_field_errors"][0],
+            "User has already the same role in this scope.",
+        )
+        self.assertEqual(self._active_admin_rows(member), 1)
+
+    def test_later_expiring_grant_over_an_expiring_same_role_is_rejected(self):
+        member = self._grant_expiring_admin()
+
+        response = client_add_user(
+            self.client,
+            self.owner,
+            member,
+            self.project,
+            ProjectRole.ADMIN,
+            timezone.now() + datetime.timedelta(days=200),
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._active_admin_rows(member), 1)
+
+    def test_expiring_role_is_made_permanent_through_update_user(self):
+        member = self._grant_expiring_admin()
+
+        response = client_update_user(
+            self.client, self.owner, member, self.project, ProjectRole.ADMIN
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIsNone(response.data["expiration_time"])
+        self.assertEqual(self._active_admin_rows(member), 1)
 
 
 class ProjectPermissionRevokeTest(ProjectPermissionBaseTest):

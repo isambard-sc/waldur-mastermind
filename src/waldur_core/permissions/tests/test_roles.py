@@ -17,30 +17,52 @@ from waldur_mastermind.marketplace.tests import fixtures
 ROLE_ENDPOINT = "/api/roles/"
 
 
-class RoleTest(test.APITransactionTestCase):
+class RoleTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.project = self.fixture.project
 
+    def _row(self, response, role):
+        """Pick one role out of a list response.
+
+        The roles table is not empty: migrations seed the system roles
+        (``0002_import_data.fill_system_roles`` and
+        ``0008_customer_role.create_customer_role``). Indexing ``data[0]``
+        therefore returns whichever role sorts first by name — CUSTOMER.MANAGER,
+        not the role under test — unless something earlier in the same pytest
+        process happened to flush the table.
+        """
+        return next(row for row in response.data if row["uuid"] == role.uuid.hex)
+
     def test_get_role(self):
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING)
         response = self.client.get(ROLE_ENDPOINT)
-        self.assertEqual(
-            list(response.data[0]["permissions"]), [PermissionEnum.UPDATE_OFFERING]
+        # assertIn, not equality: system roles do not start empty either.
+        # Migrations grant them a baseline set (e.g. ORDER.CREATE in
+        # 0019_order_create_permission), so the role carries more than the one
+        # permission this test adds.
+        self.assertIn(
+            PermissionEnum.UPDATE_OFFERING,
+            self._row(response, CustomerRole.OWNER)["permissions"],
         )
 
     def test_staff_can_create_role(self):
         user = UserFactory(is_staff=True)
         self.client.force_login(user)
+        # A name no migration seeds: role names are unique across scopes, so
+        # posting CUSTOMER.OWNER here asserts nothing about the create
+        # permission — it only ever returns "Name should be unique."
         response = self.client.post(
             ROLE_ENDPOINT,
             {
-                "name": RoleEnum.CUSTOMER_OWNER,
+                "name": "CUSTOMER.TEST_ROLE",
                 "content_type": "customer",
                 "permissions": [PermissionEnum.UPDATE_OFFERING.value],
             },
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["permissions"], [PermissionEnum.UPDATE_OFFERING])
+        self.assertFalse(response.data["is_system_role"])
 
     def test_non_staff_can_not_create_create_role(self):
         user = UserFactory(is_staff=False)
@@ -60,7 +82,7 @@ class RoleTest(test.APITransactionTestCase):
         user = UserFactory(is_staff=True)
         self.client.force_login(user)
         response = self.client.get(ROLE_ENDPOINT)
-        role_uuid = response.data[0]["uuid"]
+        role_uuid = self._row(response, CustomerRole.OWNER)["uuid"]
         response = self.client.put(
             f"{ROLE_ENDPOINT}{role_uuid}/",
             {
@@ -83,7 +105,7 @@ class RoleTest(test.APITransactionTestCase):
         user = UserFactory(is_staff=True)
         self.client.force_login(user)
         response = self.client.get(ROLE_ENDPOINT)
-        role_uuid = response.data[0]["uuid"]
+        role_uuid = self._row(response, CustomerRole.OWNER)["uuid"]
         response = self.client.put(
             f"{ROLE_ENDPOINT}{role_uuid}/",
             {
@@ -101,7 +123,7 @@ class RoleTest(test.APITransactionTestCase):
         user = UserFactory(is_staff=True)
         self.client.force_login(user)
         response = self.client.get(ROLE_ENDPOINT)
-        role_uuid = response.data[0]["uuid"]
+        role_uuid = self._row(response, CustomerRole.OWNER)["uuid"]
         response = self.client.delete(f"{ROLE_ENDPOINT}{role_uuid}/")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
@@ -143,58 +165,58 @@ class RoleTest(test.APITransactionTestCase):
         user = UserFactory(is_staff=True)
         self.client.force_login(user)
         response = self.client.get(ROLE_ENDPOINT)
-        role = response.data[0]
+        role = self._row(response, CustomerRole.OWNER)
         self.assertEqual(role["is_active"], True)
         self.client.post(
             f"{ROLE_ENDPOINT}{role['uuid']}/disable/",
         )
         response = self.client.get(ROLE_ENDPOINT)
-        self.assertEqual(response.data[0]["is_active"], False)
+        self.assertEqual(self._row(response, CustomerRole.OWNER)["is_active"], False)
 
     def test_non_staff_can_not_disable_role(self):
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING)
         user = UserFactory(is_staff=False)
         self.client.force_login(user)
         response = self.client.get(ROLE_ENDPOINT)
-        role = response.data[0]
+        role = self._row(response, CustomerRole.OWNER)
         self.assertEqual(role["is_active"], True)
         self.client.post(
             f"{ROLE_ENDPOINT}{role['uuid']}/disable/",
         )
         response = self.client.get(ROLE_ENDPOINT)
-        self.assertEqual(response.data[0]["is_active"], True)
+        self.assertEqual(self._row(response, CustomerRole.OWNER)["is_active"], True)
 
     def test_staff_can_enable_role(self):
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING)
         user = UserFactory(is_staff=True)
         self.client.force_login(user)
         response = self.client.get(ROLE_ENDPOINT)
-        role = response.data[0]
+        role = self._row(response, CustomerRole.OWNER)
         self.assertEqual(role["is_active"], True)
         self.client.post(
             f"{ROLE_ENDPOINT}{role['uuid']}/disable/",
         )
         response = self.client.get(ROLE_ENDPOINT)
-        self.assertEqual(response.data[0]["is_active"], False)
+        self.assertEqual(self._row(response, CustomerRole.OWNER)["is_active"], False)
         self.client.post(
             f"{ROLE_ENDPOINT}{role['uuid']}/enable/",
         )
         response = self.client.get(ROLE_ENDPOINT)
-        self.assertEqual(response.data[0]["is_active"], True)
+        self.assertEqual(self._row(response, CustomerRole.OWNER)["is_active"], True)
 
     def test_non_staff_can_not_enable_role(self):
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING)
         user = UserFactory(is_staff=False)
         self.client.force_login(user)
         response = self.client.get(ROLE_ENDPOINT)
-        role = response.data[0]
+        role = self._row(response, CustomerRole.OWNER)
         action_response = self.client.post(
             f"{ROLE_ENDPOINT}{role['uuid']}/enable/",
         )
         self.assertEqual(action_response.status_code, status.HTTP_403_FORBIDDEN)
 
 
-class RoleUpdateDescriptionsTest(test.APITransactionTestCase):
+class RoleUpdateDescriptionsTest(test.APITestCase):
     def setUp(self):
         self.staff = UserFactory(is_staff=True)
         self.role = models.Role.objects.create(
@@ -235,7 +257,7 @@ class RoleUpdateDescriptionsTest(test.APITransactionTestCase):
 
 
 @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
-class UserDeactivationTest(test.APITransactionTestCase):
+class UserDeactivationTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.user = self.fixture.owner
@@ -265,3 +287,91 @@ class UserDeactivationTest(test.APITransactionTestCase):
         staff_role.revoke()
         staff.refresh_from_db()
         self.assertTrue(staff.is_active)
+
+    def test_user_reactivated_when_granted_new_role(self):
+        # First, deactivate the user by revoking their role
+        self.role.revoke()
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_active)
+
+        # Then grant a new role and verify reactivation
+        self.customer.add_user(self.user, ServiceProviderRole.MANAGER)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.is_active)
+        self.assertTrue(
+            logging_models.Event.objects.filter(event_type="user_activated").exists()
+        )
+
+    def test_staff_not_reactivated_by_role_grant(self):
+        # Create inactive staff user
+        staff = structure_factories.UserFactory(is_active=False, is_staff=True)
+
+        # Grant role to staff - should not reactivate because they're staff
+        self.customer.add_user(staff, CustomerRole.OWNER)
+        staff.refresh_from_db()
+        self.assertFalse(staff.is_active)
+
+    def test_support_not_reactivated_by_role_grant(self):
+        # Create inactive support user
+        support = structure_factories.UserFactory(is_active=False, is_support=True)
+
+        # Grant role to support - should not reactivate because they're support
+        self.customer.add_user(support, CustomerRole.OWNER)
+        support.refresh_from_db()
+        self.assertFalse(support.is_active)
+
+    def test_reactivation_disabled_when_setting_false(self):
+        # Deactivate user first
+        self.role.revoke()
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_active)
+
+        # Disable the setting and grant role
+        with override_config(DEACTIVATE_USER_IF_NO_ROLES=False):
+            self.customer.add_user(self.user, ServiceProviderRole.MANAGER)
+            self.user.refresh_from_db()
+            # Should remain inactive because setting is disabled
+            self.assertFalse(self.user.is_active)
+
+
+class DeactivatedUserRoleAssignmentTest(test.APITestCase):
+    def setUp(self):
+        from waldur_core.permissions.fixtures import ProjectRole
+
+        self.role = ProjectRole.MEMBER
+        self.deactivated_user = structure_factories.UserFactory(is_active=False)
+
+    def test_staff_can_add_deactivated_user_to_project(self):
+        """Staff should be able to grant a role to a deactivated user via API."""
+        staff = structure_factories.UserFactory(is_staff=True)
+        project = structure_factories.ProjectFactory()
+
+        self.client.force_authenticate(staff)
+        url = structure_factories.ProjectFactory.get_url(project, action="add_user")
+        response = self.client.post(
+            url,
+            {
+                "user": self.deactivated_user.uuid.hex,
+                "role": self.role.name,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_non_staff_cannot_add_deactivated_user_to_project(self):
+        """Non-staff users should not be able to grant a role to a deactivated user."""
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT_PERMISSION)
+        fixture = structure_fixtures.CustomerFixture()
+        owner = fixture.owner
+        project = structure_factories.ProjectFactory(customer=fixture.customer)
+
+        self.client.force_authenticate(owner)
+        url = structure_factories.ProjectFactory.get_url(project, action="add_user")
+        response = self.client.post(
+            url,
+            {
+                "user": self.deactivated_user.uuid.hex,
+                "role": self.role.name,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("deactivated", str(response.data))

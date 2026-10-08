@@ -4,9 +4,15 @@ from dataclasses import dataclass
 @dataclass
 class Feature:
     description: str
+    # Value used while no core.Feature row exists, i.e. until an admin or
+    # load_features sets the flag explicitly.
+    default: bool = False
 
 
 FEATURES = []
+
+# Dotted keys of the features whose default is on.
+FEATURE_DEFAULTS: dict[str, bool] = {}
 
 
 class FeatureSectionMetaclass(type):
@@ -23,6 +29,8 @@ class FeatureSectionMetaclass(type):
                     section["items"].append(
                         {"key": key, "description": feature.description}
                     )
+                    if feature.default:
+                        FEATURE_DEFAULTS[f"{section['key']}.{key}"] = True
         return type.__new__(self, name, bases, attrs)
 
 
@@ -45,9 +53,17 @@ class CustomerSection(FeatureSection):
     )
 
     show_banking_data = Feature("Display banking related data under customer profile.")
+    show_onboarding = Feature("Enable onboarding functionality.")
+    show_project_digest = Feature(
+        "Enable display of project digest configuration in organization settings."
+    )
 
     show_openportal_remote_projects = Feature(
         "Allows to show OpenPortal Remote Projects (remotes) in an organization."
+    )
+
+    show_openportal_accounting_only = Feature(
+        "Show only OpenPortal award accounting for this organization, hiding the marketplace usage, limit and credit widgets that describe a different accounting model."
     )
 
 
@@ -59,6 +75,8 @@ class ProjectSection(FeatureSection):
     estimated_cost = Feature("Render estimated cost column in projects list.")
 
     oecd_fos_2007_code = Feature("Enable OECD code.")
+
+    science_domain = Feature("Enable science domain/sub-domain selection for projects.")
 
     show_industry_flag = Feature("Show industry flag.")
 
@@ -84,8 +102,6 @@ class ProjectSection(FeatureSection):
 
     mandatory_start_date = Feature("Make the project start date mandatory.")
 
-    mandatory_end_date = Feature("Make the project end date mandatory.")
-
     show_permission_reviews = Feature(
         "Allows to show permission reviews tab and popups for projects."
     )
@@ -99,6 +115,11 @@ class ProjectSection(FeatureSection):
 
     show_openportal_accounting_pages = Feature(
         "Show OpenPortal accounting pages to users in the project workspace."
+    )
+
+    show_matrix_chat = Feature(
+        "Render the project Matrix chat UI. Backend access is gated "
+        "separately on the MATRIX_ENABLED Constance setting."
     )
 
 
@@ -141,8 +162,46 @@ class UserSection(FeatureSection):
         "Show and allow editing of minimal set of user profile fields (e.g. just name and email)."
     )
 
+    show_openportal_identifier = Feature(
+        "Identify users by their OpenPortal username: show it in place of the username in user lists, show it on the user profile, and let a user choose it once if it has not been set."
+    )
+
     allow_user_creation = Feature(
         "Allow users to create new user accounts when adding team members to projects and proposals."
+    )
+
+    pending_user_actions = Feature("Show pending user actions.")
+
+    show_data_access = Feature(
+        "Enable Data Access tab showing who can access user profile data."
+    )
+
+    show_identity_bridge = Feature(
+        "Show identity bridge information in user profiles and admin views."
+    )
+
+    conceal_api_token = Feature(
+        "Hide API token management tab from non-staff and non-support users."
+    )
+
+    conceal_permission_requests = Feature(
+        "Hide permission requests tab from non-staff and non-support users."
+    )
+
+    conceal_remote_accounts = Feature(
+        "Hide remote accounts tab from non-staff and non-support users."
+    )
+
+
+class SramSection(FeatureSection):
+    class Meta:
+        key = "sram"
+        description = "SRAM integration"
+
+    integration = Feature(
+        "Render the SRAM integration administration page and SRAM markers in team "
+        "lists. Backend access is gated separately on the SRAM_INTEGRATION_ENABLED "
+        "Constance setting."
     )
 
 
@@ -161,6 +220,13 @@ class MarketplaceSection(FeatureSection):
         "Enabled display of experimental or mocked components in marketplace."
     )
 
+    realtime_updates = Feature(
+        "Enable push-driven UI updates over the event-consumer WebSocket "
+        "(experimental). When disabled, the UI relies on polling and manual "
+        "refresh as before. Requires RabbitMQ web-STOMP to be reachable at "
+        "/rmqws-stomp on the API host."
+    )
+
     show_call_management_functionality = Feature(
         "Enabled display of call management functionality."
     )
@@ -169,10 +235,24 @@ class MarketplaceSection(FeatureSection):
 
     catalogue_only = Feature("Allow marketplace to function as a catalogue only.")
 
+    conceal_offering_pricing_tab_in_public_view = Feature(
+        "Conceal offering pricing tab in the offering's public view."
+    )
+
     call_only = Feature("Allow marketplace to serve only as aggregator of call info.")
 
     show_resource_end_date = Feature(
         "Show resource end date as a non optional column in resources list."
+    )
+
+    show_posix_id_pools = Feature(
+        "Render POSIX ID pool management UI for service providers."
+    )
+
+    show_provider_accounts = Feature(
+        "Render service provider account management UI: provider accounts, "
+        "username conflicts, the shared GLAuth directory and provider account "
+        "settings."
     )
 
     allow_display_of_images_in_markdown = Feature(
@@ -186,8 +266,64 @@ class MarketplaceSection(FeatureSection):
 
     display_software_catalog = Feature("Enable display of software catalog in UI.")
 
+    show_openstack_duplicate_offerings = Feature(
+        "Show the staff diagnostics page listing tenants with duplicate "
+        "per-tenant OpenStack offerings."
+    )
+
     display_offering_partitions = Feature(
         "Enable display of offering partitions in UI."
+    )
+
+    conceal_resource_metadata = Feature(
+        "Conceal resource metadata from non-staff users in resource detail view."
+    )
+
+    hide_marketplace_from_end_users = Feature(
+        "Hide marketplace functionality from end users but allow staff access."
+    )
+    hide_organization_information_from_project_members = Feature(
+        "Hide organization information from project-level users. Organization owners, managers, and staff retain full access."
+    )
+    conceal_audit_log_from_end_users = Feature(
+        "Hide audit log tab from non-staff and non-support users."
+    )
+
+    conceal_pending_provider_orders = Feature(
+        "Hide pending provider orders section from the pending confirmations drawer."
+    )
+
+    conceal_pending_consumer_orders = Feature(
+        "Hide pending consumer orders section from the pending confirmations drawer."
+    )
+
+
+class DashboardSection(FeatureSection):
+    class Meta:
+        key = "dashboard"
+        description = "Project and organization dashboards"
+
+    usage_per_offering_bars = Feature(
+        "Show usage against the remaining cap as one stacked bar per offering."
+    )
+
+    usage_treemap = Feature(
+        "Show usage as a treemap of offering, billing type and component."
+    )
+
+    usage_limit_horizon = Feature(
+        "Show a saturation bar per offering component against a timeline, "
+        "with the current date and the next limit reset marked."
+    )
+
+    usage_period_over_period = Feature(
+        "Show usage for the current period overlaid on the previous one, "
+        "per offering component."
+    )
+
+    spend_forecast = Feature(
+        "Show credit burn-down with a projected exhaustion date on the "
+        "project dashboard."
     )
 
 
@@ -205,6 +341,8 @@ class SupportSection(FeatureSection):
     conceal_change_request = Feature(
         'Conceal "Change request" from a selection of issue types for non-staff/non-support users.'
     )
+
+    enable_llm_assistant = Feature("Enable AI Assistant")
 
 
 class InvitationsSection(FeatureSection):
@@ -234,16 +372,6 @@ class RancherSection(FeatureSection):
     apps = Feature("Render Rancher apps as a separate tab in resource details page.")
 
 
-class SlurmSection(FeatureSection):
-    class Meta:
-        key = "slurm"
-        description = "SLURM resources provisioning"
-
-    jobs = Feature(
-        "Render list of SLURM jobs as a separate tab in allocation details page."
-    )
-
-
 class OpenstackSection(FeatureSection):
     class Meta:
         key = "openstack"
@@ -260,7 +388,7 @@ class WaldurDeploymentSection(FeatureSection):
         key = "deployment"
         description = "Waldur deployment settings"
 
-    send_metrics = Feature("Send telemetry metrics.")
+    send_metrics = Feature("Send telemetry metrics.", default=True)
     enable_cookie_notice = Feature("Enable cookie notice in marketplace.")
     application_portal_only = Feature(
         "Configure Waldur to function as an application and awards portal only."
@@ -268,3 +396,35 @@ class WaldurDeploymentSection(FeatureSection):
     make_slugs_immutable = Feature(
         "Make slugs immutable, i.e. disallow direct changes to slugs after they have been set. Note that slugs may still be changed indirectly."
     )
+
+    enable_disclaimer_area = Feature("Enable disclaimer area below the footer.")
+
+
+class ProposalSection(FeatureSection):
+    class Meta:
+        key = "proposal"
+        description = "Proposals and calls"
+
+    auto_assign_award_id = Feature(
+        "Give each new proposal an award ID (for example 0261-4064-4676-1) as its slug, and carry it onto the project created when the proposal is accepted. Only takes effect together with application_portal_only, which stops the OpenPortal shortname from overwriting the project slug."
+    )
+
+
+class ResellerSection(FeatureSection):
+    class Meta:
+        key = "reseller"
+        description = "Reseller integrations"
+
+    arrow = Feature("Enable Arrow integration menu in administration.")
+    affiliates = Feature(
+        "Show affiliate program menus and pages. Backend enforcement is "
+        "controlled separately by the AFFILIATES_ENABLED Constance setting."
+    )
+
+
+def is_enabled(key: str) -> bool:
+    """Current value of a feature flag, falling back to its declared default."""
+    from waldur_core.core.models import Feature as FeatureModel
+
+    value = FeatureModel.objects.filter(key=key).values_list("value", flat=True).first()
+    return FEATURE_DEFAULTS.get(key, False) if value is None else value

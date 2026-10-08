@@ -1,22 +1,20 @@
+import decimal
+import json
 import logging
 import re
-import decimal
-import datetime
-import json
 
+import openportal
 from django.conf import settings as django_settings
 from django.db import transaction
 
-from waldur_core.structure.backend import ServiceBackend
-from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
-
+from waldur_core.structure.backend import ServiceBackend
+from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_openportal import signals
 from waldur_openportal.client import OpenPortalClient
 
-from . import models
-from . import op as openportal
+from . import exceptions, models
 from . import utils as openportal_utils
 
 logger = logging.getLogger(__name__)
@@ -25,7 +23,15 @@ logger = logging.getLogger(__name__)
 class OpenPortalBackend(ServiceBackend):
     def __init__(self, settings):
         self.settings = settings
-        self.client = self.get_client(settings)
+
+    @property
+    def client(self) -> OpenPortalClient:
+        """
+        Lazy initialize OpenPortal client instance
+        """
+        if not hasattr(self, "_client"):
+            self._client = self.get_client(self.settings)
+        return self._client
 
     def destination(self) -> openportal.Destination:
         """
@@ -50,42 +56,12 @@ class OpenPortalBackend(ServiceBackend):
         logger.debug(f"Pulling OpenPortal resources for settings: {self}")
 
         logger.warning("Skipping pull_resources")
-        return
-        # --- IGNORE ---
-        fail_count = 0
-        now = datetime.datetime.now()
-
-        from . import tasks as openportal_tasks
-
-        for allocation in self.get_allocation_queryset().filter(
-            state=CoreStates.OK, is_added=True
-        ):
-            if openportal_tasks.is_task_running(openportal_tasks.sync):
-                logger.info(
-                    "Task sync is already running - skipping allocation %s",
-                    allocation,
-                )
-                continue
-
-            try:
-                logger.debug("About to pull allocation %s", allocation)
-                self.pull_allocation(allocation)
-            except Exception as e:
-                logger.error("Error while pulling allocation [%s]: %s", allocation, e)
-                fail_count += 1
-
-                if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
-                    logger.error("Too many failures - aborting")
-                    return
-                elif (datetime.datetime.now() - now).seconds > 120:
-                    logger.error("Took too long - aborting")
-                    return
 
     def ping(self, raise_exception=False):
         logger.debug("Pinging OpenPortal")
         try:
             self.client.health()
-        except openportal.OpenPortalError as e:
+        except exceptions.OpenPortalError as e:
             logger.error(f"OpenPortal is not available: {e}")
             if raise_exception:
                 raise ServiceBackendError(e)
@@ -858,14 +834,18 @@ class OpenPortalBackend(ServiceBackend):
                 )
             )
             if created:
-                logger.debug(f"Created storage report for {project} [{report_date.year}-{report_date.month}]")
+                logger.debug(
+                    f"Created storage report for {project} [{report_date.year}-{report_date.month}]"
+                )
             else:
                 # Merge the new snapshot into the accumulated monthly report
                 accumulated = cached.get_report()
                 accumulated += new_report
                 cached.report = json.loads(accumulated.to_json())
                 cached.save(update_fields=["report"])
-                logger.debug(f"Updated storage report for {project} [{report_date.year}-{report_date.month}]")
+                logger.debug(
+                    f"Updated storage report for {project} [{report_date.year}-{report_date.month}]"
+                )
 
     def pull_allocation(self, allocation: models.Allocation):
         if not isinstance(allocation, models.Allocation):

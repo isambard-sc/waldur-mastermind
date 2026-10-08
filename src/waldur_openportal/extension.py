@@ -22,7 +22,19 @@ class OpenPortalExtension(WaldurExtension):
     def celery_tasks():
         from datetime import timedelta
 
+        from celery.schedules import crontab
+
         return {
+            # Reconciles User.slug against the OpenPortal username, clearing
+            # the slug of users who have not chosen one. Daily rather than
+            # frequent: set_shortname() keeps the copy correct as usernames
+            # are chosen, so this only has to catch what that cannot see.
+            # No-op unless user.show_openportal_identifier is on.
+            "waldur-openportal-sync-user-slugs": {
+                "task": "waldur_openportal.sync_user_slugs",
+                "schedule": crontab(minute=20, hour=2),
+                "args": (),
+            },
             # This task re-tries to add or remove local users in case
             # user management failed when called directly
             "waldur-openportal-sync-local-users": {

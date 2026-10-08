@@ -1,0 +1,1 @@
+ACTION REQUIRED: the data of your {{ site_name }} project {{ project_name }} will be deleted in {{ days_until_deletion }} days

@@ -1,7 +1,7 @@
 import logging
 
-from waldur_mastermind.marketplace import processors
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import processors
 from waldur_openportal import models as openportal_models
 from waldur_openportal import views as openportal_views
 

@@ -11,12 +11,15 @@ class MarketplaceSlurmConfig(AppConfig):
 
     def ready(self):
         from waldur_core.permissions import signals as permission_signals
+        from waldur_core.structure import signals as structure_signals
         from waldur_mastermind.marketplace import models as marketplace_models
         from waldur_mastermind.marketplace.plugins import manager
         from waldur_mastermind.marketplace_site_agent import (
             executors,
             handlers,
+            models,
             processor,
+            utils,
         )
 
         manager.register(
@@ -27,18 +30,12 @@ class MarketplaceSlurmConfig(AppConfig):
             can_update_limits=True,
             enable_remote_support=True,
             pull_resource_executor=executors.AgentResourcePullExecutor,
-        )
-
-        signals.post_save.connect(
-            handlers.send_done_order_to_message_queue,
-            sender=marketplace_models.Order,
-            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_done_order_to_message_queue",
-        )
-
-        signals.post_save.connect(
-            handlers.send_pending_order_to_message_queue,
-            sender=marketplace_models.Order,
-            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_pending_order_to_message_queue",
+            supports_order_retry=True,
+            # No max_limit_decimal_places: this one offering type fronts every
+            # site agent, and its backends disagree about whether a limit can
+            # hold a fraction. The advisory says what is known about the
+            # individual offering instead of capping the whole type.
+            limit_precision_advisory=utils.get_limit_precision_advisory,
         )
 
         signals.post_save.connect(
@@ -85,4 +82,15 @@ class MarketplaceSlurmConfig(AppConfig):
             handlers.send_course_account_deletion_info,
             sender=marketplace_models.CourseAccount,
             dispatch_uid="waldur_mastermind.marketplace_site_agent.send_course_account_deletion_info",
+        )
+
+        signals.pre_delete.connect(
+            handlers.cleanup_agent_identity_queue,
+            sender=models.AgentIdentity,
+            dispatch_uid="waldur_mastermind.marketplace_site_agent.cleanup_agent_identity_queue",
+        )
+
+        structure_signals.project_moved.connect(
+            handlers.send_resource_messages_on_project_move,
+            dispatch_uid="waldur_mastermind.marketplace_site_agent.send_resource_messages_on_project_move",
         )

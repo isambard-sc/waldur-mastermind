@@ -17,17 +17,6 @@ def get_score(num, den):
     return round(100 * num / max(1, den), 2)
 
 
-class CategoriesView(core_views.ActionsViewSet):
-    queryset = models.Category.objects.all()
-    serializer_class = serializers.ChecklistCategorySerializer
-    lookup_field = "uuid"
-    filter_backends = [
-        DjangoFilterBackend,
-        structure_filters.GenericRoleFilter,
-    ]
-    permission_classes = [rf_permissions.IsAuthenticated, core_permissions.IsStaff]
-
-
 class ChecklistAdminView(core_views.ActionsViewSet):
     queryset = models.Checklist.objects.all().order_by("-created")
     serializer_class = serializers.ChecklistSerializer
@@ -48,11 +37,19 @@ class ChecklistAdminView(core_views.ActionsViewSet):
     @action(detail=True, methods=["get"])
     def questions(self, request, uuid=None):
         checklist = self.get_object()
-        questions = checklist.questions.all()
-        data = serializers.QuestionAdminSerializer(
+        questions = checklist.questions.all().order_by("order")
+
+        page = self.paginate_queryset(questions)
+        if page is not None:
+            serializer = serializers.QuestionAdminSerializer(
+                page, context={"request": request}, many=True
+            )
+            return self.get_paginated_response(serializer.data)
+
+        serializer = serializers.QuestionAdminSerializer(
             questions, context={"request": request}, many=True
-        ).data
-        return Response(data, status=status.HTTP_200_OK)
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 class QuestionsAdminView(core_views.ActionsViewSet):
@@ -68,7 +65,7 @@ class QuestionsAdminView(core_views.ActionsViewSet):
 
 
 class QuestionOptionAdminViewSet(core_views.ActionsViewSet):
-    queryset = models.QuestionOption.objects.all().order_by(
+    queryset = models.QuestionOption.objects.select_related("question").order_by(
         "question__checklist", "question"
     )
     serializer_class = serializers.QuestionOptionsAdminSerializer

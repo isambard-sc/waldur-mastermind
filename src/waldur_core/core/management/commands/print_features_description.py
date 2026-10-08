@@ -11,8 +11,8 @@ class Command(BaseCommand):
             "// WARNING: This file is auto-generated from src/waldur_core/core/management/commands/print_features_description.py"
         )
         print("// Do not edit it manually. All manual changes would be overridden.")
-        print("import { FeatureSection } from '@waldur/features/types';")
-        print("import { translate } from '@waldur/i18n';")
+        print("import { FeatureSection } from '@/features/types';")
+        print("import { translate } from '@/i18n';")
         print()
         print("export const FeaturesDescription: FeatureSection[] = [")
         for section in sorted(FEATURES, key=lambda section: section["key"]):
@@ -23,7 +23,8 @@ class Command(BaseCommand):
             for feature in sorted(section["items"], key=lambda section: section["key"]):
                 print("      {")
                 print(f"        key: '{feature['key']}',")
-                print(f"        description: translate('{feature['description']}'),")
+                description = feature["description"].replace("'", "\\'")
+                print(f"        description: translate('{description}'),")
                 print("      },")
             print("    ],")
             print("  },")

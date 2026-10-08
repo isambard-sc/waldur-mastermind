@@ -5,10 +5,13 @@ import factory
 from celery import Signature
 from cinderclient import exceptions as cinder_exceptions
 from ddt import data, ddt
+from django.db import connection
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
 from novaclient import exceptions as nova_exceptions
 from rest_framework import status, test
 
+from waldur_core.core import tasks as core_tasks
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.utils import serialize_instance
 from waldur_core.structure.tests import factories as structure_factories
@@ -17,6 +20,7 @@ from waldur_mastermind.marketplace_openstack.utils import (
     delete_instance,
 )
 from waldur_openstack import executors, models, views
+from waldur_openstack import tasks as openstack_tasks
 from waldur_openstack.exceptions import OpenStackBackendError
 from waldur_openstack.models import Port
 from waldur_openstack.tasks import LimitedPerTypeThrottleMixin
@@ -24,11 +28,10 @@ from waldur_openstack.tests import factories, fixtures, helpers
 from waldur_openstack.tests.helpers import (
     override_openstack_settings,
 )
-from waldur_openstack.tests.unittests import test_backend
 from waldur_openstack.utils import volume_type_name_to_quota_name
 
 
-class InstanceFilterTest(test.APITransactionTestCase):
+class InstanceFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.client.force_authenticate(user=self.fixture.owner)
@@ -68,7 +71,7 @@ class InstanceFilterTest(test.APITransactionTestCase):
 
 
 @ddt
-class InstanceCreateTest(test.APITransactionTestCase):
+class InstanceCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.tenant = self.fixture.tenant
@@ -129,6 +132,20 @@ class InstanceCreateTest(test.APITransactionTestCase):
         self.assertEqual(self.tenant.get_quota_usage(Quotas.vcpu), instance.cores)
         self.assertEqual(self.tenant.get_quota_usage(Quotas.instances), 1)
 
+    def test_config_drive_is_persisted_on_create(self):
+        response = self.create_instance(self.get_valid_data(config_drive=True))
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        self.assertIs(instance.config_drive, True)
+        self.assertIs(response.data["config_drive"], True)
+
+    def test_config_drive_defaults_to_null(self):
+        response = self.create_instance(self.get_valid_data())
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        self.assertIsNone(instance.config_drive)
+        self.assertIsNone(response.data["config_drive"])
+
     def test_project_quotas_updated_when_instance_is_created(self):
         response = self.create_instance(self.get_valid_data())
         instance = models.Instance.objects.get(uuid=response.data["uuid"])
@@ -175,6 +192,27 @@ class InstanceCreateTest(test.APITransactionTestCase):
         response = self.create_instance(self.get_valid_data())
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
+    def test_rescue_tagged_image_cannot_be_used_as_boot_image(self):
+        # Either hw_rescue property is enough to mark an image as a rescue
+        # image (matches Image.is_rescue_image). Such images are typically
+        # ISO-only and won't boot a usable system disk.
+        for field in ("hw_rescue_device", "hw_rescue_bus"):
+            with self.subTest(field=field):
+                rescue_image = factories.ImageFactory(
+                    settings=self.openstack_settings,
+                    **{field: "cdrom"},
+                )
+                rescue_image.tenants.add(self.tenant)
+                response = self.create_instance(
+                    self.get_valid_data(
+                        image=factories.ImageFactory.get_url(rescue_image),
+                    )
+                )
+                self.assertEqual(
+                    response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+                )
+                self.assertIn("image", response.data)
+
     def test_user_can_define_fixed_ips(self):
         post_data = self.get_valid_data()
         fixed_ips = [{"ip_address": "192.168.0.1", "subnet_id": self.subnet.backend_id}]
@@ -184,15 +222,58 @@ class InstanceCreateTest(test.APITransactionTestCase):
         instance = models.Instance.objects.get(uuid=response.data["uuid"])
         self.assertEqual(instance.ports.first().fixed_ips, fixed_ips)
 
+    def _create_unattached_port(self, status_value="DOWN"):
+        return factories.PortFactory(
+            tenant=self.tenant,
+            network=self.subnet.network,
+            subnet=self.subnet,
+            service_settings=self.openstack_settings,
+            project=self.project,
+            status=status_value,
+        )
+
     def test_can_create_instance_with_existing_port_in_down_state(self):
+        existing_port = self._create_unattached_port(status_value="DOWN")
         post_data = self.get_valid_data()
-        self.fixture.port.status = "DOWN"
-        self.fixture.port.save()
-        post_data["ports"][0]["port"] = factories.PortFactory.get_url(self.fixture.port)
+        post_data["ports"][0]["port"] = factories.PortFactory.get_url(existing_port)
         response = self.create_instance(post_data)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         instance = models.Instance.objects.get(uuid=response.data["uuid"])
-        self.assertEqual(instance.ports.first(), self.fixture.port)
+        self.assertEqual(instance.ports.first(), existing_port)
+
+    def test_can_create_instance_with_existing_port_without_status(self):
+        existing_port = self._create_unattached_port(status_value=None)
+        post_data = self.get_valid_data()
+        post_data["ports"][0]["port"] = factories.PortFactory.get_url(existing_port)
+        response = self.create_instance(post_data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(instance.ports.first(), existing_port)
+
+    def test_cannot_create_instance_with_port_already_attached_to_another_instance(
+        self,
+    ):
+        other_instance = factories.InstanceFactory(
+            service_settings=self.openstack_settings,
+            project=self.project,
+            tenant=self.tenant,
+        )
+        existing_port = factories.PortFactory(
+            instance=other_instance,
+            tenant=self.tenant,
+            network=self.subnet.network,
+            subnet=self.subnet,
+            service_settings=self.openstack_settings,
+            project=self.project,
+            status="ACTIVE",
+        )
+        post_data = self.get_valid_data()
+        post_data["ports"][0]["port"] = factories.PortFactory.get_url(existing_port)
+        response = self.create_instance(post_data)
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+        self.assertIn("ports", response.data)
 
     def test_user_can_define_instance_subnets(self):
         subnet = self.fixture.subnet
@@ -205,6 +286,62 @@ class InstanceCreateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         instance = models.Instance.objects.get(uuid=response.data["uuid"])
         self.assertTrue(Port.objects.filter(subnet=subnet, instance=instance).exists())
+
+    def test_port_security_enabled_is_persisted_during_instance_creation(self):
+        subnet = self.fixture.subnet
+        data = self.get_valid_data(
+            ports=[
+                {
+                    "subnet": factories.SubNetFactory.get_url(subnet),
+                    "port_security_enabled": False,
+                }
+            ]
+        )
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        port = instance.ports.first()
+        self.assertIsNotNone(port)
+        self.assertFalse(port.port_security_enabled)
+
+    def test_port_security_enabled_defaults_to_true_during_instance_creation(self):
+        subnet = self.fixture.subnet
+        data = self.get_valid_data(
+            ports=[{"subnet": factories.SubNetFactory.get_url(subnet)}]
+        )
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        port = instance.ports.first()
+        self.assertIsNotNone(port)
+        self.assertTrue(port.port_security_enabled)
+
+    def test_security_groups_rejected_when_port_security_disabled(self):
+        subnet = self.fixture.subnet
+        security_group = factories.SecurityGroupFactory(
+            tenant=self.tenant,
+            service_settings=self.openstack_settings,
+            project=self.project,
+        )
+        data = self.get_valid_data(
+            ports=[
+                {
+                    "subnet": factories.SubNetFactory.get_url(subnet),
+                    "port_security_enabled": False,
+                }
+            ],
+            security_groups=[
+                {"url": factories.SecurityGroupFactory.get_url(security_group)}
+            ],
+        )
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_user_cannot_assign_subnet_from_other_settings_to_instance(self):
         data = self.get_valid_data(
@@ -399,6 +536,84 @@ class InstanceCreateTest(test.APITransactionTestCase):
         instance = models.Instance.objects.get(uuid=response.data["uuid"])
         self.assertEqual(instance.floating_ips.count(), 1)
 
+    def _import_external_network(self, *ip_versions):
+        network = factories.ExternalNetworkFactory(
+            settings=self.openstack_settings,
+            backend_id=self.openstack_settings.options["external_network_id"],
+        )
+        for ip_version in ip_versions:
+            if ip_version == 6:
+                factories.ExternalSubnetFactory(
+                    network=network,
+                    ip_version=6,
+                    cidr="2001:db8::/64",
+                    gateway_ip="2001:db8::1",
+                )
+            else:
+                factories.ExternalSubnetFactory(network=network, ip_version=4)
+        return network
+
+    def test_floating_ip_allocation_is_refused_when_external_network_has_no_ipv4_subnet(
+        self,
+    ):
+        self._import_external_network(6)
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        data = self.get_valid_data(floating_ips=[{"subnet": subnet_url}])
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("floating_ips", response.data)
+        self.assertIn("IPv6", str(response.data["floating_ips"]))
+        self.assertFalse(models.Instance.objects.filter(name="valid-name").exists())
+
+    @data((4,), (4, 6), ())
+    def test_floating_ip_allocation_is_allowed_unless_external_network_is_ipv6_only(
+        self, ip_versions
+    ):
+        self._import_external_network(*ip_versions)
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        data = self.get_valid_data(floating_ips=[{"subnet": subnet_url}])
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(instance.floating_ips.count(), 1)
+
+    def test_floating_ip_allocation_is_allowed_when_external_network_is_not_imported(
+        self,
+    ):
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        data = self.get_valid_data(floating_ips=[{"subnet": subnet_url}])
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_existing_floating_ip_is_accepted_when_external_network_has_no_ipv4_subnet(
+        self,
+    ):
+        # An address that already exists needs no allocation from the IPv6-only
+        # network, so there is nothing for Neutron to refuse.
+        self._import_external_network(6)
+        floating_ip = factories.FloatingIPFactory(
+            tenant=self.tenant, runtime_state="DOWN", state=CoreStates.OK
+        )
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        data = self.get_valid_data(
+            floating_ips=[
+                {
+                    "subnet": subnet_url,
+                    "url": factories.FloatingIPFactory.get_url(floating_ip),
+                }
+            ],
+        )
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
     def test_user_cannot_allocate_floating_ip_if_quota_limit_is_reached(self):
         self.tenant.set_quota_limit(self.tenant.Quotas.floating_ip_count, 0)
         subnet_url = factories.SubNetFactory.get_url(self.subnet)
@@ -567,7 +782,7 @@ class InstanceCreateTest(test.APITransactionTestCase):
 
 
 @ddt
-class InstanceUpdateTest(test.APITransactionTestCase):
+class InstanceUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.instance = self.fixture.instance
@@ -586,9 +801,15 @@ class InstanceUpdateTest(test.APITransactionTestCase):
 
 
 @override_settings(task_always_eager=True)
-class InstanceDeleteTest(test_backend.BaseBackendTestCase):
+class InstanceDeleteTest(test.APITransactionTestCase):
     def setUp(self):
         super().setUp()
+        self.mocked_keystone = mock.patch("keystoneclient.v3.client.Client").start()()
+        self.mocked_nova = mock.patch("novaclient.v2.client.Client").start()()
+        self.mocked_neutron = mock.patch("neutronclient.v2_0.client.Client").start()()
+        self.mocked_cinder = mock.patch("cinderclient.v3.client.Client").start()()
+        self.mocked_glance = mock.patch("glanceclient.v2.client.Client").start()()
+        fixtures.mock_session()
         self.instance = factories.InstanceFactory(
             state=CoreStates.OK,
             runtime_state=models.Instance.RuntimeStates.SHUTOFF,
@@ -597,6 +818,10 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
         self.instance.increase_backend_quotas_usage()
         self.mocked_nova.servers.get.side_effect = nova_exceptions.NotFound(code=404)
         self.tenant = self.instance.tenant
+
+    def tearDown(self):
+        super().tearDown()
+        mock.patch.stopall()
 
     def mock_volumes(self, delete_data_volume=True):
         self.data_volume = self.instance.volumes.get(bootable=False)
@@ -754,15 +979,322 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
         # Assert
         self.assertIsInstance(signature, Signature)
 
-    def test_delete_instance_via_openstack(self):
-        staff = structure_factories.UserFactory(is_staff=True)
-        self.client.force_authenticate(user=staff)
-        url = factories.InstanceFactory.get_url(self.instance)
+    def _flatten_chain_task_args(self, task):
+        args = list(task.args) if task.args else []
+        if task.kwargs:
+            args.extend(task.kwargs.values())
+        if hasattr(task, "tasks"):
+            for subtask in task.tasks:
+                args.extend(self._flatten_chain_task_args(subtask))
+        return args
+
+    def _get_chain_task_args(self, signature):
+        args = []
+        for task in signature.tasks:
+            args.extend(self._flatten_chain_task_args(task))
+        return args
+
+    def _get_delete_signature_after_pre_apply(self):
+        """Build the delete chain the same way execute() does: pre_apply first."""
+        executors.InstanceDeleteExecutor.pre_apply(self.instance)
+        self.instance.refresh_from_db()
+        return executors.InstanceDeleteExecutor.get_task_signature(
+            self.instance, serialize_instance(self.instance)
+        )
+
+    def test_delete_signature_includes_stop_after_pre_apply(self):
+        self.instance.runtime_state = models.Instance.RuntimeStates.ACTIVE
+        self.instance.save()
+
+        signature = self._get_delete_signature_after_pre_apply()
+
+        self.assertEqual(self.instance.state, CoreStates.DELETION_SCHEDULED)
+        task_args = self._get_chain_task_args(signature)
+        self.assertIn("stop_instance", task_args)
+        # Stop must not use begin_updating (illegal from DELETION_SCHEDULED).
+        self.assertNotIn("begin_updating", task_args)
+
+    def test_delete_signature_skips_stop_for_shutoff_instance(self):
+        self.instance.runtime_state = models.Instance.RuntimeStates.SHUTOFF
+        self.instance.save()
+
+        signature = self._get_delete_signature_after_pre_apply()
+
+        self.assertNotIn("stop_instance", self._get_chain_task_args(signature))
+
+    def test_active_instance_is_stopped_before_delete(self):
+        self.mock_volumes(True)
+        self.instance.runtime_state = models.Instance.RuntimeStates.ACTIVE
+        self.instance.save()
+
+        shutoff_server = mock.Mock(spec=["status"])
+        shutoff_server.status = "SHUTOFF"
+        self.mocked_nova.servers.get.side_effect = [
+            shutoff_server,
+            nova_exceptions.NotFound(code=404),
+        ]
+
+        self.delete_instance()
+
+        self.mocked_nova.servers.stop.assert_called_once_with(self.instance.backend_id)
+        self.mocked_nova.servers.delete.assert_called_once_with(
+            self.instance.backend_id
+        )
+        self.assertFalse(models.Instance.objects.filter(id=self.instance.id).exists())
+
+    def test_delete_signature_includes_backup_deletion(self):
+        factories.BackupFactory(instance=self.instance)
+
+        signature = self._get_delete_signature_after_pre_apply()
+
+        task_args = self._get_chain_task_args(signature)
+        self.assertTrue(any("openstack.backup" in str(arg) for arg in task_args))
+
+    def test_delete_signature_includes_snapshot_deletion(self):
+        volume = self.instance.volumes.first()
+        factories.SnapshotFactory(
+            tenant=self.tenant,
+            project=self.instance.project,
+            source_volume=volume,
+        )
+
+        signature = self._get_delete_signature_after_pre_apply()
+
+        task_args = self._get_chain_task_args(signature)
+        self.assertTrue(any("openstack.snapshot" in str(arg) for arg in task_args))
+
+    def test_delete_signature_skips_snapshot_deletion_for_backup_snapshots(self):
+        volume = self.instance.volumes.first()
+        backup = factories.BackupFactory(instance=self.instance)
+        snapshot = factories.SnapshotFactory(
+            tenant=self.tenant,
+            project=self.instance.project,
+            source_volume=volume,
+        )
+        backup.snapshots.add(snapshot)
+
+        self.assertEqual(
+            executors.InstanceDeleteExecutor.get_delete_snapshots_tasks(self.instance),
+            [],
+        )
+
+    def test_delete_signature_skips_backup_deletion_when_none_exist(self):
+        signature = self._get_delete_signature_after_pre_apply()
+
+        task_args = self._get_chain_task_args(signature)
+        self.assertNotIn(openstack_tasks.TERMINATION_STEP_DELETE_BACKUP, task_args)
+
+    def test_delete_signature_includes_termination_step_markers(self):
+        self.instance.runtime_state = models.Instance.RuntimeStates.ACTIVE
+        self.instance.save()
+        factories.BackupFactory(instance=self.instance)
+        volume = self.instance.volumes.first()
+        factories.SnapshotFactory(
+            tenant=self.tenant,
+            project=self.instance.project,
+            source_volume=volume,
+        )
+
+        signature = self._get_delete_signature_after_pre_apply()
+
+        task_args = self._get_chain_task_args(signature)
+        for step in (
+            openstack_tasks.TERMINATION_STEP_STOP,
+            openstack_tasks.TERMINATION_STEP_DELETE_BACKUP,
+            openstack_tasks.TERMINATION_STEP_DELETE_SNAPSHOT,
+            openstack_tasks.TERMINATION_STEP_DELETE_INSTANCE,
+        ):
+            self.assertIn(step, task_args)
+
+    def test_termination_step_marker_sets_action_details(self):
+        openstack_tasks.InstanceTerminationStepMarkerTask().execute(
+            self.instance, openstack_tasks.TERMINATION_STEP_STOP
+        )
+        self.instance.refresh_from_db()
+        self.assertEqual(
+            self.instance.action_details["termination_step"],
+            openstack_tasks.TERMINATION_STEP_STOP,
+        )
+
+    def test_delete_failure_task_prefixes_error_message(self):
+        task = openstack_tasks.InstanceDeleteFailureTask()
+
+        def set_error(instance):
+            instance.error_message = "Nova API error"
+            instance.error_traceback = "traceback"
+            instance.save(update_fields=["error_message", "error_traceback"])
+
+        self.instance.action_details = {
+            "termination_step": openstack_tasks.TERMINATION_STEP_DELETE_INSTANCE
+        }
+        self.instance.save()
+
+        with mock.patch.object(task, "save_error_message", side_effect=set_error):
+            task.execute(self.instance)
+
+        self.instance.refresh_from_db()
+        self.assertEqual(
+            self.instance.error_message,
+            "Termination failed at step 'delete_instance': Nova API error",
+        )
+        self.assertEqual(self.instance.state, CoreStates.ERRED)
+
+    def test_delete_failure_task_preserves_order_uuid_in_log(self):
+        from waldur_mastermind.marketplace import enums as marketplace_enums
+        from waldur_mastermind.marketplace.tests import (
+            factories as marketplace_factories,
+        )
+
+        resource = marketplace_factories.ResourceFactory(scope=self.instance)
+        order = marketplace_factories.OrderFactory(
+            resource=resource,
+            type=marketplace_enums.OrderTypes.TERMINATE,
+            state=marketplace_enums.OrderStates.EXECUTING,
+        )
+        self.instance.state = CoreStates.DELETION_SCHEDULED
+        self.instance.action_details = {
+            "termination_step": openstack_tasks.TERMINATION_STEP_STOP
+        }
+        self.instance.save()
+
+        task = openstack_tasks.InstanceDeleteFailureTask()
+
+        def set_error(instance):
+            instance.error_message = "backend error"
+            instance.save(update_fields=["error_message"])
+
+        with mock.patch.object(task, "save_error_message", side_effect=set_error):
+            with mock.patch.object(
+                openstack_tasks, "log_instance_termination_event"
+            ) as log_event_mock:
+                task.execute(self.instance)
+
+        order.refresh_from_db()
+        self.assertEqual(order.state, marketplace_enums.OrderStates.ERRED)
+        log_event_mock.assert_called_once()
+        self.assertEqual(
+            log_event_mock.call_args.kwargs["context"]["order_uuid"],
+            order.uuid.hex,
+        )
+
+    def test_failure_signature_uses_deletion_task_when_force(self):
+        serialized = serialize_instance(self.instance)
+        signature = executors.InstanceDeleteExecutor.get_failure_signature(
+            self.instance, serialized, force=True
+        )
+        self.assertEqual(signature.task, core_tasks.DeletionTask().si(serialized).task)
+
+    def test_failure_signature_uses_instance_delete_failure_task_when_not_force(self):
+        serialized = serialize_instance(self.instance)
+        signature = executors.InstanceDeleteExecutor.get_failure_signature(
+            self.instance, serialized, force=False
+        )
+        self.assertEqual(
+            signature.task,
+            openstack_tasks.InstanceDeleteFailureTask().s(serialized).task,
+        )
+
+    def test_force_delete_removes_instance_when_backend_delete_fails(self):
+        self.mock_volumes(True)
+        self.instance.state = CoreStates.ERRED
+        self.instance.save()
+        self.mocked_nova.servers.delete.side_effect = nova_exceptions.ClientException(
+            500
+        )
+
+        delete_instance(self.instance, is_async=False)
+
+        self.assertFalse(models.Instance.objects.filter(id=self.instance.id).exists())
+
+    def test_non_force_failure_signature_marks_instance_erred(self):
+        """Exercise the async link_error path (ErrorStateTransitionTask needs result_id).
+
+        Sync execute()'s exception branch cannot inject result_id, so we invoke the
+        failure signature the same way Celery link_error does in production.
+        """
+        self.instance.state = CoreStates.DELETION_SCHEDULED
+        self.instance.action_details = {
+            "termination_step": openstack_tasks.TERMINATION_STEP_DELETE_INSTANCE
+        }
+        self.instance.save()
+
+        serialized = serialize_instance(self.instance)
+        failure = executors.InstanceDeleteExecutor.get_failure_signature(
+            self.instance, serialized, force=False
+        )
+        fake_result_id = "00000000-0000-0000-0000-000000000001"
+        with mock.patch.object(
+            openstack_tasks.InstanceDeleteFailureTask,
+            "AsyncResult",
+            return_value=mock.Mock(result="Nova API error", traceback="tb"),
+        ):
+            failure.args = (fake_result_id,) + failure.args
+            failure.apply()
+
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.state, CoreStates.ERRED)
+        self.assertEqual(
+            self.instance.error_message,
+            "Termination failed at step 'delete_instance': Nova API error",
+        )
+
+    def test_non_force_failure_signature_stringifies_backend_exception(self):
+        self.instance.state = CoreStates.DELETION_SCHEDULED
+        self.instance.action_details = {
+            "termination_step": openstack_tasks.TERMINATION_STEP_DELETE_INSTANCE
+        }
+        self.instance.save()
+
+        backend_error = OpenStackBackendError(
+            nova_exceptions.ClientException(500, "Nova API error")
+        )
+        serialized = serialize_instance(self.instance)
+        failure = executors.InstanceDeleteExecutor.get_failure_signature(
+            self.instance, serialized, force=False
+        )
+        fake_result_id = "00000000-0000-0000-0000-000000000002"
+        with mock.patch.object(
+            openstack_tasks.InstanceDeleteFailureTask,
+            "AsyncResult",
+            return_value=mock.Mock(result=backend_error, traceback="tb"),
+        ):
+            failure.args = (fake_result_id,) + failure.args
+            task_result = failure.apply()
+
+        self.assertTrue(task_result.successful(), task_result.traceback)
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.state, CoreStates.ERRED)
+        self.assertIsInstance(self.instance.error_message, str)
+        self.assertEqual(
+            self.instance.error_message,
+            "Termination failed at step 'delete_instance': Nova API error (HTTP 500)",
+        )
+
+
+class InstanceDisabledActionsTest(test.APITestCase):
+    """Tests to verify that create and destroy actions are disabled for the instance endpoint."""
+
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.client.force_authenticate(self.fixture.staff)
+
+    def test_instance_create_action_is_not_allowed(self):
+        url = factories.InstanceFactory.get_list_url()
+        data = {"name": "Test instance"}
+
+        response = self.client.post(url, data)
+
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_instance_destroy_action_is_not_allowed(self):
+        url = factories.InstanceFactory.get_url(self.fixture.instance)
+
         response = self.client.delete(url)
+
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
-class InstanceUpdatePortsTest(test.APITransactionTestCase):
+class InstanceUpdatePortsTest(test.APITestCase):
     action_name = "update_ports"
 
     def setUp(self):
@@ -797,6 +1329,113 @@ class InstanceUpdatePortsTest(test.APITransactionTestCase):
         self.assertFalse(self.instance.ports.filter(pk=ip_to_delete.pk).exists())
         self.assertTrue(self.instance.ports.filter(subnet=subnet_to_connect).exists())
 
+    def test_changed_pinned_address_replaces_the_port(self):
+        # Rows are matched on (instance, subnet), so a re-declaration keeping
+        # the subnet but naming a different address used to be dropped: the
+        # caller got a success and the old address stayed. Declarative callers
+        # cannot see that their change did nothing.
+        existing = factories.PortFactory(
+            instance=self.instance,
+            subnet=self.fixture.subnet,
+            backend_id="already-created",
+            fixed_ips=[
+                {"subnet_id": self.fixture.subnet.backend_id, "ip_address": "10.0.0.10"}
+            ],
+        )
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {
+                        "subnet": factories.SubNetFactory.get_url(self.fixture.subnet),
+                        "fixed_ips": [
+                            {
+                                "subnet_id": self.fixture.subnet.backend_id,
+                                "ip_address": "10.0.0.99",
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        # The old row is gone, so push_instance_ports will delete the backend
+        # port still holding the old address before creating the replacement.
+        self.assertFalse(models.Port.objects.filter(pk=existing.pk).exists())
+        port = self.instance.ports.get(subnet=self.fixture.subnet)
+        self.assertEqual(
+            port.fixed_ips,
+            [
+                {
+                    "subnet_id": self.fixture.subnet.backend_id,
+                    "ip_address": "10.0.0.99",
+                }
+            ],
+        )
+        self.assertFalse(port.backend_id, "the replacement must be pushed afresh")
+
+    def test_unchanged_pinned_address_keeps_the_port(self):
+        # The replacement above costs a backend port rebuild, so it must happen
+        # only on an actual change — re-running an unchanged declaration is the
+        # common case for declarative automation.
+        existing = factories.PortFactory(
+            instance=self.instance,
+            subnet=self.fixture.subnet,
+            backend_id="already-created",
+            fixed_ips=[
+                {"subnet_id": self.fixture.subnet.backend_id, "ip_address": "10.0.0.10"}
+            ],
+        )
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {
+                        "subnet": factories.SubNetFactory.get_url(self.fixture.subnet),
+                        "fixed_ips": [
+                            {
+                                "subnet_id": self.fixture.subnet.backend_id,
+                                "ip_address": "10.0.0.10",
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        existing.refresh_from_db()
+        self.assertEqual(existing.backend_id, "already-created")
+
+    def test_declaration_without_fixed_ips_keeps_an_allocated_port(self):
+        # No fixed_ips means "allocate one", which an already-allocated port
+        # satisfies. Treating it as a change would rebuild every unpinned port
+        # on every update.
+        existing = factories.PortFactory(
+            instance=self.instance,
+            subnet=self.fixture.subnet,
+            backend_id="already-created",
+            fixed_ips=[
+                {"subnet_id": self.fixture.subnet.backend_id, "ip_address": "10.0.0.10"}
+            ],
+        )
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {"subnet": factories.SubNetFactory.get_url(self.fixture.subnet)}
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        existing.refresh_from_db()
+        self.assertEqual(existing.backend_id, "already-created")
+
     def test_user_cannot_add_port_from_different_settings(self):
         subnet = factories.SubNetFactory()
 
@@ -811,6 +1450,135 @@ class InstanceUpdatePortsTest(test.APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(self.instance.ports.filter(subnet=subnet).exists())
+
+    def _shared_network_from_another_tenant(self):
+        """A network owned by another tenant and shared into ours by RBAC."""
+        other_tenant = factories.TenantFactory(
+            service_settings=self.fixture.tenant.service_settings
+        )
+        network = factories.NetworkFactory(tenant=other_tenant)
+        subnet = factories.SubNetFactory(network=network, tenant=other_tenant)
+        factories.NetworkRBACPolicyFactory(
+            network=network, target_tenant=self.fixture.tenant
+        )
+        return subnet
+
+    def test_rbac_share_grants_access_only_to_the_shared_network(self):
+        """One shared network must not expose the owner's other networks.
+
+        The allowance used to be computed from the *owning tenant* of any shared
+        network, so sharing one network let the target tenant reach every other
+        network that tenant owned.
+        """
+        shared_subnet = self._shared_network_from_another_tenant()
+        other_tenant = shared_subnet.tenant
+        unshared_network = factories.NetworkFactory(tenant=other_tenant)
+        unshared_subnet = factories.SubNetFactory(
+            network=unshared_network, tenant=other_tenant
+        )
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {"subnet": factories.SubNetFactory.get_url(unshared_subnet)},
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(self.instance.ports.filter(subnet=unshared_subnet).exists())
+
+    def test_subnet_of_an_rbac_shared_network_is_still_accepted(self):
+        shared_subnet = self._shared_network_from_another_tenant()
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {"subnet": factories.SubNetFactory.get_url(shared_subnet)},
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertTrue(self.instance.ports.filter(subnet=shared_subnet).exists())
+
+    def test_port_on_a_shared_network_belongs_to_the_instance_tenant(self):
+        # The port used to inherit the subnet's tenant, which on a shared network
+        # is the network owner. push_instance_ports then created it in Neutron
+        # under that project while attaching it with a session scoped to the
+        # instance's tenant, so nova could not see the port and the attach 404ed
+        # on every run.
+        shared_subnet = self._shared_network_from_another_tenant()
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {"subnet": factories.SubNetFactory.get_url(shared_subnet)},
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        port = self.instance.ports.get(subnet=shared_subnet)
+        self.assertNotEqual(shared_subnet.tenant, self.instance.tenant)
+        self.assertEqual(port.tenant, self.instance.tenant)
+        self.assertEqual(port.project, self.instance.project)
+
+    def test_user_cannot_pin_an_address_on_another_tenants_network(self):
+        """Neutron reserves this to the network owner; Waldur creates ports as admin."""
+        subnet = self._shared_network_from_another_tenant()
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {
+                        "subnet": factories.SubNetFactory.get_url(subnet),
+                        "fixed_ips": [
+                            {"ip_address": "10.90.0.50", "subnet_id": subnet.backend_id}
+                        ],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(self.instance.ports.filter(subnet=subnet).exists())
+
+    def test_user_can_attach_to_a_shared_network_without_pinning(self):
+        """Letting OpenStack allocate is what Neutron permits to the recipient."""
+        subnet = self._shared_network_from_another_tenant()
+
+        response = self.client.post(
+            self.url,
+            data={"ports": [{"subnet": factories.SubNetFactory.get_url(subnet)}]},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertTrue(self.instance.ports.filter(subnet=subnet).exists())
+
+    def test_staff_may_pin_an_address_on_another_tenants_network(self):
+        subnet = self._shared_network_from_another_tenant()
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {
+                        "subnet": factories.SubNetFactory.get_url(subnet),
+                        "fixed_ips": [
+                            {"ip_address": "10.90.0.50", "subnet_id": subnet.backend_id}
+                        ],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
     def test_user_cannot_connect_instance_to_one_subnet_twice(self):
         response = self.client.post(
@@ -828,8 +1596,176 @@ class InstanceUpdatePortsTest(test.APITransactionTestCase):
             self.instance.ports.filter(subnet=self.fixture.subnet).exists()
         )
 
+    def test_fixed_ips_are_saved_when_updating_ports(self):
+        subnet = factories.SubNetFactory(tenant=self.fixture.tenant)
+        fixed_ips = [{"ip_address": "192.168.0.10", "subnet_id": subnet.backend_id}]
 
-class InstanceUpdateFloatingIPsTest(test.APITransactionTestCase):
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {
+                        "subnet": factories.SubNetFactory.get_url(subnet),
+                        "fixed_ips": fixed_ips,
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        port = self.instance.ports.filter(subnet=subnet).first()
+        self.assertIsNotNone(port)
+        self.assertEqual(port.fixed_ips, fixed_ips)
+
+    def test_existing_port_is_reused_when_updating_ports(self):
+        existing_port = factories.PortFactory(
+            tenant=self.fixture.tenant,
+            network=self.fixture.subnet.network,
+            subnet=self.fixture.subnet,
+            service_settings=self.fixture.tenant.service_settings,
+            project=self.fixture.tenant.project,
+            status="DOWN",
+        )
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {
+                        "port": factories.PortFactory.get_url(existing_port),
+                        "subnet": factories.SubNetFactory.get_url(self.fixture.subnet),
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        existing_port.refresh_from_db()
+        self.assertEqual(existing_port.instance, self.instance)
+        # No extra port should be created for the same subnet
+        self.assertEqual(
+            self.instance.ports.filter(subnet=self.fixture.subnet).count(), 1
+        )
+        self.assertEqual(
+            self.instance.ports.filter(subnet=self.fixture.subnet).first().pk,
+            existing_port.pk,
+        )
+
+    def test_existing_active_port_attached_to_same_instance_is_accepted(self):
+        existing_port = factories.PortFactory(
+            instance=self.instance,
+            tenant=self.fixture.tenant,
+            network=self.fixture.subnet.network,
+            subnet=self.fixture.subnet,
+            service_settings=self.fixture.tenant.service_settings,
+            project=self.fixture.tenant.project,
+            status="ACTIVE",
+            device_owner="compute:nova",
+        )
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {
+                        "port": factories.PortFactory.get_url(existing_port),
+                        "subnet": factories.SubNetFactory.get_url(self.fixture.subnet),
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        existing_port.refresh_from_db()
+        self.assertEqual(existing_port.instance, self.instance)
+
+    def test_port_without_status_can_be_referenced(self):
+        existing_port = factories.PortFactory(
+            tenant=self.fixture.tenant,
+            network=self.fixture.subnet.network,
+            subnet=self.fixture.subnet,
+            service_settings=self.fixture.tenant.service_settings,
+            project=self.fixture.tenant.project,
+            status=None,
+        )
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {
+                        "port": factories.PortFactory.get_url(existing_port),
+                        "subnet": factories.SubNetFactory.get_url(self.fixture.subnet),
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        existing_port.refresh_from_db()
+        self.assertEqual(existing_port.instance, self.instance)
+
+    def test_port_with_infrastructure_device_owner_is_rejected(self):
+        existing_port = factories.PortFactory(
+            tenant=self.fixture.tenant,
+            network=self.fixture.subnet.network,
+            subnet=self.fixture.subnet,
+            service_settings=self.fixture.tenant.service_settings,
+            project=self.fixture.tenant.project,
+            status="ACTIVE",
+            device_owner="network:router_interface",
+        )
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {
+                        "port": factories.PortFactory.get_url(existing_port),
+                        "subnet": factories.SubNetFactory.get_url(self.fixture.subnet),
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("ports", response.data)
+
+    def test_port_attached_to_other_instance_is_rejected(self):
+        other_instance = factories.InstanceFactory(
+            service_settings=self.fixture.tenant.service_settings,
+            project=self.fixture.project,
+            tenant=self.fixture.tenant,
+        )
+        existing_port = factories.PortFactory(
+            instance=other_instance,
+            tenant=self.fixture.tenant,
+            network=self.fixture.subnet.network,
+            subnet=self.fixture.subnet,
+            service_settings=self.fixture.tenant.service_settings,
+            project=self.fixture.tenant.project,
+            status="ACTIVE",
+        )
+
+        response = self.client.post(
+            self.url,
+            data={
+                "ports": [
+                    {
+                        "port": factories.PortFactory.get_url(existing_port),
+                        "subnet": factories.SubNetFactory.get_url(self.fixture.subnet),
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("ports", response.data)
+        existing_port.refresh_from_db()
+        self.assertEqual(existing_port.instance, other_instance)
+
+
+class InstanceUpdateFloatingIPsTest(test.APITestCase):
     action_name = "update_floating_ips"
 
     def setUp(self):
@@ -953,6 +1889,28 @@ class InstanceUpdateFloatingIPsTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         self.assertIn(self.fixture.floating_ip, self.instance.floating_ips)
 
+    def test_floating_ip_allocation_is_refused_when_external_network_has_no_ipv4_subnet(
+        self,
+    ):
+        settings = self.fixture.tenant.service_settings
+        network = factories.ExternalNetworkFactory(
+            settings=settings,
+            backend_id=settings.options["external_network_id"],
+        )
+        factories.ExternalSubnetFactory(
+            network=network,
+            ip_version=6,
+            cidr="2001:db8::/64",
+            gateway_ip="2001:db8::1",
+        )
+        data = {"floating_ips": [{"subnet": self.subnet_url}]}
+
+        response = self.client.post(self.url, data=data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("floating_ips", response.data)
+        self.assertEqual(self.instance.floating_ips.count(), 0)
+
     def test_user_cannot_use_same_subnet_twice(self):
         data = {
             "floating_ips": [{"subnet": self.subnet_url}, {"subnet": self.subnet_url}]
@@ -961,7 +1919,7 @@ class InstanceUpdateFloatingIPsTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class InstanceBackupTest(test.APITransactionTestCase):
+class InstanceBackupTest(test.APITestCase):
     action_name = "backup"
 
     def setUp(self):
@@ -1021,7 +1979,7 @@ class InstanceBackupTest(test.APITransactionTestCase):
 
 
 @ddt
-class InstanceActionsTest(test.APITransactionTestCase):
+class InstanceActionsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.fixture.tenant.service_settings.options = {
@@ -1114,9 +2072,441 @@ class InstanceConsoleLogTest(InstanceActionsTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue("Invalid request." in response.data)
 
+    def test_length_is_read_from_query_string_on_get(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(self.url, {"length": 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.mock_console.assert_called_once_with(self.instance, 10)
+
+    # The POST form exists for action-oriented clients (the Ansible collection
+    # drives every instance action as a POST). It must behave exactly like GET,
+    # taking `length` from the body instead of the query string.
+    @data("staff", "admin", "manager", "owner")
+    def test_post_is_available_for_the_same_users_as_get(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.post(self.url, {"length": 50})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, self.backend_return_value)
+        self.mock_console.assert_called_once_with(self.instance, 50)
+
+    def test_post_without_length_returns_full_log(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.mock_console.assert_called_once_with(self.instance, None)
+
+    @data("user")
+    def test_post_not_available_for_users_unassociated_with_project(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.post(self.url, {"length": 50})
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.mock_console.assert_not_called()
+
+    def test_post_rejects_invalid_length(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.post(self.url, {"length": "many"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.mock_console.assert_not_called()
+
 
 @ddt
-class InstanceRetrieveTest(test.APITransactionTestCase):
+class InstancePlacementAllocationsTest(InstanceActionsTest):
+    """The diagnostic endpoint that surfaces what Placement allocated to an
+    instance. Audience is sysadmin-scope (staff, support, service-provider
+    owner of the OpenStack ServiceSettings' customer) — the response carries
+    fleet-topology data (resource provider UUIDs and names) that project
+    members must not see, even in opaque form."""
+
+    action = "placement_allocations"
+    backend_method = "get_instance_placement_allocations"
+    backend_return_value = [
+        {
+            "resource_provider_uuid": "rp-uuid-1",
+            "resource_provider_name": "compute01",
+            "resources": {"VCPU": 1, "MEMORY_MB": 1024, "DISK_GB": 10},
+        }
+    ]
+
+    # ---- allowed audiences (sysadmin-scope only) ----
+
+    @data("staff", "global_support", "owner")
+    def test_action_allowed_for_sysadmin_audiences(self, user):
+        # `owner` in OpenStackFixture holds CUSTOMER.OWNER on the customer
+        # that owns the ServiceSettings — i.e. the service-provider owner
+        # in production setups. Should see the full payload.
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        row = response.data[0]
+        self.assertEqual(row["resource_provider_uuid"], "rp-uuid-1")
+        self.assertEqual(row["resource_provider_name"], "compute01")
+        self.assertEqual(
+            row["resources"], {"VCPU": 1, "MEMORY_MB": 1024, "DISK_GB": 10}
+        )
+
+    # ---- denied audiences ----
+
+    @data("admin", "manager", "member")
+    def test_action_denied_for_project_roles(self, user):
+        # Project-level roles must NOT see Placement topology — neither
+        # the compute hostname nor the opaque resource_provider_uuid.
+        # The data is sysadmin-scope.
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.mock_console.assert_not_called()
+
+    @data("user")
+    def test_action_denied_for_unrelated_user(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        # Unrelated users are filtered out by the queryset before the
+        # permission check, so they get 404 (not 403).
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.mock_console.assert_not_called()
+
+    # ---- backend behaviors (verified via staff caller) ----
+
+    def test_empty_allocations_returns_empty_list(self):
+        # Placement returns 200 with empty allocations dict for unknown
+        # consumers — should surface as an empty list, not a 404 or 500.
+        self.mock_console.return_value = []
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, [])
+
+    def test_backend_error_is_propagated(self):
+        self.mock_console.side_effect = OpenStackBackendError("Placement down.")
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Placement down.", response.data)
+
+
+@ddt
+class InstanceRescueActionTest(test.APITestCase):
+    """Rescue / unrescue actions on InstanceViewSet [WAL-8603]."""
+
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.instance = self.fixture.instance
+        self.instance.state = CoreStates.OK
+        self.instance.runtime_state = models.Instance.RuntimeStates.ACTIVE
+        self.instance.save()
+        self.rescue_url = factories.InstanceFactory.get_url(
+            self.instance, action="rescue"
+        )
+        self.unrescue_url = factories.InstanceFactory.get_url(
+            self.instance, action="unrescue"
+        )
+
+        # Stub out the executors so we don't actually push tasks.
+        self.rescue_exec = mock.patch(
+            "waldur_openstack.executors.InstanceRescueExecutor.execute"
+        ).start()
+        self.unrescue_exec = mock.patch(
+            "waldur_openstack.executors.InstanceUnrescueExecutor.execute"
+        ).start()
+
+    def tearDown(self):
+        super().tearDown()
+        mock.patch.stopall()
+
+    # ---- helpers ----------------------------------------------------------
+
+    def _make_rescue_image(self, hw_rescue_device="cdrom", hw_rescue_bus="ide"):
+        image = factories.ImageFactory(settings=self.fixture.settings)
+        image.hw_rescue_device = hw_rescue_device
+        image.hw_rescue_bus = hw_rescue_bus
+        image.save()
+        image.tenants.add(self.fixture.tenant)
+        return image
+
+    def _make_volume_backed(self):
+        # Bootable volume on the instance flips the BFV-detection check.
+        factories.VolumeFactory(instance=self.instance, bootable=True)
+
+    # ---- rescue happy path ------------------------------------------------
+
+    def test_rescue_without_image_for_image_backed_instance(self):
+        # Image-backed (no bootable volume): rescue without explicit image
+        # is allowed; Nova will use the boot image. The fixture's instance
+        # comes with a system volume by default, so drop it here to model
+        # an image-backed instance.
+        self.instance.volumes.update(bootable=False)
+        self.client.force_authenticate(user=self.fixture.admin)
+        response = self.client.post(self.rescue_url, data={})
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.rescue_exec.assert_called_once()
+
+    def test_rescue_with_valid_rescue_image(self):
+        image = self._make_rescue_image()
+        self.client.force_authenticate(user=self.fixture.admin)
+        response = self.client.post(
+            self.rescue_url,
+            data={"rescue_image": factories.ImageFactory.get_url(image)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        call_kwargs = self.rescue_exec.call_args.kwargs
+        self.assertEqual(call_kwargs["rescue_image_ref"], image.backend_id)
+
+    # ---- BFV safety -------------------------------------------------------
+
+    def test_volume_backed_rescue_requires_explicit_image(self):
+        self._make_volume_backed()
+        self.client.force_authenticate(user=self.fixture.admin)
+        response = self.client.post(self.rescue_url, data={})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.rescue_exec.assert_not_called()
+
+    def test_volume_backed_rescue_rejects_non_tagged_image(self):
+        self._make_volume_backed()
+        # Plain image, no hw_rescue_* properties set.
+        plain_image = factories.ImageFactory(settings=self.fixture.settings)
+        plain_image.tenants.add(self.fixture.tenant)
+        self.client.force_authenticate(user=self.fixture.admin)
+        response = self.client.post(
+            self.rescue_url,
+            data={"rescue_image": factories.ImageFactory.get_url(plain_image)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.rescue_exec.assert_not_called()
+
+    def test_volume_backed_rescue_accepts_tagged_image(self):
+        self._make_volume_backed()
+        image = self._make_rescue_image()
+        self.client.force_authenticate(user=self.fixture.admin)
+        response = self.client.post(
+            self.rescue_url,
+            data={"rescue_image": factories.ImageFactory.get_url(image)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+    # ---- cross-tenant -----------------------------------------------------
+
+    def test_cross_tenant_rescue_image_rejected(self):
+        # Image not associated with the instance's tenant.
+        other_image = factories.ImageFactory(settings=self.fixture.settings)
+        other_image.hw_rescue_device = "cdrom"
+        other_image.save()
+        # No tenants.add — so it's not visible to the instance's tenant.
+        self.client.force_authenticate(user=self.fixture.admin)
+        response = self.client.post(
+            self.rescue_url,
+            data={"rescue_image": factories.ImageFactory.get_url(other_image)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.rescue_exec.assert_not_called()
+
+    # ---- runtime-state preconditions --------------------------------------
+
+    def test_rescue_rejected_from_shutoff(self):
+        self.instance.runtime_state = models.Instance.RuntimeStates.SHUTOFF
+        self.instance.save()
+        self.client.force_authenticate(user=self.fixture.admin)
+        response = self.client.post(self.rescue_url, data={})
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.rescue_exec.assert_not_called()
+
+    def test_unrescue_rejected_from_active(self):
+        self.client.force_authenticate(user=self.fixture.admin)
+        response = self.client.post(self.unrescue_url)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.unrescue_exec.assert_not_called()
+
+    def test_unrescue_succeeds_from_rescue(self):
+        self.instance.runtime_state = models.Instance.RuntimeStates.RESCUE
+        self.instance.save()
+        self.client.force_authenticate(user=self.fixture.admin)
+        response = self.client.post(self.unrescue_url)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.unrescue_exec.assert_called_once()
+
+    # ---- permissions ------------------------------------------------------
+
+    @data("user")
+    def test_unrelated_user_cannot_rescue(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.post(self.rescue_url, data={})
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.rescue_exec.assert_not_called()
+
+
+class InstanceSetMetadataTest(test.APITestCase):
+    """set_metadata action on InstanceViewSet [#190]."""
+
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.instance = self.fixture.instance
+        self.instance.state = CoreStates.OK
+        self.instance.metadata = {"env": "staging", "owner": "team-a"}
+        self.instance.save()
+        self.url = factories.InstanceFactory.get_url(
+            self.instance, action="set_metadata"
+        )
+        self.executor = mock.patch(
+            "waldur_openstack.executors.InstanceUpdateMetadataExecutor.execute"
+        ).start()
+        self.client.force_authenticate(user=self.fixture.admin)
+
+    def tearDown(self):
+        super().tearDown()
+        mock.patch.stopall()
+
+    def test_metadata_is_replaced_wholesale(self):
+        response = self.client.post(self.url, {"metadata": {"env": "prod"}})
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.metadata, {"env": "prod"})
+        self.executor.assert_called_once()
+
+    def test_metadata_can_be_cleared(self):
+        response = self.client.post(self.url, {"metadata": {}}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.metadata, {})
+
+    def test_metadata_is_required(self):
+        response = self.client.post(self.url, {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.executor.assert_not_called()
+
+    def test_too_many_entries_are_rejected(self):
+        metadata = {f"key-{i}": "value" for i in range(129)}
+
+        response = self.client.post(self.url, {"metadata": metadata}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.executor.assert_not_called()
+
+    def test_long_key_is_rejected(self):
+        response = self.client.post(
+            self.url, {"metadata": {"k" * 256: "value"}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_empty_key_is_rejected(self):
+        response = self.client.post(
+            self.url, {"metadata": {"": "value"}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_long_value_is_rejected(self):
+        response = self.client.post(
+            self.url, {"metadata": {"env": "v" * 256}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_whitespace_in_values_is_preserved(self):
+        # Nova stores the value verbatim, so trimming it here would make the
+        # value read back differently from what the client sent.
+        response = self.client.post(
+            self.url, {"metadata": {"note": "  padded  "}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.metadata, {"note": "  padded  "})
+
+    def test_non_string_value_is_rejected(self):
+        # Nova metadata is string-to-string; a number must not be coerced.
+        response = self.client.post(
+            self.url, {"metadata": {"port": 8080}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.metadata, {"env": "staging", "owner": "team-a"})
+
+    def test_action_is_rejected_in_erred_state(self):
+        self.instance.state = CoreStates.ERRED
+        self.instance.save()
+
+        response = self.client.post(
+            self.url, {"metadata": {"env": "prod"}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.executor.assert_not_called()
+
+    def test_unrelated_user_cannot_set_metadata(self):
+        self.client.force_authenticate(user=self.fixture.user)
+
+        response = self.client.post(
+            self.url, {"metadata": {"env": "prod"}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.executor.assert_not_called()
+
+    def test_metadata_is_not_editable_via_patch(self):
+        url = factories.InstanceFactory.get_url(self.instance)
+
+        response = self.client.patch(url, {"metadata": {"env": "prod"}}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.metadata, {"env": "staging", "owner": "team-a"})
+
+
+class ImageRescueFilterTest(test.APITestCase):
+    """is_rescue_image filter on the openstack-images list."""
+
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.client.force_authenticate(user=self.fixture.staff)
+        # Pre-existing fixture image is tied to the tenant via the fixture; we
+        # only need to assert filtering, not permission scoping here.
+        self.tenant = self.fixture.tenant
+        self.url = factories.ImageFactory.get_list_url()
+
+        self.tagged_with_device = factories.ImageFactory(settings=self.fixture.settings)
+        self.tagged_with_device.hw_rescue_device = "cdrom"
+        self.tagged_with_device.save()
+        self.tagged_with_device.tenants.add(self.tenant)
+
+        self.tagged_with_bus = factories.ImageFactory(settings=self.fixture.settings)
+        self.tagged_with_bus.hw_rescue_bus = "usb"
+        self.tagged_with_bus.save()
+        self.tagged_with_bus.tenants.add(self.tenant)
+
+        self.plain = factories.ImageFactory(settings=self.fixture.settings)
+        self.plain.tenants.add(self.tenant)
+
+    def _list_uuids(self, **params):
+        params.setdefault("tenant_uuid", self.tenant.uuid.hex)
+        response = self.client.get(self.url, params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return {row["uuid"] for row in response.data}
+
+    def test_no_filter_returns_all(self):
+        uuids = self._list_uuids()
+        self.assertIn(self.tagged_with_device.uuid.hex, uuids)
+        self.assertIn(self.tagged_with_bus.uuid.hex, uuids)
+        self.assertIn(self.plain.uuid.hex, uuids)
+
+    def test_is_rescue_image_true_returns_only_tagged(self):
+        uuids = self._list_uuids(is_rescue_image="true")
+        self.assertIn(self.tagged_with_device.uuid.hex, uuids)
+        self.assertIn(self.tagged_with_bus.uuid.hex, uuids)
+        self.assertNotIn(self.plain.uuid.hex, uuids)
+
+    def test_is_rescue_image_false_excludes_tagged(self):
+        uuids = self._list_uuids(is_rescue_image="false")
+        self.assertNotIn(self.tagged_with_device.uuid.hex, uuids)
+        self.assertNotIn(self.tagged_with_bus.uuid.hex, uuids)
+        self.assertIn(self.plain.uuid.hex, uuids)
+
+
+@ddt
+class InstanceRetrieveTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.instance = self.fixture.instance
@@ -1137,7 +2527,7 @@ class InstanceRetrieveTest(test.APITransactionTestCase):
         self.assertFalse("hypervisor_hostname" in response.json())
 
 
-class MaxConcurrentProvisionTest(test.APITransactionTestCase):
+class MaxConcurrentProvisionTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
 
@@ -1153,4 +2543,177 @@ class MaxConcurrentProvisionTest(test.APITransactionTestCase):
     def test_plugin_settings_limit_is_used_if_it_is_available(self):
         self.assertEqual(
             5, LimitedPerTypeThrottleMixin().get_limit(self.fixture.instance)
+        )
+
+
+class InstanceUpdateBlockedIfOfferingIsUnavailableTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.instance = self.fixture.instance
+
+    def test_start_action_blocked_when_can_be_managed_false(self):
+        url = factories.InstanceFactory.get_url(self.instance, action="start")
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+        self.instance.can_be_managed = False
+        self.instance.save()
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_get_request_allowed_when_can_be_managed_false(self):
+        url = factories.InstanceFactory.get_url(self.instance)
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.instance.can_be_managed = False
+        self.instance.save()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_update_blocked_when_can_be_managed_false(self):
+        url = factories.InstanceFactory.get_url(self.instance)
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        response = self.client.put(url, {"name": "VM"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.instance.can_be_managed = False
+        self.instance.save()
+        response = self.client.put(url, {"name": "VM"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class InstanceListQueryCountTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.client.force_authenticate(self.fixture.admin)
+        self.url = factories.InstanceFactory.get_list_url()
+
+    def create_instance(self):
+        instance = factories.InstanceFactory(
+            project=self.fixture.project, tenant=self.fixture.tenant
+        )
+        instance.security_groups.add(
+            factories.SecurityGroupFactory(tenant=self.fixture.tenant)
+        )
+        port = factories.PortFactory(
+            instance=instance,
+            tenant=self.fixture.tenant,
+            network=self.fixture.network,
+            subnet=self.fixture.subnet,
+            fixed_ips=[{"ip_address": "192.168.42.10", "subnet_id": "subnet-id"}],
+        )
+        factories.FloatingIPFactory(tenant=self.fixture.tenant, port=port)
+        factories.VolumeFactory(
+            project=self.fixture.project, tenant=self.fixture.tenant, instance=instance
+        )
+        return instance
+
+    # Tables which the instance serializer renders for every row: without
+    # prefetching them the list view issues a query per instance.
+    prefetched_tables = (
+        "openstack_port",
+        "openstack_subnet",
+        "openstack_floatingip",
+        "openstack_securitygroup",
+        "openstack_securitygrouprule",
+        "openstack_volume",
+        "openstack_tenant",
+        "structure_project",
+        "structure_servicesettings",
+    )
+
+    def count_queries_per_table(self, expected_count):
+        with CaptureQueriesContext(connection) as context:
+            response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), expected_count)
+        return {
+            table: len(
+                [
+                    query
+                    for query in context.captured_queries
+                    if f'"{table}"' in query["sql"]
+                ]
+            )
+            for table in self.prefetched_tables
+        }
+
+    def test_related_objects_are_not_queried_for_every_instance(self):
+        self.create_instance()
+        queries_for_single_instance = self.count_queries_per_table(1)
+
+        self.create_instance()
+        self.create_instance()
+        queries_for_three_instances = self.count_queries_per_table(3)
+
+        self.assertEqual(queries_for_single_instance, queries_for_three_instances)
+
+
+class InstanceIPPropertiesQueryCountTest(test.APITestCase):
+    """The IP properties are also read outside the prefetched list view, e.g.
+    by marketplace metadata handlers, so they must not cost a query per port."""
+
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.instance = self.fixture.instance
+
+    def add_port_with_floating_ip(self):
+        port = factories.PortFactory(
+            instance=self.instance,
+            tenant=self.fixture.tenant,
+            network=self.fixture.network,
+            subnet=self.fixture.subnet,
+            fixed_ips=[{"ip_address": "192.168.42.10", "subnet_id": "subnet-id"}],
+        )
+        factories.FloatingIPFactory(tenant=self.fixture.tenant, port=port)
+
+    def count_queries(self):
+        instance = models.Instance.objects.get(pk=self.instance.pk)
+        with CaptureQueriesContext(connection) as context:
+            instance.external_ips
+            instance.external_address
+            instance.internal_ips
+            instance.attached_floating_ips
+        return len(context.captured_queries)
+
+    def test_ip_properties_do_not_query_per_port_without_prefetch(self):
+        self.add_port_with_floating_ip()
+        queries_for_single_port = self.count_queries()
+
+        self.add_port_with_floating_ip()
+        self.add_port_with_floating_ip()
+
+        self.assertEqual(self.count_queries(), queries_for_single_port)
+
+
+class InstanceFloatingIPsOrderingTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.client.force_authenticate(self.fixture.admin)
+        self.instance = self.fixture.instance
+
+    def create_floating_ip(self):
+        port = factories.PortFactory(
+            instance=self.instance,
+            tenant=self.fixture.tenant,
+            network=self.fixture.network,
+            subnet=self.fixture.subnet,
+        )
+        return factories.FloatingIPFactory(tenant=self.fixture.tenant, port=port)
+
+    def test_floating_ips_keep_the_model_ordering_across_ports(self):
+        oldest = self.create_floating_ip()
+        newest = self.create_floating_ip()
+
+        response = self.client.get(factories.InstanceFactory.get_url(self.instance))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [floating_ip["address"] for floating_ip in response.data["floating_ips"]],
+            [newest.address, oldest.address],
         )

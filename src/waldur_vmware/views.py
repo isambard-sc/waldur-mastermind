@@ -12,7 +12,7 @@ from rest_framework.viewsets import GenericViewSet
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import CoreStates
-from waldur_core.core.serializers import EmptySerializer
+from waldur_core.core.serializers import StatusSerializer
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import views as structure_views
 from waldur_core.structure.serializers import ConsoleUrlSerializer
@@ -40,7 +40,9 @@ class LimitViewSet(RetrieveModelMixin, GenericViewSet):
     serializer_class = serializers.VmwareLimitSerializer
 
 
-class VirtualMachineViewSet(structure_views.ResourceViewSet):
+class VirtualMachineViewSet(
+    structure_views.ResourceViewSet, structure_views.AvailabilityCheckViewMixin
+):
     queryset = models.VirtualMachine.objects.all().order_by("name")
     serializer_class = serializers.VmwareVirtualMachineSerializer
     filterset_class = filters.VirtualMachineFilter
@@ -61,6 +63,7 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
         )
     ]
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @action(detail=True, methods=["post"])
     def start(self, request, uuid=None):
         instance: models.VirtualMachine = self.get_object()
@@ -76,8 +79,8 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
             models.VirtualMachine.RuntimeStates.SUSPENDED,
         ),
     ]
-    start_serializer_class = EmptySerializer
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @action(detail=True, methods=["post"])
     def stop(self, request, uuid=None):
         instance: models.VirtualMachine = self.get_object()
@@ -93,8 +96,8 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
             models.VirtualMachine.RuntimeStates.SUSPENDED,
         ),
     ]
-    stop_serializer_class = EmptySerializer
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @action(detail=True, methods=["post"])
     def reset(self, request, uuid=None):
         instance: models.VirtualMachine = self.get_object()
@@ -109,8 +112,8 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
             models.VirtualMachine.RuntimeStates.POWERED_ON,
         ),
     ]
-    reset_serializer_class = EmptySerializer
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @action(detail=True, methods=["post"])
     def suspend(self, request, uuid=None):
         instance: models.VirtualMachine = self.get_object()
@@ -125,12 +128,12 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
             models.VirtualMachine.RuntimeStates.POWERED_ON,
         ),
     ]
-    suspend_serializer_class = EmptySerializer
 
     def vm_tools_are_running(vm):
         if vm.tools_state != models.VirtualMachine.ToolsStates.RUNNING:
             raise rf_serializers.ValidationError("VMware Tools are not running.")
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @action(detail=True, methods=["post"])
     def shutdown_guest(self, request, uuid=None):
         instance: models.VirtualMachine = self.get_object()
@@ -146,8 +149,8 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
         ),
         vm_tools_are_running,
     ]
-    shutdown_guest_serializer_class = EmptySerializer
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @action(detail=True, methods=["post"])
     def reboot_guest(self, request, uuid=None):
         instance: models.VirtualMachine = self.get_object()
@@ -156,8 +159,9 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
             {"status": _("reboot was scheduled")}, status=status.HTTP_202_ACCEPTED
         )
 
-    reboot_guest_serializer_class = EmptySerializer
-
+    @extend_schema(
+        responses={status.HTTP_201_CREATED: serializers.VmwarePortSerializer}
+    )
     @action(detail=True, methods=["post"])
     def create_port(self, request, uuid=None):
         serializer = self.get_serializer(data=request.data)
@@ -180,6 +184,9 @@ class VirtualMachineViewSet(structure_views.ResourceViewSet):
     ]
     create_port_serializer_class = serializers.VmwarePortSerializer
 
+    @extend_schema(
+        responses={status.HTTP_201_CREATED: serializers.VmwareDiskSerializer}
+    )
     @action(detail=True, methods=["post"])
     def create_disk(self, request, uuid=None):
         serializer = self.get_serializer(data=request.data)
@@ -266,6 +273,7 @@ class DiskViewSet(structure_views.ResourceViewSet):
     pull_executor = executors.DiskPullExecutor
     delete_executor = executors.DiskDeleteExecutor
 
+    @extend_schema(responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @action(detail=True, methods=["post"])
     def extend(self, request, uuid=None):
         """Increase disk capacity"""

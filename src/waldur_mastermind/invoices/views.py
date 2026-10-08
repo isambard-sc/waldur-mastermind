@@ -4,7 +4,7 @@ import uuid
 from decimal import Decimal
 
 from dateutil.relativedelta import relativedelta
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import F, Q, QuerySet, Sum
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
@@ -15,11 +15,12 @@ from rest_framework.response import Response
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
-from waldur_core.core.serializers import EmptySerializer
+from waldur_core.core.serializers import DetailSerializer, StatusSerializer
 from waldur_core.core.utils import is_uuid_like
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
 from waldur_core.structure import filters as structure_filters
+from waldur_core.structure import managers as structure_managers
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure.managers import filter_queryset_for_user
@@ -28,10 +29,11 @@ from waldur_mastermind.common.utils import quantize_price
 from waldur_mastermind.invoices import compensations
 from waldur_mastermind.invoices.models import InvoiceItem
 
-from . import filters, models, serializers, tasks, utils
+from . import filters, ledger, models, serializers, tasks, utils
+from .audit import skip_credit_audit
 
 
-class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
+class InvoiceViewSet(core_views.HistoryViewSetMixin, core_views.ReadOnlyActionsViewSet):
     queryset = models.Invoice.objects.order_by("-year", "-month")
     serializer_class = serializers.InvoiceSerializer
     lookup_field = "uuid"
@@ -54,9 +56,26 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
         responses=serializers.InvoiceItemSerializer,
         parameters=[
             OpenApiParameter("query", str, OpenApiParameter.QUERY),
-            OpenApiParameter("provider_uuid", str, OpenApiParameter.QUERY),
-            OpenApiParameter("project_uuid", str, OpenApiParameter.QUERY),
-            OpenApiParameter("offering_uuid", str, OpenApiParameter.QUERY),
+            OpenApiParameter(
+                "provider_uuid",
+                uuid.UUID,
+                OpenApiParameter.QUERY,
+                extensions={"x-waldur-operation-id": "customers_retrieve"},
+            ),
+            OpenApiParameter(
+                "project_uuid",
+                uuid.UUID,
+                OpenApiParameter.QUERY,
+                extensions={"x-waldur-operation-id": "projects_retrieve"},
+            ),
+            OpenApiParameter(
+                "offering_uuid",
+                uuid.UUID,
+                OpenApiParameter.QUERY,
+                extensions={
+                    "x-waldur-operation-id": "marketplace_public_offerings_list"
+                },
+            ),
             OpenApiParameter(
                 "conceal_compensation_items",
                 bool,
@@ -111,6 +130,8 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
         return Response(serializer.data)
 
     @extend_schema(
+        responses={status.HTTP_200_OK: DetailSerializer},
+        request=None,
         summary="Send invoice notification",
         description="Schedule sending of a notification for the specified invoice.",
     )
@@ -130,9 +151,9 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
 
     send_notification_permissions = [structure_permissions.is_staff]
     send_notification_validators = [_is_invoice_created]
-    send_notification_serializer_class = EmptySerializer
 
     @extend_schema(
+        responses={status.HTTP_200_OK: None},
         description="Mark invoice as paid and optionally create payment record with proof of payment.",
         request=serializers.PaidSerializer,
     )
@@ -189,7 +210,14 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
     @extend_schema(
         description="Spendings grouped by offerings and filtered by provider.",
         responses=serializers.InvoiceStatsSerializer,
-        parameters=[OpenApiParameter("provider_uuid", str, OpenApiParameter.QUERY)],
+        parameters=[
+            OpenApiParameter(
+                "provider_uuid",
+                uuid.UUID,
+                OpenApiParameter.QUERY,
+                extensions={"x-waldur-operation-id": "customers_retrieve"},
+            )
+        ],
     )
     @action(detail=True)
     def stats(self, request, uuid=None):
@@ -377,10 +405,144 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
     set_reference_number_permissions = [structure_permissions.is_staff]
     set_reference_number_serializer_class = serializers.ReferenceNumberSerializer
 
+    @extend_schema(
+        summary="Import usage data",
+        description="Import component usage items as JSON data for multiple customers. "
+        "Creates invoice items for the specified billing period. "
+        "Items are deduplicated by name, customer, and billing period to prevent duplicates.",
+        request=serializers.ImportUsageSerializer,
+        responses=serializers.ImportUsageResponseSerializer,
+    )
+    @transaction.atomic
+    @action(detail=False, methods=["post"])
+    def import_usage(self, request):
+        serializer = serializers.ImportUsageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        year = serializer.validated_data["year"]
+        month = serializer.validated_data["month"]
+        items = serializer.validated_data["items"]
+
+        created = 0
+        skipped = 0
+        errors = []
+
+        # Pre-fetch all customers for name lookup (single query)
+        customers = list(structure_models.Customer.objects.all())
+        all_customers = {c.name.lower(): c for c in customers}
+        all_customers_by_uuid = {c.uuid.hex: c for c in customers}
+
+        for item in items:
+            customer = None
+            customer_identifier = None
+
+            # Try to find customer by UUID first, then by name
+            if item.get("customer_uuid"):
+                customer_uuid = str(item["customer_uuid"]).replace("-", "")
+                customer = all_customers_by_uuid.get(customer_uuid)
+                customer_identifier = customer_uuid
+            elif item.get("customer_name"):
+                customer_name = item["customer_name"].strip()
+                customer = all_customers.get(customer_name.lower())
+                customer_identifier = customer_name
+
+            if not customer:
+                errors.append(
+                    {
+                        "customer_name": customer_identifier or "Unknown",
+                        "reason": "Customer not found",
+                    }
+                )
+                continue
+
+            # Skip zero amounts
+            unit_price = item["unit_price"]
+            if unit_price == Decimal("0"):
+                skipped += 1
+                continue
+
+            # Get or create invoice for customer + year/month
+            invoice, _ = models.Invoice.objects.get_or_create(
+                customer=customer,
+                year=year,
+                month=month,
+            )
+
+            # Validate invoice state - only allow adding items to mutable invoices
+            if invoice.state not in models.Invoice.States.MUTABLE_STATES:
+                errors.append(
+                    {
+                        "customer_name": customer.name,
+                        "reason": f"Invoice is in '{invoice.state}' state, items can only be added to mutable invoices",
+                    }
+                )
+                continue
+
+            # Build details dict for additional metadata
+            details = {}
+            if item.get("service_provider_name"):
+                details["service_provider_name"] = item["service_provider_name"]
+            if item.get("offering_name"):
+                details["offering_name"] = item["offering_name"]
+            if item.get("plan_name"):
+                details["plan_name"] = item["plan_name"]
+
+            # Check for duplicate items (idempotency)
+            existing_item = models.InvoiceItem.objects.filter(
+                invoice=invoice,
+                name=item["name"],
+                article_code=item.get("article_code", ""),
+            ).first()
+
+            if existing_item:
+                skipped += 1
+                continue
+
+            # Create invoice item
+            invoice_item = models.InvoiceItem.objects.create(
+                invoice=invoice,
+                name=item["name"],
+                unit_price=unit_price,
+                quantity=1,
+                unit=models.InvoiceItem.Units.QUANTITY,
+                article_code=item.get("article_code", ""),
+                details=details,
+            )
+
+            event_logger.emit(
+                "Invoice item {invoice_item_name} has been imported for {customer_name} ({month}/{year}).",
+                event_type=EventType.INVOICE_ITEM_CREATED,
+                event_context={
+                    "invoice_item": invoice_item,
+                    "invoice_item_name": invoice_item.name,
+                    "customer": customer,
+                    "month": month,
+                    "year": year,
+                },
+                scopes=[invoice, customer],
+            )
+
+            created += 1
+
+        return Response(
+            {"created": created, "skipped": skipped, "errors": errors},
+            status=status.HTTP_200_OK,
+        )
+
+    import_usage_permissions = [structure_permissions.is_staff]
+    import_usage_serializer_class = serializers.ImportUsageSerializer
+
 
 class InvoiceItemViewSet(core_views.ActionsViewSet):
     disabled_actions = ["create"]
-    queryset = models.InvoiceItem.objects.all().order_by("start")
+    queryset = models.InvoiceItem.objects.select_related(
+        "invoice",
+        "invoice__customer",
+        "resource",
+        "resource__offering",
+        "plan_component",
+        "plan_component__component",
+    ).order_by("start")
     serializer_class = serializers.InvoiceItemDetailSerializer
     lookup_field = "uuid"
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
@@ -404,6 +566,7 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
         return Response(serializer.data)
 
     @extend_schema(
+        responses={status.HTTP_201_CREATED: serializers.InvoiceItemUUIDSerializer},
         request=serializers.InvoiceItemCompensationSerializer,
         description="Create compensation invoice item for selected invoice item.",
     )
@@ -447,6 +610,7 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
         )
 
     @extend_schema(
+        responses={status.HTTP_200_OK: serializers.InvoiceItemUUIDSerializer},
         description="Move invoice item from one invoice to another one.",
         request=serializers.InvoiceItemMigrateToSerializer,
     )
@@ -487,7 +651,31 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
             status=status.HTTP_200_OK,
         )
 
-    def _get_costs_data(self, paginated_invoices):
+    def _get_current_month_items(self, project_uuid, user):
+        now = datetime.date.today()
+        items = filter_queryset_for_user(
+            InvoiceItem.objects.filter(
+                project_uuid=project_uuid,
+                invoice__year=now.year,
+                invoice__month=now.month,
+                unit_price__gt=0,
+            ),
+            user,
+        ).values("name", "unit_price", "unit", "quantity", "measured_unit")
+        return [
+            {
+                "name": item["name"],
+                "unit_price": float(item["unit_price"]),
+                "unit": item["unit"],
+                "quantity": float(item["quantity"]),
+                "measured_unit": item["measured_unit"],
+                "price": float(item["unit_price"] * item["quantity"]),
+            }
+            for item in items
+        ]
+
+    def _get_costs_data(self, paginated_invoices, current_month_items=None):
+        now = datetime.date.today()
         result_list = []
         for invoice in paginated_invoices:
             data = {
@@ -497,6 +685,12 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
                 "year": invoice["invoice__year"],
                 "month": invoice["invoice__month"],
             }
+            if (
+                current_month_items is not None
+                and invoice["invoice__year"] == now.year
+                and invoice["invoice__month"] == now.month
+            ):
+                data["items"] = current_month_items
             result_list.append(data)
         return result_list
 
@@ -508,6 +702,7 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
                 type=uuid.UUID,
                 location=OpenApiParameter.QUERY,
                 description="UUID of the project for which statistics should be calculated.",
+                extensions={"x-waldur-operation-id": "projects_retrieve"},
             )
         ],
         responses=serializers.InvoiceCostSerializer(many=True),
@@ -517,9 +712,13 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
         project_uuid = request.GET.get("project_uuid", "")
         if not is_uuid_like(project_uuid):
             raise exceptions.ValidationError("project_uuid is not a valid UUID.")
+        current_month_items = self._get_current_month_items(project_uuid, request.user)
+        invoices = filter_queryset_for_user(
+            InvoiceItem.objects.filter(project_uuid=project_uuid),
+            request.user,
+        )
         invoices = (
-            InvoiceItem.objects.filter(project_uuid=project_uuid)
-            .values("invoice__year", "invoice__month")
+            invoices.values("invoice__year", "invoice__month")
             .annotate(
                 price=Sum(F("unit_price") * F("quantity")),
                 compensation=Sum(
@@ -540,9 +739,9 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
         )
         page = self.paginate_queryset(invoices)
         if page is not None:
-            data = self._get_costs_data(page)
+            data = self._get_costs_data(page, current_month_items)
             return self.get_paginated_response(data)
-        data = self._get_costs_data(invoices)
+        data = self._get_costs_data(invoices, current_month_items)
         return Response(data)
 
     def _get_costs_for_periods_data(
@@ -609,6 +808,16 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
                 type=uuid.UUID,
                 location=OpenApiParameter.QUERY,
                 description="UUID of the project for which statistics should be calculated.",
+                extensions={"x-waldur-operation-id": "projects_retrieve"},
+            ),
+            OpenApiParameter(
+                name="resource_uuid",
+                type=uuid.UUID,
+                location=OpenApiParameter.QUERY,
+                description="Optional marketplace resource UUID. When provided, "
+                "costs are limited to this resource only.",
+                required=False,
+                extensions={"x-waldur-operation-id": "marketplace_resources_retrieve"},
             ),
         ],
         responses=serializers.CostsForPeriodSerializer,
@@ -618,12 +827,16 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.GET, context={"request": request})
         serializer.is_valid(raise_exception=True)
         project_uuid = serializer.validated_data["project_uuid"]
+        resource_uuid = serializer.validated_data.get("resource_uuid")
         period = serializer.validated_data["period"]
         month_start = datetime.date.today().replace(day=1)
 
+        items = InvoiceItem.objects.filter(project_uuid=project_uuid.hex)
+        if resource_uuid:
+            items = items.filter(resource__uuid=resource_uuid.hex)
+
         invoices = (
-            InvoiceItem.objects.filter(project_uuid=project_uuid.hex)
-            .values("invoice__year", "invoice__month")
+            items.values("invoice__year", "invoice__month")
             .annotate(price=Sum(F("unit_price") * F("quantity")))
             .distinct()
             .order_by("-invoice__year", "-invoice__month")
@@ -691,6 +904,13 @@ class InvoiceItemViewSet(core_views.ActionsViewSet):
         partial_update_permissions
     ) = destroy_permissions = migrate_to_permissions = [structure_permissions.is_staff]
 
+    @extend_schema(
+        responses={
+            status.HTTP_200_OK: serializers.CustomerCreditConsumptionByMonthSerializer(
+                many=True
+            )
+        }
+    )
     @action(detail=True, methods=["get"])
     def consumptions(self, request, uuid=None):
         customer_credit = self.get_object()
@@ -725,8 +945,8 @@ class PaymentProfileViewSet(core_views.ActionsViewSet):
     ) = enable_permissions = [structure_permissions.is_staff]
     queryset = models.PaymentProfile.objects.all().order_by("name")
     serializer_class = serializers.PaymentProfileSerializer
-    enable_serializer_class = EmptySerializer
 
+    @extend_schema(responses={status.HTTP_200_OK: StatusSerializer}, request=None)
     @action(detail=True, methods=["post"])
     def enable(self, request, uuid=None):
         profile: models.PaymentProfile = self.get_object()
@@ -755,7 +975,8 @@ class PaymentViewSet(core_views.ActionsViewSet):
     serializer_class = serializers.PaymentSerializer
 
     @extend_schema(
-        description="Link a payment to an invoice. Payment can be linked to an invoice only if they belong to the same customer."
+        responses={status.HTTP_200_OK: DetailSerializer},
+        description="Link a payment to an invoice. Payment can be linked to an invoice only if they belong to the same customer.",
     )
     @action(detail=True, methods=["post"])
     def link_to_invoice(self, request, uuid=None):
@@ -795,14 +1016,15 @@ class PaymentViewSet(core_views.ActionsViewSet):
 
     link_to_invoice_validators = [_link_to_invoice_exists]
     link_to_invoice_serializer_class = serializers.LinkToInvoiceSerializer
-    unlink_from_invoice_serializer_class = EmptySerializer
 
     def _link_to_invoice_does_not_exist(payment):
         if not payment.invoice:
             raise exceptions.ValidationError(_("Link to an invoice does not exist."))
 
     @extend_schema(
-        description="Unlink a payment from an invoice. Remove connection between payment and existing linked invoice."
+        responses={status.HTTP_200_OK: DetailSerializer},
+        request=None,
+        description="Unlink a payment from an invoice. Remove connection between payment and existing linked invoice.",
     )
     @action(detail=True, methods=["post"])
     def unlink_from_invoice(self, request, uuid=None):
@@ -863,7 +1085,10 @@ class PaymentViewSet(core_views.ActionsViewSet):
         )
 
 
-@extend_schema(request=serializers.FinancialReportEmailSerializer, responses=None)
+@extend_schema(
+    request=serializers.FinancialReportEmailSerializer,
+    responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+)
 @api_view(["POST"])
 @permission_classes((IsStaffOrSupportUser,))
 def send_financial_report_by_mail(request):
@@ -890,12 +1115,23 @@ class CustomerCreditViewSet(core_views.ActionsViewSet):
     create_permissions = update_permissions = partial_update_permissions = (
         destroy_permissions
     ) = [structure_permissions.is_staff]
-    queryset = models.CustomerCredit.objects.all().order_by("created")
+    # Annotate the earnings-typed ledger sum so the list endpoint resolves
+    # withdrawable_balance without a per-row aggregate; the property falls
+    # back to a query when the annotation is absent.
+    queryset = models.CustomerCredit.objects.annotate(
+        withdrawable_earned_agg=Sum(
+            "transactions__amount",
+            filter=Q(
+                transactions__transaction_type__in=models.CreditTransaction.Types.WITHDRAWABLE_TYPES
+            ),
+        )
+    ).order_by("created")
     serializer_class = serializers.CustomerCreditSerializer
     create_serializer_class = update_serializer_class = (
         partial_update_serializer_class
     ) = serializers.CreateCustomerCreditSerializer
 
+    @extend_schema(responses={status.HTTP_200_OK: None}, request=None)
     @transaction.atomic
     @action(detail=True, methods=["post"])
     def apply_compensations(self, request, uuid=None):
@@ -903,7 +1139,11 @@ class CustomerCreditViewSet(core_views.ActionsViewSet):
         compensations.MonthlyCompensation(
             customer_credit.customer
         ).apply_compensations()
+        # DRF asserts on a None return, so without this the action always 500s
+        # after doing its work.
+        return Response(status=status.HTTP_200_OK)
 
+    @extend_schema(responses={status.HTTP_200_OK: None}, request=None)
     @transaction.atomic
     @action(detail=True, methods=["post"])
     def clear_compensations(self, request, uuid=None):
@@ -911,6 +1151,7 @@ class CustomerCreditViewSet(core_views.ActionsViewSet):
         compensations.MonthlyCompensation(
             customer_credit.customer
         ).clear_compensations()
+        return Response(status=status.HTTP_200_OK)
 
     apply_compensations_permissions = clear_compensations_permissions = [
         structure_permissions.is_staff
@@ -946,6 +1187,54 @@ class CustomerCreditViewSet(core_views.ActionsViewSet):
 
     consumptions_serializer_class = serializers.CustomerCreditConsumptionSerializer
 
+    @extend_schema(
+        description="Staff adjustment of the withdrawable part of the credit. "
+        "Records a signed ledger entry with a comment and changes the credit "
+        "value by the same amount.",
+        request=serializers.WithdrawableAdjustmentSerializer,
+        responses={status.HTTP_200_OK: serializers.CustomerCreditSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def adjust_withdrawable(self, request, uuid=None):
+        credit = self.get_object()
+        input_serializer = serializers.WithdrawableAdjustmentSerializer(
+            data=request.data
+        )
+        input_serializer.is_valid(raise_exception=True)
+        amount = input_serializer.validated_data["amount"]
+        comment = input_serializer.validated_data["comment"]
+
+        with transaction.atomic():
+            credit = models.CustomerCredit.objects.select_for_update().get(pk=credit.pk)
+            if credit.value + amount < 0:
+                raise exceptions.ValidationError(
+                    {"amount": _("Adjustment would make the credit value negative.")}
+                )
+            # A reduction (e.g. a payout) may only draw down the earned,
+            # withdrawable portion — never staff-granted promotional credit.
+            if amount < 0 and -amount > credit.withdrawable_balance:
+                raise exceptions.ValidationError(
+                    {"amount": _("Reduction would exceed the withdrawable balance.")}
+                )
+            with (
+                skip_credit_audit(),
+                ledger.credit_transaction_type(
+                    models.CreditTransaction.Types.WITHDRAWABLE_ADJUSTMENT,
+                    comment=comment,
+                ),
+            ):
+                credit.value += amount
+                credit.save(update_fields=["value"])
+
+        return Response(
+            serializers.CustomerCreditSerializer(
+                credit, context=self.get_serializer_context()
+            ).data
+        )
+
+    adjust_withdrawable_permissions = [structure_permissions.is_staff]
+    adjust_withdrawable_serializer_class = serializers.WithdrawableAdjustmentSerializer
+
 
 class ProjectCreditViewSet(core_views.ActionsViewSet):
     lookup_field = "uuid"
@@ -963,29 +1252,164 @@ class ProjectCreditViewSet(core_views.ActionsViewSet):
     filterset_class = filters.ProjectCreditFilter
 
     def list(self, request, *args, **kwargs):
-        """
-        The default permissions above prevent users from querying the
-        project credits in the projects they belong to. This is a quick
-        hack that gives them permission to view the project credits in the
-        projects - so that the accounting circle widget is visible in
-        homeport
-        """
-        filter = filters.ProjectCreditFilter(request.query_params, request=request)
+        """List project credits visible to the requesting user.
 
-        if not filter.is_valid():
-            return Response(filter.errors, status=status.HTTP_400_BAD_REQUEST)
+        ProjectCredit is not reachable through the generic role filter, which
+        would hide a project's credits from its own members and so blank out
+        the accounting widget in homeport. Scope to the projects the user has
+        a role in instead, rather than bypassing filtering: dropping
+        GenericRoleFilter altogether would also drop the IP restrictions it
+        applies.
+        """
+        projects = filter_queryset_for_user(
+            structure_models.Project.available_objects.all(), request.user
+        )
+        queryset = self.get_queryset().filter(project__in=projects)
+        queryset = structure_managers.filter_queryset_by_user_ip(queryset, request)
 
-        queryset = filter.filter_queryset(self.get_queryset())
+        credit_filter = filters.ProjectCreditFilter(
+            request.query_params, request=request
+        )
+        if not credit_filter.is_valid():
+            return Response(credit_filter.errors, status=status.HTTP_400_BAD_REQUEST)
+        queryset = credit_filter.filter_queryset(queryset)
 
         page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
 
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+
+class CustomerAffiliateViewSet(core_views.ActionsViewSet):
+    """Affiliate links are configured by staff only. Affiliate organization
+    owners get read-only access to their own links, earnings and accruals;
+    they never gain access to the referred customer's invoices.
+
+    The whole API is gated behind the opt-in ``AFFILIATES_ENABLED``
+    Constance setting and responds with 404 while the feature is disabled.
+    """
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        if not utils.affiliates_feature_enabled():
+            raise exceptions.NotFound()
+
+    lookup_field = "uuid"
+    filter_backends = (
+        structure_filters.GenericRoleFilter,
+        DjangoFilterBackend,
+    )
+    filterset_class = filters.CustomerAffiliateFilter
+    create_permissions = update_permissions = partial_update_permissions = (
+        destroy_permissions
+    ) = [structure_permissions.is_staff]
+    # Annotate the lifetime earned sum so the list endpoint does not issue a
+    # per-row aggregate (the serializer falls back to a query when absent).
+    queryset = (
+        models.CustomerAffiliate.objects.annotate(
+            total_earned_agg=Sum("accruals__amount")
+        )
+        .all()
+        .order_by("created")
+    )
+    serializer_class = serializers.CustomerAffiliateSerializer
+    create_serializer_class = update_serializer_class = (
+        partial_update_serializer_class
+    ) = serializers.CreateCustomerAffiliateSerializer
+
+    def perform_create(self, serializer):
+        self._save_link(serializer)
+
+    def perform_update(self, serializer):
+        self._save_link(serializer)
+
+    def _save_link(self, serializer):
+        # The serializer checks for another active link without a lock, so a
+        # concurrent request can save one first. Report the constraint
+        # violation as a 400 instead of a 500.
         try:
-            if page is not None:
-                serializer = self.get_serializer(page, many=True)
-                return self.get_paginated_response(serializer.data)
+            with transaction.atomic():
+                serializer.save()
+        except IntegrityError:
+            raise exceptions.ValidationError(
+                _(
+                    "Another affiliate link for this organization was saved "
+                    "at the same time. Reload the list and try again."
+                )
+            )
 
-            serializer = self.get_serializer(queryset, many=True)
+    @extend_schema(
+        description="List fees accrued from this affiliate link. Exposes the "
+        "fee amount and invoice period only — never the referred customer's "
+        "invoice contents.",
+        responses=serializers.AffiliateFeeAccrualSerializer(many=True),
+    )
+    @action(detail=True, methods=["get"])
+    def accruals(self, request, uuid=None):
+        link = self.get_object()
+        serializer = self.get_serializer(
+            link.accruals.all().order_by("-created"), many=True
+        )
+        return Response(serializer.data)
 
-            return Response(serializer.data)
-        except Exception as e:
-            raise e
+    accruals_serializer_class = serializers.AffiliateFeeAccrualSerializer
+
+    @extend_schema(
+        description="Earnings summary of this affiliate link: lifetime total, "
+        "per-month series and the affiliate organization's withdrawable "
+        "credit balance.",
+        responses=serializers.AffiliateEarningsSerializer,
+    )
+    @action(detail=True, methods=["get"])
+    def earnings(self, request, uuid=None):
+        link = self.get_object()
+        accruals = link.accruals.all()
+        total_earned = accruals.aggregate(sum=Sum("amount"))["sum"] or 0
+        per_month = (
+            accruals.values("invoice__year", "invoice__month")
+            .annotate(amount=Sum("amount"))
+            .order_by("invoice__year", "invoice__month")
+        )
+        credit = models.CustomerCredit.objects.filter(customer=link.affiliate).first()
+        serializer = self.get_serializer(
+            {
+                "total_earned": total_earned,
+                "withdrawable_balance": credit.withdrawable_balance if credit else 0,
+                "per_month": [
+                    {
+                        "year": int(row["invoice__year"]),
+                        "month": int(row["invoice__month"]),
+                        "amount": row["amount"],
+                    }
+                    for row in per_month
+                ],
+            }
+        )
+        return Response(serializer.data)
+
+    earnings_serializer_class = serializers.AffiliateEarningsSerializer
+
+
+class CreditTransactionViewSet(core_views.ReadOnlyActionsViewSet):
+    """Read-only ledger of credit value changes: the withdrawable balance trace
+    for an organization credit, and the drawdown history — used against usage,
+    lost to the minimal-consumption floor — for a project allocation.
+
+    ``GenericRoleFilter`` scopes it against ``Permissions``: staff see
+    everything, an organization owner their organization's rows on either
+    balance, and project roles their own project's.
+    """
+
+    lookup_field = "uuid"
+    queryset = models.CreditTransaction.objects.select_related(
+        "credit__customer", "project_credit__project__customer"
+    ).order_by("-created")
+    serializer_class = serializers.CreditTransactionSerializer
+    filter_backends = (
+        structure_filters.GenericRoleFilter,
+        DjangoFilterBackend,
+    )
+    filterset_class = filters.CreditTransactionFilter

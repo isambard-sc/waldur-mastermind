@@ -5,7 +5,7 @@ from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.notifications.tests import factories
 
 
-class AdminAnnouncementCreateTest(test.APITransactionTestCase):
+class AdminAnnouncementCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.url = factories.AdminAnnouncementFactory.get_list_url()
@@ -37,6 +37,15 @@ class AdminAnnouncementCreateTest(test.APITransactionTestCase):
         self.assertEqual(response.data["type"], "information")
         self.assertFalse(response.data["is_active"])
 
+    @freeze_time("2025-01-01")
+    def test_support_can_create_admin_announcement(self):
+        payload = self.payload.copy()
+        payload["active_from"] = "2025-01-01T00:00:00Z"
+        response = self.create_admin_announcement(self.fixture.global_support, payload)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["description"], "admin announcement")
+        self.assertEqual(response.data["type"], "information")
+
     def test_user_cannot_create_admin_announcement(self):
         payload = {
             "description": "admin announcement",
@@ -53,7 +62,7 @@ class AdminAnnouncementCreateTest(test.APITransactionTestCase):
         return response
 
 
-class AdminAnnouncementGetTest(test.APITransactionTestCase):
+class AdminAnnouncementGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.admin_announcement = factories.AdminAnnouncementFactory()
@@ -70,7 +79,7 @@ class AdminAnnouncementGetTest(test.APITransactionTestCase):
 
 
 @freeze_time("2025-01-01")
-class AdminAnnouncementFilterTest(test.APITransactionTestCase):
+class AdminAnnouncementFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.admin_announcement = factories.AdminAnnouncementFactory(

@@ -1,14 +1,20 @@
-from django.utils.topological_sort import stable_topological_sort
+from ipaddress import ip_network
+
 from django.utils.translation import gettext_lazy as _
 
 from waldur_core.core import exceptions as core_exceptions
+from waldur_core.core.utils import stable_topological_sort
+from waldur_core.permissions.fixtures import CustomerRole
 from waldur_openstack.models import (
     CustomerOpenStack,
+    ExternalNetwork,
+    ExternalSubnet,
     Flavor,
     Image,
     Instance,
     SecurityGroup,
     SecurityGroupRule,
+    SubNet,
     Tenant,
     VolumeType,
 )
@@ -43,15 +49,85 @@ def get_valid_availability_zones(instance):
     )
 
 
+def is_openstack_service_provider(user, service_settings) -> bool:
+    """User is staff or owner of the customer that owns the OpenStack service settings.
+
+    Provider users can manage provider-internal resources (non-shared externals,
+    advanced gateway options); consumer-side users may not.
+    """
+    if user.is_staff:
+        return True
+    customer = service_settings.customer
+    if customer is None:
+        return False
+    return customer.has_user(user, CustomerRole.OWNER)
+
+
+def get_tenant_external_networks(tenant: Tenant, user):
+    """Global ExternalNetwork rows usable as gateway by `user` on routers in `tenant`.
+
+    Non-shared external networks are provider-internal (e.g. management or
+    upstream-peering pools) and must not be exposed to consumer-side users, even
+    if Neutron has synced them into the deployment-wide catalog. Providers
+    (staff or service settings customer owners) still see the full set.
+    """
+    qs = ExternalNetwork.objects.filter(settings=tenant.service_settings)
+    if not is_openstack_service_provider(user, tenant.service_settings):
+        qs = qs.filter(is_shared=True)
+    return qs
+
+
+def get_external_network(tenant: Tenant) -> ExternalNetwork | None:
+    """
+    Fetch ExternalNetwork instance for a tenant.
+    Priority order:
+    1. Tenant's external_network_ref FK (if set)
+    2. CustomerOpenStack external_network_ref FK (if exists)
+    3. Lookup by service settings external_network_id option
+    Falls back to string-based lookup if FK is not set.
+    """
+    # Priority 1: tenant's own FK
+    if tenant.external_network_ref_id:
+        return tenant.external_network_ref
+
+    service_settings = tenant.service_settings
+    customer = tenant.project.customer
+
+    # Priority 2: CustomerOpenStack FK
+    try:
+        customer_openstack = CustomerOpenStack.objects.get(
+            settings=service_settings, customer=customer
+        )
+        if customer_openstack.external_network_ref_id:
+            return customer_openstack.external_network_ref
+    except CustomerOpenStack.DoesNotExist:
+        pass
+
+    # Priority 3: fall back to string-based lookup via service settings option
+    external_network_id = service_settings.get_option("external_network_id")
+    if external_network_id:
+        return ExternalNetwork.objects.filter(
+            settings=service_settings, backend_id=external_network_id
+        ).first()
+
+    return None
+
+
 def get_external_network_id(tenant: Tenant):
     """
     Fetch external network ID from tenant, service settings or customer settings.
     Priority order:
-    1. Tenant's external_network_id field (if set)
-    2. CustomerOpenStack external_network_id (if exists)
-    3. Service settings external_network_id option
+    1. Tenant's external_network_ref FK backend_id (if set)
+    2. Tenant's external_network_id field (if set, legacy)
+    3. CustomerOpenStack external_network_id (if exists)
+    4. Service settings external_network_id option
     """
-    # First priority: tenant's own external_network_id
+    # Try FK-based resolution first
+    ext_net = get_external_network(tenant)
+    if ext_net:
+        return ext_net.backend_id
+
+    # Legacy fallback: direct string fields
     if tenant.external_network_id:
         return tenant.external_network_id
 
@@ -67,6 +143,85 @@ def get_external_network_id(tenant: Tenant):
     except CustomerOpenStack.DoesNotExist:
         pass
     return external_network_id
+
+
+def get_external_network_without_ipv4(tenant: Tenant) -> ExternalNetwork | None:
+    """Return the tenant's external network if it is known to have no IPv4 subnet.
+
+    Neutron allocates floating IPs from IPv4 subnets only, so on such a network
+    every allocation is accepted by the API and then fails in the backend.
+    Returns None whenever the answer is unknown -- the network, or its subnets,
+    have not been imported -- so that an incomplete catalog never blocks a
+    request which might succeed.
+    """
+    external_network_id = get_external_network_id(tenant)
+    if not external_network_id:
+        return None
+    network = ExternalNetwork.objects.filter(
+        settings=tenant.service_settings, backend_id=external_network_id
+    ).first()
+    if network is None:
+        return None
+    ip_versions = set(network.subnets.values_list("ip_version", flat=True))
+    if not ip_versions or 4 in ip_versions:
+        return None
+    return network
+
+
+def get_no_ipv4_external_network_message(tenant: Tenant):
+    """Why a floating IP cannot be allocated for this tenant, or None when it can.
+
+    Shared so that the API and the admin action refuse in the same words.
+    """
+    network = get_external_network_without_ipv4(tenant)
+    if network is None:
+        return None
+    return _(
+        "External network %s has no IPv4 subnet, so no floating IP can be "
+        "allocated from it. Floating IPs are IPv4 only: IPv6 addresses are "
+        "routed rather than floating, so reach the instance on its own IPv6 "
+        "address instead."
+    ) % (network.name or network.backend_id)
+
+
+def _is_ipv6(ip_version: int, cidr: str) -> bool:
+    # A subnet created by Waldur keeps the default ip_version of 4 until it is
+    # pulled from Neutron, so the CIDR decides as well.
+    if ip_version == 6:
+        return True
+    try:
+        return ip_network(cidr, strict=False).version == 6
+    except ValueError:
+        return False
+
+
+def tenant_has_ipv6(tenant: Tenant) -> bool:
+    """
+    Whether the tenant has IPv6: one of its subnets has an IPv6 CIDR, or the
+    external network it uses has an IPv6 subnet. When no external network is
+    resolved for the tenant, any external network of its service settings
+    counts. A tenant whose external subnets were never pulled counts as
+    IPv4-only.
+    """
+    subnets = SubNet.objects.filter(tenant=tenant)
+    if any(
+        _is_ipv6(ip_version, cidr)
+        for ip_version, cidr in subnets.values_list("ip_version", "cidr")
+    ):
+        return True
+
+    external_subnets = ExternalSubnet.objects.filter(
+        network__settings=tenant.service_settings
+    )
+    external_network_id = get_external_network_id(tenant)
+    if external_network_id:
+        external_subnets = external_subnets.filter(
+            network__backend_id=external_network_id
+        )
+    return any(
+        _is_ipv6(ip_version, cidr)
+        for ip_version, cidr in external_subnets.values_list("ip_version", "cidr")
+    )
 
 
 def check_volume_resize_enabled(volume):

@@ -8,20 +8,24 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.test import (
     APIRequestFactory,
-    APITransactionTestCase,
+    APITestCase,
     force_authenticate,
 )
 from rest_framework.views import APIView
 
 from waldur_core.core import utils
 from waldur_core.core.fields import TimestampField
+from waldur_core.core.models import DESCRIPTION_LENGTH
 from waldur_core.core.serializers import (
     Base64Field,
     DictSerializerField,
     GenericRelatedField,
+    HTMLCleanField,
     RestrictedSerializerMixin,
 )
+from waldur_core.core.tests.helpers import EXPANDING_DESCRIPTION
 from waldur_core.logging.utils import get_loggable_models
+from waldur_core.structure.models import Project, UserAgreement
 from waldur_core.structure.serializers import CustomerSerializer
 from waldur_core.structure.tests.factories import CustomerFactory, UserFactory
 
@@ -65,10 +69,10 @@ class DictFieldTestSerializer(serializers.Serializer):
 
 class DictSerializerFieldTest(unittest.TestCase):
     def setUp(self):
-        self.python_dict = {"python": {"image": "python:3.11-alpine"}}
+        self.python_dict = {"python": {"image": "python:3.12-alpine"}}
         self.python_json = """{
     "python": {
-        "image": "python:3.11-alpine"
+        "image": "python:3.12-alpine"
     }
     }"""
 
@@ -122,7 +126,7 @@ class DictSerializerFieldTest(unittest.TestCase):
         self.assertFalse(serializer.is_valid(), "Serializer should reject None values")
 
 
-class GenericRelatedFieldTest(APITransactionTestCase):
+class GenericRelatedFieldTest(APITestCase):
     def setUp(self):
         self.user = UserFactory(is_staff=True)
         self.request = APIRequestFactory().get("/")
@@ -245,7 +249,7 @@ class UserListView(ListAPIView):
     ]
 
 
-class RestrictedSerializerTest(APITransactionTestCase):
+class RestrictedSerializerTest(APITestCase):
     def setUp(self):
         """
         Set up common objects for all tests in this class.
@@ -320,7 +324,7 @@ class RestrictedSerializerTest(APITransactionTestCase):
             )
 
 
-class SlugSerializerMixinTest(APITransactionTestCase):
+class SlugSerializerMixinTest(APITestCase):
     """Test SlugSerializerMixin uniqueness validation for staff users."""
 
     def setUp(self):
@@ -452,3 +456,126 @@ class SlugSerializerMixinTest(APITransactionTestCase):
         # So the slug should not be in validated_data
         serializer.is_valid()
         self.assertNotIn("slug", serializer.validated_data)
+
+
+class HTMLCleanFieldTestSerializer(serializers.Serializer):
+    content = HTMLCleanField(
+        required=False, allow_blank=True, max_length=DESCRIPTION_LENGTH
+    )
+
+
+class HTMLCleanFieldTest(unittest.TestCase):
+    def test_plain_text_within_limit_is_accepted(self):
+        field = HTMLCleanField(max_length=DESCRIPTION_LENGTH)
+        value = field.to_internal_value("plain text")
+        self.assertEqual(value, "plain text")
+
+    def test_value_expanded_by_html_clean_is_rejected_when_over_limit(self):
+        field = HTMLCleanField(max_length=DESCRIPTION_LENGTH)
+        # Exactly at pre-clean limit, but & -> &amp; expands past DESCRIPTION_LENGTH.
+        with self.assertRaises(serializers.ValidationError) as ctx:
+            field.to_internal_value("&" * DESCRIPTION_LENGTH)
+        self.assertIn("too long", str(ctx.exception).lower())
+
+    def test_expanded_value_error_names_html_sanitisation_as_the_cause(self):
+        # An input shorter than the limit that only overflows once escaped must
+        # not be reported as simply exceeding the limit — the user is looking at
+        # a box with fewer characters in it than the number they are quoted.
+        field = HTMLCleanField(max_length=DESCRIPTION_LENGTH)
+        with self.assertRaises(serializers.ValidationError) as ctx:
+            field.to_internal_value(EXPANDING_DESCRIPTION)
+        self.assertIn("sanitisation", str(ctx.exception))
+
+    def test_value_without_max_length_does_not_crash_after_html_clean(self):
+        field = HTMLCleanField()
+        value = field.to_internal_value("&" * DESCRIPTION_LENGTH)
+        self.assertGreater(len(value), DESCRIPTION_LENGTH)
+
+    def test_serializer_returns_400_when_cleaned_description_exceeds_limit(self):
+        serializer = HTMLCleanFieldTestSerializer(
+            data={"content": "Norouzi, M., & Hinton, G. " * 220}
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("content", serializer.errors)
+
+    def test_plain_oversize_value_keeps_the_standard_max_length_message(self):
+        # Nothing to do with sanitisation: the value was too long as typed.
+        serializer = HTMLCleanFieldTestSerializer(
+            data={"content": "a" * (DESCRIPTION_LENGTH + 1)}
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertEqual(
+            serializer.errors["content"][0].code,
+            "max_length",
+        )
+        self.assertNotIn("sanitisation", str(serializer.errors["content"]))
+
+
+class HTMLCleanFieldModelSerializer(serializers.ModelSerializer):
+    """An HTMLCleanField declared without max_length over a bounded column."""
+
+    description = HTMLCleanField(required=False, allow_blank=True)
+
+    class Meta:
+        model = Project
+        fields = ("name", "description")
+
+
+class UnboundedHTMLCleanFieldModelSerializer(serializers.ModelSerializer):
+    """The same declaration over an unbounded TextField column."""
+
+    content = HTMLCleanField(required=False, allow_blank=True)
+
+    class Meta:
+        model = UserAgreement
+        fields = ("content",)
+
+
+class HTMLCleanFieldMaxLengthInferenceTest(APITestCase):
+    """A declaration without max_length must not silently drop the length guard.
+
+    A plain ModelSerializer inherits the model field's max_length validator.
+    Redeclaring the field as HTMLCleanField used to throw that away, so an
+    oversized value reached Postgres and raised DataError (HTTP 500) instead of
+    being rejected with 400. The limit is now inferred from the model field.
+    """
+
+    def test_max_length_is_inferred_from_bounded_model_field(self):
+        field = HTMLCleanFieldModelSerializer().fields["description"]
+        self.assertEqual(field.max_length, DESCRIPTION_LENGTH)
+
+    def test_inferred_limit_rejects_plain_oversize_value(self):
+        serializer = HTMLCleanFieldModelSerializer(
+            data={"name": "project", "description": "a" * (DESCRIPTION_LENGTH + 1)}
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("description", serializer.errors)
+
+    def test_inferred_limit_rejects_value_expanded_by_html_clean(self):
+        serializer = HTMLCleanFieldModelSerializer(
+            data={"name": "project", "description": EXPANDING_DESCRIPTION}
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("sanitisation", str(serializer.errors["description"]))
+
+    def test_explicit_max_length_is_not_overridden(self):
+        class ExplicitSerializer(HTMLCleanFieldModelSerializer):
+            description = HTMLCleanField(required=False, max_length=10)
+
+        self.assertEqual(ExplicitSerializer().fields["description"].max_length, 10)
+
+    def test_unbounded_model_field_stays_unbounded(self):
+        # TextField has no max_length, so nothing is inferred and long values pass.
+        field = UnboundedHTMLCleanFieldModelSerializer().fields["content"]
+        self.assertIsNone(field.max_length)
+        self.assertGreater(
+            len(field.to_internal_value("&" * DESCRIPTION_LENGTH)),
+            DESCRIPTION_LENGTH,
+        )
+
+    def test_field_on_plain_serializer_is_not_affected(self):
+        # No model to infer from, so the field stays unbounded.
+        class PlainSerializer(serializers.Serializer):
+            content = HTMLCleanField(required=False, allow_blank=True)
+
+        self.assertIsNone(PlainSerializer().fields["content"].max_length)

@@ -11,13 +11,30 @@ from drf_spectacular.types import OpenApiTypes
 
 
 class WaldurTokenScheme(TokenScheme):
-    target_class = "waldur_core.core.authentication.TokenAuthentication"
+    target_class = "waldur_core.core.authentication.ImpersonationAuthentication"
     name = "waldurTokenAuth"
+    # TokenScheme sets priority=-1 and match_subclasses=True so it can match any
+    # TokenAuthentication subclass. Without a higher priority here, this exact-class
+    # extension ties with the base TokenScheme and loses on registration order,
+    # so ImpersonationAuthentication falls back to the colliding "tokenAuth" name.
+    priority = 0
 
 
 class WaldurSessionScheme(SessionScheme):
     target_class = "waldur_core.core.authentication.SessionAuthentication"
     name = "waldurCookieAuth"
+
+
+class PATAuthenticationScheme(OpenApiAuthenticationExtension):
+    target_class = "waldur_core.core.authentication.PATAuthentication"
+    name = "waldurPATAuth"
+
+    def get_security_definition(self, auto_schema):
+        return build_bearer_security_scheme_object(
+            header_name="Authorization",
+            token_prefix="Bearer",
+            bearer_format="w_<unix_timestamp>_<random>",
+        )
 
 
 class OIDCAuthenticationScheme(OpenApiAuthenticationExtension):
@@ -64,3 +81,23 @@ class IPAddressFieldExtension(OpenApiSerializerFieldExtension):
 
         if field.protocol == "ipv6":
             return {"type": "string", "format": "ipv6"}
+
+
+class JSONFieldExtension(OpenApiSerializerFieldExtension):
+    target_class = "rest_framework.fields.JSONField"
+
+    def map_serializer_field(self, auto_schema, direction):
+        return {"type": "object", "additionalProperties": True}
+
+
+from drf_spectacular.utils import extend_schema_field
+from rest_framework import serializers
+
+
+@extend_schema_field(OpenApiTypes.ANY)
+class AnyJSONField(serializers.Field):
+    def to_representation(self, value):
+        return value
+
+    def to_internal_value(self, data):
+        return data

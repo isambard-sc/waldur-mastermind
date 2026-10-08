@@ -67,6 +67,20 @@ class GenericKeyFilterBackend(BaseFilterBackend):
             )
         return queryset
 
+    def get_schema_operation_parameters(self, view):
+        return [
+            {
+                "name": self.get_field_name(),
+                "required": False,
+                "in": "query",
+                "schema": {
+                    "type": "string",
+                    "format": "uri",
+                },
+                "description": f"Filter by {self.get_field_name()} URL.",
+            }
+        ]
+
 
 class MappedMultipleChoiceFilter(django_filters.MultipleChoiceFilter):
     """
@@ -106,12 +120,6 @@ class LooseMultipleChoiceFilter(MultipleChoiceFilter):
     field_class = LooseMultipleChoiceField
 
 
-class UUIDInFilter(django_filters.BaseInFilter, django_filters.UUIDFilter):
-    """A UUIDFilter that accepts multiple values (comma-separated)."""
-
-    pass
-
-
 class CharInFilter(django_filters.BaseInFilter, django_filters.CharFilter):
     """A CharFilter that accepts multiple values (comma-separated)."""
 
@@ -139,10 +147,40 @@ class URLFilter(django_filters.CharFilter):
         if value in EMPTY_VALUES:
             return qs
 
-        uuid_value = self.get_uuid(value)
-        if not core_utils.is_uuid_like(uuid_value):
+        lookup_value = self.get_uuid(value)
+        if not lookup_value:
             return qs.none()
-        return super().filter(qs, uuid_value)
+        if self.lookup_field == "uuid" and not core_utils.is_uuid_like(lookup_value):
+            return qs.none()
+        return super().filter(qs, lookup_value)
+
+
+class RelatedUUIDFilter(django_filters.UUIDFilter):
+    """
+    UUIDFilter that also stores view_name for OpenAPI schema generation.
+    """
+
+    def __init__(self, view_name=None, **kwargs):
+        super().__init__(**kwargs)
+        self.view_name = view_name
+
+
+class RelatedUUIDInFilter(django_filters.BaseInFilter, RelatedUUIDFilter):
+    """
+    UUIDInFilter that also stores view_name for OpenAPI schema generation.
+    """
+
+    pass
+
+
+class ModelMultipleChoiceFilter(django_filters.ModelMultipleChoiceFilter):
+    """
+    ModelMultipleChoiceFilter that also stores view_name for OpenAPI schema generation.
+    """
+
+    def __init__(self, view_name=None, **kwargs):
+        super().__init__(**kwargs)
+        self.view_name = view_name
 
 
 class TimestampFilter(django_filters.NumberFilter):
@@ -222,6 +260,13 @@ class ExternalFilterBackend(BaseFilterBackend):
             queryset = item.filter_queryset(request, queryset, view)
         return queryset
 
+    def get_schema_operation_parameters(self, view):
+        parameters = []
+        for item in self.__class__.get_registered_filters():
+            if hasattr(item, "get_schema_operation_parameters"):
+                parameters.extend(item.get_schema_operation_parameters(view))
+        return parameters
+
 
 class EmptyFilter(django_filters.CharFilter):
     """
@@ -276,7 +321,13 @@ class ExtendedOrderingFilter(django_filters.OrderingFilter):
 
 class CreatedModifiedFilter(django_filters.FilterSet):
     created = django_filters.DateTimeFilter(lookup_expr="gte", label="Created after")
+    created_before = django_filters.DateTimeFilter(
+        field_name="created", lookup_expr="lte", label="Created before"
+    )
     modified = django_filters.DateTimeFilter(lookup_expr="gte", label="Modified after")
+    modified_before = django_filters.DateTimeFilter(
+        field_name="modified", lookup_expr="lte", label="Modified before"
+    )
 
 
 def filter_by_full_name(queryset, value, field=""):
@@ -336,6 +387,37 @@ def get_generic_field_filter(
             )
     """
 
+    def get_lookup_path(model_class: type[Model]) -> str | None:
+        """
+        Determine the lookup path for the target field on a model.
+
+        Returns the lookup path string if the field can be queried, or None if the
+        model should be skipped. Supports auto-fallback to customer__<field_name>
+        for models that don't have the field directly but have a 'customer' FK
+        (e.g., ServiceProvider, CallManagingOrganisation).
+        """
+        # First, check if the model has the field as a direct database field
+        try:
+            model_class._meta.get_field(field_name)
+            return f"{field_name}__{lookup_expr}"
+        except Exception:
+            pass
+
+        # Fallback: check if model has a 'customer' FK and the target field
+        # can be accessed via customer (e.g., customer__name)
+        try:
+            customer_field = model_class._meta.get_field("customer")
+            if (
+                hasattr(customer_field, "related_model")
+                and customer_field.related_model
+            ):
+                customer_field.related_model._meta.get_field(field_name)
+                return f"customer__{field_name}__{lookup_expr}"
+        except Exception:
+            pass
+
+        return None
+
     def generic_field_filter(queryset: QuerySet, name: str, value: str) -> QuerySet:
         """
         The actual filter function that will be executed by django-filter.
@@ -347,14 +429,12 @@ def get_generic_field_filter(
 
         # This Q object will aggregate all the conditions with OR.
         query = Q()
-        lookup = (
-            f"{field_name}__{lookup_expr}"  # e.g., "uuid__exact" or "name__icontains"
-        )
 
         # Iterate over the list of models provided to the factory.
         for model_class in models_to_search:
-            # Robustness: Skip any model that doesn't have the target field.
-            if not hasattr(model_class, field_name):
+            # Determine the lookup path for this model
+            lookup = get_lookup_path(model_class)
+            if lookup is None:
                 continue
 
             # Find the primary keys of all instances of this model

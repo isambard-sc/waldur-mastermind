@@ -10,9 +10,11 @@ from rest_framework.exceptions import ValidationError
 from waldur_core.core.enums import CoreStates
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
+from waldur_mastermind.common.serializers import strip_hidden_options
 from waldur_mastermind.marketplace.enums import OrderStates, OrderTypes, ResourceStates
 
-from . import log, models, signals, tasks, utils
+from . import billing_mode, log, models, signals, tasks
+from .utils import format_limits_list, parse_date
 
 logger = logging.getLogger(__name__)
 
@@ -112,99 +114,283 @@ def resource_creation_canceled(resource: models.Resource, validate=False):
     return order
 
 
-def resource_update_succeeded(resource: models.Resource, validate=False):
+def resource_restore_succeeded(resource: models.Resource, validate=False):
     order = set_order_state(
         resource,
-        OrderTypes.UPDATE,
+        OrderTypes.RESTORE,
         OrderStates.DONE,
         validate,
     )
-
-    email_context = {
-        "resource_name": resource.name,
-        "support_email": config.SITE_EMAIL,
-        "support_phone": config.SITE_PHONE,
-    }
 
     if resource.state != ResourceStates.OK:
         resource.set_state_ok()
         resource.save(update_fields=["state"])
 
-    if order:
-        email_context.update(
-            {
-                "order_user": order.created_by.get_full_name(),
-            }
-        )
-
-        plan_changed = bool(order.plan and resource.plan != order.plan)
-        limits_changed = bool(order.limits and resource.limits != order.limits)
-        if plan_changed:
-            email_context.update(
-                {
-                    "resource_old_plan": resource.plan.name,
-                    "resource_plan": order.plan.name,
-                }
-            )
-            resource.plan = order.plan
-            transaction.on_commit(
-                lambda: tasks.notify_about_resource_change.delay(
-                    "marketplace_resource_update_succeeded",
-                    email_context,
-                    resource.uuid,
-                )
-            )
-        if limits_changed:
-            components_map = order.offering.get_limit_components()
-            email_context.update(
-                {
-                    "resource_old_limits": utils.format_limits_list(
-                        components_map, resource.limits
-                    ),
-                    "resource_limits": utils.format_limits_list(
-                        components_map, order.limits
-                    ),
-                }
-            )
-            resource.limits = order.limits
-            transaction.on_commit(
-                lambda: tasks.notify_about_resource_change.delay(
-                    "marketplace_resource_update_limits_succeeded",
-                    email_context,
-                    resource.uuid,
-                )
-            )
-
-        if plan_changed or limits_changed:
-            resource.init_cost()
-            resource.save()
-            if limits_changed:
-                log.log_resource_limit_update_succeeded(resource)
-
+    signals.resource_creation_succeeded.send(sender=models.Resource, instance=resource)
+    event_logger.emit(
+        "Resource {resource_name} has been restored.",
+        event_type=EventType.MARKETPLACE_RESOURCE_CREATE_SUCCEEDED,
+        event_context={"resource": resource},
+        scopes=log.get_resource_scopes(resource),
+    )
     return order
 
 
-def resource_update_failed(resource: models.Resource, validate=False):
+def resource_restore_failed(resource: models.Resource, validate=False):
     order = set_order_state(
         resource,
-        OrderTypes.UPDATE,
+        OrderTypes.RESTORE,
         OrderStates.ERRED,
         validate,
     )
-    if resource.state != ResourceStates.ERRED:
-        resource.set_state_erred()
-        resource.save(update_fields=["state"])
-    else:
-        logger.info("Resource %s is already in erred state, skip transition", resource)
+    resource.set_state_erred()
+    resource.save(update_fields=["state"])
+
+    if order:
+        copy_error_from_resource_to_order(resource, order)
 
     event_logger.emit(
-        "Resource {resource_name} update has failed.",
-        event_type=EventType.MARKETPLACE_RESOURCE_UPDATE_FAILED,
+        "Resource {resource_name} restoration has failed.",
+        event_type=EventType.MARKETPLACE_RESOURCE_CREATE_FAILED,
         event_context={"resource": resource},
         scopes=log.get_resource_scopes(resource),
         level="error",
     )
     return order
+
+
+def resource_restore_canceled(resource: models.Resource, validate=False):
+    order = set_order_state(
+        resource,
+        OrderTypes.RESTORE,
+        OrderStates.CANCELED,
+        validate,
+    )
+
+    if resource.state != ResourceStates.TERMINATED:
+        resource.set_state_terminated()
+        resource.save(update_fields=["state"])
+
+    event_logger.emit(
+        "Resource {resource_name} restoration has been canceled.",
+        event_type=EventType.MARKETPLACE_RESOURCE_CREATE_CANCELED,
+        event_context={"resource": resource},
+        scopes=log.get_resource_scopes(resource),
+    )
+    return order
+
+
+def apply_new_options(resource, new_options):
+    """Merge an order's new option values into the resource's options."""
+    current_options = resource.options or {}
+    current_options.update(new_options)
+    resource_options = (resource.offering.resource_options or {}).get("options")
+    if resource_options:
+        # Options hidden by the new values lose their stored values.
+        current_options = strip_hidden_options(resource_options, current_options)
+    resource.options = current_options
+
+
+def resource_update_succeeded(resource: models.Resource, validate=False):
+    """
+    Handle successful resource update completion.
+
+    This function is called either:
+    1. From process_order flow (via _process_options_update, etc.)
+    2. From set_state_done API endpoint (via sync_order_state)
+
+    Uses select_for_update() to prevent race conditions when multiple
+    processes try to update the resource simultaneously.
+    """
+    with transaction.atomic():
+        # Lock the resource row to prevent concurrent modifications
+        locked_resource = models.Resource.objects.select_for_update().get(
+            pk=resource.pk
+        )
+
+        order = set_order_state(
+            locked_resource,
+            OrderTypes.UPDATE,
+            OrderStates.DONE,
+            validate,
+        )
+
+        email_context = {
+            "resource_name": locked_resource.name,
+            "support_email": config.SITE_EMAIL,
+            "support_phone": config.SITE_PHONE,
+        }
+
+        if locked_resource.state != ResourceStates.OK:
+            locked_resource.set_state_ok()
+
+        limits_changed = False
+        if order:
+            email_context.update(
+                {
+                    "order_user": order.created_by.get_full_name(),
+                }
+            )
+
+            plan_changed = bool(order.plan and locked_resource.plan != order.plan)
+            limits_changed = bool(
+                order.limits and locked_resource.limits != order.limits
+            )
+
+            # Handle options updates from order attributes
+            new_options = order.attributes.get("new_options")
+            if new_options:
+                apply_new_options(locked_resource, new_options)
+                logger.info(
+                    "Updated options for resource %s (UUID: %s) from order %s",
+                    locked_resource.name,
+                    locked_resource.uuid.hex,
+                    order.uuid.hex,
+                )
+
+            # Handle end date changes from order attributes. This is the single
+            # place an approved order writes an end date, so it covers both
+            # completion routes: processors that finish synchronously delegate
+            # here, and offerings whose backend call is asynchronous arrive here
+            # when the backend reports back. Renewal orders carry new_end_date
+            # too, so keying on the attribute rather than on the action also
+            # applies renewals that finish asynchronously — those used to be
+            # marked done with no end date ever written.
+            new_end_date = parse_date(order.attributes.get("new_end_date"))
+            if new_end_date and locked_resource.end_date != new_end_date:
+                locked_resource.end_date = new_end_date
+                locked_resource.end_date_requested_by = (
+                    order.consumer_reviewed_by or order.created_by
+                )
+                logger.info(
+                    "Updated end date for resource %s (UUID: %s) to %s from order %s",
+                    locked_resource.name,
+                    locked_resource.uuid.hex,
+                    new_end_date,
+                    order.uuid.hex,
+                )
+
+            if plan_changed:
+                old_plan = locked_resource.plan
+                old_billing = billing_mode.describe_plan_billing(old_plan)
+                new_billing = billing_mode.describe_plan_billing(order.plan)
+                email_context.update(
+                    {
+                        "resource_old_plan": old_plan.name,
+                        "resource_plan": order.plan.name,
+                        "billing_consequence": billing_mode.describe_switch_consequence(
+                            old_billing, new_billing
+                        ),
+                    }
+                )
+                locked_resource.plan = order.plan
+                log.log_resource_plan_switched(
+                    locked_resource, old_plan, order.plan, old_billing, new_billing
+                )
+                transaction.on_commit(
+                    lambda: tasks.notify_about_resource_change.delay(
+                        "marketplace_resource_update_succeeded",
+                        email_context,
+                        locked_resource.uuid,
+                    )
+                )
+            if limits_changed:
+                components_map = order.offering.get_limit_components(
+                    order.plan or locked_resource.plan
+                )
+                email_context.update(
+                    {
+                        "resource_old_limits": format_limits_list(
+                            components_map, locked_resource.limits
+                        ),
+                        "resource_limits": format_limits_list(
+                            components_map, order.limits
+                        ),
+                    }
+                )
+                locked_resource.limits = order.limits
+                transaction.on_commit(
+                    lambda: tasks.notify_about_resource_change.delay(
+                        "marketplace_resource_update_limits_succeeded",
+                        email_context,
+                        locked_resource.uuid,
+                    )
+                )
+
+            if plan_changed or limits_changed:
+                locked_resource.init_cost()
+
+        locked_resource.save()
+
+        if limits_changed:
+            log.log_resource_limit_update_succeeded(locked_resource)
+
+        if limits_changed and (locked_resource.downscaled or locked_resource.paused):
+            resource_uuid = str(locked_resource.uuid)
+            offering_id = locked_resource.offering_id
+            transaction.on_commit(
+                lambda: _trigger_slurm_policy_reevaluation(resource_uuid, offering_id)
+            )
+
+        return order
+
+
+def _trigger_slurm_policy_reevaluation(resource_uuid, offering_id):
+    """Trigger immediate SLURM policy re-evaluation after limit changes.
+
+    When resource limits increase on a downscaled/paused resource,
+    the policy system needs to re-evaluate usage percentages so that
+    QoS restrictions are lifted promptly instead of waiting for the
+    next periodic evaluation cycle.
+    """
+    from waldur_mastermind.policy import models as policy_models
+    from waldur_mastermind.policy import tasks as policy_tasks
+
+    policies = policy_models.SlurmPeriodicUsagePolicy.objects.filter(
+        scope_id=offering_id,
+    )
+    for policy in policies:
+        policy_tasks.evaluate_resource_against_policy.delay(
+            resource_uuid, str(policy.uuid)
+        )
+
+
+def resource_update_failed(resource: models.Resource, validate=False):
+    """
+    Handle failed resource update.
+
+    Uses select_for_update() to prevent race conditions when multiple
+    processes try to update the resource simultaneously.
+    """
+    with transaction.atomic():
+        # Lock the resource row to prevent concurrent modifications
+        locked_resource = models.Resource.objects.select_for_update().get(
+            pk=resource.pk
+        )
+
+        order = set_order_state(
+            locked_resource,
+            OrderTypes.UPDATE,
+            OrderStates.ERRED,
+            validate,
+        )
+        if locked_resource.state != ResourceStates.ERRED:
+            locked_resource.set_state_erred()
+            locked_resource.save(update_fields=["state"])
+        else:
+            logger.info(
+                "Resource %s is already in erred state, skip transition",
+                locked_resource,
+            )
+
+        event_logger.emit(
+            "Resource {resource_name} update has failed.",
+            event_type=EventType.MARKETPLACE_RESOURCE_UPDATE_FAILED,
+            event_context={"resource": locked_resource},
+            scopes=log.get_resource_scopes(locked_resource),
+            level="error",
+        )
+        return order
 
 
 def resource_update_canceled(resource: models.Resource, validate=False):
@@ -244,6 +430,15 @@ def resource_deletion_succeeded(resource: models.Resource, validate=False):
     else:
         logger.info(
             "Resource %s is already in terminated state, skip transition", resource
+        )
+
+    # Terminated resources keep their row, so the ResourceApiKey FK cascade never
+    # fires. Delete the key rows explicitly (the agent's delete_resource already
+    # removed the gateway Secret entries) so no orphan OK keys remain revealable.
+    deleted, _ = resource.api_keys.all().delete()
+    if deleted:
+        logger.info(
+            "Deleted %s API key row(s) of terminated resource %s", deleted, resource
         )
 
     signals.resource_deletion_succeeded.send(models.Resource, instance=resource)
@@ -410,6 +605,18 @@ OrderHandlers = {
         OrderTypes.TERMINATE,
         OrderStates.CANCELED,
     ): resource_deletion_canceled,
+    (
+        OrderTypes.RESTORE,
+        OrderStates.DONE,
+    ): resource_restore_succeeded,
+    (
+        OrderTypes.RESTORE,
+        OrderStates.ERRED,
+    ): resource_restore_failed,
+    (
+        OrderTypes.RESTORE,
+        OrderStates.CANCELED,
+    ): resource_restore_canceled,
 }
 
 

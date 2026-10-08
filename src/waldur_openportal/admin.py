@@ -218,9 +218,7 @@ class RemoteProjectAllocationEntryAdmin(admin.ModelAdmin):
 
 
 admin.site.register(models.RemoteProject, RemoteProjectAdmin)
-admin.site.register(
-    models.RemoteProjectAuditEntry, RemoteProjectAuditEntryAdmin
-)
+admin.site.register(models.RemoteProjectAuditEntry, RemoteProjectAuditEntryAdmin)
 admin.site.register(
     models.RemoteProjectAllocationEntry,
     RemoteProjectAllocationEntryAdmin,

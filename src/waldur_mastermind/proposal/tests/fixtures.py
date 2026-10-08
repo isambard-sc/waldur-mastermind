@@ -1,10 +1,11 @@
 import datetime
 
 from django.contrib.contenttypes.models import ContentType
+from django.utils import timezone
 from django.utils.functional import cached_property
 
 from waldur_core.permissions import enums
-from waldur_core.permissions.fixtures import CallRole
+from waldur_core.permissions.fixtures import CallRole, CustomerRole
 from waldur_core.permissions.models import Role
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
@@ -40,6 +41,9 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
         ):
             CallRole.MANAGER.add_permission(perm)
             self.call_organizer_role.add_permission(perm)
+
+        # Mirrors permissions.yaml: owners see their organization's calls.
+        CustomerRole.OWNER.add_permission(enums.PermissionEnum.LIST_CALLS)
 
         CallRole.REVIEWER.add_permission(enums.PermissionEnum.LIST_PROPOSALS)
         CallRole.REVIEWER.add_permission(enums.PermissionEnum.LIST_CALLS)
@@ -120,17 +124,16 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
     def round(self):
         return proposal_factories.RoundFactory(
             call=self.call,
-            start_time=datetime.date.today(),
-            cutoff_time=datetime.date.today() + datetime.timedelta(days=10),
-            minimum_number_of_reviewers=1,
+            start_time=timezone.now(),
+            cutoff_time=timezone.now() + datetime.timedelta(days=10),
         )
 
     @cached_property
     def new_round(self):
         return proposal_factories.RoundFactory(
             call=self.call,
-            start_time=datetime.date.today(),
-            cutoff_time=datetime.date.today() + datetime.timedelta(days=10),
+            start_time=timezone.now(),
+            cutoff_time=timezone.now() + datetime.timedelta(days=10),
         )
 
     @cached_property
@@ -190,6 +193,12 @@ class ProposalFixture(structure_fixtures.CustomerFixture):
         user = structure_factories.UserFactory()
         role = CallRole.REVIEWER
         self.call.add_user(user, role)
+        return user
+
+    @cached_property
+    def panel_member(self):
+        user = structure_factories.UserFactory()
+        self.call.add_user(user, CallRole.PANEL_MEMBER)
         return user
 
     @cached_property

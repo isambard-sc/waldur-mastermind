@@ -85,16 +85,50 @@ class EmailHookAdmin(BaseHookAdmin):
     list_display = BaseHookAdmin.list_display + ("email",)
 
 
-class EventSubscriptionAdmin(admin.ModelAdmin):
-    list_display = ("uuid", "user", "source_ip", "observable_objects")
-
-
 class EmailLogAdmin(admin.ModelAdmin):
     list_display = (
         "__str__",
         "subject",
         "sent_at",
     )
+
+
+class SystemLogAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):
+    list_display = (
+        "created",
+        "source",
+        "instance",
+        "level",
+        "logger_name",
+        "message_preview",
+    )
+    list_filter = ("source", "level", "created")
+    search_fields = ("message", "logger_name", "instance")
+    ordering = ("-created",)
+    readonly_fields = (
+        "created",
+        "source",
+        "instance",
+        "level",
+        "level_number",
+        "logger_name",
+        "message",
+        "format_context",
+    )
+    exclude = ("context",)
+
+    def message_preview(self, obj):
+        if len(obj.message) > 100:
+            return obj.message[:100] + "..."
+        return obj.message
+
+    message_preview.short_description = _("Message")
+
+    def format_context(self, obj):
+        return format_json_field(obj.context)
+
+    format_context.allow_tags = True
+    format_context.short_description = _("Context")
 
 
 # This hack is needed because core admin is imported several times.
@@ -105,5 +139,5 @@ admin.site.register(models.SystemNotification, SystemNotificationAdmin)
 admin.site.register(models.WebHook, WebHookAdmin)
 admin.site.register(models.EmailHook, EmailHookAdmin)
 admin.site.register(models.Event, EventAdmin)
-admin.site.register(models.EventSubscription, EventSubscriptionAdmin)
 admin.site.register(models.EmailLog, EmailLogAdmin)
+admin.site.register(models.SystemLog, SystemLogAdmin)

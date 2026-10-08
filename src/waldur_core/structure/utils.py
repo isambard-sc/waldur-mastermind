@@ -1,11 +1,10 @@
-import datetime
 import logging
-from collections import defaultdict
 from typing import Any
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import QuerySet, Sum
+from django.db.models import QuerySet
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from rest_framework.exceptions import ValidationError
 
@@ -15,13 +14,13 @@ from waldur_core.core.enums import CoreStates
 from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure.signals import project_moved
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace.enums import (
-    BillingTypes,
-    LimitPeriods,
-    ResourceStates,
-)
+from waldur_mastermind.marketplace.enums import ResourceStates
 
 logger = logging.getLogger(__name__)
+
+# Error message set on a resource which is gone from the backend. Reports filter
+# on it, so keep it in sync with them when rewording.
+RESOURCE_MISSING_MESSAGE = "Does not exist at backend."
 
 
 def get_identity_provider_field(registration_method, field):
@@ -135,17 +134,32 @@ def update_pulled_fields(instance, imported_instance, fields):
 def handle_resource_not_found(resource):
     """
     Set resource state to ERRED and append/create "not found" error message.
+
+    Pull tasks re-check resources in ERRED state as well, so a resource that is
+    gone for good is handled on every cycle. Report it at WARNING level only on
+    the transition to missing and remember when that happened, to keep the
+    remaining warnings meaningful.
     """
+    message = RESOURCE_MISSING_MESSAGE
+    was_missing = (
+        resource.state == CoreStates.ERRED and message in resource.error_message
+    )
+    unchanged = was_missing and not getattr(resource, "runtime_state", "")
+
     resource.set_erred()
     resource.runtime_state = ""
-    message = "Does not exist at backend."
     if message not in resource.error_message:
         if not resource.error_message:
             resource.error_message = message
         else:
             resource.error_message += " (%s)" % message
-    resource.save()
-    logger.warning(
+    if hasattr(resource, "backend_missing_since") and not was_missing:
+        resource.backend_missing_since = timezone.now()
+    if not unchanged:
+        resource.save()
+
+    log = logger.debug if was_missing else logger.warning
+    log(
         f"{resource.__class__.__name__} {resource} (PK: {resource.pk}) does not exist at backend."
     )
 
@@ -167,9 +181,16 @@ def handle_resource_update_success(resource):
         resource.error_message = ""
         update_fields.append("error_message")
 
-    if hasattr(resource, "task_id"):
+    if hasattr(resource, "task_id") and resource.task_id is not None:
         resource.task_id = None
         update_fields.append("task_id")
+
+    if (
+        hasattr(resource, "backend_missing_since")
+        and resource.backend_missing_since is not None
+    ):
+        resource.backend_missing_since = None
+        update_fields.append("backend_missing_since")
 
     if update_fields:
         resource.save(update_fields=update_fields)
@@ -212,6 +233,23 @@ def check_project_end_date(obj):
         raise ValidationError(_("Project '%s' is expired.") % project)
 
 
+def is_service_settings_available_for_project(service_settings, project) -> bool:
+    """
+    Private service settings may back resources only in projects of their own
+    customer. Settings without a customer do not belong to any organization.
+    Settings behind a shared offering count as shared even if their own flag
+    was not updated when the offering was published.
+    """
+    if service_settings.shared or service_settings.customer_id in (
+        None,
+        project.customer_id,
+    ):
+        return True
+    return marketplace_models.Offering.objects.filter(
+        scope=service_settings, shared=True
+    ).exists()
+
+
 @transaction.atomic
 def move_project(project, customer, current_user=None, preserve_permissions=False):
     if customer.blocked:
@@ -243,86 +281,8 @@ def get_components_usage_data_from_resources(
     resources: QuerySet[marketplace_models.Resource],
     for_current_month: bool = False,
 ) -> list[dict[str, Any]]:
-    offerings = marketplace_models.Offering.objects.filter(
-        id__in=resources.values_list("offering_id", flat=True)
-    ).distinct()
+    from waldur_mastermind.marketplace.utils import (
+        get_components_usage_data,
+    )
 
-    components = marketplace_models.OfferingComponent.objects.filter(
-        offering__in=offerings
-    ).distinct()
-
-    component_usage = defaultdict(float)
-    component_limit = defaultdict(float)
-    component_limit_usage = defaultdict(float)
-
-    current_date = datetime.date.today()
-
-    for resource in resources:
-        for component_type, usage in resource.current_usages.items():
-            # When filtering for current month, get usage from ComponentUsage instead of current_usages
-            if not for_current_month:
-                component_usage[component_type] += float(usage)
-
-        for component_type, limit in resource.limits.items():
-            if limit is not None:
-                component_limit[component_type] += float(limit)
-
-        usage_components = resource.offering.components.filter(
-            billing_type=BillingTypes.USAGE
-        )
-        limit_components = resource.offering.components.filter(
-            billing_type=BillingTypes.LIMIT
-        )
-
-        if for_current_month:
-            for component in usage_components:
-                usages = marketplace_models.ComponentUsage.objects.filter(
-                    resource=resource,
-                    component=component,
-                    date__year=current_date.year,
-                    date__month=current_date.month,
-                )
-                total_usage = usages.aggregate(total=Sum("usage"))["total"] or 0
-                component_usage[component.type] += float(total_usage)
-
-        for component in limit_components:
-            if not for_current_month and component.limit_period in (
-                None,
-                LimitPeriods.MONTH,
-            ):
-                component_limit_usage[component.type] += float(
-                    resource.current_usages.get(component.type, 0)
-                )
-            else:
-                usages = marketplace_models.ComponentUsage.objects.filter(
-                    resource=resource, component=component
-                ).exclude(plan_period=None)
-
-                if for_current_month:
-                    usages = usages.filter(
-                        date__year=current_date.year,
-                        date__month=current_date.month,
-                    )
-                elif component.limit_period == LimitPeriods.ANNUAL:
-                    usages = usages.filter(date__year__gte=datetime.date.today().year)
-
-                total_usage = usages.aggregate(total=Sum("usage"))["total"] or 0
-                component_limit_usage[component.type] += float(total_usage)
-
-    components_data = {}
-    for component in components:
-        if component.type not in components_data:
-            components_data[component.type] = {
-                "type": component.type,
-                "name": component.name,
-                "description": component.description,
-                "measured_unit": component.measured_unit,
-                "billing_type": component.billing_type,
-                "usage": component_usage.get(component.type, 0),
-                "limit_usage": component_limit_usage.get(component.type, 0),
-                "limit": component_limit.get(component.type, None),
-                "offering_name": component.offering.name,
-                "offering_uuid": component.offering.uuid.hex,
-            }
-
-    return list(components_data.values())
+    return get_components_usage_data(resources, for_current_month)

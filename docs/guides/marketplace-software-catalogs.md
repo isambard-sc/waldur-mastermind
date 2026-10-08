@@ -1,55 +1,163 @@
 # Marketplace Software Catalogs
 
-This guide covers the software catalog system in Waldur's marketplace, using the European Environment for Scientific Software Installations (EESSI) as a primary example.
+This guide covers the software catalog system in Waldur's marketplace, including support for EESSI (European Environment for Scientific Software Installations), Spack, and other software catalogs.
 
 ## Overview
 
-The software catalog system allows marketplace offerings to expose large collections of scientific and HPC software packages from external catalogs like EESSI. Instead of manually tracking individual software installations, offerings can reference comprehensive software catalogs with thousands of packages.
+The software catalog system allows marketplace offerings to expose large collections of scientific and HPC software packages from external catalogs. Instead of manually tracking individual software installations, offerings can reference comprehensive software catalogs with thousands of packages. Waldur supports multiple catalog sources including:
+
+- **EESSI**: Binary runtime environment with pre-compiled HPC software
+- **Spack**: Source-based package manager for scientific computing
+- **Future support**: conda-forge, modules, and custom catalogs
 
 ## Architecture
 
+### Unified Catalog Loader Framework
+
+Waldur uses a unified catalog loader framework that provides:
+
+- **BaseCatalogLoader**: Abstract base class for all catalog loaders
+- **EESSICatalogLoader**: Loader for EESSI catalogs from new API format
+- **SpackCatalogLoader**: Loader for Spack catalogs from repology.json format
+- **Extensible design**: Support for additional catalog types
+
+### Data Models
+
 The system uses relational models for efficient storage and querying:
 
-- **SoftwareCatalog**: Represents a software catalog (e.g., EESSI 2023.06)
+- **SoftwareCatalog**: Represents a software catalog (e.g., EESSI 2023.06, Spack 2024.12)
 - **SoftwarePackage**: Individual software packages within catalogs
 - **SoftwareVersion**: Specific versions of packages
-- **SoftwareTarget**: Architecture/platform-specific installations
+- **SoftwareTarget**: Architecture/platform-specific installations or build variants
 - **OfferingSoftwareCatalog**: Links offerings to available catalogs
 
-## Loading EESSI Catalog Data
+### Catalog Types
 
-### 1. Download EESSI Data
+- **binary_runtime**: Pre-compiled software ready to use (EESSI)
+- **source_package**: Source packages requiring compilation (Spack)
+- **package_manager**: Traditional package managers (future: conda, pip)
+- **environment_module**: Module-based software stacks
 
-First, download the latest EESSI software catalog data:
+## Loading Software Catalogs
 
-```bash
-# Download the latest EESSI catalog data
-curl -o eessi.model.json https://www.eessi.io/docs/available_software/data/json_data_detail.json
-```
+### EESSI Catalog Loading
 
-### 2. Load Software Catalog Data
+The EESSI loader uses the new EESSI API format which supports both main software packages and extensions (Python packages, R packages, etc.).
 
-Use the EESSI management command to load catalog data:
+#### Load EESSI Catalog
 
 ```bash
 # Load EESSI catalog (dry run first to see what will be created)
-DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run python manage.py load_eessi_catalog --dry-run
+DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run waldur load_eessi_catalog --dry-run
 
-# Load the actual catalog
-DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run python manage.py load_eessi_catalog
+# Load the actual catalog with extensions
+DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run waldur load_eessi_catalog
+
+# Load without extensions
+DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run waldur load_eessi_catalog --no-extensions
 
 # Update existing catalog with new data
-DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run python manage.py load_eessi_catalog --update-existing
+DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run waldur load_eessi_catalog --update-existing
 ```
 
-This creates:
+#### EESSI Command Options
 
-- **SoftwareCatalog** entry for EESSI with detected version
+- `--catalog-name`: Name of the software catalog (default: EESSI)
+- `--catalog-version`: EESSI version (auto-detected from API if not provided)
+- `--api-url`: Base URL for EESSI API (default: <https://www.eessi.io/api_data/data/>)
+- `--extensions/--no-extensions`: Include/exclude extension packages (default: include)
+- `--dry-run`: Show what would be done without making changes
+- `--update-existing`: Update existing catalog data if it exists
+
+### Spack Catalog Loading
+
+The Spack loader supports the repology.json format from packages.spack.io, providing access to thousands of scientific computing packages.
+
+#### Load Spack Catalog
+
+```bash
+# Load Spack catalog (dry run first to see what will be created)
+DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run waldur load_spack_catalog --dry-run
+
+# Load the actual catalog
+DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run waldur load_spack_catalog
+
+# Load with custom data URL
+DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run waldur load_spack_catalog \
+  --data-url "https://custom.spack.site/data/repology.json"
+
+# Update existing catalog
+DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run waldur load_spack_catalog --update-existing
+```
+
+#### Spack Command Options
+
+- `--catalog-name`: Name of the software catalog (default: Spack)
+- `--catalog-version`: Spack version (auto-detected from data timestamp if not provided)
+- `--data-url`: URL for Spack repology.json data
+- `--dry-run`: Show what would be done without making changes
+- `--update-existing`: Update existing catalog data if it exists
+
+### What Gets Created
+
+Both management commands create:
+
+- **SoftwareCatalog** entry with detected version and metadata
 - **SoftwarePackage** entries for each software package
 - **SoftwareVersion** entries for each package version
-- **SoftwareTarget** entries for each architecture/platform combination
+- **SoftwareTarget** entries for architecture/platform combinations or build variants
 
-### 3. Associate Catalogs with Offerings
+> **Management commands vs daily task:** Management commands (`load_eessi_catalog`, `load_spack_catalog`) will create new catalog records if none exist. The daily automated task (`update_software_catalogs`) only updates existing catalog records — it never creates new ones. This prevents orphaned catalogs from being auto-created when no offering references them.
+
+## Automated Catalog Updates
+
+Waldur provides automated daily updates for software catalogs through Celery tasks.
+
+### Configuration Settings
+
+Configure automated updates through constance settings:
+
+#### EESSI Settings
+
+- `SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED`: Enable automated EESSI updates (default: **false**)
+- `SOFTWARE_CATALOG_EESSI_VERSION`: EESSI version to load (auto-detect if empty)
+- `SOFTWARE_CATALOG_EESSI_API_URL`: Base URL for EESSI API data
+- `SOFTWARE_CATALOG_EESSI_INCLUDE_EXTENSIONS`: Include Python/R extensions (default: true)
+
+#### Spack Settings
+
+- `SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED`: Enable automated Spack updates (default: **false**)
+- `SOFTWARE_CATALOG_SPACK_VERSION`: Spack version to load (auto-detect if empty)
+- `SOFTWARE_CATALOG_SPACK_DATA_URL`: URL for Spack repology.json data
+
+#### General Settings
+
+- `SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES`: Update existing packages during refresh (default: true)
+- `SOFTWARE_CATALOG_CLEANUP_ENABLED`: Enable automatic cleanup of old catalog data (default: false)
+- `SOFTWARE_CATALOG_RETENTION_DAYS`: Number of days to retain old catalog versions (default: 90)
+
+### Scheduled Updates
+
+The `update_software_catalogs` task runs daily at 3 AM and:
+
+1. **Updates only existing catalogs**: The task never creates new catalog records. If no catalog exists in the database for a given name/type, the task skips it with a warning. Create catalogs first via the API, management commands, or the `discover` endpoint to see what's available.
+2. **Independent Processing**: Each catalog is updated independently - failures don't affect other catalogs
+3. **Configuration Validation**: Validates settings before attempting updates
+4. **Error Isolation**: Individual catalog failures are logged but don't prevent other updates
+5. **Comprehensive Logging**: Detailed logging for monitoring and troubleshooting
+
+> **Note:** Both `SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED` and `SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED` default to `false`. Enable them explicitly after creating the initial catalog records.
+
+### Manual Trigger
+
+You can manually trigger catalog updates:
+
+```bash
+# Trigger all enabled catalog updates
+DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run waldur celery call marketplace.update_software_catalogs
+```
+
+## Associate Catalogs with Offerings
 
 Link the loaded software catalogs to your marketplace offerings:
 
@@ -70,11 +178,13 @@ curl -X POST "https://your-waldur.example.com/api/marketplace-provider-offerings
   }'
 ```
 
-## Understanding EESSI Architecture Targets
+## Understanding Software Catalog Targets
+
+### EESSI Architecture Targets
 
 EESSI provides software optimized for different CPU architectures and microarchitectures:
 
-### Common Targets
+#### Common CPU Targets
 
 - `x86_64/generic` - General x86_64 compatibility
 - `x86_64/intel/haswell` - Intel Haswell and newer
@@ -84,12 +194,43 @@ EESSI provides software optimized for different CPU architectures and microarchi
 - `aarch64/generic` - General ARM64 compatibility
 - `aarch64/neoverse_n1` - ARM Neoverse N1 cores
 
+#### EESSI Extension Support
+
+The new EESSI API format includes support for extension packages:
+
+- **Python packages**: NumPy, SciPy, TensorFlow, PyTorch, etc.
+- **R packages**: Bioconductor, CRAN packages
+- **Perl modules**: CPAN modules
+- **Ruby gems**: Scientific Ruby libraries
+- **Octave packages**: Signal processing, optimization
+
+Extensions are linked to their parent software packages via a many-to-many relationship. A single extension can belong to multiple parents (e.g., `adwaita-icon-theme` can be an extension of both GTK3 and GTK4). The EESSI loader collects parent information from all versions of an extension, not just the first.
+
+### Spack Build Variants
+
+Spack supports flexible build configurations through targets:
+
+#### Target Types
+
+- `build_variant/default` - Standard build configuration
+- `platform/windows` - Windows-compatible packages
+- `external/system` - System-provided packages (detectable)
+- `build_system/build-tool` - Build tools and compilers
+
+#### Spack Categories
+
+- `build-tools` - Compilers, build systems, make tools
+- `detectable` - Externally provided packages
+- `windows` - Windows compatibility
+- Custom categories based on package metadata
+
 ### Why Targets Matter
 
 1. **Performance**: Architecture-specific builds can be 20-50% faster
 2. **Compatibility**: Ensures software runs on target hardware
 3. **Instruction Sets**: Leverages specific CPU features (AVX, NEON, etc.)
 4. **HPC Requirements**: Critical for scientific computing workloads
+5. **Build Flexibility**: Spack provides multiple build configurations
 
 ## Available API Endpoints
 
@@ -99,6 +240,75 @@ The software catalog system provides the following API endpoints:
 - **marketplace-software-packages**: Browse software packages within catalogs
 - **marketplace-software-versions**: View software versions for packages
 - **marketplace-software-targets**: View architecture-specific installations
+
+### Discover Available Catalog Versions
+
+Staff users can check what catalog versions are available upstream without creating anything:
+
+```bash
+curl "https://your-waldur.example.com/api/marketplace-software-catalogs/discover/" \
+  -H "Authorization: Token your-token"
+```
+
+Example response:
+
+```json
+[
+  {
+    "name": "EESSI",
+    "catalog_type": "binary_runtime",
+    "latest_version": "2025.06",
+    "existing": true,
+    "existing_version": "2024.01",
+    "update_available": true
+  },
+  {
+    "name": "Spack",
+    "catalog_type": "source_package",
+    "latest_version": "2026.01.15",
+    "existing": false,
+    "existing_version": null,
+    "update_available": false
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Catalog name (EESSI or Spack) |
+| `catalog_type` | string | Catalog type identifier |
+| `latest_version` | string or null | Detected upstream version, null if detection failed |
+| `existing` | boolean | Whether a catalog record exists in the database |
+| `existing_version` | string or null | Version of the existing catalog record |
+| `update_available` | boolean | True when upstream version differs from existing |
+
+This endpoint makes lightweight HTTP calls to the upstream sources (EESSI API, Spack repology) to detect the latest version. It does not download package data or modify the database. Requires staff permissions.
+
+### CPU targets for an offering
+
+`GET /api/marketplace-software-catalogs/{uuid}/cpu_targets/` returns the CPU choices for **that catalog's version**. It reads `metadata.architectures_map` and does not scan package targets.
+
+Use the response when linking a catalog to an offering. Store `cpu_family` in `enabled_cpu_family` and `cpu_microarchitecture` in `enabled_cpu_microarchitectures`. The microarchitecture value is `SoftwareTarget.target_subtype` (for example `intel/sapphirerapids`, `amd/zen3`, `generic`), which is also the `cpu_microarchitecture` list filter.
+
+`full_arch` is the hardware path from the map (for example `x86_64/intel/graniterapids`). When a map value points at a different build, `cpu_microarchitecture` follows that build so package filters still match imported targets.
+
+Catalogs without an architectures map, including Spack, return `[]`. The same empty list is returned when `catalog.version` is not a key in `architectures_map`.
+
+`supports_cpu_target_restrictions` on the catalog (list, retrieve, and the nested catalog inside an offering) is `true` only for `binary_runtime`. Spack (`source_package`) is `false`. Use that flag to show or hide the CPU fields. An empty `cpu_targets` list on a catalog where the flag is `true` means this version has no map entries, not that CPU restrictions do not apply.
+
+```bash
+curl "https://your-waldur.example.com/api/marketplace-software-catalogs/<catalog_uuid>/cpu_targets/"
+```
+
+```json
+[
+  {
+    "cpu_family": "x86_64",
+    "cpu_microarchitecture": "intel/sapphirerapids",
+    "full_arch": "x86_64/intel/sapphirerapids"
+  }
+]
+```
 
 ### Software Catalog Management Actions
 
@@ -156,6 +366,15 @@ curl "https://your-waldur.example.com/api/marketplace-software-packages/?query=c
 # Filter by offering and catalog version
 curl "https://your-waldur.example.com/api/marketplace-software-packages/?offering_uuid=def-456&catalog_version=2023.06"
 
+# Filter by extension type (e.g., packages with Python extensions)
+curl "https://your-waldur.example.com/api/marketplace-software-packages/?extension_type=python"
+
+# Filter by extension name (e.g., packages bundling numpy)
+curl "https://your-waldur.example.com/api/marketplace-software-packages/?extension_name=numpy"
+
+# Filter extensions by parent package UUID
+curl "https://your-waldur.example.com/api/marketplace-software-packages/?parent_software_uuid=parent-uuid"
+
 # Order by catalog version
 curl "https://your-waldur.example.com/api/marketplace-software-packages/?o=catalog_version"
 ```
@@ -181,7 +400,7 @@ Example response:
 
 ### Package Detail with Nested Versions and Targets
 
-When viewing package details, the response includes nested versions with their targets:
+When viewing package details, the response includes nested versions with their targets and EESSI-specific metadata:
 
 ```bash
 # Get package detail with nested versions and targets
@@ -193,49 +412,74 @@ Example detailed response:
 ```json
 {
   "uuid": "package-uuid",
-  "name": "SampleApp",
-  "description": "Scientific computing application...",
-  "homepage": "https://example.com/sampleapp",
+  "name": "GROMACS",
+  "description": "Molecular dynamics simulation package...",
+  "homepage": "https://www.gromacs.org/",
   "catalog": "abc-123-def-456",
+  "is_extension": false,
+  "parent_softwares": [],
   "version_count": 2,
+  "extension_count": 0,
   "versions": [
     {
       "uuid": "version-uuid-1",
-      "version": "1.2.0",
-      "release_date": "2023-06-15",
-      "metadata": {},
+      "version": "2024.4",
+      "release_date": "2024-01-15",
+      "module": {
+        "full_module_name": "GROMACS/2024.4-foss-2023b",
+        "module_name": "GROMACS",
+        "module_version": "2024.4-foss-2023b"
+      },
+      "required_modules": [
+        {
+          "full_module_name": "EESSI/2023.06",
+          "module_name": "EESSI",
+          "module_version": "2023.06"
+        },
+        {
+          "full_module_name": "GCCcore/13.2.0",
+          "module_name": "GCCcore",
+          "module_version": "13.2.0"
+        }
+      ],
+      "extensions": [
+        {"type": "python", "name": "gmxapi", "version": "0.4.2"}
+      ],
+      "toolchain": {"name": "foss", "version": "2023b"},
+      "toolchain_families_compatibility": ["2023b_foss"],
       "targets": [
         {
           "uuid": "target-uuid-1",
-          "cpu_family": "x86_64",
-          "cpu_microarchitecture": "generic",
-          "path": "/cvmfs/software.eessi.io/versions/2023.06/software/linux/x86_64/generic"
+          "target_type": "cpu_architecture",
+          "target_name": "x86_64",
+          "target_subtype": "generic",
+          "location": "/cvmfs/software.eessi.io/versions/2023.06/software/linux/x86_64/generic",
+          "gpu_architectures": ["nvidia/cc70", "nvidia/cc80", "nvidia/cc90"]
         },
         {
           "uuid": "target-uuid-2",
-          "cpu_family": "aarch64",
-          "cpu_microarchitecture": "generic",
-          "path": "/cvmfs/software.eessi.io/versions/2023.06/software/linux/aarch64/generic"
-        }
-      ]
-    },
-    {
-      "uuid": "version-uuid-2",
-      "version": "1.3.0",
-      "release_date": "2023-08-20",
-      "metadata": {},
-      "targets": [
-        {
-          "uuid": "target-uuid-3",
-          "cpu_family": "x86_64",
-          "cpu_microarchitecture": "generic",
-          "path": "/cvmfs/software.eessi.io/versions/2023.06/software/linux/x86_64/generic"
+          "target_type": "cpu_architecture",
+          "target_name": "aarch64",
+          "target_subtype": "generic",
+          "location": "/cvmfs/software.eessi.io/versions/2023.06/software/linux/aarch64/generic",
+          "gpu_architectures": []
         }
       ]
     }
   ]
 }
 ```
+
+#### Version Response Fields (EESSI)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `module` | object | Structured module information with `full_module_name`, `module_name`, `module_version` |
+| `required_modules` | array | List of required module objects with structured info |
+| `extensions` | array | Bundled extensions (e.g., Python packages) with `type`, `name`, `version` |
+| `toolchain` | object | Toolchain info with `name` and `version` |
+| `toolchain_families_compatibility` | array | List of compatible toolchain families |
+| `targets` | array | Available architecture targets |
 
 ### Browse Software Versions
 
@@ -258,7 +502,76 @@ curl "https://your-waldur.example.com/api/marketplace-software-targets/?cpu_fami
 
 # Filter by CPU microarchitecture
 curl "https://your-waldur.example.com/api/marketplace-software-targets/?cpu_microarchitecture=generic"
+
+# Repeat a CPU filter to match any of several values
+curl "https://your-waldur.example.com/api/marketplace-software-targets/?cpu_microarchitecture=amd/zen3&cpu_microarchitecture=intel/sapphirerapids"
 ```
+
+`cpu_family` and `cpu_microarchitecture` take several values on the package, version and target lists; a row matches if it has a target for any of them.
+
+### GPU Architecture Filtering
+
+Software targets include a `gpu_architectures` field — a flat list of GPU architectures the target supports (e.g., `["nvidia/cc70", "nvidia/cc80", "nvidia/cc90"]`). This field is extracted from the nested `metadata["gpu_arch"]` structure for efficient filtering.
+
+#### Filter Packages by GPU Support
+
+```bash
+# Find packages with GPU-enabled builds
+curl "https://your-waldur.example.com/api/marketplace-software-packages/?has_gpu=true"
+
+# Find packages without GPU support
+curl "https://your-waldur.example.com/api/marketplace-software-packages/?has_gpu=false"
+
+# Find packages supporting a specific GPU architecture
+curl "https://your-waldur.example.com/api/marketplace-software-packages/?gpu_arch=nvidia/cc90"
+```
+
+#### Filter Versions by GPU Support
+
+```bash
+# Find versions with GPU-enabled builds
+curl "https://your-waldur.example.com/api/marketplace-software-versions/?has_gpu=true"
+
+# Find versions for a specific GPU architecture
+curl "https://your-waldur.example.com/api/marketplace-software-versions/?gpu_arch=nvidia/cc70"
+```
+
+#### Filter Targets by GPU Support
+
+```bash
+# Find targets with GPU architectures
+curl "https://your-waldur.example.com/api/marketplace-software-targets/?has_gpu=true"
+
+# Find targets supporting a specific GPU architecture
+curl "https://your-waldur.example.com/api/marketplace-software-targets/?gpu_arch=nvidia/cc80"
+```
+
+#### GPU Architecture in Responses
+
+Target responses include the `gpu_architectures` field:
+
+```json
+{
+  "uuid": "target-uuid",
+  "target_type": "cpu_architecture",
+  "target_name": "x86_64",
+  "target_subtype": "generic",
+  "location": "/cvmfs/software.eessi.io/versions/2023.06/software/linux/x86_64/generic",
+  "gpu_architectures": ["nvidia/cc70", "nvidia/cc80", "nvidia/cc90"],
+  "metadata": {
+    "full_arch": "x86_64/generic",
+    "gpu_arch": {
+      "x86_64/generic": ["nvidia/cc70", "nvidia/cc80", "nvidia/cc90"]
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `gpu_architectures` | array of strings | Flat list of supported GPU architectures (e.g., `nvidia/cc70`, `amd/gfx90a`) |
+| `has_gpu` | boolean filter | Filter by presence/absence of GPU support |
+| `gpu_arch` | string filter | Filter by specific GPU architecture string |
 
 ## Linking Catalogs to Offerings
 
@@ -288,7 +601,7 @@ curl -X PATCH "https://your-waldur.example.com/api/marketplace-provider-offering
   -d '{
     "offering_catalog_uuid": "offering-catalog-uuid",
     "enabled_cpu_family": ["x86_64", "aarch64"],
-    "enabled_cpu_microarchitectures": ["generic", "zen3"]
+    "enabled_cpu_microarchitectures": ["generic", "amd/zen3"]
   }'
 ```
 
@@ -313,26 +626,41 @@ curl "https://your-waldur.example.com/api/marketplace-provider-offerings/{offeri
 # Get software packages available for an offering
 curl "https://your-waldur.example.com/api/marketplace-software-packages/?offering_uuid=offering-uuid"
 
-## Command Options
+## Catalog Management Commands
 
-The `load_eessi_catalog` command supports several options:
+### Available Commands
 
-- `--json-file`: Path to EESSI JSON file (default: eessi.model.json)
-- `--catalog-name`: Name of the software catalog (default: EESSI)
-- `--catalog-version`: EESSI catalog version (auto-detected from JSON if not provided)
-- `--dry-run`: Show what would be done without making changes
-- `--update-existing`: Update existing catalog data if it exists
-- `--no-sync`: Disable synchronization (default: sync enabled to remove missing records)
+The software catalog system provides management commands for different catalog types:
 
-### Synchronization Behavior
+- **load_eessi_catalog**: Load EESSI catalogs using the new API format
+- **load_spack_catalog**: Load Spack catalogs from repology.json format
 
-By default, the command synchronizes the database with the JSON file:
+### Common Command Features
 
-- **Adds** new packages, versions, and targets from the JSON
-- **Removes** packages, versions, and targets not present in the JSON
-- **Preserves** existing records that match the JSON data
+All catalog loading commands support:
 
-Use `--no-sync` to disable removal of missing records and only add new data.
+- `--dry-run`: Preview changes without modifying the database
+- `--update-existing`: Update existing packages and versions
+- Automatic version detection from source data
+- Comprehensive error handling and logging
+- Statistics reporting on created/updated records
+
+### Data Loading Process
+
+The unified catalog loader framework follows this process:
+
+1. **Validation**: Verify command arguments and connectivity
+2. **Fetch**: Download catalog data from remote sources
+3. **Transform**: Convert source format to unified data models
+4. **Load**: Create or update database records
+5. **Report**: Provide statistics and completion status
+
+Both loaders handle:
+
+- **Extension packages**: Link child packages to one or more parent software packages
+- **Multiple architectures**: Support diverse target platforms
+- **Metadata preservation**: Store catalog-specific information
+- **Error recovery**: Continue processing despite individual failures
 
 ## Permissions
 
@@ -342,123 +670,174 @@ Use `--no-sync` to disable removal of missing records and only add new data.
 - **SoftwarePackage**: Only staff can manage package information
 - **SoftwareVersion**: Only staff can manage version data
 - **SoftwareTarget**: Only staff can manage target information
+- **Discover endpoint**: Only staff can query upstream sources for available versions
 
 ### Offering Integration (Offering Managers)
 
 - **OfferingSoftwareCatalog**: Offering managers can associate catalogs with their offerings through offering actions (`add_software_catalog`, `update_software_catalog`, `remove_software_catalog`)
 
-## EESSI Integration Details
+## Integration Details
 
-### EESSI Data Structure
+### EESSI API Format
 
-EESSI provides software in a structured format:
+The EESSI loader uses the dict-based format from [EESSI API PR #11](https://github.com/EESSI/api_data/pull/11) with structured objects for `module` and `required_modules`:
+
+```json
+{
+  "timestamp": "2026-01-27T10:00:00Z",
+  "architectures_map": {
+    "2023.06": ["x86_64/generic", "aarch64/generic", "x86_64/zen3"]
+  },
+  "software": {
+    "GROMACS": {
+      "description": "Molecular dynamics simulation package",
+      "homepage": "https://www.gromacs.org/",
+      "categories": ["chem"],
+      "versions": [
+        {
+          "version": "2024.4",
+          "cpu_arch": ["x86_64/generic", "aarch64/generic"],
+          "gpu_arch": {
+            "x86_64/generic": ["nvidia/cc70", "nvidia/cc80", "nvidia/cc90"]
+          },
+          "toolchain": {"name": "foss", "version": "2023b"},
+          "toolchain_families_compatibility": ["2023b_foss"],
+          "module": {
+            "full_module_name": "GROMACS/2024.4-foss-2023b",
+            "module_name": "GROMACS",
+            "module_version": "2024.4-foss-2023b"
+          },
+          "required_modules": [
+            {
+              "full_module_name": "EESSI/2023.06",
+              "module_name": "EESSI",
+              "module_version": "2023.06"
+            },
+            {
+              "full_module_name": "GCCcore/13.2.0",
+              "module_name": "GCCcore",
+              "module_version": "13.2.0"
+            }
+          ],
+          "extensions": [
+            {"type": "python", "name": "gmxapi", "version": "0.4.2"}
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+#### Key Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `module` | object | Structured module info: `full_module_name`, `module_name`, `module_version` |
+| `required_modules` | array of objects | Each with `full_module_name`, `module_name`, `module_version` |
+| `gpu_arch` | object | Map of CPU arch to GPU arch lists (e.g., `{"x86_64/generic": ["nvidia/cc70"]}`) |
+| `extensions` | array | Bundled packages with `type`, `name`, `version` |
+| `toolchain_families_compatibility` | array | Compatible toolchain families (e.g., `"2023b_foss"`) |
+
+#### Extension Structure
+
+In the EESSI API, each version of an extension references its parent software. The loader collects parent references from **all** versions, so an extension that references different parents across versions will be linked to all of them via the `parent_softwares` many-to-many relationship.
+
+```json
+{
+  "timestamp": "2026-01-27T10:00:00Z",
+  "software": {
+    "numpy": {
+      "description": "Fundamental package for array computing with Python",
+      "homepage": "https://numpy.org/",
+      "categories": ["math", "lib"],
+      "versions": [
+        {
+          "version": "1.26.0",
+          "cpu_arch": ["x86_64/generic"],
+          "parent_software": {"name": "SciPy-bundle", "version": "2023.11"},
+          "module": {
+            "full_module_name": "SciPy-bundle/2023.11-gfbf-2023b",
+            "module_name": "SciPy-bundle",
+            "module_version": "2023.11-gfbf-2023b"
+          },
+          "required_modules": [
+            {
+              "full_module_name": "EESSI/2023.06",
+              "module_name": "EESSI",
+              "module_version": "2023.06"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+The Waldur API response for extension packages includes a list of parent software objects:
+
+```json
+{
+  "uuid": "extension-uuid",
+  "name": "numpy",
+  "is_extension": true,
+  "parent_softwares": [
+    {"uuid": "parent-uuid-1", "name": "SciPy-bundle", "url": "https://..."},
+    {"uuid": "parent-uuid-2", "name": "Python", "url": "https://..."}
+  ]
+}
+```
+
+### Spack Repology Format
+
+Spack uses the repology.json format from packages.spack.io:
 
 ```json
 
 {
-  "targets": [
-    "/cvmfs/software.eessi.io/versions/2023.06/software/linux/x86_64/generic",
-    "/cvmfs/software.eessi.io/versions/2023.06/software/linux/aarch64/generic"
-  ],
-  "software": {
-    "Python": {
-      "description": "Python is a programming language...",
-      "homepage": "https://www.python.org/",
-      "versions": {
-        "3.9.6": {
-          "versionsuffix": "",
-          "toolchain": "GCCcore/11.2.0"
+  "last_update": "2024-12-02 10:00:00",
+  "num_packages": 8000,
+  "packages": {
+    "cmake": {
+      "summary": "A cross-platform, open-source build system",
+      "homepages": ["https://cmake.org"],
+      "categories": ["build-tools"],
+      "licenses": ["BSD-3-Clause"],
+      "maintainers": ["kitware-spack"],
+      "version": [
+        {
+          "version": "3.28.1",
+          "downloads": ["https://github.com/Kitware/CMake/releases/download/v3.28.1/cmake-3.28.1.tar.gz"]
         }
-      }
+      ],
+      "dependencies": ["openssl", "ncurses"]
     }
   }
 }
 
 ```
 
-## Offering Partitions
+### Catalog Metadata Comparison
 
-**Note**: The partition management APIs referenced in this section are documented but the actual implementation may vary. The OfferingPartition model exists in the codebase but may not have corresponding ViewSets exposed via API endpoints. Please verify the current API availability.
+| Feature | EESSI | Spack |
+|---------|-------|-------|
+| **Format** | New API (JSON) | Repology (JSON) |
+| **Type** | Binary runtime | Source packages |
+| **Architecture Support** | CPU-specific builds | Build variants |
+| **Extensions** | Python, R, Perl, etc. | Dependencies only |
+| **Toolchain Info** | Full toolchain details | Build dependencies |
+| **Installation Paths** | CVMFS paths | Download URLs |
+| **Categories** | Scientific domains | Package types |
+| **Updates** | API timestamp | Git commit date |
 
-Offering partitions represent SLURM partitions associated with marketplace offerings. They define resource limits, scheduling policies, and access controls for different compute partitions.
+## SLURM Partitions and Software Catalogs
 
-### Partition Model Fields
+For detailed information about SLURM partition configuration and their integration with software catalogs, see the dedicated [Marketplace SLURM Partitions](marketplace-slurm-partitions.md) guide.
 
-The OfferingPartition model includes the following key fields for SLURM partition configuration:
-
-### Partition Parameters
-
-#### CPU Configuration
-
-- `cpu_bind`: Default task binding policy (SLURM cpu_bind)
-- `def_cpu_per_gpu`: Default CPUs allocated per GPU
-- `max_cpus_per_node`: Maximum allocated CPUs per node
-- `max_cpus_per_socket`: Maximum allocated CPUs per socket
-
-#### Memory Configuration (in MB)
-
-- `def_mem_per_cpu`: Default memory per CPU
-- `def_mem_per_gpu`: Default memory per GPU
-- `def_mem_per_node`: Default memory per node
-- `max_mem_per_cpu`: Maximum memory per CPU
-- `max_mem_per_node`: Maximum memory per node
-
-#### Time Limits
-
-- `default_time`: Default time limit in minutes
-- `max_time`: Maximum time limit in minutes
-- `grace_time`: Preemption grace time in seconds
-
-#### Node Configuration
-
-- `max_nodes`: Maximum nodes per job
-- `min_nodes`: Minimum nodes per job
-- `exclusive_topo`: Exclusive topology access required
-- `exclusive_user`: Exclusive user access required
-
-#### Scheduling Configuration
-
-- `priority_tier`: Priority tier for scheduling and preemption
-- `qos`: Quality of Service (QOS) name
-- `req_resv`: Require reservation for job allocation
-
-### Partition Software Catalog Associations
-
-Software catalogs can optionally be associated with specific partitions through the `partition` field in OfferingSoftwareCatalog:
-
-```bash
-
-# Add software catalog to specific partition
-curl -X POST "https://your-waldur.example.com/api/marketplace-provider-offerings/{offering_uuid}/add_software_catalog/" \
-  -H "Authorization: Token your-token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "catalog": "catalog-uuid",
-    "enabled_cpu_family": ["x86_64"],
-    "enabled_cpu_microarchitectures": ["generic"],
-    "partition": "partition-uuid"
-  }'
-
-```
-
-### API Examples
-
-```bash
-
-# Add software catalog to offering with updated field names
-curl -X POST "https://your-waldur.example.com/api/marketplace-provider-offerings/{offering_uuid}/add_software_catalog/" \
-  -H "Authorization: Token your-token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "catalog": "catalog-uuid",
-    "enabled_cpu_family": ["x86_64", "aarch64"],
-    "enabled_cpu_microarchitectures": ["generic", "zen3", "neoverse_n1"]
-  }'
-
-# Filter software targets by CPU family
-curl "https://your-waldur.example.com/api/marketplace-software-targets/?cpu_family=x86_64"
-
-# Filter by CPU microarchitecture
-curl "https://your-waldur.example.com/api/marketplace-software-targets/?cpu_microarchitecture=zen3"
-
-```
+This includes:
+- SLURM partition model configuration
+- Partition management APIs (add, update, remove)
+- Partition-specific software catalog associations
+- CPU/GPU architecture targeting for different partitions
+- Connecting software GPU requirements to partition capabilities

@@ -1,0 +1,104 @@
+# Run the test suite in Docker, without installing Python or PostgreSQL locally.
+#
+#   docker compose -f docker-compose.test.yml run --rm test
+#
+# Pass pytest arguments after the service name:
+#
+#   docker compose -f docker-compose.test.yml run --rm test \
+#     src/waldur_openportal src/waldur_core/structure -q
+#
+# The first run builds the test database, which takes ~15 minutes for the
+# 700-odd migrations. Keep it for subsequent runs with --reuse-db (the default
+# below); the database lives in the test-db-data volume. To start clean:
+#
+#   docker compose -f docker-compose.test.yml down -v
+#
+# WHY THIS EXISTS RATHER THAN REUSING THE DEPLOYMENT IMAGE
+#
+# The production image cannot run the suite. Dockerfile deletes every "tests"
+# directory during the build, and test_settings adds waldur_core.quotas.tests,
+# waldur_core.structure.tests and waldur_pid.tests to INSTALLED_APPS, so Django
+# will not even start against the image as built. The dev dependency group is
+# installed though (docker_build.sh runs a plain "uv sync"), so pytest itself
+# is present: mounting the source tree over /usr/src/waldur restores the tests
+# and everything works.
+#
+# Mounting over /usr/src/waldur also hides the settings.py that the image
+# generates from /etc/waldur/settings.py at build time. That is harmless here:
+# the test settings chain imports base_settings, never server.settings.
+#
+# THE IMAGE MUST MATCH THE CHECKOUT
+#
+# The code under test comes from the mounted working tree, but the installed
+# Python dependencies come from the image. An image built before this branch
+# has the wrong ones - the resync moved openportal from 0.32 to 0.92 and
+# rewrote 1400-odd lines of uv.lock - and the resulting failures look like
+# unrelated import errors rather than a stale image.
+#
+# The entrypoint checks this and stops with a clear message. Either rebuild the
+# image from this checkout, or set WALDUR_TEST_SYNC_DEPS=1 to install the
+# locked dependencies into the container at startup instead:
+#
+#   WALDUR_TEST_SYNC_DEPS=1 docker compose -f docker-compose.test.yml run --rm test
+#
+# THIS NEVER TOUCHES A REAL DEPLOYMENT
+#
+# The suite gets its own throwaway PostgreSQL on an isolated network, so it
+# cannot reach the database of a running deployment. Point it at another server
+# with WALDUR_TEST_DB_HOST if you must, but note pytest-django would then
+# create and drop a test_* database on it.
+
+services:
+  test-db:
+    image: '${DOCKER_REGISTRY_PREFIX:-}library/postgres:${WALDUR_POSTGRES_IMAGE_TAG:-16}'
+    environment:
+      - POSTGRES_USER=waldur
+      - POSTGRES_PASSWORD=waldur
+      - POSTGRES_DB=waldur
+    # Durability is pointless for a database that is thrown away, and turning
+    # it off makes the migration build substantially faster.
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - max_connections=200
+    volumes:
+      - test-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U waldur"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  test:
+    image: '${DOCKER_LOCAL_REGISTRY_PREFIX:-}waldur-mastermind:${WALDUR_MASTERMIND_IMAGE_TAG:-latest}'
+    # root so pytest can write .pytest_cache and coverage data into the
+    # mounted source tree, which on Linux is owned by the host user.
+    user: root
+    working_dir: /usr/src/waldur
+    volumes:
+      - .:/usr/src/waldur
+    environment:
+      - DJANGO_SETTINGS_MODULE=waldur_core.server.my_test_settings
+      - WALDUR_TEST_DB_HOST=test-db
+      - WALDUR_TEST_DB_PORT=5432
+      - WALDUR_TEST_DB_NAME=waldur
+      - WALDUR_TEST_DB_USER=waldur
+      - WALDUR_TEST_DB_PASSWORD=waldur
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      test-db:
+        condition: service_healthy
+    # Bypass the deployment entrypoint, which expects to start a service. The
+    # test entrypoint checks that the image's installed dependencies match this
+    # checkout before running anything - see the script for why that matters.
+    entrypoint: ["/usr/src/waldur/scripts/docker-test-entrypoint.sh"]
+    command: ["src/", "--reuse-db", "-q"]
+
+volumes:
+  test-db-data:

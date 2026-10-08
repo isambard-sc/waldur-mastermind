@@ -4,6 +4,7 @@ from django.conf.urls import include
 from django.contrib import admin
 from django.urls import path, re_path
 
+from waldur_core.changelog import views as changelog_views
 from waldur_core.checklist import urls as checklist_urls
 from waldur_core.core import WaldurExtension
 from waldur_core.core import views as core_views
@@ -12,6 +13,7 @@ from waldur_core.core.nested_routers import NestedSimpleRouter
 from waldur_core.core.routers import SortedDefaultRouter as DefaultRouter
 from waldur_core.logging import urls as logging_urls
 from waldur_core.onboarding import urls as onboarding_urls
+from waldur_core.passkeys import urls as passkeys_urls
 from waldur_core.permissions import urls as permissions_urls
 from waldur_core.structure import urls as structure_urls
 from waldur_core.structure.views import (
@@ -22,7 +24,9 @@ from waldur_core.structure.views import (
     CustomerUsersViewSet,
     ProjectOtherUsersViewSet,
 )
+from waldur_core.user_actions import urls as user_actions_urls
 from waldur_core.users import urls as users_urls
+from waldur_core.web_shell import views as web_shell_views
 from waldur_mastermind.marketplace.views import (
     ServiceProviderComplianceViewSet,
     ServiceProviderCourseAccountsViewSet,
@@ -36,19 +40,31 @@ from waldur_mastermind.marketplace.views import (
     ServiceProviderUserCustomersViewSet,
     ServiceProviderUsersViewSet,
 )
+from waldur_mastermind.proposal.views import (
+    ReviewerProfileAffiliationViewSet,
+    ReviewerProfileExpertiseViewSet,
+    ReviewerProfilePublicationViewSet,
+)
 
 router = DefaultRouter()
 logging_urls.register_in(router)
 onboarding_urls.register_in(router)
 permissions_urls.register_in(router)
+passkeys_urls.register_in(router)
 structure_urls.register_in(router)
 users_urls.register_in(router)
+user_actions_urls.register_in(router)
 checklist_urls.register_in(router)
 
 urlpatterns = [
     re_path(r"^admin/", admin.site.urls),
-    re_path(r"^admintools/", include("admin_tools.urls")),
     re_path(r"^health-check/", include("health_check.urls")),
+    # Stats endpoints (consolidated under /api/stats/)
+    re_path(r"^api/stats/celery/", core_views.CeleryStatsViewSet.as_view()),
+    re_path(r"^api/stats/database/", core_views.DatabaseStatsViewSet.as_view()),
+    re_path(r"^api/stats/query/", core_views.QueryViewSet.as_view()),
+    re_path(r"^api/stats/table-growth/", core_views.TableGrowthStatsViewSet.as_view()),
+    # Legacy endpoints (deprecated - use /api/stats/* instead)
     re_path(r"^api/celery-stats/", core_views.CeleryStatsViewSet.as_view()),
     re_path(r"^api/database-stats/", core_views.DatabaseStatsViewSet.as_view()),
     re_path(r"^api/query/", core_views.QueryViewSet.as_view()),
@@ -60,6 +76,13 @@ if settings.WALDUR_CORE.get("EXTENSIONS_AUTOREGISTER"):
         if ext.django_app() in settings.INSTALLED_APPS:
             urlpatterns += ext.django_urls()
             ext.rest_urls()(router)
+
+# Mounted after the extensions: its catch-all answers every unknown /scim/v2/
+# path with a SCIM 404, which would otherwise shadow extension mounts such as
+# /scim/v2/sram/.
+urlpatterns += [
+    re_path(r"^scim/v2/", include("waldur_core.users.scim.server.urls")),
+]
 
 service_provider_router = NestedSimpleRouter(
     router, r"marketplace-service-providers", lookup="service_provider"
@@ -152,22 +175,69 @@ project_router.register(
     basename="project-other-users",
 )
 
+reviewer_profile_router = NestedSimpleRouter(
+    router, r"reviewer-profiles", lookup="reviewer_profile"
+)
+reviewer_profile_router.register(
+    r"affiliations",
+    ReviewerProfileAffiliationViewSet,
+    basename="reviewer-profile-affiliations",
+)
+reviewer_profile_router.register(
+    r"expertise",
+    ReviewerProfileExpertiseViewSet,
+    basename="reviewer-profile-expertise",
+)
+reviewer_profile_router.register(
+    r"publications",
+    ReviewerProfilePublicationViewSet,
+    basename="reviewer-profile-publications",
+)
+
 
 urlpatterns += [
     re_path(r"^api/", include(router.urls)),
     re_path(r"^api/", include(service_provider_router.urls)),
     re_path(r"^api/", include(customer_router.urls)),
     re_path(r"^api/", include(project_router.urls)),
+    re_path(r"^api/", include(reviewer_profile_router.urls)),
     re_path(r"^api/", include("waldur_core.logging.urls")),
     re_path(r"^api/", include("waldur_core.media.urls")),
     re_path(r"^api/", include("waldur_core.structure.urls")),
     re_path(r"^api/", include("waldur_core.checklist.urls")),
+    re_path(r"^api/", include("waldur_core.user_actions.urls")),
+    *passkeys_urls.urlpatterns,
     re_path(r"^api/", include(onboarding_urls)),
 ]
 
 
 urlpatterns += [
+    re_path(r"^api/changelog-entries/$", changelog_views.changelog_entries_list),
+    re_path(
+        r"^api/changelog-upgrade-report/$",
+        changelog_views.changelog_upgrade_report,
+    ),
+    re_path(r"^api/changelog/pending/$", changelog_views.changelog_pending),
+    # Before the ^api/changelog/<version>/$ route, which would take "releases"
+    # for a version.
+    re_path(r"^api/changelog/releases/$", changelog_views.changelog_releases),
+    re_path(
+        r"^api/changelog/compare/(?P<from_version>[^/]+)/(?P<to_version>[^/]+)/$",
+        changelog_views.changelog_compare,
+    ),
+    re_path(
+        r"^api/changelog/(?P<version>[^/]+)/delta/$",
+        changelog_views.changelog_delta,
+    ),
+    re_path(
+        r"^api/changelog/(?P<version>[^/]+)/$",
+        changelog_views.changelog_detail,
+    ),
+]
+
+urlpatterns += [
     re_path(r"^api/configuration/", core_views.configuration_detail),
+    re_path(r"^api/web-shell-ticket/", web_shell_views.web_shell_ticket),
     re_path(r"^api/override-settings/", core_views.override_db_settings),
     re_path(r"^api/version/", core_views.version_detail),
     re_path(r"^api/feature-values/", core_views.feature_values),
@@ -179,6 +249,11 @@ urlpatterns += [
         r"^api-auth/password/",
         core_views.ObtainAuthToken.as_view(),
         name="auth-password",
+    ),
+    re_path(
+        r"^api-auth/token-exchange/",
+        core_views.TokenExchangeView.as_view(),
+        name="auth-token-exchange",
     ),
     re_path(r"^api-auth/logout/", core_views.LogoutView.as_view(), name="auth-logout"),
     re_path(

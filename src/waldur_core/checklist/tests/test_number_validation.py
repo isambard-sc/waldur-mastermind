@@ -9,7 +9,7 @@ from waldur_core.structure.tests import fixtures as structure_fixtures
 
 
 @ddt
-class NumberValidationModelTest(test.APITransactionTestCase):
+class NumberValidationModelTest(test.APITestCase):
     """Test the model-level number validation functionality."""
 
     def setUp(self):
@@ -29,9 +29,9 @@ class NumberValidationModelTest(test.APITransactionTestCase):
         self.assertTrue(question.is_valid_answer(42.5))
         self.assertTrue(question.is_valid_answer(-100))
         self.assertTrue(question.is_valid_answer(0))
-        # Note: String numbers not accepted per current validation logic
-        self.assertFalse(question.is_valid_answer("42"))
-        self.assertFalse(question.is_valid_answer("42.5"))
+        # Note: String numbers are accepted per current validation logic
+        self.assertTrue(question.is_valid_answer("42"))
+        self.assertTrue(question.is_valid_answer("42.5"))
 
     def test_number_question_with_min_value_validation(self):
         """Test that NUMBER questions respect min_value constraint."""
@@ -54,7 +54,7 @@ class NumberValidationModelTest(test.APITransactionTestCase):
         self.assertFalse(question.is_valid_answer(-5))
 
         # String values not accepted per current validation logic
-        self.assertFalse(question.is_valid_answer("12"))
+        self.assertTrue(question.is_valid_answer("12"))
         self.assertFalse(question.is_valid_answer("5"))
 
     def test_number_question_with_max_value_validation(self):
@@ -77,8 +77,8 @@ class NumberValidationModelTest(test.APITransactionTestCase):
         self.assertFalse(question.is_valid_answer(100.1))
         self.assertFalse(question.is_valid_answer(1000))
 
-        # String values not accepted per current validation logic
-        self.assertFalse(question.is_valid_answer("99"))
+        # String values
+        self.assertTrue(question.is_valid_answer("99"))
         self.assertFalse(question.is_valid_answer("150"))
 
     def test_number_question_with_both_min_max_validation(self):
@@ -101,8 +101,7 @@ class NumberValidationModelTest(test.APITransactionTestCase):
         self.assertFalse(question.is_valid_answer(51))
         self.assertFalse(question.is_valid_answer(9.99))
 
-        # String values not accepted per current validation logic
-        self.assertFalse(question.is_valid_answer("30"))
+        self.assertTrue(question.is_valid_answer("30"))
         self.assertFalse(question.is_valid_answer("5"))
         self.assertFalse(question.is_valid_answer("60"))
 
@@ -124,8 +123,7 @@ class NumberValidationModelTest(test.APITransactionTestCase):
         self.assertFalse(question.is_valid_answer(10.49))
         self.assertFalse(question.is_valid_answer(20.76))
 
-        # String values not accepted per current validation logic
-        self.assertFalse(question.is_valid_answer("12.3"))
+        self.assertTrue(question.is_valid_answer("12.3"))
         self.assertFalse(question.is_valid_answer("10.4"))
 
     def test_invalid_number_formats_rejected(self):
@@ -192,7 +190,7 @@ class NumberValidationModelTest(test.APITransactionTestCase):
 
 
 @ddt
-class NumberValidationSerializerTest(test.APITransactionTestCase):
+class NumberValidationSerializerTest(test.APITestCase):
     """Test number validation via serializers and API."""
 
     def setUp(self):
@@ -292,8 +290,8 @@ class NumberValidationSerializerTest(test.APITransactionTestCase):
         )
 
     @data("staff")
-    def test_validation_min_max_only_for_number_questions(self, user):
-        """Test validation rejects min/max for non-NUMBER questions."""
+    def test_validation_min_max_only_for_numeric_questions(self, user):
+        """Test validation rejects min/max for non-numeric questions."""
         user_obj = getattr(self.fixture, user)
         self.client.force_authenticate(user_obj)
 
@@ -310,7 +308,7 @@ class NumberValidationSerializerTest(test.APITransactionTestCase):
         response = self.client.post(self.url, payload)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn(
-            "Min and max values can only be set for NUMBER type questions",
+            "Min and max values can only be set for NUMBER, YEAR, and RATING type questions",
             str(response.content),
         )
 
@@ -370,7 +368,7 @@ class NumberValidationSerializerTest(test.APITransactionTestCase):
 
 
 @ddt
-class NumberValidationAnswerSubmissionTest(test.APITransactionTestCase):
+class NumberValidationAnswerSubmissionTest(test.APITestCase):
     """Test number validation during answer submission."""
 
     def setUp(self):
@@ -462,7 +460,7 @@ class NumberValidationAnswerSubmissionTest(test.APITransactionTestCase):
 
 
 @ddt
-class NumberValidationIntegrationTest(test.APITransactionTestCase):
+class NumberValidationIntegrationTest(test.APITestCase):
     """Integration tests for number validation in real workflow scenarios."""
 
     def setUp(self):

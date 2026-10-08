@@ -3,9 +3,10 @@ from typing import TYPE_CHECKING, cast
 from urllib.parse import urlparse
 
 from django.core import validators
+from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from django.db import models
-from django.db.models import Q
+from django.db.models import F, OuterRef, Q, Subquery
 from django.template.defaultfilters import slugify
 from django.utils.translation import gettext_lazy as _
 from model_utils import FieldTracker
@@ -16,12 +17,14 @@ from waldur_core.core import exceptions as core_exceptions
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core.fields import JSONField
+from waldur_core.core.validators import validate_name
 from waldur_core.logging.mixins import LoggableMixin
 from waldur_core.quotas import models as quotas_models
 from waldur_core.quotas.fields import QuotaField
 from waldur_core.quotas.models import QuotaModelMixin
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import filter_queryset_for_user
+from waldur_openstack import enums
 
 if TYPE_CHECKING:
     from django.db.models.manager import RelatedManager
@@ -30,6 +33,17 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Octavia LBaaS choices (OVN supports TCP/UDP for protocol and health monitor type)
+PROTOCOL_CHOICES = [("TCP", "TCP"), ("UDP", "UDP")]
+LB_ALGORITHM_CHOICES = [
+    ("ROUND_ROBIN", "Round Robin"),
+    ("LEAST_CONNECTIONS", "Least Connections"),
+    ("SOURCE_IP", "Source IP"),
+    ("SOURCE_IP_PORT", "Source IP port"),
+]
+HEALTHMONITOR_TYPE_CHOICES = [("TCP", "TCP"), ("UDP", "UDP")]
+OVN_SUPPORTED_LB_ALGORITHMS = ["SOURCE_IP_PORT"]
 
 
 def build_tenants_query(user):
@@ -41,6 +55,8 @@ class Tenant(
     quotas_models.QuotaModelMixin,
     core_models.RuntimeStateMixin,
     structure_models.BaseResource,
+    core_models.AvailableMixin,
+    core_models.BackendMissingMixin,
 ):
     flavors: models.Manager["Flavor"]
     images: models.Manager["Image"]
@@ -49,6 +65,7 @@ class Tenant(
     security_groups: models.Manager["SecurityGroup"]
     floating_ips: models.Manager["FloatingIP"]
     routers: models.Manager["Router"]
+    load_balancers: models.Manager["LoadBalancer"]
     networks: models.Manager["Network"]
     ports: models.Manager["Port"]
     volume_availability_zones: models.Manager["VolumeAvailabilityZone"]
@@ -95,6 +112,14 @@ class Tenant(
         blank=True,
         help_text=_("ID of external network connected to OpenStack tenant"),
     )
+    external_network_ref = models.ForeignKey(
+        "ExternalNetwork",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="tenants",
+        help_text=_("External network connected to OpenStack tenant"),
+    )
 
     availability_zone = models.CharField(
         max_length=100,
@@ -119,10 +144,14 @@ class Tenant(
         null=True,
         help_text=_("Timestamp of when tenant update was last triggered"),
     )
+    skip_creation_of_default_router = models.BooleanField(
+        default=False,
+        help_text=_("If True, default router will not be created for this tenant"),
+    )
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         unique_together = ("service_settings", "backend_id")
 
     @classmethod
@@ -154,7 +183,15 @@ class Tenant(
 
         if settings.backend_url:
             parsed = urlparse(settings.backend_url)
-            return f"{parsed.scheme}://{parsed.hostname}/dashboard"
+            # Horizon runs on the host's default port, not on Keystone's own
+            # (a classic deployment has Keystone on :5000), so the port is
+            # left out. hostname also drops the brackets an IPv6 literal needs
+            # in a URL, so they are put back. hostname never includes
+            # credentials, so none can end up in this user-facing link.
+            host = parsed.hostname
+            if host and ":" in host:
+                host = f"[{host}]"
+            return f"{parsed.scheme}://{host}/dashboard"
 
     def format_quota(self, name, limit):
         if name == self.Quotas.vcpu.name:
@@ -217,25 +254,67 @@ class Flavor(structure_models.ServiceProperty):
         return self.settings.get_backend()
 
 
+class ImageManager(models.Manager):
+    def get_queryset(self):
+        base_qs = models.QuerySet(self.model, using=self._db)
+        latest_id = (
+            base_qs.filter(name=OuterRef("name"), settings=OuterRef("settings"))
+            .order_by(
+                F("backend_created_at").desc(nulls_last=True),
+                "-id",
+            )
+            .values("id")[:1]
+        )
+        return base_qs.filter(id=Subquery(latest_id))
+
+
 class Image(structure_models.ServiceProperty):
+    objects = ImageManager()
+    all_objects = models.Manager()
     min_disk = models.PositiveIntegerField(
         default=0, help_text=_("Minimum disk size in MiB")
     )
     min_ram = models.PositiveIntegerField(
         default=0, help_text=_("Minimum memory size in MiB")
     )
+    backend_created_at = models.DateTimeField(null=True, blank=True)
     tenants = models.ManyToManyField(to=Tenant, related_name="images")
+
+    # Glance custom properties used to identify "stable device rescue" images.
+    # An image with either property set may be used as a Nova rescue image;
+    # volume-backed instances *require* such a tagged image — the legacy
+    # rescue path does not support BFV instances and Nova will leave the
+    # instance in unrecoverable ERROR state without one.
+    hw_rescue_device = models.CharField(
+        max_length=20,
+        blank=True,
+        help_text=_("Glance hw_rescue_device property (cdrom/disk/floppy)."),
+    )
+    hw_rescue_bus = models.CharField(
+        max_length=20,
+        blank=True,
+        help_text=_("Glance hw_rescue_bus property (scsi/virtio/ide/usb)."),
+    )
 
     class Permissions:
         build_query = build_tenants_query
 
     @classmethod
     def get_backend_fields(cls):
-        return super().get_backend_fields() + ("min_disk", "min_ram")
+        return super().get_backend_fields() + (
+            "min_disk",
+            "min_ram",
+            "hw_rescue_device",
+            "hw_rescue_bus",
+        )
 
     @classmethod
     def get_url_name(cls):
         return "openstack-image"
+
+    @property
+    def is_rescue_image(self) -> bool:
+        return bool(self.hw_rescue_device or self.hw_rescue_bus)
 
 
 class VolumeType(core_models.DescribableMixin, structure_models.ServiceProperty):
@@ -256,10 +335,232 @@ class VolumeType(core_models.DescribableMixin, structure_models.ServiceProperty)
         return "openstack-volume-type"
 
 
+class ExternalNetwork(core_models.DescribableMixin, structure_models.ServiceProperty):
+    """Provider-level external network discovered from OpenStack."""
+
+    is_shared = models.BooleanField(default=False)
+    is_default = models.BooleanField(default=False)
+    status = models.CharField(max_length=30, blank=True)
+
+    class Meta:
+        unique_together = ("settings", "backend_id")
+
+    @classmethod
+    def get_url_name(cls):
+        return "openstack-external-network"
+
+    @classmethod
+    def get_backend_fields(cls):
+        return super().get_backend_fields() + (
+            "is_shared",
+            "is_default",
+            "status",
+            "description",
+        )
+
+    def get_backend(self):
+        return self.settings.get_backend()
+
+
+class Trait(core_models.UuidMixin, models.Model):
+    """OpenStack Placement trait — a capability flag on a resource provider.
+
+    Examples: HW_CPU_X86_AVX2, STORAGE_DISK_SSD, COMPUTE_ACCELERATORS,
+    HW_GPU_API_VULKAN, CUSTOM_*.
+
+    This is a global catalog keyed by ``name``: standard traits (the os-traits
+    catalog) mean the same thing on every cloud, so deduplicating them across
+    all ServiceSettings is correct. CUSTOM_* traits, however, are operator-
+    defined and are only guaranteed to be meaningful within a single source /
+    ServiceSettings — two unrelated clouds may both define CUSTOM_GOLD_TIER
+    with different semantics. Because hypervisor queries are normally scoped by
+    settings_uuid this is harmless in practice, but filtering hypervisors by a
+    CUSTOM_* trait WITHOUT scoping by settings is not semantically safe.
+    """
+
+    name = models.CharField(max_length=255, unique=True)
+
+    class Meta:
+        ordering = ("name",)
+
+    def __str__(self):
+        return self.name
+
+
+class Hypervisor(structure_models.ServiceProperty):
+    """OpenStack hypervisor node pulled from Nova admin API.
+
+    Visible to staff, support, and service provider owners/managers only.
+    """
+
+    class Permissions:
+        customer_path = "settings__customer"
+
+    traits = models.ManyToManyField(
+        Trait,
+        related_name="hypervisors",
+        blank=True,
+        help_text=_("Placement traits (capability flags) reported for this host."),
+    )
+
+    hypervisor_type = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text=_("Hypervisor type, e.g. KVM, QEMU, VMware"),
+    )
+    vcpus = models.PositiveIntegerField(default=0, help_text=_("Total vCPUs"))
+    vcpus_used = models.PositiveIntegerField(default=0, help_text=_("Used vCPUs"))
+    memory_mb = models.PositiveIntegerField(default=0, help_text=_("Total RAM in MiB"))
+    memory_mb_used = models.PositiveIntegerField(
+        default=0, help_text=_("Used RAM in MiB")
+    )
+    local_gb = models.PositiveIntegerField(default=0, help_text=_("Total disk in GiB"))
+    local_gb_used = models.PositiveIntegerField(
+        default=0, help_text=_("Used disk in GiB")
+    )
+    running_vms = models.PositiveIntegerField(
+        default=0, help_text=_("Number of running VMs")
+    )
+    state = models.CharField(
+        max_length=50, blank=True, help_text=_("Hypervisor state, e.g. up or down")
+    )
+    status = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text=_("Hypervisor status, e.g. enabled or disabled"),
+    )
+
+    @classmethod
+    def get_url_name(cls):
+        return "openstack-hypervisor"
+
+    @classmethod
+    def get_backend_fields(cls):
+        return super().get_backend_fields() + (
+            "hypervisor_type",
+            "vcpus",
+            "vcpus_used",
+            "memory_mb",
+            "memory_mb_used",
+            "local_gb",
+            "local_gb_used",
+            "running_vms",
+            "state",
+            "status",
+        )
+
+
+class HypervisorInventory(core_models.UuidMixin, models.Model):
+    """One Placement inventory line per (hypervisor, resource_class).
+
+    Stores the *raw* Placement values (total, reserved, allocation_ratio, used)
+    so admins can explain quota math and so non-classic resource classes
+    (VGPU, IPV4_ADDRESS, NUMA_CORE, CUSTOM_*, …) are surfaced — the parent
+    Hypervisor still keeps the legacy `vcpus`/`memory_mb`/`local_gb` columns
+    populated with the effective totals for backward compat.
+    """
+
+    class Permissions:
+        # Visible to staff/support and to service-provider owners.
+        customer_path = "hypervisor__settings__customer"
+
+    hypervisor = models.ForeignKey(
+        Hypervisor,
+        on_delete=models.CASCADE,
+        related_name="inventories",
+    )
+    resource_class = models.CharField(
+        max_length=255,
+        help_text=_(
+            "Placement resource class, e.g. VCPU, MEMORY_MB, DISK_GB, VGPU, "
+            "PCI_DEVICE, NUMA_CORE, CUSTOM_*."
+        ),
+    )
+    total = models.PositiveBigIntegerField(default=0)
+    reserved = models.PositiveBigIntegerField(default=0)
+    allocation_ratio = models.FloatField(default=1.0)
+    used = models.PositiveBigIntegerField(default=0)
+
+    class Meta:
+        unique_together = ("hypervisor", "resource_class")
+        ordering = ["hypervisor", "resource_class", "id"]
+
+    @classmethod
+    def get_url_name(cls):
+        return "openstack-hypervisor-inventory"
+
+    def __str__(self):
+        return f"{self.hypervisor.name}:{self.resource_class}"
+
+    @property
+    def effective_total(self) -> int:
+        """Capacity the Nova scheduler treats as available."""
+        return int(max(self.total - self.reserved, 0) * (self.allocation_ratio or 1.0))
+
+
+class ExternalSubnet(
+    core_models.DescribableMixin,
+    core_models.UuidMixin,
+    core_models.BackendModelMixin,
+    core_models.NameMixin,
+    models.Model,
+):
+    """Subnet within a provider-level external network."""
+
+    network = models.ForeignKey(
+        ExternalNetwork,
+        on_delete=models.CASCADE,
+        related_name="subnets",
+    )
+    backend_id = models.CharField(max_length=255, db_index=True)
+    # 43 fits a fully written-out IPv6 prefix: 8 groups of 4, 7 colons, "/128".
+    cidr = models.CharField(max_length=43, blank=True)
+    gateway_ip = models.GenericIPAddressField(null=True, blank=True)
+    ip_version = models.SmallIntegerField(default=4)
+    enable_dhcp = models.BooleanField(default=True)
+    allocation_pools = models.JSONField(default=list, blank=True)
+    dns_nameservers = models.JSONField(default=list, blank=True)
+    public_ip_range = models.CharField(
+        max_length=32,
+        blank=True,
+        help_text=_(
+            "Public CIDR mapped to this subnet (for carrier-grade NAT overlay)"
+        ),
+    )
+
+    class Meta:
+        unique_together = ("network", "backend_id")
+
+    def __str__(self):
+        return f"{self.name} ({self.cidr})"
+
+    @classmethod
+    def get_backend_fields(cls):
+        return super().get_backend_fields() + (
+            "backend_id",
+            "name",
+            "cidr",
+            "gateway_ip",
+            "ip_version",
+            "enable_dhcp",
+            "allocation_pools",
+            "dns_nameservers",
+            "description",
+        )
+
+
 class ServerGroup(structure_models.BaseResource):
     AFFINITY = "affinity"
+    ANTI_AFFINITY = "anti-affinity"
+    SOFT_AFFINITY = "soft-affinity"
+    SOFT_ANTI_AFFINITY = "soft-anti-affinity"
 
-    POLICIES = ((AFFINITY, "Affinity"),)
+    POLICIES = (
+        (AFFINITY, "Affinity"),
+        (ANTI_AFFINITY, "Anti-affinity"),
+        (SOFT_AFFINITY, "Soft affinity"),
+        (SOFT_ANTI_AFFINITY, "Soft anti-affinity"),
+    )
 
     policy = models.CharField(
         max_length=40,
@@ -333,6 +634,21 @@ class SecurityGroup(structure_models.BaseResource):
         return super().get_backend_fields() + ("name", "description")
 
 
+def validate_security_group_rule_protocol(value):
+    """Accept "", named protocols (tcp/udp/icmp) or an IANA protocol number 0-255."""
+    if value in ("", "tcp", "udp", "icmp"):
+        return
+    if value.isdigit() and 0 <= int(value) <= 255:
+        return
+    raise ValidationError(
+        _(
+            'Protocol must be one of "tcp", "udp", "icmp", empty (any) '
+            "or an IANA protocol number between 0 and 255, got %(value)r."
+        ),
+        params={"value": value},
+    )
+
+
 class BaseSecurityGroupRule(core_models.DescribableMixin, models.Model):
     class Meta:
         abstract = True
@@ -341,11 +657,7 @@ class BaseSecurityGroupRule(core_models.DescribableMixin, models.Model):
     UDP = "udp"
     ICMP = "icmp"
 
-    PROTOCOLS = (
-        (TCP, "tcp"),
-        (UDP, "udp"),
-        (ICMP, "icmp"),
-    )
+    NAMED_PROTOCOLS = (TCP, UDP, ICMP)
 
     INGRESS = "ingress"
     EGRESS = "egress"
@@ -366,8 +678,11 @@ class BaseSecurityGroupRule(core_models.DescribableMixin, models.Model):
     protocol = models.CharField(
         max_length=40,
         blank=True,
-        choices=PROTOCOLS,
-        help_text=_("The network protocol (TCP, UDP, ICMP, or empty for any protocol)"),
+        validators=[validate_security_group_rule_protocol],
+        help_text=_(
+            "Network protocol: 'tcp', 'udp', 'icmp', empty (any) "
+            "or an IANA protocol number 0-255 (e.g. '112' for VRRP)."
+        ),
     )
     from_port = models.IntegerField(
         validators=[validators.MaxValueValidator(65535)],
@@ -481,7 +796,7 @@ class FloatingIP(core_models.RuntimeStateMixin, structure_models.BaseResource):
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         unique_together = ("tenant", "address")
         verbose_name = _("Floating IP")
         verbose_name_plural = _("Floating IPs")
@@ -540,8 +855,38 @@ class Router(structure_models.BaseResource):
         blank=True,
         help_text=_("Network ports attached to this router"),
     )
+    external_network_id = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text=_("Backend ID of the external network used as gateway"),
+    )
+    external_network_ref = models.ForeignKey(
+        "ExternalNetwork",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="routers",
+        help_text=_(
+            "Reference to ExternalNetwork if gateway is a global external network"
+        ),
+    )
+    enable_snat = models.BooleanField(
+        null=True,
+        default=None,
+        help_text=_(
+            "Whether SNAT is enabled on the external gateway. None means OpenStack default (True)."
+        ),
+    )
+    external_fixed_ips = JSONField(
+        default=list,
+        help_text=_("List of fixed IP addresses on the external gateway port"),
+    )
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
+
+    @property
+    def has_external_gateway(self):
+        return bool(self.external_network_id)
 
     def get_backend(self):
         return self.tenant.get_backend()
@@ -551,7 +896,304 @@ class Router(structure_models.BaseResource):
         return "openstack-router"
 
 
+class LoadBalancer(structure_models.BaseResource):
+    class Meta(structure_models.BaseResource.Meta):
+        unique_together = [["tenant", "backend_id"]]
+
+    tenant = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=Tenant,
+        related_name="load_balancers",
+        help_text=_("OpenStack tenant this load balancer belongs to"),
+    )
+    backend_id = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text=_("Load balancer ID in Octavia"),
+    )
+    vip_address = models.GenericIPAddressField(
+        null=True,
+        blank=True,
+        help_text=_("Virtual IP address of the load balancer, IPv4 or IPv6"),
+    )
+    vip_subnet = models.ForeignKey(
+        on_delete=models.SET_NULL,
+        to="SubNet",
+        null=True,
+        blank=False,
+        help_text=_("Subnet for the load balancer VIP"),
+    )
+    provider = models.CharField(
+        max_length=64,
+        default="ovn",
+        editable=False,
+        help_text=_("Octavia provider (e.g. ovn for OVN LBaaS)"),
+    )
+    provisioning_status = models.CharField(
+        max_length=32,
+        blank=True,
+        editable=False,
+        help_text=_("Octavia provisioning status: ACTIVE, PENDING_CREATE, etc."),
+    )
+    operating_status = models.CharField(
+        max_length=32,
+        blank=True,
+        editable=False,
+        help_text=_("Octavia operating status: ONLINE, OFFLINE, etc."),
+    )
+    vip_port = models.ForeignKey(
+        on_delete=models.SET_NULL,
+        to="Port",
+        related_name="+",
+        null=True,
+        blank=True,
+        editable=False,
+        help_text=_("Neutron VIP port in Waldur (for floating IP and security groups)"),
+    )
+    attached_floating_ip = models.ForeignKey(
+        on_delete=models.SET_NULL,
+        to="FloatingIP",
+        related_name="load_balancers",
+        null=True,
+        blank=True,
+        help_text=_("Floating IP attached to the VIP port"),
+    )
+
+    tracker = cast(FieldInstanceTracker, FieldTracker())
+
+    def get_backend(self):
+        return self.tenant.get_backend()
+
+    @classmethod
+    def get_url_name(cls):
+        return "openstack-loadbalancer"
+
+
+class Pool(structure_models.BaseResource):
+    """Octavia LBaaS backend pool."""
+
+    class Meta(structure_models.BaseResource.Meta):
+        unique_together = [["load_balancer", "backend_id"]]
+
+    load_balancer = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=LoadBalancer,
+        related_name="pools",
+        help_text=_("Load balancer this pool belongs to"),
+    )
+    backend_id = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text=_("Pool ID in Octavia"),
+    )
+    protocol = models.CharField(
+        max_length=16,
+        choices=PROTOCOL_CHOICES,
+        help_text=_("Protocol for the pool: TCP, UDP (OVN supports TCP and UDP)"),
+    )
+    lb_algorithm = models.CharField(
+        max_length=32,
+        default="SOURCE_IP_PORT",
+        choices=LB_ALGORITHM_CHOICES,
+        help_text=_("Load balancing algorithm."),
+    )
+    provisioning_status = models.CharField(
+        max_length=32,
+        blank=True,
+        editable=False,
+        help_text=_("Octavia provisioning status: ACTIVE, PENDING_CREATE, etc."),
+    )
+    operating_status = models.CharField(
+        max_length=32,
+        blank=True,
+        editable=False,
+        help_text=_("Octavia operating status: ONLINE, OFFLINE, etc."),
+    )
+
+    def get_backend(self):
+        return self.load_balancer.get_backend()
+
+    @classmethod
+    def get_url_name(cls):
+        return "openstack-pool"
+
+
+class Listener(structure_models.BaseResource):
+    """Octavia LBaaS listener. Listens on load balancer VIP, forwards to default pool."""
+
+    class Meta(structure_models.BaseResource.Meta):
+        unique_together = [["load_balancer", "backend_id"]]
+
+    load_balancer = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=LoadBalancer,
+        related_name="listeners",
+        help_text=_("Load balancer this listener belongs to"),
+    )
+    backend_id = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text=_("Listener ID in Octavia"),
+    )
+    protocol = models.CharField(
+        max_length=16,
+        choices=PROTOCOL_CHOICES,
+        help_text=_("Protocol for the listener: TCP, UDP (OVN supports TCP and UDP)"),
+    )
+    protocol_port = models.IntegerField(
+        validators=[
+            validators.MinValueValidator(1),
+            validators.MaxValueValidator(65535),
+        ],
+        help_text=_("Port on which the listener listens"),
+    )
+    default_pool = models.ForeignKey(
+        on_delete=models.SET_NULL,
+        to=Pool,
+        related_name="listeners",
+        help_text=_("Default pool for this listener"),
+        null=True,
+        blank=True,
+    )
+    provisioning_status = models.CharField(
+        max_length=32,
+        blank=True,
+        editable=False,
+        help_text=_("Octavia provisioning status: ACTIVE, PENDING_CREATE, etc."),
+    )
+    operating_status = models.CharField(
+        max_length=32,
+        blank=True,
+        editable=False,
+        help_text=_("Octavia operating status: ONLINE, OFFLINE, etc."),
+    )
+
+    def get_backend(self):
+        return self.load_balancer.get_backend()
+
+    @classmethod
+    def get_url_name(cls):
+        return "openstack-listener"
+
+
+class PoolMember(structure_models.BaseResource):
+    """Octavia LBaaS pool member. Represents a backend server in a pool."""
+
+    class Meta(structure_models.BaseResource.Meta):
+        unique_together = [["pool", "backend_id"]]
+
+    pool = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=Pool,
+        related_name="members",
+        help_text=_("Pool this member belongs to"),
+    )
+    backend_id = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text=_("Member ID in Octavia"),
+    )
+    address = models.GenericIPAddressField(
+        help_text=_("IP address of the backend server"),
+    )
+    protocol_port = models.PositiveIntegerField(
+        validators=[
+            validators.MinValueValidator(1),
+            validators.MaxValueValidator(65535),
+        ],
+        help_text=_("Port on the backend server"),
+    )
+    subnet = models.ForeignKey(
+        on_delete=models.PROTECT,
+        to="SubNet",
+        related_name="+",
+        null=True,
+        blank=True,
+        help_text=_("Neutron subnet for the member (same tenant as the load balancer)"),
+    )
+    weight = models.PositiveSmallIntegerField(
+        default=1,
+        help_text=_("Weight for load balancing (1-256)"),
+    )
+    provisioning_status = models.CharField(
+        max_length=32,
+        blank=True,
+        editable=False,
+        help_text=_("Octavia provisioning status: ACTIVE, PENDING_CREATE, etc."),
+    )
+    operating_status = models.CharField(
+        max_length=32,
+        blank=True,
+        editable=False,
+        help_text=_("Octavia operating status: ONLINE, OFFLINE, etc."),
+    )
+
+    def get_backend(self):
+        return self.pool.get_backend()
+
+    @classmethod
+    def get_url_name(cls):
+        return "openstack-poolmember"
+
+
+class HealthMonitor(structure_models.BaseResource):
+    """Octavia LBaaS health monitor. One per pool. OVN supports TCP and UDP only."""
+
+    pool = models.OneToOneField(
+        on_delete=models.CASCADE,
+        to=Pool,
+        related_name="health_monitor",
+        help_text=_("Pool this health monitor belongs to"),
+    )
+    backend_id = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text=_("Health monitor ID in Octavia"),
+    )
+    monitor_type = models.CharField(
+        max_length=16,
+        choices=HEALTHMONITOR_TYPE_CHOICES,
+        help_text=_("Health check type: TCP, UDP (OVN supports TCP and UDP only)"),
+        db_column="type",
+    )
+    max_retries_down = models.PositiveIntegerField(default=3)
+    delay = models.PositiveIntegerField(
+        help_text=_("Interval between health checks in seconds"), default=5
+    )
+    timeout = models.PositiveIntegerField(
+        help_text=_("Time in seconds to timeout a health check"), default=5
+    )
+    max_retries = models.PositiveIntegerField(default=3)
+    provisioning_status = models.CharField(
+        max_length=32,
+        blank=True,
+        editable=False,
+        help_text=_("Octavia provisioning status: ACTIVE, PENDING_CREATE, etc."),
+    )
+    operating_status = models.CharField(
+        max_length=32,
+        blank=True,
+        editable=False,
+        help_text=_("Octavia operating status: ONLINE, OFFLINE, etc."),
+    )
+
+    def get_backend(self):
+        return self.pool.get_backend()
+
+    @classmethod
+    def get_url_name(cls):
+        return "openstack-healthmonitor"
+
+
 class Network(core_models.RuntimeStateMixin, structure_models.BaseResource):
+    class Meta(structure_models.BaseResource.Meta):
+        pass
+
     subnets: models.Manager["SubNet"]
     ports: models.Manager["Port"]
     rbac_policies: models.Manager["NetworkRBACPolicy"]
@@ -587,6 +1229,14 @@ class Network(core_models.RuntimeStateMixin, structure_models.BaseResource):
             validators.MaxValueValidator(9000),
         ],
     )
+    port_security_enabled = models.BooleanField(
+        default=True,
+        help_text=_(
+            "Default port_security_enabled for ports on this network. "
+            "When False, ports created on this network inherit disabled "
+            "port security unless explicitly overridden."
+        ),
+    )
 
     def get_backend(self):
         return self.tenant.get_backend()
@@ -611,11 +1261,14 @@ class Network(core_models.RuntimeStateMixin, structure_models.BaseResource):
             "segmentation_id",
             "runtime_state",
             "mtu",
+            "port_security_enabled",
         )
 
 
 class SubNet(structure_models.BaseResource):
     ports: models.Manager["Port"]
+
+    Ipv6Modes = enums.Ipv6Modes
 
     tenant = models.ForeignKey(
         on_delete=models.CASCADE,
@@ -637,24 +1290,53 @@ class SubNet(structure_models.BaseResource):
         help_text=_("List of additional routes for the subnet."),
     )
     cidr = models.CharField(
-        max_length=32,
+        # 43 fits a fully written-out IPv6 prefix: 8 groups of 4, 7 colons, "/128".
+        max_length=43,
         blank=True,
-        help_text=_("IPv4 network address in CIDR format (e.g. 192.168.0.0/24)"),
+        help_text=_(
+            "Network address in CIDR format (e.g. 192.168.0.0/24 or 2001:db8::/64)"
+        ),
     )
     gateway_ip = models.GenericIPAddressField(
-        protocol="IPv4",
         null=True,
         help_text=_("IP address of the gateway for this subnet"),
     )
     allocation_pools = cast(
         list[dict[str, str]],
         JSONField(
-            default=dict,
+            # A list, as the name, the type cast, the serializer field and every
+            # generated client say (#390). The default used to be `dict`, so a
+            # subnet whose pool nobody supplied carried `{}` -- not an empty
+            # list, but a value of the wrong shape -- until the next pull.
+            default=list,
+            blank=True,
             help_text=_("List of IP ranges available for allocation in this subnet"),
         ),
     )
     ip_version = models.SmallIntegerField(
         default=4, help_text=_("IP protocol version (4 or 6)")
+    )
+    ipv6_ra_mode = models.CharField(
+        max_length=20,
+        choices=Ipv6Modes.CHOICES,
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_(
+            "How the router advertises an IPv6 subnet. Null for an IPv4 subnet, "
+            "or when router advertisements come from outside OpenStack."
+        ),
+    )
+    ipv6_address_mode = models.CharField(
+        max_length=20,
+        choices=Ipv6Modes.CHOICES,
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_(
+            "How instances on an IPv6 subnet get their address. Null for an IPv4 "
+            "subnet, or when OpenStack assigns no address itself."
+        ),
     )
     enable_dhcp = models.BooleanField(
         default=True,
@@ -667,8 +1349,21 @@ class SubNet(structure_models.BaseResource):
     is_connected = models.BooleanField(
         default=True, help_text=_("Is subnet connected to the default tenant router.")
     )
+    router = models.ForeignKey(
+        on_delete=models.SET_NULL,
+        to=Router,
+        null=True,
+        blank=True,
+        related_name="subnets",
+        help_text=_(
+            "Router this subnet is attached to. Set explicitly at creation time, "
+            "otherwise recorded from the backend once the attachment is made. "
+            "While the subnet is disconnected it keeps the router it was last "
+            "attached to, which is the one a reconnect returns it to."
+        ),
+    )
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         verbose_name = _("Subnet")
         verbose_name_plural = _("Subnets")
 
@@ -693,6 +1388,8 @@ class SubNet(structure_models.BaseResource):
             "allocation_pools",
             "cidr",
             "ip_version",
+            "ipv6_ra_mode",
+            "ipv6_address_mode",
             "enable_dhcp",
             "gateway_ip",
             "dns_nameservers",
@@ -853,6 +1550,14 @@ class CustomerOpenStack(TimeStampedModel):
     external_network_id = models.CharField(
         _("OpenStack external network ID"), max_length=255
     )
+    external_network_ref = models.ForeignKey(
+        ExternalNetwork,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="customer_openstack_settings",
+        help_text=_("External network for this customer"),
+    )
 
     class Meta:
         verbose_name = _("Organization OpenStack settings")
@@ -893,9 +1598,19 @@ class VolumeAvailabilityZone(structure_models.BaseServiceProperty):
         return "openstack-volume-availability-zone"
 
 
-class Volume(core_models.ActionMixin, TenantQuotaMixin, structure_models.Storage):
+class Volume(
+    core_models.ActionMixin,
+    TenantQuotaMixin,
+    structure_models.Storage,
+    core_models.AvailableMixin,
+    core_models.BackendMissingMixin,
+):
     snapshots: models.Manager["Snapshot"]
     restoration: models.Manager["SnapshotRestoration"]
+
+    # Cinder allows volume names up to 255 chars, but the base NameMixin caps at
+    # 150. Widen so volumes with long backend names can be imported (WAL-10102).
+    name = models.CharField(_("name"), max_length=255, validators=[validate_name])
 
     tenant = models.ForeignKey(
         on_delete=models.CASCADE,
@@ -946,7 +1661,7 @@ class Volume(core_models.ActionMixin, TenantQuotaMixin, structure_models.Storage
         help_text=_("Image that this volume was created from, if any"),
     )
     image_name = models.CharField(
-        max_length=150,
+        max_length=255,
         blank=True,
         help_text=_("Name of the image this volume was created from"),
     )
@@ -978,7 +1693,7 @@ class Volume(core_models.ActionMixin, TenantQuotaMixin, structure_models.Storage
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         unique_together = ("service_settings", "backend_id")
 
     def get_quota_deltas(self):
@@ -1026,7 +1741,12 @@ class Volume(core_models.ActionMixin, TenantQuotaMixin, structure_models.Storage
             return False
 
 
-class Snapshot(core_models.ActionMixin, TenantQuotaMixin, structure_models.Storage):
+class Snapshot(
+    core_models.ActionMixin,
+    TenantQuotaMixin,
+    structure_models.Storage,
+    core_models.BackendMissingMixin,
+):
     volumes: models.Manager["Volume"]
     restorations: models.Manager["SnapshotRestoration"]
     backups: models.Manager["Backup"]
@@ -1068,7 +1788,7 @@ class Snapshot(core_models.ActionMixin, TenantQuotaMixin, structure_models.Stora
         help_text=_("Guaranteed time of snapshot retention. If null - keep forever."),
     )
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         unique_together = ("service_settings", "backend_id")
 
     @classmethod
@@ -1147,7 +1867,11 @@ class InstanceAvailabilityZone(structure_models.BaseServiceProperty):
 
 
 class Instance(
-    core_models.ActionMixin, TenantQuotaMixin, structure_models.VirtualMachine
+    core_models.ActionMixin,
+    TenantQuotaMixin,
+    structure_models.VirtualMachine,
+    core_models.AvailableMixin,
+    core_models.BackendMissingMixin,
 ):
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
@@ -1155,6 +1879,12 @@ class Instance(
     ports: "RelatedManager[Port]"
     volumes: "RelatedManager[Volume]"
     backups: "RelatedManager[Backup]"
+
+    # Nova allows server display names and image names up to 255 chars, but the
+    # base NameMixin/VirtualMachine cap both at 150. Widen so instances with long
+    # backend names can be imported instead of crashing tenant sync (WAL-10102).
+    name = models.CharField(_("name"), max_length=255, validators=[validate_name])
+    image_name = models.CharField(max_length=255, blank=True)
 
     class RuntimeStates:
         # All possible OpenStack Instance states on backend.
@@ -1170,7 +1900,11 @@ class Instance(
         REBUILD = "REBUILD"
         PASSWORD = "PASSWORD"
         PAUSED = "PAUSED"
-        RESCUED = "RESCUED"
+        # Nova returns "RESCUE" as the top-level server status when an
+        # instance is in rescue mode (vm_state="rescued" is a separate
+        # internal field). instance.runtime_state is set verbatim from
+        # backend_instance.status, so we match Nova's casing here.
+        RESCUE = "RESCUE"
         RESIZED = "RESIZED"
         REVERT_RESIZE = "REVERT_RESIZE"
         SHUTOFF = "SHUTOFF"
@@ -1236,20 +1970,37 @@ class Instance(
         default=False,
         help_text=_("If True, instance will be connected directly to external network"),
     )
-    directly_connected_ips = models.CharField(
-        max_length=255,
+    directly_connected_ips = models.TextField(
         blank=True,
         help_text=_("Comma-separated list of directly connected IP addresses"),
     )
+    config_drive = models.BooleanField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_(
+            "Force config drive on or off for this instance. "
+            "If null, the tenant-wide default from service settings is used."
+        ),
+    )
+    metadata = JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Arbitrary key/value pairs forwarded to Nova as instance metadata."
+        ),
+    )
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         unique_together = ("service_settings", "backend_id")
-        ordering = ["name", "created"]
+        ordering = ["name", "created", "id"]
 
     @property
     def external_ips(self) -> list[str]:
-        floating_ips = set(self.floating_ips.values_list("address", flat=True))
+        floating_ips = {
+            floating_ip.address for floating_ip in self.attached_floating_ips
+        }
         if self.directly_connected_ips:
             floating_ips = floating_ips.union(
                 set(self.directly_connected_ips.split(","))
@@ -1262,12 +2013,20 @@ class Instance(
 
     @property
     def external_address(self) -> set[str]:
-        return set(self.floating_ips.values_list("external_address", flat=True))
+        return {
+            floating_ip.external_address
+            for floating_ip in self.attached_floating_ips
+            if floating_ip.external_address is not None
+        }
 
     @property
     def internal_ips(self):
         internal_ips = set()
-        for ip_list in self.ports.values_list("fixed_ips", flat=True):
+        if self._ports_are_prefetched:
+            fixed_ips_per_port = [port.fixed_ips for port in self.ports.all()]
+        else:
+            fixed_ips_per_port = self.ports.values_list("fixed_ips", flat=True)
+        for ip_list in fixed_ips_per_port:
             if ip_list:
                 internal_ips.update({val["ip_address"] for val in ip_list})
         return list(internal_ips)
@@ -1302,6 +2061,32 @@ class Instance(
     def floating_ips(self) -> models.QuerySet[FloatingIP]:
         return FloatingIP.objects.filter(port__instance=self)
 
+    @property
+    def _ports_are_prefetched(self) -> bool:
+        return "ports" in getattr(self, "_prefetched_objects_cache", {})
+
+    @property
+    def attached_floating_ips(self) -> list[FloatingIP]:
+        """
+        The same floating IPs as the floating_ips property returns. When the
+        instance was loaded with prefetch_related("ports__floating_ips"), as
+        the instance viewset does, the prefetched objects are reused instead
+        of issuing a query; otherwise a single query is made, since the
+        property is also read per instance by metadata handlers.
+        """
+        if not self._ports_are_prefetched:
+            return list(self.floating_ips)
+        floating_ips = [
+            floating_ip
+            for port in self.ports.all()
+            for floating_ip in port.floating_ips.all()
+        ]
+        # Ports group the floating IPs, so the model ordering ("-created", "id")
+        # is restored here; the two passes rely on sort stability.
+        floating_ips.sort(key=lambda floating_ip: floating_ip.id)
+        floating_ips.sort(key=lambda floating_ip: floating_ip.created, reverse=True)
+        return floating_ips
+
     @classmethod
     def get_backend_fields(cls):
         return super().get_backend_fields() + (
@@ -1315,6 +2100,7 @@ class Instance(
             "hypervisor_hostname",
             "directly_connected_ips",
             "image_name",
+            "metadata",
         )
 
     @classmethod
@@ -1437,7 +2223,7 @@ class NetworkRBACPolicy(
         verbose_name = "Network RBAC Policy"
         verbose_name_plural = "Network RBAC Policies"
         unique_together = ("network", "target_tenant", "policy_type")
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     def __str__(self):
         return f"RBAC policy for {self.network} to {self.target_tenant}"

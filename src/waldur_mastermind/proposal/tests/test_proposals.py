@@ -1,23 +1,36 @@
 import datetime
 from unittest import mock
 
-from ddt import data, ddt
+from constance.test.unittest import override_config
+from ddt import data, ddt, unpack
 from django.core import mail
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
+from django.utils import timezone
 from rest_framework import status, test
 
 from waldur_core.core import utils as core_utils
-from waldur_core.media.utils import dummy_image
+from waldur_core.core.models import DESCRIPTION_LENGTH
+from waldur_core.core.tests.helpers import EXPANDING_DESCRIPTION
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
 from waldur_core.permissions.utils import has_user
 from waldur_core.structure.tests import factories as structure_factories
-from waldur_mastermind.proposal import models, tasks
-from waldur_mastermind.proposal.enums import CallStates, ProposalStates
+from waldur_mastermind.proposal import models, tasks, utils
+from waldur_mastermind.proposal.enums import (
+    AllocationTimes,
+    CallStates,
+    ProposalStates,
+    WorkflowStepInstanceStatuses,
+)
 from waldur_mastermind.proposal.tests import factories, fixtures
+
+SVG_WITH_SCRIPT = (
+    b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>'
+)
 
 
 @ddt
-class ProposalGetTest(test.APITransactionTestCase):
+class ProposalGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.url = factories.ProposalFactory.get_url(self.fixture.proposal)
@@ -55,15 +68,6 @@ class ProposalGetTest(test.APITransactionTestCase):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_proposal_with_empty_documentation_file_should_be_visible(self):
-        models.ProposalDocumentation.objects.create(proposal=self.fixture.proposal)
-        self.client.force_authenticate(self.fixture.staff)
-        response = self.client.get(self.url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertIsNone(
-            response.json()["supporting_documentation"][0]["file_size"]
-        )
-
     def create_another_call_and_proposal(self):
         another_call = factories.CallFactory(
             manager=self.fixture.manager,
@@ -78,7 +82,7 @@ class ProposalGetTest(test.APITransactionTestCase):
 
 
 @ddt
-class ProposalCreateTest(test.APITransactionTestCase):
+class ProposalCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.url = factories.ProposalFactory.get_list_url()
@@ -111,6 +115,50 @@ class ProposalCreateTest(test.APITransactionTestCase):
         proposal = models.Proposal.objects.get(uuid=response.data["uuid"])
         self.assertFalse(proposal.project)
 
+    @override_config(PROJECT_NAME_REGEX=r"^.{1,32}$")
+    def test_proposal_name_exceeding_pattern_is_rejected(self):
+        response = self.create_proposal("staff", name="x" * 33)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("name", response.data)
+
+    @override_config(PROJECT_NAME_REGEX=r"^.{1,32}$")
+    def test_proposal_name_matching_pattern_is_accepted(self):
+        response = self.create_proposal("staff", name="x" * 32)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def move_round(self, start_offset_days, cutoff_offset_days):
+        call_round = self.fixture.round
+        call_round.start_time = timezone.now() + datetime.timedelta(
+            days=start_offset_days
+        )
+        call_round.cutoff_time = timezone.now() + datetime.timedelta(
+            days=cutoff_offset_days
+        )
+        call_round.save()
+
+    def test_can_not_create_before_the_round_opens(self):
+        """A proposal exists only while its round is open.
+
+        This used to be allowed, on the reasoning that a draft could be
+        prepared ahead of the round; the rule is now the same as for
+        submission, so a proposal can never be created into a state it could
+        not then be sent from.
+        """
+        self.move_round(start_offset_days=5, cutoff_offset_days=10)
+
+        response = self.create_proposal("staff")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(models.Proposal.objects.filter(name="new").exists())
+
+    def test_can_not_create_after_the_round_has_closed(self):
+        self.move_round(start_offset_days=-10, cutoff_offset_days=-1)
+
+        response = self.create_proposal("staff")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(models.Proposal.objects.filter(name="new").exists())
+
     def create_proposal(self, user, **kwargs):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
@@ -118,15 +166,53 @@ class ProposalCreateTest(test.APITransactionTestCase):
         payload = {
             "name": "new",
             "round_uuid": self.fixture.round.uuid.hex,
-            "duration_in_days": 10,
         }
         payload.update(kwargs)
 
         return self.client.post(self.url, payload)
 
 
+class ProposalDescriptionLengthTest(test.APITestCase):
+    """Oversized proposal descriptions must be rejected with 400, not blow up in the database."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.url = factories.ProposalFactory.get_list_url()
+        self.client.force_authenticate(self.fixture.staff)
+
+    def create_proposal(self, description):
+        return self.client.post(
+            self.url,
+            {
+                "name": "new",
+                "round_uuid": self.fixture.round.uuid.hex,
+                "description": description,
+            },
+        )
+
+    def test_description_over_limit_is_rejected(self):
+        response = self.create_proposal("a" * (DESCRIPTION_LENGTH + 904))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+
+    def test_description_expanded_by_html_clean_is_rejected(self):
+        self.assertLess(len(EXPANDING_DESCRIPTION), DESCRIPTION_LENGTH)
+
+        response = self.create_proposal(EXPANDING_DESCRIPTION)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+        self.assertIn("sanitisation", str(response.data["description"]))
+
+    def test_description_within_limit_is_accepted(self):
+        response = self.create_proposal("a" * DESCRIPTION_LENGTH)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        proposal = models.Proposal.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(len(proposal.description), DESCRIPTION_LENGTH)
+
+
 @ddt
-class UpdateProposalProjectDetailsTest(test.APITransactionTestCase):
+class UpdateProposalProjectDetailsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.proposal = self.fixture.proposal
@@ -151,9 +237,11 @@ class UpdateProposalProjectDetailsTest(test.APITransactionTestCase):
         response = self.update_proposal(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    def _upload_proposal_document(self):
+    def _upload_proposal_document(self, file=None):
         url = factories.ProposalFactory.get_url(self.proposal, action="attach_document")
-        payload = {"file": dummy_image()}
+        if file is None:
+            file = SimpleUploadedFile("proposal.pdf", b"%PDF-1.4\n%%EOF\n")
+        payload = {"file": file}
         return self.client.post(url, payload, format="multipart")
 
     @data("staff", "call_manager")
@@ -164,6 +252,52 @@ class UpdateProposalProjectDetailsTest(test.APITransactionTestCase):
         proposal = models.Proposal.objects.get(uuid=self.proposal.uuid)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(proposal.proposaldocumentation_set.count(), 1)
+
+    @data(
+        ("diagram.svg", SVG_WITH_SCRIPT),
+        # The type is sniffed from the content, so renaming the file is no help.
+        ("diagram.png", SVG_WITH_SCRIPT),
+        ("animation.gif", b"GIF89a\x01\x00\x01\x00\x80\x00\x00"),
+    )
+    @unpack
+    def test_non_document_upload_is_rejected(self, name, content):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self._upload_proposal_document(SimpleUploadedFile(name, content))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(self.proposal.proposaldocumentation_set.exists())
+
+    def _detach_proposal_document(self, doc_uuids):
+        url = factories.ProposalFactory.get_url(
+            self.proposal, action="detach_documents"
+        )
+        payload = {"documents": doc_uuids}
+        return self.client.post(url, payload)
+
+    @data("staff", "call_manager")
+    def test_detach_documents(self, user):
+        # First upload a document
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        self._upload_proposal_document()
+        proposal = models.Proposal.objects.get(uuid=self.proposal.uuid)
+        self.assertEqual(proposal.proposaldocumentation_set.count(), 1)
+
+        # Then detach it
+        doc = proposal.proposaldocumentation_set.first()
+        response = self._detach_proposal_document([str(doc.uuid)])
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.proposaldocumentation_set.count(), 0)
+
+    @data("staff", "call_manager")
+    def test_detach_nonexistent_document(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        # Try to detach a non-existent document - should succeed without error
+        response = self._detach_proposal_document(
+            ["00000000-0000-0000-0000-000000000000"]
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     @data(
         "staff",
@@ -181,15 +315,61 @@ class UpdateProposalProjectDetailsTest(test.APITransactionTestCase):
 
         payload = {
             "name": "new",
-            "duration_in_days": 10,
         }
         response = self.client.post(self.url, payload)
         self.proposal.refresh_from_db()
         return response
 
+    def test_update_project_details_ignores_duration_in_days(self):
+        # Older clients still send the retired field; it is neither rejected
+        # nor echoed back.
+        self.client.force_authenticate(self.fixture.proposal_creator)
+
+        response = self.client.post(
+            self.url, {"name": self.proposal.name, "duration_in_days": 99}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        proposal = self.client.get(factories.ProposalFactory.get_url(self.proposal))
+        self.assertNotIn("duration_in_days", proposal.data)
+
+    def test_science_sub_domain_can_be_set(self):
+        sub_domain = structure_factories.ScienceSubDomainFactory()
+        self.client.force_authenticate(self.fixture.proposal_creator)
+
+        response = self.client.post(
+            self.url,
+            {
+                "name": self.proposal.name,
+                "science_sub_domain": sub_domain.uuid.hex,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.proposal.refresh_from_db()
+        self.assertEqual(self.proposal.science_sub_domain, sub_domain)
+
+    def test_science_sub_domain_can_be_cleared(self):
+        self.proposal.science_sub_domain = structure_factories.ScienceSubDomainFactory()
+        self.proposal.save()
+        self.client.force_authenticate(self.fixture.proposal_creator)
+
+        response = self.client.post(
+            self.url,
+            {
+                "name": self.proposal.name,
+                "science_sub_domain": None,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.proposal.refresh_from_db()
+        self.assertIsNone(self.proposal.science_sub_domain)
+
 
 @ddt
-class ProposalDeleteTest(test.APITransactionTestCase):
+class ProposalDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.proposal = self.fixture.proposal
@@ -223,15 +403,20 @@ class ProposalDeleteTest(test.APITransactionTestCase):
 
 
 @ddt
-class ActionTest(test.APITransactionTestCase):
+class ActionTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.proposal = self.fixture.proposal
         self.proposal.state = ProposalStates.DRAFT
         self.proposal.save()
+        # A proposal must have a project team to be submitted (in production the
+        # creator is auto-added; the factory doesn't, so add them here).
+        self.proposal.add_user(self.proposal.created_by, ProposalRole.MANAGER)
+        # Tests in this class exercise the no-workflow submission path
+        # (DRAFT -> SUBMITTED). Clear the auto-seeded allocation_decision
+        # step so submit() doesn't transition the proposal into IN_REVIEW.
+        models.CallWorkflowStep.objects.filter(call=self.proposal.round.call).delete()
         self.submit_url = factories.ProposalFactory.get_url(self.proposal, "submit")
-        self.approve_url = factories.ProposalFactory.get_url(self.proposal, "approve")
-        self.reject_url = factories.ProposalFactory.get_url(self.proposal, "reject")
         structure_factories.NotificationFactory(
             key="proposal.proposal_state_changed",
         )
@@ -263,6 +448,12 @@ class ActionTest(test.APITransactionTestCase):
     @override_settings(task_always_eager=True)
     @data("proposal_creator")
     def test_notifications_are_sent_after_submission(self, user):
+        # Pinned to a call-managed deployment, which is what this test has
+        # always meant by "proposal": 0258_derive_service_access_mode leaves a
+        # database with no call-management feature flags — every fresh one,
+        # test databases included — in marketplace mode, where the applicant's
+        # mail says "access request" instead.
+        self.enterContext(override_config(SERVICE_ACCESS_MODE="both"))
         user = getattr(self.fixture, user)
         call_manager = self.fixture.call_manager
         self.proposal.round.call.add_user(call_manager, CallRole.MANAGER)
@@ -309,120 +500,94 @@ class ActionTest(test.APITransactionTestCase):
         response = self.client.post(self.submit_url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    @override_settings(task_always_eager=True)
-    def test_force_approval_of_proposal_creates_project(self):
-        self.proposal.state = ProposalStates.IN_REVIEW
-        self.proposal.save()
-
-        self.client.force_authenticate(self.fixture.staff)
-
-        response = self.client.post(self.approve_url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.proposal.refresh_from_db()
-        self.assertTrue(self.proposal.project)
-
-        # Verify proposal creator has been notified
-        self.assertEqual(len(mail.outbox), 1)
-        self.assertEqual(mail.outbox[0].to, [self.proposal.created_by.email])
-        project_url = core_utils.format_homeport_link(
-            "projects/{project_uuid}/",
-            project_uuid=self.proposal.project.uuid,
+    def move_round(self, start_offset_days, cutoff_offset_days):
+        call_round = self.proposal.round
+        call_round.start_time = timezone.now() + datetime.timedelta(
+            days=start_offset_days
         )
-        body = mail.outbox[0].body
-        self.assertIn("Your proposal has been accepted.", body)
-        self.assertIn(f"Previous state: {ProposalStates.IN_REVIEW}", body)
-        self.assertIn(f"New state: {ProposalStates.ACCEPTED}", body)
-        self.assertIn(f"View Project: {project_url}", body)
-        for requested_resource in self.proposal.requestedresource_set.all():
-            self.assertIn(requested_resource.resource.name, body)
+        call_round.cutoff_time = timezone.now() + datetime.timedelta(
+            days=cutoff_offset_days
+        )
+        call_round.save()
 
-    def test_set_project_start_date_if_proposal_has_been_approved(self):
-        self.client.force_authenticate(self.fixture.staff)
+    def test_can_not_submit_after_the_round_has_closed(self):
+        """The cutoff is a hard deadline, enforced when the proposal is sent.
+
+        Before, this returned 200: the call managers were notified and the
+        proposal entered review, only to be cancelled by the hourly sweeper.
+        """
+        self.move_round(start_offset_days=-10, cutoff_offset_days=-1)
+
+        self.client.force_authenticate(self.fixture.proposal_creator)
+        response = self.client.post(self.submit_url)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.proposal.refresh_from_db()
+        self.assertEqual(self.proposal.state, ProposalStates.DRAFT)
+
+    def test_can_not_submit_before_the_round_opens(self):
+        """A draft may be prepared ahead of the round, but not sent early."""
+        self.move_round(start_offset_days=5, cutoff_offset_days=10)
+
+        self.client.force_authenticate(self.fixture.proposal_creator)
+        response = self.client.post(self.submit_url)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.proposal.refresh_from_db()
+        self.assertEqual(self.proposal.state, ProposalStates.DRAFT)
+
+    def test_set_project_start_date_on_fixed_date_allocation(self):
         new_proposal = factories.ProposalFactory(
             round=self.fixture.round,
             state=ProposalStates.IN_REVIEW,
+            project=None,
         )
-        allocation_date = datetime.datetime.now() + datetime.timedelta(weeks=1)
+        allocation_date = timezone.now() + datetime.timedelta(weeks=1)
         new_proposal.round.allocation_date = allocation_date
-        new_proposal.round.allocation_time = models.Round.AllocationTimes.FIXED_DATE
         new_proposal.round.save()
+        # Allocation timing is a call-level policy on the allocation_decision
+        # workflow step; the concrete date stays on the round.
+        models.CallWorkflowStep.objects.update_or_create(
+            call=new_proposal.round.call,
+            step="allocation_decision",
+            defaults={"allocation_time": AllocationTimes.FIXED_DATE},
+        )
 
-        new_url_approve = factories.ProposalFactory.get_url(new_proposal, "approve")
-        response = self.client.post(new_url_approve)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        utils.allocate_proposal(new_proposal, approved_by=self.fixture.staff)
         new_proposal.refresh_from_db()
         self.assertEqual(new_proposal.project.start_date, allocation_date.date())
 
-    @override_settings(task_always_eager=True)
-    def test_reviewer_notification_triggered_on_reject(self):
-        factories.ReviewFactory(
-            proposal=self.proposal,
-            reviewer=self.fixture.reviewer_1,
-            state=models.Review.States.SUBMITTED,
+    def test_fixed_date_allocation_sets_project_start_date_as_a_date(self):
+        # Regression: Project.start_date is a DateField but the round's
+        # allocation_date is a DateTimeField. allocate_proposal must coerce it,
+        # otherwise the in-memory project carries a datetime and downstream
+        # date comparisons (the order-created notification handler) crash with
+        # a datetime-vs-date TypeError.
+        new_proposal = factories.ProposalFactory(
+            round=self.fixture.round,
+            state=ProposalStates.IN_REVIEW,
+            project=None,
+        )
+        new_proposal.round.allocation_date = timezone.now() + datetime.timedelta(
+            weeks=1
+        )
+        new_proposal.round.save()
+        models.CallWorkflowStep.objects.update_or_create(
+            call=new_proposal.round.call,
+            step="allocation_decision",
+            defaults={"allocation_time": AllocationTimes.FIXED_DATE},
         )
 
-        self.proposal.state = ProposalStates.IN_REVIEW
-        self.proposal.save()
+        utils.allocate_proposal(new_proposal)
 
-        self.client.force_authenticate(self.fixture.staff)
-        response = self.client.post(
-            self.reject_url, {"allocation_comment": "Not suitable"}
-        )
-
-        self.proposal.refresh_from_db()
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        # Should have 2 emails: 1 for proposal creator + 1 for reviewer
-        self.assertEqual(len(mail.outbox), 2)
-
-        reviewer_email = next(
-            email
-            for email in mail.outbox
-            if email.to[0] == self.fixture.reviewer_1.email
-        )
-
-        body = reviewer_email.body
-        self.assertIn("A decision has been made on the proposal", body)
-        self.assertIn(self.proposal.name, body)
-        self.assertIn(self.proposal.round.call.name, body)
-        self.assertIn(self.proposal.state, body)
-        self.assertIn("Not suitable", body)
-        self.assertIn(self.fixture.reviewer_1.full_name, body)
-
-    @data(
-        "call_manager",
-        "call_organizer_user",
-    )
-    def test_user_can_approve_or_reject(self, user):
-        accept_response, reject_response = self._approve_reject_proposal(user)
-        self.assertEqual(accept_response.status_code, status.HTTP_200_OK)
-        self.assertEqual(reject_response.status_code, status.HTTP_200_OK)
-
-    @data(
-        "proposal_creator",
-    )
-    def test_user_can_not_approve_or_reject(self, user):
-        accept_response, reject_response = self._approve_reject_proposal(user)
-        self.assertEqual(accept_response.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertEqual(reject_response.status_code, status.HTTP_403_FORBIDDEN)
-
-    def _approve_reject_proposal(self, user):
-        user = getattr(self.fixture, user)
-        self.client.force_authenticate(user)
-        self.proposal.state = ProposalStates.SUBMITTED
-        self.proposal.save()
-        accept_response = self.client.post(self.approve_url)
-
-        self.proposal.state = ProposalStates.SUBMITTED
-        self.proposal.save()
-
-        reject_response = self.client.post(self.reject_url)
-        return accept_response, reject_response
+        # Check the in-memory value (a reload would coerce it regardless).
+        start_date = new_proposal.project.start_date
+        self.assertIsInstance(start_date, datetime.date)
+        self.assertNotIsInstance(start_date, datetime.datetime)
 
 
 @ddt
-class RequestedResourceGetTest(test.APITransactionTestCase):
+class RequestedResourceGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.url = factories.RequestedResourceFactory.get_list_url(
@@ -453,7 +618,7 @@ class RequestedResourceGetTest(test.APITransactionTestCase):
 
 
 @ddt
-class RequestedResourceCreateTest(test.APITransactionTestCase):
+class RequestedResourceCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.proposal = self.fixture.proposal
@@ -512,7 +677,7 @@ class RequestedResourceCreateTest(test.APITransactionTestCase):
 
 
 @ddt
-class RequestedResourceUpdateTest(test.APITransactionTestCase):
+class RequestedResourceUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.requested_resource = self.fixture.requested_resource
@@ -561,7 +726,7 @@ class RequestedResourceUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class RequestedResourceDeleteTest(test.APITransactionTestCase):
+class RequestedResourceDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.requested_resource = self.fixture.requested_resource
@@ -612,7 +777,8 @@ class RequestedResourceDeleteTest(test.APITransactionTestCase):
         return self.client.delete(self.url)
 
 
-class TaskTest(test.APITransactionTestCase):
+@ddt
+class TaskTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.proposal = self.fixture.proposal
@@ -621,13 +787,13 @@ class TaskTest(test.APITransactionTestCase):
         self.round = self.fixture.round
 
     def test_proposals_for_ended_rounds_should_be_cancelled(self):
-        self.round.cutoff_time = datetime.datetime.now() + datetime.timedelta(days=1)
+        self.round.cutoff_time = timezone.now() + datetime.timedelta(days=1)
         self.round.save()
         tasks.proposals_for_ended_rounds_should_be_cancelled()
         self.proposal.refresh_from_db()
         self.assertEqual(self.proposal.state, ProposalStates.DRAFT)
 
-        self.round.cutoff_time = datetime.datetime.now() - datetime.timedelta(days=1)
+        self.round.cutoff_time = timezone.now() - datetime.timedelta(days=1)
         self.round.save()
         tasks.proposals_for_ended_rounds_should_be_cancelled()
         self.proposal.refresh_from_db()
@@ -637,27 +803,56 @@ class TaskTest(test.APITransactionTestCase):
 
         self.assertTrue(Event.objects.filter(event_type="proposal_canceled").exists())
 
+    @data(ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW)
+    def test_submitted_proposals_survive_round_end(self, state):
+        # Review normally happens after the cutoff, so a proposal that was sent
+        # in time must not be swept up with the unsent drafts.
+        self.proposal.state = state
+        self.proposal.save()
+        step_instance = models.ProposalWorkflowStepInstance.objects.create(
+            proposal=self.proposal,
+            step="administrative_check",
+            status=WorkflowStepInstanceStatuses.ACTIVE,
+        )
+        review = factories.ReviewFactory(
+            proposal=self.proposal, state=models.Review.States.IN_REVIEW
+        )
+        self.round.cutoff_time = timezone.now() - datetime.timedelta(days=1)
+        self.round.save()
+
+        with mock.patch.object(
+            tasks.notify_proposal_creator_about_cancelled_proposal, "apply_async"
+        ) as notify:
+            tasks.proposals_for_ended_rounds_should_be_cancelled()
+
+        self.proposal.refresh_from_db()
+        self.assertEqual(self.proposal.state, state)
+        step_instance.refresh_from_db()
+        self.assertEqual(step_instance.status, WorkflowStepInstanceStatuses.ACTIVE)
+        review.refresh_from_db()
+        self.assertEqual(review.state, models.Review.States.IN_REVIEW)
+        notified = {call.kwargs["args"][0] for call in notify.call_args_list}
+        self.assertNotIn(self.proposal.uuid, notified)
+
     @override_settings(task_always_eager=True)
     def test_notifications_for_cancelled_proposals(self):
         structure_factories.NotificationFactory(
             key="proposal.proposal_cancelled",
         )
-        self.round.cutoff_time = datetime.datetime.now() - datetime.timedelta(days=1)
+        self.round.cutoff_time = timezone.now() - datetime.timedelta(days=1)
         self.round.save()
         tasks.proposals_for_ended_rounds_should_be_cancelled()
         self.proposal.refresh_from_db()
 
-        # Only DRAFT proposals should be cancelled after round ends
-        # SUBMITTED proposals (like proposal_submitted) should remain for review
-        self.assertEqual(len(mail.outbox), 1)
-
-        # Only the DRAFT proposal creator should receive an email
-        email_recipients = [mail.to for mail in mail.outbox]
-        expected_recipients = [
-            [self.proposal.created_by.email],
-        ]
-
-        self.assertEqual(sorted(email_recipients), sorted(expected_recipients))
+        # The fixture's round also holds a submitted proposal; only the draft's
+        # creator is told about a cancellation.
+        self.assertEqual(
+            [email.to for email in mail.outbox], [[self.proposal.created_by.email]]
+        )
+        self.fixture.proposal_submitted.refresh_from_db()
+        self.assertEqual(
+            self.fixture.proposal_submitted.state, ProposalStates.SUBMITTED
+        )
 
         # Find the email for self.proposal and verify its content
         proposal_email = None
@@ -673,70 +868,3 @@ class TaskTest(test.APITransactionTestCase):
             body,
         )
         self.assertIn("Cancellation details:", body)
-
-    def test_submitted_and_in_review_proposals_not_cancelled_after_round_ends(self):
-        """Verify that SUBMITTED and IN_REVIEW proposals are NOT cancelled when round ends."""
-        # Set round cutoff time to the past
-        self.round.cutoff_time = datetime.datetime.now() - datetime.timedelta(days=1)
-        self.round.save()
-
-        # Create proposals in different states
-        submitted_proposal = self.fixture.proposal_submitted
-        in_review_proposal = factories.ProposalFactory(
-            round=self.round,
-            state=ProposalStates.IN_REVIEW,
-        )
-
-        # Run the cancellation task
-        tasks.proposals_for_ended_rounds_should_be_cancelled()
-
-        # Verify SUBMITTED and IN_REVIEW proposals remain unchanged
-        submitted_proposal.refresh_from_db()
-        in_review_proposal.refresh_from_db()
-        self.assertEqual(submitted_proposal.state, ProposalStates.SUBMITTED)
-        self.assertEqual(in_review_proposal.state, ProposalStates.IN_REVIEW)
-
-    def test_reviews_cancelled_when_proposal_decided(self):
-        """Verify that reviews are only cancelled when proposal has been decided."""
-        from waldur_mastermind.proposal.models import Review
-
-        # Create a proposal in SUBMITTED state with reviews
-        proposal = self.fixture.proposal_submitted
-        review = factories.ReviewFactory(
-            proposal=proposal,
-            state=Review.States.IN_REVIEW,
-            review_end_date=datetime.datetime.now() - datetime.timedelta(days=1),
-        )
-
-        # Run the expiration task - review should NOT be cancelled yet
-        tasks.expired_reviews_should_be_cancelled()
-        review.refresh_from_db()
-        self.assertEqual(review.state, Review.States.IN_REVIEW)
-
-        # Now make a decision on the proposal
-        proposal.state = ProposalStates.ACCEPTED
-        proposal.save()
-
-        # Run the task again - now review should be cancelled
-        tasks.expired_reviews_should_be_cancelled()
-        review.refresh_from_db()
-        self.assertEqual(review.state, Review.States.REJECTED)
-
-    def test_reviews_remain_active_for_undecided_proposals(self):
-        """Verify that reviews remain active even past deadline if proposal not decided."""
-        from waldur_mastermind.proposal.models import Review
-
-        # Create proposal and review with expired deadline
-        proposal = self.fixture.proposal_submitted
-        review = factories.ReviewFactory(
-            proposal=proposal,
-            state=Review.States.CREATED,
-            review_end_date=datetime.datetime.now() - datetime.timedelta(days=30),
-        )
-
-        # Run expiration task
-        tasks.expired_reviews_should_be_cancelled()
-
-        # Review should still be active since proposal is not decided
-        review.refresh_from_db()
-        self.assertEqual(review.state, Review.States.CREATED)

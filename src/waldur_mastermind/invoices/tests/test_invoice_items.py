@@ -1,5 +1,6 @@
 import uuid
 from datetime import date
+from decimal import Decimal
 from unittest import mock
 
 import ddt
@@ -7,6 +8,7 @@ from freezegun import freeze_time
 from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.common.utils import parse_date
 from waldur_mastermind.invoices.models import PeriodMixin
 from waldur_mastermind.invoices.tests import factories, fixtures
@@ -15,7 +17,7 @@ from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
-class InvoiceItemDeleteTest(test.APITransactionTestCase):
+class InvoiceItemDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
 
@@ -41,7 +43,7 @@ class InvoiceItemDeleteTest(test.APITransactionTestCase):
         )
 
 
-class InvoiceItemUpdateTest(test.APITransactionTestCase):
+class InvoiceItemUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
 
@@ -144,7 +146,7 @@ class InvoiceItemUpdateTest(test.APITransactionTestCase):
         self.assertEqual(item.quantity, 6)
 
 
-class InvoiceItemCompensationTest(test.APITransactionTestCase):
+class InvoiceItemCompensationTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
         self.item = self.fixture.invoice_item
@@ -191,7 +193,7 @@ class InvoiceItemCompensationTest(test.APITransactionTestCase):
 
 @ddt.ddt
 @freeze_time("2019-01-01")
-class InvoiceTerminateTest(test.APITransactionTestCase):
+class InvoiceTerminateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
         self.item = self.fixture.invoice_item
@@ -246,7 +248,7 @@ class InvoiceTerminateTest(test.APITransactionTestCase):
 
 
 @freeze_time("2019-01-01")
-class InvoiceItemMigrateToTest(test.APITransactionTestCase):
+class InvoiceItemMigrateToTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
         self.item = self.fixture.invoice_item
@@ -280,7 +282,7 @@ class InvoiceItemMigrateToTest(test.APITransactionTestCase):
 
 
 @freeze_time("2019-01-01")
-class InvoiceItemCostsForPeriodTest(test.APITransactionTestCase):
+class InvoiceItemCostsForPeriodTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
         self.invoice1 = factories.InvoiceFactory(
@@ -349,6 +351,38 @@ class InvoiceItemCostsForPeriodTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["total_price"], "290.00")
 
+    def test_project_costs_filtered_by_resource(self):
+        # Two resources in the project with different accrued costs.
+        resource_a = marketplace_factories.ResourceFactory(project=self.fixture.project)
+        resource_b = marketplace_factories.ResourceFactory(project=self.fixture.project)
+        factories.InvoiceItemFactory(
+            invoice=self.invoice1,
+            project=self.fixture.project,
+            resource=resource_a,
+            unit_price=100,
+            quantity=1,
+        )
+        factories.InvoiceItemFactory(
+            invoice=self.invoice1,
+            project=self.fixture.project,
+            resource=resource_b,
+            unit_price=7,
+            quantity=1,
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            self.project_costs_url,
+            {
+                "project_uuid": self.fixture.project.uuid.hex,
+                "resource_uuid": resource_a.uuid.hex,
+                "period": PeriodMixin.Periods.TOTAL,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Only resource_a's cost is counted, not resource_b or the unscoped items.
+        self.assertEqual(response.data["total_price"], "100.00")
+
     def test_uuid_is_not_connected_to_any_project(self):
         self.client.force_authenticate(self.fixture.staff)
         url = factories.InvoiceItemFactory.get_list_url("project_costs_for_period")
@@ -386,12 +420,15 @@ class InvoiceItemCostsForPeriodTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
-class InvoiceItemCostsTest(test.APITransactionTestCase):
+class InvoiceItemCostsTest(test.APITestCase):
     def setUp(self):
         self.url = factories.InvoiceItemFactory.get_list_url("costs")
         self.project = structure_factories.ProjectFactory()
         self.invoice = factories.InvoiceFactory()
-        self.user = structure_factories.UserFactory()
+        # Staff because these tests focus on the aggregation/filter logic
+        # of the action; access control is exercised separately in
+        # test_security_c5_idor_fix.py.
+        self.user = structure_factories.UserFactory(is_staff=True)
 
     def test_costs_requires_project_uuid(self):
         self.client.force_authenticate(self.user)
@@ -475,3 +512,336 @@ class InvoiceItemCostsTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["price"], "100.00")
+
+    def test_costs_includes_items_for_current_month(self):
+        """Current month cost entry should include individual invoice items."""
+        factories.InvoiceItemFactory(
+            invoice=self.invoice,
+            project=self.project,
+            unit_price=Decimal("1.00"),
+            quantity=Decimal("10"),
+            unit=UnitPriceMixin.Units.PER_DAY,
+            name="CPU-Hours / My CPU Service",
+            measured_unit="CPU-Hours",
+        )
+        self.client.force_authenticate(self.user)
+        response = self.client.get(self.url + f"?project_uuid={self.project.uuid.hex}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        current = response.data[0]
+        self.assertIn("items", current)
+        self.assertEqual(len(current["items"]), 1)
+        item = current["items"][0]
+        self.assertEqual(item["name"], "CPU-Hours / My CPU Service")
+        self.assertEqual(float(item["unit_price"]), 1.00)
+        self.assertEqual(item["unit"], UnitPriceMixin.Units.PER_DAY)
+        self.assertEqual(float(item["quantity"]), 10.0)
+        self.assertEqual(item["measured_unit"], "CPU-Hours")
+
+    def test_costs_excludes_items_for_past_months(self):
+        """Past month cost entries should NOT include individual items."""
+        old_invoice = factories.InvoiceFactory(year=2023, month=1)
+        factories.InvoiceItemFactory(
+            invoice=old_invoice, project=self.project, unit_price=100, quantity=1
+        )
+        self.client.force_authenticate(self.user)
+        response = self.client.get(self.url + f"?project_uuid={self.project.uuid.hex}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("items", response.data[0])
+
+    def test_costs_excludes_zero_price_items(self):
+        """Zero-price items should be excluded from the breakdown."""
+        factories.InvoiceItemFactory(
+            invoice=self.invoice,
+            project=self.project,
+            unit_price=Decimal("0"),
+            quantity=10,
+            name="Free item",
+            measured_unit="units",
+        )
+        factories.InvoiceItemFactory(
+            invoice=self.invoice,
+            project=self.project,
+            unit_price=Decimal("5.00"),
+            quantity=1,
+            name="Paid item",
+            measured_unit="units",
+        )
+        self.client.force_authenticate(self.user)
+        response = self.client.get(self.url + f"?project_uuid={self.project.uuid.hex}")
+        items = response.data[0].get("items", [])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["name"], "Paid item")
+
+
+class InvoiceItemDetailSerializerTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.InvoiceFixture()
+
+    def test_serializer_includes_offering_uuid_from_resource(self):
+        """Test that offering_uuid is correctly serialized from resource.offering.uuid"""
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.InvoiceItemFactory.get_url(self.fixture.invoice_item)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Check that offering_uuid is present and matches the resource's offering UUID
+        self.assertIn("offering_uuid", response.data)
+        self.assertEqual(
+            str(response.data["offering_uuid"]),
+            str(self.fixture.resource.offering.uuid),
+        )
+
+    def test_serializer_includes_offering_component_type_from_direct_relationship(self):
+        """Test offering_component_type from direct plan_component relationship"""
+        # Create an invoice item with direct plan_component relationship
+        plan_component = marketplace_factories.PlanComponentFactory(
+            plan=self.fixture.plan,
+            component__type="cpu",
+            component__billing_type=BillingTypes.FIXED,
+        )
+
+        invoice_item = factories.InvoiceItemFactory(
+            resource=self.fixture.resource,
+            plan_component=plan_component,
+            invoice=self.fixture.invoice,
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.InvoiceItemFactory.get_url(invoice_item)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Check that offering_component_type is present and correct
+        self.assertIn("offering_component_type", response.data)
+        self.assertEqual(response.data["offering_component_type"], "cpu")
+
+    def test_serializer_fallback_to_details_field_for_offering_component_type(self):
+        """Test fallback to details field for backward compatibility"""
+        # Create an invoice item without direct plan_component but with details
+        invoice_item = factories.InvoiceItemFactory(
+            resource=self.fixture.resource,
+            plan_component=None,  # No direct relationship
+            invoice=self.fixture.invoice,
+            details={"offering_component_type": "memory", "plan_component_id": 123},
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.InvoiceItemFactory.get_url(invoice_item)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Check that offering_component_type falls back to details
+        self.assertIn("offering_component_type", response.data)
+        self.assertEqual(response.data["offering_component_type"], "memory")
+
+    def test_serializer_returns_none_when_no_component_type_available(self):
+        """Test that None is returned when no component type is available"""
+        # Create an invoice item without plan_component and without details
+        invoice_item = factories.InvoiceItemFactory(
+            resource=self.fixture.resource,
+            plan_component=None,
+            invoice=self.fixture.invoice,
+            details={},  # No offering_component_type in details
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.InvoiceItemFactory.get_url(invoice_item)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Check that offering_component_type is None
+        self.assertIn("offering_component_type", response.data)
+        self.assertIsNone(response.data["offering_component_type"])
+
+    def test_direct_relationship_takes_precedence_over_details(self):
+        """Test that direct plan_component relationship takes precedence over details"""
+        plan_component = marketplace_factories.PlanComponentFactory(
+            plan=self.fixture.plan,
+            component__type="storage",
+            component__billing_type=BillingTypes.USAGE,
+        )
+
+        # Create item with both direct relationship and details (different values)
+        invoice_item = factories.InvoiceItemFactory(
+            resource=self.fixture.resource,
+            plan_component=plan_component,
+            invoice=self.fixture.invoice,
+            details={"offering_component_type": "cpu"},  # Different from plan_component
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.InvoiceItemFactory.get_url(invoice_item)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Should use direct relationship, not details
+        self.assertEqual(response.data["offering_component_type"], "storage")
+
+    def test_serializer_includes_offering_name_from_resource(self):
+        """Test that offering_name is correctly serialized from resource.offering.name"""
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.InvoiceItemFactory.get_url(self.fixture.invoice_item)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.assertIn("offering_name", response.data)
+        self.assertEqual(
+            response.data["offering_name"],
+            self.fixture.resource.offering.name,
+        )
+
+    def test_serializer_fallback_to_details_field_for_offering_name(self):
+        """Test fallback to details field when resource is missing"""
+        invoice_item = factories.InvoiceItemFactory(
+            resource=None,
+            invoice=self.fixture.invoice,
+            details={"offering_name": "Test Offering"},
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.InvoiceItemFactory.get_url(invoice_item)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.assertIn("offering_name", response.data)
+        self.assertEqual(response.data["offering_name"], "Test Offering")
+
+    def test_serializer_returns_none_when_no_offering_name_available(self):
+        """Test that None is returned when no offering name is available"""
+        invoice_item = factories.InvoiceItemFactory(
+            resource=None,
+            invoice=self.fixture.invoice,
+            details={},
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.InvoiceItemFactory.get_url(invoice_item)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.assertIn("offering_name", response.data)
+        self.assertIsNone(response.data["offering_name"])
+
+
+class InvoiceItemModelTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.InvoiceFixture()
+
+    def test_get_plan_component_uses_direct_relationship_first(self):
+        """Test that get_plan_component() uses direct relationship when available"""
+        plan_component = marketplace_factories.PlanComponentFactory(
+            plan=self.fixture.plan, component__type="cpu"
+        )
+
+        invoice_item = factories.InvoiceItemFactory(
+            plan_component=plan_component,
+            details={"plan_component_id": 999},  # Different ID to ensure direct is used
+        )
+
+        result = invoice_item.get_plan_component()
+        self.assertEqual(result, plan_component)
+
+    def test_get_plan_component_fallback_to_details(self):
+        """Test fallback to details field when no direct relationship"""
+        plan_component = marketplace_factories.PlanComponentFactory(
+            plan=self.fixture.plan, component__type="memory"
+        )
+
+        invoice_item = factories.InvoiceItemFactory(
+            plan_component=None, details={"plan_component_id": plan_component.id}
+        )
+
+        result = invoice_item.get_plan_component()
+        self.assertEqual(result, plan_component)
+
+    def test_get_plan_component_returns_none_when_not_found(self):
+        """Test that None is returned when plan component is not found"""
+        invoice_item = factories.InvoiceItemFactory(
+            plan_component=None,
+            details={"plan_component_id": 99999},  # Non-existent ID
+        )
+
+        result = invoice_item.get_plan_component()
+        self.assertIsNone(result)
+
+    def test_get_plan_component_returns_none_when_no_data(self):
+        """Test that None is returned when no plan component data available"""
+        invoice_item = factories.InvoiceItemFactory(plan_component=None, details={})
+
+        result = invoice_item.get_plan_component()
+        self.assertIsNone(result)
+
+
+class InvoiceItemProjectScopeVisibilityTest(test.APITestCase):
+    """Project-scope roles see invoice items / costs of their project only
+    when the owning customer displays billing info in projects."""
+
+    def setUp(self):
+        self.fixture = fixtures.InvoiceFixture()
+        self.item = self.fixture.invoice_item  # unit_price=10, quantity=30
+        self.costs_url = factories.InvoiceItemFactory.get_list_url("costs")
+        self.list_url = factories.InvoiceItemFactory.get_list_url()
+
+    def get_costs(self, user, project=None):
+        project = project or self.fixture.project
+        self.client.force_authenticate(user)
+        return self.client.get(self.costs_url, {"project_uuid": project.uuid.hex})
+
+    def hide_billing_info(self):
+        self.fixture.customer.display_billing_info_in_projects = False
+        self.fixture.customer.save(update_fields=["display_billing_info_in_projects"])
+
+    def test_project_user_sees_costs_when_billing_info_is_displayed(self):
+        for user in (self.fixture.admin, self.fixture.manager, self.fixture.member):
+            response = self.get_costs(user)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(len(response.data), 1)
+            self.assertEqual(response.data[0]["price"], "300.00")
+
+    def test_project_user_does_not_see_costs_when_billing_info_is_hidden(self):
+        self.hide_billing_info()
+        response = self.get_costs(self.fixture.admin)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, [])
+
+    def test_owner_sees_costs_regardless_of_billing_info_flag(self):
+        self.hide_billing_info()
+        response = self.get_costs(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["price"], "300.00")
+
+    def test_project_user_does_not_see_costs_of_other_project(self):
+        other_project = structure_factories.ProjectFactory(
+            customer=self.fixture.customer
+        )
+        factories.InvoiceItemFactory(
+            invoice=self.fixture.invoice,
+            project=other_project,
+            unit_price=5,
+            quantity=1,
+        )
+        response = self.get_costs(self.fixture.admin, project=other_project)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, [])
+
+    def test_project_user_can_list_invoice_items_when_billing_info_is_displayed(self):
+        self.client.force_authenticate(self.fixture.admin)
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn(self.item.uuid.hex, [item["uuid"] for item in response.data])
+
+    def test_project_user_can_not_list_invoice_items_when_billing_info_is_hidden(self):
+        self.hide_billing_info()
+        self.client.force_authenticate(self.fixture.admin)
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn(self.item.uuid.hex, [item["uuid"] for item in response.data])

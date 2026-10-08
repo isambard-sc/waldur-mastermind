@@ -24,6 +24,15 @@ class CustomerRole:
             ),
         )
 
+    @classproperty
+    def READER(self):
+        return Role.objects.get_system_role(
+            RoleEnum.CUSTOMER_READER,
+            content_type=ContentType.objects.get_by_natural_key(
+                "structure", "customer"
+            ),
+        )
+
 
 class ServiceProviderRole:
     @classproperty
@@ -58,16 +67,6 @@ class ProjectRole:
             content_type=ContentType.objects.get_by_natural_key("structure", "project"),
         )
 
-    @classproperty
-    def INACTIVE(self):
-        role = Role.objects.get_system_role(
-            RoleEnum.PROJECT_MEMBER,
-            content_type=ContentType.objects.get_by_natural_key("structure", "project"),
-        )
-        role.is_active = False
-        role.save()
-        return role
-
 
 class OfferingRole:
     @classproperty
@@ -92,6 +91,13 @@ class CallRole:
     def MANAGER(self):
         return Role.objects.get_system_role(
             RoleEnum.CALL_MANAGER,
+            content_type=ContentType.objects.get_by_natural_key("proposal", "call"),
+        )
+
+    @classproperty
+    def PANEL_MEMBER(self):
+        return Role.objects.get_system_role(
+            RoleEnum.CALL_PANEL_MEMBER,
             content_type=ContentType.objects.get_by_natural_key("proposal", "call"),
         )
 

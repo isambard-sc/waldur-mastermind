@@ -1,11 +1,11 @@
 import logging
 from typing import cast
 
-import kubernetes as k8s
 from model_utils.tracker import FieldInstanceTracker
 
 from waldur_kubernetes.backend import KubernetesBackend
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import ResourceStates
 from waldur_mastermind.marketplace.utils import get_resource_state
 from waldur_mastermind.marketplace_rancher.const import (
@@ -63,10 +63,10 @@ def create_offering_user_for_rancher_user(
         )
         return
 
-    marketplace_models.OfferingUser.objects.create(
-        offering=offering,
-        user=instance.user,
-        username=instance.user.username,
+    # Through the shared creator so a provider-scoped offering gets a backed
+    # account; the username below is only used outside provider scope.
+    marketplace_utils.create_offering_user(
+        instance.user, offering, username=instance.user.username
     )
 
 
@@ -89,6 +89,10 @@ def drop_offering_user_for_rancher_user(sender, instance: RancherUser, **kwargs)
 def update_argocd_secret_when_resource_options_changed(
     sender, instance: marketplace_models.Resource, **kwargs
 ):
+    # Lazy import: keep the kubernetes SDK out of Django startup.
+    # See CLAUDE.md, "Lazy imports for heavy optional backends".
+    import kubernetes as k8s
+
     resource = instance
     tracker = cast(FieldInstanceTracker, resource.tracker)
     if not tracker.has_changed("options"):

@@ -6,6 +6,8 @@ from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
 
+from waldur_core.logging.enums import EventType
+from waldur_core.logging.models import Event
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.utils import move_project
@@ -14,7 +16,7 @@ from waldur_mastermind.marketplace.enums import OrderStates, ResourceStates
 from waldur_mastermind.marketplace.tests import factories, fixtures
 
 
-class RemovalOfExpiredProjectWithoutActiveResourcesTest(test.APITransactionTestCase):
+class RemovalOfExpiredProjectWithoutActiveResourcesTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.project = self.fixture.project
@@ -30,26 +32,98 @@ class RemovalOfExpiredProjectWithoutActiveResourcesTest(test.APITransactionTestC
         self.project.end_date = datetime.datetime(year=2020, month=1, day=1).date()
         self.project.save()
 
+    def project_exists(self):
+        return structure_models.Project.available_objects.filter(
+            id=self.project.id
+        ).exists()
+
+    def deletion_events(self):
+        return Event.objects.filter(event_type=EventType.PROJECT_DELETION_TRIGGERED)
+
     def test_delete_expired_project_if_every_resource_has_been_terminated(self):
         with freeze_time("2020-01-01"):
             self.assertTrue(self.project.is_expired)
-            self.resource_1.state = ResourceStates.TERMINATED
-            self.resource_1.save()
-            self.assertTrue(
-                structure_models.Project.available_objects.filter(
-                    id=self.project.id
-                ).exists()
+            with mock.patch.object(
+                tasks.delete_expired_project,
+                "delay",
+                side_effect=tasks.delete_expired_project,
+            ):
+                self.resource_1.state = ResourceStates.TERMINATED
+                with self.captureOnCommitCallbacks(execute=True):
+                    self.resource_1.save()
+                self.assertTrue(self.project_exists())
+                self.resource_2.state = ResourceStates.TERMINATED
+                with self.captureOnCommitCallbacks(execute=True):
+                    self.resource_2.save()
+                self.assertFalse(self.project_exists())
+
+    def test_deletion_is_scheduled_after_commit_not_run_in_request(self):
+        with freeze_time("2020-01-01"):
+            models.Resource.objects.filter(id=self.resource_1.id).update(
+                state=ResourceStates.TERMINATED
             )
-            self.resource_2.state = ResourceStates.TERMINATED
-            self.resource_2.save()
-            self.assertFalse(
-                structure_models.Project.available_objects.filter(
-                    id=self.project.id
-                ).exists()
+            with mock.patch.object(tasks.delete_expired_project, "delay") as mock_delay:
+                self.resource_2.state = ResourceStates.TERMINATED
+                with self.captureOnCommitCallbacks(execute=True):
+                    self.resource_2.save()
+                mock_delay.assert_called_once_with(self.project.uuid.hex)
+            self.assertTrue(self.project_exists())
+
+    def test_task_is_not_scheduled_when_project_is_not_expired(self):
+        with freeze_time("2019-12-01"):
+            models.Resource.objects.filter(id=self.resource_1.id).update(
+                state=ResourceStates.TERMINATED
             )
+            with mock.patch.object(tasks.delete_expired_project, "delay") as mock_delay:
+                self.resource_2.state = ResourceStates.TERMINATED
+                with self.captureOnCommitCallbacks(execute=True):
+                    self.resource_2.save()
+                mock_delay.assert_not_called()
+
+    def test_task_deletes_expired_project_without_active_resources(self):
+        with freeze_time("2020-01-01"):
+            models.Resource.objects.update(state=ResourceStates.TERMINATED)
+            tasks.delete_expired_project(self.project.uuid.hex)
+            self.assertFalse(self.project_exists())
+
+    def test_task_emits_deletion_triggered_event(self):
+        with freeze_time("2020-01-01"):
+            models.Resource.objects.update(state=ResourceStates.TERMINATED)
+            tasks.delete_expired_project(self.project.uuid.hex)
+            event = self.deletion_events().order_by("-created").first()
+            self.assertIsNotNone(event)
+            self.assertIn(self.project.name, event.message)
+            self.assertEqual(event.context["project_uuid"], self.project.uuid.hex)
+
+    def test_task_does_not_emit_event_when_deletion_is_skipped(self):
+        with freeze_time("2020-01-01"):
+            models.Resource.objects.filter(id=self.resource_1.id).update(
+                state=ResourceStates.TERMINATED
+            )
+            tasks.delete_expired_project(self.project.uuid.hex)
+            self.assertFalse(self.deletion_events().exists())
+
+    def test_task_skips_project_that_is_no_longer_expired(self):
+        with freeze_time("2020-01-01"):
+            models.Resource.objects.update(state=ResourceStates.TERMINATED)
+            self.project.end_date = None
+            self.project.save()
+            tasks.delete_expired_project(self.project.uuid.hex)
+            self.assertTrue(self.project_exists())
+
+    def test_task_skips_project_with_active_resources(self):
+        with freeze_time("2020-01-01"):
+            models.Resource.objects.filter(id=self.resource_1.id).update(
+                state=ResourceStates.TERMINATED
+            )
+            tasks.delete_expired_project(self.project.uuid.hex)
+            self.assertTrue(self.project_exists())
+
+    def test_task_ignores_unknown_project(self):
+        tasks.delete_expired_project("0" * 32)
 
 
-class MarketplaceResourceCountTest(test.APITransactionTestCase):
+class MarketplaceResourceCountTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.project = self.fixture.project
@@ -70,7 +144,7 @@ class MarketplaceResourceCountTest(test.APITransactionTestCase):
         )
 
 
-class ProjectMoveTest(test.APITransactionTestCase):
+class ProjectMoveTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -112,8 +186,24 @@ class ProjectMoveTest(test.APITransactionTestCase):
         private_offering.refresh_from_db()
         self.assertEqual(private_offering.customer, self.new_customer)
 
+    def test_change_customer_moves_service_settings_of_private_offering(self):
+        service_settings = structure_factories.ServiceSettingsFactory(
+            customer=self.old_customer, shared=False
+        )
+        private_offering = factories.OfferingFactory(
+            project=self.project,
+            customer=self.old_customer,
+            shared=False,
+            scope=service_settings,
+        )
+        self.change_customer()
+        private_offering.refresh_from_db()
+        service_settings.refresh_from_db()
+        self.assertEqual(private_offering.customer, self.new_customer)
+        self.assertEqual(service_settings.customer, self.new_customer)
 
-class ProjectStartDateTest(test.APITransactionTestCase):
+
+class ProjectStartDateTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.MarketplaceFixture()
         self.project = self.fixture.project

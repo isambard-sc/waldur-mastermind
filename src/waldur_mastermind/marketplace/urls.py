@@ -25,6 +25,26 @@ def register_in(router):
         basename="marketplace-category-group",
     )
     router.register(
+        r"marketplace-offering-groups",
+        views.OfferingGroupViewSet,
+        basename="marketplace-offering-group",
+    )
+    router.register(
+        r"marketplace-posix-id-pools",
+        views.PosixIdPoolViewSet,
+        basename="marketplace-posix-id-pool",
+    )
+    router.register(
+        r"marketplace-posix-identities",
+        views.PosixIdentityViewSet,
+        basename="marketplace-posix-identity",
+    )
+    router.register(
+        r"marketplace-tags",
+        views.TagViewSet,
+        basename="marketplace-tag",
+    )
+    router.register(
         r"marketplace-provider-offerings",
         views.ProviderOfferingViewSet,
         basename="marketplace-provider-offering",
@@ -68,6 +88,11 @@ def register_in(router):
         basename="marketplace-provider-resource",
     )
     router.register(
+        r"marketplace-offering-access-subnets",
+        views.OfferingAccessSubnetViewSet,
+        basename="marketplace-offering-access-subnet",
+    )
+    router.register(
         r"marketplace-category-component-usages",
         views.CategoryComponentUsageViewSet,
         basename="marketplace-category-component-usage",
@@ -81,6 +106,11 @@ def register_in(router):
         r"marketplace-component-user-usages",
         views.ComponentUserUsageViewSet,
         basename="marketplace-component-user-usage",
+    )
+    router.register(
+        r"marketplace-component-usage-monthly",
+        views.ComponentUsageMonthlyViewSet,
+        basename="marketplace-component-usage-monthly",
     )
     router.register(
         r"marketplace-public-api",
@@ -98,19 +128,19 @@ def register_in(router):
         basename="marketplace-offering-referral",
     )
     router.register(
-        r"marketplace-offering-user-roles",
-        views.OfferingUserRoleViewSet,
-        basename="marketplace-offering-user-role",
-    )
-    router.register(
-        r"marketplace-resource-users",
-        views.ResourceUserViewSet,
-        basename="marketplace-resource-user",
-    )
-    router.register(
         r"marketplace-offering-users",
         views.OfferingUsersViewSet,
         basename="marketplace-offering-user",
+    )
+    router.register(
+        r"marketplace-service-provider-accounts",
+        views.ServiceProviderAccountViewSet,
+        basename="marketplace-service-provider-account",
+    )
+    router.register(
+        r"marketplace-service-provider-project-groups",
+        views.ServiceProviderProjectGroupViewSet,
+        basename="marketplace-service-provider-project-group",
     )
     router.register(
         r"marketplace-offering-user-checklist-completions",
@@ -121,6 +151,21 @@ def register_in(router):
         r"marketplace-stats",
         views.StatsViewSet,
         basename="marketplace-stats",
+    )
+    router.register(
+        r"marketplace-project-posix-groups",
+        views.ProjectPosixGroupsViewSet,
+        basename="marketplace-project-posix-group",
+    )
+    router.register(
+        r"marketplace-customer-usage",
+        views.MarketplaceCustomerUsageViewSet,
+        basename="marketplace-customer-usage",
+    )
+    router.register(
+        r"marketplace-project-usage",
+        views.MarketplaceProjectUsageViewSet,
+        basename="marketplace-project-usage",
     )
     router.register(
         r"provider-invoice-items",
@@ -138,9 +183,19 @@ def register_in(router):
         basename="marketplace-robot-account",
     )
     router.register(
+        r"marketplace-resource-api-keys",
+        views.ResourceApiKeyViewSet,
+        basename="marketplace-resource-api-key",
+    )
+    router.register(
         r"marketplace-project-service-accounts",
         views.ProjectServiceAccountViewSet,
         basename="marketplace-project-service-account",
+    )
+    router.register(
+        r"marketplace-project-order-auto-approvals",
+        views.ProjectOrderAutoApprovalViewSet,
+        basename="marketplace-project-order-auto-approval",
     )
     router.register(
         r"marketplace-customer-service-accounts",
@@ -151,6 +206,16 @@ def register_in(router):
         r"marketplace-sections",
         views.SectionViewSet,
         basename="marketplace-section",
+    )
+    router.register(
+        r"marketplace-attributes",
+        views.AttributeViewSet,
+        basename="marketplace-attribute",
+    )
+    router.register(
+        r"marketplace-attribute-options",
+        views.AttributeOptionViewSet,
+        basename="marketplace-attribute-option",
     )
     router.register(
         r"marketplace-category-help-articles",
@@ -241,6 +306,53 @@ def register_in(router):
         r"marketplace-software-targets",
         views.SoftwareTargetViewSet,
         basename="marketplace-software-target",
+    )
+    router.register(
+        r"marketplace-demo-presets",
+        views.DemoPresetViewSet,
+        basename="marketplace-demo-preset",
+    )
+    router.register(
+        r"marketplace-article-code-update",
+        views.ArticleCodeUpdateViewSet,
+        basename="marketplace-article-code-update",
+    )
+
+    # Resource projects (nested under resources)
+    router.register(
+        r"marketplace-resource-projects",
+        views.ConsumerResourceProjectViewSet,
+        basename="marketplace-resource-project",
+    )
+    router.register(
+        r"marketplace-provider-resource-projects",
+        views.ProviderResourceProjectViewSet,
+        basename="marketplace-provider-resource-project",
+    )
+    router.register(
+        r"marketplace-offering-roles",
+        views.OfferingRoleViewSet,
+        basename="marketplace-offering-role",
+    )
+    router.register(
+        r"marketplace-offering-merges",
+        views.OfferingMergeViewSet,
+        basename="marketplace-offering-merge",
+    )
+    router.register(
+        r"marketplace-offering-profiles",
+        views.OfferingProfileViewSet,
+        basename="marketplace-offering-profile",
+    )
+    router.register(
+        r"marketplace-resource-limit-change-requests",
+        views.ResourceLimitChangeRequestViewSet,
+        basename="marketplace-resource-limit-change-request",
+    )
+    router.register(
+        r"marketplace-resource-end-date-change-requests",
+        views.ResourceEndDateChangeRequestViewSet,
+        basename="marketplace-resource-end-date-change-request",
     )
 
 

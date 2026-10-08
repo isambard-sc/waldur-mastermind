@@ -16,9 +16,12 @@ from waldur_mastermind.marketplace.tasks import (
     notify_consumer_about_pending_order,
     process_order_on_commit,
 )
-from waldur_slurm.utils import sanitize_allocation_name
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_allocation_name(name):
+    return re.sub(r"[^a-zA-Z0-9\-_]+", "", name)
 
 
 def get_internal_customer():
@@ -108,7 +111,7 @@ def get_or_create_project(customer: Customer, user: User, wrong_customer: Custom
         project = cast(
             Project, Project.objects.create(customer=customer, name=user.username)
         )
-        project.add_user(user, ProjectRole.ADMIN)
+        project.add_user_or_skip(user, ProjectRole.ADMIN)
         return project
 
 
@@ -252,7 +255,7 @@ def handle_new_user(sender, instance: User, created=False, **kwargs):
             return
         # assure that user has permissions connected with the project
         if not project.has_user(user, ProjectRole.ADMIN):
-            project.add_user(user, ProjectRole.ADMIN)
+            project.add_user_or_skip(user, ProjectRole.ADMIN)
 
         order, order_created = get_or_create_order(
             project,
@@ -275,7 +278,7 @@ def handle_new_user(sender, instance: User, created=False, **kwargs):
 
         # assure that user has permissions connected with the project
         if not project.has_user(user, ProjectRole.ADMIN):
-            project.add_user(user, ProjectRole.ADMIN)
+            project.add_user_or_skip(user, ProjectRole.ADMIN)
 
         order, order_created = get_or_create_order(
             project,

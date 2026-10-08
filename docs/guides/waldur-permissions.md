@@ -60,6 +60,111 @@ destroy_permissions = [check_destroy_permissions]
 - Custom validation that requires dynamic permission targets
 - Legacy code not yet refactored to declarative patterns
 
+## Adding New Permissions
+
+### 1. Define the Permission Enum
+
+Add the new permission to `PermissionEnum` in `src/waldur_core/permissions/enums.py`:
+
+```python
+class PermissionEnum(StrEnum):
+    MY_NEW_PERMISSION = "RESOURCE.MY_ACTION"
+```
+
+If the permission is for managing team members (creating/updating/deleting roles) on a scope type, also add it to the `CREATE_PERMISSIONS`, `UPDATE_PERMISSIONS`, and `DELETE_PERMISSIONS` dicts in the same file.
+
+### 2. Assign to Roles via permissions.yaml
+
+**Do NOT use data migrations to assign permissions to roles.** Instead, add the permission to the appropriate roles in `docker/rootfs/etc/waldur/permissions.yaml`:
+
+```yaml
+- role: CUSTOMER.OWNER
+  scope: customer
+  permissions:
+    - RESOURCE.MY_ACTION   # Add here
+```
+
+This file is loaded by the `import_roles` management command, which runs on deployment. The command creates roles and syncs their permissions from the YAML definition.
+
+**Operator-defined custom roles** (a deployment's own role, not one shipped with Waldur) go
+through a separate file, `docker/rootfs/etc/waldur/custom-roles.yaml`, mounted at
+`/etc/waldur/custom-roles.yaml` — same schema, also loaded by `import_roles` on every
+deployment, but empty (`[]`) by default. The `waldur-helm` chart exposes it as
+`waldur.customRoles`. Don't add operator-specific roles to `permissions.yaml` — that file ships
+with the image and is the same for every deployment.
+
+**Reusing a built-in role's name here is also valid**, and is how an operator fully replaces
+that role's permission set rather than adding/dropping individual permissions.
+`import_roles` matches by name, so an entry for e.g. `CUSTOMER.OWNER` in `custom-roles.yaml`
+overwrites its permissions with exactly the list given — the built-in `permissions.yaml` loads
+first (in `initdb`), so this always wins. This is a deliberate, one-way handover: from then on
+the operator owns that role's full permission set, and any permission mastermind adds to it in
+a later release is loaded and then immediately overwritten again on every deployment until the
+operator adds it to their own list too. Use `permissions-override.yaml`
+(`add_permissions`/`drop_permissions`, below) instead when the goal is to adjust a role while
+still tracking future upstream changes to it.
+
+Two more caveats, regardless of which name is used. A role loaded from this file is created as
+a **system role**, so it can no longer be renamed or deleted through the API; if a role of that
+name was created by hand in the UI, it is converted to a system role and its permission set is
+replaced by the file's. And there is no counterpart to `drop_stale_permissions` for roles —
+removing a role from the file does **not** remove it from the database, it only stops being
+managed. Deactivate roles you no longer want via `permissions-override.yaml`
+(`is_active: false`) rather than by deleting the entry.
+
+### 3. Use in ViewSets
+
+```python
+my_action_permissions = [
+    permission_factory(PermissionEnum.MY_NEW_PERMISSION, ["project.customer"])
+]
+```
+
+## Team visibility
+
+Listing the members of a scope (`GET .../list_users/`) is gated on a
+permission, not on role membership. Staff and support always pass. Otherwise
+the caller needs an active role that is one of the following:
+
+- on the organization, and grants `CUSTOMER.VIEW_TEAM`
+  (`PermissionEnum.VIEW_CUSTOMER_TEAM`);
+- on any project of the organization, and grants `PROJECT.VIEW_TEAM`
+  (`PermissionEnum.VIEW_PROJECT_TEAM`);
+- on the scope itself, when that scope is not an organization or a project
+  (resource, offering, call, proposal). No permission is needed here.
+
+Provider-side access to a resource's team (`OFFERING.UPDATE` on the offering or
+its organization) is unchanged.
+
+`permissions.yaml` grants `CUSTOMER.VIEW_TEAM` to `CUSTOMER.OWNER`,
+`CUSTOMER.SUPPORT` and `CUSTOMER.READER`. It grants `PROJECT.VIEW_TEAM` to
+`PROJECT.ADMIN`, `PROJECT.MANAGER` and `PROJECT.MEMBER`. A role without it,
+such as a zero-permission placeholder, can no longer see who else is in the
+organization. A role cloned into an organization copies its template's
+permissions when it is created, and later additions to the template do not
+reach it. Migration `permissions.0029_view_team_permissions` therefore adds the
+view-team permission to the six system roles above **and to their existing
+clones**, so organization owners on a cloned role keep the team listing after
+the upgrade. It also covers stacks that never run `import_roles`.
+
+Migration `permissions.0030_view_team_for_existing_roles` does the same for
+**every other organization or project role that exists at upgrade time**, such
+as roles staff created by hand, because until then any role let its holder list
+the team. SRAM placeholder roles are left out: they are meant to be private.
+Roles created after the upgrade get the permission only when someone grants it.
+
+Roles defined in `custom-roles.yaml` are different: `import_roles` replaces
+their whole permission set on every deployment, so the migration's addition is
+dropped again. Add `CUSTOMER.VIEW_TEAM` / `PROJECT.VIEW_TEAM` to those roles'
+`permissions` lists, or to `add_permissions` in `permissions-override.yaml`,
+which is applied afterwards. `import_roles` warns about every organization or
+project role it loads without the matching permission.
+
+The test suite mirrors the YAML grant: an autouse fixture in the root
+`conftest.py` adds the matching permission to every customer- and
+project-scoped system role that `get_system_role` creates. A test that needs
+the permission absent calls `role.delete_permission(...)`.
+
 ## Permission System Behavior
 
 ### Expiration Handling
@@ -89,3 +194,137 @@ destroy_permissions = [check_destroy_permissions]
 - Use `distinct()` for deduplication instead of manual logic
 - Accept 20-30 queries for complex operations rather than approximations
 - Verify permission checks use reasonable query counts (≤3 for most operations)
+
+## Personal Access Tokens — entity scoping
+
+`PersonalAccessToken` has two scope layers:
+
+1. `scopes` — the permission allowlist (subset of `PermissionEnum`). A PAT
+   can only ever exercise permissions that the user holds *and* that are
+   listed here.
+2. `allowed_scopes` — optional list of entity bindings restricting *where*
+   the PAT can act. Stored as `[{content_type_id, object_id}, …]`. Created
+   from `[{type, uuid}, …]` where `type` is a key of
+   `permissions.enums.TYPE_MAP` (e.g. `customer`, `project`, `offering`,
+   `resource`, `resource_project`, `call`, `proposal`, `service_provider`,
+   `call_organizer`).
+
+### Enforcement
+
+`_pat_scope_check` (and the `_pat_entity_check` helper in
+`waldur_core.permissions.utils`) runs ahead of the `is_staff` bypass so a
+scoped PAT narrows even staff users. The rules:
+
+- Empty `allowed_scopes` → no entity restriction (legacy behaviour).
+- `scope=None` request + non-empty bindings → denied. A scoped PAT cannot
+  perform scope-less / global actions.
+- Otherwise → allowed iff the request scope, or any of its ancestors per
+  `get_scope_ancestors`, matches one of the PAT's bindings. The walk is
+  upward-only: a PAT bound to a child entity does **not** authorise actions
+  on its parent.
+
+### Restrictions
+
+- `STAFF.ACCESS` / `SUPPORT.ACCESS` cannot be combined with `allowed_scopes` —
+  those scopes are global by design.
+- Non-staff users may only bind a PAT to entities where they hold at least
+  one of the requested permissions (directly or via an ancestor) — this
+  guard prevents privilege escalation through binding.
+- Bindings are immutable. `rotate` preserves them; there is no PATCH
+  endpoint. To change bindings, create a new PAT.
+- Bindings do **not** auto-revoke when the granting role is removed. The
+  stored `allowed_scopes` continue to surface entity names in the PAT
+  list/detail response, but enforcement falls through to the user's
+  current roles — the binding can only narrow access, never grant it.
+  If a user is removed from a customer, their PAT may still display the
+  customer's name (a minor info-leak about an entity they used to have
+  access to); to scrub it, revoke and recreate the PAT.
+
+### List-endpoint result filtering
+
+`PATScopeListFilter` in `waldur_core.permissions.pat_filtering` narrows
+both list and detail querysets so a scoped PAT only sees entities reachable
+from its bindings. It is installed once at app ready by
+monkey-patching `GenericAPIView.filter_queryset` — viewsets that override
+`filter_backends` are still covered, since the patch wraps the original
+implementation and applies the PAT filter after the viewset's own
+backends. Detail endpoints inherit the same narrowing because DRF's
+`get_object` calls `filter_queryset` before `get_object_or_404`.
+
+**Coverage**: the nine `TYPE_MAP` entity models are filtered:
+
+| Model | Reachable from binding type |
+|---|---|
+| `structure.Customer` | `customer` |
+| `structure.Project` | `customer`, `project` |
+| `marketplace.Offering` | `customer`, `offering` |
+| `marketplace.Resource` | `customer`, `project`, `offering`, `resource` |
+| `marketplace.ResourceProject` | `customer`, `project`, `offering`, `resource`, `resource_project` |
+| `marketplace.ServiceProvider` | `customer`, `service_provider` |
+| `proposal.CallManagingOrganisation` | `customer`, `call_organizer` |
+| `proposal.Call` | `call` (no ancestor inheritance) |
+| `proposal.Proposal` | `proposal` (no ancestor inheritance) |
+
+Endpoints whose model does not appear above (e.g. `/api/marketplace-orders/`,
+`/api/invoices/`) currently pass through unfiltered. Add a builder via
+`register_pat_filter` in `pat_filtering.py` to extend coverage.
+
+**Codepath limit**: the install only wraps `GenericAPIView.filter_queryset`.
+Views that bypass that codepath — `APIView` subclasses, custom actions
+that call `Model.objects.filter(...)` directly without going through
+`self.filter_queryset(self.get_queryset())`, or bespoke CSV/export
+endpoints — are **not** filtered. If you add such a view and it returns
+data for an entity in `TYPE_MAP`, call `PATScopeListFilter().filter_queryset(...)`
+on the queryset yourself before serialising.
+
+### Performance notes for scoped-PAT hot paths
+
+`_pat_entity_check` calls `get_scope_ancestors(scope)`, which dereferences
+foreign-key attributes on the request scope. If the view's queryset
+doesn't `select_related` those FKs, each scoped-PAT permission check
+incurs an extra DB round-trip per ancestor. Views that are hot under
+PAT auth should `select_related("customer", "project__customer",
+"offering")` (or whichever ancestors apply) — scoped PATs walk the
+ancestor chain on every permission check, so each missed `select_related`
+multiplies into one query per ancestor per check.
+
+## Role hygiene report
+
+`waldur_core/permissions/hygiene.py` checks the role catalogue for names that
+are not machine codes, system roles this release does not define, clones whose
+name or organization binding drifted, custom roles that are silently offered in
+every organization, and permissions that can never apply to a role's scope.
+Offering catalog roles (`resource` / `resource_project`) are exempt — their
+names are the provider's to choose.
+
+Two entry points, both read-only:
+
+```bash
+waldur check_role_names                       # text, exits 1 on errors
+waldur check_role_names --severity warning    # errors and warnings only
+waldur check_role_names --format json
+```
+
+```http
+GET /api/roles/hygiene_report/                # staff only
+```
+
+Only the findings that cannot be legitimately deployment-specific carry the
+error severity that fails the command: a name that is not a machine code, a
+system role bound to the wrong scope, a clone whose name drifted from its
+organization, a clone that lost its organization binding, and a role bound to
+more than one organization. A role name this release does not define is a
+warning — `import_roles` marks every role in a deployment's own
+`permissions.yaml` as a system role, and a deployment cannot add its roles to
+`SYSTEM_ROLE_SCOPES`.
+
+Two tables drive the scope checks and are the place to extend when a scope type
+or permission category is added, both in `permissions/enums.py`:
+`SCOPE_ANCESTORS` (which scopes a role governs from where it is granted) and
+`PERMISSION_TARGET_SCOPES` (the scope each permission category acts on). A
+permission is meaningful on its target scope and on every ancestor of it; a
+category missing from the table is skipped rather than guessed at.
+
+## Quiet grant sources
+
+`UserRole.source` records who issued a machine-made grant (`rule:<uuid>`, `sram:<uuid>`, ...). Role events carry it as `role_source`. An app can register a source prefix with `waldur_core.permissions.utils.register_quiet_grant_source(prefix)` in `AppConfig.ready`: grants and revocations with that prefix are still logged, but their events carry `suppress_email: true` and email hooks skip them. The SRAM integration registers `sram:` and `sram-rule:`, since its membership sync would otherwise email on every change.

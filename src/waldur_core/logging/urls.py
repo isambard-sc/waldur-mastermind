@@ -1,4 +1,5 @@
-from django.urls import re_path
+from django.urls import include, re_path
+from rest_framework.routers import DefaultRouter
 
 from waldur_core.logging import views
 
@@ -14,10 +15,35 @@ def register_in(router):
         views.EventSubscriptionViewSet,
         basename="event-subscription",
     )
+    router.register(
+        r"event-subscription-queues",
+        views.EventSubscriptionQueueViewSet,
+        basename="event-subscription-queue",
+    )
+    router.register(
+        r"event-consumers",
+        views.EventConsumerViewSet,
+        basename="event-consumer",
+    )
     router.register(r"email-logs", views.EmailLogView, basename="email-log")
+    router.register(r"system-logs", views.SystemLogViewSet, basename="system-log")
+    router.register(
+        r"data-access-logs",
+        views.UserDataAccessLogViewSet,
+        basename="data-access-log",
+    )
+
+
+# Debug router for staff-only debugging endpoints under /api/debug/
+debug_router = DefaultRouter()
+debug_router.register(r"pubsub", views.PubsubDebugViewSet, basename="pubsub-debug")
+debug_router.register(r"email", views.EmailDebugViewSet, basename="email-debug")
 
 
 urlpatterns = [
     re_path(r"^rabbitmq-vhost-stats/", views.RabbitMQVhostStats.as_view()),
     re_path(r"^rabbitmq-user-stats/", views.RabbitMQUserStats.as_view()),
+    re_path(r"^rabbitmq-stats/", views.RabbitMQStatsViewSet.as_view()),
+    re_path(r"^rabbitmq-overview/", views.RabbitMQOverviewStats.as_view()),
+    re_path(r"^debug/", include(debug_router.urls)),
 ]

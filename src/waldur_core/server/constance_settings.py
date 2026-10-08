@@ -13,7 +13,268 @@ LANGUAGE_CHOICES = [
     "nb",
     "ar",
     "cs",
+    "hr",
+    "km",
 ]
+
+SCRIPT_RUN_MODE_CHOICES = [
+    ("docker", "Docker"),
+    ("k8s", "Kubernetes"),
+]
+
+SIDEBAR_STYLE_CHOICES = [
+    ("primary", "Primary"),
+    ("accent", "Dark primary"),
+    ("accent-light", "Light primary"),
+    ("dark", "Dark"),
+    ("light", "Light"),
+    ("auto", "Match theme"),
+]
+
+FONT_FAMILY_CHOICES = [
+    ("Inter", "Inter"),
+    ("Maven Pro", "Maven Pro"),
+]
+
+MARKETPLACE_LAYOUT_MODE_CHOICES = [
+    ("classic", "Classic"),
+    ("sidebar", "Sidebar"),
+    ("carousel", "Carousel"),
+]
+
+MARKETPLACE_CARD_STYLE_CHOICES = [
+    ("compact", "Compact"),
+    ("detailed", "Detailed"),
+    ("list", "List"),
+    ("minimal", "Minimal"),
+]
+
+OPENPORTAL_MEMBERSHIP_SYNC_MODE_CHOICES = [
+    ("invitation", "Invite the user and wait for them to accept"),
+    ("direct", "Add the user to the project immediately"),
+]
+
+LOGIN_PAGE_LAYOUT_CHOICES = [
+    ("split-screen", "Split-screen"),
+    ("centered-card", "Centered-card"),
+    ("minimal", "Minimal"),
+    ("full-hero", "Full-hero"),
+    ("gradient", "Gradient"),
+    ("stacked", "Stacked"),
+    ("right-split", "Right-split"),
+    ("glassmorphism", "Glassmorphism"),
+    ("neumorphism", "Neumorphism"),
+    ("animated-gradient", "Animated-gradient"),
+    ("video-background", "Video-background"),
+    ("bottom-sheet", "Bottom-sheet"),
+    ("tabbed", "Tabbed"),
+    ("wizard", "Wizard"),
+    ("stats", "Stats"),
+    ("news", "News"),
+    ("carousel", "Carousel"),
+    ("logo-watermark", "Logo-watermark"),
+    ("brand-pattern", "Brand-pattern"),
+    ("duotone", "Duotone"),
+    ("diagonal", "Diagonal"),
+    ("time-based", "Time-based"),
+    ("seasonal", "Seasonal"),
+    ("weather", "Weather"),
+]
+
+SUPPORT_BACKEND_CHOICES = [
+    ("basic", "Basic"),
+    ("atlassian", "Atlassian"),
+    ("zammad", "Zammad"),
+    ("smax", "SMAX"),
+]
+
+ZAMMAD_ARTICLE_TYPE_CHOICES = [
+    ("email", "email"),
+    ("phone", "phone"),
+    ("web", "web"),
+    ("note", "note"),
+    ("sms", "sms"),
+    ("chat", "chat"),
+    ("fax", "fax"),
+    ("twitter status", "twitter status"),
+    ("twitter direct-message", "twitter direct-message"),
+    ("facebook feed post", "facebook feed post"),
+    ("facebook feed comment", "facebook feed comment"),
+    ("telegram personal-message", "telegram personal-message"),
+]
+
+OFFERING_VISIBILITY_CHOICES = [
+    ("show_all", "Show all shared offerings"),
+    ("show_restricted_disabled", "Show all but mark inaccessible as disabled"),
+    ("hide_inaccessible", "Hide offerings user cannot access"),
+    ("require_membership", "Hide all unless user belongs to an organization/project"),
+]
+
+# How an applicant reaches services. Governs navigation and entry points only;
+# the API keeps serving everything in every mode.
+SERVICE_ACCESS_MODE_CHOICES = [
+    ("calls", "Calls only"),
+    ("marketplace", "Marketplace only"),
+    ("both", "Marketplace and calls"),
+]
+
+AI_ASSISTANT_ENABLED_ROLES_CHOICES = [
+    ("disabled", "Disabled"),
+    ("staff", "Staff users"),
+    ("staff_and_support", "Staff and support users"),
+    ("all", "All users"),
+    ("anonymous", "All users including anonymous"),
+]
+
+NOTIFY_SYSTEM_CHOICES = [
+    ("AdminAnnouncement", "AdminAnnouncement"),
+    ("BroadcastMessage", "BroadcastMessage"),
+]
+
+ONBOARDING_VALIDATION_CHOICES = [
+    ("ariregister", "ariregister"),
+    ("wirtschaftscompass", "wirtschaftscompass"),
+    ("bolagsverket", "bolagsverket"),
+    ("breg", "breg"),
+    ("dnb_se", "dnb_se"),
+    ("dnb_no", "dnb_no"),
+    ("dnb_dk", "dnb_dk"),
+    ("dnb_fi", "dnb_fi"),
+]
+
+DEACTIVATION_POLICY_CHOICES = [
+    ("all_isds_removed", "All ISDs removed"),
+    ("any_isd_removed", "Any ISD removal"),
+]
+
+SSH_KEY_TYPE_CHOICES = [
+    ("ssh-ed25519", "ssh-ed25519"),
+    ("ecdsa-sha2-nistp256", "ecdsa-sha2-nistp256"),
+    ("ecdsa-sha2-nistp384", "ecdsa-sha2-nistp384"),
+    ("ecdsa-sha2-nistp521", "ecdsa-sha2-nistp521"),
+    ("ssh-rsa", "ssh-rsa"),
+    ("sk-ssh-ed25519@openssh.com", "sk-ssh-ed25519@openssh.com"),
+    ("sk-ecdsa-sha2-nistp256@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"),
+]
+
+PROVIDER_CHOICES = [
+    ("", "Not configured"),
+    ("tara", "TARA"),
+    ("eduteams", "eduTEAMS"),
+    ("keycloak", "Keycloak"),
+]
+
+# Note: These should ideally be imported from marketplace, but for now we define common ones.
+OFFERING_TYPE_CHOICES = [
+    ("Support.OfferingTemplate", "Support"),
+    ("Marketplace.Booking", "Booking"),
+    ("Marketplace.Basic", "Basic"),
+    ("OpenStack.Tenant", "OpenStack Tenant"),
+    ("OpenStack.Instance", "OpenStack Instance"),
+    ("OpenStack.Volume", "OpenStack Volume"),
+    ("Marketplace.Rancher", "Rancher"),
+    ("VMware.VirtualMachine", "VMware Virtual Machine"),
+    ("Waldur.RemoteOffering", "Remote Offering"),
+    ("Marketplace.Script", "Script"),
+    ("Marketplace.Slurm", "Site Agent"),
+]
+
+PROPOSAL_CONFIGURABLE_FIELD_CHOICES = [
+    ("project_summary", "Summary"),
+    ("description", "Description"),
+    ("science_sub_domain", "Science domain"),
+    ("supporting_documentation", "Supporting documentation"),
+]
+
+USER_ATTRIBUTE_CHOICES = [
+    ("username", "Username"),
+    ("registration_method", "Registration method"),
+    ("first_name", "First name"),
+    ("last_name", "Last name"),
+    ("full_name", "Full name"),
+    ("email", "Email"),
+    ("phone_number", "Phone number"),
+    ("organization", "Organization"),
+    ("job_title", "Job title"),
+    ("affiliations", "Affiliations"),
+    ("gender", "Gender"),
+    ("personal_title", "Personal title"),
+    ("birth_date", "Birth date"),
+    ("place_of_birth", "Place of birth"),
+    ("address", "Address"),
+    ("country_of_residence", "Country of residence"),
+    ("nationality", "Nationality"),
+    ("nationalities", "Nationalities"),
+    ("organization_country", "Organization country"),
+    ("organization_type", "Organization type"),
+    ("organization_registry_code", "Organization registry code"),
+    ("organization_vat_code", "Organization VAT code"),
+    ("organization_address", "Organization address"),
+    ("eduperson_assurance", "Eduperson assurance"),
+    ("civil_number", "Civil number"),
+    ("identity_source", "Identity source"),
+    ("active_isds", "Active identity sources"),
+    ("uid_number", "UID number"),
+    ("primary_gid", "Primary GID"),
+]
+
+# Keep in sync with waldur_core.users.scim.server.matching.IDENTIFYING_ATTRIBUTES.
+SCIM_USER_MATCH_ATTRIBUTE_CHOICES = [
+    ("username", "Username"),
+    ("email", "Email"),
+    ("civil_number", "Civil number"),
+]
+
+REPORTING_SCREEN_CHOICES = [
+    # Resources
+    ("resource-usage", "Resources: Usage"),
+    ("user-usage", "Resources: Usage by user"),
+    ("quotas", "Resources: Quotas"),
+    ("usage-monitoring", "Resources: Usage monitoring"),
+    ("usage-trends", "Resources: Usage trends"),
+    ("organization-summary", "Resources: Organization summary"),
+    ("project-detail", "Resources: Project detail"),
+    ("resources-geography", "Resources: Geographic distribution"),
+    ("project-classification", "Resources: Project classification"),
+    ("usage-by-customer", "Resources: Usage by customer"),
+    ("usage-by-org-type", "Resources: Usage by organization type"),
+    ("usage-by-creator", "Resources: Usage by creator"),
+    (
+        "projects-by-affiliated-organization",
+        "Resources: Projects by affiliated organization",
+    ),
+    # Proposals
+    ("call-performance", "Proposals: Call performance"),
+    ("review-progress", "Proposals: Review progress"),
+    ("resource-demand", "Proposals: Resource demand"),
+    # Provider
+    ("capacity", "Provider: Capacity"),
+    ("provider-overview", "Provider: Provider overview"),
+    ("provider-revenue", "Provider: Provider revenue"),
+    ("provider-orders", "Provider: Provider orders"),
+    ("provider-resources", "Provider: Provider resources"),
+    ("provider-customers", "Provider: Provider customers"),
+    ("provider-offerings", "Provider: Provider offerings"),
+    ("openstack-instances", "Provider: OpenStack instances"),
+    ("offering-usage", "Provider: Offering component usage"),
+    # Users
+    ("user-analytics", "Users: Analytics"),
+    ("user-demographics", "Users: Demographics"),
+    ("user-organizations", "Users: Organizations"),
+    ("user-affiliations", "Users: Affiliations"),
+    ("user-roles", "Users: Role distribution"),
+    # Financial
+    ("growth", "Financial: Growth"),
+    ("revenue", "Financial: Monthly revenue"),
+    ("pricelist", "Financial: Pricelist"),
+    ("orders", "Financial: Orders"),
+    ("offering-costs", "Financial: Offering costs"),
+    # Operations
+    ("maintenance-overview", "Operations: Maintenance overview"),
+    ("provisioning-stats", "Operations: Provisioning statistics"),
+]
+
+DEFAULT_ENABLED_REPORTING_SCREENS = [key for key, _ in REPORTING_SCREEN_CHOICES]
 
 CONSTANCE_BACKEND = "constance.backends.database.DatabaseBackend"
 CONSTANCE_DBS = "default"
@@ -25,16 +286,77 @@ CONSTANCE_ADDITIONAL_FIELDS = {
     "color_field": ["django.forms.CharField", {"required": False}],
     "html_field": ["django.forms.CharField", {"required": False}],
     "text_field": ["django.forms.CharField", {"required": False}],
+    "markdown_field": [
+        "django.forms.CharField",
+        {"required": False, "widget": "django.forms.Textarea"},
+    ],
+    # String setting that must not be blanked out - an empty value would change
+    # the meaning of the setting rather than just unset it.
+    "non_empty_field": ["django.forms.CharField", {"required": True}],
+    # Three to five capital latin letters. Validated here as well as in the
+    # settings serializer: the Django admin builds its form straight from this
+    # table and never reaches DRF, so a serializer-only rule let an admin store
+    # a prefix with a space or a newline in it.
+    "issue_key_prefix_field": [
+        "django.forms.RegexField",
+        {"regex": r"^[A-Z]{3,5}$", "required": True, "strip": True},
+    ],
     "url_field": ["django.forms.URLField", {"required": False}],
     "secret_field": ["django.forms.CharField", {"required": False}],
     "dict_field": ["waldur_core.core.serializers.DictField", {"required": False}],
     "list_field": ["waldur_core.core.serializers.ListField", {"required": False}],
+    "multiple_choice_field": [
+        "waldur_core.core.serializers.ListField",
+        {"required": False},
+    ],
+    "json_list_field": [
+        "waldur_core.core.serializers.JsonListField",
+        {"required": False},
+    ],
     "country_list_field": [
         "waldur_core.core.serializers.ListField",
         {"required": False},
     ],
     "choice_field": ["django.forms.ChoiceField", {"required": False}],
+    "multilingual_image_field": [
+        "waldur_core.core.forms.MultilingualImageField",
+        {"required": False},
+    ],
 }
+
+CONSTANCE_CONFIG_CHOICES = {
+    "SCRIPT_RUN_MODE": SCRIPT_RUN_MODE_CHOICES,
+    "DEFAULT_IDP": PROVIDER_CHOICES,
+    "SIDEBAR_STYLE": SIDEBAR_STYLE_CHOICES,
+    "FONT_FAMILY": FONT_FAMILY_CHOICES,
+    "LOGIN_PAGE_LAYOUT": LOGIN_PAGE_LAYOUT_CHOICES,
+    "MARKETPLACE_LAYOUT_MODE": MARKETPLACE_LAYOUT_MODE_CHOICES,
+    "MARKETPLACE_CARD_STYLE": MARKETPLACE_CARD_STYLE_CHOICES,
+    "OPENPORTAL_MEMBERSHIP_SYNC_MODE": OPENPORTAL_MEMBERSHIP_SYNC_MODE_CHOICES,
+    "WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE": SUPPORT_BACKEND_CHOICES,
+    "ZAMMAD_ARTICLE_TYPE": ZAMMAD_ARTICLE_TYPE_CHOICES,
+    "DEFAULT_OFFERING_USER_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
+    "DEFAULT_CALL_USER_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
+    "DEFAULT_PROPOSAL_REQUIRED_FIELDS": PROPOSAL_CONFIGURABLE_FIELD_CHOICES,
+    "DEFAULT_PROPOSAL_HIDDEN_FIELDS": PROPOSAL_CONFIGURABLE_FIELD_CHOICES,
+    "INVITATION_ALLOWED_FIELDS": USER_ATTRIBUTE_CHOICES,
+    "ENABLED_USER_PROFILE_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
+    "MANDATORY_USER_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
+    "MAINTENANCE_ANNOUNCEMENT_NOTIFY_SYSTEM": NOTIFY_SYSTEM_CHOICES,
+    "DISABLED_OFFERING_TYPES": OFFERING_TYPE_CHOICES,
+    "ONBOARDING_VALIDATION_METHODS": ONBOARDING_VALIDATION_CHOICES,
+    "FEDERATED_IDENTITY_SYNC_ALLOWED_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
+    "FEDERATED_IDENTITY_LOCKED_FIELDS": USER_ATTRIBUTE_CHOICES,
+    "FEDERATED_IDENTITY_DEACTIVATION_POLICY": DEACTIVATION_POLICY_CHOICES,
+    "SCIM_INBOUND_ALLOWED_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
+    "SCIM_USER_MATCH_WALDUR_ATTRIBUTE": SCIM_USER_MATCH_ATTRIBUTE_CHOICES,
+    "RESTRICTED_OFFERING_VISIBILITY_MODE": OFFERING_VISIBILITY_CHOICES,
+    "SERVICE_ACCESS_MODE": SERVICE_ACCESS_MODE_CHOICES,
+    "SSH_KEY_ALLOWED_TYPES": SSH_KEY_TYPE_CHOICES,
+    "ENABLED_REPORTING_SCREENS": REPORTING_SCREEN_CHOICES,
+    "AI_ASSISTANT_ENABLED_ROLES": AI_ASSISTANT_ENABLED_ROLES_CHOICES,
+}
+
 CONSTANCE_CONFIG = {
     "SITE_NAME": ("Waldur", "Human-friendly name of the Waldur deployment."),
     "SITE_DESCRIPTION": (
@@ -49,6 +371,20 @@ CONSTANCE_CONFIG = {
         "Username",
         "Label for the username field in Rancher external user resource access management.",
     ),
+    "DISCLAIMER_AREA_TEXT": (
+        "",
+        "Text content rendered in the disclaimer area below the footer.",
+        "text_field",
+    ),
+    "ABOUT_US_PAGE_ENABLED": (
+        False,
+        "Show the About us page and its link in the footer.",
+    ),
+    "ABOUT_US_PAGE_CONTENT": (
+        "",
+        "Markdown content of the About us page.",
+        "markdown_field",
+    ),
     "SITE_ADDRESS": ("", "It is used in marketplace order header."),
     "SITE_EMAIL": ("", "It is used in marketplace order header and UI footer."),
     "SITE_PHONE": ("", "It is used in marketplace order header and UI footer."),
@@ -60,11 +396,60 @@ CONSTANCE_CONFIG = {
         "120x120",
         "Size of the thumbnail to generate when screenshot is uploaded for an offering.",
     ),
+    "ENABLE_MARKDOWN_IMAGE_UPLOAD": (
+        False,
+        "Allow uploading images for embedding in offering markdown descriptions.",
+    ),
+    "MARKDOWN_IMAGE_MAX_SIZE_MB": (
+        5,
+        "Maximum size in megabytes for a markdown image upload.",
+    ),
     "ANONYMOUS_USER_CAN_VIEW_OFFERINGS": (
         True,
         "Allow anonymous users to see shared offerings in active, paused and archived states",
     ),
+    "SHOW_OFFERING_COVER_IMAGE": (
+        False,
+        "Show offering cover image as a banner above the name on the offering page.",
+    ),
     "ANONYMOUS_USER_CAN_VIEW_PLANS": (True, "Allow anonymous users to see plans"),
+    "RESTRICTED_OFFERING_VISIBILITY_MODE": (
+        "show_all",
+        "Controls offering visibility for regular users. "
+        "'show_all': Show all shared offerings (current behavior). "
+        "'show_restricted_disabled': Show all but mark inaccessible as disabled. "
+        "'hide_inaccessible': Hide offerings user cannot access. "
+        "'require_membership': Hide all unless user belongs to an organization/project.",
+        "choice_field",
+    ),
+    "SERVICE_ACCESS_MODE": (
+        "both",
+        "How users reach services. "
+        "'calls': only through calls for proposals, no marketplace navigation. "
+        "'marketplace': the marketplace is the single entry point; calls are "
+        "reached through an offering and proposals are tracked in the user "
+        "profile. "
+        "'both': marketplace and calls are browsable independently. "
+        "Navigation only — the API serves the same data in every mode.",
+        "choice_field",
+    ),
+    "OPENPORTAL_MEMBERSHIP_SYNC_MODE": (
+        "invitation",
+        "How to add a user to a project when an OpenPortal award lists them as "
+        "a member. "
+        "'invitation': create a pending invitation, so the user accepts, agrees "
+        "to the terms and is provisioned locally before gaining access. "
+        "'direct': create the account if it does not exist and grant the role "
+        "immediately. "
+        "A pending invitation is reported back to the allocating portal as a "
+        "member either way, so the award reaches a consistent state without "
+        "waiting for the user to act.",
+        "choice_field",
+    ),
+    "ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT": (
+        False,
+        "If true, service provider owners and managers can manage offering lifecycle (activate, pause, unpause, archive, draft, delete) without staff approval.",
+    ),
     "NOTIFY_STAFF_ABOUT_APPROVALS": (
         False,
         "If true, users with staff role are notified when request for order approval is generated",
@@ -81,18 +466,44 @@ CONSTANCE_CONFIG = {
         "Marketplace",
         "Marketplace landing page title.",
     ),
+    "MARKETPLACE_LAYOUT_MODE": (
+        "classic",
+        "Default marketplace layout mode.",
+        "choice_field",
+    ),
+    "MARKETPLACE_CARD_STYLE": (
+        "detailed",
+        "Default marketplace offering card style.",
+        "choice_field",
+    ),
     "ENABLE_STALE_RESOURCE_NOTIFICATIONS": (
         False,
         "Enable reminders to owners about resources of shared offerings that have not generated any cost for the last 3 months.",
+    ),
+    "ENABLE_ISSUES_FOR_USER_SSH_KEY_CHANGES": (
+        False,
+        "If true, a support ticket is created when a user adds or removes an SSH public key.",
     ),
     "TELEMETRY_URL": (
         "https://telemetry.waldur.com/",
         "URL for sending telemetry data.",
     ),
     "TELEMETRY_VERSION": (1, "Telemetry service version."),
+    "TELEMETRY_DEPLOYMENT_ID": (
+        "",
+        "Random identifier sent with telemetry so reports from one deployment "
+        "can be grouped. Generated on the first report; clear it to rotate.",
+    ),
+    "CHECK_FOR_UPDATES": (
+        True,
+        "If true, the version endpoint queries GitHub for the latest released "
+        "Waldur version. Disable in deployments without outbound internet access "
+        "to avoid failed requests to api.github.com.",
+    ),
     "SCRIPT_RUN_MODE": (
         "docker",
         'Type of jobs deployment. Valid values: "docker" for simple docker deployment, "k8s" for Kubernetes-based one',
+        "choice_field",
     ),
     "DOCKER_CLIENT": (
         {"base_url": "unix:///var/run/docker.sock"},
@@ -111,7 +522,7 @@ CONSTANCE_CONFIG = {
     "DOCKER_REMOVE_CONTAINER": (True, "Remove Docker container after script execution"),
     "DOCKER_IMAGES": (
         {
-            "python": {"image": "python:3.11-alpine", "command": "python"},
+            "python": {"image": "python:3.12-alpine", "command": "python"},
             "shell": {"image": "alpine:3", "command": "sh"},
             "ansible": {
                 "image": "alpine/ansible:2.18.6",
@@ -137,9 +548,17 @@ CONSTANCE_CONFIG = {
     ),
     "INVITATION_DISABLE_MULTIPLE_ROLES": (
         False,
-        "Do not allow user to grant multiple roles in the same project or organization using invitation.",
+        "Do not allow a user to hold multiple roles within the same scope (project or organization). Applies to invitations, permission requests and direct role assignment. When enabled, users can still get roles in different scopes but cannot have multiple roles in the same scope.",
     ),
-    "DEFAULT_IDP": ("", "Triggers authentication flow at once."),
+    "ONLY_ONE_PROJECT_MANAGER": (
+        False,
+        "If true, a project may have at most one active project manager (PROJECT.MANAGER).",
+    ),
+    "DEFAULT_IDP": (
+        "",
+        "Triggers authentication flow at once.",
+        "choice_field",
+    ),
     "DOCS_URL": ("", "Renders link to docs in header", "url_field"),
     "SHORT_PAGE_TITLE": ("Waldur", "It is used as prefix for page title."),
     "FULL_PAGE_TITLE": (
@@ -149,6 +568,24 @@ CONSTANCE_CONFIG = {
     "PROJECT_END_DATE_MANDATORY": (
         False,
         "If true, project end date field becomes mandatory when creating or updating projects.",
+    ),
+    "AFFILIATION_REQUIRED_AT_PROJECT_CREATION": (
+        False,
+        "If true, the affiliation field is required when creating or updating projects.",
+    ),
+    "PROJECT_NAME_REGEX": (
+        "",
+        "Regular expression that a project name must fully match when creating or "
+        "renaming a project. The whole name has to match the pattern. Leave empty to "
+        "disable the check. Examples: '^.{1,32}$' limits the name to at most 32 "
+        "characters; '^[A-Za-z0-9 _-]{1,32}$' also restricts it to letters, digits, "
+        "spaces, underscores and hyphens; '^[A-Za-z].{0,31}$' additionally requires it "
+        "to start with a letter.",
+    ),
+    "PROJECT_NAME_REGEX_ERROR_MESSAGE": (
+        "",
+        "Custom validation error shown when a project name does not match "
+        "PROJECT_NAME_REGEX. Leave empty to use the default message.",
     ),
     "ENABLE_ORDER_START_DATE": (
         False,
@@ -226,12 +663,62 @@ CONSTANCE_CONFIG = {
     ),
     "SIDEBAR_STYLE": (
         "dark",
-        "Style of sidebar. Possible values: dark, light, accent.",
+        "Style of sidebar.",
+        "choice_field",
     ),
-    "SITE_LOGO": ("", "The image used in marketplace order header.", "image_field"),
+    "FONT_FAMILY": (
+        "Inter",
+        "Font family used in the UI.",
+        "choice_field",
+    ),
     "LOGIN_LOGO": ("", "A custom .png image file for login page", "image_field"),
+    "LOGIN_LOGO_MULTILINGUAL": (
+        {},
+        "Language-specific login logos. Dict mapping language codes to image paths, "
+        "e.g., {'de': 'path/to/german_logo.png'}. "
+        "Falls back to LOGIN_LOGO if requested language not found.",
+        "multilingual_image_field",
+    ),
+    "LOGIN_PAGE_LAYOUT": (
+        "split-screen",
+        "Login page layout style.",
+        "choice_field",
+    ),
+    "LOGIN_PAGE_VIDEO_URL": (
+        "",
+        "Video URL for the video-background login page layout. "
+        "Supports MP4 format. Leave empty to use default sample video.",
+        "url_field",
+    ),
+    "LOGIN_PAGE_STATS": (
+        [],
+        "Stats displayed in the Stats login page layout. "
+        "List of objects with 'value' and 'label' keys, "
+        "e.g., [{'value': '10K+', 'label': 'Active Users'}, {'value': '99.9%', 'label': 'Uptime'}].",
+        "json_list_field",
+    ),
+    "LOGIN_PAGE_CAROUSEL_SLIDES": (
+        [],
+        "Carousel slides displayed in the Carousel login page layout. "
+        "List of objects with 'title' and 'subtitle' keys, "
+        "e.g., [{'title': 'Welcome', 'subtitle': 'Get started with our platform'}].",
+        "json_list_field",
+    ),
+    "LOGIN_PAGE_NEWS": (
+        [],
+        "News items displayed in the News login page layout. "
+        "List of objects with 'date', 'title', 'description', and 'tag' keys. "
+        "Supported tags: Feature, Update, Security, Announcement, Maintenance. "
+        "Example: [{'date': 'Jan 2025', 'title': 'New Feature', 'description': 'Description here', 'tag': 'Feature'}].",
+        "json_list_field",
+    ),
     "FAVICON": ("", "A custom favicon .png image file", "image_field"),
     "OFFERING_LOGO_PLACEHOLDER": ("", "Default logo for offering", "image_field"),
+    "DISCLAIMER_AREA_LOGO": (
+        "",
+        "The logo image rendered in the disclaimer area below the footer.",
+        "image_field",
+    ),
     # service desk integration settings
     "WALDUR_SUPPORT_ENABLED": (
         True,
@@ -239,11 +726,45 @@ CONSTANCE_CONFIG = {
     ),
     "WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE": (
         "atlassian",
-        "Type of support backend. Possible values: atlassian, zammad, smax.",
+        "Type of support backend. Possible values: basic, atlassian, zammad, smax.",
+        "choice_field",
     ),
     "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE": (
         True,
         "Toggler for request type displaying",
+    ),
+    "WALDUR_SUPPORT_ISSUE_KEY_PREFIX": (
+        "WLD",
+        "Prefix of ticket keys created by the built-in service desk, "
+        "e.g. WLD in WLD-A1B2C3D4. Three to five capital latin letters. "
+        "Keys of existing tickets are not rewritten.",
+        "issue_key_prefix_field",
+    ),
+    "WALDUR_SUPPORT_PROVIDER_ROUTING_ENABLED": (
+        False,
+        "Enable automatic routing of tickets to provider helpdesks.",
+    ),
+    "WALDUR_SUPPORT_AUTO_ASSIGN": (
+        False,
+        "Enable automatic assignment of tickets to support users.",
+    ),
+    "WALDUR_SUPPORT_AUTO_ASSIGN_STRATEGY": (
+        "least_loaded",
+        "Strategy for auto-assignment. Possible values: least_loaded, round_robin.",
+    ),
+    "WALDUR_SUPPORT_SLA_ENABLED": (
+        False,
+        "Enable SLA deadline tracking for the basic support backend.",
+    ),
+    "WALDUR_SUPPORT_SLA_RESPONSE_HOURS": (
+        4,
+        "SLA deadline for first response in hours.",
+        int,
+    ),
+    "WALDUR_SUPPORT_SLA_RESOLUTION_HOURS": (
+        24,
+        "SLA deadline for issue resolution in hours.",
+        int,
     ),
     # Atlassian settings
     "ATLASSIAN_MAP_WALDUR_USERS_TO_SERVICEDESK_AGENTS": (
@@ -269,6 +790,12 @@ CONSTANCE_CONFIG = {
         "secret_field",
     ),
     "ATLASSIAN_OAUTH2_CLIENT_ID": ("", "OAuth 2.0 Client ID", "secret_field"),
+    "ATLASSIAN_OAUTH2_CLIENT_SECRET": (
+        "",
+        "OAuth 2.0 Client Secret. With the client ID set, Waldur obtains and renews "
+        "access tokens itself (client credentials grant).",
+        "secret_field",
+    ),
     "ATLASSIAN_OAUTH2_ACCESS_TOKEN": ("", "OAuth 2.0 Access Token", "secret_field"),
     "ATLASSIAN_OAUTH2_TOKEN_TYPE": ("Bearer", "OAuth 2.0 Token Type"),
     "ATLASSIAN_VERIFY_SSL": (
@@ -290,21 +817,7 @@ CONSTANCE_CONFIG = {
     ),
     "ATLASSIAN_EXCLUDED_ATTACHMENT_TYPES": (
         "",
-        "Comma-separated list of file extenstions not allowed for attachment.",
-    ),
-    "ATLASSIAN_ISSUE_TYPES": (
-        "Informational, Service Request, Change Request, Incident",
-        "Comma-separated list of enabled issue types. First type is the default one.",
-    ),
-    "ATLASSIAN_SUPPORT_TYPE_MAPPING": (
-        {
-            "Informational": "Get IT help",
-            "Service Request": "Request new software",
-            "Change Request": "Change Request",
-            "Incident": "Report a system problem",
-        },
-        "Mapping from frontend issue types to backend request types",
-        "dict_field",
+        "Comma-separated list of file extensions not allowed for attachment.",
     ),
     "ATLASSIAN_DESCRIPTION_TEMPLATE": ("", "Template for issue description"),
     "ATLASSIAN_SUMMARY_TEMPLATE": ("", "Template for issue summary"),
@@ -330,6 +843,15 @@ CONSTANCE_CONFIG = {
         "customfield_10200",
         "Waldur backend ID custom field ID (fallback when field lookup by name fails)",
     ),
+    "JIRA_WEBHOOK_SHARED_SECRET": (
+        "",
+        "Shared secret expected in the X-Webhook-Secret header of inbound "
+        "JIRA webhook deliveries. If empty, authentication is not enforced "
+        "and the receiver accepts unauthenticated requests (legacy "
+        "behaviour). Configure your JIRA automation/webhook to send the "
+        "same value to enable authentication.",
+        "secret_field",
+    ),
     # Zammad settings
     "ZAMMAD_API_URL": (
         "",
@@ -344,9 +866,8 @@ CONSTANCE_CONFIG = {
     ),
     "ZAMMAD_ARTICLE_TYPE": (
         "email",
-        "Type of a comment. "
-        "Default is email because it allows support to reply to tickets directly in Zammad"
-        "<https://docs.zammad.org/en/latest/api/ticket/articles.html#articles/>",
+        "Type of a comment.",
+        "choice_field",
     ),
     "ZAMMAD_COMMENT_MARKER": (
         "Created by Waldur",
@@ -361,6 +882,14 @@ CONSTANCE_CONFIG = {
         "Time in minutes while comment deletion is available "
         "<https://github.com/zammad/zammad/issues/2687/>, "
         "<https://github.com/zammad/zammad/issues/3086/>",
+    ),
+    "ZAMMAD_WEBHOOK_SHARED_SECRET": (
+        "",
+        "Shared secret expected in the X-Webhook-Secret header of inbound "
+        "Zammad webhook deliveries. If empty, authentication is not "
+        "enforced and the receiver accepts unauthenticated requests "
+        "(legacy behaviour).",
+        "secret_field",
     ),
     # SMAX settings
     "SMAX_API_URL": (
@@ -385,6 +914,21 @@ CONSTANCE_CONFIG = {
     "SMAX_CREATION_SOURCE_NAME": ("", "Creation source name."),
     "SMAX_REQUESTS_OFFERING": ("", "Requests offering code for all issues."),
     "SMAX_VERIFY_SSL": (True, "Toggler for SSL verification"),
+    "SMAX_CERTIFICATE": (
+        "",
+        "Custom CA certificate (PEM format) used to verify the TLS connection "
+        "to the SMAX server. When set, it overrides the default CA bundle. "
+        "Ignored if SSL verification is disabled.",
+        "text_field",
+    ),
+    "SMAX_WEBHOOK_SHARED_SECRET": (
+        "",
+        "Shared secret expected in the X-Webhook-Secret header of inbound "
+        "SMAX webhook deliveries. If empty, authentication is not enforced "
+        "and the receiver accepts unauthenticated requests (legacy "
+        "behaviour).",
+        "secret_field",
+    ),
     # Service accounts
     "ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND": (
         False,
@@ -397,6 +941,80 @@ CONSTANCE_CONFIG = {
     ),
     # Proposal settings
     "PROPOSAL_REVIEW_DURATION": (7, "Review duration in days."),
+    "PROPOSAL_DASHBOARD_REVIEWS_DUE_WITHIN_DAYS": (
+        7,
+        "How many days ahead the call manager dashboard looks for review "
+        "deadlines. Past-due reviews are always included.",
+    ),
+    # ORCID integration settings
+    "ORCID_CLIENT_ID": (
+        "",
+        "ORCID OAuth2 Client ID for reviewer profile integration.",
+    ),
+    "ORCID_CLIENT_SECRET": (
+        "",
+        "ORCID OAuth2 Client Secret.",
+        "secret_field",
+    ),
+    "ORCID_REDIRECT_URI": (
+        "",
+        "ORCID OAuth2 Redirect URI. Typically {HOMEPORT_URL}/orcid-callback/",
+        "url_field",
+    ),
+    "ORCID_API_URL": (
+        "https://pub.orcid.org/v3.0",
+        "ORCID API Base URL. Use https://pub.sandbox.orcid.org/v3.0 for testing.",
+        "url_field",
+    ),
+    "ORCID_AUTH_URL": (
+        "https://orcid.org/oauth",
+        "ORCID OAuth Authorization URL. Use https://sandbox.orcid.org/oauth for testing.",
+        "url_field",
+    ),
+    "ORCID_SANDBOX_MODE": (
+        False,
+        "Use ORCID sandbox environment for testing. When enabled, uses sandbox URLs automatically.",
+    ),
+    # External publication API settings
+    "SEMANTIC_SCHOLAR_API_KEY": (
+        "",
+        "Semantic Scholar API Key for publication imports. Optional but recommended for higher rate limits.",
+        "secret_field",
+    ),
+    "CROSSREF_MAILTO": (
+        "",
+        "Email address for CrossRef API polite pool. Provides higher rate limits.",
+        "email_field",
+    ),
+    # Reviewer profile settings
+    "REVIEWER_PROFILES_ENABLED": (
+        True,
+        "Enable reviewer profile management features.",
+    ),
+    "COI_DETECTION_ENABLED": (
+        True,
+        "Enable conflict of interest detection features.",
+    ),
+    "COI_DISCLOSURE_REQUIRED": (
+        False,
+        "Require reviewers to submit COI disclosure before reviewing proposals.",
+    ),
+    "AUTOMATED_MATCHING_ENABLED": (
+        True,
+        "Enable automated reviewer-proposal matching algorithms.",
+    ),
+    "COI_COAUTHORSHIP_LOOKBACK_YEARS": (
+        5,
+        "Default number of years to look back for co-authorship COI detection.",
+    ),
+    "COI_COAUTHORSHIP_THRESHOLD_PAPERS": (
+        2,
+        "Default number of co-authored papers to trigger a COI.",
+    ),
+    "COI_INSTITUTIONAL_LOOKBACK_YEARS": (
+        3,
+        "Default number of years after leaving institution before COI expires.",
+    ),
     "USER_TABLE_COLUMNS": ("", "Comma-separated list of columns for users table."),
     "AUTO_APPROVE_USER_TOS": (
         False,
@@ -423,11 +1041,15 @@ CONSTANCE_CONFIG = {
     ),
     "FREEIPA_USERNAME_PREFIX": (
         "waldur_",
-        "Prefix to be appended to all usernames created in FreeIPA by Waldur",
+        "Prefix to be appended to all usernames created in FreeIPA by Waldur. "
+        "It marks which accounts are managed by Waldur, so it may not be empty.",
+        "non_empty_field",
     ),
     "FREEIPA_GROUPNAME_PREFIX": (
         "waldur_",
-        "Prefix to be appended to all group names created in FreeIPA by Waldur",
+        "Prefix to be appended to all group names created in FreeIPA by Waldur. "
+        "It marks which groups are managed by Waldur, so it may not be empty.",
+        "non_empty_field",
     ),
     "FREEIPA_BLACKLISTED_USERNAMES": (
         ["root"],
@@ -437,6 +1059,73 @@ CONSTANCE_CONFIG = {
     "FREEIPA_GROUP_SYNCHRONIZATION_ENABLED": (
         True,
         "Optionally disable creation of user groups in FreeIPA matching Waldur structure",
+    ),
+    "SCIM_MEMBERSHIP_SYNC_ENABLED": (
+        False,
+        "Enable SCIM entitlement synchronization to external identity provider.",
+    ),
+    "SCIM_API_URL": ("", "Base URL of the SCIM API service."),
+    "SCIM_API_KEY": ("", "SCIM API key for X-API-Key header.", "secret_field"),
+    "SCIM_URN_NAMESPACE": ("", "URN namespace for SCIM entitlements."),
+    "SCIM_INBOUND_ENABLED": (
+        False,
+        "Enable inbound SCIM 2.0 service provider at /scim/v2/. Allows external "
+        "identity providers (Okta, Entra ID, Keycloak) to provision users and groups.",
+    ),
+    "SCIM_INBOUND_SOURCE_NAME": (
+        "scim:default",
+        "Source label written to User.attribute_sources for inbound SCIM writes. "
+        "Used by the multi-source attribute merge to track ownership.",
+    ),
+    "SCIM_INBOUND_ALLOWED_ATTRIBUTES": (
+        ["first_name", "last_name", "email", "organization", "affiliations"],
+        "User attributes settable via inbound SCIM.",
+        "multiple_choice_field",
+    ),
+    "SCIM_INBOUND_SSH_KEYS_ENABLED": (
+        False,
+        "Allow inbound SCIM to manage user SSH public keys via the sshPublicKeys "
+        "attribute of the Waldur User extension. When enabled, SCIM is authoritative: "
+        "a full-replace (PUT / PATCH replace) that omits a key deletes it, including "
+        "keys the user added via the UI. Off by default because SSH keys grant access.",
+    ),
+    "SCIM_USER_MATCH_WALDUR_ATTRIBUTE": (
+        "username",
+        "Waldur user attribute that links an inbound SCIM user to an existing "
+        "account. Must be username or an enabled identifying attribute. With "
+        "username, new accounts are named after the matched value.",
+        "choice_field",
+    ),
+    "SCIM_USER_MATCH_SCIM_ATTRIBUTE": (
+        "userName",
+        "SCIM attribute holding the value matched against "
+        "SCIM_USER_MATCH_WALDUR_ATTRIBUTE, e.g. userName, emails, or an extension "
+        "path such as urn:mace:surf.nl:sram:scim:extension:User.eduPersonUniqueId.",
+    ),
+    "SRAM_INTEGRATION_ENABLED": (
+        False,
+        "Accept SCIM provisioning from SURF Research Access Management (SRAM) at "
+        "/scim/v2/sram/. Also requires SCIM_INBOUND_ENABLED and a staff service-account "
+        "token registered as the service's SCIM bearer token in SRAM.",
+    ),
+    "SRAM_PLACEHOLDER_ROLE_TEMPLATE": (
+        "",
+        "Name of the organization role whose permissions SRAM placeholder roles "
+        "copy. Empty gives placeholders no permissions. Placeholders are refreshed "
+        "on the next push or by 'waldur sram_resync'.",
+    ),
+    "SCIM_PULL_API_URL": (
+        "",
+        "Base URL for outbound SCIM pull (fetching user attributes from an external IdP).",
+    ),
+    "SCIM_PULL_API_KEY": (
+        "",
+        "Bearer token for outbound SCIM pull.",
+        "secret_field",
+    ),
+    "SCIM_PULL_SOURCE_NAME": (
+        "scim:pull",
+        "Source label written to User.attribute_sources for attributes pulled from a remote SCIM directory.",
     ),
     "KEYCLOAK_ICON": (
         "",
@@ -490,27 +1179,40 @@ CONSTANCE_CONFIG = {
     ),
     "OIDC_AUTH_URL": (
         "",
-        "OIDC authentication endpoint URL.",
+        "OIDC authorization endpoint URL. Reserved for future OAuth 2.0 authorization code flow integration.",
     ),
     "OIDC_INTROSPECTION_URL": (
         "",
-        "OIDC introspection endpoint URL for validating access tokens.",
+        "RFC 7662 Token Introspection endpoint URL. Used to validate API bearer tokens. "
+        "When a client sends Authorization: Bearer <token>, Waldur calls this endpoint to verify the token is active.",
     ),
     "OIDC_CLIENT_ID": (
         "",
-        "Client ID for authenticating against the introspection endpoint.",
+        "Client ID for HTTP Basic authentication when calling the token introspection endpoint. "
+        "Required together with OIDC_CLIENT_SECRET and OIDC_INTROSPECTION_URL.",
     ),
     "OIDC_CLIENT_SECRET": (
         "",
-        "Client secret for authenticating against the introspection endpoint.",
+        "Client secret for HTTP Basic authentication when calling the token introspection endpoint. "
+        "Required together with OIDC_CLIENT_ID and OIDC_INTROSPECTION_URL.",
+        "secret_field",
     ),
     "OIDC_USER_FIELD": (
         "username",
-        "Field name from the introspection response to identify the user (e.g., 'username', 'email', 'client_id').",
+        "Field name from the introspection response JSON used to identify the Waldur user. "
+        "Common values: 'username', 'email', 'sub', 'client_id'. The value is matched against User.username.",
     ),
     "OIDC_CACHE_TIMEOUT": (
         300,
-        "Number of seconds to cache token introspection results.",
+        "Seconds to cache successful token introspection results. Reduces load on the introspection endpoint. "
+        "Set to 0 to disable caching. Default: 300 (5 minutes).",
+    ),
+    "OIDC_REGISTRATION_METHOD": (
+        "oidc",
+        "Value stored in User.registration_method for accounts created or adopted "
+        "via Bearer token introspection (OIDCAuthentication). Set to the social "
+        "IdP provider slug (e.g. 'eduteams') when introspection and OAuth share "
+        "the same identity provider so IdentityProvider.protected_fields apply.",
     ),
     "OIDC_ACCESS_TOKEN_ENABLED": (
         False,
@@ -518,24 +1220,140 @@ CONSTANCE_CONFIG = {
     ),
     "OIDC_BLOCK_CREATION_OF_UNINVITED_USERS": (
         False,
-        "If true, block creation of an account on OIDC login if user email is not provided or provided and is not in the list of one of the active invitations.",
+        "If true, block creation of an account on OIDC login if user email is not provided or provided and is not in the list of one of the active invitations or matching active group invitation email patterns.",
+    ),
+    "OIDC_BLOCK_CREATION_OF_UNINVITED_USERS_RESPONSE_MESSAGE": (
+        "Account creation is blocked for uninvited users.",
+        "The message to show when OIDC account creation is blocked for uninvited users. "
+        "URLs are rendered as clickable links; include the scheme "
+        "(e.g. https://example.com) so bare URLs are linked.",
+        "text_field",
+    ),
+    "OIDC_BLOCKED_LOGIN_RESPONSE_MESSAGE": (
+        "Access to this deployment is restricted.",
+        "The message to show when an existing account is refused at login because its email "
+        "no longer matches OIDC_ALLOWED_USER_EMAIL_PATTERNS. Kept separate from the account "
+        "creation message so a long-standing user is not told their account cannot be created. "
+        "URLs are rendered as clickable links; include the scheme "
+        "(e.g. https://example.com) so bare URLs are linked.",
+        "text_field",
+    ),
+    "OIDC_ALLOWED_USER_EMAIL_PATTERNS": (
+        [],
+        "Comma-separated list of regular expressions matched against the user email, "
+        "e.g. '.*@example\\.com'. Only has an effect when OIDC_BLOCK_CREATION_OF_UNINVITED_USERS is enabled. "
+        "When non-empty, a user whose email matches any of the patterns may sign up without an invitation, "
+        "and existing users must keep matching in order to log in - except staff and support users, "
+        "users holding at least one unexpired role, users with a pending invitation and users matching "
+        "an autoprovisioning rule, which are always allowed. Only interactive logins are gated; "
+        "background identity synchronisation is not. "
+        "Patterns must match the whole email and are case-insensitive. "
+        "Note: values are split on commas, so a pattern cannot contain a comma - "
+        "'{n,m}' quantifiers are not supported, repeat the expression instead.",
+        "list_field",
+    ),
+    "OIDC_MATCHMAKING_BY_EMAIL": (
+        False,
+        "If true, when OIDC login fails to find a user by the primary lookup field, "
+        "attempt a secondary lookup by email before creating a new user. "
+        "On successful email match, the user's primary lookup field is updated to the OIDC claim value.",
+    ),
+    "OIDC_DEFAULT_LOGOUT_URL": (
+        "",
+        "Default logout URL used as fallback when IdentityProvider does not have a logout_url set. "
+        "This allows configuring a global logout endpoint for OIDC providers that don't expose end_session_endpoint in their discovery document.",
+        "url_field",
     ),
     "DEACTIVATE_USER_IF_NO_ROLES": (
         False,
         "Deactivate user if all roles are revoked (except staff/support)",
     ),
+    "WALDUR_AUTH_SOCIAL_ROLE_CLAIM": (
+        "",
+        "OAuth/OIDC token claim name containing user roles for automatic staff/support assignment. "
+        "If the claim contains 'staff', user gets is_staff=True. If it contains 'support', user gets is_support=True. "
+        "Leave empty to disable role synchronization from identity provider.",
+    ),
+    "REMOTE_EDUTEAMS_REFRESH_TOKEN": (
+        "",
+        "Rotating OAuth2 refresh token for remote eduTEAMS API access. "
+        "Automatically updated by the periodic token rotation task. "
+        "If empty, falls back to REMOTE_EDUTEAMS_REFRESH_TOKEN from Django settings.",
+        "secret_field",
+    ),
+    "DEFAULT_OFFERING_USER_ATTRIBUTES": (
+        ["username", "full_name", "email"],
+        "Default user attributes exposed to service providers (OfferingUser API) when no explicit config exists.",
+        "multiple_choice_field",
+    ),
+    "DEFAULT_CALL_USER_ATTRIBUTES": (
+        ["username", "full_name", "email"],
+        "Default applicant attributes exposed to call reviewers when no explicit CallApplicantVisibilityConfig exists.",
+        "multiple_choice_field",
+    ),
+    "DEFAULT_PROPOSAL_REQUIRED_FIELDS": (
+        ["project_summary"],
+        "Project details fields a new call requires by default. Applied when the "
+        "call is created; changing this never alters an existing call.",
+        "multiple_choice_field",
+    ),
+    "DEFAULT_PROPOSAL_HIDDEN_FIELDS": (
+        [],
+        "Project details fields a new call does not ask for at all. Applied when "
+        "the call is created; changing this never alters an existing call.",
+        "multiple_choice_field",
+    ),
+    "INVITATION_ALLOWED_FIELDS": (
+        ["full_name", "organization", "job_title"],
+        "Fields that can be provided in invitations for email personalization. These are NOT copied to user profile.",
+        "multiple_choice_field",
+    ),
+    "ENABLED_USER_PROFILE_ATTRIBUTES": (
+        ["phone_number", "organization", "job_title", "affiliations"],
+        "List of enabled user profile attributes. Controls IdP sync and UI display.",
+        "multiple_choice_field",
+    ),
+    "MANDATORY_USER_ATTRIBUTES": (
+        [],
+        "List of user profile attributes that are mandatory.",
+        "multiple_choice_field",
+    ),
+    "ENFORCE_MANDATORY_USER_ATTRIBUTES": (
+        False,
+        "If True, users with incomplete mandatory attributes will be blocked from most API "
+        "endpoints until they complete their profile.",
+    ),
     "MAINTENANCE_ANNOUNCEMENT_NOTIFY_BEFORE_MINUTES": (
         60,
         "How many minutes before scheduled maintenance users should be notified.",
     ),
+    "MAINTENANCE_ANNOUNCEMENT_TRAILING_BUFFER_MINUTES": (
+        60,
+        "Minutes the announcement banner stays visible after maintenance completes",
+    ),
     "MAINTENANCE_ANNOUNCEMENT_NOTIFY_SYSTEM": (
         ["AdminAnnouncement"],
-        "How maintenance notifications are delivered. Choices: AdminAnnouncement or BroadcastMessage.",
-        "list_field",
+        "How maintenance notifications are delivered.",
+        "multiple_choice_field",
     ),
     "ENFORCE_USER_CONSENT_FOR_OFFERINGS": (
         False,
         "If True, users must have active consent to access offerings that have active Terms of Service.",
+    ),
+    "ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS": (
+        False,
+        "If True, service providers only see offering users whose profiles have "
+        "all exposed attributes filled (per OfferingUserAttributeConfig).",
+    ),
+    "DISABLED_OFFERING_TYPES": (
+        [],
+        "List of offering types disabled for creation and selection.",
+        "multiple_choice_field",
+    ),
+    "ONBOARDING_VALIDATION_METHODS": (
+        [],
+        "List of automatic validation methods available for this portal.",
+        "multiple_choice_field",
     ),
     "ONBOARDING_VERIFICATION_EXPIRY_HOURS": (
         48,
@@ -549,7 +1367,6 @@ CONSTANCE_CONFIG = {
     "ONBOARDING_ARIREGISTER_USERNAME": (
         "",
         "Username for Estonian Äriregister API authentication.",
-        "text_field",
     ),
     "ONBOARDING_ARIREGISTER_PASSWORD": (
         "",
@@ -566,6 +1383,523 @@ CONSTANCE_CONFIG = {
         "url_field",
     ),
     "ONBOARDING_WICO_TOKEN": ("", "WirtschaftsCompass API token", "secret_field"),
+    "ONBOARDING_BOLAGSVERKET_API_URL": (
+        "https://gw-accept2.api.bolagsverket.se/",
+        "Sweden Business Register API server URL",
+        "url_field",
+    ),
+    "ONBOARDING_BOLAGSVERKET_TOKEN_API_URL": (
+        "https://portal-accept2.api.bolagsverket.se/",
+        "Bolagsverket OAuth2 token server base URL",
+        "url_field",
+    ),
+    "ONBOARDING_BOLAGSVERKET_CLIENT_ID": (
+        "",
+        "Sweden Business Register API client identifier",
+    ),
+    "ONBOARDING_BOLAGSVERKET_CLIENT_SECRET": (
+        "",
+        "Sweden Business Register API client secret",
+        "secret_field",
+    ),
+    "ONBOARDING_BREG_API_URL": (
+        "https://data.brreg.no/",
+        "Norway Business Register API server URL",
+        "url_field",
+    ),
+    "ONBOARDING_DNB_API_URL": (
+        "https://sandbox-api.bisnode.com/credit-data-companies/v2",
+        "Dun & Bradstreet (Bisnode) Credit Data API base URL",
+        "url_field",
+    ),
+    "ONBOARDING_DNB_RTS_API_URL": (
+        "https://sandbox-api.bisnode.com/nordic-rts/v1",
+        "Dun & Bradstreet (Bisnode) Nordic Right to Sign API base URL",
+        "url_field",
+    ),
+    "ONBOARDING_DNB_TOKEN_URL": (
+        "https://login.bisnode.com/as/token.oauth2",
+        "Dun & Bradstreet OAuth2 token endpoint URL",
+        "url_field",
+    ),
+    "ONBOARDING_DNB_CLIENT_ID": (
+        "",
+        "Dun & Bradstreet API client identifier",
+    ),
+    "ONBOARDING_DNB_CLIENT_SECRET": (
+        "",
+        "Dun & Bradstreet API client secret",
+        "secret_field",
+    ),
+    # AI assistant settings
+    "AI_ASSISTANT_ENABLED": (
+        False,
+        "Enable AI Assistant feature and calls to the inference service.",
+    ),
+    "AI_ASSISTANT_ENABLED_ROLES": (
+        "disabled",
+        "Controls which user roles can access the AI Assistant. "
+        "'disabled': No role-based access. "
+        "'staff': Staff users only. "
+        "'staff_and_support': Staff and support users. "
+        "'all': All authenticated users. "
+        "'anonymous': All users including anonymous (enables the public anonymous chat endpoint).",
+        "choice_field",
+    ),
+    "AI_ASSISTANT_BACKEND_TYPE": (
+        "vllm",
+        "Type of AI Assistant backend. For example: vllm, openai, ollama.",
+    ),
+    "AI_ASSISTANT_API_URL": (
+        "",
+        "Base URL for AI Assistant service API.",
+        "url_field",
+    ),
+    "AI_ASSISTANT_API_TOKEN": (
+        "",
+        "API key for authenticating with the AI Assistant service.",
+        "secret_field",
+    ),
+    "AI_ASSISTANT_MODEL": (
+        "qwen3.5-122b-nothinking",
+        "Name of the AI Assistant model to use for inference.",
+    ),
+    "AI_ASSISTANT_COMPLETION_KWARGS": (
+        {},
+        "Override keyword arguments merged on top of provider defaults for AI Assistant chat completion. "
+        "Supported keys: temperature, top_p, top_k, max_tokens, max_completion_tokens, "
+        "presence_penalty, frequency_penalty, repetition_penalty, stop, seed, "
+        "reasoning_effort, extra_body. "
+        "Leave empty to use provider defaults.",
+        "dict_field",
+    ),
+    "AI_ASSISTANT_TOKEN_LIMIT_DAILY": (
+        -1,
+        "Per-actor daily token cap (authenticated OR anonymous). -1 means unlimited.",
+    ),
+    "AI_ASSISTANT_TOKEN_LIMIT_WEEKLY": (
+        -1,
+        "Per-actor (authenticated OR anonymous) weekly token cap. -1 means unlimited.",
+    ),
+    "AI_ASSISTANT_TOKEN_LIMIT_MONTHLY": (
+        -1,
+        "Per-actor (authenticated OR anonymous) monthly token cap. -1 means unlimited.",
+    ),
+    "AI_ASSISTANT_GLOBAL_DAILY_TOKEN_BUDGET": (
+        5000000,
+        "Site-wide daily token cap across all assistant traffic (auth + "
+        "anonymous). -1 means unlimited.",
+    ),
+    "AI_ASSISTANT_GLOBAL_REQUESTS_PER_MINUTE": (
+        60,
+        "Site-wide burst cap across all assistant traffic.",
+    ),
+    "AI_ASSISTANT_SESSION_RETENTION_DAYS": (
+        90,
+        "Number of days to retain AI Assistant sessions before automatic deletion. Set to -1 to disable automatic cleanup.",
+    ),
+    "AI_ASSISTANT_HISTORY_LIMIT": (
+        50,
+        "Maximum number of past messages included in the AI Assistant context window.",
+    ),
+    "AI_ASSISTANT_STREAM_TIMEOUT_SECONDS": (
+        120,
+        "Hard timeout in seconds for a full streaming request including LLM completion.",
+    ),
+    "AI_ASSISTANT_INJECTION_ALLOWLIST": (
+        "",
+        "Comma-separated allowlist phrases that bypass injection detection.",
+    ),
+    "AI_ASSISTANT_NAME": (
+        "Waldur Assistant",
+        "Display name for the AI Assistant persona (e.g. 'Mari', 'Waldur Assistant').",
+    ),
+    "AI_ASSISTANT_SYSTEM_PROMPT_CUSTOM_INSTRUCTIONS": (
+        "",
+        "Additional instructions injected into the AI Assistant system prompt. "
+        "Use this for organisation-specific context, terminology, FAQ content, "
+        "or behavioural guidelines. Supports {assistant_name} and {organization} "
+        "placeholders. Overridden by the active SystemPrompt record when set.",
+        "text_field",
+    ),
+    # Anonymous AI assistant settings
+    "ANONYMOUS_CHAT_USER_SLUG_SALT": (
+        "",
+        "Scrypt salt for per-IP user_slug derivation. Empty disables slug "
+        "computation (interactions are written without it).",
+        "secret_field",
+    ),
+    "ANONYMOUS_CHAT_FEEDBACK_TOKEN_SECRET": (
+        "",
+        "HMAC-SHA256 secret for /feedback/ anti-replay tokens. Loss of "
+        "secrecy invalidates all in-flight feedback submissions.",
+        "secret_field",
+    ),
+    "ANONYMOUS_CHAT_CATALOG_MAX_ENTRIES": (
+        50,
+        "Hard cap on the number of offerings injected into the anonymous "
+        "assistant's system prompt catalog summary. Past this, drop the tail.",
+    ),
+    "ANONYMOUS_CHAT_REVIEW_ENABLED": (
+        True,
+        "Master toggle for the nightly LLM-as-judge review of completed "
+        "anonymous sessions. On by default — cost is bounded by "
+        "ANONYMOUS_CHAT_REVIEW_DAILY_TOKEN_BUDGET.",
+    ),
+    "ANONYMOUS_CHAT_REVIEW_DAILY_TOKEN_BUDGET": (
+        2000000,
+        "Independent budget for the LLM judge so review can't starve "
+        "user-facing traffic. Reuses AI_ASSISTANT_API_URL/TOKEN/MODEL.",
+    ),
+    "ANONYMOUS_CHAT_ARTIFACT_RETENTION_DAYS": (
+        30,
+        "Days of inactivity after which pseudonymous bookkeeping rows "
+        "(SessionBinding, AnonymousChatBudget) are purged. Active blocks "
+        "are always retained until they expire. Set to -1 to disable.",
+    ),
+    # Software catalog settings
+    "SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED": (
+        False,
+        "Enable automated daily updates for EESSI software catalog",
+    ),
+    "SOFTWARE_CATALOG_EESSI_VERSION": (
+        "",
+        "EESSI catalog version to load (auto-detect if empty)",
+    ),
+    "SOFTWARE_CATALOG_EESSI_API_URL": (
+        "https://www.eessi.io/api_data/data/",
+        "Base URL for EESSI API data",
+    ),
+    "SOFTWARE_CATALOG_EESSI_INCLUDE_EXTENSIONS": (
+        True,
+        "Include extension packages (Python, R packages, etc.) from EESSI",
+    ),
+    "SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED": (
+        False,
+        "Enable automated daily updates for Spack software catalog",
+    ),
+    "SOFTWARE_CATALOG_SPACK_VERSION": (
+        "",
+        "Spack catalog version to load (auto-detect if empty)",
+    ),
+    "SOFTWARE_CATALOG_SPACK_DATA_URL": (
+        "https://raw.githubusercontent.com/spack/packages.spack.io/refs/heads/gh-pages/data/repology.json",
+        "URL for Spack repology.json data",
+    ),
+    "SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES": (
+        True,
+        "Update existing packages during catalog refresh",
+    ),
+    "SOFTWARE_CATALOG_CLEANUP_ENABLED": (
+        True,
+        "Enable automatic cleanup of old catalog data",
+    ),
+    "SOFTWARE_CATALOG_RETENTION_DAYS": (
+        90,
+        "Number of days to retain old catalog versions",
+    ),
+    # System Logging settings
+    "SYSTEM_LOG_ENABLED": (
+        False,
+        "Enable storing system logs (API, Worker, Beat) in the database for staff viewing.",
+    ),
+    "SYSTEM_LOG_MAX_ROWS_PER_SOURCE": (
+        5000,
+        "Maximum number of log rows to keep per source (api, worker, beat). Oldest rows are deleted when exceeded.",
+    ),
+    # Table Growth Monitoring settings
+    "TABLE_GROWTH_MONITORING_ENABLED": (
+        True,
+        "Enable table growth monitoring to detect potential data leaks from bugs.",
+    ),
+    "TABLE_GROWTH_WEEKLY_THRESHOLD_PERCENT": (
+        50,
+        "Alert if a table grows by more than this percentage in a week.",
+    ),
+    "TABLE_GROWTH_MONTHLY_THRESHOLD_PERCENT": (
+        200,
+        "Alert if a table grows by more than this percentage in a month.",
+    ),
+    "TABLE_GROWTH_RETENTION_DAYS": (
+        90,
+        "Number of days to retain table size history data.",
+    ),
+    "TABLE_GROWTH_MIN_SIZE_BYTES": (
+        1048576,
+        "Minimum table size in bytes (default 1MB) to monitor. Smaller tables are ignored.",
+    ),
+    # User Revision History
+    "USER_REVISION_RETENTION_DAYS": (
+        730,
+        "Delete user profile revision history older than this many days. "
+        "Set to 0 to keep it forever.",
+    ),
+    "USER_REVISION_KEEP_MINIMUM": (
+        20,
+        "Always keep at least this many most recent revisions per user, however "
+        "old they are. Must be above 0, otherwise pruning can erase a user's "
+        "history entirely.",
+    ),
+    # User Actions Configuration
+    "USER_ACTIONS_ENABLED": (
+        False,
+        "Enable user actions notification system.",
+    ),
+    "USER_ACTIONS_PENDING_ORDER_HOURS": (
+        24,
+        "Hours before pending order becomes a user action item (1-168).",
+    ),
+    "USER_ACTIONS_HIGH_URGENCY_NOTIFICATION": (
+        True,
+        "Send digest notification if user has high urgency actions.",
+    ),
+    "USER_ACTIONS_NOTIFICATION_THRESHOLD": (
+        5,
+        "Send digest notification if user has more than N actions.",
+    ),
+    "USER_ACTIONS_EXECUTION_RETENTION_DAYS": (
+        90,
+        "Number of days to keep action execution history.",
+    ),
+    "USER_ACTIONS_DEFAULT_EXPIRATION_REMINDERS": (
+        [30, 14, 7, 1],
+        "Default reminder schedule (days before expiration) for expiring resources. Can be overridden per offering via plugin_options.resource_expiration_reminders.",
+        "list_field",
+    ),
+    # OpenStack call tracing settings
+    "OPENSTACK_LOG_CALLS_ENABLED": (
+        False,
+        "Emit one log line per OpenStack HTTP call on logger "
+        "`waldur_openstack.calls` (method, host+path, status, elapsed ms, "
+        "originating backend action). Useful for diagnosing slow tenant "
+        "operations; off by default because chatty under steady-state load.",
+    ),
+    "OPENSTACK_LOG_CALLS_THRESHOLD_MS": (
+        0,
+        "When OPENSTACK_LOG_CALLS_ENABLED is on, only emit lines for calls "
+        "slower than this many milliseconds. 0 logs every call. Errors are "
+        "always logged regardless of this threshold.",
+    ),
+    # User Data Access Logging settings
+    "USER_DATA_ACCESS_LOGGING_ENABLED": (
+        False,
+        "Enable logging of user profile data access events for GDPR compliance.",
+    ),
+    "USER_DATA_ACCESS_LOG_RETENTION_DAYS": (
+        90,
+        "Number of days to retain user data access logs before automatic cleanup.",
+    ),
+    "USER_DATA_ACCESS_LOG_SELF_ACCESS": (
+        False,
+        "Log when users access their own profile data. Disabled by default to reduce log volume.",
+    ),
+    # Arrow Integration Settings
+    "ARROW_AUTO_RECONCILIATION": (
+        False,
+        "Auto-apply compensations when Arrow validates billing",
+    ),
+    "ARROW_SYNC_INTERVAL_HOURS": (
+        6,
+        "Billing sync interval in hours",
+    ),
+    "ARROW_CONSUMPTION_SYNC_ENABLED": (
+        False,
+        "Enable real-time consumption sync from Arrow API",
+    ),
+    "ARROW_CONSUMPTION_SYNC_INTERVAL_HOURS": (
+        1,
+        "Consumption sync interval in hours (default: hourly)",
+    ),
+    "ARROW_BILLING_CHECK_INTERVAL_HOURS": (
+        6,
+        "Billing export check interval in hours for reconciliation",
+    ),
+    # Usage polling settings
+    "USAGE_POLL_RECORD_RETENTION_MONTHS": (
+        3,
+        "Number of months to retain usage poll records before automatic cleanup.",
+    ),
+    # SLURM Policy settings
+    "SLURM_POLICY_EVALUATION_LOG_RETENTION_DAYS": (
+        90,
+        "Number of days to retain SLURM policy evaluation log entries before automatic cleanup.",
+    ),
+    # Identity Bridge settings
+    "FEDERATED_IDENTITY_SYNC_ENABLED": (
+        False,
+        "Enable the Identity Bridge API for push-based ISD user attribute synchronization.",
+    ),
+    "FEDERATED_IDENTITY_SYNC_ALLOWED_ATTRIBUTES": (
+        ["first_name", "last_name", "email", "organization", "affiliations"],
+        "User attributes settable via Identity Bridge.",
+        "multiple_choice_field",
+    ),
+    "FEDERATED_IDENTITY_AUTHORITATIVE_ISD": (
+        "",
+        "ISD source identifier that is authoritative for FEDERATED_IDENTITY_LOCKED_FIELDS "
+        "(e.g. 'isd:efp'). When set and present in a user's active ISDs, other identity "
+        "sources (eduTEAMS, OIDC logins, ...) cannot overwrite the locked fields on sync. "
+        "Empty disables the protection.",
+    ),
+    "FEDERATED_IDENTITY_LOCKED_FIELDS": (
+        [],
+        "User attributes that only FEDERATED_IDENTITY_AUTHORITATIVE_ISD may set. "
+        "Other identity sources cannot overwrite these once the authoritative ISD "
+        "has asserted the user (e.g. first_name, last_name). Empty disables the protection.",
+        "multiple_choice_field",
+    ),
+    "FEDERATED_IDENTITY_DEACTIVATION_POLICY": (
+        "any_isd_removed",
+        "When to deactivate a federated user.",
+        "choice_field",
+    ),
+    # Project Digest settings
+    "ENABLE_PROJECT_DIGEST": (
+        False,
+        "Enable project digest email notifications for organizations.",
+    ),
+    # SSH key settings
+    "SSH_KEY_ALLOWED_TYPES": (
+        [
+            "ssh-ed25519",
+            "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521",
+            "ssh-rsa",
+            "sk-ssh-ed25519@openssh.com",
+            "sk-ecdsa-sha2-nistp256@openssh.com",
+        ],
+        "List of allowed SSH key types. Empty list means all types are allowed.",
+        "multiple_choice_field",
+    ),
+    "SSH_KEY_MIN_RSA_KEY_SIZE": (
+        2048,
+        "Minimum allowed RSA key size in bits. Set to 0 to disable the check.",
+    ),
+    "ENABLED_REPORTING_SCREENS": (
+        DEFAULT_ENABLED_REPORTING_SCREENS,
+        "Select which reporting screens should be visible to users. Uncheck to disable specific reports.",
+        "multiple_choice_field",
+    ),
+    # POSIX ID pool settings
+    "POSIX_ID_POOL_UTILIZATION_THRESHOLD": (
+        90,
+        "Utilization percentage of a POSIX ID pool namespace that triggers a warning event.",
+    ),
+    # Affiliate program settings
+    "AFFILIATES_ENABLED": (
+        False,
+        "Enable the affiliate program: staff-configured affiliate links, "
+        "fee accrual from finalized invoices, and the customer-affiliates API.",
+    ),
+    # Matrix chat settings
+    "MATRIX_ENABLED": (False, "Enable Matrix chat integration."),
+    "MATRIX_AUTO_CREATE_PROJECT_ROOMS": (
+        False,
+        "Automatically create a Matrix room for every newly created project. "
+        "Off by default; existing projects are backfilled with the "
+        "provision_matrix_rooms management command.",
+    ),
+    "MATRIX_HOMESERVER_URL": (
+        "",
+        "Matrix homeserver base URL, e.g. https://matrix.example.com",
+        "url_field",
+    ),
+    "MATRIX_HOMESERVER_PUBLIC_URL": (
+        "",
+        "Matrix homeserver URL used by browser clients. Falls back to "
+        "MATRIX_HOMESERVER_URL when blank. Set this when the homeserver is "
+        "reachable from servers and browsers at different addresses (e.g. a "
+        "Docker-internal name vs. a public Caddy-proxied URL).",
+        "url_field",
+    ),
+    "MATRIX_HOMESERVER_DOMAIN": (
+        "",
+        "Matrix homeserver domain name, e.g. matrix.example.com",
+    ),
+    "MATRIX_APPSERVICE_AS_TOKEN": (
+        "",
+        "Application service token for authenticating to the homeserver.",
+        "secret_field",
+    ),
+    "MATRIX_APPSERVICE_HS_TOKEN": (
+        "",
+        "Homeserver token for authenticating webhook requests.",
+        "secret_field",
+    ),
+    "MATRIX_APPSERVICE_SENDER_LOCALPART": (
+        "waldur-bot",
+        "Localpart for the appservice bot user.",
+    ),
+    "MATRIX_HISTORY_EXPORT_ENABLED": (
+        False,
+        "Enable periodic history export of Matrix rooms.",
+    ),
+    "MATRIX_EXPORT_MEDIA": (
+        False,
+        "Include media files when exporting Matrix room history.",
+    ),
+    "MATRIX_USER_REGISTRATION_SECRET": (
+        "",
+        "Shared secret for Matrix user registration.",
+        "secret_field",
+    ),
+    "MATRIX_USER_ID_FORMAT": (
+        "username",
+        "Format for generating Matrix user IDs: username, uuid, or email_local.",
+    ),
+    "MATRIX_LOGIN_METHOD": (
+        "token",
+        "Login method for Matrix credentials: password, token, or oidc.",
+    ),
+    "MATRIX_OIDC_PROVIDER_URL": (
+        "",
+        "OIDC provider URL for Matrix SSO login.",
+        "url_field",
+    ),
+    "MATRIX_LIVEKIT_KEY": (
+        "",
+        "LiveKit API key for the call SFU (Calls observability tab).",
+    ),
+    "MATRIX_LIVEKIT_SECRET": (
+        "",
+        "LiveKit API secret used to mint the admin token.",
+        "secret_field",
+    ),
+    "MATRIX_LIVEKIT_URL": (
+        "",
+        "Internal LiveKit base URL. Falls back to http://livekit:7880 when blank.",
+        "url_field",
+    ),
+    # Site Agent Logs
+    "SITE_AGENT_LOG_MAX_ROWS_PER_IDENTITY": (
+        10000,
+        "Maximum number of log rows to keep per agent identity. Oldest rows are deleted when exceeded.",
+    ),
+    # Personal Access Tokens
+    "PAT_ENABLED": (
+        False,
+        "Enable Personal Access Token authentication.",
+    ),
+    "PAT_MAX_LIFETIME_DAYS": (
+        365,
+        "Maximum PAT lifetime in days.",
+    ),
+    "PAT_MAX_TOKENS_PER_USER": (
+        20,
+        "Maximum number of active PATs per user.",
+    ),
+    "PAT_MAX_ACL_ENTRIES": (
+        20,
+        "Maximum number of network ACL entries per personal access token.",
+    ),
+    "PAT_MAX_AUDIT_EVENTS_PER_HOUR": (
+        50,
+        "Maximum audit events a single personal access token may generate per "
+        "hour, counted separately for source-address changes and for "
+        "rejections. Bounds the event table against a caller who holds one "
+        "valid token and rotates source addresses.",
+    ),
 }
 
 CONSTANCE_CONFIG_FIELDSETS = {
@@ -576,6 +1910,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "SITE_DESCRIPTION",
         "HOMEPORT_URL",
         "RANCHER_USERNAME_INPUT_LABEL",
+        "DISCLAIMER_AREA_TEXT",
     ),
     "Marketplace Branding": (
         "SITE_ADDRESS",
@@ -583,25 +1918,49 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "SITE_PHONE",
         "CURRENCY_NAME",
         "MARKETPLACE_LANDING_PAGE",
+        "MARKETPLACE_LAYOUT_MODE",
+        "MARKETPLACE_CARD_STYLE",
         "COUNTRIES",
     ),
-    "Marketplace": (
-        "THUMBNAIL_SIZE",
+    "Marketplace visibility & access": (
         "ANONYMOUS_USER_CAN_VIEW_OFFERINGS",
         "ANONYMOUS_USER_CAN_VIEW_PLANS",
+        "RESTRICTED_OFFERING_VISIBILITY_MODE",
+        "SERVICE_ACCESS_MODE",
+        "SHOW_OFFERING_COVER_IMAGE",
+        "ENFORCE_USER_CONSENT_FOR_OFFERINGS",
+        "ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS",
+        "ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT",
+    ),
+    "Marketplace notifications": (
         "NOTIFY_STAFF_ABOUT_APPROVALS",
         "NOTIFY_ABOUT_RESOURCE_CHANGE",
         "DISABLE_SENDING_NOTIFICATIONS_ABOUT_RESOURCE_UPDATE",
         "ENABLE_STALE_RESOURCE_NOTIFICATIONS",
-        "ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND",
-        "ENABLE_MOCK_COURSE_ACCOUNT_BACKEND",
-        "ENFORCE_USER_CONSENT_FOR_OFFERINGS",
+    ),
+    "Offerings & orders": (
+        "THUMBNAIL_SIZE",
+        "ENABLE_MARKDOWN_IMAGE_UPLOAD",
+        "MARKDOWN_IMAGE_MAX_SIZE_MB",
+        "DISABLED_OFFERING_TYPES",
         "ENABLE_ORDER_START_DATE",
     ),
-    "Project": ("PROJECT_END_DATE_MANDATORY",),
+    "Marketplace development": (
+        "ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND",
+        "ENABLE_MOCK_COURSE_ACCOUNT_BACKEND",
+    ),
+    "Project": (
+        "PROJECT_END_DATE_MANDATORY",
+        "AFFILIATION_REQUIRED_AT_PROJECT_CREATION",
+        "PROJECT_NAME_REGEX",
+        "PROJECT_NAME_REGEX_ERROR_MESSAGE",
+        "OPENPORTAL_MEMBERSHIP_SYNC_MODE",
+    ),
     "Telemetry": (
         "TELEMETRY_URL",
         "TELEMETRY_VERSION",
+        "TELEMETRY_DEPLOYMENT_ID",
+        "CHECK_FOR_UPDATES",
     ),
     "Custom Scripts": (
         "SCRIPT_RUN_MODE",
@@ -619,6 +1978,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "COMMON_FOOTER_TEXT",
         "COMMON_FOOTER_HTML",
         "MAINTENANCE_ANNOUNCEMENT_NOTIFY_BEFORE_MINUTES",
+        "MAINTENANCE_ANNOUNCEMENT_TRAILING_BUFFER_MINUTES",
         "MAINTENANCE_ANNOUNCEMENT_NOTIFY_SYSTEM",
     ),
     "Links": (
@@ -629,11 +1989,22 @@ CONSTANCE_CONFIG_FIELDSETS = {
     ),
     "Theme": (
         "SIDEBAR_STYLE",
+        "FONT_FAMILY",
         "BRAND_COLOR",
         "DISABLE_DARK_THEME",
     ),
+    "About us page": (
+        "ABOUT_US_PAGE_ENABLED",
+        "ABOUT_US_PAGE_CONTENT",
+    ),
+    "Login page": (
+        "LOGIN_PAGE_LAYOUT",
+        "LOGIN_PAGE_VIDEO_URL",
+        "LOGIN_PAGE_STATS",
+        "LOGIN_PAGE_CAROUSEL_SLIDES",
+        "LOGIN_PAGE_NEWS",
+    ),
     "Images": (
-        "SITE_LOGO",
         "SIDEBAR_LOGO",
         "SIDEBAR_LOGO_MOBILE",
         "SIDEBAR_LOGO_DARK",
@@ -642,14 +2013,23 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "MARKETPLACE_HERO_IMAGE",
         "CALL_MANAGEMENT_HERO_IMAGE",
         "LOGIN_LOGO",
+        "LOGIN_LOGO_MULTILINGUAL",
         "FAVICON",
         "OFFERING_LOGO_PLACEHOLDER",
         "KEYCLOAK_ICON",
+        "DISCLAIMER_AREA_LOGO",
     ),
     "Service desk integration settings": (
         "WALDUR_SUPPORT_ENABLED",
         "WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE",
         "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE",
+        "WALDUR_SUPPORT_ISSUE_KEY_PREFIX",
+        "WALDUR_SUPPORT_PROVIDER_ROUTING_ENABLED",
+        "WALDUR_SUPPORT_AUTO_ASSIGN",
+        "WALDUR_SUPPORT_AUTO_ASSIGN_STRATEGY",
+        "WALDUR_SUPPORT_SLA_ENABLED",
+        "WALDUR_SUPPORT_SLA_RESPONSE_HOURS",
+        "WALDUR_SUPPORT_SLA_RESOLUTION_HOURS",
     ),
     "Atlassian settings": (
         "ATLASSIAN_API_URL",
@@ -659,13 +2039,12 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ATLASSIAN_TOKEN",
         "ATLASSIAN_PERSONAL_ACCESS_TOKEN",
         "ATLASSIAN_OAUTH2_CLIENT_ID",
+        "ATLASSIAN_OAUTH2_CLIENT_SECRET",
         "ATLASSIAN_OAUTH2_ACCESS_TOKEN",
         "ATLASSIAN_OAUTH2_TOKEN_TYPE",
         "ATLASSIAN_PROJECT_ID",
         "ATLASSIAN_DEFAULT_OFFERING_ISSUE_TYPE",
         "ATLASSIAN_EXCLUDED_ATTACHMENT_TYPES",
-        "ATLASSIAN_ISSUE_TYPES",
-        "ATLASSIAN_SUPPORT_TYPE_MAPPING",
         "ATLASSIAN_AFFECTED_RESOURCE_FIELD",
         "ATLASSIAN_DESCRIPTION_TEMPLATE",
         "ATLASSIAN_SUMMARY_TEMPLATE",
@@ -686,6 +2065,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ATLASSIAN_VERIFY_SSL",
         "ATLASSIAN_USE_OLD_API",
         "ATLASSIAN_MAP_WALDUR_USERS_TO_SERVICEDESK_AGENTS",
+        "JIRA_WEBHOOK_SHARED_SECRET",
     ),
     "Zammad settings": (
         "ZAMMAD_API_URL",
@@ -695,6 +2075,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ZAMMAD_COMMENT_MARKER",
         "ZAMMAD_COMMENT_PREFIX",
         "ZAMMAD_COMMENT_COOLDOWN_DURATION",
+        "ZAMMAD_WEBHOOK_SHARED_SECRET",
     ),
     "SMAX settings": (
         "SMAX_API_URL",
@@ -709,18 +2090,65 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "SMAX_TIMES_TO_PULL",
         "SMAX_CREATION_SOURCE_NAME",
         "SMAX_VERIFY_SSL",
+        "SMAX_CERTIFICATE",
+        "SMAX_WEBHOOK_SHARED_SECRET",
     ),
-    "Proposal settings": ("PROPOSAL_REVIEW_DURATION",),
+    "Proposal settings": (
+        "PROPOSAL_REVIEW_DURATION",
+        "PROPOSAL_DASHBOARD_REVIEWS_DUE_WITHIN_DAYS",
+        "DEFAULT_PROPOSAL_REQUIRED_FIELDS",
+        "DEFAULT_PROPOSAL_HIDDEN_FIELDS",
+        "REVIEWER_PROFILES_ENABLED",
+        "COI_DETECTION_ENABLED",
+        "COI_DISCLOSURE_REQUIRED",
+        "AUTOMATED_MATCHING_ENABLED",
+        "COI_COAUTHORSHIP_LOOKBACK_YEARS",
+        "COI_COAUTHORSHIP_THRESHOLD_PAPERS",
+        "COI_INSTITUTIONAL_LOOKBACK_YEARS",
+    ),
+    "ORCID integration settings": (
+        "ORCID_CLIENT_ID",
+        "ORCID_CLIENT_SECRET",
+        "ORCID_REDIRECT_URI",
+        "ORCID_API_URL",
+        "ORCID_AUTH_URL",
+        "ORCID_SANDBOX_MODE",
+    ),
+    "Publication API settings": (
+        "SEMANTIC_SCHOLAR_API_KEY",
+        "CROSSREF_MAILTO",
+    ),
     "Table settings": ("USER_TABLE_COLUMNS",),
     "Localization": ("LANGUAGE_CHOICES",),
-    "User settings": (
+    "Authentication settings": (
         "AUTO_APPROVE_USER_TOS",
-        "ENABLE_STRICT_CHECK_ACCEPTING_INVITATION",
-        "INVITATION_DISABLE_MULTIPLE_ROLES",
         "DEFAULT_IDP",
         "DEACTIVATE_USER_IF_NO_ROLES",
         "OIDC_BLOCK_CREATION_OF_UNINVITED_USERS",
+        "OIDC_BLOCK_CREATION_OF_UNINVITED_USERS_RESPONSE_MESSAGE",
+        "OIDC_ALLOWED_USER_EMAIL_PATTERNS",
+        "OIDC_BLOCKED_LOGIN_RESPONSE_MESSAGE",
+        "OIDC_MATCHMAKING_BY_EMAIL",
         "OIDC_ACCESS_TOKEN_ENABLED",
+        "REMOTE_EDUTEAMS_REFRESH_TOKEN",
+    ),
+    "Invitation settings": (
+        "ENABLE_STRICT_CHECK_ACCEPTING_INVITATION",
+        "INVITATION_DISABLE_MULTIPLE_ROLES",
+        "ONLY_ONE_PROJECT_MANAGER",
+        "INVITATION_ALLOWED_FIELDS",
+    ),
+    "User profile settings": (
+        "DEFAULT_OFFERING_USER_ATTRIBUTES",
+        "DEFAULT_CALL_USER_ATTRIBUTES",
+        "ENABLED_USER_PROFILE_ATTRIBUTES",
+        "MANDATORY_USER_ATTRIBUTES",
+        "ENFORCE_MANDATORY_USER_ATTRIBUTES",
+    ),
+    "Data privacy settings": (
+        "USER_DATA_ACCESS_LOGGING_ENABLED",
+        "USER_DATA_ACCESS_LOG_RETENTION_DAYS",
+        "USER_DATA_ACCESS_LOG_SELF_ACCESS",
     ),
     "FreeIPA settings": (
         "FREEIPA_ENABLED",
@@ -733,15 +2161,38 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "FREEIPA_BLACKLISTED_USERNAMES",
         "FREEIPA_GROUP_SYNCHRONIZATION_ENABLED",
     ),
-    "OIDC auth settings": (
+    "SCIM Entitlements (outbound push)": (
+        "SCIM_MEMBERSHIP_SYNC_ENABLED",
+        "SCIM_API_URL",
+        "SCIM_API_KEY",
+        "SCIM_URN_NAMESPACE",
+    ),
+    "SCIM Identity Provider": (
+        "SCIM_INBOUND_ENABLED",
+        "SCIM_INBOUND_SOURCE_NAME",
+        "SCIM_INBOUND_ALLOWED_ATTRIBUTES",
+        "SCIM_INBOUND_SSH_KEYS_ENABLED",
+        "SCIM_USER_MATCH_WALDUR_ATTRIBUTE",
+        "SCIM_USER_MATCH_SCIM_ATTRIBUTE",
+        "SRAM_INTEGRATION_ENABLED",
+        "SRAM_PLACEHOLDER_ROLE_TEMPLATE",
+        "SCIM_PULL_API_URL",
+        "SCIM_PULL_API_KEY",
+        "SCIM_PULL_SOURCE_NAME",
+    ),
+    "API token authentication": (
         "OIDC_AUTH_URL",
         "OIDC_INTROSPECTION_URL",
         "OIDC_CLIENT_ID",
         "OIDC_CLIENT_SECRET",
         "OIDC_USER_FIELD",
         "OIDC_CACHE_TIMEOUT",
+        "OIDC_REGISTRATION_METHOD",
+        "OIDC_DEFAULT_LOGOUT_URL",
+        "WALDUR_AUTH_SOCIAL_ROLE_CLAIM",
     ),
     "Onboarding settings": (
+        "ONBOARDING_VALIDATION_METHODS",
         "ONBOARDING_VERIFICATION_EXPIRY_HOURS",
         "ONBOARDING_ARIREGISTER_BASE_URL",
         "ONBOARDING_ARIREGISTER_USERNAME",
@@ -749,7 +2200,136 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ONBOARDING_ARIREGISTER_TIMEOUT",
         "ONBOARDING_WICO_API_URL",
         "ONBOARDING_WICO_TOKEN",
+        "ONBOARDING_BOLAGSVERKET_API_URL",
+        "ONBOARDING_BOLAGSVERKET_TOKEN_API_URL",
+        "ONBOARDING_BOLAGSVERKET_CLIENT_ID",
+        "ONBOARDING_BOLAGSVERKET_CLIENT_SECRET",
+        "ONBOARDING_BREG_API_URL",
+        "ONBOARDING_DNB_API_URL",
+        "ONBOARDING_DNB_RTS_API_URL",
+        "ONBOARDING_DNB_TOKEN_URL",
+        "ONBOARDING_DNB_CLIENT_ID",
+        "ONBOARDING_DNB_CLIENT_SECRET",
     ),
+    "AI assistant settings": (
+        "AI_ASSISTANT_NAME",
+        "AI_ASSISTANT_ENABLED",
+        "AI_ASSISTANT_ENABLED_ROLES",
+        "AI_ASSISTANT_BACKEND_TYPE",
+        "AI_ASSISTANT_API_URL",
+        "AI_ASSISTANT_API_TOKEN",
+        "AI_ASSISTANT_MODEL",
+        "AI_ASSISTANT_SYSTEM_PROMPT_CUSTOM_INSTRUCTIONS",
+        "AI_ASSISTANT_COMPLETION_KWARGS",
+        "AI_ASSISTANT_STREAM_TIMEOUT_SECONDS",
+        "AI_ASSISTANT_TOKEN_LIMIT_DAILY",
+        "AI_ASSISTANT_TOKEN_LIMIT_WEEKLY",
+        "AI_ASSISTANT_TOKEN_LIMIT_MONTHLY",
+        "AI_ASSISTANT_GLOBAL_DAILY_TOKEN_BUDGET",
+        "AI_ASSISTANT_GLOBAL_REQUESTS_PER_MINUTE",
+        "AI_ASSISTANT_SESSION_RETENTION_DAYS",
+        "AI_ASSISTANT_HISTORY_LIMIT",
+        "AI_ASSISTANT_INJECTION_ALLOWLIST",
+        "ANONYMOUS_CHAT_USER_SLUG_SALT",
+        "ANONYMOUS_CHAT_FEEDBACK_TOKEN_SECRET",
+        "ANONYMOUS_CHAT_CATALOG_MAX_ENTRIES",
+        "ANONYMOUS_CHAT_REVIEW_ENABLED",
+        "ANONYMOUS_CHAT_REVIEW_DAILY_TOKEN_BUDGET",
+        "ANONYMOUS_CHAT_ARTIFACT_RETENTION_DAYS",
+    ),
+    "Software catalog general": (
+        "SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES",
+        "SOFTWARE_CATALOG_CLEANUP_ENABLED",
+        "SOFTWARE_CATALOG_RETENTION_DAYS",
+    ),
+    "Software catalog EESSI": (
+        "SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED",
+        "SOFTWARE_CATALOG_EESSI_VERSION",
+        "SOFTWARE_CATALOG_EESSI_API_URL",
+        "SOFTWARE_CATALOG_EESSI_INCLUDE_EXTENSIONS",
+    ),
+    "Software catalog Spack": (
+        "SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED",
+        "SOFTWARE_CATALOG_SPACK_VERSION",
+        "SOFTWARE_CATALOG_SPACK_DATA_URL",
+    ),
+    "System Logging": (
+        "SYSTEM_LOG_ENABLED",
+        "SYSTEM_LOG_MAX_ROWS_PER_SOURCE",
+        "OPENSTACK_LOG_CALLS_ENABLED",
+        "OPENSTACK_LOG_CALLS_THRESHOLD_MS",
+    ),
+    "Table Growth Monitoring": (
+        "TABLE_GROWTH_MONITORING_ENABLED",
+        "TABLE_GROWTH_WEEKLY_THRESHOLD_PERCENT",
+        "TABLE_GROWTH_MONTHLY_THRESHOLD_PERCENT",
+        "TABLE_GROWTH_RETENTION_DAYS",
+        "TABLE_GROWTH_MIN_SIZE_BYTES",
+    ),
+    "User Revision History": (
+        "USER_REVISION_RETENTION_DAYS",
+        "USER_REVISION_KEEP_MINIMUM",
+    ),
+    "User Actions": (
+        "USER_ACTIONS_ENABLED",
+        "USER_ACTIONS_PENDING_ORDER_HOURS",
+        "USER_ACTIONS_HIGH_URGENCY_NOTIFICATION",
+        "USER_ACTIONS_NOTIFICATION_THRESHOLD",
+        "USER_ACTIONS_EXECUTION_RETENTION_DAYS",
+        "USER_ACTIONS_DEFAULT_EXPIRATION_REMINDERS",
+    ),
+    "Arrow Integration": (
+        "ARROW_AUTO_RECONCILIATION",
+        "ARROW_SYNC_INTERVAL_HOURS",
+        "ARROW_CONSUMPTION_SYNC_ENABLED",
+        "ARROW_CONSUMPTION_SYNC_INTERVAL_HOURS",
+        "ARROW_BILLING_CHECK_INTERVAL_HOURS",
+    ),
+    "SLURM Policy": ("SLURM_POLICY_EVALUATION_LOG_RETENTION_DAYS",),
+    "Usage Polling": ("USAGE_POLL_RECORD_RETENTION_MONTHS",),
+    "Identity Bridge": (
+        "FEDERATED_IDENTITY_SYNC_ENABLED",
+        "FEDERATED_IDENTITY_SYNC_ALLOWED_ATTRIBUTES",
+        "FEDERATED_IDENTITY_AUTHORITATIVE_ISD",
+        "FEDERATED_IDENTITY_LOCKED_FIELDS",
+        "FEDERATED_IDENTITY_DEACTIVATION_POLICY",
+    ),
+    "Project Digest": ("ENABLE_PROJECT_DIGEST",),
+    "SSH keys": (
+        "SSH_KEY_ALLOWED_TYPES",
+        "SSH_KEY_MIN_RSA_KEY_SIZE",
+        "ENABLE_ISSUES_FOR_USER_SSH_KEY_CHANGES",
+    ),
+    "Reporting": ("ENABLED_REPORTING_SCREENS",),
+    "POSIX ID pools": ("POSIX_ID_POOL_UTILIZATION_THRESHOLD",),
+    "Affiliates": ("AFFILIATES_ENABLED",),
+    "Matrix chat": (
+        "MATRIX_ENABLED",
+        "MATRIX_AUTO_CREATE_PROJECT_ROOMS",
+        "MATRIX_HOMESERVER_URL",
+        "MATRIX_HOMESERVER_PUBLIC_URL",
+        "MATRIX_HOMESERVER_DOMAIN",
+        "MATRIX_APPSERVICE_AS_TOKEN",
+        "MATRIX_APPSERVICE_HS_TOKEN",
+        "MATRIX_APPSERVICE_SENDER_LOCALPART",
+        "MATRIX_HISTORY_EXPORT_ENABLED",
+        "MATRIX_EXPORT_MEDIA",
+        "MATRIX_USER_REGISTRATION_SECRET",
+        "MATRIX_USER_ID_FORMAT",
+        "MATRIX_LOGIN_METHOD",
+        "MATRIX_OIDC_PROVIDER_URL",
+        "MATRIX_LIVEKIT_KEY",
+        "MATRIX_LIVEKIT_SECRET",
+        "MATRIX_LIVEKIT_URL",
+    ),
+    "Personal Access Tokens": (
+        "PAT_ENABLED",
+        "PAT_MAX_LIFETIME_DAYS",
+        "PAT_MAX_TOKENS_PER_USER",
+        "PAT_MAX_ACL_ENTRIES",
+        "PAT_MAX_AUDIT_EVENTS_PER_HOUR",
+    ),
+    "Site Agent Logs": ("SITE_AGENT_LOG_MAX_ROWS_PER_IDENTITY",),
 }
 
 PUBLIC_CONSTANCE_SETTINGS = (
@@ -761,6 +2341,10 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "SITE_PHONE",
     "CURRENCY_NAME",
     "ANONYMOUS_USER_CAN_VIEW_OFFERINGS",
+    "SHOW_OFFERING_COVER_IMAGE",
+    "ENABLE_MARKDOWN_IMAGE_UPLOAD",
+    "RESTRICTED_OFFERING_VISIBILITY_MODE",
+    "SERVICE_ACCESS_MODE",
     "DOCS_URL",
     "SHORT_PAGE_TITLE",
     "FULL_PAGE_TITLE",
@@ -768,11 +2352,11 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "HERO_LINK_LABEL",
     "HERO_LINK_URL",
     "SUPPORT_PORTAL_URL",
-    "SITE_LOGO",
     "SIDEBAR_LOGO",
     "SIDEBAR_LOGO_MOBILE",
     "SIDEBAR_LOGO_DARK",
     "SIDEBAR_STYLE",
+    "FONT_FAMILY",
     "POWERED_BY_LOGO",
     "HERO_IMAGE",
     "MARKETPLACE_HERO_IMAGE",
@@ -780,16 +2364,44 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "LOGIN_LOGO",
     "FAVICON",
     "OFFERING_LOGO_PLACEHOLDER",
+    "DISCLAIMER_AREA_LOGO",
+    "DISCLAIMER_AREA_TEXT",
+    "ABOUT_US_PAGE_ENABLED",
+    "ABOUT_US_PAGE_CONTENT",
     "COMMON_FOOTER_TEXT",
     "COMMON_FOOTER_HTML",
     "LANGUAGE_CHOICES",
     "DISABLE_DARK_THEME",
+    "LOGIN_PAGE_LAYOUT",
+    "LOGIN_PAGE_VIDEO_URL",
+    "LOGIN_PAGE_STATS",
+    "LOGIN_PAGE_CAROUSEL_SLIDES",
+    "LOGIN_PAGE_NEWS",
     "MARKETPLACE_LANDING_PAGE",
+    "MARKETPLACE_LAYOUT_MODE",
+    "MARKETPLACE_CARD_STYLE",
     "ENABLE_ORDER_START_DATE",
+    # Project name validation — exposed so the create/rename form can show the
+    # configured naming rule and validate it client-side.
+    "PROJECT_NAME_REGEX",
+    "PROJECT_NAME_REGEX_ERROR_MESSAGE",
+    "ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT",
+    "AI_ASSISTANT_ENABLED",
+    "AI_ASSISTANT_ENABLED_ROLES",
+    "AI_ASSISTANT_NAME",
+    "MATRIX_ENABLED",
+    "AFFILIATES_ENABLED",
+    "SRAM_INTEGRATION_ENABLED",
     # Support plugin
     "WALDUR_SUPPORT_ENABLED",
     "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE",
     "WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE",
+    "WALDUR_SUPPORT_PROVIDER_ROUTING_ENABLED",
+    "WALDUR_SUPPORT_AUTO_ASSIGN",
+    "WALDUR_SUPPORT_AUTO_ASSIGN_STRATEGY",
+    "WALDUR_SUPPORT_SLA_ENABLED",
+    "WALDUR_SUPPORT_SLA_RESPONSE_HOURS",
+    "WALDUR_SUPPORT_SLA_RESOLUTION_HOURS",
     "USER_TABLE_COLUMNS",
     # FreeIPA
     "FREEIPA_ENABLED",
@@ -800,4 +2412,23 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "RANCHER_USERNAME_INPUT_LABEL",
     "ENFORCE_USER_CONSENT_FOR_OFFERINGS",
     "OIDC_ACCESS_TOKEN_ENABLED",
+    # Onboarding settings
+    "ONBOARDING_VALIDATION_METHODS",
+    # User Actions
+    "USER_ACTIONS_ENABLED",
+    # User profile attributes
+    "ENABLED_USER_PROFILE_ATTRIBUTES",
+    "MANDATORY_USER_ATTRIBUTES",
+    "ENFORCE_MANDATORY_USER_ATTRIBUTES",
+    "ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS",
+    # Project Digest
+    "ENABLE_PROJECT_DIGEST",
+    # SSH keys
+    "SSH_KEY_ALLOWED_TYPES",
+    "SSH_KEY_MIN_RSA_KEY_SIZE",
+    "ENABLED_REPORTING_SCREENS",
+    # Personal Access Tokens
+    "PAT_ENABLED",
+    "ONLY_ONE_PROJECT_MANAGER",
+    "INVITATION_DISABLE_MULTIPLE_ROLES",
 )

@@ -1,12 +1,16 @@
 import datetime
+import re
+import uuid
 from decimal import Decimal
 from unittest import mock
 
 from constance.test.unittest import override_config
 from dateutil.relativedelta import relativedelta
 from ddt import data, ddt, unpack
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
 from freezegun import freeze_time
+from rest_framework import exceptions as rf_exceptions
 from rest_framework import status, test
 
 from waldur_core.core.utils import month_start
@@ -20,11 +24,14 @@ from waldur_core.permissions.fixtures import (
 )
 from waldur_core.structure.tests import fixtures
 from waldur_core.structure.tests.factories import ProjectFactory, UserFactory
+from waldur_mastermind.common import mixins as common_mixins
 from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices.tests import factories as invoices_factories
 from waldur_mastermind.marketplace import callbacks, models, plugins
+from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import (
+    BASIC_OFFERING,
     SUPPORT_OFFERING,
     BillingTypes,
     LimitPeriods,
@@ -39,7 +46,7 @@ from waldur_mastermind.marketplace.tests.fixtures import MarketplaceFixture
 from waldur_openstack.tests import factories as openstack_factories
 
 
-class ResourceGetTest(test.APITransactionTestCase):
+class ResourceGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         self.project = self.fixture.project
@@ -69,6 +76,174 @@ class ResourceGetTest(test.APITransactionTestCase):
             f"{self.project.customer.slug}-{self.project.slug}-{self.offering.slug}-2",
         )
 
+    def test_suggest_name_with_pattern_core_variables(self):
+        self.offering.plugin_options = {
+            "resource_name_pattern": "{project_slug}-{offering_slug}-{counter}"
+        }
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url("suggest_name")
+        response = self.client.post(
+            url, {"project": self.project.uuid.hex, "offering": self.offering.uuid.hex}
+        )
+        # There is 1 existing resource, so counter = 2
+        self.assertEqual(
+            response.data["name"],
+            f"{self.project.slug}-{self.offering.slug}-2",
+        )
+
+    def test_suggest_name_with_pattern_counter_omitted_for_first(self):
+        self.resource.delete()
+        self.offering.plugin_options = {
+            "resource_name_pattern": "{project_slug}-{offering_slug}-{counter}"
+        }
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url("suggest_name")
+        response = self.client.post(
+            url, {"project": self.project.uuid.hex, "offering": self.offering.uuid.hex}
+        )
+        # No existing resources, so counter renders as empty and trailing hyphen is stripped
+        self.assertEqual(
+            response.data["name"],
+            f"{self.project.slug}-{self.offering.slug}",
+        )
+
+    def test_suggest_name_with_pattern_and_attributes(self):
+        self.offering.plugin_options = {
+            "resource_name_pattern": "{project_slug}-{attributes[environment]}-{counter}"
+        }
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url("suggest_name")
+        response = self.client.post(
+            url,
+            {
+                "project": self.project.uuid.hex,
+                "offering": self.offering.uuid.hex,
+                "attributes": {"environment": "prod"},
+            },
+            format="json",
+        )
+        self.assertEqual(
+            response.data["name"],
+            f"{self.project.slug}-prod-2",
+        )
+
+    def test_suggest_name_with_pattern_and_plan_name(self):
+        self.offering.plugin_options = {
+            "resource_name_pattern": "{project_slug}-{plan_name}-{counter}"
+        }
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url("suggest_name")
+        response = self.client.post(
+            url,
+            {
+                "project": self.project.uuid.hex,
+                "offering": self.offering.uuid.hex,
+                "plan": self.plan.uuid.hex,
+            },
+            format="json",
+        )
+        plan_name_sanitized = re.sub(r"[^A-Za-z0-9.-]", "-", self.plan.name)
+        expected = f"{self.project.slug}-{plan_name_sanitized}-2"
+        self.assertEqual(response.data["name"], expected)
+
+    def test_suggest_name_with_missing_attribute_renders_empty(self):
+        self.offering.plugin_options = {
+            "resource_name_pattern": "{project_slug}-{attributes[missing_key]}-{offering_slug}"
+        }
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url("suggest_name")
+        response = self.client.post(
+            url, {"project": self.project.uuid.hex, "offering": self.offering.uuid.hex}
+        )
+        # Missing attribute renders as empty, duplicate hyphens collapsed and stripped
+        self.assertEqual(
+            response.data["name"],
+            f"{self.project.slug}-{self.offering.slug}",
+        )
+
+    def test_suggest_name_with_invalid_pattern_falls_back_to_default(self):
+        self.offering.plugin_options = {
+            "resource_name_pattern": "{project_slug}-{!invalid}"
+        }
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url("suggest_name")
+        response = self.client.post(
+            url, {"project": self.project.uuid.hex, "offering": self.offering.uuid.hex}
+        )
+        # Fallback to default behavior
+        self.assertEqual(
+            response.data["name"],
+            f"{self.project.customer.slug}-{self.project.slug}-{self.offering.slug}-2",
+        )
+
+    def test_suggest_name_without_pattern_preserves_default(self):
+        self.offering.plugin_options = {}
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url("suggest_name")
+        response = self.client.post(
+            url, {"project": self.project.uuid.hex, "offering": self.offering.uuid.hex}
+        )
+        self.assertEqual(
+            response.data["name"],
+            f"{self.project.customer.slug}-{self.project.slug}-{self.offering.slug}-2",
+        )
+
+    def test_suggest_name_replaces_underscores_with_hyphens(self):
+        self.project.customer.slug = "my_customer"
+        self.project.customer.save()
+        self.project.slug = "my_project"
+        self.project.save()
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url("suggest_name")
+        response = self.client.post(
+            url, {"project": self.project.uuid.hex, "offering": self.offering.uuid.hex}
+        )
+        self.assertNotIn("_", response.data["name"])
+        self.assertTrue(response.data["name"].startswith("my-customer-my-project-"))
+
+    def test_suggest_name_with_pattern_replaces_underscores(self):
+        self.offering.plugin_options = {
+            "resource_name_pattern": "{customer_name}-{project_name}"
+        }
+        self.offering.save()
+        self.project.customer.name = "My_Customer"
+        self.project.customer.save()
+        self.project.name = "My_Project"
+        self.project.save()
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url("suggest_name")
+        response = self.client.post(
+            url, {"project": self.project.uuid.hex, "offering": self.offering.uuid.hex}
+        )
+        self.assertNotIn("_", response.data["name"])
+
+    def test_suggest_name_is_lowercased(self):
+        self.offering.plugin_options = {
+            "resource_name_pattern": "{customer_name}-{attributes[environment]}"
+        }
+        self.offering.save()
+        self.project.customer.name = "MyCustomer"
+        self.project.customer.save()
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url("suggest_name")
+        response = self.client.post(
+            url,
+            {
+                "project": self.project.uuid.hex,
+                "offering": self.offering.uuid.hex,
+                "attributes": {"environment": "Production"},
+            },
+            format="json",
+        )
+        self.assertEqual(response.data["name"], "mycustomer-production")
+
     def test_resource_is_usage_based(self):
         factories.OfferingComponentFactory(
             offering=self.offering, billing_type=BillingTypes.USAGE
@@ -92,6 +267,20 @@ class ResourceGetTest(test.APITransactionTestCase):
 
         response = self.get_resource()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_service_provider_sees_project_start_date(self):
+        self.project.start_date = datetime.date(2024, 1, 15)
+        self.project.save()
+        owner = UserFactory()
+        self.offering.customer.add_user(owner, CustomerRole.OWNER)
+
+        self.client.force_authenticate(owner)
+        url = factories.ResourceFactory.get_provider_resource_url(self.resource)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["project_start_date"], datetime.date(2024, 1, 15)
+        )
 
     def test_other_user_can_not_get_resource_data(self):
         response = self.get_resource(UserFactory())
@@ -213,8 +402,18 @@ class ResourceGetTest(test.APITransactionTestCase):
         self.assertIn("creation_order", response.data)
         self.assertIsNotNone(response.data["creation_order"])
 
+    def test_offering_backend_id_is_exposed(self):
+        self.offering.backend_id = "external-offering-123"
+        self.offering.save()
+        response = self.get_resource()
+        self.assertEqual(response.data["offering_backend_id"], "external-offering-123")
 
-class ResourceSwitchPlanTest(test.APITransactionTestCase):
+    def test_offering_backend_id_is_empty_by_default(self):
+        response = self.get_resource()
+        self.assertEqual(response.data["offering_backend_id"], "")
+
+
+class ResourceSwitchPlanTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         self.project = self.fixture.project
@@ -236,6 +435,9 @@ class ResourceSwitchPlanTest(test.APITransactionTestCase):
         CustomerRole.OWNER.add_permission(PermissionEnum.APPROVE_ORDER)
         ProjectRole.ADMIN.add_permission(PermissionEnum.SWITCH_RESOURCE_PLAN)
         ProjectRole.MANAGER.add_permission(PermissionEnum.SWITCH_RESOURCE_PLAN)
+        # Switching a plan submits an order, so it needs order creation rights.
+        for role in (CustomerRole.OWNER, ProjectRole.ADMIN, ProjectRole.MANAGER):
+            role.add_permission(PermissionEnum.CREATE_ORDER)
 
     def switch_plan(self, user, resource, plan):
         self.client.force_authenticate(user)
@@ -298,6 +500,21 @@ class ResourceSwitchPlanTest(test.APITransactionTestCase):
 
         # Assert
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_plan_switch_is_not_available_if_plan_unit_is_different(self):
+        # Arrange
+        self.plan2.unit = common_mixins.UnitPriceMixin.Units.PER_DAY
+        self.plan2.save()
+
+        # Act
+        response = self.switch_plan(self.fixture.owner, self.resource1, self.plan2)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Billing period of new plan must match the old one.",
+            response.data["plan"][0],
+        )
 
     def test_order_is_created(self):
         # Act
@@ -374,7 +591,7 @@ class ResourceSwitchPlanTest(test.APITransactionTestCase):
         mock_tasks.process_order.delay.assert_not_called()
 
 
-class ResourceRenewTest(test.APITransactionTestCase):
+class ResourceRenewTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         self.project = self.fixture.project
@@ -412,10 +629,27 @@ class ResourceRenewTest(test.APITransactionTestCase):
         # Set permissions
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
         ProjectRole.ADMIN.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
+        # Renewal submits an order, so it needs order creation rights too.
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.CREATE_ORDER)
 
     def renew_resource(self, user, resource, payload):
         self.client.force_authenticate(user)
         url = factories.ResourceFactory.get_url(resource, "renew")
+        # Check if payload contains files, then use multipart format
+        has_files = any(hasattr(value, "read") for value in payload.values())
+        if has_files:
+            # For multipart, we need to flatten nested data like limits
+            flattened_payload = {}
+            for key, value in payload.items():
+                if key == "limits" and isinstance(value, dict):
+                    # Convert limits dict to JSON string for multipart
+                    import json
+
+                    flattened_payload[key] = json.dumps(value)
+                else:
+                    flattened_payload[key] = value
+            return self.client.post(url, flattened_payload, format="multipart")
         return self.client.post(url, payload)
 
     def test_user_can_renew_prepaid_resource(self):
@@ -499,9 +733,184 @@ class ResourceRenewTest(test.APITransactionTestCase):
         )
         self.assertEqual(order.limits["storage"], 200)
 
+    def test_user_can_renew_with_request_comment(self):
+        # Arrange
+        payload = {
+            "extension_months": 60,
+            "request_comment": "Need extension for project completion",
+        }
+
+        # Act
+        response = self.renew_resource(self.fixture.owner, self.resource, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        order = models.Order.objects.get(uuid=response.data["order_uuid"])
+        self.assertEqual(order.request_comment, "Need extension for project completion")
+
+    def test_user_can_renew_with_attachment(self):
+        # Arrange
+        pdf_content = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\nxref\n0 1\n0000000000 65535 f \ntrailer\n<<\n/Size 1\n/Root 1 0 R\n>>\nstartxref\n9\n%%EOF"
+        attachment = SimpleUploadedFile(
+            "renewal_request.pdf", pdf_content, content_type="application/pdf"
+        )
+
+        payload = {"extension_months": 60, "attachment": attachment}
+
+        # Act
+        response = self.renew_resource(self.fixture.owner, self.resource, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        order = models.Order.objects.get(uuid=response.data["order_uuid"])
+        self.assertTrue(order.attachment)
+        self.assertIn("renewal_request.pdf", order.attachment.name)
+
+    def test_user_can_renew_with_both_comment_and_attachment(self):
+        # Arrange
+        pdf_content = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\nxref\n0 1\n0000000000 65535 f \ntrailer\n<<\n/Size 1\n/Root 1 0 R\n>>\nstartxref\n9\n%%EOF"
+        attachment = SimpleUploadedFile(
+            "renewal_documentation.pdf", pdf_content, content_type="application/pdf"
+        )
+
+        payload = {
+            "extension_months": 12,
+            "request_comment": "Annual renewal with increased storage",
+            "attachment": attachment,
+        }
+
+        # Act
+        response = self.renew_resource(self.fixture.owner, self.resource, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        order = models.Order.objects.get(uuid=response.data["order_uuid"])
+        self.assertEqual(order.request_comment, "Annual renewal with increased storage")
+        self.assertTrue(order.attachment)
+        self.assertIn("renewal_documentation.pdf", order.attachment.name)
+
+    def test_renewal_validates_comment_length(self):
+        # Arrange - comment longer than 255 characters
+        long_comment = "x" * 256
+        payload = {"extension_months": 60, "request_comment": long_comment}
+
+        # Act
+        response = self.renew_resource(self.fixture.owner, self.resource, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_renewal_allows_empty_comment(self):
+        # Arrange
+        payload = {"extension_months": 60, "request_comment": ""}
+
+        # Act
+        response = self.renew_resource(self.fixture.owner, self.resource, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        order = models.Order.objects.get(uuid=response.data["order_uuid"])
+        self.assertEqual(order.request_comment, "")
+
+
+class ResourceRenewCostWithFactorTest(test.APITestCase):
+    """Test that renewal cost calculation correctly accounts for component factor."""
+
+    def setUp(self):
+        self.fixture = fixtures.ServiceFixture()
+        self.project = self.fixture.project
+
+        # Create offering with OpenStack.Tenant type so component_factors returns real values
+        self.offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            type="OpenStack.Tenant",
+        )
+        self.storage_component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="storage",
+            is_prepaid=True,
+            billing_type=BillingTypes.ONE_TIME,
+        )
+        self.ram_component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="ram",
+            is_prepaid=True,
+            billing_type=BillingTypes.ONE_TIME,
+        )
+        self.cores_component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="cores",
+            is_prepaid=True,
+            billing_type=BillingTypes.ONE_TIME,
+        )
+        self.plan = factories.PlanFactory(offering=self.offering)
+        factories.PlanComponentFactory(
+            plan=self.plan,
+            component=self.storage_component,
+            price=Decimal("3.0"),  # €3 per GB per month
+        )
+        factories.PlanComponentFactory(
+            plan=self.plan,
+            component=self.ram_component,
+            price=Decimal("2.0"),  # €2 per GB per month
+        )
+        factories.PlanComponentFactory(
+            plan=self.plan,
+            component=self.cores_component,
+            price=Decimal("1.0"),  # €1 per core per month
+        )
+
+        # Limits stored in internal units: RAM=3072 MB (3 GB), Storage=125952 MB (123 GB)
+        self.resource = factories.ResourceFactory(
+            project=self.project,
+            offering=self.offering,
+            plan=self.plan,
+            state=ResourceStates.OK,
+            limits={"cores": 23, "ram": 3072, "storage": 125952},
+            end_date=timezone.now().date() + relativedelta(months=1),
+        )
+
+    def test_get_renewal_cost_divides_by_factor(self):
+        """Renewal cost should use display units (GB), not internal units (MB)."""
+        cost = self.resource.get_renewal_cost(extension_months=1)
+        # cores: 1 * 23 * 1 = 23
+        # ram: 2 * (3072/1024) * 1 = 2 * 3 = 6
+        # storage: 3 * (125952/1024) * 1 = 3 * 123 = 369
+        # total = 398
+        self.assertEqual(cost, Decimal("398.0"))
+
+    def test_get_renewal_cost_with_new_limits(self):
+        """Renewal cost with upgraded limits should also use display units."""
+        cost = self.resource.get_renewal_cost(
+            extension_months=6,
+            new_limits={"cores": 46, "ram": 6144, "storage": 251904},
+        )
+        # cores: 1 * 46 * 6 = 276
+        # ram: 2 * (6144/1024) * 6 = 2 * 6 * 6 = 72
+        # storage: 3 * (251904/1024) * 6 = 3 * 246 * 6 = 4428
+        # total = 4776
+        self.assertEqual(cost, Decimal("4776.0"))
+
+    def test_get_renewal_estimate_uses_display_units(self):
+        """Estimate should show display units in component details."""
+        estimate = self.resource.get_renewal_estimate(extension_months=1)
+        components = {c["component_type"]: c for c in estimate["components"]}
+
+        # Storage: current_limit and new_limit should be in GB, not MB
+        self.assertEqual(components["storage"]["new_limit"], Decimal("123"))
+        self.assertEqual(components["storage"]["current_limit"], Decimal("123"))
+        self.assertEqual(components["ram"]["new_limit"], Decimal("3"))
+        self.assertEqual(components["ram"]["current_limit"], Decimal("3"))
+        # Cores have factor=1, so no conversion
+        self.assertEqual(components["cores"]["new_limit"], Decimal("23"))
+
 
 @ddt
-class ResourceTerminateTest(test.APITransactionTestCase):
+class ResourceTerminateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         self.project = self.fixture.project
@@ -547,6 +956,23 @@ class ResourceTerminateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         mocked_approve.assert_not_called()
 
+    @data("staff", "owner")
+    def test_resource_of_private_offering_of_other_customer_can_be_terminated(
+        self, user
+    ):
+        self.offering.shared = False
+        self.offering.save()
+        self.assertNotEqual(self.offering.customer, self.project.customer)
+
+        response = self.terminate(getattr(self.fixture, user))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(
+            models.Order.objects.filter(
+                resource=self.resource, type=OrderTypes.TERMINATE
+            ).exists()
+        )
+
     def test_order_is_created_when_user_submits_termination_request(self):
         # Act
         response = self.terminate(self.fixture.owner)
@@ -559,7 +985,6 @@ class ResourceTerminateTest(test.APITransactionTestCase):
     @data(
         ResourceStates.CREATING,
         ResourceStates.UPDATING,
-        ResourceStates.TERMINATING,
     )
     def test_termination_request_is_not_accepted_if_resource_is_not_ok_or_erred(
         self, state
@@ -572,6 +997,16 @@ class ResourceTerminateTest(test.APITransactionTestCase):
         response = self.terminate(self.fixture.owner)
 
         # Assert
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_termination_request_is_not_accepted_if_resource_is_terminating_without_pending_order(
+        self,
+    ):
+        self.resource.state = ResourceStates.TERMINATING
+        self.resource.save()
+
+        response = self.terminate(self.fixture.owner)
+
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
 
     @data(ResourceStates.OK, ResourceStates.ERRED)
@@ -595,6 +1030,21 @@ class ResourceTerminateTest(test.APITransactionTestCase):
         self.assertEqual(order.state, OrderStates.EXECUTING)
         self.assertEqual(order.created_by, self.fixture.staff)
 
+    def test_order_is_approved_implicitly_when_purchase_order_is_required(self):
+        # Regression: require_purchase_order_upload used to hold every terminate
+        # order in PENDING_CONSUMER, and the terminate endpoint accepts no
+        # attachment, so the order could only be unblocked by uploading a file
+        # to it out of band. Termination is exempt from the requirement.
+        self.offering.plugin_options = {"require_purchase_order_upload": True}
+        self.offering.save()
+
+        # Act
+        response = self.terminate(self.fixture.staff)
+
+        # Assert
+        order = models.Order.objects.get(uuid=response.data["order_uuid"])
+        self.assertEqual(order.state, OrderStates.EXECUTING)
+
     def test_plan_switch_is_not_allowed_if_pending_order_for_resource_already_exists(
         self,
     ):
@@ -607,6 +1057,133 @@ class ResourceTerminateTest(test.APITransactionTestCase):
         response = self.terminate(self.fixture.staff)
 
         # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @mock.patch("waldur_mastermind.marketplace.tasks.process_order.delay")
+    def test_owner_confirms_pending_terminate_order_on_terminate(
+        self, mocked_process_order
+    ):
+        """Default offering (Support) skips provider review and project is active."""
+        CustomerRole.OWNER.add_permission(PermissionEnum.APPROVE_ORDER)
+
+        order = factories.OrderFactory(
+            resource=self.resource,
+            project=self.project,
+            offering=self.offering,
+            plan=self.plan,
+            type=OrderTypes.TERMINATE,
+            state=OrderStates.PENDING_CONSUMER,
+            created_by=self.fixture.admin,
+        )
+
+        owner_response = self.terminate(self.fixture.owner)
+        self.assertEqual(owner_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(owner_response.data["order_uuid"], order.uuid.hex)
+
+        order.refresh_from_db()
+        self.assertEqual(order.state, OrderStates.EXECUTING)
+        self.assertEqual(order.consumer_reviewed_by, self.fixture.owner)
+        self.assertEqual(models.Order.objects.filter(resource=self.resource).count(), 1)
+
+    @mock.patch("waldur_mastermind.marketplace.tasks.process_order.delay")
+    def test_owner_confirms_pending_terminate_order_when_purchase_order_is_required(
+        self, mocked_process_order
+    ):
+        CustomerRole.OWNER.add_permission(PermissionEnum.APPROVE_ORDER)
+        self.offering.plugin_options = {"require_purchase_order_upload": True}
+        self.offering.save()
+
+        order = factories.OrderFactory(
+            resource=self.resource,
+            project=self.project,
+            offering=self.offering,
+            plan=self.plan,
+            type=OrderTypes.TERMINATE,
+            state=OrderStates.PENDING_CONSUMER,
+            created_by=self.fixture.admin,
+        )
+
+        owner_response = self.terminate(self.fixture.owner)
+        self.assertEqual(owner_response.status_code, status.HTTP_200_OK)
+
+        order.refresh_from_db()
+        self.assertEqual(order.state, OrderStates.EXECUTING)
+        self.assertEqual(order.consumer_reviewed_by, self.fixture.owner)
+
+    @mock.patch(
+        "waldur_mastermind.marketplace.tasks.notify_provider_about_pending_order.delay"
+    )
+    def test_owner_confirms_pending_terminate_order_moves_to_pending_provider(
+        self, mocked_notify
+    ):
+        CustomerRole.OWNER.add_permission(PermissionEnum.APPROVE_ORDER)
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer, type=BASIC_OFFERING
+        )
+        plan = factories.PlanFactory(offering=offering)
+        self.resource.offering = offering
+        self.resource.plan = plan
+        self.resource.save()
+
+        order = factories.OrderFactory(
+            resource=self.resource,
+            project=self.project,
+            offering=offering,
+            plan=plan,
+            type=OrderTypes.TERMINATE,
+            state=OrderStates.PENDING_CONSUMER,
+            created_by=self.fixture.admin,
+        )
+
+        response = self.terminate(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["order_uuid"], order.uuid.hex)
+
+        order.refresh_from_db()
+        self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
+        self.assertEqual(order.consumer_reviewed_by, self.fixture.owner)
+        mocked_notify.assert_called_once()
+
+    def test_owner_confirms_pending_terminate_order_moves_to_pending_project(self):
+        CustomerRole.OWNER.add_permission(PermissionEnum.APPROVE_ORDER)
+        self.project.start_date = datetime.date(2030, 1, 1)
+        self.project.save()
+
+        order = factories.OrderFactory(
+            resource=self.resource,
+            project=self.project,
+            offering=self.offering,
+            plan=self.plan,
+            type=OrderTypes.TERMINATE,
+            state=OrderStates.PENDING_CONSUMER,
+            created_by=self.fixture.admin,
+        )
+
+        response = self.terminate(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["order_uuid"], order.uuid.hex)
+
+        order.refresh_from_db()
+        self.assertEqual(order.state, OrderStates.PENDING_PROJECT)
+        self.assertEqual(order.consumer_reviewed_by, self.fixture.owner)
+
+    def test_user_without_approve_permission_cannot_terminate_with_pending_order(self):
+        member = UserFactory()
+        self.project.add_user(member, ProjectRole.MEMBER)
+        ProjectRole.MEMBER.add_permission(PermissionEnum.TERMINATE_RESOURCE)
+        ProjectRole.MEMBER.add_permission(PermissionEnum.LIST_RESOURCES)
+
+        factories.OrderFactory(
+            resource=self.resource,
+            project=self.project,
+            offering=self.offering,
+            plan=self.plan,
+            type=OrderTypes.TERMINATE,
+            state=OrderStates.PENDING_CONSUMER,
+            created_by=self.fixture.admin,
+        )
+
+        response = self.terminate(member)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_resource_terminating_is_not_available_for_blocked_organization(self):
@@ -632,7 +1209,7 @@ class ResourceTerminateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
-class PlanUsageTest(test.APITransactionTestCase):
+class PlanUsageTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         self.project = self.fixture.project
@@ -746,7 +1323,7 @@ class PlanUsageTest(test.APITransactionTestCase):
         )
 
 
-class ResourceCostEstimateTest(test.APITransactionTestCase):
+class ResourceCostEstimateTest(test.APITestCase):
     @override_config(
         WALDUR_SUPPORT_ENABLED=True,
         WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE="basic",
@@ -851,7 +1428,7 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
         self.assertEqual(order.cost, 50)
 
 
-class ResourceUpdateLimitsTest(test.APITransactionTestCase):
+class ResourceUpdateLimitsTest(test.APITestCase):
     def setUp(self):
         plugins.manager.register(
             offering_type="TEST_TYPE",
@@ -869,8 +1446,15 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         self.resource.save()
         self.resource.offering.type = "TEST_TYPE"
         self.resource.offering.save()
+        factories.OfferingComponentFactory(
+            offering=self.resource.offering,
+            type="vcpu",
+            billing_type=BillingTypes.LIMIT,
+        )
 
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
+        # A limit update submits an order, so it needs order creation rights too.
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
 
     def update_limits(self, user, resource, limits=None):
         limits = limits or {"vcpu": 10}
@@ -878,6 +1462,40 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         url = factories.ResourceFactory.get_url(resource, "update_limits")
         payload = {"limits": limits}
         return self.client.post(url, payload)
+
+    def test_a_fraction_is_refused_on_an_integer_only_component(self):
+        """update_limits is the UI's change-limits route and had no fractional
+        test, though it is one of the eight validate_limits call sites."""
+        response = self.update_limits(self.fixture.owner, self.resource, {"vcpu": 1.5})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_a_fraction_is_accepted_where_the_component_allows_it(self):
+        models.OfferingComponent.objects.filter(
+            offering=self.resource.offering, type="vcpu"
+        ).update(limit_decimal_places=1)
+
+        response = self.update_limits(self.fixture.owner, self.resource, {"vcpu": 1.5})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        order = models.Order.objects.filter(resource=self.resource).latest("created")
+        self.assertEqual(order.limits["vcpu"], 1.5)
+
+    def test_owner_can_not_update_limits_of_private_offering_of_other_customer(self):
+        self.resource.offering.shared = False
+        self.resource.offering.save()
+
+        response = self.update_limits(self.fixture.owner, self.resource)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_staff_can_update_limits_of_private_offering_of_other_customer(self):
+        self.resource.offering.shared = False
+        self.resource.offering.save()
+
+        response = self.update_limits(self.fixture.staff, self.resource)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
 
     def test_create_update_limits_order(self):
         response = self.update_limits(self.fixture.owner, self.resource)
@@ -982,8 +1600,590 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         response = self.update_limits(self.fixture.owner, self.resource)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    def test_update_limit_fails_if_offering_is_unavailable(self):
+        self.resource.offering.state = OfferingStates.UNAVAILABLE
+        self.resource.offering.save()
+        response = self.update_limits(self.fixture.owner, self.resource)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-class ResourceMoveTest(test.APITransactionTestCase):
+    def test_update_limits_validates_max_value(self):
+        component = self.resource.offering.components.get(type="vcpu")
+        component.max_value = 10
+        component.save()
+        response = self.update_limits(self.fixture.owner, self.resource, {"vcpu": 15})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_update_limits_validates_min_value(self):
+        component = self.resource.offering.components.get(type="vcpu")
+        component.min_value = 2
+        component.save()
+        response = self.update_limits(self.fixture.owner, self.resource, {"vcpu": 0})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_update_limits_succeeds_within_bounds(self):
+        component = self.resource.offering.components.get(type="vcpu")
+        component.min_value = 1
+        component.max_value = 20
+        component.save()
+        response = self.update_limits(self.fixture.owner, self.resource, {"vcpu": 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class ResourceReallocateLimitsTest(test.APITestCase):
+    def setUp(self):
+        plugins.manager.register(
+            offering_type="TEST_TYPE",
+            create_resource_processor=test_utils.TestCreateProcessor,
+            update_resource_processor=test_utils.TestUpdateScopedProcessor,
+            can_update_limits=True,
+        )
+
+        self.fixture = fixtures.ServiceFixture()
+        self.source_resource = factories.ResourceFactory()
+        self.source_resource.state = ResourceStates.OK
+        self.source_resource.project.customer = self.fixture.customer
+        self.source_resource.project.save()
+        self.source_resource.limits = {"vcpu": 10, "ram": 20}
+        self.source_resource.save()
+        self.source_resource.offering.type = "TEST_TYPE"
+        self.source_resource.offering.save()
+
+        factories.OfferingComponentFactory(
+            offering=self.source_resource.offering,
+            type="vcpu",
+            billing_type=BillingTypes.LIMIT,
+        )
+        factories.OfferingComponentFactory(
+            offering=self.source_resource.offering,
+            type="ram",
+            billing_type=BillingTypes.LIMIT,
+        )
+        factories.OfferingComponentFactory(
+            offering=self.source_resource.offering,
+            type="storage",
+            billing_type=BillingTypes.LIMIT,
+        )
+
+        self.target_resource_1 = factories.ResourceFactory(
+            offering=self.source_resource.offering,
+            project=self.fixture.project,
+        )
+        self.target_resource_1.state = ResourceStates.OK
+        self.target_resource_1.limits = {"vcpu": 2, "ram": 4}
+        self.target_resource_1.save()
+
+        self.target_resource_2 = factories.ResourceFactory(
+            offering=self.source_resource.offering,
+            project=self.fixture.project,
+        )
+        self.target_resource_2.state = ResourceStates.OK
+        self.target_resource_2.limits = {"vcpu": 1, "ram": 2}
+        self.target_resource_2.save()
+
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
+        # Reallocation submits one order per affected resource.
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.CREATE_ORDER)
+
+    def reallocate_limits(self, user, source_resource, limits, targets):
+        self.client.force_authenticate(user)
+        url = factories.ResourceFactory.get_url(source_resource, "reallocate_limits")
+        payload = {"limits": limits, "targets": targets}
+        return self.client.post(url, payload)
+
+    def test_create_reallocate_limits_orders(self):
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            },
+            {
+                "resource_uuid": self.target_resource_2.uuid.hex,
+                "allocated_limits": {"vcpu": 2, "ram": 4},
+            },
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 5, "ram": 10},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("source_order_uuid", response.data)
+        self.assertIn("target_order_uuids", response.data)
+        self.assertEqual(len(response.data["target_order_uuids"]), 2)
+
+    def test_reallocate_limits_creates_source_and_target_orders(self):
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Check source order was created
+        source_order = models.Order.objects.get(uuid=response.data["source_order_uuid"])
+        self.assertEqual(source_order.type, OrderTypes.UPDATE)
+        self.assertEqual(source_order.resource, self.source_resource)
+        # Limits should be subtracted from source resource, 10 - 3 = 7 and 20 - 6 = 14
+        self.assertEqual(source_order.limits["vcpu"], 7)
+        self.assertEqual(source_order.limits["ram"], 14)
+
+        target_order = models.Order.objects.get(
+            uuid=response.data["target_order_uuids"][0]
+        )
+        self.assertEqual(target_order.type, OrderTypes.UPDATE)
+        self.assertEqual(target_order.resource, self.target_resource_1)
+        # Limits should be added to target resource, 2 + 3 = 5 and 4 + 6 = 10
+        self.assertEqual(target_order.limits["vcpu"], 5)
+        self.assertEqual(target_order.limits["ram"], 10)
+
+    def test_reallocate_limits_is_not_available_if_source_resource_is_not_OK(self):
+        self.source_resource.state = ResourceStates.UPDATING
+        self.source_resource.save()
+
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reallocate_limits_is_not_available_if_target_resource_is_not_OK(self):
+        self.target_resource_1.state = ResourceStates.UPDATING
+        self.target_resource_1.save()
+
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reallocate_limits_is_not_allowed_if_pending_order_for_source_exists(self):
+        factories.OrderFactory(
+            resource=self.source_resource, state=OrderStates.PENDING_CONSUMER
+        )
+
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reallocate_limits_is_not_allowed_if_pending_order_for_target_exists(self):
+        factories.OrderFactory(
+            resource=self.target_resource_1, state=OrderStates.PENDING_CONSUMER
+        )
+
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reallocate_limits_validates_source_cannot_be_target(self):
+        targets = [
+            {
+                "resource_uuid": self.source_resource.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reallocate_limits_validates_component_exists_in_source(self):
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"invalid_component": 5},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reallocate_limits_validates_cannot_exceed_source_limits(self):
+        # Source resource has 10 vcpu and 20 ram but we are trying to reallocate 15 vcpu
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 15},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Cannot reallocate 15 of vcpu. Source resource only has 10 available.",
+            response.data,
+        )
+
+    def test_reallocate_limits_validates_total_allocated_does_not_exceed_reallocated(
+        self,
+    ):
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            },
+            {
+                "resource_uuid": self.target_resource_2.uuid.hex,
+                "allocated_limits": {"vcpu": 5, "ram": 10},
+            },
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 5, "ram": 10},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "exceeds reallocated amount",
+            str(response.data),
+        )
+
+    def test_reallocate_limits_validates_total_allocated_is_not_less_than_reallocated(
+        self,
+    ):
+        # Reallocating 5 vcpu and 10 ram, but only allocating 3 vcpu and 6 ram total, should not be allowed
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 2, "ram": 4},
+            },
+            {
+                "resource_uuid": self.target_resource_2.uuid.hex,
+                "allocated_limits": {"vcpu": 1, "ram": 2},
+            },
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 5, "ram": 10},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "is less than reallocated amount",
+            str(response.data),
+        )
+        self.assertIn(
+            "All allocated limits must sum to the reallocated amount",
+            str(response.data),
+        )
+
+    def test_reallocate_limits_validates_target_has_same_components(self):
+        # Create target with different components (storage instead of vcpu and ram)
+        target_different = factories.ResourceFactory(
+            offering=self.source_resource.offering,
+            project=self.fixture.project,
+        )
+        target_different.state = ResourceStates.OK
+        target_different.limits = {"storage": 100}
+        target_different.save()
+
+        targets = [
+            {
+                "resource_uuid": target_different.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("must have the same components as the source", str(response.data))
+
+    def test_reallocate_limits_validates_target_resource_exists(self):
+        fake_uuid = uuid.uuid4()
+        targets = [
+            {
+                "resource_uuid": fake_uuid,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Target resources with UUIDs %s do not exist." % fake_uuid,
+            str(response.data),
+        )
+
+    def test_reallocate_limits_validates_target_same_offering(self):
+        different_offering = factories.OfferingFactory()
+        factories.OfferingComponentFactory(
+            offering=different_offering,
+            type="vcpu",
+            billing_type=BillingTypes.LIMIT,
+        )
+        factories.OfferingComponentFactory(
+            offering=different_offering,
+            type="ram",
+            billing_type=BillingTypes.LIMIT,
+        )
+        target_different_offering = factories.ResourceFactory(
+            offering=different_offering,
+            project=self.fixture.project,
+        )
+        target_different_offering.state = ResourceStates.OK
+        target_different_offering.limits = {"vcpu": 2, "ram": 4}
+        target_different_offering.save()
+
+        targets = [
+            {
+                "resource_uuid": target_different_offering.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "must be from the same offering",
+            str(response.data),
+        )
+
+    def test_reallocate_limits_validates_empty_limits(self):
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Limits to reallocate and targets cannot be empty.", str(response.data)
+        )
+
+    def test_reallocate_limits_validates_empty_targets(self):
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            [],
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Limits to reallocate and targets cannot be empty.", str(response.data)
+        )
+
+    def reallocate_allocated(self, allocated):
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": allocated,
+            }
+        ]
+        return self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+
+    def allow_fractions(self, places=1):
+        """Let every component of the offering take a fractional limit."""
+        models.OfferingComponent.objects.filter(
+            offering=self.source_resource.offering
+        ).update(limit_decimal_places=places)
+
+    def test_a_fraction_is_refused_on_integer_only_components(self):
+        """The reallocate paths call validate_limits three times and none of
+        them had a fractional test, though this is where add_limit_values --
+        the only exact-arithmetic helper -- is actually used in production."""
+        response = self.reallocate_allocated({"vcpu": 0.5, "ram": 6})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_a_fractional_split_that_balances_exactly_is_accepted(self):
+        """0.1 + 0.2 as floats is 0.30000000000000004, which overshoots the
+        amount being reallocated and fails a split that balances exactly."""
+        self.allow_fractions()
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 0.1, "ram": 6},
+            },
+            {
+                "resource_uuid": self.target_resource_2.uuid.hex,
+                "allocated_limits": {"vcpu": 0.2, "ram": 4},
+            },
+        ]
+
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 0.3, "ram": 10},
+            targets,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_the_source_limit_after_a_fractional_reallocation_is_exact(self):
+        """The subtraction must not leave 9.699999999999999 behind."""
+        self.allow_fractions()
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 0.3, "ram": 6},
+            }
+        ]
+
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 0.3, "ram": 6},
+            targets,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        source_order = models.Order.objects.filter(
+            resource=self.source_resource, type=OrderTypes.UPDATE
+        ).latest("created")
+        self.assertEqual(source_order.limits["vcpu"], 9.7)
+
+    def test_reallocate_limits_rejects_negative_values(self):
+        response = self.reallocate_allocated({"vcpu": -1, "ram": 6})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Ensure this value is greater than or equal to 0.", str(response.data)
+        )
+
+    def test_reallocate_limits_rejects_zero_values(self):
+        # The serializer floor is 0 so that a fractional component can be
+        # reallocated below 1; positivity is enforced downstream instead.
+        response = self.reallocate_allocated({"vcpu": 0, "ram": 6})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("must be positive", str(response.data))
+
+    def test_reallocate_limits_requires_permission_for_target_resource(self):
+        other_project = ProjectFactory()
+        target_other = factories.ResourceFactory(
+            offering=self.source_resource.offering,
+            project=other_project,
+        )
+        target_other.state = ResourceStates.OK
+        target_other.limits = {"vcpu": 1, "ram": 2}
+        target_other.save()
+
+        targets = [
+            {
+                "resource_uuid": target_other.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "User does not have permission to update target resource",
+            str(response.data),
+        )
+
+    @mock.patch("waldur_mastermind.marketplace.tasks.process_order")
+    def test_reallocate_limits_orders_are_created_in_transaction(self, mock_task):
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 3, "ram": 6},
+            }
+        ]
+        response = self.reallocate_limits(
+            self.fixture.staff,
+            self.source_resource,
+            {"vcpu": 3, "ram": 6},
+            targets,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            models.Order.objects.filter(
+                resource__in=[self.source_resource, self.target_resource_1],
+                type=OrderTypes.UPDATE,
+            ).count(),
+            2,
+        )
+
+
+class ResourceMoveTest(test.APITestCase):
     def setUp(self):
         self.tenant = openstack_factories.TenantFactory()
         self.fixture = fixtures.ProjectFixture()
@@ -1062,7 +2262,7 @@ class ResourceMoveTest(test.APITransactionTestCase):
 
 
 @ddt
-class ResourceBackendIDTest(test.APITransactionTestCase):
+class ResourceBackendIDTest(test.APITestCase):
     def setUp(self):
         self.fixture = MarketplaceFixture()
         self.resource = self.fixture.resource
@@ -1091,7 +2291,36 @@ class ResourceBackendIDTest(test.APITransactionTestCase):
 
 
 @ddt
-class ResourceBackendMetadataTest(test.APITransactionTestCase):
+class ResourceEffectiveIDTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.url = factories.ResourceFactory.get_provider_resource_url(
+            self.resource, action="set_effective_id"
+        )
+
+        CustomerRole.OWNER.add_permission(PermissionEnum.SET_RESOURCE_BACKEND_ID)
+
+    def make_request(self, role):
+        self.client.force_authenticate(role)
+        payload = {"effective_id": "new_effective_id"}
+        return self.client.post(self.url, payload)
+
+    @data("staff", "offering_owner", "service_owner")
+    def test_user_can_set_effective_id_of_resource(self, user):
+        response = self.make_request(getattr(self.fixture, user))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.effective_id, "new_effective_id")
+
+    @data("owner", "admin", "manager")
+    def test_user_can_not_set_effective_id_of_resource(self, user):
+        response = self.make_request(getattr(self.fixture, user))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+@ddt
+class ResourceBackendMetadataTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = MarketplaceFixture()
         self.resource = self.fixture.resource
@@ -1124,7 +2353,60 @@ class ResourceBackendMetadataTest(test.APITransactionTestCase):
 
 
 @ddt
-class ResourceSetStateErredTest(test.APITransactionTestCase):
+class ResourceSetEndpointsTest(test.APITestCase):
+    def setUp(self) -> None:
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.url = factories.ResourceFactory.get_provider_resource_url(
+            self.resource, action="set_endpoints"
+        )
+        CustomerRole.OWNER.add_permission(PermissionEnum.SET_RESOURCE_BACKEND_METADATA)
+        ServiceProviderRole.MANAGER.add_permission(
+            PermissionEnum.SET_RESOURCE_BACKEND_METADATA
+        )
+
+    def make_request(self, role, endpoints=None):
+        self.client.force_authenticate(role)
+        payload = {
+            "endpoints": endpoints
+            if endpoints is not None
+            else [
+                {"name": "vLLM API", "url": "http://192.168.0.150:8000/v1"},
+                {"name": "Chat playground", "url": "http://192.168.0.150:8000"},
+            ]
+        }
+        return self.client.post(self.url, payload, format="json")
+
+    @data("staff", "offering_owner", "service_owner", "service_manager")
+    def test_user_can_set_endpoints_of_resource(self, user):
+        response = self.make_request(getattr(self.fixture, user))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        endpoints = {e.name: e.url for e in self.resource.endpoints.all()}
+        self.assertEqual(
+            endpoints,
+            {
+                "vLLM API": "http://192.168.0.150:8000/v1",
+                "Chat playground": "http://192.168.0.150:8000",
+            },
+        )
+
+    def test_set_endpoints_replaces_previous_set(self):
+        models.ResourceAccessEndpoint.objects.create(
+            resource=self.resource, name="stale", url="http://old:1/"
+        )
+        response = self.make_request(self.fixture.staff)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        names = set(self.resource.endpoints.values_list("name", flat=True))
+        self.assertEqual(names, {"vLLM API", "Chat playground"})
+
+    @data("owner", "admin", "manager")
+    def test_user_can_not_set_endpoints_of_resource(self, user):
+        response = self.make_request(getattr(self.fixture, user))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+@ddt
+class ResourceSetStateErredTest(test.APITestCase):
     def setUp(self):
         self.fixture = MarketplaceFixture()
         self.resource = self.fixture.resource
@@ -1170,7 +2452,7 @@ class ResourceSetStateErredTest(test.APITransactionTestCase):
 
 
 @ddt
-class ResourceReportTest(test.APITransactionTestCase):
+class ResourceReportTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -1218,7 +2500,7 @@ class ResourceReportTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class ResourceDetailsTest(test.APITransactionTestCase):
+class ResourceDetailsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -1250,7 +2532,54 @@ class ResourceDetailsTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
-class ResourceGetTeamTest(test.APITransactionTestCase):
+class ResourceTeamMembersMultiRoleTest(test.APITestCase):
+    """team_members deduplicates by user, so a user holding several
+    resource-scope roles must expose all of them via roles[]; the scalar
+    role_name reflects only the first grant and is kept for
+    backward compatibility."""
+
+    def setUp(self) -> None:
+        from django.contrib.contenttypes.models import ContentType
+
+        from waldur_core.permissions.models import Role
+
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(customer=self.fixture.customer)
+        self.resource = factories.ResourceFactory(
+            project=self.fixture.project, offering=self.offering
+        )
+        self.user = UserFactory()
+        resource_ct = ContentType.objects.get_for_model(models.Resource)
+        self.role_a = Role.objects.create(
+            name="custom_role_a", content_type=resource_ct, is_system_role=False
+        )
+        self.role_b = Role.objects.create(
+            name="custom_role_b", content_type=resource_ct, is_system_role=False
+        )
+        self.resource.add_user(self.user, self.role_a)
+        self.resource.add_user(self.user, self.role_b)
+        self.url = factories.ResourceFactory.get_url(
+            self.resource, action="team_members"
+        )
+
+    def test_all_resource_scope_roles_are_returned(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            self.url, {"field": ["full_name", "role_name", "roles"]}
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        rows = [row for row in response.data if row["full_name"] == self.user.full_name]
+        self.assertEqual(1, len(rows))
+        row = rows[0]
+        self.assertEqual(
+            {"custom_role_a", "custom_role_b"},
+            {grant["role_name"] for grant in row["roles"]},
+        )
+        # The legacy scalar still carries one of the grants.
+        self.assertIn(row["role_name"], {"custom_role_a", "custom_role_b"})
+
+
+class ResourceGetTeamTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -1289,8 +2618,124 @@ class ResourceGetTeamTest(test.APITransactionTestCase):
         user = users[0]
         self.assertEqual(self.admin.username, user["username"])
 
+    def test_has_consent_filter_excludes_users_without_consent(self):
+        self.client.force_authenticate(self.service_owner)
 
-class ResourceUsageLimitsTest(test.APITransactionTestCase):
+        response = self.client.get(self.provider_url, {"has_consent": "true"})
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(0, len(response.data))
+
+    def test_has_consent_filter_includes_users_with_active_consent(self):
+        models.UserOfferingConsent.objects.create(
+            user=self.admin,
+            offering=self.offering,
+            version="1.0",
+        )
+        self.client.force_authenticate(self.service_owner)
+
+        response = self.client.get(self.provider_url, {"has_consent": "true"})
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(response.data))
+        self.assertEqual(self.admin.full_name, response.data[0]["full_name"])
+
+    def test_has_consent_filter_excludes_users_with_revoked_consent(self):
+        models.UserOfferingConsent.objects.create(
+            user=self.admin,
+            offering=self.offering,
+            version="1.0",
+            revocation_date=timezone.now(),
+        )
+        self.client.force_authenticate(self.service_owner)
+
+        response = self.client.get(self.provider_url, {"has_consent": "true"})
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(0, len(response.data))
+
+    def test_without_has_consent_filter_returns_all_team_members(self):
+        self.client.force_authenticate(self.service_owner)
+
+        response = self.client.get(self.provider_url)
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(response.data))
+
+    def test_consumer_team_returns_all_members_without_consent_filter(self):
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(self.customer_url)
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(response.data))
+
+
+@override_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
+class ResourceProviderTeamConsentEnforcementTest(test.APITestCase):
+    def setUp(self) -> None:
+        self.fixture = fixtures.ProjectFixture()
+        self.project = self.fixture.project
+        self.offering = factories.OfferingFactory(customer=self.fixture.customer)
+        self.service_owner = self.fixture.owner
+        self.admin = self.fixture.admin
+        self.staff = self.fixture.staff
+
+        models.OfferingTermsOfService.objects.create(
+            offering=self.offering,
+            terms_of_service="Test ToS",
+            version="1.0",
+            is_active=True,
+        )
+
+        self.resource = factories.ResourceFactory(
+            project=self.project, offering=self.offering
+        )
+        self.provider_url = factories.ResourceFactory.get_provider_resource_url(
+            self.resource, action="team"
+        )
+        self.customer_url = factories.ResourceFactory.get_url(
+            self.resource, action="team"
+        )
+
+    def test_provider_team_hides_users_without_consent(self):
+        self.client.force_authenticate(self.service_owner)
+
+        response = self.client.get(self.provider_url)
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(0, len(response.data))
+
+    def test_provider_team_includes_users_with_active_consent(self):
+        models.UserOfferingConsent.objects.create(
+            user=self.admin,
+            offering=self.offering,
+            version="1.0",
+        )
+        self.client.force_authenticate(self.service_owner)
+
+        response = self.client.get(self.provider_url)
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(response.data))
+        self.assertEqual(self.admin.full_name, response.data[0]["full_name"])
+
+    def test_provider_team_staff_sees_all_members_without_consent(self):
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get(self.provider_url)
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(response.data))
+
+    def test_consumer_team_returns_all_members_when_enforcement_enabled(self):
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(self.customer_url)
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(response.data))
+
+    def test_consumer_team_has_consent_filter_still_works(self):
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(self.customer_url, {"has_consent": "true"})
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(0, len(response.data))
+
+
+class ResourceUsageLimitsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.UserFixture()
         self.user = self.fixture.staff
@@ -1341,21 +2786,22 @@ class ResourceUsageLimitsTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["limit_usage"], {"cpu": 10})
 
-    def test_if_limit_period_is_null(self):
-        self.offering_component.limit_period = None
+    def test_if_limit_period_is_month(self):
+        """When limit_period is 'month' (default), limit_usage aggregates current month's
+        ComponentUsage records (source of truth), not current_usages snapshot."""
+        self.offering_component.limit_period = LimitPeriods.MONTH
         self.offering_component.save()
-
-        self.resource.current_usages = {"cpu": 5}
-        self.resource.save()
 
         self.client.force_authenticate(self.user)
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["limit_usage"], {"cpu": 5})
+        # Current month has usage=10, previous year has usage=5
+        # With limit_period='month' → current month only → 10
+        self.assertEqual(response.data["limit_usage"], {"cpu": 10})
 
 
 @ddt
-class ResourceForceTerminateTest(test.APITransactionTestCase):
+class ResourceForceTerminateTest(test.APITestCase):
     def setUp(self):
         self.fixture = MarketplaceFixture()
         self.resource = self.fixture.resource
@@ -1388,10 +2834,10 @@ class ResourceForceTerminateTest(test.APITransactionTestCase):
         mock.patch.stopall()
 
     @data("staff")
-    def test_user_can_force_terminate_resource(self, user):
+    def test_staff_also_gets_erred_resource_on_processor_failure(self, user):
         order_state, resource_state = self._terminate_order(user)
         self.assertEqual(order_state, OrderStates.ERRED)
-        self.assertEqual(resource_state, ResourceStates.TERMINATED)
+        self.assertEqual(resource_state, ResourceStates.ERRED)
 
     @data(
         "owner",
@@ -1411,9 +2857,7 @@ class ResourceForceTerminateTest(test.APITransactionTestCase):
     def _terminate_order(self, user):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
-        response = self.client.post(
-            self.url, {"attributes": {"action": "force_destroy"}}
-        )
+        response = self.client.post(self.url, {"attributes": {}})
         if response.status_code == 404:
             return None, self.resource.state
         order_uuid = response.data["order_uuid"]
@@ -1425,84 +2869,7 @@ class ResourceForceTerminateTest(test.APITransactionTestCase):
 
 
 @ddt
-class ResourceUpdateOptionsTest(test.APITransactionTestCase):
-    def setUp(self):
-        self.fixture = MarketplaceFixture()
-        options = {
-            "email": {
-                "type": "string",
-                "label": "email",
-                "default": "user@example.com",
-                "required": False,
-            }
-        }
-        self.fixture.offering.resource_options = {"options": options}
-        self.fixture.offering.save()
-        self.resource = self.fixture.resource
-        self.url = factories.ResourceFactory.get_url(self.resource, "update_options")
-        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_OPTIONS)
-
-    def make_request(self, user, payload=None, custom_url=None):
-        url = custom_url or self.url
-        self.client.force_authenticate(user)
-        payload = payload or {"options": {"email": "order@example.com"}}
-        return self.client.post(url, payload)
-
-    @data(
-        "staff",
-        "owner",
-    )
-    def test_user_can_update_resource_options(self, user):
-        response = self.make_request(getattr(self.fixture, user))
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.resource.refresh_from_db()
-        self.assertEqual(self.resource.options["email"], "order@example.com")
-
-    def test_create_order_when_offering_requires_order_for_option_change(self):
-        self.fixture.offering.plugin_options = {
-            "create_orders_on_resource_option_change": True
-        }
-        self.fixture.offering.save()
-        response = self.make_request(self.fixture.owner)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.resource.refresh_from_db()
-        self.assertEqual(self.resource.options, None)
-        self.assertTrue(
-            models.Order.objects.filter(uuid=response.data["order_uuid"]).exists()
-        )
-        order = models.Order.objects.filter(uuid=response.data["order_uuid"]).get()
-        self.assertEqual(
-            order.attributes.get("new_options"), {"email": "order@example.com"}
-        )
-
-        order.set_state_executing()
-        order.save()
-        marketplace_utils.process_order(order, self.fixture.owner)
-        self.resource.refresh_from_db()
-        self.assertEqual(self.resource.options, {"email": "order@example.com"})
-        order.refresh_from_db()
-        self.assertEqual(order.state, OrderStates.DONE)
-        self.assertEqual(self.resource.state, models.Resource.States.OK)
-
-    @data("admin")
-    def test_user_can_not_update_resource_options(self, user):
-        response = self.make_request(getattr(self.fixture, user))
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-    @data("offering_owner")
-    def test_service_provider_can_update_resource_options(self, user):
-        url = factories.ResourceFactory.get_provider_resource_url(
-            self.resource, "update_options"
-        )
-
-        response = self.make_request(getattr(self.fixture, user), custom_url=url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.resource.refresh_from_db()
-        self.assertEqual(self.resource.options["email"], "order@example.com")
-
-
-@ddt
-class ProviderResourcesTest(test.APITransactionTestCase):
+class ProviderResourcesTest(test.APITestCase):
     def setUp(self):
         self.fixture = MarketplaceFixture()
         self.resource = self.fixture.resource
@@ -1522,8 +2889,55 @@ class ProviderResourcesTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
+class ProviderResourceOrderWorkflowTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.url = factories.ResourceFactory.get_provider_resource_url(self.resource)
+        self.creation_order = self.fixture.order
+
+    def test_provider_owner_sees_creation_order(self):
+        self.client.force_authenticate(self.fixture.provider_owner)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(response.data["creation_order"])
+        self.assertEqual(
+            response.data["creation_order"]["uuid"], self.creation_order.uuid.hex
+        )
+
+    def test_provider_manager_sees_order_in_progress(self):
+        in_progress = models.Order.objects.create(
+            project=self.resource.project,
+            resource=self.resource,
+            state=OrderStates.EXECUTING,
+            created_by=self.fixture.owner,
+            offering=self.resource.offering,
+            type=OrderTypes.UPDATE,
+        )
+        self.client.force_authenticate(self.fixture.provider_manager)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(response.data["order_in_progress"])
+        self.assertEqual(
+            response.data["order_in_progress"]["uuid"], in_progress.uuid.hex
+        )
+
+    def test_provider_project_member_cannot_see_order_workflow(self):
+        # offering_admin holds only a project role on the provider's internal
+        self.assertFalse(
+            marketplace_utils.user_can_see_resource_order_workflow(
+                self.fixture.offering_admin, self.resource
+            )
+        )
+
+    def test_provider_project_member_cannot_access_provider_resource(self):
+        self.client.force_authenticate(self.fixture.offering_admin)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
 @ddt
-class ProviderResourceLimitsSetTest(test.APITransactionTestCase):
+class ProviderResourceLimitsSetTest(test.APITestCase):
     def setUp(self):
         self.fixture = MarketplaceFixture()
         self.resource = self.fixture.resource
@@ -1535,6 +2949,7 @@ class ProviderResourceLimitsSetTest(test.APITransactionTestCase):
         self.url = factories.ResourceFactory.get_provider_resource_url(
             self.resource, "set_limits"
         )
+        ServiceProviderRole.MANAGER.add_permission(PermissionEnum.SET_RESOURCE_STATE)
 
     def make_request(self, user, limits=None):
         self.client.force_authenticate(user)
@@ -1562,3 +2977,805 @@ class ProviderResourceLimitsSetTest(test.APITransactionTestCase):
                 message__contains="cpu",
             ).exists()
         )
+
+    def test_keys_without_matching_component_are_rejected(self):
+        # An agent may push a backend-native key that does not correspond to any
+        # offering component. This is configuration skew that must surface, not
+        # be persisted (an orphan key would later crash limit formatting on
+        # resource update), so the whole request is rejected and limits stay put.
+        response = self.make_request(
+            self.fixture.staff, limits={"cpu": 20, "max_tokens": 1000000000}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("max_tokens", str(response.data))
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 10})
+
+
+class ProviderResourceSetLimitsWithPeriodicPolicyTest(test.APITestCase):
+    """When a SlurmPeriodicUsagePolicy is active on the offering, the
+    set_limits action must not let backend echoes overwrite LIMIT-typed
+    components — that's the trigger of the geometric inflation loop with
+    the periodic policy task (see policy/models.py:calculate_slurm_settings)."""
+
+    def setUp(self):
+        from waldur_mastermind.invoices.models import PeriodMixin
+        from waldur_mastermind.policy import models as policy_models
+
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.component = self.fixture.offering_component
+        self.component.type = "node"
+        self.component.billing_type = BillingTypes.LIMIT
+        self.component.save()
+        self.resource.limits = {"node": 18800}
+        self.resource.save()
+        self.url = factories.ResourceFactory.get_provider_resource_url(
+            self.resource, "set_limits"
+        )
+        ServiceProviderRole.MANAGER.add_permission(PermissionEnum.SET_RESOURCE_STATE)
+
+        self.policy = policy_models.SlurmPeriodicUsagePolicy.objects.create(
+            scope=self.resource.offering,
+            actions="notify_organization_owners",
+            apply_to_all=True,
+            grace_ratio=0.3,
+            carryover_enabled=False,
+            limit_type="GrpTRESMins",
+            tres_billing_enabled=False,
+            raw_usage_reset=True,
+            period=PeriodMixin.Periods.MONTH_3,
+        )
+
+    def _post(self, limits):
+        self.client.force_authenticate(self.fixture.staff)
+        return self.client.post(self.url, {"limits": limits})
+
+    def test_inflated_echo_is_dropped_silently(self):
+        """The site agent posts the grace-inflated value (18800 * 1.3 = 24440).
+        The endpoint must accept the request (no 4xx — the agent has no
+        retry/error handling for set_limits) but leave resource.limits
+        untouched for LIMIT-typed components."""
+        response = self._post({"node": int(18800 * 1.3)})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits["node"], 18800)
+
+    def test_noop_write_is_accepted(self):
+        """Idempotent retries with the unchanged value should pass through
+        cleanly — otherwise the agent's polling would generate noise."""
+        response = self._post({"node": 18800})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits["node"], 18800)
+
+    def test_change_allowed_when_no_policy(self):
+        """Sanity check: removing the policy restores the original
+        admin-override behavior of set_limits."""
+        self.policy.delete()
+        response = self._post({"node": 24440})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits["node"], 24440)
+
+    def test_held_value_is_not_clamped_to_the_component_bounds(self):
+        """The gate restores the stored limit, and the bounds check must not
+        then narrow that restored value: the request was already decided
+        against, and clamping it would shrink a working allocation."""
+        self.component.max_value = 100
+        self.component.save()
+        response = self._post({"node": 24440})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits["node"], 18800)
+
+    def test_usage_component_changes_pass_through(self):
+        """The gate only protects LIMIT-typed components. A USAGE-typed
+        component on the same offering must still be writable."""
+        from waldur_mastermind.marketplace.models import OfferingComponent
+
+        OfferingComponent.objects.create(
+            offering=self.resource.offering,
+            type="cpu",
+            name="CPU",
+            billing_type=BillingTypes.USAGE,
+        )
+        self.resource.limits = {"node": 18800, "cpu": 100}
+        self.resource.save()
+
+        response = self._post({"node": int(18800 * 1.3), "cpu": 200})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        # node held (gated), cpu updated (not LIMIT-typed).
+        self.assertEqual(self.resource.limits["node"], 18800)
+        self.assertEqual(self.resource.limits["cpu"], 200)
+
+
+class ProviderResourceSetLimitsClampingTest(test.APITestCase):
+    """set_limits narrows a value outside the component's bounds instead of
+    rejecting it: the agent has no error handling for a 4xx and would mark the
+    resource ERRED, so a configuration skew must not break the resource. The
+    limits written here are the ones that get billed, so they may not stay
+    outside what the offering declares either."""
+
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.component = self.fixture.offering_component
+        self.component.billing_type = BillingTypes.LIMIT
+        self.component.save()
+        self.resource.limits = {"cpu": 10}
+        self.resource.save()
+        self.url = factories.ResourceFactory.get_provider_resource_url(
+            self.resource, "set_limits"
+        )
+
+    def _post(self, limits):
+        self.client.force_authenticate(self.fixture.staff)
+        return self.client.post(self.url, {"limits": limits}, format="json")
+
+    def _set_bounds(self, **kwargs):
+        for field, value in kwargs.items():
+            setattr(self.component, field, value)
+        self.component.save()
+
+    def test_valid_value_is_stored_unchanged(self):
+        self._set_bounds(min_value=1, max_value=100)
+        response = self._post({"cpu": 20})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 20})
+
+    def test_fraction_is_truncated_for_integer_only_component(self):
+        # limit_decimal_places defaults to 0: the backend maps the limit onto an
+        # integer quota and would truncate the fraction at the far end anyway.
+        response = self._post({"cpu": 20.7})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 20})
+
+    def test_fraction_is_truncated_to_declared_precision(self):
+        self._set_bounds(limit_decimal_places=1)
+        response = self._post({"cpu": 20.78})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 20.7})
+
+    def test_value_above_maximum_is_clamped(self):
+        self._set_bounds(max_value=50)
+        response = self._post({"cpu": 80})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 50})
+
+    def test_zero_maximum_is_not_a_bound(self):
+        # 0 in max_value means "no maximum", the same reading validate_limits
+        # and the frontend use.
+        self._set_bounds(max_value=0)
+        response = self._post({"cpu": 80})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 80})
+
+    def test_value_below_minimum_is_clamped(self):
+        self._set_bounds(min_value=5)
+        response = self._post({"cpu": 2})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 5})
+
+    def test_zero_minimum_rules_out_a_negative_limit(self):
+        self._set_bounds(min_value=0)
+        response = self._post({"cpu": -5})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 0})
+
+    def test_fractional_minimum_is_rounded_up_to_declared_precision(self):
+        # Truncating the bound would land back below the minimum it enforces.
+        self._set_bounds(min_value=Decimal("5.5"))
+        response = self._post({"cpu": 2})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 6})
+
+    def test_value_above_offering_safety_limit_is_clamped(self):
+        self._set_bounds(max_available_limit=100)
+        factories.ResourceFactory(
+            offering=self.resource.offering,
+            plan=self.fixture.plan,
+            project=self.fixture.project,
+            limits={"cpu": 30},
+        )
+        response = self._post({"cpu": 90})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        # 70 is left, and the cap is exclusive, so 69 is the largest value the
+        # order path would accept.
+        self.assertEqual(self.resource.limits, {"cpu": 69})
+
+    def test_own_limit_is_not_counted_against_the_safety_limit(self):
+        self._set_bounds(max_available_limit=100)
+        response = self._post({"cpu": 90})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 90})
+
+    def test_echo_of_the_stored_limit_survives_a_shrunken_safety_limit(self):
+        # The offering has no room left, but this request does not ask for any:
+        # the agent is echoing the limit the resource already holds. Clamping it
+        # would shrink a working resource, and bill a compensation, over a
+        # shortfall the request did not cause.
+        self._set_bounds(max_available_limit=100)
+        factories.ResourceFactory(
+            offering=self.resource.offering,
+            plan=self.fixture.plan,
+            project=self.fixture.project,
+            limits={"cpu": 95},
+        )
+        response = self._post({"cpu": 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 10})
+
+    def test_growth_is_capped_at_the_stored_limit_when_nothing_is_left(self):
+        self._set_bounds(max_available_limit=100)
+        factories.ResourceFactory(
+            offering=self.resource.offering,
+            plan=self.fixture.plan,
+            project=self.fixture.project,
+            limits={"cpu": 95},
+        )
+        response = self._post({"cpu": 20})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        # Only 4 would fit, but the resource already holds 10 and the increase
+        # is what gets refused, not the limit it already has.
+        self.assertEqual(self.resource.limits, {"cpu": 10})
+
+    def test_shrink_is_accepted_when_the_offering_is_over_its_safety_limit(self):
+        # The cap was lowered below what is already allocated. A shrink hands
+        # capacity back rather than taking any, and the backend has already
+        # shrunk: keeping the old limit would bill for capacity it gave up.
+        self._set_bounds(max_available_limit=100)
+        factories.ResourceFactory(
+            offering=self.resource.offering,
+            plan=self.fixture.plan,
+            project=self.fixture.project,
+            limits={"cpu": 100},
+        )
+        response = self._post({"cpu": 5})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 5})
+
+    def test_shrink_is_accepted_when_what_is_left_is_below_the_minimum(self):
+        self._set_bounds(min_value=5, max_available_limit=100)
+        factories.ResourceFactory(
+            offering=self.resource.offering,
+            plan=self.fixture.plan,
+            project=self.fixture.project,
+            limits={"cpu": 95},
+        )
+        response = self._post({"cpu": 6})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 6})
+
+    def test_shrink_under_the_safety_limit_is_not_reported_as_clamped(self):
+        self.resource.limits = {"cpu": 100}
+        self.resource.save()
+        self._set_bounds(max_available_limit=1000)
+        factories.ResourceFactory(
+            offering=self.resource.offering,
+            plan=self.fixture.plan,
+            project=self.fixture.project,
+            limits={"cpu": 950},
+        )
+        with self.assertLogs("waldur_mastermind.marketplace.views", "WARNING") as logs:
+            response = self._post({"cpu": 60})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 60})
+        self.assertFalse(
+            [line for line in logs.output if "Clamping set_limits" in line],
+            logs.output,
+        )
+
+    def test_unsatisfiable_bounds_keep_the_stored_limit(self):
+        # Nothing between the minimum and what the offering has left, so there
+        # is no value to narrow to.
+        self._set_bounds(min_value=80, max_available_limit=100)
+        factories.ResourceFactory(
+            offering=self.resource.offering,
+            plan=self.fixture.plan,
+            project=self.fixture.project,
+            limits={"cpu": 60},
+        )
+        response = self._post({"cpu": 90})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 10})
+
+    def test_unsatisfiable_bounds_leave_a_new_component_out(self):
+        self._set_bounds(min_value=80, max_value=50)
+        self.resource.limits = {}
+        self.resource.save()
+        response = self._post({"cpu": 90})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {})
+
+    def test_unchanged_value_is_left_alone_when_a_bound_is_raised(self):
+        # The provider raised the minimum after the resource was allocated. The
+        # agent keeps reporting the limit the backend actually holds, and
+        # clamping that echo would inflate the stored limit — and the invoice —
+        # to capacity that does not exist, on every single sync.
+        self._set_bounds(min_value=50)
+        response = self._post({"cpu": 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 10})
+
+    def test_unchanged_value_is_left_alone_when_a_maximum_is_lowered(self):
+        self._set_bounds(max_value=5)
+        response = self._post({"cpu": 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 10})
+
+    def test_negative_value_is_truncated_downwards(self):
+        # ROUND_DOWN rounds toward zero, which would raise the limit instead of
+        # narrowing it.
+        self._set_bounds(min_value=-100)
+        response = self._post({"cpu": -20.7})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": -21})
+
+    def test_negative_minimum_is_rounded_towards_zero(self):
+        self._set_bounds(min_value=Decimal("-5.5"))
+        response = self._post({"cpu": -9})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": -5})
+
+    def test_lowered_maximum_does_not_reverse_a_growth_request(self):
+        # The provider lowered the maximum after the resource was allocated.
+        # The agent asks to grow; refusing that is fine, but clamping to the
+        # bound would shrink a working allocation four-fold in answer to a
+        # request to enlarge it.
+        self.resource.limits = {"cpu": 200}
+        self.resource.save()
+        self._set_bounds(max_value=50)
+        response = self._post({"cpu": 210})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 200})
+
+    def test_raised_minimum_does_not_reverse_a_shrink_request(self):
+        self._set_bounds(min_value=50)
+        response = self._post({"cpu": 8})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 10})
+
+    def test_a_step_towards_the_bound_is_still_accepted(self):
+        # The direction rule refuses a reversal, not a partial move: shrinking
+        # towards a lowered maximum goes through untouched.
+        self.resource.limits = {"cpu": 200}
+        self.resource.save()
+        self._set_bounds(max_value=50)
+        response = self._post({"cpu": 30})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 30})
+
+    def test_growth_request_does_not_shave_an_imprecise_stored_limit(self):
+        # 10.7 predates this route enforcing precision. The offering has no
+        # room for the requested growth, which is a reason to refuse it — not
+        # to trim the allocation the resource is running on.
+        self.resource.limits = {"cpu": 10.7}
+        self.resource.save()
+        self._set_bounds(max_available_limit=100)
+        factories.ResourceFactory(
+            offering=self.resource.offering,
+            plan=self.fixture.plan,
+            project=self.fixture.project,
+            limits={"cpu": 95},
+        )
+        response = self._post({"cpu": 20})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 10.7})
+
+    def test_growth_within_a_step_does_not_shave_an_imprecise_stored_limit(self):
+        # Truncating 10.8 gives 10, below the stored 10.7: a request to grow
+        # must not come out as a shrink.
+        self.resource.limits = {"cpu": 10.7}
+        self.resource.save()
+        response = self._post({"cpu": 10.8})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 10.7})
+
+    def test_growth_past_a_step_from_an_imprecise_stored_limit_is_accepted(self):
+        self.resource.limits = {"cpu": 10.7}
+        self.resource.save()
+        response = self._post({"cpu": 11.3})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 11})
+
+    def test_usage_component_is_not_clamped(self):
+        # Bounds describe a requested limit; a usage-typed component reports
+        # what the backend measured and is not a limit at all.
+        self.component.billing_type = BillingTypes.USAGE
+        self.component.max_value = 50
+        self.component.save()
+        response = self._post({"cpu": 80})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 80})
+
+    def test_plugin_validator_rejection_keeps_the_stored_limits(self):
+        def reject(limits):
+            raise rf_exceptions.ValidationError("CPU limit is mandatory.")
+
+        with mock.patch.object(
+            plugins.manager, "get_limits_validator", return_value=reject
+        ):
+            response = self._post({"cpu": 20})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits, {"cpu": 10})
+
+
+@ddt
+class ProviderUpdateOptionsDirectTest(test.APITestCase):
+    def setUp(self):
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_OPTIONS)
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.resource.state = ResourceStates.CREATING
+        self.resource.options = {"storage": 10}
+        self.resource.save()
+
+        # Set up offering with resource options metadata
+        self.resource.offering.resource_options = {
+            "options": {
+                "storage": {"type": "integer", "label": "Storage"},
+                "ram": {"type": "integer", "label": "RAM"},
+            }
+        }
+        self.resource.offering.save()
+
+        self.url = factories.ResourceFactory.get_provider_resource_url(
+            self.resource, action="update_options_direct"
+        )
+
+    @data("offering_owner")
+    def test_service_provider_can_update_options_directly(self, user_type):
+        user = getattr(self.fixture, user_type)
+        self.client.force_authenticate(user)
+
+        new_options = {"storage": 20, "ram": 4}
+        response = self.client.post(self.url, {"options": new_options})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["status"], "Resource options have been updated directly."
+        )
+
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.options, new_options)
+
+    def test_update_options_direct_works_during_transitional_states(self):
+        # Test that update works even during CREATING state
+        self.client.force_authenticate(self.fixture.offering_owner)
+
+        new_options = {"storage": 15, "ram": 8}
+        response = self.client.post(self.url, {"options": new_options})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.options, new_options)
+
+    def test_consumer_users_cannot_access_provider_endpoint(self):
+        # Project admin should not be able to access provider endpoint
+        self.client.force_authenticate(self.fixture.admin)
+        response = self.client.post(self.url, {"options": {"storage": 20}})
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_invalid_options_are_rejected(self):
+        self.client.force_authenticate(self.fixture.offering_owner)
+
+        # Missing required metadata should cause validation error
+        self.resource.offering.resource_options = {}
+        self.resource.offering.save()
+
+        response = self.client.post(self.url, {"options": {"storage": 20}})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class ResourceSlugTemplateTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ServiceFixture()
+        self.project = self.fixture.project
+        self.plan = factories.PlanFactory()
+        self.offering = self.plan.offering
+
+    def _set_template(self, template):
+        self.offering.plugin_options = {"resource_slug_template": template}
+        self.offering.save()
+
+    def _create_resource(self, name="My Resource"):
+        return models.Resource.objects.create(
+            project=self.project,
+            offering=self.offering,
+            plan=self.plan,
+            name=name,
+        )
+
+    def test_default_slug_is_truncated_to_ten_chars(self):
+        # Without a template the core SlugMixin behaviour applies: slugify(name)[:10].
+        resource = self._create_resource(name="A very long resource name")
+        self.assertEqual(resource.slug, "a-very-lon")
+
+    def test_template_slug_is_not_truncated_to_ten(self):
+        self._set_template("{customer_slug}-{project_slug}-{counter_padded}")
+        resource = self._create_resource()
+        expected = f"{self.project.customer.slug}-{self.project.slug}-001"
+        self.assertEqual(resource.slug, expected)
+        self.assertGreater(len(resource.slug), 10)
+
+    def test_template_slug_uniqueness(self):
+        self._set_template("{offering_slug}")
+        first = self._create_resource()
+        second = self._create_resource()
+        third = self._create_resource()
+        self.assertEqual(first.slug, self.offering.slug)
+        self.assertEqual(second.slug, f"{self.offering.slug}-2")
+        self.assertEqual(third.slug, f"{self.offering.slug}-3")
+
+    def test_counter_template_sequential_is_clean(self):
+        # A {counter} template yields a single, clean, incrementing counter.
+        self._set_template("{project_slug}-{counter}")
+        first = self._create_resource()
+        second = self._create_resource()
+        third = self._create_resource()
+        self.assertEqual(first.slug, f"{self.project.slug}-1")
+        self.assertEqual(second.slug, f"{self.project.slug}-2")
+        self.assertEqual(third.slug, f"{self.project.slug}-3")
+
+    def test_counter_template_avoids_double_counter_after_churn(self):
+        # Regression for WAL-9925: deleting a lower-numbered resource drops the
+        # count-based counter onto a slug that still exists. The counter must be
+        # advanced (proj-3), NOT a second counter appended (proj-2-2).
+        self._set_template("{project_slug}-{counter}")
+        first = self._create_resource()
+        second = self._create_resource()
+        self.assertEqual(first.slug, f"{self.project.slug}-1")
+        self.assertEqual(second.slug, f"{self.project.slug}-2")
+        first.delete()  # count drops to 1, so the next counter re-renders proj-2
+        third = self._create_resource()
+        self.assertEqual(third.slug, f"{self.project.slug}-3")
+        self.assertNotIn(f"{self.project.slug}-2-", third.slug)
+
+    def test_invalid_template_falls_back_to_default(self):
+        # An unknown placeholder must not crash slug generation at save time.
+        self._set_template("{nonexistent}-suffix")
+        resource = self._create_resource(name="Fallback Name")
+        self.assertEqual(resource.slug, "fallback-n")
+
+    def test_existing_resource_slug_not_regenerated_on_save(self):
+        # Backward compatibility: an already-persisted slug is never rewritten,
+        # even after a template is added to the offering.
+        resource = self._create_resource(name="A very long resource name")
+        original_slug = resource.slug
+        self._set_template("{customer_slug}-{project_slug}-{counter_padded}")
+        resource.name = "A completely different name"
+        resource.save()
+        resource.refresh_from_db()
+        self.assertEqual(resource.slug, original_slug)
+
+    def test_max_length_extends_default_name_slug(self):
+        # The numeric knob lengthens the name-based slug beyond the 10-char default.
+        self.offering.plugin_options = {"resource_slug_max_length": 20}
+        self.offering.save()
+        resource = self._create_resource(name="A very long resource name")
+        self.assertEqual(resource.slug, "a-very-long-resource")
+        self.assertGreater(len(resource.slug), 10)
+
+    def test_max_length_clamped_to_ceiling(self):
+        # Values above the ceiling are clamped to RESOURCE_SLUG_MAX_LENGTH.
+        self.offering.plugin_options = {"resource_slug_max_length": 100}
+        self.offering.save()
+        resource = self._create_resource(
+            name="This is an extremely long resource name exceeding forty chars"
+        )
+        self.assertLessEqual(len(resource.slug), models.RESOURCE_SLUG_MAX_LENGTH)
+        self.assertGreater(len(resource.slug), 10)
+
+    def test_template_takes_precedence_over_max_length(self):
+        self.offering.plugin_options = {
+            "resource_slug_template": "{offering_slug}",
+            "resource_slug_max_length": 40,
+        }
+        self.offering.save()
+        resource = self._create_resource(name="A very long resource name")
+        self.assertEqual(resource.slug, self.offering.slug)
+
+
+class ResourceSlugTemplateValidatorTest(test.APITestCase):
+    def _validate(self, template):
+        serializer = marketplace_serializers.LifecyclePluginOptionsSerializer(
+            data={"resource_slug_template": template}
+        )
+        return serializer
+
+    def test_valid_template_is_accepted(self):
+        serializer = self._validate("{customer_slug}-{project_slug}-{counter_padded}")
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+    def test_unknown_placeholder_is_rejected(self):
+        serializer = self._validate("{bogus}-{counter}")
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("resource_slug_template", serializer.errors)
+
+    def test_too_long_template_is_rejected(self):
+        serializer = self._validate(
+            "{customer_slug}-{project_slug}-{offering_slug}-{year}-{month}-extra-padding"
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("resource_slug_template", serializer.errors)
+
+    def test_blank_template_is_accepted(self):
+        serializer = self._validate("")
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+    def _validate_max_length(self, value):
+        return marketplace_serializers.LifecyclePluginOptionsSerializer(
+            data={"resource_slug_max_length": value}
+        )
+
+    def test_max_length_valid_value_is_accepted(self):
+        serializer = self._validate_max_length(40)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+    def test_max_length_above_ceiling_is_rejected(self):
+        serializer = self._validate_max_length(100)
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("resource_slug_max_length", serializer.errors)
+
+    def test_max_length_zero_is_rejected(self):
+        serializer = self._validate_max_length(0)
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("resource_slug_max_length", serializer.errors)
+
+
+@ddt
+class ProviderResourceOfferingScopeTest(test.APITestCase):
+    """Provider write-back actions must accept an offering-level role.
+
+    A user holding only OFFERING.MANAGER can act on resources of that
+    offering, without needing a customer-wide role. This is what a site
+    agent authenticates as. See waldur/waldur-mastermind#317.
+    """
+
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.resource.offering.resource_options = {
+            "options": {"ram": {"type": "integer", "label": "RAM"}}
+        }
+        self.resource.offering.save()
+        for permission in (
+            PermissionEnum.SET_RESOURCE_BACKEND_METADATA,
+            PermissionEnum.SET_RESOURCE_STATE,
+            PermissionEnum.SUBMIT_RESOURCE_REPORT,
+            PermissionEnum.UPDATE_RESOURCE_OPTIONS,
+        ):
+            OfferingRole.MANAGER.add_permission(permission)
+
+    def make_request(self, resource, action, payload):
+        url = factories.ResourceFactory.get_provider_resource_url(
+            resource, action=action
+        )
+        self.client.force_authenticate(self.fixture.offering_manager)
+        return self.client.post(url, payload, format="json")
+
+    @data(
+        ("set_backend_metadata", {"backend_metadata": {"key": "value"}}),
+        (
+            "set_endpoints",
+            {"endpoints": [{"name": "API", "url": "http://example.com/v1"}]},
+        ),
+        ("set_as_ok", None),
+        ("refresh_last_sync", None),
+        (
+            "submit_report",
+            {"report": [{"header": "Section header", "body": "Section body"}]},
+        ),
+        ("update_options_direct", {"options": {"ram": 4}}),
+        ("set_limits", {"limits": {"cpu": 2}}),
+    )
+    @unpack
+    def test_offering_manager_can_write_back(self, action, payload):
+        response = self.make_request(self.resource, action, payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, action)
+
+    @data(
+        "set_backend_metadata",
+        "set_endpoints",
+        "set_as_ok",
+        "refresh_last_sync",
+        "submit_report",
+        "update_options_direct",
+        "set_limits",
+    )
+    def test_offering_manager_can_not_reach_another_offering(self, action):
+        other = factories.ResourceFactory()
+        response = self.make_request(other, action, None)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, action)
+
+
+@ddt
+class ProviderSetEndDateOfferingScopeTest(test.APITestCase):
+    """OFFERING.MANAGER carries RESOURCE.SET_END_DATE, so a site agent can
+    write an end date back without a customer-wide role.
+
+    #317 made the provider check reach the offering scope; the role still did
+    not hold the permission, so the call kept returning 403. permissions.yaml
+    now grants it alongside the other provider write-back permissions. See
+    waldur/waldur-mastermind#318.
+    """
+
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.resource.state = ResourceStates.OK
+        self.resource.save()
+        OfferingRole.MANAGER.add_permission(PermissionEnum.SET_RESOURCE_END_DATE)
+        # The deprecated action refuses a resource invoiced in the last 90 days.
+        # That rule is not what is under test here, and the fixture always
+        # bills the resource on creation.
+        invoices_models.InvoiceItem.objects.filter(resource=self.resource).delete()
+        self.end_date = timezone.datetime.today().date() + datetime.timedelta(days=90)
+
+    def set_end_date(self, resource, action="set_end_date"):
+        url = factories.ResourceFactory.get_provider_resource_url(
+            resource, action=action
+        )
+        self.client.force_authenticate(self.fixture.offering_manager)
+        return self.client.post(
+            url, {"end_date": self.end_date.isoformat()}, format="json"
+        )
+
+    @data("set_end_date", "set_end_date_by_provider")
+    def test_offering_manager_sets_the_end_date(self, action):
+        """Both the current action and the deprecated one, which checked
+        offering.customer only and so contradicted its own replacement."""
+        response = self.set_end_date(self.resource, action)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.end_date, self.end_date)
+
+    @data("set_end_date", "set_end_date_by_provider")
+    def test_offering_manager_can_not_reach_another_offering(self, action):
+        other = factories.ResourceFactory(state=ResourceStates.OK)
+
+        response = self.set_end_date(other, action)
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, action)
+
+    @data("set_end_date", "set_end_date_by_provider")
+    def test_role_without_the_permission_is_still_refused(self, action):
+        """The grant is what unlocks this — not membership of the offering."""
+        OfferingRole.MANAGER.delete_permission(PermissionEnum.SET_RESOURCE_END_DATE)
+
+        response = self.set_end_date(self.resource, action)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, action)

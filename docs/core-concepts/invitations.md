@@ -58,10 +58,12 @@ Group invitations provide template-based access that multiple users can request 
 
 - **Pattern-based matching**: Users can request access if they match email patterns or affiliations
 - **Approval workflow**: Requests go through a review process before granting access
+- **Auto-approval**: Optionally skip manual review for users matching invitation patterns
 - **Project creation option**: Can automatically create projects instead of granting customer-level access
 - **Role mapping**: Support for different roles at customer and project levels
 - **Template-based naming**: Configurable project name templates for auto-created projects
 - **Public visibility**: Public invitations can be viewed and requested by unauthenticated users
+- **Duplicate role prevention**: Multiple layers of checks prevent duplicate role assignments
 
 #### Workflow
 
@@ -74,16 +76,31 @@ sequenceDiagram
     participant S as System
 
     U->>GI: Submit request
-    GI->>PR: Create PermissionRequest
-    PR->>A: Notify approvers
-    A->>PR: Approve/Reject
-    alt Approved & auto_create_project
-      PR->>S: Create project
-      S->>U: Grant project permission
-    else Approved & normal
-      PR->>S: Grant scope permission
+    GI->>GI: Check user already has role
+    GI->>GI: Check INVITATION_DISABLE_MULTIPLE_ROLES
+    GI->>GI: Check no existing PermissionRequest (pending/approved)
+    GI->>GI: Validate email/affiliation patterns
+
+    alt Validation fails
+      GI-->>U: 400 Bad Request
+    else Validation passes
+      GI->>PR: Create PermissionRequest
+      alt auto_approve enabled
+        PR->>PR: Auto-approve
+        PR->>S: Grant role (with duplicate guard)
+        PR-->>U: 200 OK (auto_approved: true)
+      else Manual approval
+        PR->>A: Notify approvers
+        A->>PR: Approve/Reject
+        alt Approved & auto_create_project
+          PR->>S: Create project (excludes soft-deleted)
+          S->>U: Grant project permission
+        else Approved & normal
+          PR->>S: Grant scope permission
+        end
+        PR->>U: Notify result
+      end
     end
-    PR->>U: Notify result
 ```
 
 #### Public Group Invitations
@@ -189,10 +206,12 @@ class Invitation(BaseInvitation):
 class GroupInvitation(BaseInvitation):
     is_active: BooleanField         # Whether invitation is active
     is_public: BooleanField         # Allow unauthenticated users to see invitation
+    auto_approve: BooleanField      # Auto-approve requests from matching users
 
     # User pattern matching
     user_email_patterns: JSONField  # Email patterns for matching users
     user_affiliations: JSONField    # Affiliation patterns
+    user_identity_sources: JSONField  # Allowed identity providers (e.g., eduGAIN, SAML)
 
     # Project creation alternative
     auto_create_project: BooleanField      # Create project instead of customer role
@@ -250,6 +269,236 @@ def can_manage_invitation_with(request, scope):
 - **PendingInvitationFilter**: Filters invitations user can accept
 - **VisibleInvitationFilter**: Controls invitation detail visibility
 
+## Duplicate Role Prevention
+
+The invitation system enforces multiple layers of protection against granting duplicate roles.
+These checks apply to both individual and group invitation flows.
+
+### Validation Layers
+
+```mermaid
+flowchart TD
+    A[User submits group invitation request] --> B{has_user check:<br/>User already has this role?}
+    B -->|Yes| R1[Reject: User already has this role in the scope]
+    B -->|No| C{INVITATION_DISABLE_MULTIPLE_ROLES<br/>and user has any role in scope?}
+    C -->|Yes| R2[Reject: User already has role within this scope]
+    C -->|No| D{Existing PermissionRequest<br/>pending or approved?}
+    D -->|Yes| R3[Reject: Permission request already exists for this scope]
+    D -->|No| E[Create PermissionRequest]
+    E --> F{Auto-approve enabled?}
+    F -->|Yes| G[Approve immediately]
+    F -->|No| H[Wait for manual approval]
+    G --> I{has_user guard in approve:<br/>User already has role?}
+    H --> I
+    I -->|Yes| S[Skip role creation silently]
+    I -->|No| J[Grant role via add_user]
+```
+
+#### Layer 1: `has_user()` Check in `submit_request`
+
+Before creating a `PermissionRequest`, the system checks whether the user already holds the
+exact role being requested in the target scope. This mirrors the check in individual invitation
+acceptance (`InvitationViewSet.accept()`).
+
+#### Layer 2: `INVITATION_DISABLE_MULTIPLE_ROLES` Check
+
+When `INVITATION_DISABLE_MULTIPLE_ROLES=True` (Constance setting), a user cannot hold
+**any** active role in the same scope. This prevents a user from accumulating multiple different
+roles (e.g., both OWNER and SUPPORT) in a single customer or project. Applies to both
+individual and group invitation flows.
+
+#### Layer 3: Existing PermissionRequest Check
+
+The system checks for existing `PermissionRequest` records in `PENDING` or `APPROVED` state
+for the same user and scope. This prevents a user from submitting multiple requests even if
+the first was auto-approved and already transitioned out of `PENDING` state.
+
+#### Layer 4: Defense-in-Depth in `approve()`
+
+The `PermissionRequest.approve()` method performs a final `has_user()` check before calling
+`add_user()`. This catches edge cases where overlapping requests from different group
+invitations target the same scope and role. If the user already has the role, approval
+completes silently without creating a duplicate.
+
+### Soft-Deleted Project Handling
+
+When `auto_create_project=True`, the system uses `Project.available_objects.get_or_create()`
+instead of `Project.objects.get_or_create()`. This ensures soft-deleted projects (with
+`is_removed=True`) are excluded, and a fresh project is created if the matching project was
+previously deleted.
+
+## User Restrictions
+
+Customers and Projects can define user restrictions that control which users can be added as members. These restrictions apply to both direct membership (via `add_user` API) and invitation acceptance. GroupInvitations can add additional restrictions on top of scope restrictions but cannot bypass them.
+
+### Restriction Fields
+
+Both Customer and Project models support the following restriction fields:
+
+```python
+# Available on Customer, Project, and GroupInvitation models
+user_email_patterns: JSONField      # Regexes for allowed emails, matched against the whole address
+user_affiliations: JSONField        # List of allowed affiliations
+user_identity_sources: JSONField    # List of allowed identity providers
+
+# AAI-based filtering (also available on Customer, Project, and GroupInvitation)
+user_nationalities: JSONField       # List of allowed nationality codes (ISO 3166-1 alpha-2)
+user_organization_types: JSONField  # List of allowed organization type URNs (SCHAC)
+user_assurance_levels: JSONField    # List of required assurance URIs (REFEDS)
+```
+
+### Validation Logic
+
+Restrictions use **OR logic within a field** and **AND logic across fields and levels**:
+
+- **Within a field**: User matches if ANY email pattern OR ANY affiliation OR ANY identity source matches
+- **Across fields**: User must pass ALL fields that have restrictions set (e.g., if both email patterns and affiliations are set, user must match at least one of each)
+- **Across levels**: User must pass ALL levels that have restrictions set (Customer → Project → GroupInvitation)
+
+**Email patterns** are regular expressions matched against the **whole** address, ignoring case. `.*@university\.edu` accepts `john@university.edu` and `John@University.EDU`, but not `john@university.edu.attacker.net`. A trailing `$` is allowed but not needed. Escape the dots, since an unescaped `.` matches any character. A pattern that is not a valid regex, or that could cause catastrophic backtracking, never matches. Shell wildcards such as `*@university.edu` are rejected when saved, and the error suggests the equivalent regex.
+
+**Special AAI validation rules:**
+
+- **Nationalities**: User must have at least one nationality in the allowed list (checks both `nationality` and `nationalities` fields)
+- **Organization types**: User's `organization_type` must be in the allowed list
+- **Assurance levels**: User must have ALL required assurance URIs (AND logic, not OR)
+
+```mermaid
+flowchart TD
+    A[User attempts to join] --> B{Customer has restrictions?}
+    B -->|Yes| C{User matches Customer restrictions?}
+    B -->|No| D{Project has restrictions?}
+    C -->|No| REJECT[Rejected - Customer restrictions not met]
+    C -->|Yes| D
+    D -->|Yes| E{User matches Project restrictions?}
+    D -->|No| F{GroupInvitation has restrictions?}
+    E -->|No| REJECT2[Rejected - Project restrictions not met]
+    E -->|Yes| F
+    F -->|Yes| G{User matches GroupInvitation restrictions?}
+    F -->|No| ALLOW[Allowed]
+    G -->|No| REJECT3[Rejected - GroupInvitation restrictions not met]
+    G -->|Yes| ALLOW
+```
+
+### Cascade Validation Table
+
+| Customer | Project | GroupInvitation | User Must Match |
+|----------|---------|-----------------|-----------------|
+| No restrictions | No restrictions | No restrictions | Anyone allowed |
+| Has restrictions | No restrictions | No restrictions | Customer only |
+| No restrictions | Has restrictions | No restrictions | Project only |
+| Has restrictions | Has restrictions | No restrictions | Customer AND Project |
+| Has restrictions | Has restrictions | Has restrictions | Customer AND Project AND GroupInvitation |
+
+### Permission to Set Restrictions
+
+| Scope | Who Can Set Restrictions |
+|-------|-------------------------|
+| Customer | Staff users only (`is_staff=True`) |
+| Project | Users with `CREATE_PROJECT` permission on customer |
+| GroupInvitation | Invitation creator (must respect scope restrictions) |
+
+### Examples
+
+#### Customer-Level Email Restriction
+
+```python
+# Only users from specific domains can join this customer
+customer.user_email_patterns = [r".*@university\.edu", r".*@research\.org"]
+customer.save()
+
+# User with email "john@university.edu" can be added - matches pattern
+# User with email "jane@gmail.com" cannot be added - no pattern match
+```
+
+#### Project-Level Affiliation Restriction
+
+```python
+# Project requires staff or faculty affiliation
+project.user_affiliations = ["staff", "faculty"]
+project.save()
+
+# User with affiliations=["staff"] can be added
+# User with affiliations=["student"] cannot be added
+```
+
+#### Identity Source Restriction
+
+```python
+# Only allow users authenticated via specific identity providers
+customer.user_identity_sources = ["eduGAIN", "SAML"]
+customer.save()
+
+# User with identity_source="eduGAIN" can be added
+# User with identity_source="local" cannot be added
+```
+
+#### Nationality Restriction (AAI)
+
+```python
+# Only allow users from EU member states
+project.user_nationalities = ["DE", "FR", "IT", "ES", "NL", "BE", "AT", "PL"]
+project.save()
+
+# User with nationality="DE" or nationalities=["DE", "US"] can be added
+# User with nationality="US" and nationalities=["US"] cannot be added
+```
+
+#### Organization Type Restriction (AAI)
+
+```python
+# Only allow users from universities or research institutions
+customer.user_organization_types = [
+    "urn:schac:homeOrganizationType:int:university",
+    "urn:schac:homeOrganizationType:int:research-institution"
+]
+customer.save()
+
+# User with organization_type="urn:schac:homeOrganizationType:int:university" can be added
+# User with organization_type="urn:schac:homeOrganizationType:int:company" cannot be added
+```
+
+#### Assurance Level Restriction (AAI)
+
+```python
+# Require high assurance level for sensitive projects
+project.user_assurance_levels = [
+    "https://refeds.org/assurance/IAP/high",
+    "https://refeds.org/assurance/ID/eppn-unique-no-reassign"
+]
+project.save()
+
+# User must have BOTH assurance URIs in their eduperson_assurance list
+# This ensures strong identity verification from the identity provider
+```
+
+#### Combined Customer and Project Restrictions
+
+```python
+# Customer requires university email
+customer.user_email_patterns = [r".*@university\.edu"]
+customer.save()
+
+# Project within customer requires staff affiliation
+project.user_affiliations = ["staff"]
+project.save()
+
+# User must match BOTH:
+# - Email must match .*@university.edu
+# - Affiliation must include "staff"
+```
+
+### Important Notes
+
+1. **Staff users are NOT exempt**: Restrictions apply to all users including staff
+2. **Empty restrictions allow all**: If no restrictions are set, any user is allowed
+3. **GroupInvitation inherits scope restrictions**: GroupInvitation cannot bypass Customer/Project restrictions
+4. **Validation occurs at multiple points**:
+   - Direct membership via `POST /customers/{uuid}/add_user/` or `POST /projects/{uuid}/add_user/`
+   - Invitation acceptance via `POST /invitations/{uuid}/accept/`
+   - GroupInvitation request via `POST /group-invitations/{uuid}/submit_request/`
+   - PermissionRequest approval
+
 ## Background Processing
 
 ### Celery Tasks
@@ -300,8 +549,8 @@ The system provides robust error tracking:
 ```python
 # Invitation lifecycle
 INVITATION_LIFETIME = timedelta(weeks=1)        # Individual invitation expiration
-GROUP_INVITATION_LIFETIME = timedelta(weeks=4)  # Group invitation expiration
 INVITATION_MAX_AGE = 60 * 60 * 24 * 7          # Token validity period
+# Note: Group invitations do not expire
 
 # User creation
 INVITATION_CREATE_MISSING_USER = False         # Auto-create user accounts
@@ -315,8 +564,9 @@ VALIDATE_INVITATION_EMAIL = False              # Strict email matching
 
 ```python
 # Runtime configuration
-ENABLE_STRICT_CHECK_ACCEPTING_INVITATION = True   # Enforce email matching
-INVITATION_DISABLE_MULTIPLE_ROLES = False         # Prevent multiple roles per user
+ENABLE_STRICT_CHECK_ACCEPTING_INVITATION = True   # Enforce email matching on individual invitations
+INVITATION_DISABLE_MULTIPLE_ROLES = False         # Prevent multiple roles in same scope
+                                                  # (applies to both individual and group invitations)
 ```
 
 ### Webhook Integration
@@ -341,7 +591,83 @@ The system uses several email templates (`waldur_core/users/templates/`):
 - `invitation_approved` - Auto-created user credentials
 - `permission_request_submitted` - Permission request notification
 
+## Notifications
+
+Group invitations rely on the marketplace notification framework
+(`users.*` keys registered in `waldur_core/structure/notifications.py`). Each
+notification maps to a database `Notification` row that staff can toggle and
+whose templates they can override from the UI
+(**Support → User management → Notifications**, backed by
+`/api/notification-messages/`). If a notification is **disabled**, delivery is
+silently skipped — this is the first thing to check when an expected email is
+not received.
+
+### When a request to join is submitted
+
+When a user submits a request against a group invitation, a
+`PermissionRequest` is created and transitioned to `PENDING`. The
+`post_save` handler
+`create_notification_about_permission_request_has_been_submitted`
+(`waldur_core/users/handlers.py`) queues
+`send_mail_notification_about_permission_request_has_been_submitted`
+(`waldur_core/users/tasks.py`) on transaction commit, which sends the
+`users.permission_request_submitted` notification to the approvers.
+
+#### Recipient resolution
+
+Recipients are resolved in
+`get_users_for_notification_about_request_has_been_submitted` and
+`get_customer_notification_emails`
+(`waldur_core/users/utils.py`) and combined as follows:
+
+| Priority | Recipient set | How it is resolved |
+|----------|---------------|--------------------|
+| 1 | **Approvers** | Users holding a role that grants the scope's *create permission* (e.g. `CREATE_CUSTOMER_PERMISSION` for a customer-scoped invitation, `CREATE_PROJECT_PERMISSION` for a project-scoped one). For project scopes, the parent customer's qualifying owners are included too. Users with a blank email or `notifications_enabled=False` are excluded. |
+| 2 | **Organization contacts** | The invitation customer's contact `email` field plus every address in its comma-separated `notification_emails` field. |
+| 3 | **Staff (fallback)** | Active staff users with a valid email — used **only** when priorities 1 and 2 yield no recipients. |
+
+The final list is the union of priorities 1 and 2 (de-duplicated, blanks
+dropped); if that union is empty it falls back to priority 3. If even staff are
+unavailable, a warning is logged and no email is sent.
+
+This means an organization can be notified about join requests even when no
+member currently holds the approver permission — by setting the organization's
+**contact email** or **notification emails**. Those fields are configured on
+the organization (**Edit organization → Contact information**).
+
+!!! note
+    `auto_approve` invitations still emit `permission_request_submitted` to the
+    approvers before the request is immediately approved, because `submit()`
+    runs before `approve()`.
+
+### When a request is rejected
+
+Rejecting a `PermissionRequest` triggers
+`create_notification_about_permission_request_has_been_rejected`
+→ `send_mail_notification_about_permission_request_has_been_rejected`, which
+sends `users.permission_request_rejected` to the requester
+(`permission_request.created_by`) only.
+
+### Individual invitation requests (for contrast)
+
+The separate individual-invitation flow
+(`ONLY_STAFF_CAN_INVITE_USERS`) uses `send_invitation_requested` and the
+`users.invitation_requested` template, which notifies **staff only** — it does
+not consult organization owners or the customer notification emails.
+
 ## Advanced Features
+
+### Auto-Approval
+
+Group invitations with `auto_approve=True` skip manual review and immediately approve
+matching users. When a user submits a request:
+
+1. The system validates patterns (email, affiliation, identity source)
+2. Creates a `PermissionRequest` in `PENDING` state
+3. Immediately transitions it to `APPROVED`
+4. Grants the role (subject to duplicate role prevention checks)
+
+All duplicate role prevention layers still apply to auto-approved requests.
 
 ### Project Auto-Creation
 
@@ -351,10 +677,10 @@ Group invitations can automatically create projects instead of granting customer
 # Configuration
 auto_create_project = True
 project_role = ProjectRole.MANAGER
-project_name_template = "{user.full_name} Project"
+project_name_template = "{full_name} Project"  # placeholders: {username}, {email}, {full_name}
 
 # On approval, creates:
-# 1. New project with resolved name
+# 1. New project with resolved name (excludes soft-deleted projects)
 # 2. Project-level role assignment
 # 3. Proper permission hierarchy
 ```
@@ -364,13 +690,17 @@ project_name_template = "{user.full_name} Project"
 Group invitations support sophisticated user matching:
 
 ```python
-# Email patterns
-user_email_patterns = ["*@company.com", "*@university.edu"]
+# Email patterns (regex, matched against the whole address, ignoring case)
+user_email_patterns = [r".*@company\.com", r".*@university\.edu"]
 
-# Affiliation patterns
-user_affiliations = ["ACME Corp", "State University"]
+# Affiliation patterns (exact match)
+user_affiliations = ["staff", "student", "faculty"]
+
+# Identity sources (exact match)
+user_identity_sources = ["eduGAIN", "SAML", "local"]
 
 # Validation logic in GroupInvitation.get_objects_by_user_patterns()
+# Uses OR logic: user matches if ANY email pattern OR ANY affiliation OR ANY identity source matches
 ```
 
 ### Token-Based Security
@@ -480,6 +810,11 @@ Multiple levels of email validation:
   - Check affiliation matching logic
   - Confirm invitation is still active
 
+5. **"User already has this role" on group invitation submit**
+  - User already holds the requested role in the target scope
+  - Check if user was previously granted the role via individual invitation or direct assignment
+  - If `INVITATION_DISABLE_MULTIPLE_ROLES=True`, the user may hold a different role in the same scope
+
 ### Debugging Tools
 
 1. **Admin interface**: View invitation details and states
@@ -514,8 +849,8 @@ group_invitation = GroupInvitation.objects.create(
     role=CustomerRole.OWNER,
     auto_create_project=True,
     project_role=ProjectRole.MANAGER,
-    project_name_template="{user.full_name}'s Research Project",
-    user_email_patterns=["*@university.edu"],
+    project_name_template="{full_name}'s Research Project",
+    user_email_patterns=[r".*@university\.edu"],
     created_by=admin_user
 )
 
@@ -532,8 +867,8 @@ public_invitation = GroupInvitation.objects.create(
     is_public=True,            # Makes it visible to unauthenticated users
     auto_create_project=True,  # Required for public invitations
     project_role=ProjectRole.MANAGER,
-    project_name_template="{user.full_name} Research Project",
-    user_email_patterns=["*@university.edu", "*@research.org"],
+    project_name_template="{full_name} Research Project",
+    user_email_patterns=[r".*@university\.edu", r".*@research\.org"],
     created_by=staff_user      # Must be staff user
 )
 

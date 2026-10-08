@@ -25,12 +25,13 @@ class ReviewerDashboardViewSet(ReviewerChecklistMixin, ReadOnlyActionsViewSet):
 # - get_checklist_for_object(obj) -> Checklist or None
 """
 
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.plumbing import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import decorators, response, status
-from rest_framework import permissions as rf_permissions
 
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist import serializers as checklist_serializers
+from waldur_core.core.permissions import PATScopeAwareIsAdminUser
 
 
 class BaseChecklistMixin:
@@ -80,12 +81,21 @@ class UserChecklistMixin(BaseChecklistMixin):
     """
 
     # Default permissions - should be overridden by inheriting viewsets
-    checklist_permissions = [rf_permissions.IsAdminUser]
-    completion_status_permissions = [rf_permissions.IsAdminUser]
-    submit_answers_permissions = [rf_permissions.IsAdminUser]
+    checklist_permissions = [PATScopeAwareIsAdminUser]
+    completion_status_permissions = [PATScopeAwareIsAdminUser]
+    submit_answers_permissions = [PATScopeAwareIsAdminUser]
 
     @extend_schema(
         description="Get checklist with questions and existing answers.",
+        parameters=[
+            OpenApiParameter(
+                name="include_all",
+                type=OpenApiTypes.BOOL,
+                location=OpenApiParameter.QUERY,
+                description="If true, returns all questions including hidden ones (for dynamic form visibility). Default: false.",
+                required=False,
+            ),
+        ],
         responses={
             200: checklist_serializers.ChecklistResponseSerializer,
             400: {"description": "No checklist configured"},
@@ -106,8 +116,17 @@ class UserChecklistMixin(BaseChecklistMixin):
 
         checklist = completion.checklist
 
-        # Get visible questions using checklist module logic
-        questions = checklist.get_visible_questions(completion)
+        # Check if client wants all questions (for dynamic form visibility)
+        # Support both DRF Request (query_params) and Django WSGIRequest (GET)
+        query_params = getattr(request, "query_params", request.GET)
+        include_all = query_params.get("include_all", "false").lower() == "true"
+
+        if include_all:
+            # Return ALL questions - frontend handles visibility dynamically
+            questions = checklist.get_questions()
+        else:
+            # Return only visible questions based on saved answers (default)
+            questions = checklist.get_visible_questions(completion)
 
         # Create response data
         response_data = {
@@ -189,7 +208,9 @@ class UserChecklistMixin(BaseChecklistMixin):
                     user=request.user,
                 ).delete()
             else:
-                # Create or update answer using direct foreign key
+                # Create or update answer using direct foreign key.
+                # File processing (for file/multiple_files questions) is handled
+                # inside Answer.save() via process_file_answer(), which is idempotent.
                 checklist_models.Answer.objects.update_or_create(
                     completion=completion,
                     question=question,
@@ -231,9 +252,19 @@ class UserChecklistMixin(BaseChecklistMixin):
 
     @extend_schema(
         description="Get checklist template for creating new objects.",
+        parameters=[
+            OpenApiParameter(
+                name="parent_uuid",
+                type=OpenApiTypes.UUID,
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="UUID of the parent object (e.g., customer UUID for new projects)",
+            )
+        ],
         responses={
             200: checklist_serializers.ChecklistTemplateSerializer,
             400: {"description": "No checklist configured"},
+            404: {"description": "Parent object not found"},
         },
     )
     @decorators.action(detail=False, methods=["get"], url_path="checklist-template")
@@ -250,7 +281,9 @@ class UserChecklistMixin(BaseChecklistMixin):
         Returns:
             Checklist template with all questions and their visibility rules.
         """
-        parent_uuid = request.query_params.get("parent_uuid")
+        # Support both DRF Request (query_params) and Django WSGIRequest (GET)
+        query_params = getattr(request, "query_params", request.GET)
+        parent_uuid = query_params.get("parent_uuid")
         if not parent_uuid:
             return response.Response(
                 {"detail": "parent_uuid query parameter is required"},
@@ -332,8 +365,8 @@ class ReviewerChecklistMixin(BaseChecklistMixin):
     """
 
     # Default permissions - MUST be overridden by inheriting viewsets with reviewer permissions
-    checklist_review_permissions = [rf_permissions.IsAdminUser]
-    completion_review_status_permissions = [rf_permissions.IsAdminUser]
+    checklist_review_permissions = [PATScopeAwareIsAdminUser]
+    completion_review_status_permissions = [PATScopeAwareIsAdminUser]
 
     @extend_schema(
         description="Get checklist with questions and existing answers including review logic (reviewers only).",

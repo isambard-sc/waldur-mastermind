@@ -11,7 +11,6 @@ from rest_framework.response import Response
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.core.enums import CoreStates
-from waldur_core.core.serializers import EmptySerializer
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.utils import permission_factory
 from waldur_mastermind.booking.utils import get_offering_bookings_and_busy_slots
@@ -22,6 +21,7 @@ from waldur_mastermind.marketplace.callbacks import (
     resource_creation_succeeded,
 )
 from waldur_mastermind.marketplace.enums import BOOKING_OFFERING, ResourceStates
+from waldur_mastermind.proposal import managers as proposal_managers
 
 from . import executors, filters, permissions, serializers
 
@@ -37,8 +37,11 @@ class ResourceViewSet(core_views.ReadOnlyActionsViewSet):
     filterset_class = filters.BookingResourceFilter
     lookup_field = "uuid"
     serializer_class = serializers.BookingResourceSerializer
-    accept_serializer_class = reject_serializer_class = EmptySerializer
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.BookingOrderUUIDSerializer},
+        request=None,
+    )
     @action(detail=True, methods=["post"])
     def reject(self, request, uuid=None):
         resource: models.Resource = self.get_object()
@@ -48,6 +51,10 @@ class ResourceViewSet(core_views.ReadOnlyActionsViewSet):
 
         return Response({"order_uuid": order.uuid.hex}, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.BookingOrderUUIDSerializer},
+        request=None,
+    )
     @action(detail=True, methods=["post"])
     def accept(self, request, uuid=None):
         resource: models.Resource = self.get_object()
@@ -79,6 +86,11 @@ class OfferingViewSet(core_views.ReadOnlyActionsViewSet):
     )
     lookup_field = "uuid"
     serializer_class = serializers.OfferingSerializer
+
+    def get_queryset(self):
+        return proposal_managers.annotate_offerings_open_for_proposals(
+            super().get_queryset()
+        )
 
     @extend_schema(request=None, responses=None)
     @action(detail=True, methods=["post"])

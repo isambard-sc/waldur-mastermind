@@ -12,6 +12,7 @@ from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
 
+from waldur_core.core.models import DESCRIPTION_LENGTH
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.media.utils import dummy_image
 from waldur_core.permissions.enums import PermissionEnum
@@ -24,6 +25,7 @@ from waldur_core.structure.tests import models as test_models
 from waldur_core.structure.utils import move_project
 from waldur_core.users.enums import InvitationState
 from waldur_core.users.models import Invitation
+from waldur_mastermind.marketplace.enums import BillingTypes
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
@@ -40,7 +42,7 @@ class ProjectPermissionGrantTest(TransactionTestCase):
 
 
 @ddt
-class ProjectUpdateDeleteTest(test.APITransactionTestCase):
+class ProjectUpdateDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_PROJECT)
@@ -112,20 +114,110 @@ class ProjectUpdateDeleteTest(test.APITransactionTestCase):
         self.assertFalse(Project.available_objects.filter(pk=pk).exists())
         self.assertTrue(Project.objects.filter(pk=pk).exists())
 
-    @override_waldur_core_settings(OECD_FOS_2007_CODE_MANDATORY=True)
-    def test_update_if_oecd_is_not_passed(self):
-        self.fixture.project.save()
-        self.client.force_authenticate(self.fixture.staff)
 
-        data = {"backend_id": "backend_id"}
-        response = self.client.patch(
-            factories.ProjectFactory.get_url(self.fixture.project), data
+class ProjectEndDatePermissionTest(test.APITestCase):
+    """Who may change Project.end_date through the project endpoint.
+
+    Setting a date has always required DELETE_PROJECT on the customer;
+    clearing one used to require nothing beyond the ability to update the
+    project at all.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+
+    def test_user_without_delete_permission_cannot_clear_end_date(self):
+        """Removing an expiry must not be easier than setting one.
+
+        The permission check used to test the submitted value for truthiness, so
+        an explicit null slipped through unguarded and anyone able to update the
+        project could keep it alive indefinitely.
+        """
+        ProjectRole.MANAGER.add_permission(PermissionEnum.UPDATE_PROJECT)
+        self.addCleanup(
+            lambda: ProjectRole.MANAGER.delete_permission(PermissionEnum.UPDATE_PROJECT)
         )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        project = self.fixture.project
+        project.end_date = timezone.now().date() + timedelta(days=90)
+        project.save()
+
+        self.client.force_authenticate(self.fixture.manager)
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project), {"end_date": None}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        project.refresh_from_db()
+        self.assertIsNotNone(project.end_date)
+
+    def test_user_without_delete_permission_cannot_set_end_date(self):
+        ProjectRole.MANAGER.add_permission(PermissionEnum.UPDATE_PROJECT)
+        self.addCleanup(
+            lambda: ProjectRole.MANAGER.delete_permission(PermissionEnum.UPDATE_PROJECT)
+        )
+        project = self.fixture.project
+
+        self.client.force_authenticate(self.fixture.manager)
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"end_date": (timezone.now().date() + timedelta(days=90)).isoformat()},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        project.refresh_from_db()
+        self.assertIsNone(project.end_date)
+
+    def test_user_with_delete_permission_can_clear_end_date(self):
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_PROJECT)
+        CustomerRole.OWNER.add_permission(PermissionEnum.DELETE_PROJECT)
+        self.addCleanup(
+            lambda: CustomerRole.OWNER.delete_permission(PermissionEnum.UPDATE_PROJECT)
+        )
+        self.addCleanup(
+            lambda: CustomerRole.OWNER.delete_permission(PermissionEnum.DELETE_PROJECT)
+        )
+        project = self.fixture.project
+        project.end_date = timezone.now().date() + timedelta(days=90)
+        project.save()
+
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project), {"end_date": None}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        project.refresh_from_db()
+        self.assertIsNone(project.end_date)
+
+    def test_resubmitting_the_same_end_date_is_not_blocked(self):
+        """A partial update that echoes the current value changes nothing.
+
+        Unrelated PATCHes that round-trip the whole object must not start
+        failing just because they carry the end date they already had.
+        """
+        ProjectRole.MANAGER.add_permission(PermissionEnum.UPDATE_PROJECT)
+        self.addCleanup(
+            lambda: ProjectRole.MANAGER.delete_permission(PermissionEnum.UPDATE_PROJECT)
+        )
+        end_date = timezone.now().date() + timedelta(days=90)
+        project = self.fixture.project
+        project.end_date = end_date
+        project.save()
+
+        self.client.force_authenticate(self.fixture.manager)
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"end_date": end_date.isoformat(), "description": "unrelated edit"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        project.refresh_from_db()
+        self.assertEqual(project.end_date, end_date)
+        self.assertEqual(project.description, "unrelated edit")
 
 
 @ddt
-class ProjectCreateTest(test.APITransactionTestCase):
+class ProjectCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT)
@@ -168,47 +260,23 @@ class ProjectCreateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertFalse(Project.objects.filter(name=data["name"]).exists())
 
-    def test_validate_end_date(self):
+    def test_validate_end_date_on_creation_has_no_grace_period(self):
+        """A project being created has no grace period yet, so a past end date
+        is rejected outright."""
         self.client.force_authenticate(self.fixture.staff)
-        grace_days = models.PROJECT_GRACE_PERIOD_DAYS
         today = datetime.date(2021, 7, 1)
 
-        # A date further in the past than the grace period is rejected.
         payload = self._get_valid_project_payload(self.fixture.customer)
-        too_old_end_date = today - timedelta(days=grace_days + 1)
-        payload["end_date"] = too_old_end_date.isoformat()
+        payload["end_date"] = (today - timedelta(days=1)).isoformat()
 
         with freeze_time(today.isoformat()):
             response = self.client.post(
                 factories.ProjectFactory.get_list_url(), payload
             )
 
-            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-            self.assertTrue(
-                "Cannot be earlier than the current date" in str(response.data)
-            )
-            self.assertFalse(Project.objects.filter(name=payload["name"]).exists())
-
-        # A date within the grace period of today is accepted - setting it
-        # extends the project's grace period rather than being rejected as
-        # a past date.
-        payload = self._get_valid_project_payload(self.fixture.customer)
-        payload["name"] = "project_within_grace_period"
-        within_grace_end_date = today - timedelta(days=grace_days)
-        payload["end_date"] = within_grace_end_date.isoformat()
-
-        with freeze_time(today.isoformat()):
-            response = self.client.post(
-                factories.ProjectFactory.get_list_url(), payload
-            )
-
-            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-            self.assertTrue(
-                Project.objects.filter(
-                    name=payload["name"],
-                    end_date=within_grace_end_date,
-                ).exists()
-            )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Cannot be earlier than the current date", str(response.data))
+        self.assertFalse(Project.objects.filter(name=payload["name"]).exists())
 
         # The current date is, of course, still accepted.
         payload = self._get_valid_project_payload(self.fixture.customer)
@@ -220,13 +288,70 @@ class ProjectCreateTest(test.APITransactionTestCase):
                 factories.ProjectFactory.get_list_url(), payload
             )
 
-            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-            self.assertTrue(
-                Project.objects.filter(
-                    name=payload["name"],
-                    end_date=today,
-                ).exists()
-            )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            Project.objects.filter(name=payload["name"], end_date=today).exists()
+        )
+
+    def test_validate_end_date_uses_project_grace_period(self):
+        """Setting an end date inside the project's own grace period is allowed:
+        it extends the grace period rather than being rejected as a past date."""
+        self.client.force_authenticate(self.fixture.staff)
+        today = datetime.date(2021, 7, 1)
+        grace_days = 30
+
+        project = self.fixture.project
+        project.grace_period_days = grace_days
+        project.save(update_fields=["grace_period_days"])
+        url = factories.ProjectFactory.get_url(project)
+
+        # Inside the grace period: accepted.
+        within_grace = today - timedelta(days=grace_days)
+        with freeze_time(today.isoformat()):
+            response = self.client.patch(url, {"end_date": within_grace.isoformat()})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        project.refresh_from_db()
+        self.assertEqual(project.end_date, within_grace)
+
+        # Beyond the grace period: rejected.
+        too_old = today - timedelta(days=grace_days + 1)
+        with freeze_time(today.isoformat()):
+            response = self.client.patch(url, {"end_date": too_old.isoformat()})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Cannot be earlier than the current date", str(response.data))
+        project.refresh_from_db()
+        self.assertEqual(project.end_date, within_grace)
+
+    def test_validate_end_date_falls_back_to_customer_grace_period(self):
+        """With no project-level grace period, the customer's setting applies."""
+        self.client.force_authenticate(self.fixture.staff)
+        today = datetime.date(2021, 7, 1)
+        grace_days = 15
+
+        customer = self.fixture.customer
+        customer.grace_period_days = grace_days
+        customer.save(update_fields=["grace_period_days"])
+
+        project = self.fixture.project
+        project.grace_period_days = None
+        project.save(update_fields=["grace_period_days"])
+        url = factories.ProjectFactory.get_url(project)
+
+        within_grace = today - timedelta(days=grace_days)
+        with freeze_time(today.isoformat()):
+            response = self.client.patch(url, {"end_date": within_grace.isoformat()})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        project.refresh_from_db()
+        self.assertEqual(project.end_date, within_grace)
+
+        too_old = today - timedelta(days=grace_days + 1)
+        with freeze_time(today.isoformat()):
+            response = self.client.patch(url, {"end_date": too_old.isoformat()})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     @data("staff", "owner")
     def test_user_can_set_end_date(self, user):
@@ -296,10 +421,10 @@ class ProjectCreateTest(test.APITransactionTestCase):
         self.client.force_authenticate(self.fixture.owner)
         payload = self._get_valid_project_payload(self.fixture.customer)
         payload["name"] = "project_with_end_date"
-        payload["end_date"] = "2025-12-31"
+        payload["end_date"] = "2030-12-31"
         response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(str(response.data["end_date"]), "2025-12-31")
+        self.assertEqual(str(response.data["end_date"]), "2030-12-31")
 
     @override_config(PROJECT_END_DATE_MANDATORY=False)
     def test_project_can_be_created_without_end_date_when_setting_disabled(self):
@@ -308,7 +433,76 @@ class ProjectCreateTest(test.APITransactionTestCase):
         payload["name"] = "project_without_end_date_allowed"
         response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertIsNone(response.data["end_date"])
+
+    def test_description_exceeds_limit_after_html_clean_returns_400(self):
+        self.client.force_authenticate(self.fixture.owner)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "project_with_long_description"
+        payload["description"] = "&" * DESCRIPTION_LENGTH
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+        self.assertFalse(Project.objects.filter(name=payload["name"]).exists())
+
+    @override_config(PROJECT_END_DATE_MANDATORY=True)
+    def test_patch_does_not_require_end_date_when_field_is_not_being_changed(self):
+        # Regression: setting PROJECT_END_DATE_MANDATORY must not block PATCH
+        # requests that don't touch end_date on projects whose end_date is null.
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+        project.end_date = None
+        project.save()
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"description": "updated"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["description"], "updated")
+
+    @override_config(PROJECT_END_DATE_MANDATORY=True)
+    def test_patch_rejects_explicit_null_end_date_when_setting_enabled(self):
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+        project.end_date = datetime.date(2030, 1, 1)
+        project.save()
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"end_date": None},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("end_date", response.data)
+
+    @override_waldur_core_settings(OECD_FOS_2007_CODE_MANDATORY=True)
+    def test_patch_does_not_require_oecd_code_when_field_is_not_being_changed(self):
+        # Regression: same anti-pattern as PROJECT_END_DATE_MANDATORY -- a
+        # PATCH that doesn't touch oecd_fos_2007_code must not be rejected
+        # just because the project's current value is null.
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+        project.oecd_fos_2007_code = None
+        project.save()
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"description": "updated"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    @override_config(AFFILIATION_REQUIRED_AT_PROJECT_CREATION=True)
+    def test_patch_does_not_require_affiliation_when_field_is_not_being_changed(self):
+        # Regression: same anti-pattern. The setting name itself implies
+        # "at creation", so PATCHes that don't include affiliation_uuid must
+        # be allowed even when the project's current affiliation is null.
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+        project.affiliation = None
+        project.save()
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"description": "updated"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
 
     def test_validate_start_date(self):
         self.client.force_authenticate(self.fixture.staff)
@@ -449,6 +643,92 @@ class ProjectCreateTest(test.APITransactionTestCase):
                 project3.start_date, datetime.datetime(year=2021, month=6, day=1).date()
             )
 
+    @override_config(PROJECT_NAME_REGEX=r"^.{1,32}$")
+    def test_project_name_regex_rejects_too_long_name(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "x" * 33
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("name", response.data)
+        self.assertFalse(Project.objects.filter(name=payload["name"]).exists())
+
+    @override_config(PROJECT_NAME_REGEX=r"^.{1,32}$")
+    def test_project_name_regex_allows_matching_name(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "x" * 32
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(Project.objects.filter(name=payload["name"]).exists())
+
+    def test_project_name_regex_disabled_by_default(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "x" * 100
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    @override_config(
+        PROJECT_NAME_REGEX=r"^.{1,32}$",
+        PROJECT_NAME_REGEX_ERROR_MESSAGE="Name must be at most 32 characters.",
+    )
+    def test_project_name_regex_uses_custom_error_message(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "x" * 33
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Name must be at most 32 characters.", str(response.data))
+
+    @override_config(PROJECT_NAME_REGEX=r"^.{1,32}$")
+    def test_project_name_regex_applies_on_rename(self):
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"name": "x" * 33},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_config(PROJECT_NAME_REGEX=r"^.{1,32}$")
+    def test_patch_not_changing_name_is_allowed_for_existing_long_name(self):
+        # A project whose name predates the rule must remain editable as long as
+        # the PATCH does not touch the name.
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+        project.name = "x" * 100
+        project.save()
+
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"description": "updated"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    @override_config(PROJECT_NAME_REGEX="[")
+    def test_invalid_regex_is_ignored(self):
+        # A malformed pattern is an admin misconfiguration and must not block
+        # project creation.
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "x" * 100
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
     def _get_valid_project_payload(self, customer):
         return {
             "name": "New project name",
@@ -456,7 +736,7 @@ class ProjectCreateTest(test.APITransactionTestCase):
         }
 
 
-class ProjectApiPermissionTest(test.APITransactionTestCase):
+class ProjectApiPermissionTest(test.APITestCase):
     forbidden_combinations = (
         # User role, Project
         ("admin", "manager"),
@@ -520,9 +800,10 @@ class ProjectApiPermissionTest(test.APITransactionTestCase):
             reverse("project-list"), self._get_valid_payload(project)
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertDictContainsSubset(
-            {"detail": "You do not have permission to perform this action."},
-            response.data,
+        self.assertIn("detail", response.data)
+        self.assertEqual(
+            response.data["detail"],
+            "You do not have permission to perform this action.",
         )
 
     def test_user_cannot_create_project_within_customer_he_doesnt_own_but_manages_its_project(
@@ -537,9 +818,10 @@ class ProjectApiPermissionTest(test.APITransactionTestCase):
             reverse("project-list"), self._get_valid_payload(project)
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertDictContainsSubset(
-            {"detail": "You do not have permission to perform this action."},
-            response.data,
+        self.assertIn("detail", response.data)
+        self.assertEqual(
+            response.data["detail"],
+            "You do not have permission to perform this action.",
         )
 
     def test_user_cannot_create_project_within_customer_he_is_not_affiliated_with(self):
@@ -550,8 +832,9 @@ class ProjectApiPermissionTest(test.APITransactionTestCase):
             reverse("project-list"), self._get_valid_payload(project)
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertDictContainsSubset(
-            {"customer": ["Invalid hyperlink - Object does not exist."]}, response.data
+        self.assertIn("customer", response.data)
+        self.assertEqual(
+            response.data["customer"], ["Invalid hyperlink - Object does not exist."]
         )
 
     def test_user_can_create_project_within_customer_he_owns(self):
@@ -676,7 +959,7 @@ class TestExecutor(executors.BaseCleanupExecutor):
 
 
 @mock.patch("waldur_core.core.WaldurExtension.get_extensions")
-class ProjectCleanupTest(test.APITransactionTestCase):
+class ProjectCleanupTest(test.APITestCase):
     def test_executors_are_sorted_in_topological_order(self, get_extensions):
         class ParentExecutor(executors.BaseCleanupExecutor):
             pass
@@ -733,7 +1016,7 @@ class ProjectCleanupTest(test.APITransactionTestCase):
         )
 
 
-class ChangeProjectCustomerTest(test.APITransactionTestCase):
+class ChangeProjectCustomerTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -766,7 +1049,7 @@ class ChangeProjectCustomerTest(test.APITransactionTestCase):
 
 
 @ddt
-class ChangeProjectImageTest(test.APITransactionTestCase):
+class ChangeProjectImageTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -795,12 +1078,13 @@ class ChangeProjectImageTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
-class ProjectMoveTest(test.APITransactionTestCase):
+class ProjectMoveTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
         self.url = factories.ProjectFactory.get_url(self.project, action="move_project")
         self.customer = factories.CustomerFactory()
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT)
 
     def get_response(self, role, customer):
         self.client.force_authenticate(role)
@@ -834,8 +1118,66 @@ class ProjectMoveTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(self.project.customer, old_customer)
 
+    def test_user_can_move_project_if_has_create_project_permission_in_both_customers(
+        self,
+    ):
+        """Test that a user with CREATE_PROJECT permission in both source and target organizations can move a project."""
 
-class ProjectListFilterTest(test.APITransactionTestCase):
+        user_with_permission = factories.UserFactory()
+        self.project.customer.add_user(user_with_permission, CustomerRole.OWNER)
+        self.customer.add_user(user_with_permission, CustomerRole.OWNER)
+
+        response = self.get_response(user_with_permission, self.customer)
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.project.customer, self.customer)
+
+    def test_user_cannot_move_project_without_create_permission_in_source_customer(
+        self,
+    ):
+        """Test that a user without CREATE_PROJECT permission in the source organization cannot move a project."""
+
+        # User has permission only in target organization
+        user = factories.UserFactory()
+        self.customer.add_user(user, CustomerRole.OWNER)
+
+        response = self.get_response(user, self.customer)
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        # Project should remain in original customer
+        self.assertNotEqual(self.project.customer, self.customer)
+
+    def test_user_cannot_move_project_without_create_permission_in_target_customer(
+        self,
+    ):
+        """Test that a user without CREATE_PROJECT permission in the target organization cannot move a project."""
+
+        # User has permission only in source organization
+        user = factories.UserFactory()
+        self.project.customer.add_user(user, CustomerRole.OWNER)
+
+        response = self.get_response(user, self.customer)
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        # Project should remain in original customer
+        self.assertNotEqual(self.project.customer, self.customer)
+
+    def test_user_without_create_project_permission_cannot_move_project(self):
+        """Test that a user without CREATE_PROJECT permission in either organization cannot move a project."""
+        user_without_permission = factories.UserFactory()
+
+        response = self.get_response(user_without_permission, self.customer)
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        # Project should remain in original customer
+        self.assertNotEqual(self.project.customer, self.customer)
+
+
+class ProjectListFilterTest(test.APITestCase):
     _valid_backend_id = uuid.uuid4()
     _valid_effective_id = uuid.uuid4()
 
@@ -901,29 +1243,48 @@ class ProjectListFilterTest(test.APITransactionTestCase):
         self.assertEqual(response.data[0]["name"], self.project1.name)
 
 
-class ProjectResourceQuotasTest(test.APITransactionTestCase):
+class ProjectResourceQuotasTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
         self.empty_project = factories.ProjectFactory()
         self.offering = marketplace_factories.OfferingFactory()
         self.component1 = marketplace_factories.OfferingComponentFactory(
-            offering=self.offering, type="cpu", name="CPU", measured_unit="vCPU"
+            offering=self.offering,
+            type="cpu",
+            name="CPU",
+            measured_unit="vCPU",
+            billing_type=BillingTypes.USAGE,
         )
         self.component2 = marketplace_factories.OfferingComponentFactory(
-            offering=self.offering, type="ram", name="RAM", measured_unit="GB"
+            offering=self.offering,
+            type="ram",
+            name="RAM",
+            measured_unit="GB",
+            billing_type=BillingTypes.USAGE,
         )
         self.resource1 = marketplace_factories.ResourceFactory(
             project=self.project,
             offering=self.offering,
-            current_usages={"cpu": 2, "ram": 4},
             limits={"cpu": 8, "ram": 16},
         )
         self.resource2 = marketplace_factories.ResourceFactory(
             project=self.project,
             offering=self.offering,
-            current_usages={"cpu": 1, "ram": 2},
             limits={"cpu": 4, "ram": 8},
+        )
+        # Create ComponentUsage records (source of truth for stats)
+        marketplace_factories.ComponentUsageFactory(
+            resource=self.resource1, component=self.component1, usage=2
+        )
+        marketplace_factories.ComponentUsageFactory(
+            resource=self.resource1, component=self.component2, usage=4
+        )
+        marketplace_factories.ComponentUsageFactory(
+            resource=self.resource2, component=self.component1, usage=1
+        )
+        marketplace_factories.ComponentUsageFactory(
+            resource=self.resource2, component=self.component2, usage=2
         )
         self.url = factories.ProjectFactory.get_url(self.project, "stats")
 
@@ -955,7 +1316,7 @@ class ProjectResourceQuotasTest(test.APITransactionTestCase):
         self.assertEqual(ram_component["measured_unit"], "GB")
 
 
-class ProjectOtherUsersTest(test.APITransactionTestCase):
+class ProjectOtherUsersTest(test.APITestCase):
     def test_user_can_list_other_users(self):
         fixture = fixtures.ProjectFixture()
         ProjectRole.ADMIN.add_permission(PermissionEnum.LIST_PROJECTS)
@@ -988,7 +1349,7 @@ class ProjectOtherUsersTest(test.APITransactionTestCase):
         )
 
 
-class ProjectRecoveryTest(test.APITransactionTestCase):
+class ProjectRecoveryTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -1206,20 +1567,23 @@ class ProjectRecoveryTest(test.APITransactionTestCase):
         )
         self.assertEqual(response1.status_code, status.HTTP_200_OK)
 
-        # Soft delete and recover again
+        # Soft delete cancels open invitations. Refresh so soft-delete does not
+        # overwrite termination_metadata (incl. invitation_sent) with a stale
+        # in-memory copy from setUp.
+        self.project.refresh_from_db()
         self.project.delete()
         response2 = self.client.post(
             self.url, {"send_invitations_to_previous_members": True}
         )
         self.assertEqual(response2.status_code, status.HTTP_200_OK)
 
-        # Should not create duplicate invitations
+        # invitation_sent in termination_metadata prevents a second batch
         project_ct = ContentType.objects.get_for_model(self.project)
         invitations = Invitation.objects.filter(
             content_type=project_ct, object_id=self.project.id
         )
-        # Should still be 2 invitations, not 4
         self.assertEqual(invitations.count(), 2)
+        self.assertEqual(invitations.filter(state=InvitationState.CANCELED).count(), 2)
 
     def test_legacy_project_basic_recovery_works(self):
         """Test recovery of project that was deleted before termination metadata feature."""
@@ -1623,3 +1987,560 @@ class ProjectRecoveryTest(test.APITransactionTestCase):
         # Should have null termination_metadata
         self.assertIn("termination_metadata", response.data)
         self.assertIsNone(response.data["termination_metadata"])
+
+
+class GracePeriodTest(test.APITestCase):
+    """Test grace period functionality for projects and customers."""
+
+    def setUp(self):
+        self.fixture = fixtures.ServiceFixture()
+        self.staff_user = factories.UserFactory(is_staff=True)
+        # Add permissions for testing grace period updates
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_CUSTOMER)
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_PROJECT)
+
+    def test_project_grace_period_overrides_customer_grace_period(self):
+        """Test that project-level grace period overrides customer-level setting."""
+        # Set customer grace period to 5 days
+        customer = self.fixture.customer
+        customer.grace_period_days = 5
+        customer.save()
+
+        # Create project with grace period override of 10 days
+        project = self.fixture.project
+        project.grace_period_days = 10
+        project.end_date = timezone.now().date() + timedelta(days=1)
+        project.save()
+
+        # Should get project-level grace period
+        self.assertEqual(project.get_grace_period_days(), 10)
+
+        # Effective end date should be end_date + 10 days
+        expected_effective_end_date = project.end_date + timedelta(days=10)
+        self.assertEqual(project.get_effective_end_date(), expected_effective_end_date)
+
+    def test_project_inherits_customer_grace_period(self):
+        """Test that project inherits customer grace period when not set."""
+        # Set customer grace period to 7 days
+        customer = self.fixture.customer
+        customer.grace_period_days = 7
+        customer.save()
+
+        # Create project without grace period setting
+        project = self.fixture.project
+        project.grace_period_days = None
+        project.end_date = timezone.now().date() + timedelta(days=1)
+        project.save()
+
+        # Should inherit customer grace period
+        self.assertEqual(project.get_grace_period_days(), 7)
+
+        # Effective end date should be end_date + 7 days
+        expected_effective_end_date = project.end_date + timedelta(days=7)
+        self.assertEqual(project.get_effective_end_date(), expected_effective_end_date)
+
+    def test_zero_grace_period_when_none_set(self):
+        """Test that grace period is 0 when neither customer nor project have it set."""
+        # Ensure no grace periods are set
+        customer = self.fixture.customer
+        customer.grace_period_days = None
+        customer.save()
+
+        project = self.fixture.project
+        project.grace_period_days = None
+        project.end_date = timezone.now().date() + timedelta(days=1)
+        project.save()
+
+        # Should default to 0 grace period
+        self.assertEqual(project.get_grace_period_days(), 0)
+
+        # Effective end date should be same as end_date
+        self.assertEqual(project.get_effective_end_date(), project.end_date)
+
+    def test_is_expired_with_grace_period(self):
+        """Test that is_expired considers grace period."""
+        # Set grace period of 5 days
+        project = self.fixture.project
+        project.grace_period_days = 5
+        project.end_date = timezone.now().date() - timedelta(days=3)  # 3 days ago
+        project.save()
+
+        # Should not be expired yet (within grace period)
+        self.assertFalse(project.is_expired)
+
+        # Set end date to 6 days ago (beyond grace period)
+        project.end_date = timezone.now().date() - timedelta(days=6)
+        project.save()
+
+        # Should be expired now
+        self.assertTrue(project.is_expired)
+
+    def test_get_effective_end_date_returns_none_when_no_end_date(self):
+        """Test that get_effective_end_date returns None when no end_date is set."""
+        project = self.fixture.project
+        project.grace_period_days = 5
+        project.end_date = None
+        project.save()
+
+        self.assertIsNone(project.get_effective_end_date())
+
+    def test_grace_period_fields_visible_to_all_in_api(self):
+        """Test that grace_period_days field is visible to all users in API."""
+        # Test Customer API
+        customer_url = factories.CustomerFactory.get_url(self.fixture.customer)
+
+        # Non-staff user should see grace_period_days
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.get(customer_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("grace_period_days", response.data)
+
+        # Staff user should also see grace_period_days
+        self.client.force_authenticate(self.staff_user)
+        response = self.client.get(customer_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("grace_period_days", response.data)
+
+        # Test Project API
+        project_url = factories.ProjectFactory.get_url(self.fixture.project)
+
+        # Non-staff user should see grace_period_days
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.get(project_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("grace_period_days", response.data)
+
+        # Staff user should also see grace_period_days
+        self.client.force_authenticate(self.staff_user)
+        response = self.client.get(project_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("grace_period_days", response.data)
+
+    def test_customer_grace_period_visible_in_project_api(self):
+        """Test that customer-level grace period is exposed in project API."""
+        self.fixture.customer.grace_period_days = 14
+        self.fixture.customer.save()
+
+        project_url = factories.ProjectFactory.get_url(self.fixture.project)
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.get(project_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("customer_grace_period_days", response.data)
+        self.assertEqual(response.data["customer_grace_period_days"], 14)
+
+    def test_non_staff_cannot_update_grace_period(self):
+        """Test that non-staff users cannot update grace_period_days."""
+        # Test Customer update
+        customer_url = factories.CustomerFactory.get_url(self.fixture.customer)
+
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(customer_url, {"grace_period_days": 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Grace period should not have been updated
+        self.fixture.customer.refresh_from_db()
+        self.assertIsNone(self.fixture.customer.grace_period_days)
+
+        # Test Project update
+        project_url = factories.ProjectFactory.get_url(self.fixture.project)
+
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(project_url, {"grace_period_days": 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Grace period should not have been updated
+        self.fixture.project.refresh_from_db()
+        self.assertIsNone(self.fixture.project.grace_period_days)
+
+    def test_staff_can_update_grace_period(self):
+        """Test that staff users can update grace_period_days."""
+        # Test Customer update
+        customer_url = factories.CustomerFactory.get_url(self.fixture.customer)
+
+        self.client.force_authenticate(self.staff_user)
+        response = self.client.patch(customer_url, {"grace_period_days": 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Grace period should have been updated
+        self.fixture.customer.refresh_from_db()
+        self.assertEqual(self.fixture.customer.grace_period_days, 10)
+
+        # Test Project update
+        project_url = factories.ProjectFactory.get_url(self.fixture.project)
+
+        self.client.force_authenticate(self.staff_user)
+        response = self.client.patch(project_url, {"grace_period_days": 15})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Grace period should have been updated
+        self.fixture.project.refresh_from_db()
+        self.assertEqual(self.fixture.project.grace_period_days, 15)
+
+    def test_grace_period_field_readonly_for_non_staff(self):
+        """Test that grace_period_days field is read-only for non-staff users."""
+        # Test Customer API - should be read-only for non-staff
+        customer_url = factories.CustomerFactory.get_url(self.fixture.customer)
+
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.options(customer_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # The field should be present but read-only in the options
+        actions = response.data.get("actions", {})
+        if "PUT" in actions and "grace_period_days" in actions["PUT"]:
+            field_info = actions["PUT"]["grace_period_days"]
+            self.assertTrue(field_info.get("read_only", False))
+
+        # Test Project API - should be read-only for non-staff
+        project_url = factories.ProjectFactory.get_url(self.fixture.project)
+
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.options(project_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # The field should be present but read-only in the options
+        actions = response.data.get("actions", {})
+        if "PUT" in actions and "grace_period_days" in actions["PUT"]:
+            field_info = actions["PUT"]["grace_period_days"]
+            self.assertTrue(field_info.get("read_only", False))
+
+    def test_is_in_grace_period_with_no_end_date(self):
+        """Test that is_in_grace_period returns False when project has no end_date."""
+        project = self.fixture.project
+        project.end_date = None
+        project.grace_period_days = 10
+        project.save()
+
+        self.assertFalse(project.is_in_grace_period)
+
+    def test_is_in_grace_period_before_end_date(self):
+        """Test that is_in_grace_period returns False when current date is before end_date."""
+        project = self.fixture.project
+        project.grace_period_days = 5
+        # Set end_date to tomorrow
+        project.end_date = timezone.now().date() + timedelta(days=1)
+        project.save()
+
+        self.assertFalse(project.is_in_grace_period)
+
+    def test_is_in_grace_period_on_end_date(self):
+        """Test that is_in_grace_period returns False when current date equals end_date."""
+        project = self.fixture.project
+        project.grace_period_days = 5
+        # Set end_date to today
+        project.end_date = timezone.now().date()
+        project.save()
+
+        self.assertFalse(project.is_in_grace_period)
+
+    def test_is_in_grace_period_within_grace_period(self):
+        """Test that is_in_grace_period returns True when within grace period."""
+        project = self.fixture.project
+        project.grace_period_days = 10
+        # Set end_date to 5 days ago (within 10-day grace period)
+        project.end_date = timezone.now().date() - timedelta(days=5)
+        project.save()
+
+        self.assertTrue(project.is_in_grace_period)
+
+    def test_is_in_grace_period_on_last_day_of_grace_period(self):
+        """Test that is_in_grace_period returns True on the last day of grace period."""
+        project = self.fixture.project
+        project.grace_period_days = 5
+        # Set end_date to exactly 5 days ago (last day of grace period)
+        project.end_date = timezone.now().date() - timedelta(days=5)
+        project.save()
+
+        self.assertTrue(project.is_in_grace_period)
+
+    def test_is_in_grace_period_past_grace_period(self):
+        """Test that is_in_grace_period returns False when past grace period."""
+        project = self.fixture.project
+        project.grace_period_days = 5
+        # Set end_date to 6 days ago (past 5-day grace period)
+        project.end_date = timezone.now().date() - timedelta(days=6)
+        project.save()
+
+        self.assertFalse(project.is_in_grace_period)
+
+    def test_is_in_grace_period_with_zero_grace_period(self):
+        """Test that is_in_grace_period returns False when grace period is 0."""
+        project = self.fixture.project
+        project.grace_period_days = 0
+        # Set end_date to yesterday
+        project.end_date = timezone.now().date() - timedelta(days=1)
+        project.save()
+
+        self.assertFalse(project.is_in_grace_period)
+
+    def test_is_in_grace_period_inherits_customer_grace_period(self):
+        """Test that is_in_grace_period works with inherited customer grace period."""
+        # Set customer grace period but not project grace period
+        customer = self.fixture.customer
+        customer.grace_period_days = 7
+        customer.save()
+
+        project = self.fixture.project
+        project.grace_period_days = None
+        # Set end_date to 3 days ago (within 7-day customer grace period)
+        project.end_date = timezone.now().date() - timedelta(days=3)
+        project.save()
+
+        self.assertTrue(project.is_in_grace_period)
+
+    def test_end_date_with_grace_returns_none_when_no_end_date(self):
+        """Test that end_date_with_grace returns None when project has no end_date."""
+        project = self.fixture.project
+        project.end_date = None
+        project.grace_period_days = 10
+        project.save()
+
+        self.assertIsNone(project.end_date_with_grace)
+
+    def test_end_date_with_grace_adds_grace_period_days(self):
+        """Test that end_date_with_grace correctly adds grace period days."""
+        project = self.fixture.project
+        project.grace_period_days = 7
+        project.end_date = timezone.now().date()
+        project.save()
+
+        expected_grace_end = project.end_date + timedelta(days=7)
+        self.assertEqual(project.end_date_with_grace, expected_grace_end)
+
+    def test_end_date_with_grace_with_zero_grace_period(self):
+        """Test that end_date_with_grace equals end_date when grace period is 0."""
+        project = self.fixture.project
+        project.grace_period_days = 0
+        project.end_date = timezone.now().date()
+        project.save()
+
+        self.assertEqual(project.end_date_with_grace, project.end_date)
+
+    def test_end_date_with_grace_inherits_customer_grace_period(self):
+        """Test that end_date_with_grace works with inherited customer grace period."""
+        # Set customer grace period but not project grace period
+        customer = self.fixture.customer
+        customer.grace_period_days = 14
+        customer.save()
+
+        project = self.fixture.project
+        project.grace_period_days = None
+        project.end_date = timezone.now().date()
+        project.save()
+
+        expected_grace_end = project.end_date + timedelta(days=14)
+        self.assertEqual(project.end_date_with_grace, expected_grace_end)
+
+    def test_end_date_with_grace_project_overrides_customer(self):
+        """Test that project grace period overrides customer grace period in end_date_with_grace."""
+        # Set both customer and project grace periods
+        customer = self.fixture.customer
+        customer.grace_period_days = 5
+        customer.save()
+
+        project = self.fixture.project
+        project.grace_period_days = 12  # Should override customer setting
+        project.end_date = timezone.now().date()
+        project.save()
+
+        expected_grace_end = project.end_date + timedelta(days=12)
+        self.assertEqual(project.end_date_with_grace, expected_grace_end)
+
+    def test_grace_period_properties_consistency_with_expired(self):
+        """Test that grace period properties are consistent with is_expired property."""
+        project = self.fixture.project
+        project.grace_period_days = 5
+
+        # Test case 1: Project not expired, not in grace period
+        project.end_date = timezone.now().date() + timedelta(days=1)
+        project.save()
+        self.assertFalse(project.is_expired)
+        self.assertFalse(project.is_in_grace_period)
+
+        # Test case 2: Project in grace period, not expired
+        project.end_date = timezone.now().date() - timedelta(days=3)
+        project.save()
+        self.assertFalse(project.is_expired)  # Within grace period
+        self.assertTrue(project.is_in_grace_period)
+
+        # Test case 3: Project expired and past grace period
+        project.end_date = timezone.now().date() - timedelta(days=6)
+        project.save()
+        self.assertTrue(project.is_expired)  # Past grace period
+        self.assertFalse(project.is_in_grace_period)  # Past grace period
+
+    @freeze_time("2025-01-15")
+    def test_grace_period_properties_with_frozen_time(self):
+        """Test grace period properties with frozen time for precise date testing."""
+        project = self.fixture.project
+        project.grace_period_days = 7
+
+        # Set end_date to 2025-01-10 (5 days ago)
+        project.end_date = datetime.date(2025, 1, 10)
+        project.save()
+
+        # Should be in grace period
+        self.assertTrue(project.is_in_grace_period)
+        self.assertFalse(project.is_expired)
+
+        # Grace end should be 2025-01-17
+        expected_grace_end = datetime.date(2025, 1, 17)
+        self.assertEqual(project.end_date_with_grace, expected_grace_end)
+
+
+class ProjectListQueryOptimizationTest(test.APITestCase):
+    """
+    Test that project list endpoint is optimized to avoid N+1 queries.
+
+    Fixes PUHURI-PORTALS-E3K (N+1 query on customer and resources_count).
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+        self.staff = self.fixture.staff
+
+        # Create multiple projects with resources
+        self.projects = [self.fixture.project]
+        for i in range(4):  # Total 5 projects
+            self.projects.append(factories.ProjectFactory(customer=self.customer))
+
+        # Create resources for some projects
+        self.offering = marketplace_factories.OfferingFactory()
+        from waldur_mastermind.marketplace.models import Resource
+
+        # Project 0: 2 active resources
+        marketplace_factories.ResourceFactory(
+            project=self.projects[0],
+            offering=self.offering,
+            state=Resource.States.OK,
+        )
+        marketplace_factories.ResourceFactory(
+            project=self.projects[0],
+            offering=self.offering,
+            state=Resource.States.OK,
+        )
+
+        # Project 1: 1 active, 1 terminated resource
+        marketplace_factories.ResourceFactory(
+            project=self.projects[1],
+            offering=self.offering,
+            state=Resource.States.OK,
+        )
+        marketplace_factories.ResourceFactory(
+            project=self.projects[1],
+            offering=self.offering,
+            state=Resource.States.TERMINATED,
+        )
+
+        # Project 2: 1 updating resource
+        marketplace_factories.ResourceFactory(
+            project=self.projects[2],
+            offering=self.offering,
+            state=Resource.States.UPDATING,
+        )
+
+        # Project 3 and 4: no resources
+
+        self.url = factories.ProjectFactory.get_list_url()
+
+    def test_resources_count_is_correct(self):
+        """Test that resources_count returns correct count of active resources."""
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Create a lookup by project UUID
+        results_by_uuid = {
+            item["uuid"]: item for item in response.data if "uuid" in item
+        }
+
+        # Project 0: 2 active resources
+        self.assertEqual(
+            results_by_uuid[str(self.projects[0].uuid)]["resources_count"], 2
+        )
+
+        # Project 1: 1 active (terminated doesn't count)
+        self.assertEqual(
+            results_by_uuid[str(self.projects[1].uuid)]["resources_count"], 1
+        )
+
+        # Project 2: 1 updating resource (counts as active)
+        self.assertEqual(
+            results_by_uuid[str(self.projects[2].uuid)]["resources_count"], 1
+        )
+
+        # Project 3: no resources
+        self.assertEqual(
+            results_by_uuid[str(self.projects[3].uuid)]["resources_count"], 0
+        )
+
+        # Project 4: no resources
+        self.assertEqual(
+            results_by_uuid[str(self.projects[4].uuid)]["resources_count"], 0
+        )
+
+    def test_query_count_does_not_scale_with_projects(self):
+        """Test that query count is optimized and doesn't have N+1 issues."""
+        from django.db import connection, reset_queries
+        from django.test import override_settings
+
+        self.client.force_authenticate(self.staff)
+
+        with override_settings(DEBUG=True):
+            reset_queries()
+
+            response = self.client.get(self.url)
+
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+            # Filter relevant queries (exclude framework/setup queries)
+            business_queries = [
+                q
+                for q in connection.queries
+                if not any(
+                    skip in q["sql"].lower()
+                    for skip in [
+                        "constance_config",
+                        "django_migrations",
+                        "django_session",
+                        "auth_user",  # Authentication queries
+                    ]
+                )
+            ]
+
+            # Count queries that look like N+1 patterns (repeated customer/resource queries)
+            customer_queries = [
+                q for q in business_queries if "structure_customer" in q["sql"].lower()
+            ]
+
+            # Resource count N+1 queries are those that:
+            # - Query marketplace_resource table with COUNT
+            # - Filter by a single project (per-project queries)
+            # We allow batch queries that group by project_id
+            per_project_resource_queries = [
+                q
+                for q in business_queries
+                if "count" in q["sql"].lower()
+                and "marketplace_resource" in q["sql"].lower()
+                # Exclude batch queries that group by project_id
+                and "project_id" not in q["sql"].lower()
+            ]
+
+            # With proper optimization:
+            # - Should have at most 1-2 customer queries (from select_related)
+            # - Should have 0 per-project resource count queries (batch query is OK)
+            # Without optimization, we'd have 5+ of each (one per project)
+            self.assertLessEqual(
+                len(customer_queries),
+                2,
+                f"Too many customer queries ({len(customer_queries)}), possible N+1 issue. "
+                f"Queries: {[q['sql'][:100] for q in customer_queries]}",
+            )
+            self.assertEqual(
+                len(per_project_resource_queries),
+                0,
+                f"Found {len(per_project_resource_queries)} per-project resource count queries (N+1 issue). "
+                f"Queries: {[q['sql'][:150] for q in per_project_resource_queries]}",
+            )

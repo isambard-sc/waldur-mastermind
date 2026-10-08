@@ -12,7 +12,7 @@ from waldur_freeipa.backend import FreeIPABackend
 from waldur_freeipa.tests import factories
 
 
-class BaseProfileTest(test.APITransactionTestCase):
+class BaseProfileTest(test.APITestCase):
     def setUp(self):
         self.user = structure_factories.UserFactory(preferred_language="ET")
         self.client.force_authenticate(self.user)
@@ -61,6 +61,14 @@ class ProfileCreateTest(BaseProfileTest):
         response = self.client.post(self.url, self.valid_data)
         self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
         self.assertIn("username", response.data)
+
+    def test_profile_creation_fails_if_username_is_taken_in_waldur(self, mock_client):
+        other_user = structure_factories.UserFactory()
+        factories.ProfileFactory(user=other_user, username="waldur_alice")
+        response = self.client.post(self.url, self.valid_data)
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+        self.assertIn("username", response.data)
+        mock_client().user_add.assert_not_called()
 
     def test_if_profile_created_client_is_called(self, mock_client):
         response = self.client.post(self.url, self.valid_data)
@@ -115,7 +123,7 @@ class ProfileCreateTest(BaseProfileTest):
 
 @override_constance_config(FREEIPA_ENABLED=True)
 @mock.patch("python_freeipa.Client")
-class ProfileSshKeysTest(test.APITransactionTestCase):
+class ProfileSshKeysTest(test.APITestCase):
     def setUp(self):
         self.user = structure_factories.UserFactory()
         self.profile = factories.ProfileFactory(user=self.user, is_active=False)
@@ -182,7 +190,7 @@ class ProfileSshKeysTest(test.APITransactionTestCase):
 @ddt
 @override_constance_config(FREEIPA_ENABLED=True)
 @mock.patch("python_freeipa.Client")
-class ProfileUpdateTest(test.APITransactionTestCase):
+class ProfileUpdateTest(test.APITestCase):
     def setUp(self):
         self.user = structure_factories.UserFactory()
         self.profile = factories.ProfileFactory(user=self.user, is_active=False)
@@ -234,7 +242,7 @@ class ProfileUpdateTest(test.APITransactionTestCase):
 
 @override_constance_config(FREEIPA_ENABLED=True)
 @mock.patch("waldur_freeipa.handlers.tasks")
-class UpdateUserHandlerTest(test.APITransactionTestCase):
+class UpdateUserHandlerTest(test.APITestCase):
     def setUp(self):
         self.user = structure_factories.UserFactory()
         self.profile = factories.ProfileFactory(user=self.user, is_active=True)
@@ -261,7 +269,7 @@ class UpdateUserHandlerTest(test.APITransactionTestCase):
 
 @override_constance_config(FREEIPA_ENABLED=True)
 @mock.patch("python_freeipa.Client")
-class ProfileStatusTest(test.APITransactionTestCase):
+class ProfileStatusTest(test.APITestCase):
     def setUp(self):
         self.user = structure_factories.UserFactory()
 

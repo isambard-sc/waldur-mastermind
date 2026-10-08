@@ -29,7 +29,7 @@ from . import fixtures
     WALDUR_SUPPORT_ENABLED=True, WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE="basic"
 )
 @freeze_time("2018-01-01")
-class InvoicesBaseTest(test.APITransactionTestCase):
+class InvoicesBaseTest(test.APITestCase):
     def setUp(self):
         super().setUp()
         self.fixture = fixtures.SupportFixture()
@@ -198,7 +198,7 @@ class UsagesTest(InvoicesBaseTest):
         self.fixture.offering_component_ram.delete()
 
         with freeze_time("2018-01-15"):
-            self._create_usage(usage=10, recurring=True)
+            self._create_usage(usage=10, missing_usage_policy="reuse")
 
         with freeze_time("2018-02-01"):
             create_monthly_invoices()

@@ -1,24 +1,32 @@
+import datetime
+import functools
 import json
 import logging
-import datetime
 import random
 import time
-import functools
 
+import openportal
 from celery import shared_task
+from constance import config as constance_config
 
 from waldur_core.core import utils as core_utils
-from waldur_core.core.models import User
 from waldur_core.core.enums import CoreStates
+from waldur_core.core.models import User
+from waldur_core.permissions.enums import RoleEnum
+from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.marketplace import models as marketplace_models
 
-from . import backend, models, remote_project_service, utils
-
-from . import op as openportal
+from . import (
+    backend,
+    config,
+    models,
+    project_updates,
+    remote_project_service,
+    utils,
+)
 from .board import OpenPortalBoard, _trim_job
-
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +34,19 @@ logger = logging.getLogger(__name__)
 def run_once_task(takeover_timeout, include_args=False):
     """
     Decorator to ensure only one instance of a task runs at a time.
+
+    The lock is a database row that is deleted in a ``finally``, so it only
+    outlives the task if the process dies without unwinding - a hard kill or an
+    OOM. ``takeover_timeout`` is the sole recovery path from that state.
+
+    ``last_run`` records when the task *started* and is deliberately never
+    refreshed while it runs: there is no heartbeat. That is safe only because
+    Celery kills any task well before the lock could expire under it. Keep
+    ``takeover_timeout`` generously above ``CELERY_TASK_TIME_LIMIT`` (currently
+    30 minutes) to account for queue wait and scheduling delays, the same
+    reasoning ``BackgroundTask.lock_timeout`` follows in waldur_core. Lowering it
+    below that limit would let a still-running task have its lock taken over and
+    end up running twice.
 
     Args:
         takeover_timeout: Timeout in seconds before a stale lock can be taken over
@@ -57,14 +78,14 @@ def run_once_task(takeover_timeout, include_args=False):
                     )
 
                     # someone else beat us to the lock - was this more than
-                    # takeover_timeout seconds ago?
+                    # takeover_timeout seconds ago?  total_seconds() rather than
+                    # seconds: the latter is the seconds-within-the-day part, so
+                    # a lock orphaned for 24h reads as 0 elapsed and is never
+                    # taken over.  Both values are UTC-aware (USE_TZ is on), so
+                    # they subtract directly.
                     if (
                         lock.last_run is None
-                        or (
-                            now.replace(tzinfo=None)
-                            - lock.last_run.replace(tzinfo=None)
-                        ).seconds
-                        > takeover_timeout
+                        or (now - lock.last_run).total_seconds() > takeover_timeout
                     ):
                         # remove the lock
                         try:
@@ -117,9 +138,13 @@ def run_once_task(takeover_timeout, include_args=False):
 
             if acquire_lock():
                 try:
-                    func(*args, **kwargs)
+                    return func(*args, **kwargs)
                 finally:
                     release_lock()
+
+            # Lock held elsewhere - indistinguishable from a task that returned
+            # None, which is fine for these fire-and-forget beat tasks.
+            return None
 
         return wrapper
 
@@ -427,6 +452,12 @@ def sync_remote_usage():
     Dispatcher: fans out one sync_remote_usage_for_destination subtask per active
     destination so that a down destination cannot block usage syncs for others.
     """
+    if not config.ensure_config_loaded():
+        logger.debug(
+            "OpenPortal not enabled or config not available, skipping sync_remote_usage"
+        )
+        return
+
     logger.info("OpenPortal task.sync_remote_usage")
 
     service_settings_ids = list(
@@ -550,6 +581,12 @@ def sync_usage():
     The sync_allocation_limits task should be scheduled separately (e.g., via cron)
     to run after this task typically completes to update resource limits.
     """
+    if not config.ensure_config_loaded():
+        logger.debug(
+            "OpenPortal not enabled or config not available, skipping sync_usage"
+        )
+        return
+
     logger.info("OpenPortal task.sync_usage")
 
     # Group allocations by customer to enable parallel processing
@@ -601,6 +638,12 @@ def sync_storage():
     Runs every 8 hours so each project gets at least one storage report per day
     without hammering the filesystems.
     """
+    if not config.ensure_config_loaded():
+        logger.debug(
+            "OpenPortal not enabled or config not available, skipping sync_storage"
+        )
+        return
+
     logger.info("OpenPortal task.sync_storage")
 
     allocations = list(models.Allocation.objects.filter(is_active=True))
@@ -695,6 +738,12 @@ def sync_remote_storage():
     Fetch and store accumulated storage reports from remote portals for all
     active RemoteAllocations.
     """
+    if not config.ensure_config_loaded():
+        logger.debug(
+            "OpenPortal not enabled or config not available, skipping sync_remote_storage"
+        )
+        return
+
     logger.info("OpenPortal task.sync_remote_storage")
     now = datetime.datetime.now()
     fail_count = 0
@@ -728,16 +777,29 @@ def sync_allocation_limits():
     This task updates the resource limits for all allocations based on project credits
     and current usage. This should be run after sync_usage to ensure all usage data is current.
     """
+    if not config.ensure_config_loaded():
+        logger.debug(
+            "OpenPortal not enabled or config not available, skipping sync_allocation_limits"
+        )
+        return
+
     logger.info("OpenPortal task.sync_allocation_limits")
     now = datetime.datetime.now()
 
-    project_credits = list(invoice_models.ProjectCredit.objects.all())
+    project_credits = list(
+        invoice_models.ProjectCredit.objects.select_related("project")
+    )
 
     # randomise the order of the projects to avoid always processing in the same order and potentially
     # leaving some projects with outdated limits for a long time
     random.shuffle(project_credits)
 
     for project_credit in project_credits:
+        # Bound before the try block: the handler below reports on it, and a
+        # failure to resolve the project would otherwise raise NameError from
+        # inside the handler (or name the previous iteration's project).
+        project = None
+
         try:
             project = project_credit.project
 
@@ -796,7 +858,9 @@ def sync_allocation_limits():
                     )
                     credits_available = 0
         except Exception as e:
-            logger.error(f"Failed to calculate credits for {project}: {e}")
+            logger.error(
+                f"Failed to calculate credits for {project or project_credit}: {e}"
+            )
             continue
 
         for allocation in allocations:
@@ -843,6 +907,10 @@ def sync_allocation_limits():
             if (datetime.datetime.now() - now).seconds > 3600:
                 logger.error("sync_allocation_limits took too long - aborting")
                 return
+
+    logger.info(
+        f"sync_allocation_limits completed: processed {len(project_credits)} credits"
+    )
 
 
 @shared_task(name="waldur_openportal.sync_remote")
@@ -994,6 +1062,21 @@ def sync_remote_for_destination(service_settings_id):
                 break
 
 
+@shared_task(name="waldur_openportal.sync_user_slugs")
+@run_once_task(takeover_timeout=60 * 60)
+def sync_user_slugs():
+    """
+    Daily reconciliation of User.slug against the OpenPortal username.
+
+    Copies UserInfo.shortname onto the slug, and clears the slug of anyone
+    who has not chosen a username. See utils.sync_user_slugs() for why, and
+    for why projects are left alone. Does nothing unless the portal-wide
+    user.show_openportal_identifier feature is on.
+    """
+    logger.info("OpenPortal task.sync_user_slugs")
+    return utils.sync_user_slugs()
+
+
 @shared_task(name="waldur_openportal.sync_local_users")
 @run_once_task(takeover_timeout=60 * 60)
 def sync_local_users():
@@ -1002,6 +1085,12 @@ def sync_local_users():
     users associated with those allocations are properly synced (e.g.
     added or removed)
     """
+    if not config.ensure_config_loaded():
+        logger.debug(
+            "OpenPortal not enabled or config not available, skipping sync_local_users"
+        )
+        return
+
     logger.info("OpenPortal task.sync_local_users")
     now = datetime.datetime.now()
 
@@ -1028,6 +1117,12 @@ def sync_remote_users():
     Dispatcher: fans out one sync_remote_users_for_destination subtask per active
     destination so that a down destination cannot block user syncs for others.
     """
+    if not config.ensure_config_loaded():
+        logger.debug(
+            "OpenPortal not enabled or config not available, skipping sync_remote_users"
+        )
+        return
+
     logger.info("OpenPortal task.sync_remote_users")
 
     service_settings_ids = list(
@@ -1156,204 +1251,12 @@ def sync_project(serialized_project):
 @shared_task(name="waldur_openportal.send_notifications")
 def send_notifications():
     """
-    This task is called to send notifications to all users associated
-    with any OpenPortal allocations.
+    Send the regular project usage update to the members of every project
+    that is due one. See project_updates for who gets it and what it says;
+    it goes out as the openportal.project_usage_update notification.
     """
     logger.info("OpenPortal task.send_notifications")
-
-    # make sure that we only run during "office hours"
-    # (10am to 3pm) - this is a bit of a hack, but it will do for now
-    now = datetime.datetime.now()
-
-    if now.hour < 10 or now.hour > 15:
-        logger.debug("Not sending notifications - outside office hours")
-        return
-
-    # Get today's date
-    today = datetime.date.today()
-
-    num_emails_sent = 0
-
-    # Loop over all ProjectCredit objects - no need to send notifications
-    # to projects that don't have any credits allocated
-    for project_credit in invoice_models.ProjectCredit.objects.all():
-        if num_emails_sent > 500:
-            logger.warning("Sent over 500 emails already - stopping")
-            return
-
-        project = project_credit.project
-
-        # Skip removed projects
-        if project.is_removed:
-            continue
-
-        # Skip projects that are expired (including grace period)
-        # We don't send notifications for expired projects
-        if project.is_expired:
-            continue
-
-        # get the end date for this project
-        end_date = project.end_date
-
-        # Double-check that the project is not expired
-        if end_date is not None and end_date < today:
-            # project is expired - no need to send notifications
-            continue
-
-        # Check to see if this project should be notified
-        notification, created = models.ProjectNotification.objects.get_or_create(
-            project=project
-        )
-
-        if notification.frequency == 0:
-            # No notifications - skip
-            continue
-
-        should_notify = False
-
-        if created or notification.last_notification is None:
-            should_notify = True
-        elif (
-            notification.last_notification
-            + datetime.timedelta(days=notification.frequency)
-            <= today
-        ):
-            should_notify = True
-
-        if not should_notify:
-            continue
-
-        # Check to see if this project has any credits available
-        credits_available = float(project_credit.value)
-
-        if credits_available is None or credits_available <= 0:
-            credits_available = 0
-        else:
-            credits_available = float(credits_available)
-
-        # find any openportal allocations associated with the project
-        # (note we don't do this for RemoteAllocations, as the remote
-        #  portal should be handling this)
-        allocations = models.Allocation.objects.filter(project=project, is_active=True)
-
-        # Skip projects with no allocations
-        if not allocations:
-            logger.debug(f"Project {project} has no OpenPortal allocations - skipping")
-            continue
-
-        # Calculate the total usage so far this month across OpenPortal allocations
-        total_spend = 0.0
-
-        for allocation in allocations:
-            total_spend += float(allocation.node_usage)
-
-        notification_subject = _notification_subject(project, today)
-
-        notification_body = _notification_body(
-            project,
-            today,
-            credits_available,
-            total_spend,
-            end_date,
-            notification.frequency,
-        )
-
-        # Send the notification to each user - wait 50ms between each
-        # notification to avoid overwhelming the mail server
-        for user in project.get_users():
-            try:
-                logger.debug(f"Sending notification to {user} in {project}")
-                logger.debug(f"Notification subject: {notification_subject}")
-                logger.debug(f"Notification body: {notification_body}")
-
-                core_utils.send_mail(
-                    subject=notification_subject,
-                    body=notification_body,
-                    to=[user.email],
-                )
-                num_emails_sent += 1
-                time.sleep(0.05)
-            except Exception as e:
-                logger.error(f"Failed to send notification to {user.email}: {e}")
-
-        # Update the last notification date
-        notification.last_notification = today
-        notification.save()
-
-
-def _notification_subject(project, today):
-    """
-    This function returns the subject for the notification email
-    for the passed project generated on the passed date
-    """
-    return f"Isambard Project Status Update - {today.strftime('%d %B %Y')}"
-
-
-def _notification_body(
-    project, today, credits_available, total_spend, end_date, update_frequency
-):
-    """
-    This function returns the body for the notification email
-    for the passed project generated on the passed date. This
-    communicates the number of credits available, the total spend
-    on the project, and when the project will end.
-    """
-
-    remaining = credits_available - total_spend
-    if remaining < 0:
-        remaining = 0
-
-    if end_date is None:
-        date_info = ""
-    else:
-        date = end_date.strftime("%d %B %Y")
-
-        days_remaining = (end_date - today).days
-
-        if days_remaining < 0:
-            days_remaining = "today"
-        elif days_remaining == 1:
-            days_remaining = "tomorrow"
-        else:
-            days_remaining = f"in {days_remaining} days time"
-
-        date_info = f"""
-
-All node hours must be consumed before the {date}, which is {days_remaining}.
-
-You must copy back all data before this date. You won't be able to login after your project ends and all remaining data will be deleted."""
-
-    if update_frequency < 1:
-        update_frequency = 1
-
-    if update_frequency == 1:
-        update_frequency = "day"
-    elif update_frequency == 7:
-        update_frequency = "week"
-    elif update_frequency == 14:
-        update_frequency = "fortnight"
-    else:
-        update_frequency = f"{update_frequency} days"
-
-    # This would eventually be better templated ;-)
-    body = f"""
-Here is your regular update for your Isambard project “{project.name}”
-
-To date, {total_spend:.2f} node hours have been used, leaving {remaining:.2f} remaining to consume before the end of your project.{date_info}
-
-For more detail, view your project at https://portal.isambard.ac.uk.
-
-To learn more about project accounting, read the documentation at https://docs.isambard.ac.uk/user-documentation/guides/accounting.
-
-If you have any queries, please raise a ticket at https://support.isambard.ac.uk.
-
-We will send you an update every {update_frequency}.
-
-If you want to change the frequency of these updates, please ask the project PI to raise a request at https://support.isambard.ac.uk.
-
-"""
-
-    return body
+    project_updates.send_project_updates()
 
 
 @shared_task(name="waldur_openportal.update_remote_project")
@@ -1928,10 +1831,8 @@ def refresh_remote_award(destination: str, local_identifier: str):
         f"OpenPortal task.refresh_remote_award: destination={destination!r}, local_identifier={local_identifier!r}"
     )
 
-    if not openportal.have_openportal():
+    if not config.ensure_config_loaded():
         return
-
-    openportal.ensure_config_loaded()
 
     try:
         destination: openportal.Destination = openportal.Destination(destination)
@@ -2015,10 +1916,8 @@ def _schedule_award_task_if_local(notification: openportal.Notification, task):
     (destination, event_argument) arguments.
     Returns early without scheduling if the identifier is for a different portal.
     """
-    if not openportal.have_openportal():
+    if not config.ensure_config_loaded():
         return
-
-    openportal.ensure_config_loaded()
 
     local_id = openportal.ProjectIdentifier(str(notification.event_argument))
     if str(local_id.portal) != str(openportal.get_portal()):
@@ -2059,10 +1958,8 @@ def reject_remote_award(destination: str, local_identifier: str):
         f" local_identifier={local_identifier!r}"
     )
 
-    if not openportal.have_openportal():
+    if not config.ensure_config_loaded():
         return
-
-    openportal.ensure_config_loaded()
 
     local_id = openportal.ProjectIdentifier(local_identifier)
 
@@ -2122,10 +2019,8 @@ def accept_remote_award(destination: str, local_identifier: str):
         f" local_identifier={local_identifier!r}"
     )
 
-    if not openportal.have_openportal():
+    if not config.ensure_config_loaded():
         return
-
-    openportal.ensure_config_loaded()
 
     local_id = openportal.ProjectIdentifier(local_identifier)
 
@@ -2216,12 +2111,13 @@ def sync_offering_agents():
     This task is called to sync the agents for all offerings
     that are associated with remote OpenPortal backends.
     """
-    if not openportal.have_openportal():
+    if not config.ensure_config_loaded():
+        logger.info(
+            "OpenPortal not enabled or config not available, skipping sync_offering_agents"
+        )
         return
 
     logger.info("OpenPortal task.sync_offering_agents")
-
-    openportal.ensure_config_loaded()
 
     # get the name of this portal
     portal = openportal.get_portal()
@@ -2251,10 +2147,11 @@ def sync_board():
     has received any jobs. If it has, then it pulls the job from the
     board and then spawns a new task to process the job.
     """
-    if not openportal.have_openportal():
+    if not config.ensure_config_loaded():
+        logger.info(
+            "OpenPortal not enabled or config not available, skipping sync_board"
+        )
         return
-
-    openportal.ensure_config_loaded()
 
     jobs = openportal.fetch_jobs()
 
@@ -2333,6 +2230,92 @@ def fix_total_allocation():
             utils.fix_total_allocation(project)
         except Exception as e:
             logger.error(f"Failed to fix total allocation for project {project}: {e}")
+
+
+@shared_task(name="waldur_openportal.notify_users_about_rejected_allocation")
+def notify_users_about_rejected_allocation(serialized_managed_project):
+    """
+    Send a rejection notification to the admins and managers of the
+    Waldur project linked to the managed project, when its resource
+    allocation request has been rejected.
+    """
+    logger.info(
+        "OpenPortal task.notify_users_about_rejected_allocation: %s",
+        serialized_managed_project,
+    )
+
+    managed_project = core_utils.deserialize_instance(serialized_managed_project)
+
+    if not isinstance(managed_project, models.ManagedProject):
+        logger.error(
+            "OpenPortal - %s is not a ManagedProject instance - it is %s",
+            managed_project,
+            type(managed_project),
+        )
+        raise ValueError(
+            f"OpenPortal - {managed_project} is not a ManagedProject instance - it is {type(managed_project)}"
+        )
+
+    if not managed_project.is_rejected():
+        logger.error(
+            "OpenPortal - ManagedProject %s is not rejected - cannot send rejection notification!",
+            managed_project,
+        )
+        raise ValueError(
+            f"OpenPortal - ManagedProject {managed_project} is not rejected - cannot send rejection notification!"
+        )
+
+    project = managed_project.project
+    if project is None:
+        logger.warning(
+            "OpenPortal - ManagedProject %s has no linked Waldur project - skipping rejection notification",
+            managed_project,
+        )
+        return
+
+    reviewer = managed_project.reviewed_by
+    if reviewer is None:
+        logger.warning(
+            "OpenPortal - ManagedProject %s has no reviewer - skipping rejection notification",
+            managed_project,
+        )
+        return
+
+    admins = get_users(project, RoleEnum.PROJECT_ADMIN)
+    managers = get_users(project, RoleEnum.PROJECT_MANAGER)
+    recipients = {u.id: u for u in [*admins, *managers] if u.email}
+
+    if not recipients:
+        logger.warning(
+            "OpenPortal - project %s has no admins or managers with an email - skipping rejection notification",
+            project,
+        )
+        return
+
+    details = managed_project.get_details()
+    project_name = details.name or managed_project.identifier
+
+    for user in recipients.values():
+        context = {
+            "recipient_first_name": user.first_name,
+            "project_name": project_name,
+            "reviewer_full_name": reviewer.full_name,
+            "reviewer_email": reviewer.email,
+            "reviewer_organization": reviewer.organization,
+            "review_comment": managed_project.review_comment or "",
+            "site_name": constance_config.SITE_NAME,
+        }
+        logger.info(
+            "OpenPortal - sending rejection notification to %s for project %s",
+            user.email,
+            managed_project,
+        )
+        core_utils.broadcast_mail(
+            "openportal",
+            "managed_project_rejected",
+            context,
+            [user.email],
+        )
 
 
 @shared_task(name="waldur_openportal.mark_stale_remote_projects")
