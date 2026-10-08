@@ -27,7 +27,7 @@ After that, the project will enter a grace period of {{ grace_period_days }} day
 {% else %}
 There is no grace period: you must copy back your data by the end of {{ last_access_date|date:"j F Y" }}. You will lose access on {{ end_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.
 {% endif %}{% endif %}
-If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion, {% if grace_change_deadline_passed %}and that date ({{ grace_change_deadline|date:"j F Y" }}) has now passed.{% else %}so no later than {{ grace_change_deadline|date:"j F Y" }}.{% endif %}
+If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be requested at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. {% if grace_change_deadline_passed %}That date ({{ grace_change_deadline|date:"j F Y" }}) has now passed, so an extension is unlikely unless there are exceptional circumstances. If something unexpected has happened, contact the allocator of your project as soon as possible.{% else %}Please request any change no later than {{ grace_change_deadline|date:"j F Y" }}, and please don't leave it until the last day: the earlier you ask, the more likely it is that an extension can be agreed.{% endif %}
 {% endif %}
 For more detail, view your project at {{ project_url }}
 {% if docs_url %}

@@ -5416,7 +5416,7 @@ Sent to every member of a project 10 days before its data is scheduled for delet
 
     Your data will be automatically scheduled for deletion in {{ days_until_deletion }} days, on {{ deletion_date|date:"j F Y" }}. Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}.
 
-    If you do not think that you will be able to copy back all of your data in time, you must contact the allocator of your project TODAY. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. They will need evidence that you have already started copying back your data.
+    If you do not think that you will be able to copy back all of your data in time, you must contact the allocator of your project TODAY. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. After today, an extension is unlikely unless there are exceptional circumstances. The allocator will need evidence that you have already started copying back your data.
 
     View your project at {{ project_url }}
     {% if docs_url %}
@@ -5436,7 +5436,7 @@ Sent to every member of a project 10 days before its data is scheduled for delet
     <body>
     <p>{% if in_grace_period %}Your <strong>{{ site_name }}</strong> project <strong>{{ project_name }}</strong> is in its grace period.{% else %}The last day of access to your <strong>{{ site_name }}</strong> project <strong>{{ project_name }}</strong> is {{ last_access_date|date:"j F Y" }}.{% if grace_period_days %} It is followed by a grace period of {{ grace_period_days }} days so that you can copy back your data.{% endif %}{% endif %}</p>
     <p><strong>Your data will be automatically scheduled for deletion in {{ days_until_deletion }} days, on {{ deletion_date|date:"j F Y" }}.</strong> Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}.</p>
-    <p>If you do not think that you will be able to copy back all of your data in time, <strong>you must contact the allocator of your project TODAY</strong>. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. They will need evidence that you have already started copying back your data.</p>
+    <p>If you do not think that you will be able to copy back all of your data in time, <strong>you must contact the allocator of your project TODAY</strong>. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. After today, an extension is unlikely unless there are exceptional circumstances. The allocator will need evidence that you have already started copying back your data.</p>
     <p><a href="{{ project_url }}">View your project</a>.</p>
     {% if docs_url %}<p>For more information, read the <a href="{{ docs_url }}">documentation</a>.</p>{% endif %}
     {% if support_url %}<p>If you have any queries, please <a href="{{ support_url }}">raise a ticket</a>.</p>{% endif %}
@@ -5471,11 +5471,11 @@ Sent to every member of a project on its end date, the first day of its grace pe
 
     Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}. You will lose access on {{ deletion_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.
     {% if grace_change_deadline_is_today %}
-    If you will not be able to copy back all of your data in time, you must contact the allocator of your project TODAY. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. They will need evidence that you have already started copying back your data.
+    If you will not be able to copy back all of your data in time, you must contact the allocator of your project TODAY. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. After today, an extension is unlikely unless there are exceptional circumstances. The allocator will need evidence that you have already started copying back your data.
     {% elif grace_change_deadline_passed %}
-    Your grace period cannot be extended, as changes to it need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. Please make sure that you have copied back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}.
+    Changes to the grace period need to be requested at least {{ grace_change_notice_days }} days before the data is scheduled for deletion, and that date has now passed. An extension is therefore unlikely unless there are exceptional circumstances. If something unexpected is preventing you from copying back your data, contact the allocator of your project as soon as possible and explain what has happened. Otherwise, please make sure that you have copied back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}.
     {% else %}
-    If you will not be able to copy back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}, you must contact the allocator of your project no later than {{ grace_change_deadline|date:"j F Y" }}. They may be able to extend your grace period, but they will need evidence that you have already started copying back your data.
+    If you will not be able to copy back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}, contact the allocator of your project no later than {{ grace_change_deadline|date:"j F Y" }}, and please don't leave it until the last day: the earlier you ask, the more likely it is that an extension can be agreed. The allocator will need evidence that you have already started copying back your data.
     {% endif %}
     View your project at {{ project_url }}
     {% if docs_url %}
@@ -5498,11 +5498,11 @@ Sent to every member of a project on its end date, the first day of its grace pe
     <h3>You MUST start copying back your data NOW.</h3>
     <p><strong>Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}.</strong> You will lose access on {{ deletion_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.</p>
     {% if grace_change_deadline_is_today %}
-    <p>If you will not be able to copy back all of your data in time, <strong>you must contact the allocator of your project TODAY</strong>. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. They will need evidence that you have already started copying back your data.</p>
+    <p>If you will not be able to copy back all of your data in time, <strong>you must contact the allocator of your project TODAY</strong>. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. After today, an extension is unlikely unless there are exceptional circumstances. The allocator will need evidence that you have already started copying back your data.</p>
     {% elif grace_change_deadline_passed %}
-    <p>Your grace period cannot be extended, as changes to it need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. Please make sure that you have copied back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}.</p>
+    <p>Changes to the grace period need to be requested at least {{ grace_change_notice_days }} days before the data is scheduled for deletion, and that date has now passed. An extension is therefore unlikely unless there are exceptional circumstances. If something unexpected is preventing you from copying back your data, contact the allocator of your project as soon as possible and explain what has happened. Otherwise, please make sure that you have copied back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}.</p>
     {% else %}
-    <p>If you will not be able to copy back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}, <strong>you must contact the allocator of your project no later than {{ grace_change_deadline|date:"j F Y" }}</strong>. They may be able to extend your grace period, but they will need evidence that you have already started copying back your data.</p>
+    <p>If you will not be able to copy back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}, <strong>contact the allocator of your project no later than {{ grace_change_deadline|date:"j F Y" }}</strong>, and please don't leave it until the last day: the earlier you ask, the more likely it is that an extension can be agreed. The allocator will need evidence that you have already started copying back your data.</p>
     {% endif %}
     <p><a href="{{ project_url }}">View your project</a>.</p>
     {% if docs_url %}<p>For more information, read the <a href="{{ docs_url }}">documentation</a>.</p>{% endif %}
@@ -5609,7 +5609,7 @@ A regular update sent to every member of a project holding an award or an alloca
     {% else %}
     There is no grace period: you must copy back your data by the end of {{ last_access_date|date:"j F Y" }}. You will lose access on {{ end_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.
     {% endif %}{% endif %}
-    If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion, {% if grace_change_deadline_passed %}and that date ({{ grace_change_deadline|date:"j F Y" }}) has now passed.{% else %}so no later than {{ grace_change_deadline|date:"j F Y" }}.{% endif %}
+    If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be requested at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. {% if grace_change_deadline_passed %}That date ({{ grace_change_deadline|date:"j F Y" }}) has now passed, so an extension is unlikely unless there are exceptional circumstances. If something unexpected has happened, contact the allocator of your project as soon as possible.{% else %}Please request any change no later than {{ grace_change_deadline|date:"j F Y" }}, and please don't leave it until the last day: the earlier you ask, the more likely it is that an extension can be agreed.{% endif %}
     {% endif %}
     For more detail, view your project at {{ project_url }}
     {% if docs_url %}
@@ -5660,7 +5660,7 @@ A regular update sent to every member of a project holding an award or an alloca
     <p>There is no grace period: <strong>you must copy back your data by the end of {{ last_access_date|date:"j F Y" }}</strong>. You will lose access on {{ end_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.</p>
     {% endif %}
     {% endif %}
-    <p>If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion, {% if grace_change_deadline_passed %}and that date ({{ grace_change_deadline|date:"j F Y" }}) has now passed.{% else %}so no later than <strong>{{ grace_change_deadline|date:"j F Y" }}</strong>.{% endif %}</p>
+    <p>If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be requested at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. {% if grace_change_deadline_passed %}That date ({{ grace_change_deadline|date:"j F Y" }}) has now passed, so an extension is unlikely unless there are exceptional circumstances. If something unexpected has happened, contact the allocator of your project as soon as possible.{% else %}Please request any change no later than <strong>{{ grace_change_deadline|date:"j F Y" }}</strong>, and please don't leave it until the last day: the earlier you ask, the more likely it is that an extension can be agreed.{% endif %}</p>
     {% endif %}
     <p>For more detail, <a href="{{ project_url }}">view your project</a>.</p>
     {% if docs_url %}<p>For more information, read the <a href="{{ docs_url }}">documentation</a>.</p>{% endif %}

@@ -298,7 +298,8 @@ class WhatTheUpdateSaysTest(ProjectUpdateTestMixin, TestCase):
         self.assertIn("your last day to access your data will be 29 January 2027", text)
         self.assertIn("You will lose access on 30 January 2027", text)
         self.assertIn("contact the allocator of your project", text)
-        self.assertIn("so no later than 20 January 2027", text)
+        self.assertIn("Please request any change no later than 20 January 2027", text)
+        self.assertIn("the earlier you ask, the more likely", text)
 
     def test_without_a_grace_period_data_goes_at_the_end_date(self):
         self.project.grace_period_days = 0
@@ -315,6 +316,7 @@ class WhatTheUpdateSaysTest(ProjectUpdateTestMixin, TestCase):
         self.assertIn("is now in its grace period", text)
         self.assertIn("your last day to access your data is 29 January 2027", text)
         self.assertIn("(20 January 2027) has now passed", text)
+        self.assertIn("unlikely unless there are exceptional circumstances", text)
 
     def test_each_award_is_reported_busiest_first(self):
         self.award(used=10000)
@@ -423,6 +425,7 @@ class GracePeriodEmailsTest(ProjectUpdateTestMixin, TestCase):
         self.assertIn(
             "allocator of your project no later than 20 January", message.body
         )
+        self.assertIn("the earlier you ask, the more likely", message.body)
 
     def test_it_is_sent_once(self):
         self.assertEqual(len(self.sent(_at(2026, 12, 31))), 1)
@@ -441,6 +444,11 @@ class GracePeriodEmailsTest(ProjectUpdateTestMixin, TestCase):
         self.assertIn("is in its grace period", message.body)
         self.assertIn("deletion in 10 days, on 30 January 2027", message.body)
         self.assertIn("contact the allocator of your project TODAY", message.body)
+        self.assertIn(
+            "After today, an extension is unlikely unless there are exceptional "
+            "circumstances",
+            message.body,
+        )
         self.assertEqual(len(self.sent(_at(2027, 1, 20, hour=15))), 0)
 
     def test_nothing_is_sent_on_other_days_in_the_grace_period(self):
@@ -476,7 +484,14 @@ class GracePeriodEmailsTest(ProjectUpdateTestMixin, TestCase):
         self.assertIn("followed by a grace period of 5 days", ending.body)
 
         [started] = self.sent(_at(2026, 12, 31))
-        self.assertIn("Your grace period cannot be extended", started.body)
+        self.assertIn("that date has now passed", started.body)
+        self.assertIn(
+            "unlikely unless there are exceptional circumstances", started.body
+        )
+        self.assertIn(
+            "contact the allocator of your project as soon as possible", started.body
+        )
+        self.assertNotIn("cannot be extended", started.body)
 
     def test_without_a_grace_period_only_the_ten_day_warning_goes(self):
         self.grace(0)

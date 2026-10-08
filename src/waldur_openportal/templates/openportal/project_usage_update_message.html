@@ -33,7 +33,7 @@
 <p>There is no grace period: <strong>you must copy back your data by the end of {{ last_access_date|date:"j F Y" }}</strong>. You will lose access on {{ end_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.</p>
 {% endif %}
 {% endif %}
-<p>If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion, {% if grace_change_deadline_passed %}and that date ({{ grace_change_deadline|date:"j F Y" }}) has now passed.{% else %}so no later than <strong>{{ grace_change_deadline|date:"j F Y" }}</strong>.{% endif %}</p>
+<p>If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be requested at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. {% if grace_change_deadline_passed %}That date ({{ grace_change_deadline|date:"j F Y" }}) has now passed, so an extension is unlikely unless there are exceptional circumstances. If something unexpected has happened, contact the allocator of your project as soon as possible.{% else %}Please request any change no later than <strong>{{ grace_change_deadline|date:"j F Y" }}</strong>, and please don't leave it until the last day: the earlier you ask, the more likely it is that an extension can be agreed.{% endif %}</p>
 {% endif %}
 <p>For more detail, <a href="{{ project_url }}">view your project</a>.</p>
 {% if docs_url %}<p>For more information, read the <a href="{{ docs_url }}">documentation</a>.</p>{% endif %}
