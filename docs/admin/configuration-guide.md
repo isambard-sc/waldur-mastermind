@@ -318,6 +318,7 @@ Default value:
 WALDUR_CORE = {'ATTACHMENT_LINK_MAX_AGE': datetime.timedelta(seconds=3600),
  'AUTHENTICATION_METHODS': ['LOCAL_SIGNIN'],
  'BACKEND_FIELDS_EDITABLE': True,
+ 'CHANGELOG_ENABLED': True,
  'COURSE_ACCOUNT_TOKEN_CLIENT_ID': '',
  'COURSE_ACCOUNT_TOKEN_SECRET': '',
  'COURSE_ACCOUNT_TOKEN_URL': '',
@@ -412,6 +413,12 @@ List of enabled authentication methods.
 **Type:** bool
 
 Allows to control /admin writable fields. If this flag is disabled it is impossible to edit any field that corresponds to backend value via /admin. Such restriction allows to save information from corruption.
+
+#### CHANGELOG_ENABLED
+
+**Type:** bool
+
+Enable changelog and version checking against upstream releases. Disable for forks that maintain their own release cycle.
 
 #### COURSE_ACCOUNT_TOKEN_CLIENT_ID
 
@@ -1334,12 +1341,6 @@ How users reach services. 'calls': only through calls for proposals, no marketpl
 
 Show offering cover image as a banner above the name on the offering page.
 
-#### ENABLE_MARKDOWN_IMAGE_UPLOAD
-
-**Type:** bool
-
-Allow uploading images for embedding in offering markdown descriptions.
-
 #### ENFORCE_USER_CONSENT_FOR_OFFERINGS
 
 **Type:** bool
@@ -1489,6 +1490,12 @@ URL for sending telemetry data.
 **Default value:** 1
 
 Telemetry service version.
+
+#### TELEMETRY_DEPLOYMENT_ID
+
+**Type:** str
+
+Random identifier sent with telemetry so reports from one deployment can be grouped. Generated on the first report; clear it to rotate.
 
 #### CHECK_FOR_UPDATES
 
@@ -1673,6 +1680,20 @@ Brand color is used for button background.
 **Type:** bool
 
 Toggler to disable dark theme.
+
+### About us page
+
+#### ABOUT_US_PAGE_ENABLED
+
+**Type:** bool
+
+Show the About us page and its link in the footer.
+
+#### ABOUT_US_PAGE_CONTENT
+
+**Type:** markdown_field
+
+Markdown content of the About us page.
 
 ### Login page
 
@@ -2259,6 +2280,14 @@ Shared secret expected in the X-Webhook-Secret header of inbound SMAX webhook de
 **Default value:** 7
 
 Review duration in days.
+
+#### PROPOSAL_DASHBOARD_REVIEWS_DUE_WITHIN_DAYS
+
+**Type:** int
+
+**Default value:** 7
+
+How many days ahead the call manager dashboard looks for review deadlines. Past-due reviews are always included.
 
 #### DEFAULT_PROPOSAL_REQUIRED_FIELDS
 
@@ -3477,6 +3506,12 @@ Enable the affiliate program: staff-configured affiliate links, fee accrual from
 **Type:** bool
 
 Enable Matrix chat integration.
+
+#### MATRIX_AUTO_CREATE_PROJECT_ROOMS
+
+**Type:** bool
+
+Automatically create a Matrix room for every newly created project. Off by default; existing projects are backfilled with the provision_matrix_rooms management command.
 
 #### MATRIX_HOMESERVER_URL
 

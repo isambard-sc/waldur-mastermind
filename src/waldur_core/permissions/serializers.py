@@ -151,6 +151,9 @@ class RoleModifySerializer(RoleDetailsSerializer):
 
     @staticmethod
     def _is_org_scoped(role: models.Role) -> bool:
+        # Deliberately an availability EXISTS rather than a lookup of the owning
+        # Customer: a scope row is a generic FK and is not cascaded when the
+        # organization is hard-deleted, and an orphaned clone must stay guarded.
         customer_ct = ContentType.objects.get_for_model(structure_models.Customer)
         return role.availability.filter(content_type=customer_ct).exists()
 
@@ -757,14 +760,13 @@ class UserRoleCreateSerializer(UserRoleMutateSerializer):
         request = self.context["request"]
         target_user = attrs["user"]
         role: models.Role = attrs["role"]
-        expiration_time = attrs.get("expiration_time")
 
         if not target_user.is_active and not request.user.is_staff:
             raise ValidationError(
                 "Only staff users can assign roles to deactivated users."
             )
 
-        validate_role_grant(scope, target_user, role, expiration_time=expiration_time)
+        validate_role_grant(scope, target_user, role)
 
         return attrs
 

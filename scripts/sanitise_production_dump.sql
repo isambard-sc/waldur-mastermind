@@ -1178,7 +1178,28 @@ BEGIN
         'marketplace_offeringuser.service_provider_comment',
         'structure_customer.contact_details',
         'core_user.description',
+        -- Proposals. The awards site is nothing but these, and they are the
+        -- most sensitive text in any Waldur database: unpublished research
+        -- plans, written by the applicant, and candid assessments of them
+        -- written by named reviewers. The columns below exist only on the
+        -- fork's own proposal app, which upstream replaced, so every one of
+        -- them is a skip on a portal database.
+        'proposal_proposal.project_summary',
+        'proposal_proposal.description',
+        'proposal_proposal.allocation_comment',
+        'proposal_proposalresourceadjustment.comment',
         'proposal_review.summary_private_comment',
+        'proposal_review.summary_public_comment',
+        'proposal_review.comment_project_title',
+        'proposal_review.comment_project_summary',
+        'proposal_review.comment_project_description',
+        'proposal_review.comment_project_duration',
+        'proposal_review.comment_project_is_confidential',
+        'proposal_review.comment_project_has_civilian_purpose',
+        'proposal_review.comment_project_supporting_documentation',
+        'proposal_review.comment_resource_requests',
+        'proposal_review.comment_team',
+        'proposal_reviewcomment.message',
         -- Prose written by staff about a person or a project. Rewriting the
         -- names that happen to be in the maps would still leave everything
         -- else the writer typed, so the text goes.
@@ -1235,6 +1256,43 @@ SELECT sanitise.exec_if('waldur_openportal_remoteproject', ARRAY['notes'], $$
     ), '[]'::jsonb)
     WHERE jsonb_typeof(p.notes) = 'array' AND p.notes <> '[]'::jsonb
 $$);
+
+-- The fork's proposal notes are the same shape as the remote-project notes
+-- above - an append-only list of {timestamp, author, text}, here visible only
+-- to call managers and staff - so they get the same treatment: the timestamps
+-- and the number of notes survive, the author is mapped, the text goes.
+SELECT sanitise.exec_if('proposal_proposal', ARRAY['notes'], $$
+    UPDATE public.proposal_proposal p
+    SET notes = coalesce((
+        SELECT jsonb_agg(
+            note
+            || jsonb_build_object(
+                'author',
+                CASE
+                    WHEN sanitise.is_pseudonym(note->>'author')
+                        THEN note->>'author'
+                    ELSE coalesce(
+                        (SELECT new FROM sanitise.name_map
+                         WHERE orig = note->>'author'),
+                        (SELECT new FROM sanitise.token_map
+                         WHERE orig = note->>'author'),
+                        'Person Number0')
+                END)
+            || jsonb_build_object('text',
+                                  sanitise.filler(note->>'text'))
+            ORDER BY ord)
+        FROM jsonb_array_elements(p.notes) WITH ORDINALITY AS n(note, ord)
+    ), '[]'::jsonb)
+    WHERE jsonb_typeof(p.notes) = 'array' AND p.notes <> '[]'::jsonb
+$$);
+
+-- Uploaded proposal and call documents. The bytes are already gone -
+-- media_file.content is emptied above - so what is left is the file NAME,
+-- which applicants routinely write their own name into
+-- ("Jane-Smith-CV.pdf"). The rows stay so that the listings and the media
+-- access rules are still exercised; only the path goes.
+SELECT sanitise.blank('proposal_proposaldocumentation', 'file');
+SELECT sanitise.blank('proposal_calldocument', 'file');
 
 -- Opaque blobs of provider or identity-provider data. core_user.details is the
 -- raw userinfo claim set from the identity provider, so it is a second copy of
@@ -2068,9 +2126,11 @@ DO $$
 DECLARE
     spec record;
     nullable text;
+    udt text;
     empty text;
     n bigint;
     bad_total bigint := 0;
+    skipped_native int := 0;
 BEGIN
     FOR spec IN
         SELECT * FROM (VALUES
@@ -2121,11 +2181,22 @@ BEGIN
     LOOP
         CONTINUE WHEN to_regclass('public.' || quote_ident(spec.tbl)) IS NULL;
 
-        SELECT is_nullable INTO nullable
+        SELECT is_nullable, udt_name INTO nullable, udt
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = spec.tbl
           AND column_name = spec.col;
         CONTINUE WHEN nullable IS NULL;
+
+        -- Only text-backed columns. The same field is a native json/jsonb
+        -- column on some releases and on some deployments - the awards site
+        -- has logging_emailhook.event_groups as jsonb where the portal has it
+        -- as text - and there is nothing to check when the database itself
+        -- guarantees the value parses. Without this the run dies here on
+        -- `function sanitise.is_json(jsonb) does not exist`, hours in.
+        IF udt NOT IN ('text', 'varchar', 'bpchar') THEN
+            skipped_native := skipped_native + 1;
+            CONTINUE;
+        END IF;
 
         EXECUTE format(
             'SELECT count(*) FROM public.%I WHERE NOT sanitise.is_json(%I)',
@@ -2144,6 +2215,12 @@ BEGIN
             '  %s.%s: %s rows did not parse, emptied', spec.tbl, spec.col,
             sanitise.commas(n)));
     END LOOP;
+
+    IF skipped_native > 0 THEN
+        PERFORM sanitise.say(format(
+            '  %s of them are native json columns on this release, so the'
+            || ' database already guarantees they parse', skipped_native));
+    END IF;
 
     IF bad_total = 0 THEN
         PERFORM sanitise.say('  all of them parse');

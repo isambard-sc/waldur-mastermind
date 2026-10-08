@@ -34,6 +34,8 @@ class LifecyclePluginOptionsPersistenceTest(test.APITestCase):
         ("resource_projects_limit_policy", "per_project"),
         ("enable_resource_limit_change_requests", True),
         ("enable_resource_limit_change_requests", False),
+        ("enable_scim_entitlements", True),
+        ("enable_scim_entitlements", False),
     )
     @unpack
     def test_option_persists(self, key, value):
@@ -46,6 +48,7 @@ class LifecyclePluginOptionsPersistenceTest(test.APITestCase):
                 "conceal_subnet_restricted_resources": True,
                 "resource_projects_limit_policy": "aggregate",
                 "enable_resource_limit_change_requests": True,
+                "enable_scim_entitlements": True,
             }
         )
         self.assertTrue(serializer.is_valid(), serializer.errors)
@@ -61,6 +64,7 @@ class LifecyclePluginOptionsPersistenceTest(test.APITestCase):
         self.assertEqual(
             serializer.validated_data["resource_projects_limit_policy"], "aggregate"
         )
+        self.assertEqual(serializer.validated_data["enable_scim_entitlements"], True)
 
     def test_invalid_limit_policy_rejected(self):
         serializer = serializers.MergedPluginOptionsSerializer(
@@ -75,3 +79,33 @@ class LifecyclePluginOptionsPersistenceTest(test.APITestCase):
         result = self._update({"enable_resource_access_subnets": True})
         self.assertEqual(result["enable_resource_access_subnets"], True)
         self.assertEqual(result["auto_approve_remote_orders"], True)
+
+    def test_uses_robot_accounts_persists(self):
+        self.assertIs(
+            self._update({"uses_robot_accounts": True})["uses_robot_accounts"],
+            True,
+        )
+
+    def test_uses_robot_accounts_rejected_with_offering_users(self):
+        self.offering.plugin_options = {
+            "service_provider_can_create_offering_user": True
+        }
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(self.offering, "update_integration")
+        response = self.client.post(
+            url, {"plugin_options": {"uses_robot_accounts": True}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertNotIn("uses_robot_accounts", self.offering.plugin_options)
+
+    def test_uses_robot_accounts_allowed_when_offering_users_disabled(self):
+        result = self._update(
+            {
+                "uses_robot_accounts": True,
+                "service_provider_can_create_offering_user": False,
+            }
+        )
+        self.assertIs(result["uses_robot_accounts"], True)
+        self.assertIs(result["service_provider_can_create_offering_user"], False)

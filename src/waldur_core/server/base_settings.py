@@ -58,6 +58,7 @@ INSTALLED_APPS = (
     "waldur_core.logging",
     "waldur_core.checklist",
     "waldur_core.user_actions",
+    "waldur_core.changelog",
     "waldur_core.passkeys",
     "rest_framework",
     "rest_framework.authtoken",
@@ -77,7 +78,6 @@ INSTALLED_APPS = (
     # health_check.contrib.celery_ping for better performance (connection pooling + targeted pings)
     "netfields",
     "constance",
-    "constance.backends.database",
     "drf_spectacular",
 )
 INSTALLED_APPS += ADMIN_INSTALLED_APPS  # noqa: F405
@@ -290,6 +290,16 @@ _FOREIGN_PRE_CHAIN = [
     structlog.stdlib.PositionalArgumentsFormatter(),
     structlog.processors.format_exc_info,
 ]
+
+# Deploy-time kill switch for the daily telemetry report. It overrides the
+# admin's feature toggle, so an operator can guarantee nothing leaves the
+# installation before first boot (air-gapped or contractually restricted sites).
+TELEMETRY_ENABLED = os.environ.get("WALDUR_TELEMETRY_ENABLED", "true").lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 # Use JSON in production, readable console in development
 _USE_JSON_LOGS = os.environ.get("WALDUR_DEV_LOGS", "").lower() not in (

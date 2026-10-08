@@ -337,6 +337,13 @@ def ensure_current_attachment(remote_project):
     Closes (sets detached_at=now) any open attachment pointing to a
     different project, then get_or_creates the open attachment for the
     current project.
+
+    Also records the key this award's usage is cached under while attached:
+    the live allocation's backend_id, which is the local project identifier
+    of current_project. It is only ever filled in, never overwritten - the key
+    is historical fact for its window, and a project's identifier cannot
+    change because its shortname is set once. Callers reach here after
+    set_mapping(), so backend_id is already known.
     """
     now = timezone.now()
     current_project = remote_project.current_project
@@ -347,12 +354,19 @@ def ensure_current_attachment(remote_project):
         detached_at__isnull=True,
     ).exclude(project=current_project).update(detached_at=now)
 
+    allocation = remote_project.remote_allocation
+    report_key = (allocation.backend_id or None) if allocation is not None else None
+
     # Get or create the open attachment for the current project
     attachment, _ = models.RemoteProjectAttachment.objects.get_or_create(
         remote_project=remote_project,
         project=current_project,
         detached_at__isnull=True,
+        defaults={"project_identifier": report_key},
     )
+    if report_key and not attachment.project_identifier:
+        attachment.project_identifier = report_key
+        attachment.save(update_fields=["project_identifier"])
 
     return attachment
 

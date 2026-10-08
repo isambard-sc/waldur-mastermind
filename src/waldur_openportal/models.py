@@ -1335,7 +1335,7 @@ class ProjectInfo(models.Model):
                 # application_portal_only mode (i.e., we're in Project Management mode)
                 try:
                     application_portal_only = core_models.Feature.objects.get(
-                        key="deployment.application_portal_only"
+                        key=core_models.APPLICATION_PORTAL_FEATURE
                     ).value
                 except core_models.Feature.DoesNotExist:
                     # Default to False if feature flag doesn't exist
@@ -3265,9 +3265,34 @@ class RemoteProject(core_models.UuidMixin, models.Model):
             # precedence; notes and breakdown are unioned.
             result = confirmed.merge(sent)
 
-            # Explicitly enforce local membership and membership_control —
-            # merge() may blend these, but last_sent is always authoritative.
-            result.members = sent.members
+            # Explicitly enforce local membership — last_sent is always
+            # authoritative and is never augmented from last_confirmed.
+            #
+            # Deliberately NOT `result.members = sent.members`.  The attribute
+            # setter is the one place in this library that re-validates member
+            # emails against allowed_domains, and it validates against the
+            # *snapshot's* domains, before the local allowed_domains below has
+            # been applied.  from_json() and merge() both accept such members
+            # without complaint, so the stored data is not invalid — a member
+            # added legitimately before the domain list was tightened would
+            # nonetheless make this read path raise
+            #
+            #   OSError: Parse("Email '...' is not in the allowed domains
+            #                   for this project")
+            #
+            # and take down the entire remote-projects list, not merely its own
+            # row.  Same shape as the allowed_domains note below: assignment
+            # and merge do not mean the same thing in this library.
+            #
+            # merge() already replaces members wholesale when sent has them, so
+            # only the "sent has none" case needs anything doing — but clear
+            # and re-merge explicitly rather than relying on that, so a change
+            # in merge()'s precedence cannot silently reinstate stale members.
+            result.members = None  # clearing never validates
+            if sent.members is not None:
+                result = result.merge(
+                    openportal.AwardDetails(json.dumps({"members": sent.members}))
+                )
 
         # Layer in current extras — these may be newer than the last send.
         # Notes are unioned (merge deduplicates); other fields overwrite.
@@ -3440,6 +3465,14 @@ class RemoteProjectAttachment(models.Model):
 
     The open attachment (detached_at=None) always matches
     RemoteProject.current_project.
+
+    Also records the key the award's usage was filed under while attached.
+    That key is the local project identifier - "{shortname}.{portal}" - so it
+    belongs to the *project*, not the award: move an award from X to Y and its
+    usage from then on is fetched and cached under Y's identifier. One award's
+    history is therefore spread across one key per project it has been
+    attached to, and only the attachment knows which key covers which days.
+    See utils.get_remote_project_windows().
     """
 
     remote_project = models.ForeignKey(
@@ -3457,8 +3490,13 @@ class RemoteProjectAttachment(models.Model):
         verbose_name=_("project"),
     )
 
+    # A plain default rather than auto_now_add, so that reconstructed rows can
+    # be backdated to when the award was really attached - as
+    # ManagedProjectAttachment does. With auto_now_add every reconstructed
+    # attachment would claim to start today, and clipping usage to it would
+    # throw away the award's entire history.
     attached_at = models.DateTimeField(
-        auto_now_add=True,
+        default=timezone.now,
         verbose_name=_("attached at"),
     )
 
@@ -3467,6 +3505,18 @@ class RemoteProjectAttachment(models.Model):
         null=True,
         verbose_name=_("detached at"),
         help_text=_("Null while this is the current attachment."),
+    )
+
+    project_identifier = models.CharField(
+        max_length=MAX_PROJECTIDENTIFIER_LENGTH,
+        blank=True,
+        null=True,
+        verbose_name=_("project identifier"),
+        help_text=_(
+            "The local project identifier ({shortname}.{portal}) that this "
+            "award's usage was fetched and cached under while attached. Null "
+            "until recorded or backfilled."
+        ),
     )
 
     note = models.TextField(

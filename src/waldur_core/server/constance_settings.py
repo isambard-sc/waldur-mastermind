@@ -135,6 +135,7 @@ ONBOARDING_VALIDATION_CHOICES = [
     ("ariregister", "ariregister"),
     ("wirtschaftscompass", "wirtschaftscompass"),
     ("bolagsverket", "bolagsverket"),
+    ("breg", "breg"),
     ("dnb_se", "dnb_se"),
     ("dnb_no", "dnb_no"),
     ("dnb_dk", "dnb_dk"),
@@ -285,6 +286,10 @@ CONSTANCE_ADDITIONAL_FIELDS = {
     "color_field": ["django.forms.CharField", {"required": False}],
     "html_field": ["django.forms.CharField", {"required": False}],
     "text_field": ["django.forms.CharField", {"required": False}],
+    "markdown_field": [
+        "django.forms.CharField",
+        {"required": False, "widget": "django.forms.Textarea"},
+    ],
     # String setting that must not be blanked out - an empty value would change
     # the meaning of the setting rather than just unset it.
     "non_empty_field": ["django.forms.CharField", {"required": True}],
@@ -370,6 +375,15 @@ CONSTANCE_CONFIG = {
         "",
         "Text content rendered in the disclaimer area below the footer.",
         "text_field",
+    ),
+    "ABOUT_US_PAGE_ENABLED": (
+        False,
+        "Show the About us page and its link in the footer.",
+    ),
+    "ABOUT_US_PAGE_CONTENT": (
+        "",
+        "Markdown content of the About us page.",
+        "markdown_field",
     ),
     "SITE_ADDRESS": ("", "It is used in marketplace order header."),
     "SITE_EMAIL": ("", "It is used in marketplace order header and UI footer."),
@@ -475,6 +489,11 @@ CONSTANCE_CONFIG = {
         "URL for sending telemetry data.",
     ),
     "TELEMETRY_VERSION": (1, "Telemetry service version."),
+    "TELEMETRY_DEPLOYMENT_ID": (
+        "",
+        "Random identifier sent with telemetry so reports from one deployment "
+        "can be grouped. Generated on the first report; clear it to rotate.",
+    ),
     "CHECK_FOR_UPDATES": (
         True,
         "If true, the version endpoint queries GitHub for the latest released "
@@ -922,6 +941,11 @@ CONSTANCE_CONFIG = {
     ),
     # Proposal settings
     "PROPOSAL_REVIEW_DURATION": (7, "Review duration in days."),
+    "PROPOSAL_DASHBOARD_REVIEWS_DUE_WITHIN_DAYS": (
+        7,
+        "How many days ahead the call manager dashboard looks for review "
+        "deadlines. Past-due reviews are always included.",
+    ),
     # ORCID integration settings
     "ORCID_CLIENT_ID": (
         "",
@@ -1770,6 +1794,12 @@ CONSTANCE_CONFIG = {
     ),
     # Matrix chat settings
     "MATRIX_ENABLED": (False, "Enable Matrix chat integration."),
+    "MATRIX_AUTO_CREATE_PROJECT_ROOMS": (
+        False,
+        "Automatically create a Matrix room for every newly created project. "
+        "Off by default; existing projects are backfilled with the "
+        "provision_matrix_rooms management command.",
+    ),
     "MATRIX_HOMESERVER_URL": (
         "",
         "Matrix homeserver base URL, e.g. https://matrix.example.com",
@@ -1898,7 +1928,6 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "RESTRICTED_OFFERING_VISIBILITY_MODE",
         "SERVICE_ACCESS_MODE",
         "SHOW_OFFERING_COVER_IMAGE",
-        "ENABLE_MARKDOWN_IMAGE_UPLOAD",
         "ENFORCE_USER_CONSENT_FOR_OFFERINGS",
         "ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS",
         "ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT",
@@ -1930,6 +1959,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
     "Telemetry": (
         "TELEMETRY_URL",
         "TELEMETRY_VERSION",
+        "TELEMETRY_DEPLOYMENT_ID",
         "CHECK_FOR_UPDATES",
     ),
     "Custom Scripts": (
@@ -1962,6 +1992,10 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "FONT_FAMILY",
         "BRAND_COLOR",
         "DISABLE_DARK_THEME",
+    ),
+    "About us page": (
+        "ABOUT_US_PAGE_ENABLED",
+        "ABOUT_US_PAGE_CONTENT",
     ),
     "Login page": (
         "LOGIN_PAGE_LAYOUT",
@@ -2061,6 +2095,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
     ),
     "Proposal settings": (
         "PROPOSAL_REVIEW_DURATION",
+        "PROPOSAL_DASHBOARD_REVIEWS_DUE_WITHIN_DAYS",
         "DEFAULT_PROPOSAL_REQUIRED_FIELDS",
         "DEFAULT_PROPOSAL_HIDDEN_FIELDS",
         "REVIEWER_PROFILES_ENABLED",
@@ -2270,6 +2305,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
     "Affiliates": ("AFFILIATES_ENABLED",),
     "Matrix chat": (
         "MATRIX_ENABLED",
+        "MATRIX_AUTO_CREATE_PROJECT_ROOMS",
         "MATRIX_HOMESERVER_URL",
         "MATRIX_HOMESERVER_PUBLIC_URL",
         "MATRIX_HOMESERVER_DOMAIN",
@@ -2330,6 +2366,8 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "OFFERING_LOGO_PLACEHOLDER",
     "DISCLAIMER_AREA_LOGO",
     "DISCLAIMER_AREA_TEXT",
+    "ABOUT_US_PAGE_ENABLED",
+    "ABOUT_US_PAGE_CONTENT",
     "COMMON_FOOTER_TEXT",
     "COMMON_FOOTER_HTML",
     "LANGUAGE_CHOICES",

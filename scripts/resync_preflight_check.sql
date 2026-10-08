@@ -353,18 +353,57 @@ SELECT 'irreversible_gate', 'projects_preserved_via_slug_only', 'INFO', count(*)
 -- That is only safe on empty tables. If these are non-zero, decide explicitly
 -- whether the data is disposable, and purge it before reconciling.
 -- ---------------------------------------------------------------------------
-SELECT
-    'proposal_data' AS section,
-    'proposal_rows' AS check,
-    CASE WHEN count(*) = 0 THEN 'PASS' ELSE 'WARN' END AS status,
-    count(*)::text || CASE WHEN count(*) > 0 THEN ' (decide: purge or migrate)' ELSE '' END AS value
-FROM proposal_proposal;
+-- Counted through dynamic SQL because the tables may not be there to name.
+-- On the awards site the reconciliation renames them to old_proposal_*, and a
+-- plain SELECT against a missing relation fails at parse time -- which aborted
+-- the whole read-only transaction and took every later check with it.
+DO $proposal$
+DECLARE
+    spec record;
+    src text;
+    n bigint;
+    archived boolean;
+BEGIN
+    archived := EXISTS (SELECT 1 FROM pg_tables
+                        WHERE schemaname = 'public'
+                          AND tablename LIKE 'old\_proposal\_%');
 
-SELECT 'proposal_data' AS section, 'round_rows' AS check, 'INFO' AS status, count(*)::text AS value FROM proposal_round
-UNION ALL
-SELECT 'proposal_data', 'call_rows', 'INFO', count(*)::text FROM proposal_call
-UNION ALL
-SELECT 'proposal_data', 'resource_adjustment_rows', 'INFO', count(*)::text FROM proposal_proposalresourceadjustment;
+    FOR spec IN
+        SELECT * FROM (VALUES
+            ('proposal_rows',            'proposal_proposal'),
+            ('round_rows',               'proposal_round'),
+            ('call_rows',                'proposal_call'),
+            ('resource_adjustment_rows', 'proposal_proposalresourceadjustment')
+        ) AS t(label, tbl)
+    LOOP
+        src := CASE WHEN archived THEN 'old_' || spec.tbl ELSE spec.tbl END;
+
+        IF to_regclass('public.' || quote_ident(src)) IS NULL THEN
+            RAISE NOTICE '| proposal_data | % | SKIP | no such table |',
+                rpad(spec.label, 24);
+            CONTINUE;
+        END IF;
+
+        EXECUTE format('SELECT count(*) FROM public.%I', src) INTO n;
+
+        IF spec.label <> 'proposal_rows' THEN
+            RAISE NOTICE '| proposal_data | % | INFO | % |',
+                rpad(spec.label, 24), n;
+        ELSIF archived THEN
+            -- Already moved aside: the rows are the archive's input, not a
+            -- decision to make.
+            RAISE NOTICE '| proposal_data | % | PASS | % archived |',
+                rpad(spec.label, 24), n;
+        ELSIF n = 0 THEN
+            RAISE NOTICE '| proposal_data | % | PASS | 0 |',
+                rpad(spec.label, 24);
+        ELSE
+            RAISE NOTICE '| proposal_data | % | WARN | % (archived by the '
+                'reconciliation; see awards-site-upgrade-plan.md) |',
+                rpad(spec.label, 24), n;
+        END IF;
+    END LOOP;
+END $proposal$;
 
 -- Purging proposal data is only self-contained if nothing outside the app
 -- points at it. Any row here must be considered before truncating.

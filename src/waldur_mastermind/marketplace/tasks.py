@@ -1,7 +1,7 @@
 import collections
 import datetime
 import decimal
-import hashlib
+import functools
 import logging
 import uuid as uuid_mod
 from datetime import timedelta
@@ -13,6 +13,7 @@ import requests
 from celery import shared_task
 from constance import config
 from dateutil.relativedelta import relativedelta
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.db.models import Count, Exists, F, OuterRef, Q, Subquery, Sum
@@ -22,8 +23,10 @@ from rest_framework import status
 
 from waldur_core import _get_version
 from waldur_core.checklist import models as checklist_models
+from waldur_core.core import features as core_features
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import ReviewStates
 from waldur_core.core.models import User
 from waldur_core.logging import event_logger
 from waldur_core.logging import models as logging_models
@@ -42,13 +45,17 @@ from waldur_mastermind.invoices.models import InvoiceItem
 from waldur_mastermind.marketplace import (
     exceptions,
     models,
+    offering_merge,
     plugins,
+    project_groups,
     utils,
 )
+from waldur_mastermind.marketplace import log as marketplace_log
 from waldur_mastermind.marketplace.catalog_loaders.eessi import EESSICatalogLoader
 from waldur_mastermind.marketplace.catalog_loaders.spack import SpackCatalogLoader
 from waldur_mastermind.marketplace.enums import (
     BillingTypes,
+    CourseAccountState,
     LimitPeriods,
     MaintenanceState,
     OfferingStates,
@@ -69,6 +76,16 @@ from waldur_mastermind.marketplace.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@shared_task(name="waldur_mastermind.marketplace.backfill_provider_project_groups")
+def backfill_provider_project_groups(service_provider_uuid):
+    """Create the POSIX project groups of projects already using a provider."""
+    provider = models.ServiceProvider.objects.filter(uuid=service_provider_uuid).first()
+    if provider is None or not provider.project_groups_enabled:
+        return
+    rows = project_groups.backfill(provider)
+    logger.info("Backfilled %s POSIX project group(s) for %s.", len(rows), provider)
 
 
 @shared_task(name="waldur_mastermind.marketplace.evaluate_usage_limit_restriction")
@@ -166,6 +183,116 @@ def create_course_account_task(course_account_uuid_hex: str, owner_username: str
         course_account.error_message = error_message
         course_account.set_state_erred()
         course_account.save(update_fields=["error_message", "state"])
+
+
+@shared_task
+def close_course_account_task(course_account_uuid_hex: str):
+    """Close a single course account via the external API.
+
+    Used by the destroy action, where the row is known to exist (the
+    ViewSet already resolved it) and closing one account at a time is
+    right - a direct API caller shouldn't wait on, or be blocked by,
+    anyone else's account.
+    """
+    try:
+        course_account = models.CourseAccount.objects.get(uuid=course_account_uuid_hex)
+    except models.CourseAccount.DoesNotExist:
+        logger.error(
+            "CourseAccount %s not found, skipping task", course_account_uuid_hex
+        )
+        return
+
+    _close_course_account_and_mark_erred_on_any_failure(course_account)
+
+
+@shared_task
+def close_course_accounts_task(accounts: list[dict]):
+    """Close every course account of one deleted project via the external API.
+
+    Batched into one task per project rather than one task per account so
+    the API token is fetched once here instead of once per account - and
+    only ever inside this task, never in the pre_delete signal that
+    scheduled it, so a slow token endpoint can't block whichever request
+    or admin action triggered the project deletion.
+
+    Each account's uuid/username/user_id is passed in rather than
+    re-queried, because CourseAccount.project is CASCADE: a hard project
+    delete (Customer.delete() once no active projects remain, or the
+    admin's "hard-delete soft-deleted projects" action) removes the row
+    before this task runs, and re-reading by uuid would silently skip
+    closing that account at the backend.
+    """
+    if not accounts:
+        return
+
+    try:
+        api_access_token = utils.get_course_account_api_token()
+    except httpx.HTTPError as exc:
+        logger.error(
+            "Unable to get course account API token, skipping %s accounts: %s",
+            len(accounts),
+            exc,
+        )
+        return
+
+    for account in accounts:
+        uuid_hex = account["uuid"]
+        username = account["username"]
+        user_id = account["user_id"]
+        try:
+            course_account = models.CourseAccount.objects.get(uuid=uuid_hex)
+        except models.CourseAccount.DoesNotExist:
+            if not username:
+                # No backend account was ever created for this one either.
+                continue
+            try:
+                utils.close_course_account_by_username(username, api_access_token)
+            except Exception as exc:
+                logger.error(
+                    "Failed to close course account %s at backend "
+                    "(local row already deleted): %s",
+                    username,
+                    exc,
+                )
+                continue
+            if user_id:
+                core_models.User.objects.filter(pk=user_id).update(
+                    is_active=False,
+                    deactivation_reason=f"Course account for {username} closed",
+                )
+            continue
+
+        _close_course_account_and_mark_erred_on_any_failure(
+            course_account, api_access_token
+        )
+
+
+def _close_course_account_and_mark_erred_on_any_failure(
+    course_account: models.CourseAccount, api_access_token: str | None = None
+):
+    """Run close_course_account and guarantee the account never gets stuck.
+
+    close_course_account itself only marks ERRED for httpx.HTTPError/ValueError
+    (the expected "backend call failed" cases). Anything else it lets
+    propagate - e.g. ValidationError when COURSE_ACCOUNT_URL isn't
+    configured - which would otherwise leave the account stuck in PENDING
+    forever: both destroy and retry require OK/ERRED as their source state,
+    so a PENDING account can't be re-attempted through the API at all.
+    """
+    try:
+        utils.close_course_account(course_account, api_access_token)
+    except Exception as exc:
+        logger.error(
+            "Failed to close course account %s: %s", course_account.uuid.hex, exc
+        )
+        course_account.refresh_from_db()
+        if course_account.state not in (
+            CourseAccountState.CLOSED,
+            CourseAccountState.ERRED,
+        ):
+            course_account.set_state_erred()
+            course_account.error_message = str(exc)
+            course_account.save(update_fields=["state", "error_message"])
 
 
 @shared_task
@@ -684,6 +811,104 @@ def calculate_allocated_for_month(
         ).aggregate(total=Sum("quantity"))
 
         return Decimal(str(items_agg["total"] or 0))
+
+
+# The maximum value ComponentUsageMonthly's max_digits=20, decimal_places=2 holds.
+MAX_USAGE_SUMMARY_DECIMAL = Decimal("999999999999999999.99")
+
+
+def refresh_component_usage_summary(
+    component: models.OfferingComponent, year: int, month: int, delete_empty=False
+) -> bool:
+    """Recalculate the ComponentUsageMonthly row of one component and month.
+
+    Returns True if a row was saved. A month with neither consumption nor
+    allocation gets no row; with ``delete_empty`` an existing one is removed,
+    so a component whose usage moved elsewhere does not keep a stale summary.
+    """
+    billing_period = datetime.date(year, month, 1)
+    consumed = calculate_consumed_for_month(component, year, month)
+    allocated = calculate_allocated_for_month(component, year, month)
+
+    if consumed == Decimal("0") and allocated == Decimal("0"):
+        if delete_empty:
+            models.ComponentUsageMonthly.objects.filter(
+                component=component, billing_period=billing_period
+            ).delete()
+        return False
+
+    usage_percent = None
+    if allocated > 0:
+        usage_percent = round((consumed * 100) / allocated, 2)
+
+    # Safety clamp to prevent DB overflow from corrupted JSONB data
+    consumed = min(consumed, MAX_USAGE_SUMMARY_DECIMAL)
+    allocated = min(allocated, MAX_USAGE_SUMMARY_DECIMAL)
+
+    models.ComponentUsageMonthly.objects.update_or_create(
+        component=component,
+        billing_period=billing_period,
+        defaults={
+            "total_consumed": consumed,
+            "total_allocated": allocated,
+            "usage_percent": usage_percent,
+        },
+    )
+    return True
+
+
+def _log_verification(merge: models.OfferingMerge):
+    if merge.verification and not merge.verification.get("passed", True):
+        marketplace_log.log_offering_merge_verification_failed(merge)
+
+
+@shared_task(name="waldur_mastermind.marketplace.execute_offering_merge")
+def execute_offering_merge(merge_uuid: str):
+    """Run a queued offering merge and record the outcome in the event log.
+
+    A refused merge (``OfferingMergeError``) ends as ``failed`` with the reason
+    in ``error_message``; it is an expected outcome, so the task succeeds.
+    Any other error fails the task after the record is marked ``failed``.
+    """
+    merge = models.OfferingMerge.objects.get(uuid=merge_uuid)
+    try:
+        merge = offering_merge.execute(merge)
+    except Exception as error:
+        merge.refresh_from_db()
+        if merge.state == models.OfferingMerge.States.FAILED:
+            marketplace_log.log_offering_merge_failed(merge, "execution")
+        if isinstance(error, offering_merge.OfferingMergeError):
+            logger.warning("Offering merge %s was refused: %s", merge_uuid, error)
+            return
+        raise
+    marketplace_log.log_offering_merge_executed(merge)
+    _log_verification(merge)
+
+
+@shared_task(name="waldur_mastermind.marketplace.undo_offering_merge")
+def undo_offering_merge(merge_uuid: str):
+    """Undo a merge the API moved to ``undoing``.
+
+    If the engine refuses (something changed since the API checked), the merge
+    returns to ``done`` with the reason in ``error_message``: it is still in
+    effect, so ``failed``, which allows a fresh preview and execution, would
+    be wrong.
+    """
+    merge = models.OfferingMerge.objects.get(uuid=merge_uuid)
+    try:
+        merge = offering_merge.undo(merge)
+    except Exception as error:
+        merge.refresh_from_db()
+        if merge.error_message:
+            marketplace_log.log_offering_merge_failed(merge, "undo")
+        if isinstance(error, offering_merge.OfferingMergeError):
+            logger.warning(
+                "Undo of offering merge %s was refused: %s", merge_uuid, error
+            )
+            return
+        raise
+    marketplace_log.log_offering_merge_undone(merge)
+    _log_verification(merge)
 
 
 @shared_task
@@ -1260,14 +1485,21 @@ def notification_about_resource_ending():
 @shared_task(name="waldur_mastermind.marketplace.send_metrics")
 def send_metrics():
     """Send anonymous usage metrics and telemetry data to the Waldur team."""
-    if not core_models.Feature.objects.filter(key="telemetry.send_metrics").exists():
+    if not settings.TELEMETRY_ENABLED:
+        return
+
+    if not core_features.is_enabled("deployment.send_metrics"):
         return
 
     # skip sending if setting is unset
     if not config.TELEMETRY_URL:
         return
 
-    site_name = config.HOMEPORT_URL
+    deployment_id = config.TELEMETRY_DEPLOYMENT_ID
+    if not deployment_id:
+        deployment_id = uuid_mod.uuid4().hex
+        config.TELEMETRY_DEPLOYMENT_ID = deployment_id
+
     deployment_type = core_utils.get_deployment_type()
     first_event = logging_models.Event.objects.order_by("created").first()
     installation_date = (
@@ -1275,7 +1507,7 @@ def send_metrics():
     )
     installation_date_str = str(installation_date) if installation_date else None
     params = {
-        "deployment_id": hashlib.sha256(site_name.encode()).hexdigest(),
+        "deployment_id": deployment_id,
         "deployment_type": deployment_type,
         "helpdesk_backend": config.WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE,
         "helpdesk_integration_status": config.WALDUR_SUPPORT_ENABLED,
@@ -1342,6 +1574,11 @@ def process_pending_start_date_orders():
         start_date__lte=today,
     )
 
+    # Resolved once for the sweep: get_system_robot is a get_or_create, and
+    # every order placed automatically would otherwise pay a query for the
+    # same row.
+    system_robot = core_utils.get_system_robot()
+
     for order in orders_to_process:
         logger.info(
             "Processing order %s (%s) as its start date %s has been reached.",
@@ -1352,8 +1589,17 @@ def process_pending_start_date_orders():
         order.set_state_executing()
         order.save(update_fields=["state"])
         # Use transaction.on_commit to ensure the state change is saved
-        # before the processing task is queued.
-        transaction.on_commit(lambda: process_order_on_commit(order, order.created_by))
+        # before the processing task is queued. Bind the arguments now rather
+        # than closing over the loop variable: a lambda would read whatever
+        # `order` holds when the callback runs, so a batch of several orders
+        # would process the last one repeatedly and strand the rest.
+        transaction.on_commit(
+            functools.partial(
+                process_order_on_commit,
+                order,
+                utils.get_order_processing_user(order, system_robot),
+            )
+        )
 
 
 @shared_task(name="waldur_mastermind.marketplace.process_pending_project_orders")
@@ -1365,14 +1611,20 @@ def process_pending_project_orders():
     orders = models.Order.objects.filter(
         state=OrderStates.PENDING_PROJECT, project__in=active_project_ids
     )
+    # Same reason as the start-date sweep above: one get_or_create for the
+    # batch rather than one per order.
+    system_robot = core_utils.get_system_robot()
     for order in orders:
-        continue_order_processing(order)
+        continue_order_processing(order, system_robot)
 
 
-def continue_order_processing(order: models.Order):
+def continue_order_processing(order: models.Order, system_robot=None):
     """
     Advances an order to the next logical state after consumer/project approval.
     Checks for provider review and the order's own start_date.
+
+    ``system_robot`` is an optional pre-resolved robot for callers sweeping a
+    batch; see ``utils.get_order_processing_user``.
     """
     if utils.order_should_not_be_reviewed_by_provider(order):
         if order.start_date and order.start_date > timezone.now().date():
@@ -1382,7 +1634,9 @@ def continue_order_processing(order: models.Order):
             order.set_state_executing()
             order.save(update_fields=["state"])
             transaction.on_commit(
-                lambda: process_order_on_commit(order, order.created_by)
+                lambda: process_order_on_commit(
+                    order, utils.get_order_processing_user(order, system_robot)
+                )
             )
     else:
         order.state = models.OrderStates.PENDING_PROVIDER
@@ -3420,3 +3674,87 @@ def send_resource_limit_change_request_rejected_notification(request_uuid):
         context,
         [request.created_by.email],
     )
+
+
+def _get_resource_end_date_change_request_context(request):
+    resource_url = core_utils.format_homeport_link(
+        "resource-details/{resource_uuid}/?tab=end-date-change-requests",
+        resource_uuid=request.resource.uuid.hex,
+    )
+    return {
+        "resource_end_date_change_request": request,
+        "resource_url": resource_url,
+    }
+
+
+@shared_task(
+    name="waldur_mastermind.marketplace.send_resource_end_date_change_request_notification"
+)
+def send_resource_end_date_change_request_notification(request_uuid):
+    """Ask whoever may decide a resource end date change request to review it."""
+    try:
+        request = models.ResourceEndDateChangeRequest.objects.get(uuid=request_uuid)
+    except models.ResourceEndDateChangeRequest.DoesNotExist:
+        logger.warning(
+            "Resource end date change request %s not found, skipping notification",
+            request_uuid,
+        )
+        return
+
+    if request.state != ReviewStates.PENDING:
+        # Decided or withdrawn before the task ran: nothing left to review.
+        return
+
+    mails = utils.get_resource_end_date_approvers(request.resource)
+    if not mails:
+        logger.info(
+            "No approvers for resource %s, skipping resource end date change request notification",
+            request.resource.uuid,
+        )
+        return
+
+    core_utils.broadcast_mail(
+        "marketplace",
+        "notification_resource_end_date_change_request_created",
+        _get_resource_end_date_change_request_context(request),
+        mails,
+    )
+
+
+def _notify_resource_end_date_change_request_requester(request_uuid, event):
+    try:
+        request = models.ResourceEndDateChangeRequest.objects.get(uuid=request_uuid)
+    except models.ResourceEndDateChangeRequest.DoesNotExist:
+        logger.warning(
+            "Resource end date change request %s not found, skipping %s notification",
+            request_uuid,
+            event,
+        )
+        return
+
+    requester = request.created_by
+    if not requester or not requester.email or not requester.notifications_enabled:
+        return
+
+    core_utils.broadcast_mail(
+        "marketplace",
+        f"notification_resource_end_date_change_request_{event}",
+        _get_resource_end_date_change_request_context(request),
+        [requester.email],
+    )
+
+
+@shared_task(
+    name="waldur_mastermind.marketplace.send_resource_end_date_change_request_approved_notification"
+)
+def send_resource_end_date_change_request_approved_notification(request_uuid):
+    """Tell the requester their resource end date change request was approved."""
+    _notify_resource_end_date_change_request_requester(request_uuid, "approved")
+
+
+@shared_task(
+    name="waldur_mastermind.marketplace.send_resource_end_date_change_request_rejected_notification"
+)
+def send_resource_end_date_change_request_rejected_notification(request_uuid):
+    """Tell the requester their resource end date change request was rejected."""
+    _notify_resource_end_date_change_request_requester(request_uuid, "rejected")

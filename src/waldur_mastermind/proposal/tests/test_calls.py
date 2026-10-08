@@ -155,7 +155,6 @@ class CallGetTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_call_should_not_be_visible(self, user):
@@ -165,6 +164,15 @@ class CallGetTest(test.APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.json()), 0)
+
+    def test_call_is_visible_to_organization_owner(self):
+        # CUSTOMER.OWNER carries CALL.LIST, so the owner sees their organization's calls.
+        user = self.fixture.owner
+        self.client.force_authenticate(user)
+        url = factories.CallFactory.get_protected_list_url()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.json())
 
 
 @ddt
@@ -233,12 +241,16 @@ class CallUpdateTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_user_can_not_update_call(self, user):
         response = self.update_call(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_owner_sees_but_can_not_update_call(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.update_call("owner")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     @data(
         "reviewer_1",
@@ -467,12 +479,16 @@ class CallDeleteTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_user_can_not_delete_call(self, user):
         response = self.delete_call(user, self.draft_call)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_owner_sees_but_can_not_delete_call(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.delete_call("owner", self.draft_call)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertTrue(
             models.Call.objects.filter(uuid=self.draft_call.uuid.hex).exists()
         )
@@ -583,12 +599,16 @@ class CallActivateTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_user_can_not_activate_call(self, user):
         response = self.activate_call(user, self.draft_call)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
+
+    def test_owner_sees_but_can_not_activate_call(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.activate_call("owner", self.draft_call)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
         self.assertEqual(self.active_call.state, CallStates.ACTIVE)
 
     @data("REVIEWER", "PANEL_MEMBER")
@@ -626,12 +646,16 @@ class CallArchiveTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_user_can_not_archive_call(self, user):
         response = self.archive_call(user, self.draft_call)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
+
+    def test_owner_sees_but_can_not_archive_call(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.archive_call("owner", self.draft_call)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
         self.assertEqual(self.draft_call.state, CallStates.DRAFT)
 
     @data("REVIEWER", "PANEL_MEMBER")
@@ -692,10 +716,15 @@ class CallDuplicateTest(test.APITestCase):
         response = self.duplicate_call("call_manager", self.source, name="Copy of call")
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
 
-    @data("user", "owner", "customer_support")
+    @data("user", "customer_support")
     def test_user_can_not_duplicate_call(self, user):
         response = self.duplicate_call(user, self.source, name="Copy of call")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
+
+    def test_owner_sees_but_can_not_duplicate_call(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.duplicate_call("owner", self.source, name="Copy of call")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
 
     def test_duplicate_requires_name(self):
         response = self.duplicate_call("staff", self.source, name="")
@@ -769,7 +798,6 @@ class RequestedOfferingsGetTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_call_should_not_be_visible(self, user):
@@ -777,6 +805,13 @@ class RequestedOfferingsGetTest(test.APITestCase):
         self.client.force_authenticate(user)
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_call_is_visible_to_organization_owner(self):
+        # CUSTOMER.OWNER carries CALL.LIST, so the owner sees their organization's calls.
+        user = self.fixture.owner
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_state_filter_applied(self):
         factories.RequestedOfferingFactory(
@@ -899,12 +934,16 @@ class RequestedOfferingsCreateTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_user_can_not_add_offering_to_call(self, user):
         response = self.add_offering(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_owner_sees_but_can_not_add_offering_to_call(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.add_offering("owner")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_validate_attributes(self):
         user = self.fixture.staff
@@ -974,12 +1013,16 @@ class RequestedOfferingsUpdateTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_user_can_not_add_offering_to_call(self, user):
         response = self.update_requested_offering(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_owner_sees_but_can_not_add_offering_to_call(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.update_requested_offering("owner")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def update_requested_offering(self, user):
         user = getattr(self.fixture, user)
@@ -1012,12 +1055,16 @@ class RequestedOfferingsDeleteTest(test.APITestCase):
 
     @data(
         "user",
-        "owner",
         "customer_support",
     )
     def test_user_can_not_add_offering_to_call(self, user):
         response = self.delete_requested_offering(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_owner_sees_but_can_not_add_offering_to_call(self):
+        # The owner sees the call through CALL.LIST but holds no call write permission.
+        response = self.delete_requested_offering("owner")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_delete_requested_offering_with_connected_proposals(self):
         user = self.fixture.staff
@@ -1341,8 +1388,8 @@ class CallPanelChairTest(test.APITestCase):
         self.assertNotIn("panel_chair", response.data)
 
 
-class CallSupportTicketCallerTest(test.APITestCase):
-    """Configuring who a call's support tickets are raised on behalf of (#449)."""
+class CallOrderAuthorTest(test.APITestCase):
+    """Configuring whose name the orders a call places carry (#449)."""
 
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
@@ -1356,75 +1403,73 @@ class CallSupportTicketCallerTest(test.APITestCase):
         return response
 
     def eligible_user(self, **kwargs):
-        """Someone the call may name as its contact -- here, one of its own
-        managers. The choice is restricted to people already attached to the
-        call, so a bare UserFactory is not selectable."""
+        """Someone the call may name as the author of its orders -- here, one
+        of its own managers. The choice is restricted to people already
+        attached to the call, so a bare UserFactory is not selectable."""
         user = structure_factories.UserFactory(**kwargs)
         self.call.add_user(user, CallRole.MANAGER)
         return user
 
     def test_default_is_the_applicant(self):
         self.assertEqual(
-            self.call.support_ticket_caller,
-            proposal_enums.SupportTicketCallers.APPLICANT,
+            self.call.order_author,
+            proposal_enums.OrderAuthors.APPLICANT,
         )
 
     def test_a_role_can_be_chosen(self):
-        response = self.patch({"support_ticket_caller": "project_manager"})
+        response = self.patch({"order_author": "project_manager"})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertEqual(self.call.support_ticket_caller, "project_manager")
+        self.assertEqual(self.call.order_author, "project_manager")
 
     def test_specific_user_can_be_selected_before_the_contact_is_named(self):
         # The settings page edits one field per request, so the mode has to be
         # selectable on its own. Until the contact is named the resolver falls
         # back to the project's roles.
-        response = self.patch({"support_ticket_caller": "specific_user"})
+        response = self.patch({"order_author": "specific_user"})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertEqual(self.call.support_ticket_caller, "specific_user")
-        self.assertIsNone(self.call.support_ticket_caller_user)
+        self.assertEqual(self.call.order_author, "specific_user")
+        self.assertIsNone(self.call.order_author_user)
 
     def test_named_contact_must_be_reachable(self):
         unreachable = self.eligible_user(email="")
 
         response = self.patch(
             {
-                "support_ticket_caller": "specific_user",
-                "support_ticket_caller_user": unreachable.uuid.hex,
+                "order_author": "specific_user",
+                "order_author_user": unreachable.uuid.hex,
             }
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("support_ticket_caller_user", response.data)
+        self.assertIn("order_author_user", response.data)
 
     def test_named_contact_is_accepted(self):
         grants_office = self.eligible_user()
 
         response = self.patch(
             {
-                "support_ticket_caller": "specific_user",
-                "support_ticket_caller_user": grants_office.uuid.hex,
+                "order_author": "specific_user",
+                "order_author_user": grants_office.uuid.hex,
             }
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertEqual(self.call.support_ticket_caller_user, grants_office)
+        self.assertEqual(self.call.order_author_user, grants_office)
 
     def test_contact_can_be_set_on_a_call_already_using_specific_user(self):
         # The two halves are writable independently, so validation has to read
         # the stored choice when only the contact is sent.
         grants_office = self.eligible_user()
-        self.call.support_ticket_caller = (
-            proposal_enums.SupportTicketCallers.SPECIFIC_USER
-        )
-        self.call.support_ticket_caller_user = self.eligible_user()
+        self.call.order_author = proposal_enums.OrderAuthors.SPECIFIC_USER
+        self.call.order_author_user = self.eligible_user()
         self.call.save()
 
-        response = self.patch({"support_ticket_caller_user": grants_office.uuid.hex})
+        response = self.patch({"order_author_user": grants_office.uuid.hex})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertEqual(self.call.support_ticket_caller_user, grants_office)
+        self.assertEqual(self.call.order_author_user, grants_office)
 
     def test_contact_fields_are_null_not_absent_when_unset(self):
         # A dotted source over a nullable FK drops the key from the payload
@@ -1434,9 +1479,9 @@ class CallSupportTicketCallerTest(test.APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         for field in (
-            "support_ticket_caller_user",
-            "support_ticket_caller_user_uuid",
-            "support_ticket_caller_user_name",
+            "order_author_user",
+            "order_author_user_uuid",
+            "order_author_user_name",
         ):
             self.assertIn(field, response.data)
             self.assertIsNone(response.data[field])
@@ -1448,25 +1493,53 @@ class CallSupportTicketCallerTest(test.APITestCase):
 
         response = self.patch(
             {
-                "support_ticket_caller": "specific_user",
-                "support_ticket_caller_user": inactive.uuid.hex,
+                "order_author": "specific_user",
+                "order_author_user": inactive.uuid.hex,
             }
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("support_ticket_caller_user", response.data)
+        self.assertIn("order_author_user", response.data)
 
-    def test_the_contact_can_be_cleared(self):
-        self.call.support_ticket_caller = (
-            proposal_enums.SupportTicketCallers.SPECIFIC_USER
-        )
-        self.call.support_ticket_caller_user = self.eligible_user()
+    def test_switching_to_specific_user_rechecks_the_stored_contact(self):
+        # The panel edits one field per request, so the mode can be flipped
+        # long after the contact was named. If that contact has since lost its
+        # address -- an SSO sync clearing it, say -- the switch must not go
+        # through just because this payload does not mention them.
+        stale = self.eligible_user()
+        self.call.order_author_user = stale
         self.call.save()
+        stale.email = ""
+        stale.save(update_fields=["email"])
 
-        response = self.patch({"support_ticket_caller_user": None})
+        response = self.patch({"order_author": "specific_user"})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("order_author_user", response.data)
+
+    def test_an_unreachable_stored_contact_does_not_block_other_edits(self):
+        # The check is on the two fields, not on the call: everything else
+        # stays editable while that state is being sorted out.
+        stale = self.eligible_user()
+        self.call.order_author = proposal_enums.OrderAuthors.SPECIFIC_USER
+        self.call.order_author_user = stale
+        self.call.save()
+        stale.email = ""
+        stale.save(update_fields=["email"])
+
+        response = self.patch({"reviews_visible_to_submitters": True})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertIsNone(self.call.support_ticket_caller_user)
+
+    def test_the_contact_can_be_cleared(self):
+        self.call.order_author = proposal_enums.OrderAuthors.SPECIFIC_USER
+        self.call.order_author_user = self.eligible_user()
+        self.call.save()
+
+        response = self.patch({"order_author_user": None})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIsNone(self.call.order_author_user)
 
     def test_an_unrelated_user_cannot_be_named(self):
         # Whoever is named starts receiving the call's ticket mail and gets a
@@ -1476,14 +1549,14 @@ class CallSupportTicketCallerTest(test.APITestCase):
 
         response = self.patch(
             {
-                "support_ticket_caller": "specific_user",
-                "support_ticket_caller_user": stranger.uuid.hex,
+                "order_author": "specific_user",
+                "order_author_user": stranger.uuid.hex,
             }
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("support_ticket_caller_user", response.data)
-        self.assertIsNone(self.call.support_ticket_caller_user)
+        self.assertIn("order_author_user", response.data)
+        self.assertIsNone(self.call.order_author_user)
 
     def test_an_unrelated_user_is_refused_like_a_missing_one(self):
         # The same message either way: the field must not report whether a uuid
@@ -1491,14 +1564,14 @@ class CallSupportTicketCallerTest(test.APITestCase):
         stranger = structure_factories.UserFactory()
         missing = uuid.uuid4().hex
 
-        unrelated = self.patch({"support_ticket_caller_user": stranger.uuid.hex})
-        nonexistent = self.patch({"support_ticket_caller_user": missing})
+        unrelated = self.patch({"order_author_user": stranger.uuid.hex})
+        nonexistent = self.patch({"order_author_user": missing})
 
         self.assertEqual(unrelated.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(nonexistent.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(
-            str(unrelated.data["support_ticket_caller_user"][0]),
-            str(nonexistent.data["support_ticket_caller_user"][0]),
+            str(unrelated.data["order_author_user"][0]),
+            str(nonexistent.data["order_author_user"][0]),
         )
 
     def test_a_member_of_the_managing_organisation_can_be_named(self):
@@ -1509,10 +1582,10 @@ class CallSupportTicketCallerTest(test.APITestCase):
 
         response = self.patch(
             {
-                "support_ticket_caller": "specific_user",
-                "support_ticket_caller_user": grants_office.uuid.hex,
+                "order_author": "specific_user",
+                "order_author_user": grants_office.uuid.hex,
             }
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertEqual(self.call.support_ticket_caller_user, grants_office)
+        self.assertEqual(self.call.order_author_user, grants_office)

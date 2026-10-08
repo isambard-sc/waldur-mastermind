@@ -116,6 +116,88 @@ class AllowedDomainsTest(TestCase):
         )
 
 
+class MembersOutsideAllowedDomainsTest(TestCase):
+    """A member whose email falls outside allowed_domains must not break reads.
+
+    The openportal library validates member emails in exactly one place -- the
+    ``members`` attribute setter. ``from_json()`` and ``merge()`` both accept
+    them without complaint, so such members are stored perfectly legitimately:
+    a member added before the domain list was tightened, for instance.
+
+    Assigning them back therefore raised
+
+        OSError: Parse("Email '...' is not in the allowed domains
+                        for this project")
+
+    from a pure read path, which took down the whole remote-projects list
+    rather than one row.
+    """
+
+    def build(self, allowed_domains=None, last_sent=None, last_confirmed=None):
+        return models.RemoteProject(
+            destination=DESTINATION,
+            identifier="someproject.someportal",
+            allowed_domains=allowed_domains,
+            last_sent_details=last_sent,
+            last_confirmed_details=last_confirmed,
+        )
+
+    def test_a_member_outside_the_snapshot_domains_does_not_raise(self):
+        remote_project = self.build(
+            last_sent={"members": {"person@elsewhere.com": "user"}},
+            last_confirmed={"allowed_domains": ["*.ac.uk"]},
+        )
+
+        details = remote_project.award_details()
+
+        self.assertEqual(details.members, {"person@elsewhere.com": "user"})
+
+    def test_the_member_is_kept_rather_than_quietly_dropped(self):
+        """Read paths report what is stored; they do not edit the team."""
+        remote_project = self.build(
+            last_sent={
+                "members": {
+                    "inside@ok.ac.uk": "user",
+                    "outside@elsewhere.com": "admin",
+                }
+            },
+            last_confirmed={"allowed_domains": ["*.ac.uk"]},
+        )
+
+        self.assertEqual(
+            remote_project.award_details().members,
+            {"inside@ok.ac.uk": "user", "outside@elsewhere.com": "admin"},
+        )
+
+    def test_last_sent_membership_still_wins_over_last_confirmed(self):
+        """The authority rule the removed assignment existed to enforce."""
+        remote_project = self.build(
+            last_sent={"members": {"current@ok.ac.uk": "user"}},
+            last_confirmed={"members": {"stale@ok.ac.uk": "admin"}},
+        )
+
+        self.assertEqual(
+            remote_project.award_details().members, {"current@ok.ac.uk": "user"}
+        )
+
+    def test_no_sent_members_clears_a_confirmed_membership(self):
+        """last_confirmed must never supply members of its own."""
+        remote_project = self.build(
+            last_sent={"name": "an award"},
+            last_confirmed={"members": {"stale@ok.ac.uk": "admin"}},
+        )
+
+        self.assertIsNone(remote_project.award_details().members)
+
+    def test_an_empty_sent_membership_is_not_read_as_unset(self):
+        remote_project = self.build(
+            last_sent={"members": {}},
+            last_confirmed={"members": {"stale@ok.ac.uk": "admin"}},
+        )
+
+        self.assertEqual(remote_project.award_details().members, {})
+
+
 class UnsupportedCommandTest(TestCase):
     """
     Older remote portals reject commands they do not know about.  The fallback

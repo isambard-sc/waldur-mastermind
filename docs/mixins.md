@@ -100,6 +100,7 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`ResourceDetailsMixin`](#resourcedetailsmixin) | `waldur_mastermind.marketplace.models` | Mixin combining resource details with cost estimation |
 | [`SafeAttributesMixin`](#safeattributesmixin) | `waldur_mastermind.marketplace.models` | Mixin for safe attribute handling |
 | [`MemberSyncFieldsMixin`](#membersyncfieldsmixin) | `waldur_mastermind.marketplace.serializers` | Adds agent-reported sync fields to a UserRole-shaped serializer |
+| [`DerivedLimitsOrderMixin`](#derivedlimitsordermixin) | `waldur_mastermind.marketplace.tests.test_derived_limits` | No description available |
 | [`LimitActionPermissionMixin`](#limitactionpermissionmixin) | `waldur_mastermind.marketplace.tests.test_order_creation_permission` | No description available |
 | [`ConnectedOfferingDetailsMixin`](#connectedofferingdetailsmixin) | `waldur_mastermind.marketplace.views` | Mixin to provide offering details action for connected resources |
 | [`ConnectedResourceDetailsMixin`](#connectedresourcedetailsmixin) | `waldur_mastermind.marketplace.views` | Mixin to provide resource details action for connected resources |
@@ -112,10 +113,13 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`EstimatedCostPolicyMixin`](#estimatedcostpolicymixin) | `waldur_mastermind.policy.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`OfferingPolicySerializerMixin`](#offeringpolicyserializermixin) | `waldur_mastermind.policy.serializers` | This mixin provides several extensions to stock Serializer class:  1 |
 | [`CallNotArchivedCreateMixin`](#callnotarchivedcreatemixin) | `waldur_mastermind.proposal.serializers` | Provide the ``validate_call_not_archived`` hook used by ``ActionMethodMixin |
+| [`AssignmentBatchTestMixin`](#assignmentbatchtestmixin) | `waldur_mastermind.proposal.tests.test_assignment_batch_notifications` | No description available |
+| [`ManagerSetupMixin`](#managersetupmixin) | `waldur_mastermind.proposal.tests.test_pool_invitation_expiry` | No description available |
 | [`ProposalComplianceTestMixin`](#proposalcompliancetestmixin) | `waldur_mastermind.proposal.tests.test_proposal_compliance` | Common setup for proposal compliance tests |
 | [`InvitationAcceptanceMixin`](#invitationacceptancemixin) | `waldur_mastermind.proposal.views` | Mixin providing common logic for accepting/declining reviewer pool invitations |
 | [`BackendNameMixin`](#backendnamemixin) | `waldur_mastermind.support.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`FileMixin`](#filemixin) | `waldur_mastermind.support.models` | Mixin to provide file-related functionality and properties |
+| [`SettingsFileMixin`](#settingsfilemixin) | `waldur_mastermind.support.tests.test_constance_override` | No description available |
 | [`CheckExtensionMixin`](#checkextensionmixin) | `waldur_mastermind.support.views` | Raise exception if extension is disabled |
 | [`UsageMixin`](#usagemixin) | `waldur_openportal.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`ActionDetailsMixin`](#actiondetailsmixin) | `waldur_openstack.admin` | Encapsulate all admin options and functionality for a given model |
@@ -1407,6 +1411,12 @@ which is distinct from any real state.
 
 **Base classes:** `Serializer`
 
+### DerivedLimitsOrderMixin
+
+**Module:** `waldur_mastermind.marketplace.tests.test_derived_limits`
+
+**Description:** No description available.
+
 ### LimitActionPermissionMixin
 
 **Module:** `waldur_mastermind.marketplace.tests.test_order_creation_permission`
@@ -1616,6 +1626,18 @@ The hook is looked up by name on the serializer and called with the parent
 Call. It keeps archived calls read-only across their nested-create surface
 (offerings / resource templates / workflow steps).
 
+### AssignmentBatchTestMixin
+
+**Module:** `waldur_mastermind.proposal.tests.test_assignment_batch_notifications`
+
+**Description:** No description available.
+
+### ManagerSetupMixin
+
+**Module:** `waldur_mastermind.proposal.tests.test_pool_invitation_expiry`
+
+**Description:** No description available.
+
 ### ProposalComplianceTestMixin
 
 **Module:** `waldur_mastermind.proposal.tests.test_proposal_compliance`
@@ -1652,6 +1674,12 @@ Make subclasses preserve the alters_data attribute on overridden methods.
 **Description:**
 
 Mixin to provide file-related functionality and properties.
+
+### SettingsFileMixin
+
+**Module:** `waldur_mastermind.support.tests.test_constance_override`
+
+**Description:** No description available.
 
 ### CheckExtensionMixin
 

@@ -237,11 +237,31 @@ class RoundStatuses:
     VALUES = [val for (val, _) in CHOICES]
 
 
-class SupportTicketCallers:
-    """Who a call's support tickets are raised on behalf of.
+class EvaluationStart:
+    """When a submitted proposal's review workflow starts.
 
-    Allocation places orders as the system robot, which has no email address
-    and so cannot be the caller on a helpdesk ticket. One of these stands in.
+    ``on_submission`` starts the first enabled step as soon as the applicant
+    submits. ``at_cutoff`` holds every proposal in ``submitted`` until its
+    round's cut-off, then starts them together, so a panel evaluates the whole
+    batch of a cut-off at once and no check starts while the round is open.
+    """
+
+    ON_SUBMISSION = "on_submission"
+    AT_CUTOFF = "at_cutoff"
+
+    CHOICES = (
+        (ON_SUBMISSION, "On submission"),
+        (AT_CUTOFF, "At the round cut-off"),
+    )
+
+
+class OrderAuthors:
+    """Who the orders a call places when it grants resources are attributed to.
+
+    Allocation authorises the spend through the call review, not through the
+    person named here; this decides whose name the resulting order carries.
+    That is who the service desk talks to when the offering is fulfilled by
+    raising a helpdesk ticket, and who Waldur addresses its order mail to.
     """
 
     APPLICANT = "applicant"
@@ -714,6 +734,11 @@ class AssignmentBatchStatuses:
         (EXPIRED, "Invitation expired"),
         (CANCELLED, "Cancelled by manager"),
     )
+
+    # Batches the reviewer has actually received. A draft is still the call
+    # manager's work in progress and a cancelled batch was withdrawn, so
+    # neither is shown to the reviewer.
+    SENT_TO_REVIEWER = (SENT, RESPONDED, EXPIRED)
 
 
 class AssignmentItemStatuses:

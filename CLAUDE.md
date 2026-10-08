@@ -335,6 +335,7 @@ Detailed guides are in `docs/guides/`:
 - **Permissions**: `waldur-permissions.md` - Permission system details
 - **Media Access**: `media-access.md` - Who may download an uploaded file
 - **Production Data**: `production-data-sanitisation.md` - Turning a production dump into local test data
+- **Awards Site**: `awards-site-upgrade-plan.md` - Archiving the old proposals and upgrading the awards deployment
 - **Resource Projects**: `resource-projects.md` - ResourceProject model, offering roles, invitations, and RoleAvailability
 - **Build Commands**: `build-commands.md` - Test/lint/build commands
 - **OpenAPI Schema**: `openapi.md` - drf-spectacular customization patterns

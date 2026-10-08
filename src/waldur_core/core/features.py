@@ -4,9 +4,15 @@ from dataclasses import dataclass
 @dataclass
 class Feature:
     description: str
+    # Value used while no core.Feature row exists, i.e. until an admin or
+    # load_features sets the flag explicitly.
+    default: bool = False
 
 
 FEATURES = []
+
+# Dotted keys of the features whose default is on.
+FEATURE_DEFAULTS: dict[str, bool] = {}
 
 
 class FeatureSectionMetaclass(type):
@@ -23,6 +29,8 @@ class FeatureSectionMetaclass(type):
                     section["items"].append(
                         {"key": key, "description": feature.description}
                     )
+                    if feature.default:
+                        FEATURE_DEFAULTS[f"{section['key']}.{key}"] = True
         return type.__new__(self, name, bases, attrs)
 
 
@@ -155,7 +163,7 @@ class UserSection(FeatureSection):
     )
 
     show_openportal_identifier = Feature(
-        "Show the OpenPortal username on the user profile, and let a user choose it once if it has not been set."
+        "Identify users by their OpenPortal username: show it in place of the username in user lists, show it on the user profile, and let a user choose it once if it has not been set."
     )
 
     allow_user_creation = Feature(
@@ -380,7 +388,7 @@ class WaldurDeploymentSection(FeatureSection):
         key = "deployment"
         description = "Waldur deployment settings"
 
-    send_metrics = Feature("Send telemetry metrics.")
+    send_metrics = Feature("Send telemetry metrics.", default=True)
     enable_cookie_notice = Feature("Enable cookie notice in marketplace.")
     application_portal_only = Feature(
         "Configure Waldur to function as an application and awards portal only."
@@ -390,6 +398,16 @@ class WaldurDeploymentSection(FeatureSection):
     )
 
     enable_disclaimer_area = Feature("Enable disclaimer area below the footer.")
+
+
+class ProposalSection(FeatureSection):
+    class Meta:
+        key = "proposal"
+        description = "Proposals and calls"
+
+    auto_assign_award_id = Feature(
+        "Give each new proposal an award ID (for example 0261-4064-4676-1) as its slug, and carry it onto the project created when the proposal is accepted. Only takes effect together with application_portal_only, which stops the OpenPortal shortname from overwriting the project slug."
+    )
 
 
 class ResellerSection(FeatureSection):
@@ -402,3 +420,11 @@ class ResellerSection(FeatureSection):
         "Show affiliate program menus and pages. Backend enforcement is "
         "controlled separately by the AFFILIATES_ENABLED Constance setting."
     )
+
+
+def is_enabled(key: str) -> bool:
+    """Current value of a feature flag, falling back to its declared default."""
+    from waldur_core.core.models import Feature as FeatureModel
+
+    value = FeatureModel.objects.filter(key=key).values_list("value", flat=True).first()
+    return FEATURE_DEFAULTS.get(key, False) if value is None else value

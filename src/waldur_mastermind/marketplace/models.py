@@ -19,6 +19,7 @@ from django.db import models
 from django.db.models import Index, Q, Sum
 from django.db.models import signals as django_signals
 from django.db.models.constraints import UniqueConstraint
+from django.db.models.functions import Lower
 from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.text import slugify
@@ -60,6 +61,9 @@ from waldur_mastermind.marketplace.enums import (
     CourseAccountState,
     DiscountAggregations,
     ImpactLevel,
+    KpiAggregations,
+    KpiCadences,
+    KpiDirections,
     LimitPeriods,
     MaintenanceState,
     MaintenanceTimingBucket,
@@ -149,7 +153,9 @@ class ServiceProvider(
             "Account settings for this provider's offerings: account_scope, "
             "username_generation_policy, username_anonymized_prefix, "
             "homedir_prefix and login_shell. Each applies to every offering "
-            "that does not set the plugin option of the same name."
+            "that does not set the plugin option of the same name. "
+            "project_groups_enabled is the provider's own: it gives every "
+            "project using the provider's services one POSIX group."
         ),
     )
 
@@ -163,6 +169,11 @@ class ServiceProvider(
         return (self.account_options or {}).get(
             "account_scope"
         ) or AccountScopes.OFFERING
+
+    @property
+    def project_groups_enabled(self) -> bool:
+        """Whether the provider gets one POSIX group per project using it."""
+        return bool((self.account_options or {}).get("project_groups_enabled"))
 
     class Permissions:
         customer_path = "customer"
@@ -895,8 +906,11 @@ class Offering(
         ``select_related("customer__serviceprovider")`` and pay nothing here at
         all. Cached because resolve_account_setting consults it once per
         setting -- scope, username policy, homedir prefix, login shell -- which
-        was four identical queries for every offering.
+        was four identical queries for every offering. A project-scoped
+        private offering has no customer, and so no provider.
         """
+        if self.customer_id is None:
+            return None
         try:
             return self.customer.serviceprovider
         except ServiceProvider.DoesNotExist:
@@ -1259,6 +1273,12 @@ class UserAttributeConfigBase(TimeStampedModel, core_models.UuidMixin):
         for field in cls._meta.fields:
             if field.name.startswith(prefix):
                 yield field
+
+    @classmethod
+    def get_attribute_names(cls) -> list[str]:
+        """Return every attribute name (without expose_ prefix) this config governs."""
+        prefix = cls.EXPOSE_PREFIX
+        return [field.name[len(prefix) :] for field in cls._iter_expose_fields()]
 
     def get_exposed_fields(self) -> list[str]:
         """Return list of attribute names (without expose_ prefix) that are enabled."""
@@ -2938,6 +2958,25 @@ class Order(
     consumer_rejection_comment = models.TextField(blank=True, default="")
     provider_rejection_comment = models.TextField(blank=True, default="")
 
+    placed_automatically = models.BooleanField(
+        default=False,
+        editable=False,
+        help_text=(
+            "The order was placed by an automated flow on behalf of the "
+            "person in created_by, rather than by that person. Proposal "
+            "allocation sets this: the call review authorised the spend and "
+            "the accepting call manager is recorded as the consumer "
+            "reviewer, while created_by only names who the order is for. "
+            "The end-date and cost-policy termination sweeps set it too "
+            "when they name the person an allocated resource's creation "
+            "order was for, recording the system robot as the consumer "
+            "reviewer. Such an order is not announced as a new order, and is "
+            "carried "
+            "out with system authority, since the person named need hold no "
+            "role on the project."
+        ),
+    )
+
     auto_approved_by_rule = models.ForeignKey(
         "ProjectOrderAutoApproval",
         on_delete=models.SET_NULL,
@@ -3417,6 +3456,134 @@ class ComponentUsagePollRecord(models.Model):
         )
 
 
+class OfferingKpi(
+    core_models.UuidMixin,
+    BaseComponent,
+):
+    """A business KPI an offering reports for the projects consuming it.
+
+    Separate from OfferingComponent on purpose: a component is money-bearing
+    and feeds invoices, whereas a KPI must never reach billing.
+    """
+
+    class Meta:
+        unique_together = ("type", "offering")
+        ordering = ["name", "id"]
+
+    offering = models.ForeignKey(
+        on_delete=models.CASCADE, to=Offering, related_name="kpis"
+    )
+    aggregation = models.CharField(
+        max_length=10,
+        choices=KpiAggregations.CHOICES,
+        default=KpiAggregations.SUM,
+        help_text=_("How datapoints roll up into one project-level figure."),
+    )
+    direction = models.CharField(
+        max_length=10,
+        choices=KpiDirections.CHOICES,
+        default=KpiDirections.NEUTRAL,
+        help_text=_("Which way this KPI has to move to count as an improvement."),
+    )
+    target = models.DecimalField(
+        max_digits=20,
+        decimal_places=2,
+        blank=True,
+        null=True,
+        help_text=_("Optional value the project is aiming for."),
+    )
+    cadence = models.CharField(
+        max_length=10,
+        choices=KpiCadences.CHOICES,
+        default=KpiCadences.MONTHLY,
+        help_text=_("How often the service is expected to report this KPI."),
+    )
+    attribute = models.CharField(
+        max_length=50,
+        blank=True,
+        validators=[InternalNameValidator],
+        help_text=_(
+            "Datapoint attribute this KPI is broken down by, for example "
+            "course. Empty when the KPI has no breakdown."
+        ),
+    )
+
+    class Permissions:
+        customer_path = "offering__customer"
+
+    def __str__(self):
+        return f"{self.offering.name} / {self.type}"
+
+
+class ResourceKpiValue(
+    TimeStampedModel,
+    core_models.UuidMixin,
+    LoggableMixin,
+):
+    """One KPI datapoint reported by a service for one of its resources.
+
+    Values hang off the resource, so a project figure is the aggregate over
+    its resources. No billing_period: a KPI is never tied to an invoice.
+    """
+
+    resource = models.ForeignKey(
+        on_delete=models.CASCADE, to=Resource, related_name="kpi_values"
+    )
+    kpi = models.ForeignKey(
+        on_delete=models.CASCADE, to=OfferingKpi, related_name="values"
+    )
+    value = models.DecimalField(max_digits=20, decimal_places=2)
+    timestamp = models.DateTimeField(help_text=_("When the measurement was taken."))
+    attributes = models.JSONField(
+        blank=True,
+        default=dict,
+        help_text=_(
+            "OpenTelemetry-style attributes qualifying this datapoint, "
+            "for example the course or the support queue."
+        ),
+    )
+
+    class Permissions:
+        customer_path = ["resource__project__customer", "resource__offering__customer"]
+        project_path = "resource__project"
+
+    class Meta:
+        # "id" is the tiebreaker: timestamps tie by design when a service
+        # reports several attribute sets for the same moment, and an ordering
+        # that is not total lets paging repeat one row and skip another.
+        ordering = ["-timestamp", "id"]
+        constraints = [
+            UniqueConstraint(
+                fields=["resource", "kpi", "timestamp", "attributes"],
+                name="unique_resource_kpi_datapoint",
+            ),
+        ]
+        indexes = [
+            Index(fields=["resource", "kpi", "timestamp"]),
+        ]
+
+    def __str__(self):
+        return f"{self.resource.name} / {self.kpi.type}: {self.value}"
+
+    def clean(self):
+        super().clean()
+        # A KPI can only be reported against the offering that declares it;
+        # without this a service could write into another provider's KPI.
+        if not self.kpi_id or not self.resource_id:
+            return
+        if self.kpi.offering_id != self.resource.offering_id:
+            raise ValidationError(
+                _("KPI %(kpi)s is not declared by the resource's offering.")
+                % {"kpi": self.kpi.type}
+            )
+
+    def save(self, *args, **kwargs):
+        # Django does not run clean() on save and DRF does not call it either,
+        # so the cross-offering guard above would never fire without this.
+        self.clean()
+        return super().save(*args, **kwargs)
+
+
 class ComponentUserUsage(
     TimeStampedModel,
     core_models.DescribableMixin,
@@ -3596,6 +3763,16 @@ class BaseAccount(
         abstract = True
         ordering = ["username", "id"]
 
+    # The comment explains a pending state; it no longer applies once the account is OK.
+    SERVICE_PROVIDER_COMMENT_FIELDS = (
+        "service_provider_comment",
+        "service_provider_comment_url",
+    )
+
+    def _clear_service_provider_comment(self):
+        self.service_provider_comment = ""
+        self.service_provider_comment_url = ""
+
     @transition(
         field=state,
         source=[
@@ -3622,7 +3799,7 @@ class BaseAccount(
         target=OfferingUserStates.OK,
     )
     def set_ok(self):
-        pass
+        self._clear_service_provider_comment()
 
     @transition(
         field=state,
@@ -3663,10 +3840,7 @@ class BaseAccount(
         target=OfferingUserStates.OK,
     )
     def set_validation_complete(self):
-        self.service_provider_comment = ""  # Clear comment when validation is complete
-        self.service_provider_comment_url = (
-            ""  # Clear comment URL when validation is complete
-        )
+        self._clear_service_provider_comment()
 
     @transition(
         field=state,
@@ -3718,7 +3892,7 @@ class BaseAccount(
         record must be able to come back from DELETED rather than asking for a
         brand-new account under a new name.
         """
-        pass
+        self._clear_service_provider_comment()
 
     @transition(
         field=state,
@@ -3765,6 +3939,25 @@ class BaseAccount(
             and (self.tracker.has_changed("username") or not self.pk)
         ):
             self.set_ok()
+            if kwargs.get("update_fields") is not None:
+                kwargs["update_fields"] = {*kwargs["update_fields"], "state"}
+        # Moving to OK clears the comment in memory; persist that even when
+        # the caller only listed "state".
+        update_fields = kwargs.get("update_fields")
+        if (
+            update_fields is not None
+            and "state" in update_fields
+            and self.state == OfferingUserStates.OK
+            and self.tracker.has_changed("state")
+        ):
+            kwargs["update_fields"] = {
+                *update_fields,
+                *(
+                    field
+                    for field in self.SERVICE_PROVIDER_COMMENT_FIELDS
+                    if self.tracker.has_changed(field)
+                ),
+            }
         super().save(*args, **kwargs)
 
     def get_log_fields(self):
@@ -4087,6 +4280,13 @@ class PosixIdPool(
     min_gid = models.BigIntegerField(null=True, blank=True)
     max_gid = models.BigIntegerField(null=True, blank=True)
     next_gid = models.BigIntegerField(null=True, blank=True)
+    # Optional range reserved for provider project groups, so their GIDs do not
+    # mix with users' primary GIDs. Values are still GIDs: they are recorded in
+    # PosixIdentity.gid and must not overlap any GID range of the provider.
+    # Without it, project groups draw from the GID range.
+    min_group_gid = models.BigIntegerField(null=True, blank=True)
+    max_group_gid = models.BigIntegerField(null=True, blank=True)
+    next_group_gid = models.BigIntegerField(null=True, blank=True)
 
     class Meta:
         verbose_name = _("POSIX ID pool")
@@ -4122,6 +4322,21 @@ class PosixIdPool(
                     )
                 ),
             ),
+            models.CheckConstraint(
+                name="marketplace_posixidpool_group_gid_all_or_nothing",
+                condition=(
+                    Q(
+                        min_group_gid__isnull=True,
+                        max_group_gid__isnull=True,
+                        next_group_gid__isnull=True,
+                    )
+                    | Q(
+                        min_group_gid__isnull=False,
+                        max_group_gid__isnull=False,
+                        next_group_gid__isnull=False,
+                    )
+                ),
+            ),
             # At least one namespace must be managed.
             models.CheckConstraint(
                 name="marketplace_posixidpool_at_least_one_namespace",
@@ -4145,6 +4360,14 @@ class PosixIdPool(
                 & Q(next_gid__gte=models.F("min_gid"))
                 & Q(next_gid__lte=models.F("max_gid") + 1),
             ),
+            models.CheckConstraint(
+                name="marketplace_posixidpool_group_gid_bounds",
+                condition=Q(min_group_gid__gte=1000)
+                & Q(min_group_gid__lte=models.F("max_group_gid"))
+                & Q(max_group_gid__lte=2**32 - 2)
+                & Q(next_group_gid__gte=models.F("min_group_gid"))
+                & Q(next_group_gid__lte=models.F("max_group_gid") + 1),
+            ),
         ]
 
     def __str__(self):
@@ -4154,6 +4377,8 @@ class PosixIdPool(
             parts.append(f"uid {self.min_uid}-{self.max_uid}")
         if self.min_gid is not None:
             parts.append(f"gid {self.min_gid}-{self.max_gid}")
+        if self.min_group_gid is not None:
+            parts.append(f"group gid {self.min_group_gid}-{self.max_group_gid}")
         return f"POSIX ID pool ({', '.join(parts)}) for {scope}"
 
     @classmethod
@@ -4161,7 +4386,7 @@ class PosixIdPool(
         return "marketplace-posix-id-pool"
 
     def manages(self, namespace: str) -> bool:
-        """Whether this pool allocates the given namespace ('uid' or 'gid')."""
+        """Whether this pool has the given range ('uid', 'gid' or 'group_gid')."""
         return getattr(self, f"min_{namespace}") is not None
 
     @property
@@ -4316,6 +4541,67 @@ class PosixIdentity(
     @classmethod
     def get_url_name(cls):
         return "marketplace-posix-identity"
+
+
+class ServiceProviderProjectGroup(
+    core_models.UuidMixin,
+    TimeStampedModel,
+):
+    """
+    One POSIX group per project that uses a service provider's services.
+
+    The provider-level counterpart of :class:`OfferingUserGroup`, as
+    :class:`ServiceProviderAccount` is of :class:`OfferingUser`: a project with
+    resources on several offerings of the provider still gets one group and one
+    GID, which is what a shared directory needs.
+
+    ``name`` is fixed at creation (derived from the project slug by default),
+    so a later slug change does not rename a group that the directory and file
+    ownership depend on. ``gid`` is a projection of the group's
+    :class:`PosixIdentity` in the provider's pool, ``None`` while no pool can
+    supply one. A group whose project no longer has resources at the provider
+    is kept, and so is its GID: files may still carry it. Even a hard-deleted
+    project leaves its group behind, with ``project`` cleared.
+    """
+
+    NAME_PATTERN = r"[a-z_][a-z0-9_-]{0,31}"
+    NAME_MAX_LENGTH = 32
+
+    service_provider = models.ForeignKey(
+        ServiceProvider, on_delete=models.CASCADE, related_name="project_groups"
+    )
+    project = models.ForeignKey(
+        structure_models.Project,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="provider_project_groups",
+    )
+    name = models.CharField(max_length=NAME_MAX_LENGTH)
+    gid = models.BigIntegerField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = _("Service provider project group")
+        ordering = ["name", "id"]
+        unique_together = ("service_provider", "project")
+        constraints = [
+            # One name per directory; LDAP compares names case-insensitively.
+            UniqueConstraint(
+                "service_provider",
+                Lower("name"),
+                name="marketplace_spprojectgroup_unique_name",
+            ),
+        ]
+
+    class Permissions:
+        customer_path = "service_provider__customer"
+
+    @classmethod
+    def get_url_name(cls):
+        return "marketplace-service-provider-project-group"
+
+    def __str__(self):
+        return f"{self.service_provider}: {self.name} ({self.gid})"
 
 
 class CategoryHelpArticle(models.Model):
@@ -4657,6 +4943,15 @@ class SoftwareCatalog(core_models.UuidMixin, TimeStampedModel):
 
     def __str__(self):
         return f"{self.name} {self.version} ({self.get_catalog_type_display()})"
+
+    @property
+    def supports_cpu_target_restrictions(self) -> bool:
+        """Whether an offering link may restrict this catalog by CPU target.
+
+        Binary runtimes (EESSI) publish CPU builds. Source catalogs such as
+        Spack store other target types and do not use these restrictions.
+        """
+        return self.catalog_type == "binary_runtime"
 
 
 class SoftwarePackage(core_models.UuidMixin, TimeStampedModel):
@@ -6008,7 +6303,14 @@ class CourseAccount(
 
     @transition(
         field=state,
-        source=[CourseAccountState.OK, CourseAccountState.ERRED],
+        # PENDING is included because closing goes through it too: the
+        # destroy action and the project pre_delete handler both move the
+        # account to PENDING before the close task actually runs.
+        source=[
+            CourseAccountState.OK,
+            CourseAccountState.ERRED,
+            CourseAccountState.PENDING,
+        ],
         target=CourseAccountState.CLOSED,
     )
     def set_state_closed(self):
@@ -6134,3 +6436,178 @@ class ResourceEndDateChangeRequest(
         return (
             f"End date change request for {self.resource} ({self.get_state_display()})"
         )
+
+
+class OfferingMerge(core_models.UuidMixin, TimeStampedModel):
+    """A staff request to move everything that belongs to ``sources`` onto ``target``.
+
+    The merge engine in ``offering_merge.py`` drives it through its lifecycle:
+    a preview is computed and stored, the executor re-computes it under lock and
+    refuses if anything changed, then repoints every row the coverage registry
+    lists and archives the sources. Each write is journalled as an
+    :class:`OfferingMergeChange`, which is what undo replays.
+
+    Offerings are never deleted by a merge: ``Resource.offering`` cascades.
+    """
+
+    class States:
+        DRAFT = "draft"
+        PREVIEWED = "previewed"
+        QUEUED = "queued"
+        RUNNING = "running"
+        DONE = "done"
+        FAILED = "failed"
+        UNDOING = "undoing"
+        UNDONE = "undone"
+
+        CHOICES = (
+            (DRAFT, "Draft"),
+            (PREVIEWED, "Previewed"),
+            (QUEUED, "Queued"),
+            (RUNNING, "Running"),
+            (DONE, "Done"),
+            (FAILED, "Failed"),
+            (UNDOING, "Undoing"),
+            (UNDONE, "Undone"),
+        )
+
+        # The record, and its mappings, may still be edited or deleted.
+        EDITABLE = (DRAFT, PREVIEWED)
+        # A preview may be computed and stored.
+        PREVIEWABLE = (DRAFT, PREVIEWED, FAILED)
+
+    class InvoicePolicies:
+        OPEN_MONTH = "open_month"
+        ALL_MONTHS = "all_months"
+
+        CHOICES = (
+            (OPEN_MONTH, "Current open month only"),
+            (ALL_MONTHS, "All months"),
+        )
+
+    sources = models.ManyToManyField(Offering, related_name="+")
+    target = models.ForeignKey(Offering, on_delete=models.PROTECT, related_name="+")
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    plan_mapping = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_("Source plan UUID (hex) to target plan UUID (hex)."),
+    )
+    component_mapping = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Per source offering UUID (hex): source component type to target "
+            "component type."
+        ),
+    )
+    attribute_key_mapping = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_("Order and resource answer key renames: old key to new key."),
+    )
+    invoice_policy = models.CharField(
+        max_length=20,
+        choices=InvoicePolicies.CHOICES,
+        default=InvoicePolicies.OPEN_MONTH,
+    )
+    state = FSMField(max_length=20, default=States.DRAFT, choices=States.CHOICES)
+    preview = models.JSONField(default=dict, blank=True)
+    verification = models.JSONField(default=dict, blank=True)
+    progress = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Execution progress: the current step, steps and rows done and in "
+            "total. Committed outside the merge's transaction while it runs."
+        ),
+    )
+    error_message = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-created", "id"]
+
+    def __str__(self):
+        return f"Offering merge {self.uuid.hex} into {self.target} ({self.state})"
+
+    @classmethod
+    def get_url_name(cls):
+        return "marketplace-offering-merge"
+
+    @transition(
+        field=state,
+        source=[States.DRAFT, States.PREVIEWED, States.FAILED],
+        target=States.PREVIEWED,
+    )
+    def set_previewed(self):
+        pass
+
+    @transition(field=state, source=States.PREVIEWED, target=States.DRAFT)
+    def set_draft(self):
+        """An edit invalidates the stored preview."""
+
+    @transition(field=state, source=States.PREVIEWED, target=States.QUEUED)
+    def set_queued(self):
+        """Execution was requested; a second request is refused from here on."""
+
+    @transition(
+        field=state, source=[States.PREVIEWED, States.QUEUED], target=States.RUNNING
+    )
+    def set_running(self):
+        pass
+
+    @transition(field=state, source=States.RUNNING, target=States.DONE)
+    def set_done(self):
+        pass
+
+    @transition(
+        field=state,
+        source=[States.PREVIEWED, States.QUEUED, States.RUNNING],
+        target=States.FAILED,
+    )
+    def set_failed(self):
+        pass
+
+    @transition(field=state, source=States.DONE, target=States.UNDOING)
+    def set_undoing(self):
+        """Undo was requested; a second request is refused from here on."""
+
+    @transition(field=state, source=States.UNDOING, target=States.DONE)
+    def set_undo_refused(self):
+        """Undo was refused or failed; the merge is still in effect."""
+
+    @transition(field=state, source=[States.DONE, States.UNDOING], target=States.UNDONE)
+    def set_undone(self):
+        pass
+
+
+class OfferingMergeChange(models.Model):
+    """One journalled write of an offering merge: which row, which field, before and after.
+
+    ``field`` is the column's attname (``offering_id``, ``limits``, ``state``);
+    values are JSON — ids for foreign keys, whole documents for JSON fields.
+    Undo replays these in reverse order.
+    """
+
+    merge = models.ForeignKey(
+        OfferingMerge, on_delete=models.CASCADE, related_name="changes"
+    )
+    model = models.CharField(
+        max_length=150, help_text=_("Model label, e.g. marketplace.Resource.")
+    )
+    object_id = models.BigIntegerField()
+    field = models.CharField(max_length=150)
+    old_value = models.JSONField(null=True, blank=True)
+    new_value = models.JSONField(null=True, blank=True)
+    created = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["id"]
+        indexes = [
+            models.Index(fields=["merge", "model", "field"]),
+        ]
+
+    def __str__(self):
+        return f"{self.model}#{self.object_id}.{self.field}"

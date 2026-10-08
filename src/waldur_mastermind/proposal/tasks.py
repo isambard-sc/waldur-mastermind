@@ -21,6 +21,7 @@ from waldur_mastermind.proposal.enums import (
     CallStates,
     NotificationRuleTriggers,
     ProposalStates,
+    ReviewerPoolInvitationStatuses,
     WorkflowStepInstanceStatuses,
 )
 
@@ -31,16 +32,17 @@ logger = logging.getLogger(__name__)
     name="waldur_mastermind.proposal.proposals_for_ended_rounds_should_be_cancelled"
 )
 def proposals_for_ended_rounds_should_be_cancelled():
-    """Cancel proposals for rounds that have ended."""
+    """Cancel draft proposals for rounds that have ended."""
+    # Only drafts: a proposal submitted before the cutoff is reviewed after it,
+    # so submitted and in-review proposals are left to the review workflow.
     date = timezone.now()
     cancellation_date = date.strftime("%Y-%m-%d %H:%M:%S")
-    for proposal in proposal_models.Proposal.objects.exclude(
-        state__in=(
-            ProposalStates.ACCEPTED,
-            ProposalStates.REJECTED,
-            ProposalStates.CANCELED,
-        )
-    ).filter(round__cutoff_time__lt=date):
+    for proposal in proposal_models.Proposal.objects.filter(
+        state=ProposalStates.DRAFT, round__cutoff_time__lt=date
+    ).select_related(
+        # Each save publishes a proposal event whose scope chain walks these.
+        "round__call__manager__customer"
+    ):
         proposal.state = ProposalStates.CANCELED
         proposal.save(update_fields=["state"])
 
@@ -64,8 +66,9 @@ def expired_reviews_should_be_cancelled():
     """Cancel reviews that have expired."""
     for review in proposal_models.Review.objects.filter(
         state=proposal_models.Review.States.IN_REVIEW
-    ):
-        if review.review_end_date <= timezone.now():
+    ).select_related("proposal__round", "assignment_item__batch"):
+        review_end_date = review.review_end_date
+        if review_end_date and review_end_date <= timezone.now():
             review.state = proposal_models.Review.States.REJECTED
             review.save(update_fields=["state"])
 
@@ -779,6 +782,63 @@ def notify_manager_when_reviews_are_completed(proposal_uuid):
     )
 
 
+@shared_task(name="waldur_mastermind.proposal.start_evaluation_for_closed_rounds")
+def start_evaluation_for_closed_rounds():
+    """Start the evaluation of proposals held for their round's cut-off.
+
+    A call that evaluates at the cut-off leaves each proposal ``submitted``
+    with its steps pending. Once the round's cut-off has passed, this activates
+    the first pending step of every such proposal, one transaction per
+    proposal so a single failure does not hold back the rest of the batch.
+
+    The candidates are not filtered on the call's current setting: only a
+    held submission leaves a proposal ``submitted`` with a pending step, so a
+    proposal held just before a manager switched the call back is still
+    started rather than stranded. Idempotent: a started proposal is
+    ``in_review`` and is not picked up again.
+    """
+    now = timezone.now()
+    held_ids = list(
+        proposal_models.Proposal.objects.filter(
+            state=ProposalStates.SUBMITTED,
+            round__cutoff_time__lte=now,
+            workflow_step_instances__status=WorkflowStepInstanceStatuses.PENDING,
+        )
+        .exclude(workflow_step_instances__status=WorkflowStepInstanceStatuses.ACTIVE)
+        .distinct()
+        .values_list("id", flat=True)
+    )
+
+    started = []
+    for proposal_id in held_ids:
+        try:
+            with transaction.atomic():
+                proposal = (
+                    proposal_models.Proposal.objects.select_for_update()
+                    .filter(id=proposal_id, state=ProposalStates.SUBMITTED)
+                    .first()
+                )
+                if proposal is None:
+                    continue
+                if workflow_service.activate_first_step(proposal) is None:
+                    continue
+        except Exception:
+            logger.exception(
+                "Failed to start the evaluation of proposal id=%s", proposal_id
+            )
+            continue
+        started.append(proposal.uuid)
+
+    for proposal_uuid in started:
+        notify_user_about_proposal_state_update.delay(
+            proposal_uuid, ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW
+        )
+
+    if started:
+        logger.info("Started the evaluation of %d proposal(s)", len(started))
+    return len(started)
+
+
 @shared_task(name="waldur_mastermind.proposal.mark_expired_workflow_steps")
 def mark_expired_workflow_steps():
     """Expire ACTIVE workflow step instances past their deadline and advance the workflow.
@@ -857,6 +917,71 @@ def mark_expired_assignment_batches():
     logger.info(f"Marked {count} assignment batches as expired: {batch_uuids}")
 
 
+# Homeport's "My assignments" tab, where a reviewer answers assignment batches.
+MY_ASSIGNMENTS_PATH = "reviews/assignments/"
+
+
+def _get_batch_reviewer_contact(batch):
+    """Email address and display name of the reviewer an assignment batch is for."""
+    pool_entry = batch.reviewer_pool_entry
+    if pool_entry.reviewer:
+        user = pool_entry.reviewer.user
+        return user.email, user.full_name
+    if pool_entry.invited_user:
+        user = pool_entry.invited_user
+        return user.email, user.full_name
+    return pool_entry.invited_email, pool_entry.invited_email
+
+
+@shared_task(name="waldur_mastermind.proposal.send_assignment_batch_invitation")
+def send_assignment_batch_invitation(batch_uuid):
+    """Email a reviewer the proposals of an assignment batch that was just sent.
+
+    Proposal details are disclosed exactly as the reviewer's assignment API
+    discloses them (``utils.disclosed_proposal_fields``).
+    """
+    batch = proposal_models.AssignmentBatch.objects.select_related(
+        "call",
+        "reviewer_pool_entry__reviewer__user",
+        "reviewer_pool_entry__invited_user",
+    ).get(uuid=batch_uuid)
+
+    reviewer_email, reviewer_name = _get_batch_reviewer_contact(batch)
+    if not reviewer_email:
+        logger.warning(
+            f"Cannot send assignment invitation for batch {batch.uuid}: no reviewer email"
+        )
+        return
+
+    # Same disclosure as the reviewer's assignment API, so the two cannot
+    # drift: a COI-blocked proposal is listed by title only.
+    disclosure = utils.proposal_disclosure_for_reviewer(batch.call)
+    proposals = []
+    for item in batch.items.select_related("proposal").order_by("proposal__name"):
+        fields = utils.disclosed_proposal_fields(item, disclosure)
+        proposals.append(
+            {"name": fields["proposal_name"], "summary": fields["proposal_summary"]}
+        )
+
+    context = {
+        "site_name": config.SITE_NAME,
+        "reviewer_name": reviewer_name,
+        "call_name": batch.call.name,
+        "proposals": proposals,
+        "items_count": len(proposals),
+        "expires_at": batch.expires_at,
+        "manager_notes": batch.manager_notes,
+        "link": core_utils.format_homeport_link(MY_ASSIGNMENTS_PATH),
+    }
+
+    core_utils.broadcast_mail(
+        "proposal",
+        "reviewer_assignment_invitation",
+        context,
+        [reviewer_email],
+    )
+
+
 @shared_task(
     name="waldur_mastermind.proposal.send_assignment_expiry_reminders",
     autoretry_for=(Exception,),
@@ -875,7 +1000,8 @@ def send_assignment_expiry_reminders():
         proposal_models.AssignmentBatch.objects.filter(
             status=AssignmentBatchStatuses.SENT,
             reminder_sent=False,
-            expires_at__isnull=False,
+            # A batch past its deadline is for the expiry task, not a reminder.
+            expires_at__gt=timezone.now(),
         )
         .select_related(
             "call",
@@ -905,19 +1031,7 @@ def send_assignment_expiry_reminders():
         # Check if we're within the reminder window
         reminder_threshold = batch.expires_at - timedelta(days=reminder_days)
         if timezone.now() >= reminder_threshold:
-            # Get reviewer email
-            reviewer_email = None
-            reviewer_name = None
-
-            if batch.reviewer_pool_entry.reviewer:
-                reviewer_email = batch.reviewer_pool_entry.reviewer.user.email
-                reviewer_name = batch.reviewer_pool_entry.reviewer.user.full_name
-            elif batch.reviewer_pool_entry.invited_user:
-                reviewer_email = batch.reviewer_pool_entry.invited_user.email
-                reviewer_name = batch.reviewer_pool_entry.invited_user.full_name
-            else:
-                reviewer_email = batch.reviewer_pool_entry.invited_email
-                reviewer_name = reviewer_email
+            reviewer_email, reviewer_name = _get_batch_reviewer_contact(batch)
 
             if reviewer_email:
                 # Mark reminder_sent BEFORE sending to prevent duplicate emails
@@ -931,8 +1045,8 @@ def send_assignment_expiry_reminders():
                     "reviewer_name": reviewer_name,
                     "call_name": batch.call.name,
                     "expires_at": batch.expires_at,
-                    "items_count": batch.assignment_items.count(),  # type: ignore[attr-defined]
-                    "link": core_utils.format_homeport_link("my-assignments/"),
+                    "items_count": batch.items.count(),
+                    "link": core_utils.format_homeport_link(MY_ASSIGNMENTS_PATH),
                 }
 
                 core_utils.broadcast_mail(
@@ -990,24 +1104,17 @@ def notify_managers_of_expired_batches():
             batch.save(update_fields=["manager_notified"])
             continue
 
-        # Get reviewer name
-        reviewer_name = None
-        if batch.reviewer_pool_entry.reviewer:
-            reviewer_name = batch.reviewer_pool_entry.reviewer.user.full_name
-        elif batch.reviewer_pool_entry.invited_user:
-            reviewer_name = batch.reviewer_pool_entry.invited_user.full_name
-        else:
-            reviewer_name = batch.reviewer_pool_entry.invited_email
+        _, reviewer_name = _get_batch_reviewer_contact(batch)
 
         context = {
             "site_name": config.SITE_NAME,
             "call_name": batch.call.name,
             "reviewer_name": reviewer_name,
-            "items_count": batch.assignment_items.count(),  # type: ignore[attr-defined]
+            "items_count": batch.items.count(),
             "sent_at": batch.sent_at,
             "expired_at": batch.expires_at,
             "assignments_url": core_utils.format_homeport_link(
-                f"call/{batch.call.uuid}/manage/?tab=reviewer-pool&pool_tab=assignments"
+                f"call/{batch.call.uuid}/manage/?tab=reviewer-pool&pool_tab=assignment_batches"
             ),
         }
 
@@ -1026,15 +1133,89 @@ def notify_managers_of_expired_batches():
         logger.info(f"Notified managers about {count} expired assignment batches")
 
 
+@shared_task(name="waldur_mastermind.proposal.mark_expired_reviewer_pool_invitations")
+def mark_expired_reviewer_pool_invitations():
+    """Expire pending pool invitations past their date and tell who sent them."""
+    candidates = proposal_models.CallReviewerPool.objects.filter(
+        invitation_status=ReviewerPoolInvitationStatuses.PENDING,
+        invitation_expires_at__lt=timezone.now(),
+    ).select_related("call", "invited_by", "reviewer__user", "invited_user")
+
+    count = 0
+    for invitation in candidates:
+        # The conditional update is the once-only guard: an invitation that was
+        # answered, re-sent or expired by a concurrent run in the meantime is
+        # left alone and its inviter is not notified again.
+        updated = proposal_models.CallReviewerPool.objects.filter(
+            pk=invitation.pk,
+            invitation_status=ReviewerPoolInvitationStatuses.PENDING,
+            invitation_expires_at__lt=timezone.now(),
+        ).update(
+            invitation_status=ReviewerPoolInvitationStatuses.EXPIRED,
+            modified=timezone.now(),
+        )
+        if not updated:
+            continue
+        count += 1
+        _notify_reviewer_pool_invitation_expired(invitation)
+
+    if count:
+        logger.info("Expired %d reviewer pool invitation(s)", count)
+    return count
+
+
+def _notify_reviewer_pool_invitation_expired(invitation):
+    call = invitation.call
+    if invitation.invited_by and invitation.invited_by.email:
+        recipients = [invitation.invited_by.email]
+    else:
+        recipients = sorted(
+            {email for email in call.call_managers.values_list("email", flat=True)}
+            - {""}
+        )
+    if not recipients:
+        logger.warning(
+            "Cannot notify about expired reviewer pool invitation %s: "
+            "nobody to notify for call %s",
+            invitation.uuid,
+            call.uuid,
+        )
+        return
+
+    context = {
+        "site_name": config.SITE_NAME,
+        "call_name": call.name,
+        "invitee_name": invitation.invitee_name,
+        "invited_at": invitation.invited_at,
+        "expired_at": invitation.invitation_expires_at,
+        "reviewer_pool_url": core_utils.format_homeport_link(
+            f"call/{call.uuid}/manage/?tab=reviewer-pool"
+        ),
+    }
+    core_utils.broadcast_mail(
+        "proposal",
+        "reviewer_pool_invitation_expired",
+        context,
+        recipients,
+    )
+
+
 @shared_task(name="waldur_mastermind.proposal.send_reviewer_invitation_email")
 def send_reviewer_invitation_email(pool_member_uuid):
     pool_member = proposal_models.CallReviewerPool.objects.select_related(
-        "call", "invited_by"
+        "call", "invited_by", "reviewer__user", "invited_user"
     ).get(uuid=pool_member_uuid)
 
-    if not pool_member.invited_email:
+    if pool_member.reviewer:
+        recipient = pool_member.reviewer.user.email
+    elif pool_member.invited_user:
+        recipient = pool_member.invited_user.email
+    else:
+        recipient = pool_member.invited_email
+
+    if not recipient:
         logger.warning(
-            f"Cannot send reviewer invitation email. Pool member {pool_member_uuid} has no invited_email."
+            f"Cannot send reviewer invitation email. Pool member {pool_member_uuid} has no email address."
         )
         return
 
@@ -1056,7 +1237,7 @@ def send_reviewer_invitation_email(pool_member_uuid):
         "proposal",
         "reviewer_invitation",
         context,
-        [pool_member.invited_email],
+        [recipient],
     )
 
 
@@ -1130,8 +1311,9 @@ def notify_workflow_step_event(instance_uuid, trigger):
 def send_workflow_step_deadline_reminders():
     """Fire ``deadline_approaching`` rules for active steps whose lead time is today.
 
-    A reminder is sent when ``(deadline - now).days == days_before`` and is
-    recorded in the instance ledger so the daily beat cannot repeat it. Steps
+    A reminder is sent when the deadline falls ``days_before`` calendar days
+    after today (``deadline.date() - now.date()``) and is recorded in the
+    instance ledger so the daily beat cannot repeat it. Steps
     already past their deadline are left to ``mark_expired_workflow_steps``.
     """
     now = timezone.now()

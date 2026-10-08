@@ -169,6 +169,21 @@ class ListOfferingUsersTest(test.APITestCase):
         self.assertEqual(1, len(response.data))
         self.assertEqual(offering_user.user.get_username(), user.username)
 
+    def test_user_can_filter_by_username(self):
+        self.client.force_login(self.fixture.staff)
+
+        def usernames(value):
+            response = self.client.get(
+                OfferingUserFactory.get_list_url(), {"username": value}
+            )
+            self.assertEqual(200, response.status_code)
+            return [row["username"] for row in response.data]
+
+        self.assertEqual(usernames("user"), ["user"])  # not "user2" too
+        self.assertEqual(usernames("user2"), ["user2"])
+        self.assertEqual(usernames("USER"), [])  # POSIX names are case-sensitive
+        self.assertEqual(usernames("nobody"), [])
+
 
 @ddt
 class CreateOfferingUsersTest(test.APITestCase):
@@ -248,6 +263,12 @@ class CreateOfferingUsersTest(test.APITestCase):
 @ddt
 class ListUsersTest(test.APITestCase):
     def setUp(self):
+        # Consumer users are shown to a provider by SERVICE_PROVIDER.LIST_USERS,
+        # which permissions.yaml grants both roles; test roles start without it.
+        CustomerRole.OWNER.add_permission(PermissionEnum.LIST_SERVICE_PROVIDER_USERS)
+        ServiceProviderRole.MANAGER.add_permission(
+            PermissionEnum.LIST_SERVICE_PROVIDER_USERS
+        )
         self.fixture = fixtures.MarketplaceFixture()
         self.fixture.admin
         self.fixture.manager
@@ -824,6 +845,49 @@ class OfferingUserStateTransitionTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.offering_user.refresh_from_db()
         self.assertEqual(self.offering_user.state, OfferingUserStates.OK)
+
+    def test_set_ok_from_pending_state_clears_comment(self):
+        self.offering_user.state = OfferingUserStates.PENDING_ADDITIONAL_VALIDATION
+        self.offering_user.service_provider_comment = "Some validation comment"
+        self.offering_user.service_provider_comment_url = "https://example.com/info"
+        self.offering_user.save()
+
+        self.client.force_authenticate(user=self.fixture.owner)
+        response = self.client.post(self.get_url(self.offering_user, "set_ok"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.state, OfferingUserStates.OK)
+        self.assertEqual(self.offering_user.service_provider_comment, "")
+        self.assertEqual(self.offering_user.service_provider_comment_url, "")
+
+    def test_setting_username_in_pending_state_clears_comment(self):
+        self.offering_user.state = OfferingUserStates.PENDING_ADDITIONAL_VALIDATION
+        self.offering_user.service_provider_comment = "Some validation comment"
+        self.offering_user.service_provider_comment_url = "https://example.com/info"
+        self.offering_user.save()
+
+        self.offering_user.username = "new-username"
+        self.offering_user.save(update_fields=["username"])
+
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.state, OfferingUserStates.OK)
+        self.assertEqual(self.offering_user.service_provider_comment, "")
+        self.assertEqual(self.offering_user.service_provider_comment_url, "")
+
+    def test_restore_clears_comment(self):
+        self.offering_user.state = OfferingUserStates.DELETED
+        self.offering_user.service_provider_comment = "Account removed"
+        self.offering_user.service_provider_comment_url = "https://example.com/info"
+        self.offering_user.save()
+
+        self.offering_user.restore()
+        self.offering_user.save(update_fields=["state"])
+
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.state, OfferingUserStates.OK)
+        self.assertEqual(self.offering_user.service_provider_comment, "")
+        self.assertEqual(self.offering_user.service_provider_comment_url, "")
 
     def test_state_transition_without_comment(self):
         """Test state transitions work without providing comment."""

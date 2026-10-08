@@ -38,6 +38,7 @@
 
 - call_document_added
 - call_document_removed
+- reviewer_workload_limit_overridden
 
 ## Chat
 
@@ -127,6 +128,11 @@
 - marketplace_offering_component_created
 - marketplace_offering_component_deleted
 - marketplace_offering_component_updated
+- marketplace_offering_merge_created
+- marketplace_offering_merge_executed
+- marketplace_offering_merge_failed
+- marketplace_offering_merge_undone
+- marketplace_offering_merge_verification_failed
 - marketplace_offering_options_updated
 - marketplace_offering_resource_options_updated
 - marketplace_plan_archived
@@ -276,7 +282,15 @@
 
 ## Permissions
 
+- role_cloned
+- role_concealed
+- role_definition_created
+- role_definition_deleted
+- role_definition_updated
+- role_disabled
+- role_enabled
 - role_granted
+- role_revealed
 - role_revoked
 - role_updated
 
@@ -309,6 +323,7 @@
 - maintenance_announcement_started
 - maintenance_announcement_unscheduled
 - maintenance_announcement_updated
+- marketplace_provider_project_group_gid_updated
 - marketplace_resource_create_canceled
 - marketplace_resource_create_failed
 - marketplace_resource_create_requested

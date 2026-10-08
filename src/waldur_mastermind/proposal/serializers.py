@@ -2,6 +2,7 @@ import logging
 import re
 from datetime import datetime
 
+import yaml
 from constance import config
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
@@ -51,20 +52,21 @@ from waldur_mastermind.proposal.enums import (
     CallStates,
     COISeverityLevels,
     COITypes,
+    EvaluationStart,
     NotificationRuleRecipients,
     NotificationRuleTriggers,
+    OrderAuthors,
     ProposalFieldStates,
     ProposalStates,
     RequestedOfferingStates,
     ReviewerPoolInvitationStatuses,
     RoundStatuses,
-    SupportTicketCallers,
     WorkflowStepInstanceStatuses,
     WorkflowStepOutcomes,
 )
 
 from . import models, notification_rules, utils, workflow_service
-from .managers import get_connected_calls
+from .managers import get_connected_calls, holds_live_review
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +116,8 @@ def _is_reviewer_only_view(user, proposal) -> bool:
     """True if the user views this proposal solely as a reviewer.
 
     Returns False for the applicant, call managers, staff, support, and
-    anonymous users — all of whom should see unfiltered data.
+    anonymous users — all of whom should see unfiltered data. True for call
+    reviewers and for anyone holding a live review of the proposal.
     """
     if not user or user.is_anonymous:
         return False
@@ -125,27 +128,99 @@ def _is_reviewer_only_view(user, proposal) -> bool:
     call_id = proposal.round.call_id
     if call_id in get_connected_calls(user, CallRole.MANAGER):
         return False
-    return call_id in get_connected_calls(user, CallRole.REVIEWER)
+    # A reviewer reaches the proposal either through a call role or through a
+    # review they hold on it (an accepted assignment grants no role); both see
+    # only what the call's applicant visibility config exposes.
+    return call_id in get_connected_calls(user, CallRole.REVIEWER) or holds_live_review(
+        user, proposal
+    )
+
+
+# Maps applicant attribute name to the proposal team list (list_users) row
+# keys that carry it. The team list is serialised by UserRoleDetailsSerializer;
+# each row describes a team member and, through created_by_*, the member who
+# granted the role (usually the applicant). As in APPLICANT_FIELD_MAP the user
+# UUID is the identity link and follows username, and the avatar image follows
+# full_name because it identifies the person as much as the name does. Row keys
+# absent from this map (uuid, created, role_*, source) describe the grant, not
+# the person; expiration_time is concealed separately.
+TEAM_MEMBER_FIELD_MAP: dict[str, list[str]] = {
+    "full_name": ["user_full_name", "created_by_full_name", "user_image"],
+    "username": ["user_username", "user_uuid", "created_by_uuid"],
+    "email": ["user_email"],
+}
+
+# Maps applicant attribute name to the list_users query parameters that match
+# on it (filters, search and ordering keys). A viewer from whom the attribute
+# is concealed may not use them: the size or order of the result would reveal
+# the value even with the row keys dropped.
+TEAM_MEMBER_QUERY_MAP: dict[str, dict[str, list[str]]] = {
+    "full_name": {
+        "params": ["full_name", "native_name", "search_string"],
+        "ordering": ["full_name", "native_name"],
+    },
+    "username": {
+        "params": ["username", "user_slug", "user", "user_url", "search_string"],
+        "ordering": ["username"],
+    },
+    "email": {
+        "params": ["search_string"],
+        "ordering": ["email"],
+    },
+}
+
+
+def get_concealed_applicant_attributes(user, proposal) -> set[str] | None:
+    """Applicant attributes the call's visibility config conceals from ``user``.
+
+    Returns None when the user does not view the proposal solely as a
+    reviewer; such viewers see every attribute. Both the proposal payload and
+    the proposal team list derive what to drop from this one set.
+    """
+    if not _is_reviewer_only_view(user, proposal):
+        return None
+    config_model = models.CallApplicantVisibilityConfig
+    exposed = set(config_model.get_exposed_fields_for_call(proposal.round.call))
+    return set(config_model.get_attribute_names()) - exposed
 
 
 def filter_applicant_fields_for_reviewer(data: dict, proposal, user) -> dict:
     """Mutate the serialized representation to drop applicant fields that
     are not exposed by the call's visibility config when the user is a
     reviewer-only viewer."""
-    if not _is_reviewer_only_view(user, proposal):
-        return data
-    exposed = models.CallApplicantVisibilityConfig.get_exposed_fields_for_call(
-        proposal.round.call
-    )
-    kept_serializer_fields: set[str] = set()
-    for attr in exposed:
-        kept_serializer_fields.update(APPLICANT_FIELD_MAP.get(attr, []))
-    all_filterable: set[str] = set()
-    for serializer_fields in APPLICANT_FIELD_MAP.values():
-        all_filterable.update(serializer_fields)
-    for field_name in all_filterable - kept_serializer_fields:
-        data.pop(field_name, None)
+    concealed = get_concealed_applicant_attributes(user, proposal)
+    for attr in concealed or ():
+        for field_name in APPLICANT_FIELD_MAP.get(attr, []):
+            data.pop(field_name, None)
     return data
+
+
+def filter_team_member_fields(rows, concealed: set[str]):
+    """Drop the team list row keys carrying a concealed applicant attribute."""
+    for attr in concealed:
+        for field_name in TEAM_MEMBER_FIELD_MAP.get(attr, []):
+            for row in rows:
+                row.pop(field_name, None)
+    return rows
+
+
+def get_concealed_team_member_query(query_params, concealed: set[str]) -> list[str]:
+    """Return the list_users query parameters that match on a concealed
+    attribute, as they appear in the request."""
+    requested_ordering = {
+        key.strip().lstrip("-")
+        for value in query_params.getlist("o")
+        for key in value.split(",")
+    }
+    refused = []
+    for attr in sorted(concealed):
+        query = TEAM_MEMBER_QUERY_MAP.get(attr)
+        if not query:
+            continue
+        refused.extend(param for param in query["params"] if param in query_params)
+        if requested_ordering & set(query["ordering"]):
+            refused.append("o")
+    return sorted(set(refused))
 
 
 class EligibilityCheckSerializer(serializers.Serializer):
@@ -456,6 +531,13 @@ class ProposalReviewSerializer(
     proposal_uuid = serializers.UUIDField(read_only=True, source="proposal.uuid")
     proposal_slug = serializers.ReadOnlyField(source="proposal.slug")
     coi_confirmation_required = serializers.SerializerMethodField()
+    override_workload_limit = serializers.BooleanField(
+        write_only=True,
+        required=False,
+        help_text="Create the review even if this takes the reviewer above "
+        "their maximum number of open assignments in the call's reviewer "
+        "pool. The override is logged.",
+    )
 
     class Meta:
         model = models.Review
@@ -488,13 +570,13 @@ class ProposalReviewSerializer(
             "comment_project_title",
             "comment_project_summary",
             "comment_project_description",
-            "comment_project_duration",
             "comment_project_supporting_documentation",
             "comment_resource_requests",
             "comment_team",
             "coi_confirmed",
             "coi_confirmed_at",
             "coi_confirmation_required",
+            "override_workload_limit",
             "created",
             "modified",
         )
@@ -574,6 +656,7 @@ class ProposalReviewSerializer(
 
         if (
             user.is_staff
+            or user.is_support
             or review.reviewer == user
             or review.proposal.round.call.manager.customer.has_user(user)
             or review.proposal.round.call.has_user(user, CallRole.MANAGER)
@@ -621,7 +704,12 @@ class ProposalReviewSerializer(
                 _("Review already exists for this proposal and reviewer.")
             )
 
+        validated_data.pop("override_workload_limit", None)
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop("override_workload_limit", None)
+        return super().update(instance, validated_data)
 
 
 set_override(
@@ -1017,6 +1105,9 @@ class PublicCallSerializer(
             "reviews_visible_to_submitters",
             "has_eligibility_restrictions",
             "proposal_field_config",
+            # Public so an applicant can be told their evaluation waits for
+            # the cut-off.
+            "evaluation_start",
         )
         view_name = "proposal-public-call-detail"
         extra_kwargs = {
@@ -1472,35 +1563,45 @@ class ProtectedCallSerializer(PublicCallSerializer):
         source="panel_chair.uuid", read_only=True, format="hex"
     )
     panel_chair_name = serializers.ReadOnlyField(source="panel_chair.full_name")
-    support_ticket_caller = serializers.ChoiceField(
-        choices=SupportTicketCallers.CHOICES,
+    order_author = serializers.ChoiceField(
+        choices=OrderAuthors.CHOICES,
         required=False,
-        help_text="Who helpdesk tickets for granted resources are raised for.",
+        help_text="Whose name the orders for resources granted by this call carry.",
+    )
+    evaluation_start = serializers.ChoiceField(
+        choices=EvaluationStart.CHOICES,
+        required=False,
+        help_text=(
+            "When a submitted proposal's evaluation starts: on submission, or "
+            "for all proposals of a round together at its cut-off. Cannot be "
+            "changed while the call has proposals submitted or in review."
+        ),
     )
     # The queryset is narrowed to the call's own people in get_fields(); what
     # stands here is only the schema's view of the field.
-    support_ticket_caller_user = serializers.SlugRelatedField(
+    order_author_user = serializers.SlugRelatedField(
         slug_field="uuid",
         queryset=core_models.User.objects.all(),
         required=False,
         allow_null=True,
         help_text=(
-            "The person tickets go to when the caller is a named contact. "
-            "Must hold a role on this call or on the organisation managing it."
+            "The person orders are attributed to when the author is a named "
+            "contact. Must hold a role on this call or on the organisation "
+            "managing it."
         ),
     )
     # allow_null is load-bearing on a dotted source over a nullable FK: without
     # it DRF raises SkipField and drops the key from the payload entirely, while
     # make_readonly_fields_required still marks it required in the generated
     # SDK. Most calls have no named contact, so that mismatch would be the norm.
-    support_ticket_caller_user_uuid = serializers.UUIDField(
-        source="support_ticket_caller_user.uuid",
+    order_author_user_uuid = serializers.UUIDField(
+        source="order_author_user.uuid",
         read_only=True,
         format="hex",
         allow_null=True,
     )
-    support_ticket_caller_user_name = serializers.CharField(
-        source="support_ticket_caller_user.full_name",
+    order_author_user_name = serializers.CharField(
+        source="order_author_user.full_name",
         read_only=True,
         allow_null=True,
     )
@@ -1594,19 +1695,19 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "proposal_field_config",
             "proposal_field_metadata",
             "has_proposals",
-            "support_ticket_caller",
-            "support_ticket_caller_user",
-            "support_ticket_caller_user_uuid",
-            "support_ticket_caller_user_name",
+            "order_author",
+            "order_author_user",
+            "order_author_user_uuid",
+            "order_author_user_name",
         )
         view_name = "proposal-protected-call-detail"
         protected_fields = ("manager",)
 
     def get_fields(self):
         fields = super().get_fields()
-        contact = fields.get("support_ticket_caller_user")
+        contact = fields.get("order_author_user")
         if contact is not None:
-            contact.queryset = self._ticket_caller_candidates()
+            contact.queryset = self._order_author_candidates()
             # Same message whichever way the lookup failed, so the field cannot
             # be used to tell an unrelated account apart from one that does not
             # exist. It still says what a usable answer looks like.
@@ -1616,15 +1717,16 @@ class ProtectedCallSerializer(PublicCallSerializer):
             )
         return fields
 
-    def _ticket_caller_candidates(self):
-        """Users this call may name as its support contact.
+    def _order_author_candidates(self):
+        """Users this call may name as the author of its orders.
 
-        Whoever is named starts receiving the call's ticket mail -- project
-        name, order description, limits -- and gets an account created for them
-        on the helpdesk. Anyone holding UPDATE_CALL could otherwise point that
-        at an arbitrary account in the deployment, so the choice is kept to
-        people already attached to the call: its own team, the managing
-        organisation, and that organisation's customer.
+        Whoever is named starts receiving the call's order mail -- project
+        name, order description, limits -- and, for offerings fulfilled by a
+        helpdesk ticket, gets an account created for them on the helpdesk.
+        Anyone holding UPDATE_CALL could otherwise point that at an arbitrary
+        account in the deployment, so the choice is kept to people already
+        attached to the call: its own team, the managing organisation, and
+        that organisation's customer.
 
         Empty when there is no call to read roles from -- during creation, and
         while drf-spectacular is building the schema.
@@ -1641,25 +1743,64 @@ class ProtectedCallSerializer(PublicCallSerializer):
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
-        self._validate_support_ticket_caller(attrs)
+        self._validate_order_author(attrs)
         return attrs
 
-    def _validate_support_ticket_caller(self, attrs):
-        """A named contact, if given, has to be able to receive a ticket.
+    def validate_evaluation_start(self, value):
+        """Refuse a switch while proposals are being evaluated.
+
+        A switch mid-round would leave the round split between proposals that
+        started on submission and proposals that wait for the cut-off.
+        """
+        call = self.instance
+        if (
+            isinstance(call, models.Call)
+            and value != call.evaluation_start
+            and call.has_proposals_under_evaluation()
+        ):
+            raise serializers.ValidationError(models.EVALUATION_START_LOCKED_MESSAGE)
+        return value
+
+    def _validate_order_author(self, attrs):
+        """A named contact the call ends up using has to be reachable.
 
         A missing contact is deliberately *not* an error. The settings page
         edits one field per request, so demanding the contact in the same
         request that selects "specific_user" would leave the manager unable to
-        select it at all -- and the resolver already falls back to the
-        project's roles rather than failing an order over it.
+        select it at all -- and allocation already falls back to the applicant
+        rather than refusing to place the order.
+
+        The check is on the state the call would be left in, not on the field
+        that happens to be in this payload: one request names a contact who
+        still has an address, an SSO sync later clears it, and a third request
+        switches the mode to "specific_user" on its own. Validating only the
+        incoming field would wave that last one through.
+
+        Requests touching neither field are left alone, so a call already in
+        that state can still have everything else edited.
         """
-        user = attrs.get("support_ticket_caller_user")
-        if user is not None and not user.email:
+        missing = object()
+        choice = attrs.get("order_author", missing)
+        contact = attrs.get("order_author_user", missing)
+        if choice is missing and contact is missing:
+            return
+
+        if choice is missing:
+            choice = getattr(self.instance, "order_author", None)
+        if contact is missing:
+            contact = getattr(self.instance, "order_author_user", None)
+
+        if (
+            choice == OrderAuthors.SPECIFIC_USER
+            and contact is not None
+            and not contact.email
+        ):
             raise serializers.ValidationError(
                 {
-                    "support_ticket_caller_user": _(
-                        "The named contact has no email address, so the "
-                        "helpdesk cannot raise tickets on their behalf."
+                    "order_author_user": _(
+                        "The named contact has no email address, so they "
+                        "cannot receive mail about the orders placed in "
+                        "their name."
                     )
                 }
             )
@@ -3446,6 +3587,7 @@ class CallReviewerPoolSerializer(
     - annotated_reviews_pending
     - annotated_reviews_in_progress
     - annotated_reviews_completed
+    - open_assignments (``CallReviewerPool.objects.with_open_assignments()``)
     """
 
     reviewer_name = serializers.SerializerMethodField()
@@ -3464,6 +3606,13 @@ class CallReviewerPoolSerializer(
     reviews_pending = serializers.SerializerMethodField()
     reviews_in_progress = serializers.SerializerMethodField()
     reviews_completed = serializers.SerializerMethodField()
+    current_assignments = serializers.IntegerField(
+        source="get_open_assignments",
+        read_only=True,
+        help_text="Number of the reviewer's open assignments in this call: "
+        "pending or accepted assignment items whose review is not finished, "
+        "plus reviews in progress created without an assignment item.",
+    )
     overridden_by_name = serializers.ReadOnlyField(
         source="overridden_by.full_name", default=""
     )
@@ -4036,6 +4185,121 @@ class DuplicateCallRequestSerializer(serializers.Serializer):
     )
 
 
+class CallExportParametersSerializer(serializers.Serializer):
+    """Request body for the protected-calls export_call action.
+
+    Call settings are always exported; each flag adds one section.
+    """
+
+    include_documents = serializers.BooleanField(required=False, default=True)
+    include_rounds = serializers.BooleanField(required=False, default=True)
+    include_offerings = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text="Requested offerings together with their resource templates.",
+    )
+    include_workflow_steps = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text="Workflow steps with their notification rules and criteria.",
+    )
+    include_field_configs = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text="Proposal field and applicant visibility configuration.",
+    )
+    include_review_configs = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text="COI, reviewer matching and assignment configuration.",
+    )
+    include_role_mappings = serializers.BooleanField(required=False, default=True)
+    include_compliance_checklist = serializers.BooleanField(
+        required=False, default=True
+    )
+
+    def sections(self) -> dict[str, bool]:
+        return {
+            key.removeprefix("include_"): value
+            for key, value in self.validated_data.items()
+        }
+
+
+class CallExportResponseSerializer(serializers.Serializer):
+    call_uuid = serializers.UUIDField()
+    call_name = serializers.CharField()
+    export_data = serializers.JSONField()
+    exported_sections = serializers.ListField(child=serializers.CharField())
+    export_timestamp = serializers.DateTimeField()
+    warnings = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="Parts that could not be exported, such as unreadable documents.",
+    )
+
+
+class CallImportParametersSerializer(serializers.Serializer):
+    """Request body for the protected-calls import_call action."""
+
+    manager = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.CallManagingOrganisation.objects.all(),
+        help_text="Call managing organisation that will own the imported call.",
+    )
+    name = serializers.CharField(
+        max_length=models.Call._meta.get_field("name").max_length,
+        required=False,
+        allow_blank=False,
+        trim_whitespace=True,
+        help_text="Name for the imported call. Defaults to the exported name.",
+    )
+    call_data = serializers.JSONField(
+        help_text="Exported call document, as a mapping or a YAML string.",
+    )
+    import_documents = serializers.BooleanField(required=False, default=True)
+    import_rounds = serializers.BooleanField(required=False, default=True)
+    import_offerings = serializers.BooleanField(required=False, default=True)
+    import_workflow_steps = serializers.BooleanField(required=False, default=True)
+    import_field_configs = serializers.BooleanField(required=False, default=True)
+    import_review_configs = serializers.BooleanField(required=False, default=True)
+    import_role_mappings = serializers.BooleanField(required=False, default=True)
+    import_compliance_checklist = serializers.BooleanField(required=False, default=True)
+
+    def validate_manager(self, manager):
+        # Raised from validation, not the view, so that the serializer cannot
+        # be used to import a call without this check.
+        if not permissions_utils.has_permission(
+            self.context["request"],
+            permissions_enums.PermissionEnum.CREATE_CALL,
+            manager,
+        ):
+            raise PermissionDenied()
+        return manager
+
+    def validate_call_data(self, value):
+        if isinstance(value, str):
+            try:
+                value = yaml.safe_load(value)
+            except yaml.YAMLError as e:
+                raise serializers.ValidationError(f"Invalid YAML data: {e}")
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Expected a mapping.")
+        return value
+
+    def sections(self) -> dict[str, bool]:
+        return {
+            key.removeprefix("import_"): value
+            for key, value in self.validated_data.items()
+            if key.startswith("import_")
+        }
+
+
+class CallImportResponseSerializer(serializers.Serializer):
+    call_uuid = serializers.UUIDField()
+    call_name = serializers.CharField()
+    imported_sections = serializers.ListField(child=serializers.CharField())
+    warnings = serializers.ListField(child=serializers.CharField())
+
+
 class BulkRoundCreateRequestSerializer(serializers.ModelSerializer):
     """Request body for the rounds_bulk_set action.
 
@@ -4441,6 +4705,7 @@ class PublicInvitationSerializer(serializers.Serializer):
     call_name = serializers.CharField(read_only=True)
     call_uuid = serializers.UUIDField(read_only=True)
     invitation_status = serializers.CharField(read_only=True)
+    invited_at = serializers.DateTimeField(read_only=True)
     expires_at = serializers.DateTimeField(read_only=True, allow_null=True)
     is_expired = serializers.BooleanField(read_only=True)
     max_assignments = serializers.IntegerField(read_only=True, allow_null=True)
@@ -4977,6 +5242,11 @@ class CreateManualAssignmentSerializer(serializers.Serializer):
         required=False,
         allow_blank=True,
         help_text="Optional notes about this assignment",
+    )
+    override_workload_limit = serializers.BooleanField(
+        default=False,
+        help_text="Assign even if this takes the reviewer above their "
+        "maximum number of open assignments. The override is logged.",
     )
 
 
@@ -5630,7 +5900,10 @@ class DashboardReviewerStatsSerializer(serializers.Serializer):
 class DashboardCallManagerStatsSerializer(serializers.Serializer):
     pending_assessments = serializers.IntegerField(read_only=True)
     active_calls = serializers.IntegerField(read_only=True)
-    overdue_reviews = serializers.IntegerField(read_only=True)
+    reviews_due_soon = serializers.IntegerField(read_only=True)
+    # The window behind reviews_due_soon, so a client can open the matching
+    # list (proposal-reviews ?due_within_days=) without hardcoding it.
+    reviews_due_within_days = serializers.IntegerField(read_only=True)
 
 
 class DashboardUpcomingDeadlineSerializer(serializers.Serializer):

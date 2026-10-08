@@ -585,6 +585,13 @@ SCRIPT_OFFERING = "Marketplace.Script"
 SLURM_OFFERING = "SlurmInvoices.SlurmPackage"
 SITE_AGENT_OFFERING = "Marketplace.Slurm"
 
+# Offering types whose users get accounts (offering users) at the provider.
+OFFERING_USER_ALLOWED_OFFERING_TYPES = [
+    BASIC_OFFERING,
+    SITE_AGENT_OFFERING,
+    SCRIPT_OFFERING,
+]
+
 # Offering types that can be swapped between each other in-place via the
 # `update_type` action. The site-agent processors inherit from the Basic
 # processors and only no-op the send paths (delegating to the external
@@ -639,4 +646,66 @@ class ResourceAction:
         (VIEW_DETAILS, _("View details")),
         (SYNCHRONIZE, _("Synchronize")),
         (VERSION_HISTORY, _("Version history")),
+    )
+
+
+class KpiAggregations:
+    """How a KPI's datapoints roll up into one project-level figure.
+
+    The names match the OpenTelemetry aggregations a metric already carries, so
+    a service emitting OTel metrics maps onto these directly instead of
+    learning a second vocabulary for the same idea.
+    """
+
+    SUM = "sum"
+    AVERAGE = "avg"
+    LAST = "last"
+    MIN = "min"
+    MAX = "max"
+
+    CHOICES = (
+        (SUM, _("Sum")),
+        (AVERAGE, _("Average")),
+        (LAST, _("Last value")),
+        (MIN, _("Minimum")),
+        (MAX, _("Maximum")),
+    )
+
+
+class KpiDirections:
+    """Which way a KPI has to move to count as an improvement.
+
+    A dashboard cannot infer this: more course completions is good, more
+    unresolved tickets is not, and the same number carries either meaning
+    depending on what it measures.
+    """
+
+    HIGHER_IS_BETTER = "up"
+    LOWER_IS_BETTER = "down"
+    NEUTRAL = "neutral"
+
+    CHOICES = (
+        (HIGHER_IS_BETTER, _("Higher is better")),
+        (LOWER_IS_BETTER, _("Lower is better")),
+        (NEUTRAL, _("Neutral")),
+    )
+
+
+class KpiCadences:
+    """How often the service is expected to report a KPI.
+
+    The dashboard shows this next to the figure and uses it to say when a
+    declared KPI is overdue its first report.
+    """
+
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    QUARTERLY = "quarterly"
+
+    CHOICES = (
+        (DAILY, _("Daily")),
+        (WEEKLY, _("Weekly")),
+        (MONTHLY, _("Monthly")),
+        (QUARTERLY, _("Quarterly")),
     )

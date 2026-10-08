@@ -9,7 +9,7 @@ from rest_framework import status, test
 from rest_framework.reverse import reverse
 
 from waldur_core.permissions.enums import PermissionEnum
-from waldur_core.permissions.fixtures import ServiceProviderRole
+from waldur_core.permissions.fixtures import CustomerRole, ServiceProviderRole
 from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices.tasks import create_monthly_invoices
 from waldur_mastermind.marketplace import models as marketplace_models
@@ -154,21 +154,28 @@ class TotalLimitTest(test.APITestCase):
         self.assertTrue(items.last().unit_price < 0)
         self.assertEqual(items.last().quantity, Decimal("9.5"))
 
-    def test_fractional_limit_change_via_set_limits_returns_200(self):
+    def test_fractional_limit_via_set_limits_is_clamped_before_billing(self):
+        # The component takes whole numbers (limit_decimal_places defaults to
+        # 0), and the backend behind the agent would truncate a fraction
+        # anyway, so set_limits truncates it here rather than billing for a
+        # limit the backend never provisioned. The request still succeeds: the
+        # agent has no error handling for a 4xx.
         ServiceProviderRole.MANAGER.add_permission(PermissionEnum.SET_RESOURCE_STATE)
         url = ResourceFactory.get_provider_resource_url(self.resource, "set_limits")
         self.client.force_authenticate(self.fixture.staff)
 
         response = self.client.post(
-            url, {"limits": {self.component.type: 0.1}}, format="json"
+            url, {"limits": {self.component.type: 4.7}}, format="json"
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.resource.refresh_from_db()
-        self.assertEqual(self.resource.limits[self.component.type], 0.1)
+        self.assertEqual(self.resource.limits[self.component.type], 4)
         items = self.get_invoice_items()
         self.assertEqual(items.count(), 2)
-        self.assertEqual(items.last().quantity, Decimal("9.9"))
+        # A decrease from 10 to 4, not to 4.7.
+        self.assertTrue(items.last().unit_price < 0)
+        self.assertEqual(items.last().quantity, Decimal("6"))
 
     def test_total_billing_works_without_create_orders(self):
         """Test TOTAL billing behavior when CREATE orders are missing (simulating deleted orders scenario)."""
@@ -461,6 +468,12 @@ class TotalLimitDailyPlanTest(test.APITestCase):
 @freeze_time("2020-11-01")
 class InvoiceItemsTest(test.APITestCase):
     def setUp(self):
+        # Provider invoice items are gated by GET_REVENUE, which
+        # permissions.yaml grants both roles; test roles start without it.
+        CustomerRole.OWNER.add_permission(PermissionEnum.GET_SERVICE_PROVIDER_REVENUE)
+        ServiceProviderRole.MANAGER.add_permission(
+            PermissionEnum.GET_SERVICE_PROVIDER_REVENUE
+        )
         self.fixture = fixtures.MarketplaceFixture()
         self.resource = self.fixture.resource
         self.resource.set_state_ok()

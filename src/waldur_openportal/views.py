@@ -1,3 +1,5 @@
+import datetime
+import json
 import logging
 
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -2048,35 +2050,114 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
     @action(detail=True, methods=["get"], url_path="total-usage")
     def total_usage(self, request, uuid=None):
         """
-        Return the total usage hours for this remote project, summed
-        across all cached monthly usage reports.
+        Return the total usage hours for this award, across every project it
+        has been attached to.
 
-        Returns 0.0 if the project has no remote identifier yet or no
-        usage reports have been cached.
+        Previously this read only the *current* project's key, and summed every
+        report under it. That lost all usage from earlier attachments, and
+        counted another award's usage if the same project had earlier held a
+        different award on this destination. It is now the total of
+        usage-report, so the two can never disagree.
         """
         remote_project = self.get_object()
-        if not remote_project.current_project or not remote_project.destination:
-            return Response({"total_hours": 0.0})
-
-        # we need to build the local identifier for the project from
-        # its shortname and the portal
-        try:
-            project_identifier = utils.get_local_project_identifier(
-                remote_project.current_project
-            )
-        except Exception as e:
-            logger.warning(
-                f"total_usage: could not get local identifier for project "
-                f"{remote_project.current_project!r}: {e}"
-            )
-            return Response({"total_hours": 0.0})
-
-        reports = models.CachedProjectUsageReport.objects.filter(
-            project_identifier=project_identifier,
-            resource=remote_project.destination,
+        return Response(
+            {"total_hours": utils.get_remote_project_total_hours(remote_project)}
         )
-        total_hours = sum(float(r.get_report().total_usage.hours) for r in reports)
-        return Response({"total_hours": total_hours})
+
+    @extend_schema(
+        parameters=[serializers.RemoteProjectUsageReportQuerySerializer],
+        responses={status.HTTP_200_OK: serializers.RemoteProjectUsageReportSerializer},
+        summary="Usage report for an award",
+        description=(
+            "The award's usage over a date range, across every project it has "
+            "been attached to. An award's usage is cached under the identifier "
+            "of whichever project held it, so each attachment's usage is read "
+            "from its own key and filtered to the days it was attached. On a "
+            "day the award moved, the project it moved to claims the whole day."
+        ),
+    )
+    @action(detail=True, methods=["get"], url_path="usage-report")
+    def usage_report(self, request, uuid=None):
+        remote_project = self.get_object()
+        query = serializers.RemoteProjectUsageReportQuerySerializer(
+            data=request.query_params
+        )
+        query.is_valid(raise_exception=True)
+
+        windows = utils.get_remote_project_windows(remote_project)
+        start = query.validated_data.get("start") or (
+            windows[0].start if windows else None
+        )
+        end = query.validated_data.get("end") or datetime.date.today()
+
+        report = None
+        if start is not None and start <= end:
+            report = utils.get_remote_project_usage_report(remote_project, start, end)
+
+        data = {
+            "start": start,
+            "end": end,
+            "total_hours": float(report.total_usage.hours) if report else 0.0,
+            "report": json.loads(report.to_json()) if report else None,
+            "windows": self._windows_data(windows),
+        }
+        return Response(serializers.RemoteProjectUsageReportSerializer(data).data)
+
+    @extend_schema(
+        parameters=[serializers.RemoteProjectUsageReportQuerySerializer],
+        responses={
+            status.HTTP_200_OK: serializers.RemoteProjectStorageReportSerializer
+        },
+        summary="Storage report for an award",
+        description=(
+            "The award's storage snapshots over a date range, across every "
+            "project it has been attached to. Each attachment contributes only "
+            "the snapshots taken on the days it was attached, read from its own "
+            "key. On a day the award moved, the project it moved to claims the "
+            "whole day. The report's top-level snapshot is the latest in range."
+        ),
+    )
+    @action(detail=True, methods=["get"], url_path="storage-report")
+    def storage_report(self, request, uuid=None):
+        remote_project = self.get_object()
+        query = serializers.RemoteProjectUsageReportQuerySerializer(
+            data=request.query_params
+        )
+        query.is_valid(raise_exception=True)
+
+        windows = utils.get_remote_project_windows(remote_project)
+        start = query.validated_data.get("start") or (
+            windows[0].start if windows else None
+        )
+        end = query.validated_data.get("end") or datetime.date.today()
+
+        report = None
+        if start is not None and start <= end:
+            report = utils.get_remote_project_storage_report(remote_project, start, end)
+
+        data = {
+            "start": start,
+            "end": end,
+            "latest": (
+                report.generated_at if report and not report.is_empty() else None
+            ),
+            "report": json.loads(report.to_json()) if report else None,
+            "windows": self._windows_data(windows),
+        }
+        return Response(serializers.RemoteProjectStorageReportSerializer(data).data)
+
+    @staticmethod
+    def _windows_data(windows):
+        return [
+            {
+                "project_uuid": window.project.uuid if window.project else None,
+                "project_name": window.project.name if window.project else None,
+                "start": window.start,
+                "end": window.end,
+                "project_identifier": window.key,
+            }
+            for window in windows
+        ]
 
 
 class RemoteProjectAuditEntryViewSet(core_views.ActionsViewSet):

@@ -41,7 +41,7 @@ dependencies = [
   "python-keystoneclient>=5.0.0,<6.0.0",
   "python-neutronclient>=11.0.0,<12.0.0",
   "python-novaclient>=18.0.0,<19.0.0",
-  "pyvmomi==8.0.3.0.1",
+  "pyvmomi==9.1.0.0",
   "PyYAML==6.0.2",
   "requests[socks]>=2.32.4,<3.0.0",
   "sentry-sdk>=2.8.0,<3.0.0",
@@ -85,7 +85,9 @@ dependencies = [
   "scim2-models>=0.4.0",
   "tomli-w>=1.2.0",
   "webauthn>=3.0.0",
+  "jsonschema>=4.0.0",
   "aiohttp>=3.14",
+  "regex>=2024.11.6",
 ]
 
 [project.urls]
@@ -126,6 +128,7 @@ waldur_openstack_replication = "waldur_openstack_replication.extension:OpenStack
 waldur_notifications = "waldur_mastermind.notifications.extension:NotificationsExtension"
 waldur_policy = "waldur_mastermind.policy.extension:PolicyExtension"
 waldur_proposal = "waldur_mastermind.proposal.extension:ProposalExtension"
+waldur_proposal_archive = "waldur_mastermind.proposal_archive.extension:ProposalArchiveExtension"
 waldur_rancher = "waldur_rancher.extension:RancherExtension"
 waldur_support = "waldur_mastermind.support.extension:SupportExtension"
 waldur_vmware = "waldur_vmware.extension:VMwareExtension"

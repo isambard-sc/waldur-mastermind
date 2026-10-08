@@ -4,6 +4,7 @@ from rest_framework import exceptions, permissions
 from waldur_core.permissions import models as permissions_models
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.utils import (
+    check_pat_support_scope,
     get_users,
     has_permission_on_any_source,
     permission_factory,
@@ -29,6 +30,34 @@ user_can_accept_requested_offering = permission_factory(
 CALL_PERMISSION_SOURCES = ["*", "manager"]
 
 
+def support_can_read(check):
+    """Let support users through `check` on safe methods only.
+
+    Support can read every call (CallQuerySet.filter_for_user), so the data a
+    call is managed with -- reviewer pool, COI and matching configuration,
+    compliance -- must be readable to them too, or the call pages they are
+    allowed to open come out broken. Writes still go through `check`.
+
+    The wrapper carries `check`'s `permission` / `sources` over: ActionsPermission
+    uses `sources` to decide the check needs the object, and the OpenAPI
+    `x-permissions` extension reads both.
+    """
+
+    def wrapper(request, view, scope=None):
+        if (
+            request.method in permissions.SAFE_METHODS
+            and request.user.is_support
+            and check_pat_support_scope(request)
+        ):
+            return
+        return check(request, view, scope)
+
+    for attr in ("permission", "sources"):
+        if hasattr(check, attr):
+            setattr(wrapper, attr, getattr(check, attr))
+    return wrapper
+
+
 class CanUpdateCallPermission(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
         call = obj.call
@@ -50,24 +79,32 @@ RESPONSIBLE_ROLE_TO_CALL_ROLE = {
 }
 
 
-def _user_holds_offering_manager_for_call(user, call):
-    """True iff the user holds OFFERING.MANAGER on any accepted offering of the call.
+def offering_manager_user_ids_for_proposal(proposal):
+    """Ids of the offering managers who evaluate ``proposal``.
 
-    Single ``UserRole`` query against the set of accepted offering ids — one
-    round-trip regardless of how many offerings the call has. Mirrors
-    ``get_users``' filters (``is_active=True`` + role name).
+    Only the managers of accepted offerings that the proposal actually
+    requested (through its ``RequestedResource`` rows) -- the offerings that
+    make it visible to them in ``managers.get_offering_manager_proposals``.
+    Managers of other offerings in the same call are not involved with it.
+    Shared by the step-permission checks and the notification rules, so the
+    people who may act on the step and the people mailed about it are one set.
     """
-    offering_ids = proposal_models.RequestedOffering.objects.filter(
-        call=call, state=RequestedOfferingStates.ACCEPTED
-    ).values_list("offering_id", flat=True)
+    offering_ids = proposal_models.RequestedResource.objects.filter(
+        proposal=proposal,
+        requested_offering__state=RequestedOfferingStates.ACCEPTED,
+    ).values_list("requested_offering__offering_id", flat=True)
     offering_ct = ContentType.objects.get_for_model(marketplace_models.Offering)
     return permissions_models.UserRole.objects.filter(
         is_active=True,
-        user=user,
         role__name=RoleEnum.OFFERING_MANAGER,
         content_type=offering_ct,
         object_id__in=offering_ids,
-    ).exists()
+    ).values_list("user_id", flat=True)
+
+
+def _user_holds_offering_manager_for_proposal(user, proposal):
+    """True iff the user manages an accepted offering the proposal requested."""
+    return offering_manager_user_ids_for_proposal(proposal).filter(user=user).exists()
 
 
 def _user_can_act_on_active_step(user, proposal):
@@ -109,7 +146,7 @@ def _user_can_act_on_active_step(user, proposal):
         return True
 
     if role == ResponsibleRoles.OFFERING_MANAGER:
-        return _user_holds_offering_manager_for_call(user, call)
+        return _user_holds_offering_manager_for_proposal(user, proposal)
 
     role_name = RESPONSIBLE_ROLE_TO_CALL_ROLE.get(role)
     if not role_name:
@@ -212,7 +249,7 @@ def _user_holds_step_role(user, proposal, call_step):
     if role == ResponsibleRoles.APPLICANT:
         return proposal.created_by_id == user.id
     if role == ResponsibleRoles.OFFERING_MANAGER:
-        return _user_holds_offering_manager_for_call(user, call)
+        return _user_holds_offering_manager_for_proposal(user, proposal)
     role_name = RESPONSIBLE_ROLE_TO_CALL_ROLE.get(role)
     if not role_name:
         return False
@@ -307,7 +344,8 @@ def can_view_step_checklist_responses(request, view, obj=None):
     """ActionsPermission check for the threaded technical-assessment responses.
 
     The per-reviewer technical assessments are visible to staff, the call's
-    managers, and offering managers of the call (technical reviewers may see
+    managers, and the managers of the offerings the proposal requested
+    (technical reviewers may see
     their peers' assessments). The applicant (proposal creator) sees them only
     when the step is configured ``applicant_visible`` — matching WAL-9337's
     "visible to Call Managers by default unless configured to let the applicant
@@ -333,7 +371,10 @@ def can_view_step_checklist_responses(request, view, obj=None):
     # unless the step is blind_review, whose whole purpose is that evaluators
     # cannot see each other's assessments. Managers/staff are oversight, not
     # evaluators, so blind_review does not gate them.
-    if _user_holds_offering_manager_for_call(user, call) and not call_step.blind_review:
+    if (
+        _user_holds_offering_manager_for_proposal(user, obj)
+        and not call_step.blind_review
+    ):
         return
     if obj.created_by_id == user.id and call_step.applicant_visible:
         return

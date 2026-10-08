@@ -7,6 +7,7 @@ from axes.signals import user_locked_out
 from constance import config
 from constance.test.unittest import override_config
 from django.conf import settings
+from django.contrib.auth import SESSION_KEY as AUTH_USER_SESSION_KEY
 from django.core.cache import cache
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import IntegrityError
@@ -16,7 +17,12 @@ from freezegun import freeze_time
 from rest_framework import status, test
 from rest_framework.authtoken.models import Token
 
-from waldur_core.core.authentication import DEFAULT_TOKEN_UPDATE_INTERVAL, refresh_token
+from waldur_core.core.authentication import (
+    AUTHENTICATION_METHOD_KEY,
+    DEFAULT_TOKEN_UPDATE_INTERVAL,
+    AuthenticationMethod,
+    refresh_token,
+)
 from waldur_core.core.models import User
 from waldur_core.logging.models import Event
 
@@ -47,6 +53,76 @@ class TokenAuthenticationTest(test.APITestCase):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + token)
         response = self.client.get(self.test_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_login_succeeds_while_a_session_cookie_is_present(self):
+        """A leftover Django session used to make login fail with a CSRF error.
+
+        The SPA and Django admin share an origin, so an admin visit leaves a
+        `sessionid` cookie that is sent to the login endpoint too. That made
+        SessionAuthentication authenticate the request, and DRF enforce CSRF on
+        it; a login POST carries no CSRF token, so the credentials were never
+        read. The reported workaround was clearing all cookies, and the symptom
+        showed up as "log out one user, log in as another".
+        """
+        client = test.APIClient(enforce_csrf_checks=True)
+        someone_else = User.objects.create_user(
+            "admin-visitor", "visitor@example.com", "other-secret"
+        )
+        client.force_login(someone_else)
+
+        response = client.post(
+            self.auth_url, data={"username": self.username, "password": self.password}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        # The credentials in the body decide who this is, not the cookie.
+        self.assertEqual(Token.objects.get(key=response.data["token"]).user, self.user)
+
+    def test_login_ends_another_users_session(self):
+        """Logging in must not write into, or keep alive, someone else's session.
+
+        The login method used to be recorded in whatever session the browser
+        sent, so a leftover admin session of another user survived the login
+        and carried the new user's login method.
+        """
+        client = test.APIClient()
+        someone_else = User.objects.create_user(
+            "admin-visitor", "visitor@example.com", "other-secret"
+        )
+        client.force_login(someone_else)
+        old_key = client.session.session_key
+
+        response = client.post(
+            self.auth_url, data={"username": self.username, "password": self.password}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        session = client.session
+        self.assertNotEqual(session.session_key, old_key)
+        self.assertFalse(session.exists(old_key))
+        self.assertNotIn(AUTH_USER_SESSION_KEY, session)
+        self.assertEqual(session[AUTHENTICATION_METHOD_KEY], AuthenticationMethod.LOCAL)
+
+    def test_login_renews_the_key_of_the_same_users_session(self):
+        client = test.APIClient()
+        client.force_login(self.user)
+        session = client.session
+        session["passkey_admin_verified_at"] = "2026-09-27T00:00:00Z"
+        session.save()
+        old_key = session.session_key
+
+        response = client.post(
+            self.auth_url, data={"username": self.username, "password": self.password}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        session = client.session
+        self.assertNotEqual(session.session_key, old_key)
+        self.assertFalse(session.exists(old_key))
+        # Same user: the admin login and its verified flag carry over.
+        self.assertEqual(session[AUTH_USER_SESSION_KEY], str(self.user.pk))
+        self.assertEqual(session["passkey_admin_verified_at"], "2026-09-27T00:00:00Z")
+        self.assertEqual(session[AUTHENTICATION_METHOD_KEY], AuthenticationMethod.LOCAL)
 
     def test_user_can_logout(self):
         response = self.client.post(

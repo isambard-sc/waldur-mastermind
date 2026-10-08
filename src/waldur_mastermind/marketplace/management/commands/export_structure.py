@@ -48,11 +48,13 @@ from waldur_mastermind.marketplace.models import (
     Order,
     Plan,
     PlanComponent,
+    PosixIdPool,
     ProjectServiceAccount,
     Resource,
     ResourcePlanPeriod,
     RobotAccount,
     ServiceProvider,
+    ServiceProviderProjectGroup,
     SlurmOfferingQoS,
     SlurmPartitionQoS,
     SoftwareCatalog,
@@ -67,6 +69,8 @@ from waldur_mastermind.proposal.models import (
     AssignmentBatch,
     AssignmentItem,
     Call,
+    CallAssignmentConfiguration,
+    CallCOIConfiguration,
     CallManagingOrganisation,
     CallResourceTemplate,
     Proposal,
@@ -230,6 +234,13 @@ class Command(BaseCommand):
             "offering_user_groups": self.log_export_step(
                 "offering_user_groups", self.export_offering_user_groups
             ),
+            "posix_id_pools": self.log_export_step(
+                "posix_id_pools", self.export_posix_id_pools
+            ),
+            "service_provider_project_groups": self.log_export_step(
+                "service_provider_project_groups",
+                self.export_service_provider_project_groups,
+            ),
             # Checklist exports
             "checklists": self.log_export_step("checklists", self.export_checklists),
             "questions": self.log_export_step("questions", self.export_questions),
@@ -267,6 +278,13 @@ class Command(BaseCommand):
                 "call_managing_organisations", self.export_call_managing_organisations
             ),
             "calls": self.log_export_step("calls", self.export_calls),
+            "call_coi_configurations": self.log_export_step(
+                "call_coi_configurations", self.export_call_coi_configurations
+            ),
+            "call_assignment_configurations": self.log_export_step(
+                "call_assignment_configurations",
+                self.export_call_assignment_configurations,
+            ),
             "requested_offerings": self.log_export_step(
                 "requested_offerings", self.export_requested_offerings
             ),
@@ -1344,6 +1362,42 @@ class Command(BaseCommand):
             )
         return offering_user_groups
 
+    def export_posix_id_pools(self):
+        """Export POSIX ID pools with their UID, GID and project group ranges."""
+        pools = []
+        for pool in PosixIdPool.objects.select_related(
+            "offering", "service_provider"
+        ).order_by("created"):
+            item = {
+                "uuid": pool.uuid.hex,
+                "offering_uuid": pool.offering.uuid.hex if pool.offering_id else None,
+                "service_provider_uuid": (
+                    pool.service_provider.uuid.hex if pool.service_provider_id else None
+                ),
+                "description": pool.description,
+            }
+            for range_name in ("uid", "gid", "group_gid"):
+                for bound in ("min", "max", "next"):
+                    key = f"{bound}_{range_name}"
+                    item[key] = getattr(pool, key)
+            pools.append(item)
+        return pools
+
+    def export_service_provider_project_groups(self):
+        """Export provider project groups; the import pins their GIDs again."""
+        return [
+            {
+                "uuid": group.uuid.hex,
+                "service_provider_uuid": group.service_provider.uuid.hex,
+                "project_uuid": group.project.uuid.hex if group.project_id else None,
+                "name": group.name,
+                "gid": group.gid,
+            }
+            for group in ServiceProviderProjectGroup.objects.select_related(
+                "service_provider", "project"
+            ).order_by("created")
+        ]
+
     def export_checklists(self):
         """Export checklist data."""
         checklists = []
@@ -1745,6 +1799,48 @@ class Command(BaseCommand):
             )
         return calls
 
+    def export_call_coi_configurations(self):
+        """Export per-call conflict-of-interest configuration data."""
+        return [
+            {
+                "uuid": config.uuid.hex,
+                "call_uuid": config.call.uuid.hex,
+                "call_name": config.call.name,
+                "coauthorship_lookback_years": config.coauthorship_lookback_years,
+                "coauthorship_threshold_papers": config.coauthorship_threshold_papers,
+                "institutional_lookback_years": config.institutional_lookback_years,
+                "include_same_department": config.include_same_department,
+                "include_same_institution": config.include_same_institution,
+                "recusal_required_types": config.recusal_required_types,
+                "management_allowed_types": config.management_allowed_types,
+                "disclosure_only_types": config.disclosure_only_types,
+                "auto_detect_coauthorship": config.auto_detect_coauthorship,
+                "auto_detect_institutional": config.auto_detect_institutional,
+                "auto_detect_named_personnel": config.auto_detect_named_personnel,
+                "invitation_proposal_disclosure": config.invitation_proposal_disclosure,
+            }
+            for config in CallCOIConfiguration.objects.select_related("call").order_by(
+                "call__name", "uuid"
+            )
+        ]
+
+    def export_call_assignment_configurations(self):
+        """Export per-call reviewer assignment configuration data."""
+        return [
+            {
+                "uuid": config.uuid.hex,
+                "call_uuid": config.call.uuid.hex,
+                "call_name": config.call.name,
+                "auto_reassign_on_decline": config.auto_reassign_on_decline,
+                "max_auto_reassign_attempts": config.max_auto_reassign_attempts,
+                "assignment_expiration_days": config.assignment_expiration_days,
+                "send_reminder_before_expiry_days": config.send_reminder_before_expiry_days,
+            }
+            for config in CallAssignmentConfiguration.objects.select_related(
+                "call"
+            ).order_by("call__name", "uuid")
+        ]
+
     def export_requested_offerings(self):
         """Export requested offering data."""
         requested_offerings = []
@@ -1862,7 +1958,6 @@ class Command(BaseCommand):
                     if proposal.approved_by
                     else None,
                     "project_summary": proposal.project_summary,
-                    "project_duration": proposal.project_duration,
                     "allocation_comment": proposal.allocation_comment,
                     "slug": proposal.slug,
                     "created": proposal.created.isoformat()
@@ -1929,7 +2024,6 @@ class Command(BaseCommand):
                     "comment_project_title": review.comment_project_title,
                     "comment_project_summary": review.comment_project_summary,
                     "comment_project_description": review.comment_project_description,
-                    "comment_project_duration": review.comment_project_duration,
                     "comment_project_supporting_documentation": review.comment_project_supporting_documentation,
                     "comment_resource_requests": review.comment_resource_requests,
                     "comment_team": review.comment_team,

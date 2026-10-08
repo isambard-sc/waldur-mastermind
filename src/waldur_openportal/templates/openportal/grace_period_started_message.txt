@@ -1,0 +1,20 @@
+Your {{ site_name }} project "{{ project_name }}" has ended. Its last day of access was {{ last_access_date|date:"j F Y" }}.
+
+The project is now in its grace period of {{ grace_period_days }} days so that you can copy back your data.
+
+You MUST start copying back your data NOW.
+
+Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}. You will lose access on {{ deletion_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.
+{% if grace_change_deadline_is_today %}
+If you will not be able to copy back all of your data in time, you must contact the allocator of your project TODAY. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. After today, an extension is unlikely unless there are exceptional circumstances. The allocator will need evidence that you have already started copying back your data.
+{% elif grace_change_deadline_passed %}
+Changes to the grace period need to be requested at least {{ grace_change_notice_days }} days before the data is scheduled for deletion, and that date has now passed. An extension is therefore unlikely unless there are exceptional circumstances. If something unexpected is preventing you from copying back your data, contact the allocator of your project as soon as possible and explain what has happened. Otherwise, please make sure that you have copied back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}.
+{% else %}
+If you will not be able to copy back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}, contact the allocator of your project no later than {{ grace_change_deadline|date:"j F Y" }}, and please don't leave it until the last day: the earlier you ask, the more likely it is that an extension can be agreed. The allocator will need evidence that you have already started copying back your data.
+{% endif %}
+View your project at {{ project_url }}
+{% if docs_url %}
+For more information, read the documentation at {{ docs_url }}
+{% endif %}{% if support_url %}
+If you have any queries, please raise a ticket at {{ support_url }}
+{% endif %}

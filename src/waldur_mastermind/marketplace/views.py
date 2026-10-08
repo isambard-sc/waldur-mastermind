@@ -82,6 +82,7 @@ from rest_framework.serializers import Serializer
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist.mixins import ReviewerChecklistMixin, UserChecklistMixin
 from waldur_core.core import encryption
+from waldur_core.core import filters as core_filters
 from waldur_core.core import models as core_models
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core import utils as core_utils
@@ -110,7 +111,7 @@ from waldur_core.logging import models as logging_models
 from waldur_core.logging.enums import EventType
 from waldur_core.media import utils as media_utils
 from waldur_core.permissions import models as permission_models
-from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.filters import UserPermissionFilter
 from waldur_core.permissions.fixtures import (
     CustomerRole,
@@ -118,6 +119,8 @@ from waldur_core.permissions.fixtures import (
 from waldur_core.permissions.models import Role, UserRole
 from waldur_core.permissions.utils import (
     add_user,
+    check_pat_support_scope,
+    get_scope_ids,
     get_user_ids,
     has_permission,
     has_permission_on_any_source,
@@ -154,9 +157,15 @@ from waldur_core.users.utils import get_invitation_duplicates
 from waldur_mastermind.analytics import models as analytics_models
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices import serializers as invoice_serializers
-from waldur_mastermind.marketplace import billing_mode, callbacks, provider_accounts
+from waldur_mastermind.marketplace import (
+    billing_mode,
+    callbacks,
+    derived_limits,
+    provider_accounts,
+)
 from waldur_mastermind.marketplace import permissions as marketplace_permissions
 from waldur_mastermind.marketplace.catalog_loaders import (
+    cpu_targets_for_catalog,
     detect_eessi_version,
     detect_spack_version,
 )
@@ -206,11 +215,15 @@ from . import (
     filters,
     log,
     models,
+    offering_merge,
+    offering_merge_coverage,
+    offering_merge_rows,
     order_approval,
     permissions,
     plugins,
     posix_ids,
     posix_maintenance,
+    project_groups,
     serializers,
     tasks,
     utils,
@@ -231,6 +244,31 @@ OFFERING_SCOPED_SOURCES = ["offering", "offering.customer"]
 # A service provider manager holds their role on the ServiceProvider itself,
 # while organization owners hold theirs on its customer; accept either.
 SERVICE_PROVIDER_SOURCES = ["*", "customer"]
+
+# The same two holders, reached from an offering: the provider's organization
+# and the ServiceProvider record behind it.
+OFFERING_PROVIDER_SOURCES = ["customer", "customer.serviceprovider"]
+
+
+def readable_by_support(permission_function):
+    """Let global support through a read gate otherwise held by scoped roles.
+
+    Support can read every other reporting endpoint; an oversight body given
+    that role should not lose the provider-level reports.
+    """
+
+    def check(request, view, scope=None):
+        user = request.user
+        if user.is_active and user.is_support and check_pat_support_scope(request):
+            return
+        permission_function(request, view, scope)
+
+    # Keep the wrapped permission visible to the OpenAPI x-permissions export.
+    for attribute in ("permission", "sources"):
+        if hasattr(permission_function, attribute):
+            setattr(check, attribute, getattr(permission_function, attribute))
+
+    return check
 
 
 def get_allowed_offering_users_for_user(
@@ -431,16 +469,18 @@ class BaseMarketplaceView(core_views.ActionsViewSet):
 class PublicViewsetMixin:
     """Mixin to allow anonymous access to offerings when configured."""
 
+    public_actions = ("list", "retrieve")
+
     def get_permissions(self):
         # Check if this is schema generation context (drf-spectacular)
         # When generating schema, we want to include all fields
         if getattr(self, "swagger_fake_view", False):
             return super().get_permissions()
 
-        if config.ANONYMOUS_USER_CAN_VIEW_OFFERINGS and self.action in [
-            "list",
-            "retrieve",
-        ]:
+        if (
+            config.ANONYMOUS_USER_CAN_VIEW_OFFERINGS
+            and self.action in self.public_actions
+        ):
             return [rf_permissions.AllowAny()]
         else:
             return super().get_permissions()
@@ -762,6 +802,7 @@ class ServiceProviderViewSet(UserRoleMixin, PublicViewsetMixin, BaseMarketplaceV
             provider.account_options, serializer.validated_data["account_options"]
         )
         preview = provider_accounts.preview_account_options(provider, proposed)
+        preview["warnings"] = project_groups.switch_warnings(provider, proposed)
         return Response(preview, status=status.HTTP_200_OK)
 
     account_options_preview_permissions = [structure_permissions.is_owner]
@@ -814,9 +855,11 @@ class ServiceProviderViewSet(UserRoleMixin, PublicViewsetMixin, BaseMarketplaceV
     glauth_tree_permissions = [structure_permissions.is_service_manager]
 
     stat_permissions = [
-        permission_factory(
-            PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
-            SERVICE_PROVIDER_SOURCES,
+        readable_by_support(
+            permission_factory(
+                PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
+                SERVICE_PROVIDER_SOURCES,
+            )
         )
     ]
 
@@ -908,9 +951,11 @@ class ServiceProviderViewSet(UserRoleMixin, PublicViewsetMixin, BaseMarketplaceV
         )
 
     revenue_permissions = [
-        permission_factory(
-            PermissionEnum.GET_SERVICE_PROVIDER_REVENUE,
-            SERVICE_PROVIDER_SOURCES,
+        readable_by_support(
+            permission_factory(
+                PermissionEnum.GET_SERVICE_PROVIDER_REVENUE,
+                SERVICE_PROVIDER_SOURCES,
+            )
         )
     ]
 
@@ -1318,10 +1363,11 @@ class ServiceProviderProjectsViewSet(mixins.ListModelMixin, rf_viewsets.GenericV
         service_provider = get_object_or_404(
             models.ServiceProvider, uuid=self.kwargs["service_provider_uuid"]
         )
-        if not has_permission(
+        if not has_permission_on_any_source(
             self.request,
             PermissionEnum.LIST_SERVICE_PROVIDER_PROJECTS,
-            service_provider.customer,
+            service_provider,
+            SERVICE_PROVIDER_SOURCES,
         ):
             raise PermissionDenied()
         return service_provider
@@ -1434,10 +1480,11 @@ class ServiceProviderUsersViewSet(mixins.ListModelMixin, rf_viewsets.GenericView
         service_provider = get_object_or_404(
             models.ServiceProvider, uuid=self.kwargs["service_provider_uuid"]
         )
-        if not has_permission(
+        if not has_permission_on_any_source(
             self.request,
             PermissionEnum.LIST_SERVICE_PROVIDER_USERS,
-            service_provider.customer,
+            service_provider,
+            SERVICE_PROVIDER_SOURCES,
         ):
             raise PermissionDenied()
         return service_provider
@@ -2256,11 +2303,23 @@ class PosixIdPoolViewSet(core_views.ActionsViewSet):
                     ),
                     distinct=True,
                 ),
+                # A GID counts against the range it lies in: project groups
+                # against the group GID range when the pool has one.
                 gid_used=Count(
                     "identities",
                     filter=Q(
                         identities__released_at__isnull=True,
-                        identities__gid__isnull=False,
+                        identities__gid__gte=F("min_gid"),
+                        identities__gid__lte=F("max_gid"),
+                    ),
+                    distinct=True,
+                ),
+                group_gid_used=Count(
+                    "identities",
+                    filter=Q(
+                        identities__released_at__isnull=True,
+                        identities__gid__gte=F("min_group_gid"),
+                        identities__gid__lte=F("max_group_gid"),
                     ),
                     distinct=True,
                 ),
@@ -2493,6 +2552,135 @@ def validate_offering_username_generation_policy(offering):
         )
 
 
+# Model fields that the offering import copies from the imported data.
+OFFERING_IMPORT_FIELDS = (
+    "name",
+    "description",
+    "full_description",
+    "vendor_details",
+    "getting_started",
+    "integration_guide",
+    "type",
+    "shared",
+    "billable",
+    "country",
+    "latitude",
+    "longitude",
+    "access_url",
+    "paused_reason",
+)
+COMPONENT_IMPORT_FIELDS = (
+    "name",
+    "description",
+    "billing_type",
+    "measured_unit",
+    "unit_factor",
+    "limit_period",
+    "limit_amount",
+    "article_code",
+    "backend_id",
+)
+PLAN_IMPORT_FIELDS = (
+    "description",
+    "unit_price",
+    "unit",
+    "archived",
+    "max_amount",
+    "article_code",
+    "backend_id",
+)
+PLAN_COMPONENT_IMPORT_FIELDS = ("amount", "price", "future_price")
+TERMS_OF_SERVICE_IMPORT_FIELDS = (
+    "terms_of_service",
+    "terms_of_service_link",
+    "version",
+    "is_active",
+    "requires_reconsent",
+    "grace_period_days",
+)
+
+
+def _import_error(path, message):
+    return rf_exceptions.ValidationError({path: [message]})
+
+
+def _import_mapping(value, path):
+    """Return an imported mapping; a missing or null one is empty."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise _import_error(path, "Expected a mapping.")
+    return value
+
+
+def _import_list(data, key, path=None):
+    """Return the list of mappings stored under key.
+
+    A null section is treated as an absent one: it imports nothing, the same
+    way a null value is treated as an absent value everywhere else here.
+    """
+    path = path or key
+    items = data.get(key)
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise _import_error(path, "Expected a list.")
+    for index, item in enumerate(items):
+        _import_mapping(item, f"{path}[{index}]")
+    return [item or {} for item in items]
+
+
+def _import_value(field, value, path):
+    """Convert one imported value to the Python type of a model field.
+
+    Raises a 400 naming the field instead of letting the database reject it.
+    """
+    if isinstance(value, dict | list):
+        raise _import_error(path, "Expected a single value.")
+    try:
+        value = field.to_python(value)
+        if value not in field.empty_values:
+            if field.choices and value not in {
+                choice for choice, _label in field.flatchoices
+            }:
+                raise DjangoValidationError(
+                    f"'{value}' is not a valid choice.", code="invalid_choice"
+                )
+            field.run_validators(value)
+    except DjangoValidationError as e:
+        raise rf_exceptions.ValidationError({path: e.messages})
+    return value
+
+
+def _import_fields(model, data, field_names, path):
+    """Return the imported values of field_names that should be written.
+
+    A missing key, or null for a column that cannot hold null, is left out, so
+    the object keeps its current value on update and its model default on
+    create. A nullable column takes null as a value.
+    """
+    values = {}
+    for name in field_names:
+        if name not in data:
+            continue
+        field = model._meta.get_field(name)
+        value = data[name]
+        if value is None:
+            if field.null:
+                values[name] = None
+            continue
+        values[name] = _import_value(field, value, f"{path}.{name}")
+    return values
+
+
+def _import_lookup(model, data, key, path):
+    """Return the required, non-empty value that identifies an imported object."""
+    value = data.get(key)
+    if value is None or value == "":
+        raise _import_error(f"{path}.{key}", "This field is required.")
+    return _import_value(model._meta.get_field(key), value, f"{path}.{key}")
+
+
 @extend_schema_view(
     list=extend_schema(
         summary="List provider offerings",
@@ -2652,7 +2840,9 @@ class ProviderOfferingViewSet(
             queryset = utils.annotate_scope_resource(queryset)
 
         # account_settings falls back to the offering's service provider.
-        return queryset.select_related("customer__serviceprovider")
+        return queryset.select_related(
+            "customer__serviceprovider", "compliance_checklist"
+        )
 
     destroy_permissions = [
         marketplace_permissions.can_manage_offering_lifecycle,
@@ -3623,7 +3813,14 @@ class ProviderOfferingViewSet(
         page = self.paginate_queryset(serializer.data)
         return self.get_paginated_response(page)
 
-    customers_permissions = [structure_permissions.is_owner]
+    customers_permissions = [
+        readable_by_support(
+            permission_factory(
+                PermissionEnum.LIST_SERVICE_PROVIDER_CUSTOMERS,
+                OFFERING_PROVIDER_SOURCES,
+            )
+        )
+    ]
 
     def get_stats(self, get_queryset, serializer, serializer_context=None):
         offering: models.Offering = self.get_object()
@@ -3672,7 +3869,13 @@ class ProviderOfferingViewSet(
             utils.get_offering_costs, serializers.ProviderOfferingCostsSerializer
         )
 
-    costs_permissions = [structure_permissions.is_owner]
+    costs_permissions = [
+        readable_by_support(
+            permission_factory(
+                PermissionEnum.GET_SERVICE_PROVIDER_REVENUE, OFFERING_PROVIDER_SOURCES
+            )
+        )
+    ]
 
     @extend_schema(
         parameters=[
@@ -3727,7 +3930,14 @@ class ProviderOfferingViewSet(
             serializer_context,
         )
 
-    component_stats_permissions = [structure_permissions.is_owner]
+    component_stats_permissions = [
+        readable_by_support(
+            permission_factory(
+                PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
+                OFFERING_PROVIDER_SOURCES,
+            )
+        )
+    ]
 
     @extend_schema(
         summary="Get offering statistics",
@@ -3765,7 +3975,14 @@ class ProviderOfferingViewSet(
             status=status.HTTP_200_OK,
         )
 
-    stats_permissions = [structure_permissions.is_owner]
+    stats_permissions = [
+        readable_by_support(
+            permission_factory(
+                PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
+                OFFERING_PROVIDER_SOURCES,
+            )
+        )
+    ]
 
     @extend_schema(
         summary="Get offering resource and user state counters",
@@ -3812,7 +4029,14 @@ class ProviderOfferingViewSet(
         serializer = serializers.OfferingStateCountersSerializer(instance=data)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-    state_counters_permissions = [structure_permissions.is_owner]
+    state_counters_permissions = [
+        readable_by_support(
+            permission_factory(
+                PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
+                OFFERING_PROVIDER_SOURCES,
+            )
+        )
+    ]
 
     @extend_schema(
         summary="Update organization groups for offering",
@@ -4321,6 +4545,21 @@ class ProviderOfferingViewSet(
                         "The component %s cannot be removed because it is builtin"
                     )
                     % offering_component.type
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        option = derived_limits.referenced_components(
+            (offering.options or {}).get("options")
+        ).get(offering_component.type)
+        if option:
+            return Response(
+                {
+                    "details": _(
+                        "The component %(component)s is used by order option "
+                        "%(option)s; change or remove that option first."
+                    )
+                    % {"component": offering_component.type, "option": option}
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -5769,8 +6008,12 @@ class ProviderOfferingViewSet(
         except yaml.YAMLError as e:
             raise rf_exceptions.ValidationError(f"Invalid YAML data: {str(e)}")
 
+        if not isinstance(import_data, dict):
+            raise _import_error("offering_data", "Expected a mapping.")
+
         warnings = []
 
+        # Any validation error below rolls back everything imported so far.
         with transaction.atomic():
             # Create or update offering
             offering, created, offering_warnings = self._import_offering_data(
@@ -5782,38 +6025,37 @@ class ProviderOfferingViewSet(
             imported_components = []
 
             if params.get("import_components", True) and "components" in import_data:
+                components_data = _import_list(import_data, "components")
                 component_warnings = self._import_offering_components(
-                    offering, import_data["components"]
+                    offering, components_data
                 )
                 warnings.extend(component_warnings)
-                imported_components.extend(
-                    [c["type"] for c in import_data["components"]]
-                )
+                imported_components.extend([str(c["type"]) for c in components_data])
 
             if params.get("import_plans", True) and "plans" in import_data:
                 plan_warnings = self._import_offering_plans(
-                    offering, import_data["plans"]
+                    offering, _import_list(import_data, "plans")
                 )
                 warnings.extend(plan_warnings)
                 imported_components.append("plans")
 
             if params.get("import_screenshots", True) and "screenshots" in import_data:
                 screenshot_warnings = self._import_offering_screenshots(
-                    offering, import_data["screenshots"]
+                    offering, _import_list(import_data, "screenshots")
                 )
                 warnings.extend(screenshot_warnings)
                 imported_components.append("screenshots")
 
             if params.get("import_files", True) and "files" in import_data:
                 file_warnings = self._import_offering_files(
-                    offering, import_data["files"]
+                    offering, _import_list(import_data, "files")
                 )
                 warnings.extend(file_warnings)
                 imported_components.append("files")
 
             if params.get("import_endpoints", True) and "endpoints" in import_data:
                 endpoint_warnings = self._import_offering_endpoints(
-                    offering, import_data["endpoints"]
+                    offering, _import_list(import_data, "endpoints")
                 )
                 warnings.extend(endpoint_warnings)
                 imported_components.append("endpoints")
@@ -5823,7 +6065,7 @@ class ProviderOfferingViewSet(
                 and "organization_groups" in import_data
             ):
                 group_warnings = self._import_organization_groups(
-                    offering, import_data["organization_groups"]
+                    offering, _import_list(import_data, "organization_groups")
                 )
                 warnings.extend(group_warnings)
                 imported_components.append("organization_groups")
@@ -5833,7 +6075,7 @@ class ProviderOfferingViewSet(
                 and "terms_of_service" in import_data
             ):
                 terms_warnings = self._import_terms_of_service(
-                    offering, import_data["terms_of_service"]
+                    offering, _import_list(import_data, "terms_of_service")
                 )
                 warnings.extend(terms_warnings)
                 imported_components.append("terms_of_service")
@@ -5853,7 +6095,15 @@ class ProviderOfferingViewSet(
 
     def _import_offering_data(self, import_data, params, user):
         """Import core offering data."""
-        offering_data = import_data.get("offering", {})
+        offering_data = _import_mapping(import_data.get("offering"), "offering")
+        offering_values = _import_fields(
+            models.Offering, offering_data, OFFERING_IMPORT_FIELDS, "offering"
+        )
+        # The name identifies the offering, both for the user and for the
+        # lookup of the offering an overwriting import updates.
+        offering_values["name"] = _import_lookup(
+            models.Offering, offering_data, "name", "offering"
+        )
         warnings = []
         created = False
 
@@ -5900,13 +6150,10 @@ class ProviderOfferingViewSet(
             raise rf_exceptions.ValidationError("No target category specified or found")
 
         # Check if offering exists
-        offering_name = offering_data.get("name")
-        existing_offering = None
-
-        if offering_name:
-            existing_offering = models.Offering.objects.filter(
-                name=offering_name, customer=customer
-            ).first()
+        offering_name = offering_values["name"]
+        existing_offering = models.Offering.objects.filter(
+            name=offering_name, customer=customer
+        ).first()
 
         if existing_offering:
             if not params.get("overwrite_existing", False):
@@ -5919,30 +6166,8 @@ class ProviderOfferingViewSet(
             created = True
 
         # Update offering fields
-        offering.name = offering_data.get("name", offering.name)
-        offering.description = offering_data.get("description", offering.description)
-        offering.full_description = offering_data.get(
-            "full_description", offering.full_description
-        )
-        offering.vendor_details = offering_data.get(
-            "vendor_details", offering.vendor_details
-        )
-        offering.getting_started = offering_data.get(
-            "getting_started", offering.getting_started
-        )
-        offering.integration_guide = offering_data.get(
-            "integration_guide", offering.integration_guide
-        )
-        offering.type = offering_data.get("type", offering.type)
-        offering.shared = offering_data.get("shared", offering.shared)
-        offering.billable = offering_data.get("billable", offering.billable)
-        offering.country = offering_data.get("country", offering.country)
-        offering.latitude = offering_data.get("latitude", offering.latitude)
-        offering.longitude = offering_data.get("longitude", offering.longitude)
-        offering.access_url = offering_data.get("access_url", offering.access_url)
-        offering.paused_reason = offering_data.get(
-            "paused_reason", offering.paused_reason
-        )
+        for name, value in offering_values.items():
+            setattr(offering, name, value)
 
         # Always set imported offerings to DRAFT state for security
         # Users must use proper state transition actions (activate, pause, etc.) after import
@@ -5956,25 +6181,26 @@ class ProviderOfferingViewSet(
         # Update JSON fields based on import parameters
         # Note: plugin_options, secret_options, and resource_options are exported
         # at the import_data level (sibling to "offering"), not inside offering_data
+        # A null JSON section keeps the current value: the columns are not nullable.
         if (
             params.get("import_plugin_options", True)
-            and "plugin_options" in import_data
+            and import_data.get("plugin_options") is not None
         ):
             offering.plugin_options = import_data["plugin_options"]
 
         if (
             params.get("import_secret_options", False)
-            and "secret_options" in import_data
+            and import_data.get("secret_options") is not None
         ):
             offering.secret_options = import_data["secret_options"]
 
-        if "attributes" in offering_data:
+        if offering_data.get("attributes") is not None:
             offering.attributes = offering_data["attributes"]
 
-        if "options" in offering_data:
+        if offering_data.get("options") is not None:
             offering.options = offering_data["options"]
 
-        if "resource_options" in import_data:
+        if import_data.get("resource_options") is not None:
             offering.resource_options = import_data["resource_options"]
 
         offering.save()
@@ -5984,51 +6210,27 @@ class ProviderOfferingViewSet(
         """Import offering components."""
         warnings = []
 
-        for component_data in components_data:
+        for index, component_data in enumerate(components_data):
+            path = f"components[{index}]"
+            component_type = _import_lookup(
+                models.OfferingComponent, component_data, "type", path
+            )
+            values = _import_fields(
+                models.OfferingComponent,
+                component_data,
+                COMPONENT_IMPORT_FIELDS,
+                path,
+            )
             component, created = models.OfferingComponent.objects.get_or_create(
                 offering=offering,
-                type=component_data["type"],
-                defaults={
-                    "name": component_data.get("name", ""),
-                    "description": component_data.get("description", ""),
-                    "billing_type": component_data.get("billing_type", ""),
-                    "measured_unit": component_data.get("measured_unit", ""),
-                    "unit_factor": component_data.get("unit_factor", 1),
-                    "limit_period": component_data.get("limit_period")
-                    or LimitPeriods.MONTH,
-                    "limit_amount": component_data.get("limit_amount"),
-                    "article_code": component_data.get("article_code", ""),
-                    "backend_id": component_data.get("backend_id", ""),
-                },
+                type=component_type,
+                defaults=values,
             )
 
             if not created:
                 # Update existing component
-                component.name = component_data.get("name", component.name)
-                component.description = component_data.get(
-                    "description", component.description
-                )
-                component.billing_type = component_data.get(
-                    "billing_type", component.billing_type
-                )
-                component.measured_unit = component_data.get(
-                    "measured_unit", component.measured_unit
-                )
-                component.unit_factor = component_data.get(
-                    "unit_factor", component.unit_factor
-                )
-                component.limit_period = component_data.get(
-                    "limit_period", component.limit_period
-                )
-                component.limit_amount = component_data.get(
-                    "limit_amount", component.limit_amount
-                )
-                component.article_code = component_data.get(
-                    "article_code", component.article_code
-                )
-                component.backend_id = component_data.get(
-                    "backend_id", component.backend_id
-                )
+                for name, value in values.items():
+                    setattr(component, name, value)
                 component.save()
 
         return warnings
@@ -6037,66 +6239,61 @@ class ProviderOfferingViewSet(
         """Import offering plans."""
         warnings = []
 
-        for plan_data in plans_data:
+        for index, plan_data in enumerate(plans_data):
+            path = f"plans[{index}]"
+            plan_name = _import_lookup(models.Plan, plan_data, "name", path)
+            values = _import_fields(models.Plan, plan_data, PLAN_IMPORT_FIELDS, path)
             plan, created = models.Plan.objects.get_or_create(
                 offering=offering,
-                name=plan_data["name"],
-                defaults={
-                    "description": plan_data.get("description", ""),
-                    "unit_price": plan_data.get("unit_price", 0),
-                    "unit": plan_data.get("unit", ""),
-                    "archived": plan_data.get("archived", False),
-                    "max_amount": plan_data.get("max_amount"),
-                    "article_code": plan_data.get("article_code", ""),
-                    "backend_id": plan_data.get("backend_id", ""),
-                },
+                name=plan_name,
+                defaults=values,
             )
 
             if not created:
                 # Update existing plan
-                plan.description = plan_data.get("description", plan.description)
-                plan.unit_price = plan_data.get("unit_price", plan.unit_price)
-                plan.unit = plan_data.get("unit", plan.unit)
-                plan.archived = plan_data.get("archived", plan.archived)
-                plan.max_amount = plan_data.get("max_amount", plan.max_amount)
-                plan.article_code = plan_data.get("article_code", plan.article_code)
-                plan.backend_id = plan_data.get("backend_id", plan.backend_id)
+                for name, value in values.items():
+                    setattr(plan, name, value)
                 plan.save()
 
             # Import plan components
-            for component_data in plan_data.get("components", []):
+            components_path = f"{path}.components"
+            plan_components_data = _import_list(
+                plan_data, "components", components_path
+            )
+            for component_index, component_data in enumerate(plan_components_data):
+                component_path = f"{components_path}[{component_index}]"
                 component_type = component_data.get("component_type")
-                if component_type:
-                    try:
-                        component = offering.components.get(type=component_type)
-                        plan_component, created = (
-                            models.PlanComponent.objects.get_or_create(
-                                plan=plan,
-                                component=component,
-                                defaults={
-                                    "amount": component_data.get("amount", 0),
-                                    "price": component_data.get("price", 0),
-                                    "future_price": component_data.get("future_price"),
-                                },
-                            )
-                        )
+                if component_type is None or component_type == "":
+                    continue
+                component_type = _import_value(
+                    models.OfferingComponent._meta.get_field("type"),
+                    component_type,
+                    f"{component_path}.component_type",
+                )
+                component_values = _import_fields(
+                    models.PlanComponent,
+                    component_data,
+                    PLAN_COMPONENT_IMPORT_FIELDS,
+                    component_path,
+                )
+                try:
+                    component = offering.components.get(type=component_type)
+                except models.OfferingComponent.DoesNotExist:
+                    warnings.append(
+                        f"Component type '{component_type}' not found for plan '{plan.name}'"
+                    )
+                    continue
 
-                        if not created:
-                            plan_component.amount = component_data.get(
-                                "amount", plan_component.amount
-                            )
-                            plan_component.price = component_data.get(
-                                "price", plan_component.price
-                            )
-                            plan_component.future_price = component_data.get(
-                                "future_price", plan_component.future_price
-                            )
-                            plan_component.save()
+                plan_component, created = models.PlanComponent.objects.get_or_create(
+                    plan=plan,
+                    component=component,
+                    defaults=component_values,
+                )
 
-                    except models.OfferingComponent.DoesNotExist:
-                        warnings.append(
-                            f"Component type '{component_type}' not found for plan '{plan.name}'"
-                        )
+                if not created:
+                    for name, value in component_values.items():
+                        setattr(plan_component, name, value)
+                    plan_component.save()
 
         return warnings
 
@@ -6104,26 +6301,32 @@ class ProviderOfferingViewSet(
         """Import offering screenshots."""
         warnings = []
 
-        for screenshot_data in screenshots_data:
-            screenshot_name = screenshot_data.get("name", "")
+        for index, screenshot_data in enumerate(screenshots_data):
+            path = f"screenshots[{index}]"
+            # The name identifies the screenshot within the offering.
+            screenshot_name = _import_lookup(
+                models.Screenshot, screenshot_data, "name", path
+            )
+            values = _import_fields(
+                models.Screenshot, screenshot_data, ("description",), path
+            )
+            description = values.get("description", "")
 
             # Check if we have base64 content to import
-            if "image_content" in screenshot_data:
+            if screenshot_data.get("image_content"):
                 try:
                     # Decode base64 content
                     image_content = base64.b64decode(screenshot_data["image_content"])
-                    filename = screenshot_data.get(
-                        "image_filename", f"{screenshot_name}.png"
+                    filename = (
+                        screenshot_data.get("image_filename")
+                        or f"{screenshot_name}.png"
                     )
-                    screenshot_data.get("content_type", "image/png")
 
                     # Create screenshot with content
                     screenshot, created = models.Screenshot.objects.get_or_create(
                         offering=offering,
                         name=screenshot_name,
-                        defaults={
-                            "description": screenshot_data.get("description", ""),
-                        },
+                        defaults={"description": description},
                     )
 
                     # Save the image content
@@ -6131,10 +6334,8 @@ class ProviderOfferingViewSet(
                         filename, ContentFile(image_content), save=True
                     )
 
-                    if not created:
-                        screenshot.description = screenshot_data.get(
-                            "description", screenshot.description
-                        )
+                    if not created and "description" in values:
+                        screenshot.description = description
                         screenshot.save()
 
                 except Exception as e:
@@ -6146,14 +6347,10 @@ class ProviderOfferingViewSet(
                 screenshot, created = models.Screenshot.objects.get_or_create(
                     offering=offering,
                     name=screenshot_name,
-                    defaults={
-                        "description": screenshot_data.get("description", ""),
-                    },
+                    defaults={"description": description},
                 )
-                if not created:
-                    screenshot.description = screenshot_data.get(
-                        "description", screenshot.description
-                    )
+                if not created and "description" in values:
+                    screenshot.description = description
                     screenshot.save()
 
                 if "image_url" in screenshot_data:
@@ -6167,16 +6364,18 @@ class ProviderOfferingViewSet(
         """Import offering files."""
         warnings = []
 
-        for file_data in files_data:
-            file_name = file_data.get("name", "")
+        for index, file_data in enumerate(files_data):
+            # The name identifies the file within the offering.
+            file_name = _import_lookup(
+                models.OfferingFile, file_data, "name", f"files[{index}]"
+            )
 
             # Check if we have base64 content to import
-            if "file_content" in file_data:
+            if file_data.get("file_content"):
                 try:
                     # Decode base64 content
                     content = base64.b64decode(file_data["file_content"])
-                    filename = file_data.get("filename", file_name)
-                    file_data.get("content_type", "application/octet-stream")
+                    filename = file_data.get("filename") or file_name
 
                     # Create or update file with content
                     offering_file, created = models.OfferingFile.objects.get_or_create(
@@ -6205,17 +6404,22 @@ class ProviderOfferingViewSet(
         """Import offering access endpoints."""
         warnings = []
 
-        for endpoint_data in endpoints_data:
+        for index, endpoint_data in enumerate(endpoints_data):
+            path = f"endpoints[{index}]"
+            endpoint_name = _import_lookup(
+                models.OfferingAccessEndpoint, endpoint_data, "name", path
+            )
+            values = _import_fields(
+                models.OfferingAccessEndpoint, endpoint_data, ("url",), path
+            )
             endpoint, created = models.OfferingAccessEndpoint.objects.get_or_create(
                 offering=offering,
-                name=endpoint_data["name"],
-                defaults={
-                    "url": endpoint_data.get("url", ""),
-                },
+                name=endpoint_name,
+                defaults=values,
             )
 
-            if not created:
-                endpoint.url = endpoint_data.get("url", endpoint.url)
+            if not created and "url" in values:
+                endpoint.url = values["url"]
                 endpoint.save()
 
         return warnings
@@ -6224,18 +6428,21 @@ class ProviderOfferingViewSet(
         """Import organization groups associations."""
         warnings = []
 
-        for group_data in groups_data:
-            group_name = group_data.get("name")
-            if group_name:
-                try:
-                    group = structure_models.OrganizationGroup.objects.get(
-                        name=group_name
-                    )
-                    offering.organization_groups.add(group)
-                except structure_models.OrganizationGroup.DoesNotExist:
-                    warnings.append(
-                        f"Organization group with name '{group_name}' not found"
-                    )
+        for index, group_data in enumerate(groups_data):
+            # A group is referenced by name, so an entry without one is unusable.
+            group_name = _import_lookup(
+                structure_models.OrganizationGroup,
+                group_data,
+                "name",
+                f"organization_groups[{index}]",
+            )
+            try:
+                group = structure_models.OrganizationGroup.objects.get(name=group_name)
+                offering.organization_groups.add(group)
+            except structure_models.OrganizationGroup.DoesNotExist:
+                warnings.append(
+                    f"Organization group with name '{group_name}' not found"
+                )
 
         return warnings
 
@@ -6243,23 +6450,20 @@ class ProviderOfferingViewSet(
         """Import terms of service configurations."""
         warnings = []
 
-        for terms_config_data in terms_data:
+        for index, terms_config_data in enumerate(terms_data):
+            values = _import_fields(
+                models.OfferingTermsOfService,
+                terms_config_data,
+                TERMS_OF_SERVICE_IMPORT_FIELDS,
+                f"terms_of_service[{index}]",
+            )
             # Deactivate existing active terms if we're importing a new active one
-            if terms_config_data.get("is_active", False):
+            if values.get("is_active", False):
                 offering.terms_of_service_configs.filter(is_active=True).update(
                     is_active=False
                 )
 
-            models.OfferingTermsOfService.objects.create(
-                offering=offering,
-                terms_of_service=terms_config_data.get("terms_of_service", ""),
-                terms_of_service_link=terms_config_data.get("terms_of_service_link", "")
-                or "",
-                version=terms_config_data.get("version", ""),
-                is_active=terms_config_data.get("is_active", False),
-                requires_reconsent=terms_config_data.get("requires_reconsent", False),
-                grace_period_days=terms_config_data.get("grace_period_days", 60),
-            )
+            models.OfferingTermsOfService.objects.create(offering=offering, **values)
 
         return warnings
 
@@ -6741,6 +6945,13 @@ class ProviderResourceProjectViewSet(UserRoleMixin, core_views.ActionsViewSet):
             user
         )
         return qs.filter(resource__in=provider_resources)
+
+    def get_user_roles_queryset(self, scope, user=None):
+        # list_users would otherwise return every grant on the resource project,
+        # including users who have not accepted the offering's terms.
+        return utils.user_roles_for_provider_caller(
+            self.request.user, scope, scope.resource.offering, user
+        )
 
     @extend_schema(responses={status.HTTP_200_OK: StatusSerializer})
     @action(detail=True, methods=["post"])
@@ -7781,7 +7992,49 @@ class OrderViewSet(
         attributes = serializer.validated_data.get("attributes")
         if attributes:
             order.attributes.update(attributes)
-            order.save(update_fields=["attributes"])
+            update_fields = ["attributes"]
+            if order.type == OrderTypes.CREATE:
+                # The provider may have changed an input that limits are
+                # derived from; the limits, and so the price, follow it.
+                limits = utils.apply_derived_limits(
+                    order.limits or {},
+                    order.offering,
+                    order.attributes,
+                    plan=order.plan,
+                )
+                if limits != (order.limits or {}):
+                    utils.validate_limits(
+                        limits, order.offering, is_creation=True, plan=order.plan
+                    )
+                    order.limits = limits
+                    order.init_cost()
+                    update_fields += ["limits", "cost"]
+                # The resource took its options and attributes from the order
+                # when it was placed; they follow the provider's change.
+                utils.copy_order_options_to_resource(order)
+                utils.copy_order_attributes_to_resource(order)
+            elif (
+                order.type == OrderTypes.UPDATE
+                and "old_limits" in order.attributes
+                and order.attributes.get("new_options")
+                and order.resource
+            ):
+                # The same for a changed formula input on an existing resource.
+                limits = utils.validate_limits(
+                    order.limits or {},
+                    order.offering,
+                    order.resource,
+                    plan=order.plan,
+                    attributes=utils.derived_limit_inputs(
+                        order.resource, order.attributes["new_options"]
+                    ),
+                    fallback=order.resource.limits,
+                )
+                if limits != (order.limits or {}):
+                    order.limits = limits
+                    order.init_cost()
+                    update_fields += ["limits", "cost"]
+            order.save(update_fields=update_fields)
         order.review_by_provider(request.user)
 
         # After provider approval, check for the order's own start_date
@@ -8604,17 +8857,45 @@ class BaseResourceViewSet(
         request,
         resource: models.Resource,
         switch_price=None,
+        order_author=None,
         **kwargs,
     ):
+        """Place an order for an action on an existing resource.
+
+        ``order_author`` names somebody other than the caller as the person the
+        order is for. It has no HTTP spelling -- the router only ever supplies
+        ``uuid`` -- and is reserved for the automated termination sweeps, which
+        replay this view as the system robot because both resolving the
+        resource and the delete leg that follows need a role on the project
+        that the person named need not hold. Such an order is marked
+        ``placed_automatically``: ``created_by`` says who it is for, and
+        ``utils.get_order_processing_user`` keeps the work on the robot.
+        """
         self.ensure_resource_operations_allowed(resource)
         with transaction.atomic():
             order = models.Order(
                 project=resource.project,
-                created_by=request.user,
+                created_by=order_author or request.user,
+                placed_automatically=order_author is not None,
                 resource=resource,
                 offering=resource.offering,
                 **kwargs,
             )
+            if (
+                order_author is not None
+                and not permissions.order_is_held_for_purchase_order(order)
+            ):
+                # Record the consumer approval up front, the way proposal
+                # allocation does. The decision was taken elsewhere -- an end
+                # date reached, a cost policy fired -- and the person named
+                # holds no role to approve with, so the order would sit in
+                # PENDING_CONSUMER and mail every approver on the project about
+                # something the robot force-approves moments later. The stamp
+                # has to be on the unsaved order: it is what
+                # notify_approvers_when_order_is_created reads the moment
+                # save() fires.
+                order.consumer_reviewed_by = request.user
+                order.consumer_reviewed_at = timezone.now()
             serializers.validate_order(order, request)
             order.init_cost()
 
@@ -8636,7 +8917,7 @@ class BaseResourceViewSet(
         responses=serializers.OrderUUIDSerializer,
     )
     @action(detail=True, methods=["post"])
-    def terminate(self, request, uuid=None):
+    def terminate(self, request, uuid=None, order_author=None):
         resource: models.Resource = self.get_object()
 
         serializer = self.get_serializer(data=request.data)
@@ -8663,6 +8944,7 @@ class BaseResourceViewSet(
             resource=resource,
             type=OrderTypes.TERMINATE,
             attributes=attributes,
+            order_author=order_author,
         )
 
     @extend_schema(responses={status.HTTP_200_OK: serializers.OrderUUIDSerializer})
@@ -8675,17 +8957,19 @@ class BaseResourceViewSet(
                 _("Restoring resource is not supported for this offering type.")
             )
 
-        resource.set_state_creating()
-        resource.save(update_fields=["state"])
+        with transaction.atomic():
+            utils.lock_and_validate_unique_options_of_resource(resource)
+            resource.set_state_creating()
+            resource.save(update_fields=["state"])
 
-        return self.create_resource_order(
-            request=request,
-            resource=resource,
-            type=OrderTypes.RESTORE,
-            attributes=resource.attributes,
-            plan=resource.plan,
-            limits=resource.limits,
-        )
+            return self.create_resource_order(
+                request=request,
+                resource=resource,
+                type=OrderTypes.RESTORE,
+                attributes=resource.attributes,
+                plan=resource.plan,
+                limits=resource.limits,
+            )
 
     restore_permissions = [
         permission_factory(
@@ -9224,6 +9508,47 @@ class BaseResourceViewSet(
         serializer = self.get_serializer(data=request.data, instance=resource)
         serializer.is_valid(raise_exception=True)
 
+        # A changed formula input changes the limits calculated from it, and so
+        # the price: it is always ordered, with the new limits on the order,
+        # which needs order creation rights whatever the offering says.
+        new_options = serializer.validated_data.get("options", {})
+        changed = utils.changed_derived_inputs(resource, new_options)
+        if changed:
+            permissions.check_order_creation_permission_as_consumer(
+                request, self, resource
+            )
+            limits = utils.validate_limits(
+                resource.limits or {},
+                resource.offering,
+                resource,
+                attributes=utils.derived_limit_inputs(resource, new_options),
+                fallback=resource.limits,
+            )
+            # A pending update order reserves its unique values, so they are
+            # re-checked under the lock in the transaction that creates it.
+            with transaction.atomic():
+                serializer.lock_and_validate_unique_options()
+                return self.create_resource_order(
+                    request=request,
+                    resource=resource,
+                    plan=resource.plan,
+                    type=OrderTypes.UPDATE,
+                    limits=limits,
+                    attributes={
+                        # A resource ordered before its resource option existed
+                        # has the old value only in its attributes.
+                        "old_options": {
+                            **(resource.options or {}),
+                            **{
+                                name: utils.derived_limit_inputs(resource).get(name)
+                                for name in changed
+                            },
+                        },
+                        "new_options": new_options,
+                        "old_limits": resource.limits,
+                    },
+                )
+
         # Check if offering requires order creation for option changes
         if resource.offering.plugin_options.get(
             "create_orders_on_resource_option_change"
@@ -9232,14 +9557,19 @@ class BaseResourceViewSet(
             old_options = resource.options or {}
             new_options = serializer.validated_data.get("options", {})
 
-            # Create order for option change
-            return self.create_resource_order(
-                request=request,
-                resource=resource,
-                plan=resource.plan,
-                type=OrderTypes.UPDATE,
-                attributes={"old_options": old_options, "new_options": new_options},
-            )
+            # Create order for option change; as above, it reserves the values.
+            with transaction.atomic():
+                serializer.lock_and_validate_unique_options()
+                return self.create_resource_order(
+                    request=request,
+                    resource=resource,
+                    plan=resource.plan,
+                    type=OrderTypes.UPDATE,
+                    attributes={
+                        "old_options": old_options,
+                        "new_options": new_options,
+                    },
+                )
         else:
             # Direct update without order
             serializer.save()
@@ -9575,13 +9905,23 @@ class ConsumerResourceViewSet(UserRoleMixin, BaseResourceViewSet):
         serializer.is_valid(raise_exception=True)
         plan = serializer.validated_data["plan"]
 
+        # The new plan may round a derived limit differently, or not bill its
+        # component as a limit at all, which refuses the switch.
+        limits = utils.apply_derived_limits(
+            resource.limits or {},
+            resource.offering,
+            utils.derived_limit_inputs(resource),
+            plan=plan,
+            fallback=resource.limits,
+        )
+
         return self.create_resource_order(
             request=request,
             resource=resource,
             old_plan=resource.plan,
             plan=plan,
             type=OrderTypes.UPDATE,
-            limits=resource.limits or {},
+            limits=limits,
         )
 
     switch_plan_serializer_class = serializers.ResourceSwitchPlanSerializer
@@ -9608,12 +9948,13 @@ class ConsumerResourceViewSet(UserRoleMixin, BaseResourceViewSet):
         request_comment = serializer.validated_data.get("request_comment", "")
         attachment = serializer.validated_data.get("attachment")
 
+        # Derived limits are set by the server, so compare what it would order.
+        limits = utils.validate_limits(limits, resource.offering, resource)
+
         if resource.limits == limits:
             raise ValidationError(
                 "Impossible to create update orders with limits set to exactly the same."
             )
-
-        utils.validate_limits(limits, resource.offering, resource)
 
         return self.create_resource_order(
             request=request,
@@ -9932,6 +10273,11 @@ class ProviderResourceViewSet(UserRoleMixin, BaseResourceViewSet):
             )
         )
 
+    def get_user_roles_queryset(self, scope, user=None):
+        return utils.user_roles_for_provider_caller(
+            self.request.user, scope, scope.offering, user
+        )
+
     @extend_schema(
         summary="Get resource team",
         description=(
@@ -9968,6 +10314,55 @@ class ProviderResourceViewSet(UserRoleMixin, BaseResourceViewSet):
         elif request.query_params.get("has_consent", "").lower() == "true":
             users = utils.filter_users_with_active_offering_consent(users, offering)
         return utils.build_resource_team_response(resource, request, users)
+
+    @extend_schema(
+        summary="List users a robot account on this resource may link",
+        description=(
+            "Returns the project and organization users of this resource that a "
+            "robot account may link as users or as the responsible user. When "
+            "ENFORCE_USER_CONSENT_FOR_OFFERINGS is enabled and the offering has "
+            "active Terms of Service, only users with active consent are returned, "
+            "for every caller."
+        ),
+        request=None,
+        responses=structure_serializers.BasicUserSerializer(many=True),
+        filters=False,
+        parameters=[
+            OpenApiParameter(
+                name="full_name",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                description="Filter by full name.",
+                required=False,
+            ),
+            OpenApiParameter(
+                name="user_keyword",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                description="Filter by full name, username or email.",
+                required=False,
+            ),
+        ],
+    )
+    @action(detail=True, methods=["get"], filter_backends=[])
+    def robot_account_users(self, request, uuid=None):
+        resource: models.Resource = self.get_object()
+        users = utils.get_robot_account_linkable_users(resource)
+        full_name = request.query_params.get("full_name")
+        if full_name:
+            users = core_filters.filter_by_full_name(users, full_name)
+        user_keyword = request.query_params.get("user_keyword")
+        if user_keyword:
+            users = core_filters.filter_by_user_keyword(users, user_keyword)
+        page = self.paginate_queryset(
+            users.order_by("first_name", "last_name", "username")
+        )
+        serializer = structure_serializers.BasicUserSerializer(
+            page, many=True, context={"request": request}
+        )
+        return self.get_paginated_response(serializer.data)
+
+    robot_account_users_permissions = [permissions.can_link_robot_account_users]
 
     @extend_schema(
         summary="Set end date by provider",
@@ -10097,6 +10492,21 @@ class ProviderResourceViewSet(UserRoleMixin, BaseResourceViewSet):
         resource = cast(models.Resource, self.get_object())
         serializer = self.get_serializer(data=request.data, instance=resource)
         serializer.is_valid(raise_exception=True)
+        changed = utils.changed_derived_inputs(
+            resource, serializer.validated_data.get("options", {})
+        )
+        if changed:
+            # Written straight to the resource, the value would no longer
+            # match the limits billed for it.
+            raise ValidationError(
+                {
+                    "options": _(
+                        "%s sets limits, so a change to it has to be ordered "
+                        "(update_options)."
+                    )
+                    % ", ".join(sorted(changed))
+                }
+            )
         # Always update options directly without creating orders
         serializer.save()
         return Response(
@@ -10511,8 +10921,9 @@ class ProviderResourceViewSet(UserRoleMixin, BaseResourceViewSet):
                 }
             )
 
+        resolved = billing_mode.resolve_for_resource(resource)
         limit_based_components = resource.offering.components.filter(
-            type__in=billing_mode.resolve_for_resource(resource).limit_types
+            type__in=resolved.limit_types
         )
 
         # When a SLURM periodic usage policy is active on the offering, the
@@ -10551,6 +10962,85 @@ class ProviderResourceViewSet(UserRoleMixin, BaseResourceViewSet):
                     "Use an update_limits order to change them.",
                     resource,
                     ignored_components,
+                )
+
+        # Unlike the order path, this action does not reject a value that falls
+        # outside the bounds the offering declares. Rejecting would mean a 4xx,
+        # which the agent does not handle and answers by marking the resource
+        # ERRED, so a configuration skew between the agent and the offering
+        # would break the resource. Narrow the value to the nearest acceptable
+        # one instead — downwards for a precision the backend would truncate
+        # anyway — and log the divergence: these limits are what gets billed,
+        # and the log is the signal that the agent's reporting needs fixing.
+        clamped_components = {}
+        for component_type, component in resolved.limit_components.items():
+            if component_type not in new_limits:
+                continue
+            value = new_limits[component_type]
+            if value == resource.limits.get(component_type):
+                # The request does not change this component: the agent is
+                # echoing what is already stored, or the policy branch above
+                # has just restored it. A bound that the stored value does not
+                # satisfy predates this request — narrowing it here would
+                # resize a working resource, and bill for it, over something
+                # nobody asked to change. Bounds apply to what the agent
+                # actually moves.
+                continue
+            clamped_value, reason = utils.clamp_limit_value(
+                value,
+                component,
+                resource,
+                stored_value=resource.limits.get(component_type),
+            )
+            if reason is None:
+                continue
+            if clamped_value is None:
+                # The component's own bounds leave nothing acceptable to fall
+                # back to, so keep whatever the resource already had.
+                old_value = resource.limits.get(component_type)
+                if old_value is None:
+                    del new_limits[component_type]
+                    outcome = "dropped"
+                else:
+                    new_limits[component_type] = old_value
+                    outcome = old_value
+            else:
+                new_limits[component_type] = clamped_value
+                outcome = clamped_value
+            clamped_components[component_type] = {
+                "from": value,
+                "to": outcome,
+                "reason": reason,
+            }
+        if clamped_components:
+            logger.warning(
+                "Clamping set_limits value(s) on resource %s to the bounds declared "
+                "by the offering components: %s. The agent is expected to report "
+                "limits the offering accepts.",
+                resource,
+                clamped_components,
+            )
+
+        # A plugin-level validator judges the limits as a whole and can only
+        # reject, so there is no nearest acceptable value to narrow to. Keep the
+        # stored limits and still answer 200, for the same reason the bounds
+        # above clamp rather than reject.
+        limits_validator = plugins.manager.get_limits_validator(resource.offering.type)
+        if limits_validator:
+            try:
+                limits_validator(new_limits)
+            except rf_exceptions.ValidationError as e:
+                logger.warning(
+                    "Ignoring set_limits write on resource %s: the %s validator "
+                    "rejected the resulting limits %s: %s",
+                    resource,
+                    resource.offering.type,
+                    new_limits,
+                    e,
+                )
+                return Response(
+                    {"status": _("The resource limits are unchanged")},
+                    status=status.HTTP_200_OK,
                 )
 
         for component in limit_based_components:
@@ -11957,7 +12447,7 @@ class OfferingUsersViewSet(
 
     @extend_schema(
         summary="Set state to OK",
-        description="Manually sets the offering user state to 'OK'. This can be used to recover from an error state or to complete a manual creation process.",
+        description="Manually sets the offering user state to 'OK'. This can be used to recover from an error state or to complete a manual creation process. This clears any service provider comments.",
         request=None,
         responses={200: None},
     )
@@ -12550,6 +13040,324 @@ class OfferingUserChecklistCompletionsViewSet(core_views.ReadOnlyActionsViewSet)
         )
 
         return queryset.order_by("-modified")
+
+
+class ServiceProviderProjectGroupViewSet(core_views.ActionsViewSet):
+    """One POSIX group per project using a service provider's services.
+
+    Read by directory writers (the site agent's offering-manager token among
+    them); written only to pin a GID, by the provider's owners.
+    """
+
+    queryset = models.ServiceProviderProjectGroup.objects.select_related(
+        "service_provider__customer", "project__customer"
+    ).order_by(*models.ServiceProviderProjectGroup._meta.ordering)
+    serializer_class = serializers.ServiceProviderProjectGroupSerializer
+    create_serializer_class = serializers.ServiceProviderProjectGroupCreateSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.ServiceProviderProjectGroupFilter
+    disabled_actions = ["update", "partial_update", "destroy"]
+
+    def get_queryset(self):
+        qs = project_groups.annotate_in_use(super().get_queryset())
+        user = self.request.user
+        if user.is_staff or user.is_support:
+            return qs
+        owned_customer_ids = get_scope_ids(
+            user,
+            ContentType.objects.get_for_model(structure_models.Customer),
+            role=RoleEnum.CUSTOMER_OWNER,
+        )
+        # The service manager role (CUSTOMER.MANAGER) is scoped to the
+        # ServiceProvider itself, not to its organization.
+        provider_ids = get_scope_ids(
+            user,
+            ContentType.objects.get_for_model(models.ServiceProvider),
+            role=RoleEnum.CUSTOMER_MANAGER,
+        )
+        # The site agent authenticates as a manager of one offering and needs
+        # every group of that offering's provider.
+        managed_offering_ids = get_scope_ids(
+            user,
+            ContentType.objects.get_for_model(models.Offering),
+            role=RoleEnum.OFFERING_MANAGER,
+        )
+        offering_customer_ids = (
+            models.Offering.objects.filter(id__in=managed_offering_ids)
+            .exclude(state=models.Offering.States.ARCHIVED)
+            .values("customer_id")
+        )
+        return qs.filter(
+            Q(service_provider__customer_id__in=owned_customer_ids)
+            | Q(service_provider_id__in=provider_ids)
+            | Q(service_provider__customer_id__in=offering_customer_ids)
+        )
+
+    def _serialize(self, groups, many=False):
+        context = self.get_serializer_context()
+        context["group_details"] = project_groups.describe(groups if many else [groups])
+        return serializers.ServiceProviderProjectGroupSerializer(
+            groups, many=many, context=context
+        ).data
+
+    def list(self, request, *args, **kwargs):
+        # Offerings and members are computed for the whole page at once rather
+        # than with several queries per group.
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            return self.get_paginated_response(self._serialize(page, many=True))
+        return Response(self._serialize(list(queryset), many=True))
+
+    def retrieve(self, request, *args, **kwargs):
+        return Response(self._serialize(self.get_object()))
+
+    def _lock_pool(self, provider):
+        pool = posix_ids.provider_pool(provider)
+        if pool is not None:
+            models.PosixIdPool.objects.select_for_update().get(pk=pool.pk)
+
+    def _pin(self, group, gid, allow_outside_range):
+        try:
+            previous = posix_ids.set_project_group_gid(
+                group, gid, allow_outside_range=allow_outside_range
+            )
+        except posix_ids.PosixIdValueConflict as exc:
+            raise rf_exceptions.ValidationError({"gid": str(exc)})
+        except DjangoValidationError as exc:
+            raise rf_exceptions.ValidationError({"gid": exc.messages[0]})
+        if previous != gid:
+            # Emitted after commit so that a refused pin leaves no event.
+            transaction.on_commit(lambda: self._log_gid_change(group, previous, gid))
+        return previous
+
+    def _log_gid_change(self, group, previous, gid):
+        if previous is None:
+            template = (
+                "POSIX project group {group_name} of service provider "
+                "{provider_name} has been pinned to GID {new_gid}."
+            )
+        else:
+            template = (
+                "GID of POSIX project group {group_name} of service provider "
+                "{provider_name} has been changed from {old_gid} to {new_gid}. "
+                "The previous GID is not reused."
+            )
+        event_logger.emit(
+            template,
+            event_type=EventType.MARKETPLACE_PROVIDER_PROJECT_GROUP_GID_UPDATED,
+            event_context={
+                "project": group.project,
+                "group_name": group.name,
+                "provider_name": group.service_provider.customer.name,
+                "old_gid": previous,
+                "new_gid": gid,
+            },
+            scopes=[group.service_provider.customer, group.project],
+        )
+
+    @extend_schema(
+        summary="Adopt a POSIX project group with a given GID",
+        description=(
+            "Create the service provider's group for a project, pinned to a GID "
+            "the directory already uses. Works for a project that has no "
+            "resource at the provider yet; the allocator never hands the GID out "
+            "afterwards. Refused with 400 when the project already has a group "
+            "(use set_gid), when another consumer in the provider's pools holds "
+            "the GID, or when the GID is outside the range project groups draw "
+            "from and allow_outside_range is not set."
+        ),
+        request=serializers.ServiceProviderProjectGroupCreateSerializer,
+        responses={201: serializers.ServiceProviderProjectGroupSerializer},
+    )
+    def create(self, request, *args, **kwargs):
+        serializer = serializers.ServiceProviderProjectGroupCreateSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        provider = data["service_provider"]
+        structure_permissions.is_owner(request, self, provider)
+        with transaction.atomic():
+            self._lock_pool(provider)
+            group = self._adopt(
+                provider,
+                data["project"],
+                data["gid"],
+                data.get("name"),
+                data["allow_outside_range"],
+            )
+        group = self.get_queryset().get(pk=group.pk)
+        return Response(self._serialize(group), status=status.HTTP_201_CREATED)
+
+    def _adopt(self, provider, project, gid, name, allow_outside_range):
+        groups = models.ServiceProviderProjectGroup.objects.filter(
+            service_provider=provider
+        )
+        if groups.filter(project=project).exists():
+            raise rf_exceptions.ValidationError(
+                {
+                    "project": _(
+                        "The project already has a group at this service "
+                        "provider; use Change GID to give it another GID."
+                    )
+                }
+            )
+        name_taken = rf_exceptions.ValidationError(
+            {"name": _("The service provider already has a group of this name.")}
+        )
+        if name and groups.filter(name__iexact=name).exists():
+            raise name_taken
+        try:
+            group, created = project_groups.get_or_create_group(
+                provider, project, name=name
+            )
+        except project_groups.GroupNameTaken:
+            raise name_taken
+        if not created:
+            # Created concurrently by the project's first resource.
+            raise rf_exceptions.ValidationError(
+                {
+                    "project": _(
+                        "The project already has a group at this service "
+                        "provider; use Change GID to give it another GID."
+                    )
+                }
+            )
+        self._pin(group, gid, allow_outside_range)
+        return group
+
+    @extend_schema(
+        summary="Set the GID of a POSIX project group",
+        description=(
+            "Move the group to another GID, e.g. one assigned outside Waldur. "
+            "The previous GID is released but never handed out again "
+            "automatically, since files may still carry it; renumbering them is "
+            "the operator's job. Refused with 400 on the same conditions as "
+            "adopting a group. Recorded as an event with both GIDs."
+        ),
+        request=serializers.ProjectGroupGidSerializer,
+        responses={200: serializers.ServiceProviderProjectGroupSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def set_gid(self, request, uuid=None):
+        group = self.get_object()
+        serializer = serializers.ProjectGroupGidSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        with transaction.atomic():
+            # Pool before group, the order every pinning path takes.
+            self._lock_pool(group.service_provider)
+            group = models.ServiceProviderProjectGroup.objects.select_for_update().get(
+                pk=group.pk
+            )
+            self._pin(group, data["gid"], data["allow_outside_range"])
+        group = self.get_queryset().get(pk=group.pk)
+        return Response(self._serialize(group))
+
+    set_gid_permissions = [structure_permissions.is_owner]
+    set_gid_serializer_class = serializers.ProjectGroupGidSerializer
+
+    @extend_schema(
+        summary="Adopt several POSIX project groups at once",
+        description=(
+            "Pin the groups of several projects in one step, e.g. the groups a "
+            "directory held before Waldur managed it. A project without a group "
+            "gets one; a project with a group has its GID set. All or nothing: "
+            "any refused entry leaves every group unchanged."
+        ),
+        request=serializers.ServiceProviderProjectGroupImportSerializer,
+        responses={200: serializers.ServiceProviderProjectGroupSerializer(many=True)},
+    )
+    @action(detail=False, methods=["post"])
+    def import_groups(self, request):
+        serializer = serializers.ServiceProviderProjectGroupImportSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        provider = data["service_provider"]
+        structure_permissions.is_owner(request, self, provider)
+        ids = []
+        with transaction.atomic():
+            self._lock_pool(provider)
+            for index, entry in enumerate(data["groups"]):
+                try:
+                    group = models.ServiceProviderProjectGroup.objects.filter(
+                        service_provider=provider, project=entry["project"]
+                    ).first()
+                    if group is None:
+                        group = self._adopt(
+                            provider,
+                            entry["project"],
+                            entry["gid"],
+                            entry.get("name"),
+                            data["allow_outside_range"],
+                        )
+                    else:
+                        self._pin(group, entry["gid"], data["allow_outside_range"])
+                except rf_exceptions.ValidationError as exc:
+                    raise rf_exceptions.ValidationError({"groups": {index: exc.detail}})
+                ids.append(group.pk)
+        groups = list(self.get_queryset().filter(pk__in=ids))
+        return Response(self._serialize(groups, many=True))
+
+    import_groups_serializer_class = (
+        serializers.ServiceProviderProjectGroupImportSerializer
+    )
+
+    @extend_schema(
+        summary="Projects a group can be adopted for",
+        description=(
+            "Projects with a resource or an order, in any state, on an offering "
+            "of the service provider: the projects its owners may adopt a group "
+            "for. Staff may adopt for any project. Filter by name, slug or "
+            "organization name with query."
+        ),
+        parameters=[
+            OpenApiParameter(
+                "service_provider_uuid",
+                str,
+                location=OpenApiParameter.QUERY,
+                required=True,
+            ),
+            OpenApiParameter("query", str, location=OpenApiParameter.QUERY),
+        ],
+        responses={200: serializers.AdoptableProjectSerializer(many=True)},
+        filters=False,
+    )
+    @action(detail=False, methods=["get"])
+    def adoptable_projects(self, request):
+        provider_uuid = request.query_params.get("service_provider_uuid") or ""
+        if not core_utils.is_uuid_like(provider_uuid):
+            raise rf_exceptions.ValidationError(
+                {"service_provider_uuid": _("Give a valid service provider UUID.")}
+            )
+        provider = get_object_or_404(models.ServiceProvider, uuid=provider_uuid)
+        if not project_groups.can_pin(request.user, provider):
+            raise PermissionDenied()
+        projects = project_groups.adoptable_projects(provider).select_related(
+            "customer"
+        )
+        query = (request.query_params.get("query") or "").strip()
+        if query:
+            projects = projects.filter(
+                Q(name__icontains=query)
+                | Q(slug__icontains=query)
+                | Q(customer__name__icontains=query)
+            )
+        page = self.paginate_queryset(projects.order_by("name", "id"))
+        names = dict(
+            models.ServiceProviderProjectGroup.objects.filter(
+                service_provider=provider, project__in=page
+            ).values_list("project_id", "name")
+        )
+        for project in page:
+            project.group_name = names.get(project.id)
+        return self.get_paginated_response(
+            serializers.AdoptableProjectSerializer(page, many=True).data
+        )
 
 
 class OfferingUserGroupViewSet(core_views.ActionsViewSet):
@@ -17796,12 +18604,28 @@ class CourseAccountViewSet(core_views.ActionsViewSet):
                 )
             raise ValidationError({"detail": str(error_details)})
 
-    def perform_destroy(self, instance):
-        try:
-            utils.close_course_account(instance)
-        except httpx.HTTPError as exc:
-            error_details = utils.extract_error_details_from_httpx_error(exc)
-            raise ValidationError({"detail": error_details})
+    @extend_schema(
+        summary="Close a course account",
+        description=(
+            "Closing happens asynchronously against the external course-account "
+            "backend. The account moves to PENDING immediately and reaches CLOSED "
+            "(or ERRED, on failure) once the task completes."
+        ),
+        responses={202: serializers.CourseAccountSerializer},
+    )
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        instance.error_message = ""
+        instance.error_traceback = ""
+        instance.set_state_pending()
+        instance.save(update_fields=["state", "error_message", "error_traceback"])
+
+        transaction.on_commit(
+            lambda: tasks.close_course_account_task.delay(instance.uuid.hex)
+        )
+
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data, status=status.HTTP_202_ACCEPTED)
 
     destroy_validators = [
         core_validators.StateValidator(CourseAccountState.OK, CourseAccountState.ERRED)
@@ -17820,11 +18644,21 @@ class CourseAccountViewSet(core_views.ActionsViewSet):
         instance.set_state_pending()
         instance.save(update_fields=["state", "error_message", "error_traceback"])
 
-        transaction.on_commit(
-            lambda: tasks.create_course_account_task.delay(
-                instance.uuid.hex, request.user.username
+        # instance.user is only ever set once creation has already succeeded
+        # (create_course_account_task sets it on success and never clears
+        # it). So an ERRED account with a user got there from a *failed
+        # close*, not a failed create - retrying it must re-attempt the
+        # close, not create a second backend account for the same person.
+        if instance.user:
+            transaction.on_commit(
+                lambda: tasks.close_course_account_task.delay(instance.uuid.hex)
             )
-        )
+        else:
+            transaction.on_commit(
+                lambda: tasks.create_course_account_task.delay(
+                    instance.uuid.hex, request.user.username
+                )
+            )
 
         serializer = self.get_serializer(instance)
         return Response(serializer.data, status=status.HTTP_202_ACCEPTED)
@@ -17954,6 +18788,8 @@ class SoftwareCatalogViewSet(
     filterset_class = filters.SoftwareCatalogFilter
 
     unsafe_methods_permissions = [structure_permissions.is_staff]
+    # cpu_targets has the same visibility as catalog retrieve.
+    public_actions = ("list", "retrieve", "cpu_targets")
 
     @extend_schema(
         summary="Discover available software catalog versions",
@@ -18022,6 +18858,29 @@ class SoftwareCatalogViewSet(
         return Response(response_serializer.data)
 
     discover_permissions = [structure_permissions.is_staff]
+
+    @extend_schema(
+        summary="List CPU targets for a software catalog",
+        description=(
+            "Returns CPU family and microarchitecture choices for this catalog's "
+            "version, taken from metadata.architectures_map. "
+            "cpu_microarchitecture matches SoftwareTarget.target_subtype and the "
+            "cpu_microarchitecture package filter, including vendor-prefixed "
+            "paths such as intel/sapphirerapids. Does not scan package targets. "
+            "Catalogs without an architectures map (for example Spack) return "
+            "an empty list."
+        ),
+        responses={200: serializers.SoftwareCatalogCpuTargetSerializer(many=True)},
+        filters=False,
+    )
+    @action(detail=True, methods=["get"], filter_backends=[], pagination_class=None)
+    def cpu_targets(self, request, uuid=None):
+        catalog = self.get_object()
+        targets = cpu_targets_for_catalog(catalog)
+        serializer = self.get_serializer(targets, many=True)
+        return Response(serializer.data)
+
+    cpu_targets_serializer_class = serializers.SoftwareCatalogCpuTargetSerializer
 
     @extend_schema(
         summary="Import a new software catalog",
@@ -18691,7 +19550,9 @@ class ResourceLimitChangeRequestViewSet(EagerLoadMixin, core_views.ActionsViewSe
                 _("This offering no longer accepts limit change requests.")
             )
 
-        utils.validate_limits(requested_limits, resource.offering, resource)
+        requested_limits = utils.validate_limits(
+            requested_limits, resource.offering, resource
+        )
 
         with transaction.atomic():
             order = models.Order(
@@ -18803,6 +19664,24 @@ class ResourceEndDateChangeRequestViewSet(EagerLoadMixin, core_views.ActionsView
         user_can_approve_resource_end_date_change_request
     ]
 
+    @staticmethod
+    def _lock_pending_request(end_date_request):
+        """Re-read the request under a row lock and insist it is still pending.
+
+        StateValidator runs before the action, so two concurrent decisions (or
+        a decision racing the requester's cancel) can both pass it. Must be
+        called inside transaction.atomic().
+        """
+        locked = models.ResourceEndDateChangeRequest.objects.select_for_update().get(
+            pk=end_date_request.pk
+        )
+        if locked.state != ReviewStates.PENDING:
+            raise ValidationError(
+                _("This end date change request has already been %(state)s.")
+                % {"state": locked.get_state_display()}
+            )
+        return locked
+
     @extend_schema(
         request=ReviewCommentSerializer,
         responses={status.HTTP_200_OK: None},
@@ -18816,34 +19695,37 @@ class ResourceEndDateChangeRequestViewSet(EagerLoadMixin, core_views.ActionsView
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
 
-        resource = end_date_request.resource
-        requested_end_date = end_date_request.requested_end_date
-
-        if resource.state != models.Resource.States.OK:
-            raise ValidationError(_("Resource is not in OK state."))
-
-        if resource.end_date == requested_end_date:
-            raise ValidationError(
-                _("Requested end date is identical to the current end date.")
-            )
-
-        # Re-checked here rather than trusted from creation time, for the same
-        # reason the date is: the offering may have stopped accepting these
-        # while the request waited — the option turned off, or a prepaid
-        # component added, which routes extensions through renewal instead.
-        if not utils.offering_allows_end_date_change_requests(resource.offering):
-            raise ValidationError(
-                _("This offering no longer accepts end date change requests.")
-            )
-
-        # Likewise the date: it may have stopped being acceptable while the
-        # request waited, for instance because the project end date moved in.
-        utils.validate_end_date_for_resource(resource, requested_end_date)
-
-        # The end date is a Waldur-side concept — moving it provisions and
-        # releases nothing — so the approval writes it directly. The approver is
-        # recorded as the requester of the date, mirroring the direct path.
         with transaction.atomic():
+            end_date_request = self._lock_pending_request(end_date_request)
+            resource = end_date_request.resource
+            requested_end_date = end_date_request.requested_end_date
+
+            if resource.state != models.Resource.States.OK:
+                raise ValidationError(_("Resource is not in OK state."))
+
+            if resource.end_date == requested_end_date:
+                raise ValidationError(
+                    _("Requested end date is identical to the current end date.")
+                )
+
+            # Re-checked here rather than trusted from creation time, for the
+            # same reason the date is: the offering may have stopped accepting
+            # these while the request waited — the option turned off, or a
+            # prepaid component added, which routes extensions through renewal
+            # instead.
+            if not utils.offering_allows_end_date_change_requests(resource.offering):
+                raise ValidationError(
+                    _("This offering no longer accepts end date change requests.")
+                )
+
+            # Likewise the date: it may have stopped being acceptable while the
+            # request waited, for instance because the project end date moved in.
+            utils.validate_end_date_for_resource(resource, requested_end_date)
+
+            # The end date is a Waldur-side concept — moving it provisions and
+            # releases nothing — so the approval writes it directly. The
+            # approver is recorded as the requester of the date, mirroring the
+            # direct path.
             resource.end_date = requested_end_date
             resource.end_date_requested_by = request.user
             resource.save(update_fields=["end_date", "end_date_requested_by"])
@@ -18877,7 +19759,9 @@ class ResourceEndDateChangeRequestViewSet(EagerLoadMixin, core_views.ActionsView
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
-        end_date_request.reject(request.user, comment)
+        with transaction.atomic():
+            end_date_request = self._lock_pending_request(end_date_request)
+            end_date_request.reject(request.user, comment)
         return Response(status=status.HTTP_200_OK)
 
     @extend_schema(
@@ -18944,7 +19828,9 @@ class ResourceEndDateChangeRequestViewSet(EagerLoadMixin, core_views.ActionsView
             raise PermissionDenied(
                 _("You can only cancel your own resource end date change requests.")
             )
-        end_date_request.cancel()
+        with transaction.atomic():
+            end_date_request = self._lock_pending_request(end_date_request)
+            end_date_request.cancel()
         return Response(
             {"detail": _("Resource end date change request has been canceled.")},
             status=status.HTTP_200_OK,
@@ -18994,3 +19880,303 @@ class ProjectOrderAutoApprovalViewSet(core_views.ActionsViewSet):
             PermissionEnum.APPROVE_ORDER, ["project", "project.customer"]
         )
     ]
+
+
+class OfferingMergeViewSet(core_views.ActionsViewSet):
+    """Staff merges of offerings: records, previews, execution and undo.
+
+    Staff and support may read merges, suggest mappings and compute a preview;
+    support's preview is never stored. Every write is staff-only. ``execute``
+    and ``undo`` are queued as Celery tasks and answer 202; the record's state,
+    ``progress`` and ``verification`` report the outcome.
+
+    States: ``draft`` and ``previewed`` records may be edited or deleted (an
+    edit returns a previewed record to draft). ``execute`` moves a previewed
+    record to ``queued``, the task to ``running`` and then ``done`` or
+    ``failed``. ``undo`` checks the engine's preconditions synchronously and
+    answers 400 with the blockers if it would be refused; otherwise it moves a
+    done record to ``undoing``, and the task to ``undone``. Should the engine
+    still refuse in the task, the record returns to ``done`` with the reason
+    in ``error_message``.
+    """
+
+    queryset = models.OfferingMerge.objects.select_related(
+        "target", "created_by"
+    ).prefetch_related("sources")
+    serializer_class = serializers.OfferingMergeSerializer
+    filterset_class = filters.OfferingMergeFilter
+    lookup_field = "uuid"
+    disabled_actions = ["update"]
+
+    safe_methods_permissions = [structure_permissions.is_staff_or_support]
+    unsafe_methods_permissions = [structure_permissions.is_staff]
+
+    def _lock(self, merge):
+        return models.OfferingMerge.objects.select_for_update().get(pk=merge.pk)
+
+    def _merge_response(self, merge, status_code=status.HTTP_200_OK):
+        merge = self.get_queryset().get(pk=merge.pk)
+        return Response(
+            serializers.OfferingMergeSerializer(
+                merge, context=self.get_serializer_context()
+            ).data,
+            status=status_code,
+        )
+
+    def perform_create(self, serializer):
+        merge = serializer.save(created_by=self.request.user)
+        log.log_offering_merge_created(merge)
+
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            merge = self._lock(serializer.instance)
+            if merge.state not in models.OfferingMerge.States.EDITABLE:
+                raise IncorrectStateException(
+                    _("Only a draft or previewed merge can be edited.")
+                )
+            if merge.state == models.OfferingMerge.States.PREVIEWED:
+                merge.set_draft()
+                merge.preview = {}
+            serializer.instance = merge
+            serializer.save()
+
+    def perform_destroy(self, instance):
+        with transaction.atomic():
+            merge = self._lock(instance)
+            if merge.state not in models.OfferingMerge.States.EDITABLE:
+                raise IncorrectStateException(
+                    _("Only a draft or previewed merge can be deleted.")
+                )
+            merge.delete()
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "sources",
+                OpenApiTypes.STR,
+                OpenApiParameter.QUERY,
+                required=True,
+                description="Source offering UUIDs, comma-separated or repeated.",
+            ),
+            OpenApiParameter(
+                "target",
+                OpenApiTypes.UUID,
+                OpenApiParameter.QUERY,
+                required=True,
+                description="Target offering UUID.",
+                extensions={
+                    "x-waldur-operation-id": "marketplace_provider_offerings_list"
+                },
+            ),
+        ],
+        responses={200: serializers.OfferingMergeSuggestedMappingSerializer},
+    )
+    @core_views.no_count_action
+    @action(detail=False, methods=["get"])
+    def suggest_mapping(self, request):
+        """Suggest plan mappings by name and component mappings by type."""
+        source_uuids = [
+            value.strip()
+            for raw in request.query_params.getlist("sources")
+            for value in raw.split(",")
+            if value.strip()
+        ]
+        target_uuid = request.query_params.get("target", "")
+        errors = {}
+        if not source_uuids or not all(map(core_utils.is_uuid_like, source_uuids)):
+            errors["sources"] = _("Pass one or more source offering UUIDs.")
+        if not core_utils.is_uuid_like(target_uuid):
+            errors["target"] = _("Pass the target offering UUID.")
+        if errors:
+            raise ValidationError(errors)
+        sources = list(models.Offering.objects.filter(uuid__in=source_uuids))
+        target = models.Offering.objects.filter(uuid=target_uuid).first()
+        if len(sources) != len(set(source_uuids)):
+            errors["sources"] = _("A source offering does not exist.")
+        if target is None:
+            errors["target"] = _("The target offering does not exist.")
+        if errors:
+            raise ValidationError(errors)
+        return Response(
+            serializers.OfferingMergeSuggestedMappingSerializer(
+                offering_merge.suggest_mapping(sources, target)
+            ).data
+        )
+
+    @extend_schema(
+        request=None,
+        responses={
+            200: serializers.OfferingMergePreviewSerializer,
+            409: OpenApiResponse(
+                description="The merge is not in a previewable state."
+            ),
+        },
+    )
+    @action(detail=True, methods=["post"])
+    def preview(self, request, uuid=None):
+        """Compute the merge preview: counts, blockers and warnings.
+
+        Staff store it on the record, which moves to ``previewed``. Support
+        receive the same preview without it being stored.
+        """
+        merge = self.get_object()
+        if merge.state not in models.OfferingMerge.States.PREVIEWABLE:
+            raise IncorrectStateException(
+                _("A merge in state %s cannot be previewed.") % merge.state
+            )
+        if request.user.is_staff:
+            try:
+                data = offering_merge.preview(merge).preview
+            except offering_merge.OfferingMergeError as error:
+                raise IncorrectStateException(error.message)
+        else:
+            data = offering_merge.build_preview(merge)
+        return Response(serializers.OfferingMergePreviewSerializer(data).data)
+
+    preview_permissions = [structure_permissions.is_staff_or_support]
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "entry",
+                OpenApiTypes.STR,
+                OpenApiParameter.QUERY,
+                required=True,
+                description="Coverage registry entry, as reported by the "
+                "preview: marketplace.Resource.offering, "
+                "invoices.InvoiceItem.details, and so on.",
+            ),
+        ],
+        responses={200: serializers.OfferingMergeAffectedRowSerializer(many=True)},
+        # The merge filterset selects merge records, not the rows of one merge;
+        # a detail action resets it at runtime, and this keeps it out of the
+        # schema and the SDK too.
+        filters=False,
+    )
+    @action(detail=True, methods=["get"])
+    def affected(self, request, uuid=None):
+        """List the rows one preview entry changes, newest first.
+
+        Staff and support; nothing is written. A merge that has not run yet
+        recomputes its plan, so the listing is what the executor would do
+        rather than a stored copy of it. A merge that has run, or has been
+        undone, is described from its journal: what was actually written.
+        """
+        merge = self.get_object()
+        label = request.query_params.get("entry", "")
+        entry = offering_merge_coverage.MERGE_COVERAGE.get(label)
+        if entry is None:
+            raise ValidationError(
+                {"entry": _("Unknown coverage registry entry %s.") % label}
+            )
+        if not entry.can_list_rows:
+            raise ValidationError(
+                {"entry": _("The rows of %s cannot be listed one by one.") % label}
+            )
+        rows = offering_merge_rows.affected_rows(merge, entry)
+        page = self.paginate_queryset(rows.items)
+        return self.get_paginated_response(
+            serializers.OfferingMergeAffectedRowSerializer(
+                rows.describe(page), many=True
+            ).data
+        )
+
+    affected_permissions = [structure_permissions.is_staff_or_support]
+
+    @extend_schema(
+        request=serializers.OfferingMergeExecuteSerializer,
+        responses={
+            202: serializers.OfferingMergeSerializer,
+            400: serializers.OfferingMergeRefusalSerializer,
+            409: OpenApiResponse(description="The merge is not previewed."),
+        },
+    )
+    @action(detail=True, methods=["post"])
+    def execute(self, request, uuid=None):
+        """Queue a previewed merge for execution.
+
+        Refused with 400 if the stored preview has blockers or a warning code
+        is missing from ``acknowledged_warnings``, and with 409 unless the
+        merge is ``previewed``, which also refuses a second request.
+        """
+        merge = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        acknowledged = set(serializer.validated_data["acknowledged_warnings"])
+        with transaction.atomic():
+            merge = self._lock(merge)
+            if merge.state != models.OfferingMerge.States.PREVIEWED:
+                raise IncorrectStateException(
+                    _("Only a previewed merge can be executed; this one is %s.")
+                    % merge.state
+                )
+            preview = merge.preview or {}
+            if preview.get("blockers"):
+                return Response(
+                    {
+                        "detail": _("The merge has blockers."),
+                        "blockers": preview["blockers"],
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            missing = sorted(
+                {warning["code"] for warning in preview.get("warnings", [])}
+                - acknowledged
+            )
+            if missing:
+                return Response(
+                    {
+                        "detail": _("Acknowledge every warning before executing."),
+                        "missing_acknowledgements": missing,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            merge.set_queued()
+            merge.progress = {}
+            merge.error_message = ""
+            merge.save(update_fields=["state", "progress", "error_message", "modified"])
+            merge_uuid = merge.uuid.hex
+            transaction.on_commit(
+                lambda: tasks.execute_offering_merge.delay(merge_uuid)
+            )
+        return self._merge_response(merge, status.HTTP_202_ACCEPTED)
+
+    execute_serializer_class = serializers.OfferingMergeExecuteSerializer
+
+    @extend_schema(
+        request=None,
+        responses={
+            202: serializers.OfferingMergeSerializer,
+            400: serializers.OfferingMergeRefusalSerializer,
+            409: OpenApiResponse(description="The merge is not done."),
+        },
+    )
+    @action(detail=True, methods=["post"])
+    def undo(self, request, uuid=None):
+        """Queue the undo of a completed merge.
+
+        The engine's preconditions are checked first: if the undo would be
+        refused, the answer is 400 with the blockers and nothing is queued.
+        """
+        merge = self.get_object()
+        with transaction.atomic():
+            merge = self._lock(merge)
+            if merge.state != models.OfferingMerge.States.DONE:
+                raise IncorrectStateException(
+                    _("Only a done merge can be undone; this one is %s.") % merge.state
+                )
+            blockers = offering_merge.undo_blockers(merge)
+            if blockers:
+                return Response(
+                    {
+                        "detail": _("The merge cannot be undone."),
+                        "blockers": blockers,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            merge.set_undoing()
+            merge.error_message = ""
+            merge.save(update_fields=["state", "error_message", "modified"])
+            merge_uuid = merge.uuid.hex
+            transaction.on_commit(lambda: tasks.undo_offering_merge.delay(merge_uuid))
+        return self._merge_response(merge, status.HTTP_202_ACCEPTED)

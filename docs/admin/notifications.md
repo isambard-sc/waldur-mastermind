@@ -2,6 +2,17 @@
 
 When a notification is removed from a release, its database row is not deleted automatically. Run `waldur load_notifications <file> --prune` to report and remove notifications whose key is no longer listed below, along with any of their templates that no other notification declares and that have no operator-customised content. Customised template content is never deleted automatically.
 
+## Enabling notifications
+
+A notification that a release adds is registered disabled, unless the release says otherwise, and a disabled notification sends no email. After an upgrade, check this list for new notifications and enable the ones you need. Either list them with the value `true` in the file passed to `waldur load_notifications <file>` (in waldur-helm, `waldur.notifications` in `values.yaml`), or have a staff user enable them in the notifications list of the administration interface (the `enable` action of `/api/notification-messages/`). Keys not listed in the file keep their current state.
+
+The call-management reviewer workflow depends on these notifications, which are disabled until enabled:
+
+- `proposal.reviewer_assignment_invitation` — the email a reviewer receives when an assignment batch is sent to them
+- `proposal.assignment_expiry_reminder` — the reminder before an assignment batch expires
+- `proposal.assignment_batch_expired` — tells call managers that a batch expired without a full response
+- `proposal.reviewer_pool_invitation_expired` — tells the inviting call manager that a reviewer pool invitation expired
+
 ## WALDUR_CORE.STRUCTURE
 
 ### structure.change_email_request
@@ -1755,6 +1766,151 @@ Notifies organization owners about active resources that have not generated cost
 
 ```
 
+### marketplace.notification_resource_end_date_change_request_approved
+
+Notifies the requester when their resource end date change request is approved.
+
+#### Templates
+
+=== "marketplace/notification_resource_end_date_change_request_approved_subject.txt"
+
+```txt
+
+    End date change request approved for resource {{ resource_end_date_change_request.resource.name }}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_approved_message.txt"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}Hello!
+
+    Your request to change the end date of resource {{ resource.name }} in project {{ resource.project.name }} has been approved{% if request.reviewed_by %} by {{ request.reviewed_by.full_name|default:request.reviewed_by.username }}{% endif %}.
+
+    The new end date is {{ request.requested_end_date|date:"Y-m-d" }}.
+    {% if request.review_comment %}Review comment: {{ request.review_comment }}
+    {% endif %}
+    You can view the resource here:
+    {{ resource_url }}
+
+    Thank you!{% endwith %}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_approved_message.html"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}<p>Hello!</p>
+    <p>Your request to change the end date of resource <strong>{{ resource.name }}</strong> in project <strong>{{ resource.project.name }}</strong> has been approved{% if request.reviewed_by %} by {{ request.reviewed_by.full_name|default:request.reviewed_by.username }}{% endif %}.</p>
+    <p>The new end date is <strong>{{ request.requested_end_date|date:"Y-m-d" }}</strong>.</p>
+    {% if request.review_comment %}<p>Review comment: {{ request.review_comment }}</p>{% endif %}
+    <p>You can <a href="{{ resource_url }}">view the resource here</a>.</p>
+    <p>Thank you!</p>{% endwith %}
+
+```
+
+### marketplace.notification_resource_end_date_change_request_created
+
+Notifies users who may set the resource end date when someone requests to change it.
+
+#### Templates
+
+=== "marketplace/notification_resource_end_date_change_request_created_subject.txt"
+
+```txt
+
+    End date change request for resource {{ resource_end_date_change_request.resource.name }}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_created_message.txt"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}Hello!
+
+    {% if request.created_by %}{{ request.created_by.full_name|default:request.created_by.username }}{% if request.created_by.email %} ({{ request.created_by.email }}){% endif %}{% else %}A project member{% endif %} has requested to change the end date of a resource.
+
+    Resource: {{ resource.name }}
+    Project: {{ resource.project.name }}
+    Organization: {{ resource.project.customer.name }}
+    Current end date: {{ resource.end_date|date:"Y-m-d"|default:"not set" }}
+    Requested end date: {{ request.requested_end_date|date:"Y-m-d" }}
+    {% if request.comment %}Comment: {{ request.comment }}
+    {% endif %}
+    Please review and approve or reject the request:
+    {{ resource_url }}
+
+    Thank you!{% endwith %}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_created_message.html"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}<p>Hello!</p>
+    <p>{% if request.created_by %}{{ request.created_by.full_name|default:request.created_by.username }}{% if request.created_by.email %} ({{ request.created_by.email }}){% endif %}{% else %}A project member{% endif %} has requested to change the end date of a resource.</p>
+    <table>
+        <tr><td>Resource:</td><td><strong>{{ resource.name }}</strong></td></tr>
+        <tr><td>Project:</td><td>{{ resource.project.name }}</td></tr>
+        <tr><td>Organization:</td><td>{{ resource.project.customer.name }}</td></tr>
+        <tr><td>Current end date:</td><td>{{ resource.end_date|date:"Y-m-d"|default:"not set" }}</td></tr>
+        <tr><td>Requested end date:</td><td><strong>{{ request.requested_end_date|date:"Y-m-d" }}</strong></td></tr>
+        {% if request.comment %}<tr><td>Comment:</td><td>{{ request.comment }}</td></tr>{% endif %}
+    </table>
+    <p>Please <a href="{{ resource_url }}">review and approve or reject the request</a>.</p>
+    <p>Thank you!</p>{% endwith %}
+
+```
+
+### marketplace.notification_resource_end_date_change_request_rejected
+
+Notifies the requester when their resource end date change request is rejected.
+
+#### Templates
+
+=== "marketplace/notification_resource_end_date_change_request_rejected_subject.txt"
+
+```txt
+
+    End date change request rejected for resource {{ resource_end_date_change_request.resource.name }}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_rejected_message.txt"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}Hello!
+
+    Your request to change the end date of resource {{ resource.name }} in project {{ resource.project.name }} to {{ request.requested_end_date|date:"Y-m-d" }} has been rejected{% if request.reviewed_by %} by {{ request.reviewed_by.full_name|default:request.reviewed_by.username }}{% endif %}.
+
+    The end date remains {{ resource.end_date|date:"Y-m-d"|default:"not set" }}.
+    {% if request.review_comment %}Review comment: {{ request.review_comment }}
+    {% endif %}
+    You can view the resource here:
+    {{ resource_url }}
+
+    Thank you!{% endwith %}
+
+```
+
+=== "marketplace/notification_resource_end_date_change_request_rejected_message.html"
+
+```txt
+
+    {% with request=resource_end_date_change_request resource=resource_end_date_change_request.resource %}<p>Hello!</p>
+    <p>Your request to change the end date of resource <strong>{{ resource.name }}</strong> in project <strong>{{ resource.project.name }}</strong> to <strong>{{ request.requested_end_date|date:"Y-m-d" }}</strong> has been rejected{% if request.reviewed_by %} by {{ request.reviewed_by.full_name|default:request.reviewed_by.username }}{% endif %}.</p>
+    <p>The end date remains <strong>{{ resource.end_date|date:"Y-m-d"|default:"not set" }}</strong>.</p>
+    {% if request.review_comment %}<p>Review comment: {{ request.review_comment }}</p>{% endif %}
+    <p>You can <a href="{{ resource_url }}">view the resource here</a>.</p>
+    <p>Thank you!</p>{% endwith %}
+
+```
+
 ### marketplace.notification_resource_limit_change_request_approved
 
 Notifies the requester when their resource limit change request is approved.
@@ -2749,7 +2905,7 @@ Notification about a new comment in the issue. The recipient is issue caller.
 
 ```txt
 
-    The issue ({{ issue.key }}) you have created has a new comment
+    The issue you have created has a new comment
 
 ```
 
@@ -2852,7 +3008,7 @@ Notification about an update in the issue comment. The recipient is issue caller
 
 ```txt
 
-    Issue {{ issue.key }}. The comment has been updated
+    The comment has been updated
 
 ```
 
@@ -2896,6 +3052,62 @@ Notification about an update in the issue comment. The recipient is issue caller
     </p>
     </body>
     </html>
+
+```
+
+### support.notification_comment_updated_staff
+
+Notification to the assignee, or to all staff and support users when the ticket is unassigned, that the issue caller has edited one of their comments. Sent only by the built-in service desk.
+
+#### Templates
+
+=== "support/notification_comment_updated_staff_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] Comment edited by {{ comment.author.name|default:"the requester" }}: {{ issue.summary.strip }}
+
+```
+
+=== "support/notification_comment_updated_staff_message.txt"
+
+```txt
+
+    {{ comment.author.name|default:"The requester" }} has edited a comment on a support request.
+
+    Request: {{ issue.key }}
+    Summary: {{ issue.summary.strip }}
+    Status: {{ issue.status }}
+    {% if issue.assignee %}Assignee: {{ issue.assignee.name }}
+    {% endif %}{% if issue.customer %}Organization: {{ issue.customer.name }}
+    {% endif %}{% if issue.project %}Project: {{ issue.project.name }}
+    {% endif %}
+    Previous comment:
+    {{ old_description.strip }}
+
+    Edited comment:
+    {{ comment.description.strip }}
+
+    Open the request: {{ issue_url }}
+
+```
+
+=== "support/notification_comment_updated_staff_message.html"
+
+```txt
+
+    <p>{{ comment.author.name|default:"The requester" }} has edited a comment on a support request.</p>
+    <p><strong>Request:</strong> {{ issue.key }}<br>
+    <strong>Summary:</strong> {{ issue.summary.strip }}<br>
+    <strong>Status:</strong> {{ issue.status }}
+    {% if issue.assignee %}<br><strong>Assignee:</strong> {{ issue.assignee.name }}{% endif %}
+    {% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}
+    {% if issue.project %}<br><strong>Project:</strong> {{ issue.project.name }}{% endif %}</p>
+    <p><strong>Previous comment:</strong></p>
+    <p>{{ old_description.strip }}</p>
+    <p><strong>Edited comment:</strong></p>
+    <p>{{ comment.description.strip }}</p>
+    <p><a href="{{ issue_url }}">Open the request</a></p>
 
 ```
 
@@ -3001,7 +3213,7 @@ Notification about a feedback related to the issue. The recipient is issue calle
 
 ```txt
 
-    Please share your feedback: {{issue.key}} {{issue.summary}}
+    Please share your feedback: {{ issue.summary }}
 
 ```
 
@@ -3082,7 +3294,7 @@ Notification about an update in the issue. The recipient is issue caller.
 
 ```txt
 
-    Updated issue: {{issue.key}} {{issue.summary}}
+    Updated issue: {{ issue.summary }}
 
 ```
 
@@ -3276,7 +3488,7 @@ Notify a provider helpdesk that a routed ticket has been escalated.
 
 ```txt
 
-    [{{ issue.key }}] ESCALATED: {{ issue.summary }}
+    [{{ child_issue.key }}] ESCALATED: {{ issue.summary }}
 
 ```
 
@@ -3396,7 +3608,7 @@ Notify a provider helpdesk that a ticket previously routed to them was rerouted 
 
 ```txt
 
-    [{{ issue.key }}] Ticket withdrawn: {{ issue.summary }}
+    [{{ child_key|default:issue.key }}] Ticket withdrawn: {{ issue.summary }}
 
 ```
 
@@ -3406,7 +3618,7 @@ Notify a provider helpdesk that a ticket previously routed to them was rerouted 
 
     A support ticket previously routed to your helpdesk has been withdrawn and reassigned to a different provider.
 
-    Ticket: {{ issue.key }}
+    Ticket: {{ child_key|default:issue.key }}
     Summary: {{ issue.summary }}
 
     No further action is required on your side. If you have already opened a corresponding ticket in your system, you may close it.
@@ -3418,7 +3630,7 @@ Notify a provider helpdesk that a ticket previously routed to them was rerouted 
 ```txt
 
     <p>A support ticket previously routed to your helpdesk has been withdrawn and reassigned to a different provider.</p>
-    <p><strong>Ticket:</strong> {{ issue.key }}<br>
+    <p><strong>Ticket:</strong> {{ child_key|default:issue.key }}<br>
     <strong>Summary:</strong> {{ issue.summary }}</p>
     <p>No further action is required on your side. If you have already opened a corresponding ticket in your system, you may close it.</p>
 
@@ -3439,6 +3651,112 @@ A template used for generating the issue summary field during issue creation.
 ```
 
 ## WALDUR_MASTERMIND.PROPOSAL
+
+### proposal.assignment_batch_expired
+
+Notifies call managers that a reviewer's assignment batch expired before they responded to every proposal.
+
+#### Templates
+
+=== "proposal/assignment_batch_expired_subject.txt"
+
+```txt
+
+    Review assignments for "{{ call_name }}" expired without a response from {{ reviewer_name }}
+
+```
+
+=== "proposal/assignment_batch_expired_message.txt"
+
+```txt
+
+    Hello,
+
+    The review assignments sent to {{ reviewer_name }} for the call "{{ call_name }}" on {{ sent_at }} expired on {{ expired_at }} before every proposal was accepted or declined ({{ items_count }} proposal{{ items_count|pluralize }} in the batch).
+
+    You can extend the deadline or reassign the proposals here:
+
+    {{ assignments_url }}
+
+    This is an automated message from {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/assignment_batch_expired_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+    </head>
+    <body>
+    <p>Hello,</p>
+
+    <p>The review assignments sent to <strong>{{ reviewer_name }}</strong> for the call "<strong>{{ call_name }}</strong>" on {{ sent_at }} expired on {{ expired_at }} before every proposal was accepted or declined ({{ items_count }} proposal{{ items_count|pluralize }} in the batch).</p>
+
+    <p>You can extend the deadline or reassign the proposals here:</p>
+
+    <p><a href="{{ assignments_url }}">{{ assignments_url }}</a></p>
+
+    <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+    </body>
+    </html>
+
+```
+
+### proposal.assignment_expiry_reminder
+
+Reminds a reviewer that their assignment batch expires soon; the lead time is set per call.
+
+#### Templates
+
+=== "proposal/assignment_expiry_reminder_subject.txt"
+
+```txt
+
+    Reminder: your review assignments for "{{ call_name }}" expire soon
+
+```
+
+=== "proposal/assignment_expiry_reminder_message.txt"
+
+```txt
+
+    Dear {{ reviewer_name }},
+
+    You have been asked to review {{ items_count }} proposal{{ items_count|pluralize }} in the call "{{ call_name }}" on {{ site_name }}, and the invitation expires soon.
+
+    Please accept or decline each proposal before {{ expires_at }}:
+
+    {{ link }}
+
+    This is an automated message from {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/assignment_expiry_reminder_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+    </head>
+    <body>
+    <p>Dear {{ reviewer_name }},</p>
+
+    <p>You have been asked to review {{ items_count }} proposal{{ items_count|pluralize }} in the call "<strong>{{ call_name }}</strong>" on {{ site_name }}, and the invitation expires soon.</p>
+
+    <p>Please accept or decline each proposal before <strong>{{ expires_at }}</strong>:</p>
+
+    <p><a href="{{ link }}">{{ link }}</a></p>
+
+    <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+    </body>
+    </html>
+
+```
 
 ### proposal.new_proposal_submitted
 
@@ -4450,6 +4768,75 @@ A notification to the call managers about a rejected review.
 
 ```
 
+### proposal.reviewer_assignment_invitation
+
+Sent to a reviewer when a call manager sends them a batch of proposals to accept or decline.
+
+#### Templates
+
+=== "proposal/reviewer_assignment_invitation_subject.txt"
+
+```txt
+
+    You have {{ items_count }} proposal{{ items_count|pluralize }} to review for "{{ call_name }}"
+
+```
+
+=== "proposal/reviewer_assignment_invitation_message.txt"
+
+```txt
+
+    Dear {{ reviewer_name }},
+
+    You have been asked to review {{ items_count }} proposal{{ items_count|pluralize }} in the call "{{ call_name }}" on {{ site_name }}:
+    {% for proposal in proposals %}
+    - {{ proposal.name }}{% if proposal.summary %}
+      {{ proposal.summary }}{% endif %}{% endfor %}
+    {% if manager_notes %}
+    Note from the call manager:
+    {{ manager_notes }}
+    {% endif %}
+    Please accept or decline each proposal by {{ expires_at }}:
+
+    {{ link }}
+
+    This is an automated message from {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/reviewer_assignment_invitation_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+    </head>
+    <body>
+    <p>Dear {{ reviewer_name }},</p>
+
+    <p>You have been asked to review {{ items_count }} proposal{{ items_count|pluralize }} in the call "<strong>{{ call_name }}</strong>" on {{ site_name }}:</p>
+
+    <ul>
+    {% for proposal in proposals %}
+        <li><strong>{{ proposal.name }}</strong>{% if proposal.summary %}<br>{{ proposal.summary }}{% endif %}</li>
+    {% endfor %}
+    </ul>
+
+    {% if manager_notes %}
+    <p><strong>Note from the call manager:</strong><br>{{ manager_notes|linebreaksbr }}</p>
+    {% endif %}
+
+    <p>Please accept or decline each proposal by <strong>{{ expires_at }}</strong>:</p>
+
+    <p><a href="{{ link }}">{{ link }}</a></p>
+
+    <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+    </body>
+    </html>
+
+```
+
 ### proposal.reviewer_invitation
 
 Sent to a person invited to join the reviewer pool for a call.
@@ -4498,6 +4885,66 @@ Sent to a person invited to join the reviewer pool for a call.
     <p>If you do not yet have an account, you will need to register and create a reviewer profile before accepting.</p>
 
     <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+    </body>
+    </html>
+
+```
+
+### proposal.reviewer_pool_invitation_expired
+
+Sent once to the call manager who invited a reviewer to the pool when the invitation expires without an answer.
+
+#### Templates
+
+=== "proposal/reviewer_pool_invitation_expired_subject.txt"
+
+```txt
+
+    Reviewer pool invitation for "{{ call_name }}" has expired
+
+```
+
+=== "proposal/reviewer_pool_invitation_expired_message.txt"
+
+```txt
+
+    Dear call manager,
+
+    The invitation you sent to {{ invitee_name }} to join the reviewer pool for the call "{{ call_name }}" has expired without an answer.
+
+    Invited: {{ invited_at }}
+    Expired: {{ expired_at }}
+
+    The invitation can no longer be accepted or declined. You can send it again from the call's reviewer pool, which gives it a new expiry date:
+
+    {{ reviewer_pool_url }}
+
+    This is an automated message from {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/reviewer_pool_invitation_expired_message.html"
+
+```txt
+
+    <html>
+    <head lang="en">
+        <meta charset="UTF-8">
+        <title>Reviewer pool invitation expired</title>
+    </head>
+    <body>
+        <p>Dear call manager,</p>
+
+        <p>The invitation you sent to <strong>{{ invitee_name }}</strong> to join the reviewer pool for the call "<strong>{{ call_name }}</strong>" has expired without an answer.</p>
+
+        <ul>
+            <li><strong>Invited:</strong> {{ invited_at }}</li>
+            <li><strong>Expired:</strong> {{ expired_at }}</li>
+        </ul>
+
+        <p>The invitation can no longer be accepted or declined. You can send it again from the call's reviewer pool, which gives it a new expiry date: <a href="{{ reviewer_pool_url }}">{{ reviewer_pool_url }}</a></p>
+
+        <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
     </body>
     </html>
 
@@ -4947,6 +5394,124 @@ A daily digest notification sent to users with pending actions.
 
 ## WALDUR_OPENPORTAL
 
+### openportal.grace_period_ending
+
+Sent to every member of a project 10 days before its data is scheduled for deletion, the last day an extension to the grace period can be requested: contact the allocator today if the data cannot be copied back in time. Same projects as openportal.project_usage_update, sent whatever its frequency.
+
+#### Templates
+
+=== "openportal/grace_period_ending_subject.txt"
+
+```txt
+
+    ACTION REQUIRED: the data of your {{ site_name }} project {{ project_name }} will be deleted in {{ days_until_deletion }} days
+
+```
+
+=== "openportal/grace_period_ending_message.txt"
+
+```txt
+
+    {% if in_grace_period %}Your {{ site_name }} project "{{ project_name }}" is in its grace period.{% else %}The last day of access to your {{ site_name }} project "{{ project_name }}" is {{ last_access_date|date:"j F Y" }}.{% if grace_period_days %} It is followed by a grace period of {{ grace_period_days }} days so that you can copy back your data.{% endif %}{% endif %}
+
+    Your data will be automatically scheduled for deletion in {{ days_until_deletion }} days, on {{ deletion_date|date:"j F Y" }}. Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}.
+
+    If you do not think that you will be able to copy back all of your data in time, you must contact the allocator of your project TODAY. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. After today, an extension is unlikely unless there are exceptional circumstances. The allocator will need evidence that you have already started copying back your data.
+
+    View your project at {{ project_url }}
+    {% if docs_url %}
+    For more information, read the documentation at {{ docs_url }}
+    {% endif %}{% if support_url %}
+    If you have any queries, please raise a ticket at {{ support_url }}
+    {% endif %}
+
+```
+
+=== "openportal/grace_period_ending_message.html"
+
+```txt
+
+    <html lang="en">
+    <head><meta charset="UTF-8"><title>The data of your {{ site_name }} project {{ project_name }} will be deleted in {{ days_until_deletion }} days</title></head>
+    <body>
+    <p>{% if in_grace_period %}Your <strong>{{ site_name }}</strong> project <strong>{{ project_name }}</strong> is in its grace period.{% else %}The last day of access to your <strong>{{ site_name }}</strong> project <strong>{{ project_name }}</strong> is {{ last_access_date|date:"j F Y" }}.{% if grace_period_days %} It is followed by a grace period of {{ grace_period_days }} days so that you can copy back your data.{% endif %}{% endif %}</p>
+    <p><strong>Your data will be automatically scheduled for deletion in {{ days_until_deletion }} days, on {{ deletion_date|date:"j F Y" }}.</strong> Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}.</p>
+    <p>If you do not think that you will be able to copy back all of your data in time, <strong>you must contact the allocator of your project TODAY</strong>. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. After today, an extension is unlikely unless there are exceptional circumstances. The allocator will need evidence that you have already started copying back your data.</p>
+    <p><a href="{{ project_url }}">View your project</a>.</p>
+    {% if docs_url %}<p>For more information, read the <a href="{{ docs_url }}">documentation</a>.</p>{% endif %}
+    {% if support_url %}<p>If you have any queries, please <a href="{{ support_url }}">raise a ticket</a>.</p>{% endif %}
+    </body>
+    </html>
+
+```
+
+### openportal.grace_period_started
+
+Sent to every member of a project on its end date, the first day of its grace period: access to compute has ended, data must be copied back now, the last day the data can be accessed, and the date by which to contact the allocator for an extension. Same projects as openportal.project_usage_update, sent whatever its frequency.
+
+#### Templates
+
+=== "openportal/grace_period_started_subject.txt"
+
+```txt
+
+    ACTION REQUIRED: your {{ site_name }} project {{ project_name }} has ended - copy back your data now
+
+```
+
+=== "openportal/grace_period_started_message.txt"
+
+```txt
+
+    Your {{ site_name }} project "{{ project_name }}" has ended. Its last day of access was {{ last_access_date|date:"j F Y" }}.
+
+    The project is now in its grace period of {{ grace_period_days }} days so that you can copy back your data.
+
+    You MUST start copying back your data NOW.
+
+    Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}. You will lose access on {{ deletion_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.
+    {% if grace_change_deadline_is_today %}
+    If you will not be able to copy back all of your data in time, you must contact the allocator of your project TODAY. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. After today, an extension is unlikely unless there are exceptional circumstances. The allocator will need evidence that you have already started copying back your data.
+    {% elif grace_change_deadline_passed %}
+    Changes to the grace period need to be requested at least {{ grace_change_notice_days }} days before the data is scheduled for deletion, and that date has now passed. An extension is therefore unlikely unless there are exceptional circumstances. If something unexpected is preventing you from copying back your data, contact the allocator of your project as soon as possible and explain what has happened. Otherwise, please make sure that you have copied back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}.
+    {% else %}
+    If you will not be able to copy back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}, contact the allocator of your project no later than {{ grace_change_deadline|date:"j F Y" }}, and please don't leave it until the last day: the earlier you ask, the more likely it is that an extension can be agreed. The allocator will need evidence that you have already started copying back your data.
+    {% endif %}
+    View your project at {{ project_url }}
+    {% if docs_url %}
+    For more information, read the documentation at {{ docs_url }}
+    {% endif %}{% if support_url %}
+    If you have any queries, please raise a ticket at {{ support_url }}
+    {% endif %}
+
+```
+
+=== "openportal/grace_period_started_message.html"
+
+```txt
+
+    <html lang="en">
+    <head><meta charset="UTF-8"><title>Your {{ site_name }} project {{ project_name }} has ended</title></head>
+    <body>
+    <p>Your <strong>{{ site_name }}</strong> project <strong>{{ project_name }}</strong> has ended. Its last day of access was {{ last_access_date|date:"j F Y" }}.</p>
+    <p>The project is now in its grace period of {{ grace_period_days }} days so that you can copy back your data.</p>
+    <h3>You MUST start copying back your data NOW.</h3>
+    <p><strong>Your last day to access your data is {{ data_last_access_date|date:"j F Y" }}.</strong> You will lose access on {{ deletion_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.</p>
+    {% if grace_change_deadline_is_today %}
+    <p>If you will not be able to copy back all of your data in time, <strong>you must contact the allocator of your project TODAY</strong>. Today is the last day that a change to the grace period can be requested, as changes need to be made at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. After today, an extension is unlikely unless there are exceptional circumstances. The allocator will need evidence that you have already started copying back your data.</p>
+    {% elif grace_change_deadline_passed %}
+    <p>Changes to the grace period need to be requested at least {{ grace_change_notice_days }} days before the data is scheduled for deletion, and that date has now passed. An extension is therefore unlikely unless there are exceptional circumstances. If something unexpected is preventing you from copying back your data, contact the allocator of your project as soon as possible and explain what has happened. Otherwise, please make sure that you have copied back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}.</p>
+    {% else %}
+    <p>If you will not be able to copy back all of your data by the end of {{ data_last_access_date|date:"j F Y" }}, <strong>contact the allocator of your project no later than {{ grace_change_deadline|date:"j F Y" }}</strong>, and please don't leave it until the last day: the earlier you ask, the more likely it is that an extension can be agreed. The allocator will need evidence that you have already started copying back your data.</p>
+    {% endif %}
+    <p><a href="{{ project_url }}">View your project</a>.</p>
+    {% if docs_url %}<p>For more information, read the <a href="{{ docs_url }}">documentation</a>.</p>{% endif %}
+    {% if support_url %}<p>If you have any queries, please <a href="{{ support_url }}">raise a ticket</a>.</p>{% endif %}
+    </body>
+    </html>
+
+```
+
 ### openportal.managed_project_rejected
 
 Sent to Project admins and Project managers when their resource allocation request is rejected.
@@ -4992,6 +5557,115 @@ Sent to Project admins and Project managers when their resource allocation reque
     {% if review_comment %}<p>Rejection reason: {{ review_comment }}</p>{% endif %}
     <p>Please contact your Resource Allocator for details: <a href="mailto:{{ reviewer_email }}">{{ reviewer_email }}</a></p>
     <p>Best regards,<br>{{ reviewer_full_name }}<br>{% if reviewer_organization %}{{ reviewer_organization }}<br>{% endif %}{{ reviewer_email }}</p>
+    </body>
+    </html>
+
+```
+
+### openportal.project_usage_update
+
+A regular update sent to every member of a project holding an award or an allocation on this portal: what has been used, whether it is ahead of or behind the pace needed to use the allocation by the end date, and when the grace period ends and data is deleted. Not sent for projects managed by a remote awarding portal, which sends its own. How often is set per project (every 14 days by default).
+
+#### Templates
+
+=== "openportal/project_usage_update_subject.txt"
+
+```txt
+
+    {{ site_name }} project update for {{ project_name }} - {{ today|date:"j F Y" }}
+
+```
+
+=== "openportal/project_usage_update_message.txt"
+
+```txt
+
+    Here is your regular update for your {{ site_name }} project "{{ project_name }}".
+    {% for award in awards %}
+    {% if awards|length > 1 %}{{ award.name }}
+    {% endif %}So far {{ award.used }} of {{ award.allocation }} has been used ({{ award.used_percent }}% of the allocation). An even spend from the start of the award on {{ award.start_date|date:"j F Y" }} would have used {{ award.expected_percent }}% by today.
+    {% if award.status == "behind" %}
+    You are BEHIND the pace needed to use the whole allocation by the end of {{ award.last_access_date|date:"j F Y" }}, the last day of the award. At your current rate of use you are projected to lose {{ award.projected_loss }} ({{ award.projected_loss_percent }}% of your allocation) when the award ends, because allocation that is not used by then is lost.{% if award.required_per_day %} To use the rest, you would need to use {{ award.required_per_day }} per day from today.{% endif %}
+    {% elif award.status == "ahead" %}
+    You are AHEAD of the even pace for this allocation.{% if award.exhaustion_date %} At your current rate of use the allocation will run out on {{ award.exhaustion_date|date:"j F Y" }}, before the last day of the award on {{ award.last_access_date|date:"j F Y" }}.{% else %} At your current rate of use the allocation will last to the end of {{ award.last_access_date|date:"j F Y" }}, the last day of the award.{% endif %}
+    {% elif award.status == "on-track" %}
+    You are ON PACE to use the whole allocation by the end of {{ award.last_access_date|date:"j F Y" }}, the last day of the award.
+    {% elif award.status == "settling" %}
+    It is too early in the award to judge whether you are ahead or behind the pace needed to use the whole allocation by the end of {{ award.last_access_date|date:"j F Y" }}, the last day of the award.
+    {% elif award.status == "exhausted" %}
+    The whole allocation has been used, with {{ award.remaining_days }} days of the award still to run.
+    {% elif award.status == "ended" %}
+    The award has ended. Its last day was {{ award.last_access_date|date:"j F Y" }}.
+    {% endif %}{% endfor %}
+    {% if local_usage %}
+    This month, {{ local_usage.usage_this_month }} node hours have been used.{% if local_usage.credit_remaining %} The project has {{ local_usage.credit_remaining }} remaining to use before the end of the project.{% endif %}
+    {% endif %}
+    {% if end_date %}{% if in_grace_period %}
+    Your project ended on {{ end_date|date:"j F Y" }} and is now in its grace period, so that you can copy back your data. This has to be done quickly: your last day to access your data is {{ data_last_access_date|date:"j F Y" }}. You will lose access on {{ deletion_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.
+    {% else %}
+    The last day of access to your project is {{ last_access_date|date:"j F Y" }}, which is {% if days_until_last_access == 0 %}today{% elif days_until_last_access == 1 %}tomorrow{% else %}in {{ days_until_last_access }} days{% endif %}. Access ends at the start of {{ end_date|date:"j F Y" }}, so all of the allocation must be used by the end of {{ last_access_date|date:"j F Y" }}.
+    {% if grace_period_days %}
+    After that, the project will enter a grace period of {{ grace_period_days }} days so that you can copy back your data. This has to be done quickly: your last day to access your data will be {{ data_last_access_date|date:"j F Y" }}. You will lose access on {{ deletion_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.
+    {% else %}
+    There is no grace period: you must copy back your data by the end of {{ last_access_date|date:"j F Y" }}. You will lose access on {{ end_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.
+    {% endif %}{% endif %}
+    If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be requested at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. {% if grace_change_deadline_passed %}That date ({{ grace_change_deadline|date:"j F Y" }}) has now passed, so an extension is unlikely unless there are exceptional circumstances. If something unexpected has happened, contact the allocator of your project as soon as possible.{% else %}Please request any change no later than {{ grace_change_deadline|date:"j F Y" }}, and please don't leave it until the last day: the earlier you ask, the more likely it is that an extension can be agreed.{% endif %}
+    {% endif %}
+    For more detail, view your project at {{ project_url }}
+    {% if docs_url %}
+    For more information, read the documentation at {{ docs_url }}
+    {% endif %}{% if support_url %}
+    If you have any queries, please raise a ticket at {{ support_url }}
+    {% endif %}
+    We will send you an update every {{ update_frequency }}. If you want to change how often these updates are sent, please ask the project PI to raise a request{% if support_url %} at {{ support_url }}{% endif %}.
+
+```
+
+=== "openportal/project_usage_update_message.html"
+
+```txt
+
+    <html lang="en">
+    <head><meta charset="UTF-8"><title>{{ site_name }} project update for {{ project_name }}</title></head>
+    <body>
+    <p>Here is your regular update for your <strong>{{ site_name }}</strong> project <strong>{{ project_name }}</strong>.</p>
+    {% for award in awards %}
+    {% if awards|length > 1 %}<h3>{{ award.name }}</h3>{% endif %}
+    <p>So far <strong>{{ award.used }}</strong> of {{ award.allocation }} has been used ({{ award.used_percent }}% of the allocation). An even spend from the start of the award on {{ award.start_date|date:"j F Y" }} would have used {{ award.expected_percent }}% by today.</p>
+    {% if award.status == "behind" %}
+    <p><strong>You are behind</strong> the pace needed to use the whole allocation by the end of {{ award.last_access_date|date:"j F Y" }}, the last day of the award. At your current rate of use you are projected to lose <strong>{{ award.projected_loss }} ({{ award.projected_loss_percent }}% of your allocation)</strong> when the award ends, because allocation that is not used by then is lost.{% if award.required_per_day %} To use the rest, you would need to use {{ award.required_per_day }} per day from today.{% endif %}</p>
+    {% elif award.status == "ahead" %}
+    <p><strong>You are ahead</strong> of the even pace for this allocation.{% if award.exhaustion_date %} At your current rate of use the allocation will run out on <strong>{{ award.exhaustion_date|date:"j F Y" }}</strong>, before the last day of the award on {{ award.last_access_date|date:"j F Y" }}.{% else %} At your current rate of use the allocation will last to the end of {{ award.last_access_date|date:"j F Y" }}, the last day of the award.{% endif %}</p>
+    {% elif award.status == "on-track" %}
+    <p><strong>You are on pace</strong> to use the whole allocation by the end of {{ award.last_access_date|date:"j F Y" }}, the last day of the award.</p>
+    {% elif award.status == "settling" %}
+    <p>It is too early in the award to judge whether you are ahead or behind the pace needed to use the whole allocation by the end of {{ award.last_access_date|date:"j F Y" }}, the last day of the award.</p>
+    {% elif award.status == "exhausted" %}
+    <p><strong>The whole allocation has been used</strong>, with {{ award.remaining_days }} days of the award still to run.</p>
+    {% elif award.status == "ended" %}
+    <p>The award has ended. Its last day was {{ award.last_access_date|date:"j F Y" }}.</p>
+    {% endif %}
+    {% endfor %}
+    {% if local_usage %}
+    <p>This month, <strong>{{ local_usage.usage_this_month }}</strong> node hours have been used.{% if local_usage.credit_remaining %} The project has {{ local_usage.credit_remaining }} remaining to use before the end of the project.{% endif %}</p>
+    {% endif %}
+    {% if end_date %}
+    {% if in_grace_period %}
+    <p>Your project ended on {{ end_date|date:"j F Y" }} and is now in its grace period, so that you can copy back your data. This has to be done quickly: <strong>your last day to access your data is {{ data_last_access_date|date:"j F Y" }}</strong>. You will lose access on {{ deletion_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.</p>
+    {% else %}
+    <p>The last day of access to your project is <strong>{{ last_access_date|date:"j F Y" }}</strong>, which is {% if days_until_last_access == 0 %}today{% elif days_until_last_access == 1 %}tomorrow{% else %}in {{ days_until_last_access }} days{% endif %}. Access ends at the start of {{ end_date|date:"j F Y" }}, so all of the allocation must be used by the end of {{ last_access_date|date:"j F Y" }}.</p>
+    {% if grace_period_days %}
+    <p>After that, the project will enter a grace period of {{ grace_period_days }} days so that you can copy back your data. This has to be done quickly: <strong>your last day to access your data will be {{ data_last_access_date|date:"j F Y" }}</strong>. You will lose access on {{ deletion_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.</p>
+    {% else %}
+    <p>There is no grace period: <strong>you must copy back your data by the end of {{ last_access_date|date:"j F Y" }}</strong>. You will lose access on {{ end_date|date:"j F Y" }}, when your data will be automatically scheduled for deletion.</p>
+    {% endif %}
+    {% endif %}
+    <p>If you want to make any changes to the allocation, or to the start or end dates of the project, please contact the allocator of your project. Any changes to the grace period need to be requested at least {{ grace_change_notice_days }} days before the data is scheduled for deletion. {% if grace_change_deadline_passed %}That date ({{ grace_change_deadline|date:"j F Y" }}) has now passed, so an extension is unlikely unless there are exceptional circumstances. If something unexpected has happened, contact the allocator of your project as soon as possible.{% else %}Please request any change no later than <strong>{{ grace_change_deadline|date:"j F Y" }}</strong>, and please don't leave it until the last day: the earlier you ask, the more likely it is that an extension can be agreed.{% endif %}</p>
+    {% endif %}
+    <p>For more detail, <a href="{{ project_url }}">view your project</a>.</p>
+    {% if docs_url %}<p>For more information, read the <a href="{{ docs_url }}">documentation</a>.</p>{% endif %}
+    {% if support_url %}<p>If you have any queries, please <a href="{{ support_url }}">raise a ticket</a>.</p>{% endif %}
+    <p>We will send you an update every {{ update_frequency }}. If you want to change how often these updates are sent, please ask the project PI to raise a request{% if support_url %} at <a href="{{ support_url }}">{{ support_url }}</a>{% endif %}.</p>
     </body>
     </html>
 

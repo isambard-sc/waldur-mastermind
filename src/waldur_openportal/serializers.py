@@ -1082,6 +1082,79 @@ class SetLinksSerializer(rf_serializers.Serializer):
         return value
 
 
+class RemoteProjectUsageWindowSerializer(rf_serializers.Serializer):
+    """One period the award was attached to a project, and where its usage lives."""
+
+    project_uuid = rf_serializers.UUIDField(format="hex", allow_null=True)
+    project_name = rf_serializers.CharField(allow_null=True)
+    start = rf_serializers.DateField()
+    end = rf_serializers.DateField(
+        allow_null=True, help_text="Inclusive. Null while still attached."
+    )
+    project_identifier = rf_serializers.CharField(
+        allow_null=True,
+        help_text="The key this window's usage is cached under.",
+    )
+
+
+class RemoteProjectUsageReportQuerySerializer(rf_serializers.Serializer):
+    start = rf_serializers.DateField(
+        required=False,
+        help_text="First day to include. Defaults to when the award was first attached.",
+    )
+    end = rf_serializers.DateField(
+        required=False, help_text="Last day to include. Defaults to today."
+    )
+
+    def validate(self, attrs):
+        start, end = attrs.get("start"), attrs.get("end")
+        if start and end and start > end:
+            raise rf_serializers.ValidationError("start must not be after end.")
+        return attrs
+
+
+class RemoteProjectUsageReportSerializer(rf_serializers.Serializer):
+    """An award's usage, across every project it has been attached to.
+
+    Each window's usage is read from the key it was cached under and filtered
+    to exactly that window's days, so a day is never counted twice: on a day
+    the award moved, the project it moved to claims the whole day.
+    """
+
+    start = rf_serializers.DateField(allow_null=True)
+    end = rf_serializers.DateField(allow_null=True)
+    total_hours = rf_serializers.FloatField()
+    report = rf_serializers.JSONField(
+        allow_null=True,
+        help_text="The combined OpenPortal ProjectUsageReport, as JSON.",
+    )
+    windows = RemoteProjectUsageWindowSerializer(many=True)
+
+
+class RemoteProjectStorageReportSerializer(rf_serializers.Serializer):
+    """An award's storage, across every project it has been attached to.
+
+    Storage is a series of dated snapshots, not a total. Each window
+    contributes only the snapshots taken on its own days; the report's
+    top-level snapshot is the latest of them.
+    """
+
+    start = rf_serializers.DateField(allow_null=True)
+    end = rf_serializers.DateField(allow_null=True)
+    latest = rf_serializers.DateTimeField(
+        allow_null=True,
+        help_text="When the latest snapshot in the range was taken. Null if none.",
+    )
+    report = ProjectStorageReportField(
+        allow_null=True,
+        help_text=(
+            "The combined OpenPortal ProjectStorageReport, as JSON. The latest "
+            "snapshot is the top level; daily_reports holds the earlier ones."
+        ),
+    )
+    windows = RemoteProjectUsageWindowSerializer(many=True)
+
+
 class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     """
     Serializer for RemoteProject.
@@ -1211,18 +1284,43 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     def get_pending_details(self, obj):
         return obj.pending_details if self._is_privileged(obj) else None
 
+    def _safe_award_details(self, obj):
+        """``obj.award_details()``, or None if it cannot be derived.
+
+        These two fields are computed per row inside a list serializer, and
+        ``award_details()`` runs the openportal library over data stored
+        possibly years ago. If that raises, DRF has already started building
+        the response, so the failure is not one bad row -- it is a 500 for the
+        whole page, and every other project on it becomes unreachable too.
+
+        A remote project whose details will not derive is worth knowing about,
+        so it is logged with its uuid rather than swallowed; but it is not
+        worth taking the organisation's project list down for. Only the
+        library's own error type is caught, so a bug in our code still
+        surfaces as a bug.
+        """
+        try:
+            return obj.award_details()
+        except OSError as exc:
+            logger.error(
+                "Cannot derive award details for remote project %s: %s",
+                obj.uuid,
+                exc,
+            )
+            return None
+
     @extend_schema_field(AwardDetailsSerializer(allow_null=True))
     def get_award_details(self, obj):
         if not self._is_privileged(obj):
             return None
-        details = obj.award_details()
+        details = self._safe_award_details(obj)
         if details is None:
             return None
         return json.loads(details.to_json())
 
     @extend_schema_field(rf_serializers.CharField(allow_null=True))
     def get_allocation_string(self, obj):
-        details = obj.award_details()
+        details = self._safe_award_details(obj)
         if details is None:
             return None
         return json.loads(details.to_json()).get("allocation")

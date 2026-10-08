@@ -64,6 +64,13 @@ USERNAME_REGEX = r"^[a-zA-Z0-9_.][a-zA-Z0-9_.-]*[a-zA-Z0-9_.$-]?$"
 # UserSection; read here and by waldur_openportal.utils.sync_user_slugs().
 OPENPORTAL_IDENTIFIER_FEATURE = "user.show_openportal_identifier"
 
+# Deployment-wide switch: this Waldur is an application and awards portal, so
+# Project.slug is the award identifier (0251-4064-4677-1) rather than a copy of
+# the OpenPortal project shortname. Declared in core.features under
+# WaldurDeploymentSection; read by waldur_openportal wherever a project slug
+# would otherwise be written from a shortname.
+APPLICATION_PORTAL_FEATURE = "deployment.application_portal_only"
+
 GENDER_CHOICES = [(code, _(label)) for code, label in _GENDER_CHOICES_RAW]
 
 

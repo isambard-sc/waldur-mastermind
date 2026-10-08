@@ -507,6 +507,42 @@ Every one of the leaks listed above was found by layer 3, not by reading the
 schema. If you extend the script, keep that order: add the column, then check
 that the scan agrees.
 
+### The same field is not the same type everywhere
+
+Both scripts carry an inventory of columns that are `text` in the database and
+JSON to the ORM, and check each one still parses. Both used to guard only on
+the table and column *existing*. That is half the story: the same Waldur field
+is `text` on one deployment and native `json`/`jsonb` on another -
+`logging_emailhook.event_groups` is `text` on the portal and `jsonb` on the
+awards site - and each script broke differently on the one it did not expect.
+
+```
+ERROR:  function sanitise.is_json(jsonb) does not exist
+ERROR:  invalid input syntax for type json
+```
+
+The first is `sanitise.is_json()` taking `text`. The second is subtler and
+worth remembering on its own account: the check reads
+`nullif(col, '') IS NOT NULL`, and `nullif` coerces the empty string to the
+column's type, so on a `jsonb` column PostgreSQL tries to parse `''` as JSON
+and raises before the check ever runs.
+
+Both now guard on `udt_name` and skip anything that is not `text`, `varchar`
+or `bpchar` - a native JSON column needs no check, since the database already
+guarantees it parses. **When adding a column to either inventory, guard on its
+type, not just on its name.**
+
+The cost of getting this wrong is measured in hours, so it is worth knowing
+where each failure leaves you:
+
+- **The sanitiser is one transaction**, so a failure there rolls back
+  completely and the restored copy is pristine. `--reuse-server <datadir>`
+  picks the cluster back up and skips the restore.
+- **The verifier runs after the commit**, so a failure there costs only the
+  checking. `KEEP_SCRATCH=1 SKIP_SANITISE=1` with the same `--reuse-server`
+  re-runs the verify, dump and scan against the already-sanitised database, in
+  seconds.
+
 ## Rehearsed against
 
 A full run against a real dump: 188 JSON columns sized and the 27 non-empty

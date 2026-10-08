@@ -60,9 +60,42 @@ DECLARE
     -- system parts: personN.project, personN.project.cluster.
     login_shape text := '^person[0-9]+([._-][A-Za-z0-9][A-Za-z0-9._-]*)?$';
 
+    -- What sanitise.filler() leaves behind, as a predicate that matches a
+    -- column it did NOT write. Expressed as SQL rather than a regex because
+    -- the filler is the original's own length, so its last phrase is cut off
+    -- mid-word and a prefix match would reject a legitimately short value.
+    -- filler() also empties anything that parses as JSON, hence the pair.
+    prose_leak text :=
+        $p$(nullif(%1$I, '') IS NOT NULL
+            AND %1$I NOT IN ('{}', '[]')
+            AND %1$I <> left(repeat('redacted placeholder text ',
+                                    (length(%1$I) / 26) + 1), length(%1$I)))$p$;
+
+    -- The fork's proposal app: unpublished research plans and the reviews of
+    -- them. Named here so the same list drives the existence check and the
+    -- predicate, and so a column added to either escapes neither.
+    -- Same reasoning: upstream's Proposal has project_summary and
+    -- allocation_comment, but its description lives elsewhere.
+    proposal_prose text[] := ARRAY['project_summary', 'allocation_comment'];
+    proposal_prose_fork text[] := ARRAY['description'];
+    -- Split because a check skips entirely when one of its columns is absent:
+    -- upstream's Review has the nine below but not the fork's two, so keeping
+    -- them together would silently stop verifying the nine on a portal
+    -- database.
+    review_prose text[] := ARRAY[
+        'summary_public_comment', 'summary_private_comment',
+        'comment_project_title', 'comment_project_summary',
+        'comment_project_description', 'comment_project_duration',
+        'comment_project_supporting_documentation',
+        'comment_resource_requests', 'comment_team'];
+    review_prose_fork text[] := ARRAY[
+        'comment_project_is_confidential',
+        'comment_project_has_civilian_purpose'];
+
     r record;
     spec text;
     present boolean;
+    col_type text;
     n bigint;
     pass int := 0;
     fail int := 0;
@@ -268,6 +301,41 @@ BEGIN
         ('stored_file_contents_dropped', 'media_file', ARRAY['content'],
          $p$octet_length(content) > 0$p$, 'FAIL'),
 
+        -- the fork's proposal app, which exists only on the awards site: a
+        -- skip everywhere else, and the whole of the database there
+        ('proposal_text_filled',    'proposal_proposal', proposal_prose,
+         (SELECT string_agg(format(prose_leak, c), ' OR ')
+          FROM unnest(proposal_prose) AS c), 'FAIL'),
+        ('proposal_description_filled', 'proposal_proposal',
+         proposal_prose_fork,
+         (SELECT string_agg(format(prose_leak, c), ' OR ')
+          FROM unnest(proposal_prose_fork) AS c), 'FAIL'),
+        ('proposal_reviews_filled', 'proposal_review',   review_prose,
+         (SELECT string_agg(format(prose_leak, c), ' OR ')
+          FROM unnest(review_prose) AS c), 'FAIL'),
+        ('proposal_review_extras_filled', 'proposal_review', review_prose_fork,
+         (SELECT string_agg(format(prose_leak, c), ' OR ')
+          FROM unnest(review_prose_fork) AS c), 'FAIL'),
+        ('proposal_review_comments_filled', 'proposal_reviewcomment',
+         ARRAY['message'], format(prose_leak, 'message'), 'FAIL'),
+        ('proposal_adjustments_filled', 'proposal_proposalresourceadjustment',
+         ARRAY['comment'], format(prose_leak, 'comment'), 'FAIL'),
+        -- The notes are a list of {timestamp, author, text}: the timestamps
+        -- and the count survive on purpose, the text must not.
+        ('proposal_notes_filled',   'proposal_proposal', ARRAY['notes'],
+         $p$jsonb_typeof(notes) = 'array' AND EXISTS (
+             SELECT 1 FROM jsonb_array_elements(notes) AS e
+             WHERE nullif(e->>'text', '') IS NOT NULL
+               AND e->>'text' <> left(
+                     repeat('redacted placeholder text ',
+                            (length(e->>'text') / 26) + 1),
+                     length(e->>'text')))$p$, 'FAIL'),
+        -- Applicants write their own names into filenames.
+        ('proposal_docs_pathless',  'proposal_proposaldocumentation',
+         ARRAY['file'], $p$nullif(file, '') IS NOT NULL$p$, 'FAIL'),
+        ('proposal_call_docs_pathless', 'proposal_calldocument',
+         ARRAY['file'], $p$nullif(file, '') IS NOT NULL$p$, 'FAIL'),
+
         -- tables that must be empty
         ('no_identity_providers', 'waldur_auth_social_identityprovider',
          ARRAY['id'], 'true', 'FAIL'),
@@ -381,16 +449,24 @@ BEGIN
         'openstack_volume.metadata',
         'waldur_openstack_replication_migration.mappings'
     ] LOOP
-        SELECT to_regclass('public.' || quote_ident(split_part(spec, '.', 1)))
-                   IS NOT NULL
-               AND EXISTS (
-                   SELECT 1 FROM information_schema.columns ic
-                   WHERE ic.table_schema = 'public'
-                     AND ic.table_name = split_part(spec, '.', 1)
-                     AND ic.column_name = split_part(spec, '.', 2))
-        INTO present;
+        SELECT ic.udt_name INTO col_type
+        FROM information_schema.columns ic
+        WHERE ic.table_schema = 'public'
+          AND ic.table_name = split_part(spec, '.', 1)
+          AND ic.column_name = split_part(spec, '.', 2);
 
-        IF NOT present OR current_setting('server_version_num')::int < 160000
+        -- Skip when the column is absent on this release, when the server is
+        -- too old for IS JSON, or when this deployment declares the field as
+        -- native json/jsonb rather than text. The last one is not just
+        -- unnecessary - the database already guarantees such a value parses -
+        -- but actively breaks the check: nullif(col, '') casts the empty
+        -- string to the column's type, and ''::jsonb raises
+        -- `invalid input syntax for type json`. The same field is text on one
+        -- deployment and jsonb on another; logging_emailhook.event_groups is
+        -- text on the portal and jsonb on the awards site.
+        IF col_type IS NULL
+           OR col_type NOT IN ('text', 'varchar', 'bpchar')
+           OR current_setting('server_version_num')::int < 160000
         THEN
             skip := skip + 1;
             RAISE NOTICE '| SKIP   | % | % |',
