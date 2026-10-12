@@ -1,12 +1,17 @@
+import datetime
 from unittest.mock import Mock
 
+from constance.test import override_config
 from django.contrib.contenttypes.models import ContentType
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework import exceptions, test
+from rest_framework.exceptions import ValidationError
 
 from waldur_core.permissions import models, utils
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
-from waldur_core.permissions.fixtures import CustomerRole
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
+from waldur_core.permissions.serializers import clone_role_for_customer
 from waldur_core.structure.tests import factories, fixtures
 
 
@@ -88,7 +93,7 @@ class HasPermissionUtilTest(TestCase):
         self.assertEqual(result_user, result_request)
 
 
-class PermissionFactoryTest(test.APITransactionTestCase):
+class PermissionFactoryTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -412,3 +417,368 @@ class HasUserUtilTest(TestCase):
 
         result = utils.has_user(self.customer, self.user, self.role)
         self.assertFalse(result)
+
+
+class BulkPermissionTest(TestCase):
+    """Tests for has_any_permission and has_all_permissions utilities."""
+
+    def setUp(self):
+        self.fixture = fixtures.CustomerFixture()
+        self.customer = self.fixture.customer
+        self.owner = self.fixture.owner
+        self.user = factories.UserFactory()
+        self.staff_user = factories.UserFactory(is_staff=True)
+        # Add specific permissions to customer owner role
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING)
+
+    def test_has_any_permission_returns_true_when_user_has_one(self):
+        """Test that has_any_permission returns True when user has at least one permission."""
+        permissions = [PermissionEnum.CREATE_OFFERING, PermissionEnum.DELETE_OFFERING]
+        result = utils.has_any_permission(self.owner, permissions, self.customer)
+        self.assertTrue(result)
+
+    def test_has_any_permission_returns_false_when_user_has_none(self):
+        """Test that has_any_permission returns False when user has no permissions."""
+        permissions = [PermissionEnum.CREATE_OFFERING, PermissionEnum.DELETE_OFFERING]
+        result = utils.has_any_permission(self.user, permissions, self.customer)
+        self.assertFalse(result)
+
+    def test_has_all_permissions_returns_true_when_user_has_all(self):
+        """Test that has_all_permissions returns True when user has all permissions."""
+        permissions = [PermissionEnum.CREATE_OFFERING, PermissionEnum.UPDATE_OFFERING]
+        result = utils.has_all_permissions(self.owner, permissions, self.customer)
+        self.assertTrue(result)
+
+    def test_has_all_permissions_returns_false_when_user_lacks_one(self):
+        """Test that has_all_permissions returns False when user lacks any permission."""
+        permissions = [PermissionEnum.CREATE_OFFERING, PermissionEnum.DELETE_OFFERING]
+        result = utils.has_all_permissions(self.owner, permissions, self.customer)
+        self.assertFalse(result)
+
+    def test_staff_user_passes_any_permission_check(self):
+        """Test that staff users pass all bulk permission checks."""
+        permissions = [PermissionEnum.CREATE_OFFERING, PermissionEnum.DELETE_OFFERING]
+        self.assertTrue(
+            utils.has_any_permission(self.staff_user, permissions, self.customer)
+        )
+        self.assertTrue(
+            utils.has_all_permissions(self.staff_user, permissions, self.customer)
+        )
+
+    def test_has_any_permission_with_none_scope(self):
+        """Test that has_any_permission returns False for None scope."""
+        permissions = [PermissionEnum.CREATE_OFFERING]
+        result = utils.has_any_permission(self.owner, permissions, None)
+        self.assertFalse(result)
+
+    def test_has_all_permissions_with_none_scope(self):
+        """Test that has_all_permissions returns False for None scope."""
+        permissions = [PermissionEnum.CREATE_OFFERING]
+        result = utils.has_all_permissions(self.owner, permissions, None)
+        self.assertFalse(result)
+
+    def test_inactive_user_fails_any_permission_check(self):
+        """Test that inactive users fail all bulk permission checks."""
+        self.owner.is_active = False
+        self.owner.save()
+
+        permissions = [PermissionEnum.CREATE_OFFERING]
+        self.assertFalse(
+            utils.has_any_permission(self.owner, permissions, self.customer)
+        )
+        self.assertFalse(
+            utils.has_all_permissions(self.owner, permissions, self.customer)
+        )
+
+    def test_has_any_permission_accepts_request_object(self):
+        """Test that has_any_permission accepts request object."""
+        mock_request = Mock()
+        mock_request.user = self.owner
+
+        permissions = [PermissionEnum.CREATE_OFFERING]
+        result = utils.has_any_permission(mock_request, permissions, self.customer)
+        self.assertTrue(result)
+
+
+class PermissionFactoryValidationTest(TestCase):
+    """Tests for permission_factory input validation."""
+
+    def test_raises_value_error_for_invalid_permission_type(self):
+        """Test that permission_factory raises ValueError for invalid permission type."""
+        with self.assertRaises(ValueError) as context:
+            utils.permission_factory("OFFERING.CREATE")
+        self.assertIn("permission must be PermissionEnum", str(context.exception))
+
+    def test_raises_value_error_for_invalid_sources_type(self):
+        """Test that permission_factory raises ValueError for invalid sources type."""
+        with self.assertRaises(ValueError) as context:
+            utils.permission_factory(PermissionEnum.CREATE_OFFERING, sources="customer")
+        self.assertIn("sources must be a list or None", str(context.exception))
+
+    def test_accepts_valid_permission_enum(self):
+        """Test that permission_factory accepts valid PermissionEnum."""
+        result = utils.permission_factory(PermissionEnum.CREATE_OFFERING)
+        self.assertIsNotNone(result)
+
+    def test_accepts_none_sources(self):
+        """Test that permission_factory accepts None sources."""
+        result = utils.permission_factory(PermissionEnum.CREATE_OFFERING, sources=None)
+        self.assertIsNotNone(result)
+
+    def test_accepts_list_sources(self):
+        """Test that permission_factory accepts list sources."""
+        result = utils.permission_factory(
+            PermissionEnum.CREATE_OFFERING, sources=["customer"]
+        )
+        self.assertIsNotNone(result)
+
+
+class SameRoleGrantTest(TestCase):
+    def setUp(self):
+        self.project = factories.ProjectFactory()
+        self.user = factories.UserFactory()
+
+    def test_expiring_grant_of_the_same_role_blocks_another(self):
+        self.project.add_user(
+            self.user,
+            ProjectRole.ADMIN,
+            expiration_time=timezone.now() + datetime.timedelta(days=10),
+        )
+
+        with self.assertRaisesMessage(
+            ValidationError, "User has already the same role in this scope."
+        ):
+            utils.validate_role_grant(self.project, self.user, ProjectRole.ADMIN)
+
+    def test_revoked_grant_of_the_same_role_does_not_block(self):
+        self.project.add_user(self.user, ProjectRole.ADMIN)
+        utils.delete_user(self.project, self.user, ProjectRole.ADMIN)
+
+        utils.validate_role_grant(self.project, self.user, ProjectRole.ADMIN)
+
+
+class SingleRolePerScopeTest(TestCase):
+    def setUp(self):
+        self.project = factories.ProjectFactory()
+        self.user = factories.UserFactory()
+        self.project.add_user(self.user, ProjectRole.MANAGER)
+
+    def test_disabled_by_default_allows_second_role(self):
+        utils.validate_role_grant(self.project, self.user, ProjectRole.ADMIN)
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_enabled_blocks_second_role(self):
+        with self.assertRaisesMessage(
+            ValidationError, "User already has role within this scope."
+        ):
+            utils.validate_role_grant(self.project, self.user, ProjectRole.ADMIN)
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_enabled_allows_role_in_another_scope(self):
+        other_project = factories.ProjectFactory(customer=self.project.customer)
+
+        utils.validate_role_grant(other_project, self.user, ProjectRole.ADMIN)
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_enabled_allows_role_after_previous_is_revoked(self):
+        utils.delete_user(self.project, self.user, ProjectRole.MANAGER)
+
+        utils.validate_role_grant(self.project, self.user, ProjectRole.ADMIN)
+
+
+class OnlyOneProjectManagerTest(TestCase):
+    def setUp(self):
+        self.project = factories.ProjectFactory()
+        self.manager = factories.UserFactory()
+        self.other_user = factories.UserFactory()
+
+    def test_disabled_by_default_allows_second_manager(self):
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+
+        utils.validate_role_grant(self.project, self.other_user, ProjectRole.MANAGER)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_blocks_second_manager(self):
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+
+        with self.assertRaisesMessage(
+            ValidationError, "Project already has an active project manager."
+        ):
+            utils.validate_role_grant(
+                self.project, self.other_user, ProjectRole.MANAGER
+            )
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_allows_first_manager(self):
+        utils.validate_role_grant(self.project, self.manager, ProjectRole.MANAGER)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_allows_admin_when_manager_exists(self):
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+
+        utils.validate_role_grant(self.project, self.other_user, ProjectRole.ADMIN)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_allows_manager_on_another_project(self):
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+        other_project = factories.ProjectFactory(customer=self.project.customer)
+
+        utils.validate_role_grant(other_project, self.other_user, ProjectRole.MANAGER)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_allows_manager_after_previous_is_revoked(self):
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+        utils.delete_user(self.project, self.manager, ProjectRole.MANAGER)
+
+        utils.validate_role_grant(self.project, self.other_user, ProjectRole.MANAGER)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_expired_manager_does_not_block_new_manager(self):
+        expired_manager = factories.UserFactory()
+        utils.add_user(
+            self.project,
+            expired_manager,
+            ProjectRole.MANAGER,
+            expiration_time=timezone.now() - timezone.timedelta(days=1),
+        )
+
+        utils.validate_role_grant(self.project, self.other_user, ProjectRole.MANAGER)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_blocks_second_manager_via_clone(self):
+        clone = clone_role_for_customer(
+            ProjectRole.MANAGER, self.project.customer, conceal_template=False
+        )
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+
+        with self.assertRaisesMessage(
+            ValidationError, "Project already has an active project manager."
+        ):
+            utils.validate_role_grant(self.project, self.other_user, clone)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_counts_clone_manager_as_existing_manager(self):
+        clone = clone_role_for_customer(
+            ProjectRole.MANAGER, self.project.customer, conceal_template=False
+        )
+        self.project.add_user(self.manager, clone)
+
+        with self.assertRaisesMessage(
+            ValidationError, "Project already has an active project manager."
+        ):
+            utils.validate_role_grant(
+                self.project, self.other_user, ProjectRole.MANAGER
+            )
+
+
+class TemplateAwareRoleMatchingTest(TestCase):
+    """Role checks resolve organization-scoped clones one level deep: a user
+    holding a clone satisfies a check for the clone's template, never the
+    reverse (issue #316)."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+        self.project = self.fixture.project
+        self.user = factories.UserFactory()
+        self.clone = clone_role_for_customer(
+            ProjectRole.MEMBER, self.customer, conceal_template=False
+        )
+        utils.add_user(self.project, self.user, self.clone)
+
+    def test_clone_holder_satisfies_has_user_for_template(self):
+        self.assertTrue(utils.has_user(self.project, self.user, ProjectRole.MEMBER))
+
+    def test_template_holder_does_not_satisfy_has_user_for_clone(self):
+        member = factories.UserFactory()
+        utils.add_user(self.project, member, ProjectRole.MEMBER)
+        self.assertFalse(utils.has_user(self.project, member, self.clone))
+
+    def test_match_clones_false_is_identity_strict(self):
+        self.assertFalse(
+            utils.has_user(
+                self.project, self.user, ProjectRole.MEMBER, match_clones=False
+            )
+        )
+        self.assertTrue(
+            utils.has_user(self.project, self.user, self.clone, match_clones=False)
+        )
+
+    def test_expiration_time_applies_to_clone_match(self):
+        expiring = factories.UserFactory()
+        utils.add_user(
+            self.project,
+            expiring,
+            self.clone,
+            expiration_time=timezone.now() + timezone.timedelta(days=1),
+        )
+        self.assertTrue(utils.has_user(self.project, expiring, ProjectRole.MEMBER))
+        # Not a permanent role
+        self.assertFalse(
+            utils.has_user(
+                self.project, expiring, ProjectRole.MEMBER, expiration_time=None
+            )
+        )
+        # Expired by then
+        self.assertFalse(
+            utils.has_user(
+                self.project,
+                expiring,
+                ProjectRole.MEMBER,
+                expiration_time=timezone.now() + timezone.timedelta(days=2),
+            )
+        )
+
+    def test_orphaned_clone_no_longer_matches_template(self):
+        # Deleting a template SET_NULLs its clones; an orphan is a plain
+        # custom role and must not match anything but itself.
+        self.clone.template = None
+        self.clone.save()
+        self.assertFalse(utils.has_user(self.project, self.user, ProjectRole.MEMBER))
+        self.assertTrue(utils.has_user(self.project, self.user, self.clone))
+
+
+class TemplateAwareBulkLookupTest(TestCase):
+    """Bulk role lookups resolve organization-scoped clones one level deep,
+    matching the intent of the checks they back (issue #316)."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+        self.project = self.fixture.project
+        self.user = factories.UserFactory()
+        self.clone = clone_role_for_customer(
+            ProjectRole.MEMBER, self.customer, conceal_template=False
+        )
+        utils.add_user(self.project, self.user, self.clone)
+
+    def test_bulk_lookups_include_clone_holders(self):
+        project_ct = ContentType.objects.get_for_model(self.project)
+        self.assertIn(self.user, utils.get_users(self.project, RoleEnum.PROJECT_MEMBER))
+        self.assertIn(
+            self.user.id,
+            list(utils.get_user_ids(project_ct, [self.project.id], ProjectRole.MEMBER)),
+        )
+        self.assertIn(
+            self.user.id,
+            list(
+                utils.get_user_ids(
+                    project_ct, [self.project.id], RoleEnum.PROJECT_MEMBER
+                )
+            ),
+        )
+        self.assertIn(
+            self.project.id,
+            list(utils.get_scope_ids(self.user, project_ct, ProjectRole.MEMBER)),
+        )
+
+    def test_mail_fanout_reaches_clone_holders(self):
+        # Backs e.g. resource-termination notifications, which look up
+        # get_user_mails(ProjectRole.ADMIN) and used to skip clone holders.
+        admin = factories.UserFactory()
+        admin_clone = clone_role_for_customer(
+            ProjectRole.ADMIN, self.customer, conceal_template=False
+        )
+        utils.add_user(self.project, admin, admin_clone)
+        self.assertIn(admin.email, self.project.get_user_mails(ProjectRole.ADMIN))

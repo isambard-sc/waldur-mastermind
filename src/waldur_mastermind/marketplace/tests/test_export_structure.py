@@ -13,6 +13,7 @@ from waldur_core.permissions.models import Role, RolePermission, UserRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.invoices.tests import factories as invoices_factories
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
+from waldur_mastermind.policy.tests import factories as policy_factories
 
 
 class ExportStructureCommandTest(TestCase):
@@ -28,13 +29,13 @@ class ExportStructureCommandTest(TestCase):
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
 
-    def _call_export_command(self, output_path=None):
+    def _call_export_command(self, output_path=None, **kwargs):
         """Helper to call export_structure command and return output."""
         if output_path is None:
             output_path = self.output_file_path
 
         output = StringIO()
-        call_command("export_structure", "-o", output_path, stdout=output)
+        call_command("export_structure", "-o", output_path, stdout=output, **kwargs)
         return output.getvalue()
 
     def _load_exported_json(self, file_path=None):
@@ -84,6 +85,44 @@ class ExportStructureCommandTest(TestCase):
         self.assertFalse(exported_user["is_support"])
         self.assertTrue(exported_user["is_active"])
         self.assertIsNotNone(exported_user["date_joined"])
+
+    def test_export_users_with_token_lifetime(self):
+        """Test that export captures token_lifetime field correctly."""
+        # Test with explicit token_lifetime value
+        structure_factories.UserFactory(
+            username="user_with_lifetime",
+            email="lifetime@example.com",
+            token_lifetime=7200,  # 2 hours
+        )
+
+        # Test with token_lifetime = None (unlimited)
+        user_unlimited = structure_factories.UserFactory(
+            username="user_unlimited",
+            email="unlimited@example.com",
+        )
+        user_unlimited.token_lifetime = None
+        user_unlimited.save()
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        # Find the exported users
+        exported_users = {u["username"]: u for u in data["users"]}
+
+        # Verify user with explicit token_lifetime
+        self.assertIn("user_with_lifetime", exported_users)
+        self.assertEqual(
+            exported_users["user_with_lifetime"]["token_lifetime"],
+            7200,
+        )
+
+        # Verify user with unlimited token (token_lifetime = None → exported as -1)
+        self.assertIn("user_unlimited", exported_users)
+        self.assertEqual(
+            exported_users["user_unlimited"]["token_lifetime"],
+            -1,
+            "token_lifetime should be -1 for unlimited tokens",
+        )
 
     def test_export_customers_with_all_fields(self):
         """Test that export captures all customer fields correctly."""
@@ -162,7 +201,6 @@ class ExportStructureCommandTest(TestCase):
             backend_id="test_backend",
             default_vm_category=True,
             default_volume_category=False,
-            default_tenant_category=False,
         )
 
         self._call_export_command()
@@ -288,7 +326,7 @@ class ExportStructureCommandTest(TestCase):
             exported_user_role["scope_type"],
             f"{content_type.app_label}.{content_type.model}",
         )
-        self.assertEqual(exported_user_role["scope_uuid"], str(customer.id))
+        self.assertEqual(exported_user_role["scope_uuid"], str(customer.uuid.hex))
         self.assertEqual(exported_user_role["scope_name"], customer.name)
         self.assertTrue(exported_user_role["is_active"])
 
@@ -696,7 +734,7 @@ class ExportStructureCommandTest(TestCase):
             resource=resource,
             component=component,
             usage=100.5,
-            recurring=True,
+            missing_usage_policy="reuse",
             description="Monthly storage usage",
         )
 
@@ -714,7 +752,7 @@ class ExportStructureCommandTest(TestCase):
         self.assertEqual(exported_usage["component_type"], "storage")
         self.assertEqual(exported_usage["component_name"], "Storage")
         self.assertEqual(exported_usage["usage"], "100.50")
-        self.assertTrue(exported_usage["recurring"])
+        self.assertEqual(exported_usage["missing_usage_policy"], "reuse")
         self.assertEqual(exported_usage["description"], "Monthly storage usage")
         self.assertIsNotNone(exported_usage["date"])
         self.assertIsNotNone(exported_usage["billing_period"])
@@ -1033,3 +1071,676 @@ class ExportStructureCommandTest(TestCase):
 
         restored_category = Category.objects.get(uuid=original_category_uuid)
         self.assertEqual(restored_category.title, "Roundtrip Category")
+
+    def test_export_import_slurm_qos_round_trip(self):
+        """SLURM QoS profiles and partition allow-list links survive round-trip."""
+        from waldur_mastermind.marketplace.models import (
+            SlurmOfferingQoS,
+            SlurmPartitionQoS,
+        )
+
+        offering = marketplace_factories.OfferingFactory(name="QoS Offering")
+        partition = marketplace_factories.OfferingPartitionFactory(
+            offering=offering, partition_name="gpu"
+        )
+        qos = marketplace_factories.SlurmOfferingQoSFactory(
+            offering=offering, name="boost", max_nodes=128
+        )
+        link = marketplace_factories.SlurmPartitionQoSFactory(
+            partition=partition, qos=qos, is_default=True
+        )
+        qos_uuid = qos.uuid
+        link_uuid = link.uuid
+
+        # Export
+        self._call_export_command()
+        data = self._load_exported_json()
+        self.assertEqual(len(data["slurm_offering_qos"]), 1)
+        self.assertEqual(data["slurm_offering_qos"][0]["name"], "boost")
+        self.assertEqual(data["slurm_offering_qos"][0]["max_nodes"], 128)
+        self.assertEqual(len(data["slurm_partition_qos"]), 1)
+        self.assertTrue(data["slurm_partition_qos"][0]["is_default"])
+
+        # Drop the QoS rows (partition + offering are kept).
+        SlurmPartitionQoS.objects.all().delete()
+        SlurmOfferingQoS.objects.all().delete()
+
+        # Re-import
+        import_output = StringIO()
+        call_command(
+            "import_structure", "-i", self.output_file_path, stdout=import_output
+        )
+
+        restored_qos = SlurmOfferingQoS.objects.get(uuid=qos_uuid)
+        self.assertEqual(restored_qos.name, "boost")
+        self.assertEqual(restored_qos.max_nodes, 128)
+        self.assertEqual(restored_qos.offering.uuid, offering.uuid)
+
+        restored_link = SlurmPartitionQoS.objects.get(uuid=link_uuid)
+        self.assertTrue(restored_link.is_default)
+        self.assertEqual(restored_link.partition.uuid, partition.uuid)
+        self.assertEqual(restored_link.qos.uuid, restored_qos.uuid)
+
+    def test_export_group_invitations(self):
+        """Test that export captures group invitation data."""
+        from django.contrib.contenttypes.models import ContentType
+
+        from waldur_core.permissions.models import Role
+        from waldur_core.users.models import GroupInvitation
+
+        customer = structure_factories.CustomerFactory()
+        user = structure_factories.UserFactory()
+        content_type = ContentType.objects.get_for_model(customer)
+        role = Role.objects.create(
+            name="CUSTOMER.OWNER",
+            description="Customer Owner",
+            content_type=content_type,
+            is_active=True,
+        )
+
+        group_invitation = GroupInvitation.objects.create(
+            customer=customer,
+            role=role,
+            created_by=user,
+            is_active=True,
+            is_public=False,
+            auto_create_project=False,
+            content_type=content_type,
+            object_id=customer.id,
+        )
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        # Verify group invitations exported
+        self.assertIn("group_invitations", data)
+        exported_group_invitations = [
+            gi
+            for gi in data["group_invitations"]
+            if gi["uuid"] == group_invitation.uuid.hex
+        ]
+        self.assertEqual(len(exported_group_invitations), 1)
+
+        exported_gi = exported_group_invitations[0]
+        self.assertEqual(exported_gi["customer_uuid"], customer.uuid.hex)
+        self.assertEqual(exported_gi["role_uuid"], role.uuid.hex)
+        self.assertEqual(exported_gi["created_by_uuid"], user.uuid.hex)
+        self.assertEqual(exported_gi["is_active"], True)
+        self.assertEqual(exported_gi["is_public"], False)
+        self.assertEqual(exported_gi["auto_create_project"], False)
+
+    def test_export_invitations(self):
+        """Test that export captures invitation data."""
+        from django.contrib.contenttypes.models import ContentType
+
+        from waldur_core.permissions.models import Role
+        from waldur_core.users.models import Invitation
+
+        customer = structure_factories.CustomerFactory()
+        user = structure_factories.UserFactory()
+        content_type = ContentType.objects.get_for_model(customer)
+        role = Role.objects.create(
+            name="CUSTOMER.OWNER",
+            description="Customer Owner",
+            content_type=content_type,
+            is_active=True,
+        )
+
+        invitation = Invitation.objects.create(
+            customer=customer,
+            role=role,
+            created_by=user,
+            email="test@example.com",
+            full_name="Test User",
+            state="pending",
+            execution_state="Scheduled",
+            content_type=content_type,
+            object_id=customer.id,
+        )
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        # Verify invitations exported
+        self.assertIn("invitations", data)
+        exported_invitations = [
+            inv for inv in data["invitations"] if inv["uuid"] == invitation.uuid.hex
+        ]
+        self.assertEqual(len(exported_invitations), 1)
+
+        exported_inv = exported_invitations[0]
+        self.assertEqual(exported_inv["customer_uuid"], customer.uuid.hex)
+        self.assertEqual(exported_inv["role_uuid"], role.uuid.hex)
+        self.assertEqual(exported_inv["created_by_uuid"], user.uuid.hex)
+        self.assertEqual(exported_inv["email"], "test@example.com")
+        self.assertEqual(exported_inv["full_name"], "Test User")
+        self.assertEqual(exported_inv["state"], "pending")
+        self.assertEqual(exported_inv["execution_state"], "Scheduled")
+
+    def test_export_permission_requests(self):
+        """Test that export captures permission request data."""
+        from django.contrib.contenttypes.models import ContentType
+
+        from waldur_core.core.enums import ReviewStates
+        from waldur_core.permissions.models import Role
+        from waldur_core.users.models import GroupInvitation, PermissionRequest
+
+        customer = structure_factories.CustomerFactory()
+        user = structure_factories.UserFactory()
+        requesting_user = structure_factories.UserFactory()
+        content_type = ContentType.objects.get_for_model(customer)
+        role = Role.objects.create(
+            name="CUSTOMER.OWNER",
+            description="Customer Owner",
+            content_type=content_type,
+            is_active=True,
+        )
+
+        group_invitation = GroupInvitation.objects.create(
+            customer=customer,
+            role=role,
+            created_by=user,
+            is_active=True,
+            is_public=False,
+            auto_create_project=False,
+            content_type=content_type,
+            object_id=customer.id,
+        )
+
+        permission_request = PermissionRequest.objects.create(
+            invitation=group_invitation,
+            created_by=requesting_user,
+            state=ReviewStates.PENDING,
+            review_comment="Please grant me access",
+        )
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        # Verify permission requests exported
+        self.assertIn("permission_requests", data)
+        exported_permission_requests = [
+            pr
+            for pr in data["permission_requests"]
+            if pr["uuid"] == permission_request.uuid.hex
+        ]
+        self.assertEqual(len(exported_permission_requests), 1)
+
+        exported_pr = exported_permission_requests[0]
+        self.assertEqual(exported_pr["invitation_uuid"], group_invitation.uuid.hex)
+        self.assertEqual(exported_pr["created_by_uuid"], requesting_user.uuid.hex)
+        self.assertEqual(exported_pr["state"], ReviewStates.PENDING)
+        self.assertEqual(exported_pr["review_comment"], "Please grant me access")
+
+    # Credit Export Tests
+
+    def test_export_customer_credits_with_all_fields(self):
+        """Test that customer credits are exported with all fields."""
+        # Create test data
+        customer = structure_factories.CustomerFactory()
+        offering = marketplace_factories.OfferingFactory()
+
+        customer_credit = invoices_factories.CustomerCreditFactory(
+            customer=customer,
+            value=1000.50,
+            expected_consumption=800.25,
+            minimal_consumption_logic="linear",
+            grace_coefficient=15,
+            apply_as_minimal_consumption=True,
+            end_date=timezone.now().replace(day=1).date(),
+        )
+        # Add offering to many-to-many relationship
+        customer_credit.offerings.add(offering)
+
+        # Export and verify
+        self._call_export_command()
+        exported_data = self._load_exported_json()
+
+        self.assertIn("customer_credits", exported_data)
+        exported_credits = exported_data["customer_credits"]
+        self.assertEqual(len(exported_credits), 1)
+
+        exported_credit = exported_credits[0]
+        self.assertEqual(exported_credit["uuid"], customer_credit.uuid.hex)
+        self.assertEqual(exported_credit["customer_uuid"], customer.uuid.hex)
+        self.assertEqual(exported_credit["customer_name"], customer.name)
+        self.assertEqual(exported_credit["value"], "1000.50000")
+        self.assertEqual(exported_credit["expected_consumption"], "800.25000")
+        self.assertEqual(exported_credit["minimal_consumption_logic"], "linear")
+        self.assertEqual(exported_credit["grace_coefficient"], "15")
+        self.assertEqual(exported_credit["apply_as_minimal_consumption"], True)
+        self.assertIsNotNone(exported_credit["end_date"])
+        self.assertIsNotNone(exported_credit["created"])
+        self.assertIsNotNone(exported_credit["modified"])
+        self.assertIn("offering_uuids", exported_credit)
+        self.assertEqual(len(exported_credit["offering_uuids"]), 1)
+        self.assertEqual(exported_credit["offering_uuids"][0], offering.uuid.hex)
+
+    def test_export_project_credits_with_all_fields(self):
+        """Test that project credits are exported with all fields."""
+        # Create test data
+        customer = structure_factories.CustomerFactory()
+        project = structure_factories.ProjectFactory(customer=customer)
+        # ProjectCredit requires a CustomerCredit to exist with sufficient value
+        invoices_factories.CustomerCreditFactory(
+            customer=customer,
+            value=1000,  # Higher than project credit value
+        )
+
+        project_credit = invoices_factories.ProjectCreditFactory(
+            project=project,
+            value=500.75,
+            expected_consumption=400.50,
+            minimal_consumption_logic="fixed",
+            grace_coefficient=10,
+            apply_as_minimal_consumption=False,
+            end_date=timezone.now().replace(day=1).date(),
+            mark_unused_credit_as_spent_on_project_termination=True,
+        )
+
+        # Export and verify
+        self._call_export_command()
+        exported_data = self._load_exported_json()
+
+        self.assertIn("project_credits", exported_data)
+        exported_credits = exported_data["project_credits"]
+        self.assertEqual(len(exported_credits), 1)
+
+        exported_credit = exported_credits[0]
+        self.assertEqual(exported_credit["uuid"], project_credit.uuid.hex)
+        self.assertEqual(exported_credit["project_uuid"], project.uuid.hex)
+        self.assertEqual(exported_credit["project_name"], project.name)
+        self.assertEqual(exported_credit["customer_uuid"], customer.uuid.hex)
+        self.assertEqual(exported_credit["customer_name"], customer.name)
+        self.assertEqual(exported_credit["value"], "500.75000")
+        self.assertEqual(exported_credit["expected_consumption"], "400.50000")
+        self.assertEqual(exported_credit["minimal_consumption_logic"], "fixed")
+        self.assertEqual(exported_credit["grace_coefficient"], "10")
+        self.assertEqual(exported_credit["apply_as_minimal_consumption"], False)
+        self.assertIsNotNone(exported_credit["end_date"])
+        self.assertEqual(
+            exported_credit["mark_unused_credit_as_spent_on_project_termination"], True
+        )
+        self.assertIsNotNone(exported_credit["created"])
+        self.assertIsNotNone(exported_credit["modified"])
+
+    def test_export_credits_empty_collections(self):
+        """Test that empty credit collections are properly handled."""
+        # Export without any credits
+        self._call_export_command()
+        exported_data = self._load_exported_json()
+
+        self.assertIn("customer_credits", exported_data)
+        self.assertIn("project_credits", exported_data)
+        self.assertEqual(len(exported_data["customer_credits"]), 0)
+        self.assertEqual(len(exported_data["project_credits"]), 0)
+
+    def test_export_multiple_credits_different_customers_projects(self):
+        """Test exporting multiple credits across different customers and projects."""
+        # Create test data
+        customer1 = structure_factories.CustomerFactory()
+        customer2 = structure_factories.CustomerFactory()
+        project1 = structure_factories.ProjectFactory(customer=customer1)
+        project2 = structure_factories.ProjectFactory(customer=customer2)
+
+        invoices_factories.CustomerCreditFactory(customer=customer1, value=1000)
+        invoices_factories.CustomerCreditFactory(customer=customer2, value=2000)
+        invoices_factories.ProjectCreditFactory(project=project1, value=300)
+        invoices_factories.ProjectCreditFactory(project=project2, value=400)
+
+        # Export and verify
+        self._call_export_command()
+        exported_data = self._load_exported_json()
+
+        # Check customer credits
+        customer_credits = exported_data["customer_credits"]
+        self.assertEqual(len(customer_credits), 2)
+        exported_customer_uuids = {
+            credit["customer_uuid"] for credit in customer_credits
+        }
+        self.assertIn(customer1.uuid.hex, exported_customer_uuids)
+        self.assertIn(customer2.uuid.hex, exported_customer_uuids)
+
+        # Check project credits
+        project_credits = exported_data["project_credits"]
+        self.assertEqual(len(project_credits), 2)
+        exported_project_uuids = {credit["project_uuid"] for credit in project_credits}
+        self.assertIn(project1.uuid.hex, exported_project_uuids)
+        self.assertIn(project2.uuid.hex, exported_project_uuids)
+
+    def test_export_customer_credit_without_offerings(self):
+        """Test that customer credits without offerings are exported correctly."""
+        customer = structure_factories.CustomerFactory()
+        invoices_factories.CustomerCreditFactory(customer=customer)
+
+        # Export and verify
+        self._call_export_command()
+        exported_data = self._load_exported_json()
+
+        exported_credits = exported_data["customer_credits"]
+        self.assertEqual(len(exported_credits), 1)
+
+        exported_credit = exported_credits[0]
+        # Should not have offering_uuids key since no offerings are associated
+        self.assertNotIn("offering_uuids", exported_credit)
+
+    def test_export_customer_credit_with_multiple_offerings(self):
+        """Test that customer credits with multiple offerings are exported correctly."""
+        customer = structure_factories.CustomerFactory()
+        offering1 = marketplace_factories.OfferingFactory()
+        offering2 = marketplace_factories.OfferingFactory()
+
+        customer_credit = invoices_factories.CustomerCreditFactory(customer=customer)
+        customer_credit.offerings.add(offering1, offering2)
+
+        # Export and verify
+        self._call_export_command()
+        exported_data = self._load_exported_json()
+
+        exported_credits = exported_data["customer_credits"]
+        self.assertEqual(len(exported_credits), 1)
+
+        exported_credit = exported_credits[0]
+        self.assertIn("offering_uuids", exported_credit)
+        self.assertEqual(len(exported_credit["offering_uuids"]), 2)
+        self.assertIn(offering1.uuid.hex, exported_credit["offering_uuids"])
+        self.assertIn(offering2.uuid.hex, exported_credit["offering_uuids"])
+
+    def test_export_credits_command_output_shows_counts(self):
+        """Test that the export command output shows credit counts."""
+        # Create test data
+        customer = structure_factories.CustomerFactory()
+        project = structure_factories.ProjectFactory(customer=customer)
+        invoices_factories.CustomerCreditFactory(customer=customer, value=1000)
+        invoices_factories.ProjectCreditFactory(project=project, value=100)
+
+        # Call export and capture output
+        output = self._call_export_command()
+
+        # Verify that credit counts appear in the summary
+        self.assertIn("Customer Credits: 1", output)
+        self.assertIn("Project Credits: 1", output)
+
+    def test_export_software_catalogs(self):
+        """Test that export captures software catalog definitions."""
+        catalog = marketplace_factories.SoftwareCatalogFactory(
+            name="EESSI",
+            version="2023.06",
+            catalog_type="binary_runtime",
+            source_url="https://eessi.io",
+            description="EESSI software catalog",
+            metadata={"arch_mapping": {"x86_64": "generic"}},
+            auto_update_enabled=True,
+        )
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        self.assertIn("software_catalogs", data)
+        self.assertEqual(len(data["software_catalogs"]), 1)
+
+        exported_catalog = data["software_catalogs"][0]
+        self.assertEqual(exported_catalog["uuid"], catalog.uuid.hex)
+        self.assertEqual(exported_catalog["name"], "EESSI")
+        self.assertEqual(exported_catalog["version"], "2023.06")
+        self.assertEqual(exported_catalog["catalog_type"], "binary_runtime")
+        self.assertEqual(exported_catalog["source_url"], "https://eessi.io")
+        self.assertEqual(exported_catalog["description"], "EESSI software catalog")
+        self.assertEqual(
+            exported_catalog["metadata"], {"arch_mapping": {"x86_64": "generic"}}
+        )
+        self.assertTrue(exported_catalog["auto_update_enabled"])
+        self.assertIsNotNone(exported_catalog["created"])
+
+    def test_export_offering_partitions(self):
+        """Test that export captures offering partition data."""
+        offering = marketplace_factories.OfferingFactory(name="SLURM Offering")
+        partition = marketplace_factories.OfferingPartitionFactory(
+            offering=offering,
+            partition_name="gpu",
+            cpu_bind=1,
+            def_cpu_per_gpu=4,
+            max_cpus_per_node=64,
+        )
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        self.assertIn("offering_partitions", data)
+        self.assertEqual(len(data["offering_partitions"]), 1)
+
+        exported_partition = data["offering_partitions"][0]
+        self.assertEqual(exported_partition["uuid"], partition.uuid.hex)
+        self.assertEqual(exported_partition["offering_uuid"], offering.uuid.hex)
+        self.assertEqual(exported_partition["offering_name"], "SLURM Offering")
+        self.assertEqual(exported_partition["partition_name"], "gpu")
+        self.assertEqual(exported_partition["cpu_bind"], 1)
+        self.assertEqual(exported_partition["def_cpu_per_gpu"], 4)
+        self.assertEqual(exported_partition["max_cpus_per_node"], 64)
+        self.assertIsNotNone(exported_partition["created"])
+
+    def test_export_offering_software_catalogs(self):
+        """Test that export captures offering-to-software-catalog links."""
+        offering = marketplace_factories.OfferingFactory(name="Test Offering")
+        catalog = marketplace_factories.SoftwareCatalogFactory(
+            name="EESSI", version="2023.06"
+        )
+        partition = marketplace_factories.OfferingPartitionFactory(
+            offering=offering, partition_name="gpu"
+        )
+        link = marketplace_factories.OfferingSoftwareCatalogFactory(
+            offering=offering,
+            catalog=catalog,
+            partition=partition,
+            enabled_cpu_family=["x86_64", "aarch64"],
+            enabled_cpu_microarchitectures=["generic", "zen3"],
+        )
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        self.assertIn("offering_software_catalogs", data)
+        self.assertEqual(len(data["offering_software_catalogs"]), 1)
+
+        exported_link = data["offering_software_catalogs"][0]
+        self.assertEqual(exported_link["uuid"], link.uuid.hex)
+        self.assertEqual(exported_link["offering_uuid"], offering.uuid.hex)
+        self.assertEqual(exported_link["offering_name"], "Test Offering")
+        self.assertEqual(exported_link["catalog_uuid"], catalog.uuid.hex)
+        self.assertEqual(exported_link["catalog_name"], "EESSI")
+        self.assertEqual(exported_link["partition_uuid"], partition.uuid.hex)
+        self.assertEqual(exported_link["enabled_cpu_family"], ["x86_64", "aarch64"])
+        self.assertEqual(
+            exported_link["enabled_cpu_microarchitectures"], ["generic", "zen3"]
+        )
+        self.assertIsNotNone(exported_link["created"])
+
+    def test_export_offering_software_catalogs_without_partition(self):
+        """Test that export handles links without partition correctly."""
+        offering = marketplace_factories.OfferingFactory()
+        catalog = marketplace_factories.SoftwareCatalogFactory()
+        link = marketplace_factories.OfferingSoftwareCatalogFactory(
+            offering=offering,
+            catalog=catalog,
+            partition=None,
+            enabled_cpu_family=["x86_64"],
+        )
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        self.assertIn("offering_software_catalogs", data)
+        exported_link = data["offering_software_catalogs"][0]
+        self.assertEqual(exported_link["uuid"], link.uuid.hex)
+        self.assertNotIn("partition_uuid", exported_link)
+
+    def test_export_software_catalogs_empty(self):
+        """Test that empty software catalog collections are handled correctly."""
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        self.assertIn("software_catalogs", data)
+        self.assertIn("offering_partitions", data)
+        self.assertIn("offering_software_catalogs", data)
+        self.assertEqual(len(data["software_catalogs"]), 0)
+        self.assertEqual(len(data["offering_partitions"]), 0)
+        self.assertEqual(len(data["offering_software_catalogs"]), 0)
+
+    def test_export_project_estimated_cost_policies(self):
+        """Test that project estimated cost policies are exported correctly."""
+        policy = policy_factories.ProjectEstimatedCostPolicyFactory(
+            limit_cost=500,
+            actions="notify_project_team,block_creation_of_new_resources",
+        )
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        self.assertIn("project_estimated_cost_policies", data)
+        policies = data["project_estimated_cost_policies"]
+        self.assertEqual(len(policies), 1)
+        exported = policies[0]
+        self.assertEqual(exported["uuid"], policy.uuid.hex)
+        self.assertEqual(exported["project_uuid"], policy.scope.uuid.hex)
+        self.assertEqual(exported["limit_cost"], 500)
+        self.assertEqual(
+            exported["actions"],
+            "notify_project_team,block_creation_of_new_resources",
+        )
+
+    def test_export_customer_estimated_cost_policies(self):
+        """Test that customer estimated cost policies are exported correctly."""
+        policy = policy_factories.CustomerEstimatedCostPolicyFactory(
+            limit_cost=1000,
+            actions="notify_organization_owners",
+        )
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        self.assertIn("customer_estimated_cost_policies", data)
+        policies = data["customer_estimated_cost_policies"]
+        self.assertEqual(len(policies), 1)
+        exported = policies[0]
+        self.assertEqual(exported["uuid"], policy.uuid.hex)
+        self.assertEqual(exported["customer_uuid"], policy.scope.uuid.hex)
+        self.assertEqual(exported["limit_cost"], 1000)
+        self.assertEqual(exported["actions"], "notify_organization_owners")
+
+    def test_export_slurm_periodic_policies(self):
+        """Test that SLURM periodic usage policies are exported correctly."""
+        policy = policy_factories.SlurmPeriodicUsagePolicyFactory(
+            limit_type="GrpTRESMins",
+            carryover_factor=75,
+            grace_ratio=0.3,
+        )
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        self.assertIn("slurm_periodic_policies", data)
+        policies = data["slurm_periodic_policies"]
+        self.assertEqual(len(policies), 1)
+        exported = policies[0]
+        self.assertEqual(exported["uuid"], policy.uuid.hex)
+        self.assertEqual(exported["offering_uuid"], policy.scope.uuid.hex)
+        self.assertEqual(exported["limit_type"], "GrpTRESMins")
+        self.assertEqual(exported["carryover_factor"], 75)
+        self.assertAlmostEqual(exported["grace_ratio"], 0.3)
+        self.assertIn("component_limits", exported)
+
+    def test_export_events_not_included_by_default(self):
+        """Test that events are not exported without --include-events flag."""
+        from waldur_core.logging.tests.factories import EventFactory
+
+        EventFactory(event_type="reduction_of_customer_credit")
+
+        self._call_export_command()
+        data = self._load_exported_json()
+
+        self.assertNotIn("events", data)
+
+    def test_export_events_with_flag(self):
+        """Test that events related to invoicing, credits and policies are exported."""
+        from waldur_core.logging.tests.factories import EventFactory
+
+        credit_event = EventFactory(
+            event_type="reduction_of_customer_credit",
+            message="Credit reduced",
+            context={"customer_uuid": "abc123"},
+        )
+        invoice_event = EventFactory(
+            event_type="invoice_created",
+            message="Invoice created",
+            context={"customer_uuid": "abc123"},
+        )
+        policy_event = EventFactory(
+            event_type="policy_notification",
+            message="Policy triggered",
+            context={"project_uuid": "def456"},
+        )
+        # Unrelated event should not be exported
+        EventFactory(
+            event_type="auth_logged_in_with_username",
+            message="User logged in",
+        )
+
+        self._call_export_command(include_events=True)
+        data = self._load_exported_json()
+
+        self.assertIn("events", data)
+        exported_events = data["events"]
+        exported_uuids = {e["uuid"] for e in exported_events}
+
+        self.assertIn(credit_event.uuid.hex, exported_uuids)
+        self.assertIn(invoice_event.uuid.hex, exported_uuids)
+        self.assertIn(policy_event.uuid.hex, exported_uuids)
+        self.assertEqual(len(exported_events), 3)
+
+        # Verify event fields
+        credit_exported = next(
+            e for e in exported_events if e["uuid"] == credit_event.uuid.hex
+        )
+        self.assertEqual(credit_exported["event_type"], "reduction_of_customer_credit")
+        self.assertEqual(credit_exported["message"], "Credit reduced")
+        self.assertEqual(credit_exported["context"]["customer_uuid"], "abc123")
+        self.assertIn("created", credit_exported)
+
+    def test_export_includes_events_from_overdue_credit_zeroing(self):
+        """Test that events generated by set_to_zero_overdue_credits are included in export."""
+        from datetime import timedelta
+
+        from waldur_mastermind.invoices.tasks import set_to_zero_overdue_credits
+
+        customer = structure_factories.CustomerFactory()
+        past_first_of_month = (
+            timezone.now().date().replace(day=1) - timedelta(days=1)
+        ).replace(day=1)
+        credit = invoices_factories.CustomerCreditFactory(
+            customer=customer,
+            value=500,
+            end_date=past_first_of_month,
+        )
+
+        self.assertEqual(credit.value, 500)
+
+        set_to_zero_overdue_credits()
+
+        credit.refresh_from_db()
+        self.assertEqual(credit.value, 0)
+
+        self._call_export_command(include_events=True)
+        data = self._load_exported_json()
+
+        self.assertIn("events", data)
+        exported_events = data["events"]
+        overdue_events = [
+            e
+            for e in exported_events
+            if e["event_type"] == "set_to_zero_overdue_credit"
+        ]
+        self.assertEqual(len(overdue_events), 1)
+        self.assertIn("set to zero", overdue_events[0]["message"])
+        self.assertEqual(
+            overdue_events[0]["context"]["customer_uuid"], customer.uuid.hex
+        )

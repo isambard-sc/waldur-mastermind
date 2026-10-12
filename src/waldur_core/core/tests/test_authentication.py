@@ -1,23 +1,35 @@
+from unittest import mock
+
 import httpx
 import jwt
 import respx
+from axes.signals import user_locked_out
+from constance import config
 from constance.test.unittest import override_config
 from django.conf import settings
+from django.contrib.auth import SESSION_KEY as AUTH_USER_SESSION_KEY
 from django.core.cache import cache
 from django.core.exceptions import ObjectDoesNotExist
+from django.db import IntegrityError
 from django.urls import reverse
 from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
 from rest_framework.authtoken.models import Token
 
-from waldur_core.core.authentication import refresh_token
+from waldur_core.core.authentication import (
+    AUTHENTICATION_METHOD_KEY,
+    DEFAULT_TOKEN_UPDATE_INTERVAL,
+    AuthenticationMethod,
+    refresh_token,
+)
 from waldur_core.core.models import User
+from waldur_core.logging.models import Event
 
 from . import helpers
 
 
-class TokenAuthenticationTest(test.APITransactionTestCase):
+class TokenAuthenticationTest(test.APITestCase):
     def setUp(self):
         self.username = "test"
         self.password = "secret"
@@ -41,6 +53,76 @@ class TokenAuthenticationTest(test.APITransactionTestCase):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + token)
         response = self.client.get(self.test_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_login_succeeds_while_a_session_cookie_is_present(self):
+        """A leftover Django session used to make login fail with a CSRF error.
+
+        The SPA and Django admin share an origin, so an admin visit leaves a
+        `sessionid` cookie that is sent to the login endpoint too. That made
+        SessionAuthentication authenticate the request, and DRF enforce CSRF on
+        it; a login POST carries no CSRF token, so the credentials were never
+        read. The reported workaround was clearing all cookies, and the symptom
+        showed up as "log out one user, log in as another".
+        """
+        client = test.APIClient(enforce_csrf_checks=True)
+        someone_else = User.objects.create_user(
+            "admin-visitor", "visitor@example.com", "other-secret"
+        )
+        client.force_login(someone_else)
+
+        response = client.post(
+            self.auth_url, data={"username": self.username, "password": self.password}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        # The credentials in the body decide who this is, not the cookie.
+        self.assertEqual(Token.objects.get(key=response.data["token"]).user, self.user)
+
+    def test_login_ends_another_users_session(self):
+        """Logging in must not write into, or keep alive, someone else's session.
+
+        The login method used to be recorded in whatever session the browser
+        sent, so a leftover admin session of another user survived the login
+        and carried the new user's login method.
+        """
+        client = test.APIClient()
+        someone_else = User.objects.create_user(
+            "admin-visitor", "visitor@example.com", "other-secret"
+        )
+        client.force_login(someone_else)
+        old_key = client.session.session_key
+
+        response = client.post(
+            self.auth_url, data={"username": self.username, "password": self.password}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        session = client.session
+        self.assertNotEqual(session.session_key, old_key)
+        self.assertFalse(session.exists(old_key))
+        self.assertNotIn(AUTH_USER_SESSION_KEY, session)
+        self.assertEqual(session[AUTHENTICATION_METHOD_KEY], AuthenticationMethod.LOCAL)
+
+    def test_login_renews_the_key_of_the_same_users_session(self):
+        client = test.APIClient()
+        client.force_login(self.user)
+        session = client.session
+        session["passkey_admin_verified_at"] = "2026-09-27T00:00:00Z"
+        session.save()
+        old_key = session.session_key
+
+        response = client.post(
+            self.auth_url, data={"username": self.username, "password": self.password}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        session = client.session
+        self.assertNotEqual(session.session_key, old_key)
+        self.assertFalse(session.exists(old_key))
+        # Same user: the admin login and its verified flag carry over.
+        self.assertEqual(session[AUTH_USER_SESSION_KEY], str(self.user.pk))
+        self.assertEqual(session["passkey_admin_verified_at"], "2026-09-27T00:00:00Z")
+        self.assertEqual(session[AUTHENTICATION_METHOD_KEY], AuthenticationMethod.LOCAL)
 
     def test_user_can_logout(self):
         response = self.client.post(
@@ -93,6 +175,16 @@ class TokenAuthenticationTest(test.APITransactionTestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    def test_user_blocked_event_is_emitted_once_when_lockout_threshold_is_reached(self):
+        for _ in range(6):
+            self.client.post(
+                self.auth_url, data={"username": self.username, "password": "WRONG"}
+            )
+
+        events = Event.objects.filter(event_type="user_blocked")
+        self.assertEqual(events.count(), 1)
+        self.assertIn(self.username, events.first().message)
+
     def test_expired_token_is_recreated_on_successful_authentication(self):
         user = User.objects.get(username=self.username)
         self.assertIsNotNone(user.token_lifetime)
@@ -124,6 +216,101 @@ class TokenAuthenticationTest(test.APITransactionTestCase):
         with freeze_time(next_time):
             token = refresh_token(self.user)
         self.assertLess(token.created, timezone.now())
+
+    def test_refresh_token_tolerates_concurrent_rotation(self):
+        """A concurrent request/task may rotate an expired token between our
+        read and our write. Because Token.user is unique, the racing create()
+        raises IntegrityError; refresh_token must recover by reusing the
+        surviving token instead of bubbling up a 500 on the
+        authtoken_token_user_id_key unique constraint."""
+        self.user.token_lifetime = 10
+        self.user.save()
+        original, _ = Token.objects.get_or_create(user=self.user)
+
+        expired_time = timezone.now() + timezone.timedelta(seconds=20)
+        with freeze_time(expired_time):
+            # Simulate losing the rotation race: our create() collides on the
+            # unique user constraint. The atomic savepoint rolls back our
+            # delete, so the surviving token is returned.
+            with mock.patch.object(
+                Token.objects,
+                "create",
+                side_effect=IntegrityError("duplicate key value"),
+            ):
+                token = refresh_token(self.user)
+
+        self.assertEqual(Token.objects.filter(user=self.user).count(), 1)
+        self.assertEqual(token.key, original.key)
+
+    def test_token_not_refreshed_within_half_lifetime(self):
+        """When user has token_lifetime set, the debounce interval is
+        token_lifetime / 2. Token created timestamp should NOT be updated
+        if less than half the lifetime has elapsed."""
+        self.user.token_lifetime = 3600
+        self.user.save()
+        token = Token.objects.get(user=self.user)
+        original_created = token.created
+
+        # 1799 seconds is less than 3600 / 2 = 1800 debounce interval
+        frozen_time = original_created + timezone.timedelta(seconds=1799)
+        with freeze_time(frozen_time):
+            refresh_token(self.user)
+
+        token.refresh_from_db()
+        self.assertEqual(token.created, original_created)
+
+    def test_token_refreshed_after_half_lifetime(self):
+        """When user has token_lifetime set, the debounce interval is
+        token_lifetime / 2. Token created timestamp SHOULD be updated
+        if more than half the lifetime has elapsed."""
+        self.user.token_lifetime = 3600
+        self.user.save()
+        token = Token.objects.get(user=self.user)
+        original_created = token.created
+
+        # 1801 seconds is more than 3600 / 2 = 1800 debounce interval
+        frozen_time = original_created + timezone.timedelta(seconds=1801)
+        with freeze_time(frozen_time):
+            refresh_token(self.user)
+
+        token.refresh_from_db()
+        self.assertGreater(token.created, original_created)
+
+    def test_token_not_refreshed_within_default_interval_when_no_lifetime(self):
+        """When user has no token_lifetime, the debounce interval falls back
+        to DEFAULT_TOKEN_UPDATE_INTERVAL (600s). Token created timestamp
+        should NOT be updated if less than 600 seconds have elapsed."""
+        self.user.token_lifetime = None
+        self.user.save()
+        token = Token.objects.get(user=self.user)
+        original_created = token.created
+
+        # 599 seconds is less than the 600s default interval
+        frozen_time = original_created + timezone.timedelta(seconds=599)
+        with freeze_time(frozen_time):
+            refresh_token(self.user)
+
+        token.refresh_from_db()
+        self.assertEqual(token.created, original_created)
+
+    def test_token_refreshed_after_default_interval_when_no_lifetime(self):
+        """When user has no token_lifetime, the debounce interval falls back
+        to DEFAULT_TOKEN_UPDATE_INTERVAL (600s). Token created timestamp
+        SHOULD be updated if more than 600 seconds have elapsed."""
+        self.user.token_lifetime = None
+        self.user.save()
+        token = Token.objects.get(user=self.user)
+        original_created = token.created
+
+        # 601 seconds is more than the 600s default interval
+        frozen_time = original_created + timezone.timedelta(
+            seconds=DEFAULT_TOKEN_UPDATE_INTERVAL.total_seconds() + 1
+        )
+        with freeze_time(frozen_time):
+            refresh_token(self.user)
+
+        token.refresh_from_db()
+        self.assertGreater(token.created, original_created)
 
     def test_token_never_expires_if_token_lifetime_is_none(self):
         user = User.objects.get(username=self.username)
@@ -187,6 +374,38 @@ class TokenAuthenticationTest(test.APITransactionTestCase):
         self.assertTrue(b"Authentication method is disabled." in response.content)
 
 
+class AxesLockoutEventTest(test.APITestCase):
+    def tearDown(self):
+        cache.clear()
+
+    def test_user_blocked_event_is_emitted_on_axes_lockout(self):
+        user_locked_out.send(
+            "axes",
+            request=None,
+            username="attacker",
+            ip_address="203.0.113.7",
+        )
+
+        events = Event.objects.filter(event_type="user_blocked")
+        self.assertEqual(events.count(), 1)
+        message = events.first().message
+        self.assertIn("attacker", message)
+        self.assertIn("203.0.113.7", message)
+
+    def test_repeated_axes_lockout_signals_emit_a_single_event(self):
+        # django-axes re-sends user_locked_out on every attempt made while the
+        # lockout is already in force; only the first should be logged.
+        for _ in range(5):
+            user_locked_out.send(
+                "axes",
+                request=None,
+                username="attacker",
+                ip_address="203.0.113.7",
+            )
+
+        self.assertEqual(Event.objects.filter(event_type="user_blocked").count(), 1)
+
+
 VALID_JWT_PAYLOAD = {
     "exp": 9999999999,  # Far future
     "username": "test_user",
@@ -202,7 +421,7 @@ VALID_JWT_TOKEN = jwt.encode(VALID_JWT_PAYLOAD, "test_secret")
     OIDC_CLIENT_SECRET="test-secret",
     OIDC_USER_FIELD="username",
 )
-class OIDCAuthenticationTest(test.APITransactionTestCase):
+class OIDCAuthenticationTest(test.APITestCase):
     def tearDown(self):
         cache.clear()
 
@@ -253,6 +472,32 @@ class OIDCAuthenticationTest(test.APITransactionTestCase):
         self.assertEqual(response.data["detail"], "Token has expired.")
 
     @respx.mock
+    def test_existing_inactive_user_is_rejected(self):
+        """An existing deactivated user must be rejected, not crash on re-creation.
+
+        The default User.objects manager filters out inactive users, so a naive
+        get_or_create would miss the existing row and then collide on the unique
+        username constraint, producing a 500. Authentication must return 401.
+        """
+        username = "deactivated_user"
+        User.objects.create_user(username=username, is_active=False)
+
+        respx.post("http://oidc.example.com/introspect").mock(
+            return_value=httpx.Response(
+                200, json={"active": True, "username": username}
+            )
+        )
+
+        response = self.client.get(
+            "/api/users/me/",
+            HTTP_AUTHORIZATION=f"Bearer {VALID_JWT_TOKEN}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        # No duplicate row was created.
+        self.assertEqual(User.all_objects.filter(username=username).count(), 1)
+
+    @respx.mock
     def test_user_created_if_not_exists(self):
         """Test that a new user is created when they don't exist in the system"""
         non_existent_username = "new_test_user"
@@ -283,3 +528,5 @@ class OIDCAuthenticationTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["username"], non_existent_username)
         self.assertTrue(User.objects.filter(username=non_existent_username).exists())
+        new_user = User.objects.get(username=non_existent_username)
+        self.assertEqual(new_user.registration_method, config.OIDC_REGISTRATION_METHOD)

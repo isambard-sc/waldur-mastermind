@@ -4,12 +4,14 @@ from ddt import data, ddt
 from rest_framework import status, test
 
 from waldur_core.core.enums import CoreStates
+from waldur_core.structure.tests import factories as structure_factories
+from waldur_core.structure.utils import move_project
 from waldur_openstack import models
 
 from . import factories, fixtures
 
 
-class BaseSecurityGroupTest(test.APITransactionTestCase):
+class BaseSecurityGroupTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
 
@@ -42,6 +44,19 @@ class SecurityGroupCreateTest(BaseSecurityGroupTest):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         self.assertEqual(models.SecurityGroup.objects.count(), 1)
         self.assertEqual(models.SecurityGroupRule.objects.count(), 1)
+
+    def test_security_group_can_be_created_after_project_is_moved(self):
+        self.fixture.settings.shared = False
+        self.fixture.settings.save()
+        move_project(self.fixture.project, structure_factories.CustomerFactory())
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.post(self.url, data=self.valid_data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertNotEqual(
+            self.fixture.settings.customer, self.fixture.tenant.project.customer
+        )
 
     def test_security_group_name_should_be_unique(self):
         self.client.force_authenticate(self.fixture.admin)
@@ -184,6 +199,95 @@ class SecurityGroupCreateTest(BaseSecurityGroupTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(models.SecurityGroup.objects.count(), 0)
         self.assertEqual(models.SecurityGroupRule.objects.count(), 0)
+
+    def test_user_can_create_security_group_rule_for_numeric_protocol(self):
+        # IANA protocol number 112 (VRRP) — required for HA load-balancer VIP.
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.post(
+            self.url,
+            data={
+                "name": "vrrp",
+                "rules": [
+                    {
+                        "protocol": "112",
+                        "from_port": -1,
+                        "to_port": -1,
+                        "cidr": "0.0.0.0/0",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(models.SecurityGroup.objects.count(), 1)
+        self.assertEqual(models.SecurityGroupRule.objects.count(), 1)
+        self.assertEqual(models.SecurityGroupRule.objects.get().protocol, "112")
+
+    def test_can_not_create_security_group_rule_for_numeric_protocol_with_port_range(
+        self,
+    ):
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.post(
+            self.url,
+            data={
+                "name": "vrrp",
+                "rules": [
+                    {
+                        "protocol": "112",
+                        "from_port": 80,
+                        "to_port": 80,
+                        "cidr": "0.0.0.0/0",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(models.SecurityGroup.objects.count(), 0)
+
+    def test_can_not_create_security_group_rule_with_out_of_range_protocol(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.post(
+            self.url,
+            data={
+                "name": "bad",
+                "rules": [
+                    {
+                        "protocol": "999",
+                        "from_port": -1,
+                        "to_port": -1,
+                        "cidr": "0.0.0.0/0",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(models.SecurityGroup.objects.count(), 0)
+
+    def test_can_not_create_security_group_rule_with_negative_protocol(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.post(
+            self.url,
+            data={
+                "name": "bad",
+                "rules": [
+                    {
+                        "protocol": "-1",
+                        "from_port": -1,
+                        "to_port": -1,
+                        "cidr": "0.0.0.0/0",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(models.SecurityGroup.objects.count(), 0)
 
     def test_can_not_create_security_group_with_invalid_port(self):
         self.client.force_authenticate(self.fixture.staff)
@@ -595,3 +699,204 @@ class SecurityGroupRetrieveTest(BaseSecurityGroupTest):
         self.client.force_authenticate(getattr(self.fixture, user))
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class TenantPushSecurityGroupsTest(BaseSecurityGroupTest):
+    def setUp(self):
+        super().setUp()
+        self.tenant = self.fixture.tenant
+        self.tenant.state = CoreStates.OK
+        self.tenant.save()
+        self.url = factories.TenantFactory.get_url(
+            self.tenant, action="push_security_groups"
+        )
+        self.client.force_authenticate(self.fixture.admin)
+
+    @patch("waldur_openstack.executors.TenantPushSecurityGroupsExecutor.execute")
+    def test_create_new_security_group(self, mock_executor):
+        payload = [{"name": "new-sg", "description": "New SG"}]
+        response = self.client.post(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertTrue(self.tenant.security_groups.filter(name="new-sg").exists())
+        mock_executor.assert_called_once_with(self.tenant)
+
+    @patch("waldur_openstack.executors.TenantPushSecurityGroupsExecutor.execute")
+    def test_delete_existing_security_group(self, mock_executor):
+        sg_to_delete = factories.SecurityGroupFactory(tenant=self.tenant)
+        payload = []
+        response = self.client.post(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertFalse(
+            self.tenant.security_groups.filter(id=sg_to_delete.id).exists()
+        )
+        mock_executor.assert_called_once_with(self.tenant)
+
+    @patch("waldur_openstack.executors.TenantPushSecurityGroupsExecutor.execute")
+    def test_update_existing_security_group(self, mock_executor):
+        sg_to_update = factories.SecurityGroupFactory(tenant=self.tenant)
+        payload = [
+            {
+                "uuid": sg_to_update.uuid.hex,
+                "name": "updated-name",
+                "description": "updated-desc",
+            }
+        ]
+        response = self.client.post(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        sg_to_update.refresh_from_db()
+        self.assertEqual(sg_to_update.name, "updated-name")
+        self.assertEqual(sg_to_update.description, "updated-desc")
+        mock_executor.assert_called_once_with(self.tenant)
+
+    @patch("waldur_openstack.executors.TenantPushSecurityGroupsExecutor.execute")
+    def test_update_rules_for_existing_group(self, mock_executor):
+        sg_to_update = factories.SecurityGroupFactory(tenant=self.tenant)
+        factories.SecurityGroupRuleFactory(security_group=sg_to_update)
+        self.assertEqual(sg_to_update.rules.count(), 1)
+
+        payload = [
+            {
+                "uuid": sg_to_update.uuid.hex,
+                "name": sg_to_update.name,
+                "rules": [
+                    {
+                        "protocol": "tcp",
+                        "from_port": 80,
+                        "to_port": 80,
+                        "cidr": "0.0.0.0/0",
+                    }
+                ],
+            }
+        ]
+        response = self.client.post(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        sg_to_update.refresh_from_db()
+        self.assertEqual(sg_to_update.rules.count(), 1)
+        self.assertEqual(sg_to_update.rules.first().from_port, 80)
+        mock_executor.assert_called_once_with(self.tenant)
+
+    @patch("waldur_openstack.executors.TenantPushSecurityGroupsExecutor.execute")
+    def test_mixed_operation(self, mock_executor):
+        sg_to_delete = factories.SecurityGroupFactory(tenant=self.tenant, name="delete")
+        sg_to_update = factories.SecurityGroupFactory(tenant=self.tenant, name="update")
+
+        payload = [
+            {
+                "uuid": sg_to_update.uuid.hex,
+                "name": "updated-name",
+            },
+            {"name": "new-sg"},
+        ]
+        response = self.client.post(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+        self.assertFalse(
+            self.tenant.security_groups.filter(id=sg_to_delete.id).exists()
+        )
+        self.assertTrue(
+            self.tenant.security_groups.filter(name="updated-name").exists()
+        )
+        self.assertTrue(self.tenant.security_groups.filter(name="new-sg").exists())
+
+        mock_executor.assert_called_once_with(self.tenant)
+
+    def test_create_group_with_remote_group_rule_by_name(self):
+        payload = [
+            {
+                "name": "sg-A",
+                "rules": [
+                    {
+                        "protocol": "tcp",
+                        "from_port": 1,
+                        "to_port": 1,
+                        "remote_group_name": "sg-B",
+                    }
+                ],
+            },
+            {"name": "sg-B"},
+        ]
+        response = self.client.post(self.url, payload)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+        sg_a = self.tenant.security_groups.get(name="sg-A")
+        sg_b = self.tenant.security_groups.get(name="sg-B")
+
+        self.assertEqual(sg_a.rules.count(), 1)
+        self.assertEqual(sg_a.rules.first().remote_group, sg_b)
+
+
+class SecurityGroupInstanceCountTest(BaseSecurityGroupTest):
+    def setUp(self):
+        super().setUp()
+        self.security_group = self.fixture.security_group
+        self.client.force_authenticate(self.fixture.admin)
+
+    def test_instance_count_is_zero_for_unused_security_group(self):
+        response = self.client.get(
+            factories.SecurityGroupFactory.get_url(self.security_group)
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["instance_count"], 0)
+
+    def test_instance_count_reflects_attached_instances(self):
+        for _ in range(2):
+            instance = factories.InstanceFactory(
+                project=self.fixture.project, tenant=self.fixture.tenant
+            )
+            instance.security_groups.add(self.security_group)
+
+        response = self.client.get(
+            factories.SecurityGroupFactory.get_url(self.security_group)
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["instance_count"], 2)
+
+    def test_instance_count_includes_instances_attached_through_a_port(self):
+        instance = factories.InstanceFactory(
+            project=self.fixture.project, tenant=self.fixture.tenant
+        )
+        port = factories.PortFactory(
+            instance=instance,
+            tenant=self.fixture.tenant,
+            network=self.fixture.network,
+        )
+        port.security_groups.add(self.security_group)
+
+        response = self.client.get(
+            factories.SecurityGroupFactory.get_url(self.security_group)
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["instance_count"], 1)
+
+    def test_instance_attached_by_both_relations_is_counted_once(self):
+        instance = factories.InstanceFactory(
+            project=self.fixture.project, tenant=self.fixture.tenant
+        )
+        instance.security_groups.add(self.security_group)
+        port = factories.PortFactory(
+            instance=instance,
+            tenant=self.fixture.tenant,
+            network=self.fixture.network,
+        )
+        port.security_groups.add(self.security_group)
+
+        response = self.client.get(
+            factories.SecurityGroupFactory.get_url(self.security_group)
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["instance_count"], 1)
+
+    def test_instance_count_is_null_for_nested_security_group(self):
+        instance = self.fixture.instance
+        self.fixture.port.security_groups.add(self.security_group)
+
+        response = self.client.get(factories.InstanceFactory.get_url(instance))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(
+            response.data["ports"][0]["security_groups"][0]["instance_count"]
+        )

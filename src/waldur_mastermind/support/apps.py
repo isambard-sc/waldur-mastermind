@@ -44,6 +44,12 @@ class SupportConfig(AppConfig):
         )
 
         signals.post_save.connect(
+            handlers.send_issue_created_notification,
+            sender=Issue,
+            dispatch_uid="waldur_mastermind.support.handlers.send_issue_created_notification",
+        )
+
+        signals.post_save.connect(
             handlers.send_issue_updated_notification,
             sender=Issue,
             dispatch_uid="waldur_mastermind.support.handlers.send_issue_updated_notification",
@@ -53,4 +59,22 @@ class SupportConfig(AppConfig):
             handlers.create_feedback_if_issue_has_been_resolved,
             sender=Issue,
             dispatch_uid="waldur_mastermind.support.handlers.create_feedback_if_issue_has_been_resolved",
+        )
+
+        signals.post_save.connect(
+            handlers.dispatch_routing_on_issue_create,
+            sender=Issue,
+            dispatch_uid="waldur_mastermind.support.handlers.dispatch_routing_on_issue_create",
+        )
+
+        signals.post_save.connect(
+            handlers.forward_comment_to_children,
+            sender=Comment,
+            dispatch_uid="waldur_mastermind.support.handlers.forward_comment_to_children",
+        )
+
+        signals.post_save.connect(
+            handlers.propagate_comment_to_parent,
+            sender=Comment,
+            dispatch_uid="waldur_mastermind.support.handlers.propagate_comment_to_parent",
         )

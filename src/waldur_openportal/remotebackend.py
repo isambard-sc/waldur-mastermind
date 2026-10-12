@@ -4,6 +4,7 @@ import json
 import logging
 import re
 
+import openportal
 from django.conf import settings as django_settings
 from django.core.exceptions import ObjectDoesNotExist
 
@@ -13,12 +14,11 @@ from waldur_core.structure.backend import ServiceBackend
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.marketplace import models as marketplace_models
-
+from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_openportal import remote_project_service, signals
 from waldur_openportal.remoteclient import RemoteOpenPortalClient
 
-from . import models
-from . import op as openportal
+from . import exceptions, models
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,15 @@ logger = logging.getLogger(__name__)
 class RemoteOpenPortalBackend(ServiceBackend):
     def __init__(self, settings):
         self.settings = settings
-        self.client = self.get_client(settings)
+
+    @property
+    def client(self) -> RemoteOpenPortalClient:
+        """
+        Lazy initialize OpenPortal client instance
+        """
+        if not hasattr(self, "_client"):
+            self._client = self.get_client(self.settings)
+        return self._client
 
     def destination(self) -> openportal.Destination:
         """
@@ -52,42 +60,12 @@ class RemoteOpenPortalBackend(ServiceBackend):
         logger.debug(f"Pulling OpenPortal remote resources for settings: {self}")
 
         logger.warning("Skipping pull_resources")
-        return
-        # --- IGNORE ---
-        fail_count = 0
-        now = datetime.datetime.now()
-
-        from . import tasks as openportal_tasks
-
-        for allocation in self.get_allocation_queryset().filter(
-            state=CoreStates.OK, is_added=True
-        ):
-            if openportal_tasks.is_task_running(openportal_tasks.sync):
-                logger.debug(
-                    "Task sync is already running - skipping allocation %s",
-                    allocation,
-                )
-                continue
-
-            try:
-                logger.debug("About to pull allocation %s", allocation)
-                self.pull_allocation(allocation)
-            except Exception as e:
-                logger.error("Error while pulling allocation [%s]: %s", allocation, e)
-                fail_count += 1
-
-                if fail_count > 5 and (datetime.datetime.now() - now).seconds > 60:
-                    logger.error("Too many failures - aborting")
-                    return
-                elif (datetime.datetime.now() - now).seconds > 120:
-                    logger.error("Took too long - aborting")
-                    return
 
     def ping(self, raise_exception=False):
         logger.debug("Pinging OpenPortal")
         try:
             self.client.health()
-        except openportal.OpenPortalError as e:
+        except exceptions.OpenPortalError as e:
             logger.error(f"OpenPortal is not available: {e}")
             if raise_exception:
                 raise ServiceBackendError(e)
@@ -323,7 +301,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
             # add it again just to be sure
             try:
                 mapping = self.client.add_project(project, details)
-            except openportal.ManagedProjectRejectedError as e:
+            except exceptions.ManagedProjectRejectedError as e:
                 logger.warning(f"OpenPortal project {project} is rejected: {e}. ")
                 try:
                     if remote_project is None:
@@ -397,7 +375,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
             try:
                 mapping = self.client.add_project(project, details)
-            except openportal.ManagedProjectRejectedError as e:
+            except exceptions.ManagedProjectRejectedError as e:
                 logger.warning(f"OpenPortal project {project} is rejected: {e}. ")
                 try:
                     if remote_project is None:
@@ -454,7 +432,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
             confirmed_details_json = json.loads(
                 self.client.get_award(project).to_json()
             )
-        except openportal.OpenPortalUnsupportedCommandError as e:
+        except exceptions.OpenPortalUnsupportedCommandError as e:
             logger.warning(
                 f"Remote portal does not support get_award for {project}"
                 f" (older portal) — using sent details as confirmed: {e}"
@@ -607,7 +585,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
                 _confirmed_details_json = json.loads(
                     self.client.get_award(project_identifier).to_json()
                 )
-            except openportal.OpenPortalUnsupportedCommandError as e:
+            except exceptions.OpenPortalUnsupportedCommandError as e:
                 logger.warning(
                     f"Remote portal does not support get_award for"
                     f" {project_identifier} (older portal)"
@@ -637,7 +615,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
             else:
                 allocation.state = CoreStates.OK
                 allocation.save(update_fields=["state", "modified"])
-        except openportal.ManagedProjectRejectedError as e:
+        except exceptions.ManagedProjectRejectedError as e:
             logger.warning(
                 f"OpenPortal project {project_identifier} is rejected: {e}. "
             )
@@ -1005,10 +983,16 @@ class RemoteOpenPortalBackend(ServiceBackend):
             )
             return
 
-        # Get the plan period
-        plan_period = marketplace_models.ResourcePlanPeriod.objects.filter(
-            resource=resource, end=None
-        ).first()
+        # Resolve the plan period the month being reconciled was billed under,
+        # not whichever period happens to be open now. A resource whose plan
+        # has changed since — or which has been terminated — has a closed
+        # period covering that month, and its ComponentUsage is keyed to it.
+        # Looking the usage up under the current period would miss the existing
+        # row and add a second one for the same month, which the uniqueness
+        # constraint allows because the plan periods differ.
+        plan_period = marketplace_utils.get_plan_period_for_billing(
+            resource, month_date
+        )
 
         if not plan_period:
             logger.warning(
@@ -1267,7 +1251,7 @@ class RemoteOpenPortalBackend(ServiceBackend):
 
             try:
                 report = self.client.get_storage_report(project, month)
-            except openportal.OpenPortalError as e:
+            except exceptions.OpenPortalError as e:
                 logger.warning(
                     f"Failed to get storage report for {allocation} in {month}: {e}"
                 )

@@ -1,6 +1,8 @@
+import ipaddress
 import logging
 import re
 
+from constance import config
 from cryptography import x509
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat import backends as hazmat_backends
@@ -10,11 +12,10 @@ from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator
 from django.utils.deconstruct import deconstructible
 from django.utils.translation import gettext_lazy as _
-from iptools.ipv4 import validate_cidr as is_valid_ipv4_cidr
-from iptools.ipv6 import validate_cidr as is_valid_ipv6_cidr
 
 from waldur_core.core import exceptions
-from waldur_core.core.enums import CoreStates
+from waldur_core.core.countries import ISO_3166_1
+from waldur_core.core.enums import GENDER_CHOICES, CoreStates
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,33 @@ def validate_name(value):
         )
 
 
+def get_project_name_regex_error(value):
+    """Check a user-supplied project name against the configurable pattern.
+
+    Returns an error message if ``PROJECT_NAME_REGEX`` is set and the whole name
+    does not match it, otherwise ``None``. The check is intentionally applied
+    only to user-facing project create/rename paths; system-generated project
+    names (auto-provisioning, imports, proposal/Rancher composed names) are not
+    subject to it. A malformed pattern is treated as an admin misconfiguration
+    and skipped rather than blocking project creation.
+    """
+    pattern = config.PROJECT_NAME_REGEX
+    if not pattern or not value:
+        return None
+    try:
+        matches = re.fullmatch(pattern, value)
+    except re.error:
+        logger.warning(
+            "PROJECT_NAME_REGEX is not a valid regular expression: %r", pattern
+        )
+        return None
+    if matches:
+        return None
+    return config.PROJECT_NAME_REGEX_ERROR_MESSAGE or _(
+        "Project name does not match the required pattern."
+    )
+
+
 class StateValidator:
     # Use state_enum to validate states of a model that has custom state field (e.g. RobotAccounts use RobotAccountStates)
     def __init__(self, *valid_states, state_enum=None):
@@ -47,7 +75,7 @@ class StateValidator:
             elif hasattr(resource, "States"):
                 states_names = dict(resource.States.CHOICES)
             else:
-                states_names = dict(CoreStates.CHOICES)
+                states_names = dict(CoreStates.choices)
             valid_states_names = [
                 str(states_names[state]) for state in self.valid_states
             ]
@@ -69,6 +97,27 @@ class BackendURLValidator(URLValidator):
     schemes = ["ldap", "ldaps", "http", "https", "ssh", "rdp"]
 
 
+def is_valid_ipv4_cidr(value: str) -> bool:
+    # Mirrors iptools.ipv4.validate_cidr: bare addresses without /prefix are rejected.
+    if not isinstance(value, str) or "/" not in value:
+        return False
+    try:
+        ipaddress.IPv4Network(value, strict=False)
+    except ValueError:
+        return False
+    return True
+
+
+def is_valid_ipv6_cidr(value: str) -> bool:
+    if not isinstance(value, str) or "/" not in value:
+        return False
+    try:
+        ipaddress.IPv6Network(value, strict=False)
+    except ValueError:
+        return False
+    return True
+
+
 def is_valid_ipv46_cidr(value):
     return is_valid_ipv6_cidr(value) or is_valid_ipv4_cidr(value)
 
@@ -87,6 +136,58 @@ def validate_cidr_list(value):
             code="invalid",
             params=", ".join(invalid_items),
         )
+
+
+def normalize_network_acl(entries: list[str]) -> list[str]:
+    """Validate and canonicalise a list of CIDR strings for a network ACL.
+
+    Bare addresses are widened to /32 or /128. Entries with host bits set are
+    rejected rather than silently masked — in an access-control list, silently
+    turning 203.0.113.5/24 into a whole /24 would grant far more than intended.
+    """
+    if not isinstance(entries, list):
+        raise ValidationError(
+            _("Network ACL must be a list of CIDR strings."),
+            code="invalid_network_acl",
+        )
+
+    normalized = []
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValidationError(
+                _("Network ACL entries must be non-empty strings."),
+                code="invalid_network_acl",
+            )
+        item = entry.strip()
+        try:
+            network = ipaddress.ip_network(item, strict=True)
+        except ValueError:
+            try:
+                suggestion = ipaddress.ip_network(item, strict=False)
+            except ValueError:
+                raise ValidationError(
+                    _("%(entry)s is not a valid IP address or CIDR network."),
+                    code="invalid_network_acl",
+                    params={"entry": item},
+                ) from None
+            raise ValidationError(
+                _("%(entry)s has host bits set; use %(suggestion)s instead."),
+                code="invalid_network_acl",
+                params={"entry": item, "suggestion": str(suggestion)},
+            ) from None
+
+        if network.prefixlen == 0:
+            raise ValidationError(
+                _("%(entry)s allows every address; leave the list empty instead."),
+                code="invalid_network_acl",
+                params={"entry": item},
+            )
+
+        text = str(network)
+        if text not in normalized:
+            normalized.append(text)
+
+    return normalized
 
 
 @deconstructible
@@ -138,6 +239,156 @@ def validate_x509_certificate(data):
         raise ValidationError(_("Invalid X509 certificate."))
 
 
+# ISO 3166-1 alpha-2 country codes plus "EU", matching the choices exposed on the API
+ISO_3166_1_ALPHA_2_CODES = frozenset(code for code, _name in ISO_3166_1) | {"EU"}
+
+
+@deconstructible
+class ISO3166Alpha2Validator:
+    """Validate ISO 3166-1 alpha-2 country codes."""
+
+    message = _(
+        "Enter a valid ISO 3166-1 alpha-2 country code (e.g., 'US', 'DE', 'EE')."
+    )
+    code = "invalid_country_code"
+
+    def __init__(self, message=None, code=None):
+        if message is not None:
+            self.message = message
+        if code is not None:
+            self.code = code
+
+    def __call__(self, value):
+        if value and value.upper() not in ISO_3166_1_ALPHA_2_CODES:
+            raise ValidationError(self.message, code=self.code)
+
+
+validate_iso_3166_alpha2 = ISO3166Alpha2Validator()
+
+
+VALID_PERSONAL_TITLES = {"Mr", "Ms", "Mrs", "Miss", "Dr", "Prof", "Sir", "Dame"}
+
+
+def validate_personal_title(value):
+    """Validate personal title against a set of allowed values."""
+    if not value:
+        return
+    if value not in VALID_PERSONAL_TITLES:
+        raise ValidationError(
+            _("Invalid personal title '%(value)s'. Allowed values are: %(allowed)s."),
+            params={
+                "value": value,
+                "allowed": ", ".join(sorted(VALID_PERSONAL_TITLES)),
+            },
+        )
+
+
+def validate_gender(value):
+    if not value:
+        return
+    valid_values = {key for key, _ in GENDER_CHOICES}
+    if value not in valid_values:
+        raise ValidationError(
+            _("Invalid gender '%(value)s'. Allowed values are: %(allowed)s."),
+            params={
+                "value": value,
+                "allowed": ", ".join(sorted(valid_values)),
+            },
+        )
+
+
+def validate_nationalities(value):
+    """Validate that nationalities is a list of valid ISO 3166-1 alpha-2 codes."""
+    if not value:
+        return
+    if not isinstance(value, list):
+        raise ValidationError(_("Nationalities must be a list."))
+    for item in value:
+        if not isinstance(item, str):
+            raise ValidationError(_("Each nationality must be a string."))
+        if item.upper() not in ISO_3166_1_ALPHA_2_CODES:
+            raise ValidationError(
+                _("'%(value)s' is not a valid ISO 3166-1 alpha-2 country code."),
+                params={"value": item},
+            )
+
+
+def validate_schac_organization_type(value):
+    """
+    Validate SCHAC homeOrganizationType URN format.
+
+    SCHAC URN format: urn:schac:homeOrganizationType:<country>:<type>
+    Examples:
+    - urn:schac:homeOrganizationType:int:university
+    - urn:schac:homeOrganizationType:de:research-institution
+    """
+    if not value:
+        return
+
+    if not isinstance(value, str):
+        raise ValidationError(_("Organization type must be a string."))
+
+    # SCHAC URN pattern
+    schac_pattern = re.compile(
+        r"^urn:schac:homeOrganizationType:[a-z]{2,3}:[a-zA-Z0-9\-]+$"
+    )
+
+    # Also accept simple organization types without URN prefix
+    simple_pattern = re.compile(r"^[a-zA-Z0-9\-_]+$")
+
+    if not schac_pattern.match(value) and not simple_pattern.match(value):
+        raise ValidationError(
+            _(
+                "Invalid organization type format. Use SCHAC URN format "
+                "(e.g., 'urn:schac:homeOrganizationType:int:university') "
+                "or a simple identifier (e.g., 'university')."
+            )
+        )
+
+
+def validate_refeds_assurance_list(value):
+    """
+    Validate REFEDS Assurance Framework URIs.
+
+    REFEDS assurance URIs are typically in the format:
+    - https://refeds.org/assurance/IAP/...
+    - https://refeds.org/assurance/ID/...
+    - https://refeds.org/assurance/ATP/...
+    - urn:oasis:names:tc:SAML:2.0:ac:classes:...
+    """
+    if not value:
+        return
+
+    if not isinstance(value, list):
+        raise ValidationError(_("Assurance levels must be a list."))
+
+    # URI patterns for assurance levels
+    valid_patterns = [
+        re.compile(r"^https://refeds\.org/assurance/"),
+        re.compile(r"^urn:oasis:names:tc:SAML:"),
+        re.compile(r"^https://"),  # Allow other HTTPS URIs
+        re.compile(r"^urn:"),  # Allow other URNs
+    ]
+
+    invalid_items = []
+    for item in value:
+        if not isinstance(item, str):
+            invalid_items.append(str(item))
+            continue
+
+        if not any(pattern.match(item) for pattern in valid_patterns):
+            invalid_items.append(item)
+
+    if invalid_items:
+        raise ValidationError(
+            _(
+                "Invalid assurance URIs: %(items)s. "
+                "Expected REFEDS assurance URIs or valid URNs."
+            ),
+            params={"items": ", ".join(invalid_items)},
+        )
+
+
 def validate_unix_path(path):
     """Validate that the given path is a valid Unix/Linux file path."""
     if not isinstance(path, str):
@@ -173,3 +424,105 @@ def validate_unix_path(path):
             raise ValidationError(
                 _("Path component is too long (maximum 255 characters).")
             )
+
+
+# Quantifier, either a bare one or a bounded repetition: +, *, {2}, {2,}, {2,5}
+_QUANTIFIER = r"(?:[+*]|\{\d+,?\d*\})"
+
+# Patterns that indicate potential ReDoS vulnerability
+_REDOS_PATTERNS = [
+    # Nested quantifiers: (a+)+, (?P<x>a+)+, (?:a{2,})*. The group prefix is
+    # optional - an earlier revision required "(?", which let the plain (a+)+
+    # form, the textbook catastrophic-backtracking case, pass unnoticed.
+    rf"\((?:\?P?<[^>]*>|\?:)?[^)]*{_QUANTIFIER}[^)]*\){_QUANTIFIER}",
+    r"\([^)]*\|[^)]*\)[+*]{2,}",  # Overlapping alternations with quantifiers
+    r"[+*]\?[+*]",  # Adjacent quantifiers
+]
+_REDOS_REGEX = re.compile("|".join(_REDOS_PATTERNS))
+_MAX_REGEX_PATTERN_LENGTH = 200
+
+
+def is_potentially_dangerous_regex(pattern: str) -> bool:
+    """Check if a regex pattern might cause ReDoS.
+
+    Returns True if the pattern exceeds the maximum length or contains
+    constructs known to cause catastrophic backtracking.
+    """
+    if len(pattern) > _MAX_REGEX_PATTERN_LENGTH:
+        return True
+    return bool(_REDOS_REGEX.search(pattern))
+
+
+def collect_access_email_pattern_errors(patterns) -> list[str]:
+    """Collect human-readable problems with a list of access-control email patterns.
+
+    Returns an empty list when every pattern is a usable regular expression.
+    """
+    if not isinstance(patterns, list | tuple):
+        return ["Value must be a list of regular expressions."]
+
+    invalid_patterns = []
+    dangerous_patterns = []
+
+    for pattern in patterns:
+        if not pattern or not isinstance(pattern, str):
+            invalid_patterns.append(pattern)
+            continue
+        try:
+            re.compile(pattern)
+        except re.error:
+            invalid_patterns.append(pattern)
+            continue
+        if is_potentially_dangerous_regex(pattern):
+            dangerous_patterns.append(pattern)
+
+    errors = []
+    if invalid_patterns:
+        errors.append(f"Invalid regex patterns: {invalid_patterns}")
+    if dangerous_patterns:
+        errors.append(
+            "Potentially dangerous patterns (nested quantifiers or too long): "
+            f"{dangerous_patterns}"
+        )
+    return errors
+
+
+def validate_access_email_patterns(patterns) -> None:
+    """Reject email patterns that cannot be used as an access-control allowlist."""
+    errors = collect_access_email_pattern_errors(patterns)
+    if errors:
+        raise ValidationError(errors)
+
+
+def matches_access_email_pattern(patterns, email) -> bool:
+    """Check whether an email is allowed by any of the access-control patterns.
+
+    Unlike :meth:`UserDetailsMatchMixin._is_pattern_match`, which is a convenience
+    filter, this is an authorization decision, so matching is deliberately strict:
+
+    * the whole email must match the pattern (``fullmatch``), otherwise a pattern
+      such as ``.*@example\\.com`` would also admit ``user@example.com.attacker.net``;
+    * matching is case-insensitive, mirroring how emails are compared elsewhere
+      (``email__iexact``);
+    * an unusable pattern (not a string, invalid regex, potential ReDoS) never
+      matches, so a broken configuration denies access rather than granting it.
+    """
+    if not email or not isinstance(email, str):
+        return False
+    if not isinstance(patterns, list | tuple):
+        return False
+
+    for pattern in patterns:
+        if not pattern or not isinstance(pattern, str):
+            continue
+        if is_potentially_dangerous_regex(pattern):
+            logger.warning(
+                "Potentially dangerous regex pattern rejected: '%s'", pattern[:50]
+            )
+            continue
+        try:
+            if re.fullmatch(pattern, email, re.IGNORECASE):
+                return True
+        except re.error as e:
+            logger.warning("Invalid regex pattern '%s': %s", pattern, e)
+    return False

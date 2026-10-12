@@ -1,1 +1,0 @@
-Draft proposal "{{ proposal_name }}" has been deleted

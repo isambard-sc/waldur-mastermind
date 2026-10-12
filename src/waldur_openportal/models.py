@@ -1,27 +1,27 @@
-import logging
 import json
+import logging
+import re
 
-from . import op as openportal
-
+import openportal
 from django.conf import settings
-from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models
-from django.db.models import F
-from django.utils.translation import gettext_lazy as _
 from django.core import validators
-
+from django.core.validators import MaxValueValidator, MinValueValidator
+from django.db import models, transaction
+from django.db.models import F
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 from model_utils import FieldTracker
 
 from waldur_core.core import models as core_models
-from waldur_core.core import utils as core_utils
-from waldur_core.structure import models as structure_models
-from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.invoices import models as invoice_models
-from waldur_core.structure.managers import get_project_users
-from waldur_core.permissions.models import UserRole, Role
-from waldur_core.core.mixins import ReviewMixin
 from waldur_core.core.enums import ReviewStates
+from waldur_core.core.mixins import ReviewMixin
+from waldur_core.permissions.models import Role, UserRole
+from waldur_core.structure import models as structure_models
+from waldur_core.structure.managers import get_project_users
+from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_openportal import utils
+
+from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,10 @@ class UsageMixin(models.Model):
     node_usage = models.DecimalField(default=0, decimal_places=2, max_digits=20)
 
 
-class Allocation(UsageMixin, structure_models.BaseResource):
+class Allocation(UsageMixin, structure_models.BaseResource, core_models.AvailableMixin):
+    class Meta(structure_models.BaseResource.Meta):
+        pass
+
     is_active = models.BooleanField(default=True)
     tracker = FieldTracker()
 
@@ -162,7 +165,12 @@ class Allocation(UsageMixin, structure_models.BaseResource):
         return self.__str__()
 
 
-class RemoteAllocation(UsageMixin, structure_models.BaseResource):
+class RemoteAllocation(
+    UsageMixin, structure_models.BaseResource, core_models.AvailableMixin
+):
+    class Meta(structure_models.BaseResource.Meta):
+        pass
+
     is_active = models.BooleanField(default=True)
     tracker = FieldTracker()
 
@@ -372,13 +380,13 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
 
         return (allocation, allocation_unit)
 
-    def get_project_details(self) -> openportal.ProjectDetails:
+    def get_project_details(self) -> openportal.AwardDetails:
         if self.project is None:
             raise ValueError("Project is not set!")
 
         project = self.project
 
-        details = openportal.ProjectDetails("{}")
+        details = openportal.AwardDetails("{}")
 
         if project.name is not None:
             details.name = str(project.name)
@@ -946,11 +954,21 @@ class UserInfo(models.Model):
         validators=[
             validators.RegexValidator(
                 regex=r"^[a-z][a-z0-9]+$",
-                message="Must start with a letter and only contain numbers and letters.",
+                message=_(
+                    "Must start with a letter and only contain numbers and letters."
+                ),
             ),
+            # RegexValidator searches rather than matches, so this rejects
+            # "admin" and "root" anywhere in the shortname, not only at the
+            # end: the shortname becomes a local account name, and a
+            # privileged-looking one is worth refusing wherever it appears.
+            # IGNORECASE is belt and braces - the rule above already limits
+            # the shortname to lower case.
             validators.RegexValidator(
-                regex=r"(admin)|(root)$",
+                regex=r"admin|root",
+                flags=re.IGNORECASE,
                 inverse_match=True,
+                message=_("Cannot contain 'admin' or 'root'."),
             ),
             validators.MinLengthValidator(4),
             validators.MaxLengthValidator(MAX_USER_SHORTNAME_LENGTH),
@@ -967,49 +985,33 @@ class UserInfo(models.Model):
 
     def sanitise(self):
         """
-        Double check that our shortname matches the user unix_username
-        if this field exists
+        Nothing to reconcile: the shortname is this model's own field, and
+        set_shortname() copies it to User.slug as it writes.
+
+        It used to mirror core.User.unix_username, which no longer exists -
+        UserInfo.shortname IS that field now, and User.slug the copy of it.
+        Kept as a no-op because two backends, the API and both viewsets call
+        it, and ProjectInfo.sanitise() still does real work.
         """
-        if hasattr(self.user, "unix_username"):
-            if (
-                self.shortname != self.user.unix_username
-                and self.user.unix_username is not None
-            ):
-                self.set_shortname(self.user.unix_username)
-                self.save()
 
     def set_shortname(self, shortname: str):
         """
-        Set the shortname, checking whether or not this has not already
-        been set, and making sure it lines up with the unix_username if
-        that field is present in the user
+        Set the shortname, refusing to change one that is already set:
+        external systems form local usernames from it and cannot follow a
+        rename. Copies it to User.slug as it goes.
+
+        This is the only writer of the field, so it is where the rules
+        declared on it are enforced - full_clean() runs the validators
+        (save() does not) and the uniqueness check. Everything is checked
+        before anything is written, and the write of the shortname and the
+        write of its copy on User.slug share a transaction: a rejected
+        shortname must not leave a slug behind, or the copy everyone reads
+        drifts away from the value it copies.
         """
         if not shortname:
             raise ValueError("Shortname cannot be empty.")
 
-        if hasattr(self.user, "unix_username"):
-            if (
-                shortname != self.user.unix_username
-                and self.user.unix_username is not None
-            ):
-                # Set flag to prevent circular updates when saving unix_username
-                self.user._syncing_to_userinfo = True
-                try:
-                    self.user.unix_username = self.shortname
-                    self.user.save(update_fields=["unix_username"])
-                finally:
-                    self.user._syncing_to_userinfo = False
-
-            self.shortname = self.user.unix_username
-
-        # make sure to copy the shortname to the slug
-        # Set flag to prevent circular updates
-        self.user._syncing_to_userinfo = True
-        try:
-            self.user.slug = shortname
-            self.user.save(update_fields=["slug"])
-        finally:
-            self.user._syncing_to_userinfo = False
+        shortname = shortname.strip()
 
         if self.shortname and self.shortname != shortname:
             logger.error(
@@ -1020,11 +1022,21 @@ class UserInfo(models.Model):
             )
 
         self.shortname = shortname
+        self.full_clean()
+
+        with transaction.atomic():
+            self.save()
+
+            # make sure to copy the shortname to the slug
+            # Set flag to prevent circular updates
+            self.user._syncing_to_userinfo = True
+            try:
+                self.user.slug = shortname
+                self.user.save(update_fields=["slug"])
+            finally:
+                self.user._syncing_to_userinfo = False
 
     def save(self, *args, **kwargs):
-        if "update_fields" in kwargs and "query_field" not in kwargs["update_fields"]:
-            kwargs["update_fields"] = set(kwargs["update_fields"]).add("query_field")
-
         # The shortname cannot be changed after creation as external systems may already depend on it.
         prev = self.tracker.previous("shortname")
         if self.tracker.has_changed("shortname") and prev:
@@ -1323,7 +1335,7 @@ class ProjectInfo(models.Model):
                 # application_portal_only mode (i.e., we're in Project Management mode)
                 try:
                     application_portal_only = core_models.Feature.objects.get(
-                        key="deployment.application_portal_only"
+                        key=core_models.APPLICATION_PORTAL_FEATURE
                     ).value
                 except core_models.Feature.DoesNotExist:
                     # Default to False if feature flag doesn't exist
@@ -1413,9 +1425,6 @@ class ProjectInfo(models.Model):
             self.allowed_destinations = str(destinations)
 
     def save(self, *args, force_accept_changed_shortname: bool = False, **kwargs):
-        if "update_fields" in kwargs and "query_field" not in kwargs["update_fields"]:
-            kwargs["update_fields"] = set(kwargs["update_fields"]).add("query_field")
-
         # The shortname cannot be changed after creation as external systems may already depend on it.
         if not force_accept_changed_shortname:
             prev = self.tracker.previous("shortname")
@@ -1682,7 +1691,7 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
     # Combination of name, offering and portal must be unique
     class Meta:
         unique_together = ("name", "offering", "portal")
-        ordering = ["name"]
+        ordering = ["name", "id"]
         verbose_name = _("Project class")
         verbose_name_plural = _("Project classes")
 
@@ -2245,16 +2254,16 @@ class ManagedProject(ReviewMixin, models.Model):
             f"{self.get_remote_identifier()}:{self.get_local_identifier()}"
         )
 
-    def set_details(self, details: openportal.ProjectDetails):
+    def set_details(self, details: openportal.AwardDetails):
         """
-        Set the ProjectDetails object for this project.
-        If the details are not an instance of ProjectDetails, convert it.
+        Set the AwardDetails object for this project.
+        If the details are not an instance of AwardDetails, convert it.
         """
-        if not isinstance(details, openportal.ProjectDetails):
+        if not isinstance(details, openportal.AwardDetails):
             if not isinstance(details, str):
-                details = openportal.ProjectDetails(json.dumps(details))
+                details = openportal.AwardDetails(json.dumps(details))
             else:
-                details = openportal.ProjectDetails(details)
+                details = openportal.AwardDetails(details)
 
         new_details = json.loads(str(details))
 
@@ -2284,12 +2293,12 @@ class ManagedProject(ReviewMixin, models.Model):
                     new_details=self.details,
                 )
 
-    def get_details(self) -> openportal.ProjectDetails:
+    def get_details(self) -> openportal.AwardDetails:
         """
-        Get the ProjectDetails object from the project data.
+        Get the AwardDetails object from the project data.
         If the project data is not set, return None.
         """
-        return openportal.ProjectDetails(json.dumps(self.details))
+        return openportal.AwardDetails(json.dumps(self.details))
 
     def _get_project_link(self) -> openportal.Link | None:
         """
@@ -2322,6 +2331,7 @@ class ManagedProject(ReviewMixin, models.Model):
             existing_details = self.get_details()
             existing_details.project_link = None
             self.set_details(existing_details)
+            self._sync_attachment()
             return
 
         if not isinstance(project, structure_models.Project):
@@ -2337,10 +2347,133 @@ class ManagedProject(ReviewMixin, models.Model):
         existing_details = self.get_details()
         existing_details.project_link = self._get_project_link()
         self.set_details(existing_details)
+        self._sync_attachment()
+
+    def _sync_attachment(self):
+        """
+        Ensure ManagedProjectAttachment reflects self.project: close any
+        open attachment pointing at a project other than the current one
+        (or at any project, when self.project is now None), then get or
+        create the open attachment for the current project, if any.
+
+        Called from set_project() - the single place self.project changes -
+        so every attach/detach, whether via the attach()/detach() API
+        actions or the silent set_project() call made when an award is
+        first created or linked to an existing project, is tracked here.
+        """
+        now = timezone.now()
+
+        ManagedProjectAttachment.objects.filter(
+            managed_project=self, detached_at__isnull=True
+        ).exclude(project=self.project).update(detached_at=now)
+
+        if self.project is not None:
+            ManagedProjectAttachment.objects.get_or_create(
+                managed_project=self,
+                project=self.project,
+                detached_at__isnull=True,
+            )
+
+    def get_attachments(self):
+        """
+        Return this ManagedProject's attachment history
+        (ManagedProjectAttachment rows), reconstructing it from
+        ManagedProjectAuditEntry the first time it's needed - e.g. for a
+        ManagedProject that predates ManagedProjectAttachment tracking.
+        """
+        existing = self.attachments.all()
+        if existing.exists():
+            return existing
+
+        self._reconstruct_attachments_from_audit_log()
+        return self.attachments.all()
+
+    def _reconstruct_attachments_from_audit_log(self):
+        """
+        One-off, best-effort reconstruction of this ManagedProject's
+        attachment history from ManagedProjectAuditEntry, for a
+        ManagedProject that predates ManagedProjectAttachment tracking.
+        Idempotent: does nothing if attachments already exist.
+
+        ManagedProjectAuditEntry never records which project an attach or
+        detach referred to - only ManagedProject.project, a single current
+        value, does. So this can only safely reconstruct history on the
+        assumption that this ManagedProject has only ever pointed at
+        self.project. If self.project is currently None, there is no project
+        left to attribute past periods to, so nothing is reconstructed.
+
+        The very first attachment is often silent - set directly on the
+        ManagedProject when the award is created or linked to an existing
+        project, with no ManagedProjectAuditEntry recorded - so it is
+        inferred from self.created. Every later attach/detach was recorded
+        explicitly by attach()/detach().
+        """
+        if self.project is None:
+            return
+
+        with transaction.atomic():
+            # Re-check inside the transaction: this is a best-effort guard
+            # against a concurrent caller reconstructing the same history
+            # twice, not a fully race-proof lock - acceptable here since
+            # this only ever runs once per legacy ManagedProject.
+            if self.attachments.exists():
+                return
+
+            events = list(
+                ManagedProjectAuditEntry.objects.filter(
+                    managed_project=self,
+                    event_type__in=[
+                        ManagedProjectAuditEventType.PROJECT_ATTACHED,
+                        ManagedProjectAuditEventType.PROJECT_DETACHED,
+                    ],
+                )
+                .order_by("timestamp")
+                .values_list("timestamp", "event_type")
+            )
+
+            note = "Reconstructed from ManagedProjectAuditEntry."
+
+            if not events:
+                ManagedProjectAttachment.objects.create(
+                    managed_project=self,
+                    project=self.project,
+                    attached_at=self.created,
+                    note=f"{note} No attach/detach events recorded; "
+                    "inferred from ManagedProject.created.",
+                )
+                return
+
+            current_start = (
+                self.created
+                if events[0][1] == ManagedProjectAuditEventType.PROJECT_DETACHED
+                else None
+            )
+
+            for timestamp, event_type in events:
+                if event_type == ManagedProjectAuditEventType.PROJECT_DETACHED:
+                    if current_start is not None:
+                        ManagedProjectAttachment.objects.create(
+                            managed_project=self,
+                            project=self.project,
+                            attached_at=current_start,
+                            detached_at=timestamp,
+                            note=note,
+                        )
+                    current_start = None
+                else:
+                    current_start = timestamp
+
+            if current_start is not None:
+                ManagedProjectAttachment.objects.create(
+                    managed_project=self,
+                    project=self.project,
+                    attached_at=current_start,
+                    note=note,
+                )
 
     def merge_details(
-        self, new_details: openportal.ProjectDetails
-    ) -> openportal.ProjectDetails:
+        self, new_details: openportal.AwardDetails
+    ) -> openportal.AwardDetails:
         """
         Merge incoming details from the local portal into the existing details,
         with the following fields treated as authoritative from the incoming
@@ -2373,24 +2506,6 @@ class ManagedProject(ReviewMixin, models.Model):
 
         merged.project_link = self._get_project_link()
         return merged
-
-    def set_project_link(self, waldur_project) -> None:
-        """
-        Set the project_link in AwardDetails to point to this portal's
-        representation of the project (UUID as id, homeport URL as url).
-        Called whenever a Waldur project is attached or created.
-        """
-        from waldur_core.core.utils import format_homeport_link
-
-        details = self.get_details()
-        link = openportal.Link()
-        link.id = str()
-        try:
-            link.set_url(format_homeport_link(f"/projects/{waldur_project.uuid}/"))
-        except Exception:
-            pass
-        details.project_link = link
-        self.set_details(details)
 
     def get_default_offerings(self) -> list[marketplace_models.Offering]:
         """
@@ -2469,10 +2584,10 @@ class ManagedProject(ReviewMixin, models.Model):
 
         Failures are logged and swallowed so they never disrupt the caller.
         """
-        if not openportal.have_openportal():
+        if not config.ensure_config_loaded():
             return
         try:
-            openportal.ensure_config_loaded()
+            config.ensure_config_loaded()
             dest = openportal.Destination(self.destination)
             reverse_dest = openportal.Destination(".".join(reversed(dest.agents)))
             openportal.notify(f"{reverse_dest} {action} {self.identifier}")
@@ -2502,6 +2617,75 @@ class ManagedProject(ReviewMixin, models.Model):
             return f"ManagedProject for {self.get_offering()} [{self.identifier} => {self.project}]"
         except Exception:
             return f"ManagedProject for 'null offering' [{self.identifier} => {self.project}]"
+
+
+class ManagedProjectAttachment(models.Model):
+    """
+    Records each period during which a local Waldur Project held the award
+    represented by a ManagedProject.
+
+    Written from ManagedProject.set_project() - the single place
+    ManagedProject.project changes - so every attach/detach, whether via the
+    attach()/detach() API actions or the silent set_project() call made when
+    an award is first created or linked to an existing project, is tracked
+    here. A ManagedProject that predates this tracking has its history
+    reconstructed on first read; see ManagedProject.get_attachments().
+
+    The open attachment (detached_at=None) always matches
+    ManagedProject.project (when set).
+
+    Unlike similar timestamped models elsewhere in this app, attached_at
+    uses a plain default rather than auto_now_add, so that reconstructed
+    rows can be backdated to when the attach/detach actually happened.
+    """
+
+    managed_project = models.ForeignKey(
+        to=ManagedProject,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+        verbose_name=_("managed project"),
+    )
+
+    project = models.ForeignKey(
+        to=structure_models.Project,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="managed_project_attachments",
+        verbose_name=_("project"),
+    )
+
+    attached_at = models.DateTimeField(
+        default=timezone.now,
+        verbose_name=_("attached at"),
+    )
+
+    detached_at = models.DateTimeField(
+        blank=True,
+        null=True,
+        verbose_name=_("detached at"),
+        help_text=_("Null while this is the current attachment."),
+    )
+
+    note = models.TextField(
+        blank=True,
+        verbose_name=_("note"),
+        help_text=_(
+            "Optional comment - e.g. noting this row was reconstructed from "
+            "ManagedProjectAuditEntry rather than recorded at the time."
+        ),
+    )
+
+    class Meta:
+        # -id breaks ties: attachments recorded in the same instant (or
+        # backdated to the same reconstructed timestamp) would otherwise float
+        # between pages. See PaginationOrderingTest.
+        ordering = ["-attached_at", "-id"]
+        verbose_name = _("Managed Project Attachment")
+        verbose_name_plural = _("Managed Project Attachments")
+
+    def __str__(self) -> str:
+        status = "current" if self.detached_at is None else f"until {self.detached_at}"
+        return f"{self.managed_project} → {self.project} ({status})"
 
 
 # ---------------------------------------------------------------------------
@@ -2657,7 +2841,7 @@ class ManagedProjectAuditEntry(models.Model):
     )
 
     class Meta:
-        ordering = ["-timestamp"]
+        ordering = ["-timestamp", "id"]
         verbose_name = _("Managed Project Audit Entry")
         verbose_name_plural = _("Managed Project Audit Entries")
 
@@ -3081,9 +3265,34 @@ class RemoteProject(core_models.UuidMixin, models.Model):
             # precedence; notes and breakdown are unioned.
             result = confirmed.merge(sent)
 
-            # Explicitly enforce local membership and membership_control —
-            # merge() may blend these, but last_sent is always authoritative.
-            result.members = sent.members
+            # Explicitly enforce local membership — last_sent is always
+            # authoritative and is never augmented from last_confirmed.
+            #
+            # Deliberately NOT `result.members = sent.members`.  The attribute
+            # setter is the one place in this library that re-validates member
+            # emails against allowed_domains, and it validates against the
+            # *snapshot's* domains, before the local allowed_domains below has
+            # been applied.  from_json() and merge() both accept such members
+            # without complaint, so the stored data is not invalid — a member
+            # added legitimately before the domain list was tightened would
+            # nonetheless make this read path raise
+            #
+            #   OSError: Parse("Email '...' is not in the allowed domains
+            #                   for this project")
+            #
+            # and take down the entire remote-projects list, not merely its own
+            # row.  Same shape as the allowed_domains note below: assignment
+            # and merge do not mean the same thing in this library.
+            #
+            # merge() already replaces members wholesale when sent has them, so
+            # only the "sent has none" case needs anything doing — but clear
+            # and re-merge explicitly rather than relying on that, so a change
+            # in merge()'s precedence cannot silently reinstate stale members.
+            result.members = None  # clearing never validates
+            if sent.members is not None:
+                result = result.merge(
+                    openportal.AwardDetails(json.dumps({"members": sent.members}))
+                )
 
         # Layer in current extras — these may be newer than the last send.
         # Notes are unioned (merge deduplicates); other fields overwrite.
@@ -3092,11 +3301,26 @@ class RemoteProject(core_models.UuidMixin, models.Model):
 
             # explicitly control these terms locally
             result.membership_control = extras_obj.membership_control or None
-            result.allowed_domains = extras_obj.allowed_domains or None
             result.earliest_approve = extras_obj.earliest_approve or None
             result.call = extras_obj.call or None
             result.award = extras_obj.award or None
             result.renewal = extras_obj.renewal or None
+
+            # allowed_domains cannot go through the attribute setter: it
+            # normalises an empty list to None, which would turn "nothing
+            # allowed" into "no restriction at all".  merge() does preserve an
+            # empty list, but only onto a field that is unset, so clear the
+            # field first and then merge the local value back in.
+            # Still true as of openportal 0.91.0; from_json and merge keep the
+            # empty list, only assignment drops it.  See
+            # docs/guides/how-to-reconcile-a-fork.md, section 7.
+            result.allowed_domains = None
+            if self.allowed_domains is not None:
+                result = result.merge(
+                    openportal.AwardDetails(
+                        json.dumps({"allowed_domains": self.allowed_domains})
+                    )
+                )
 
         # Remote portal always owns its project URL — restore after extras
         # so that link_project cannot silently override a confirmed value.
@@ -3130,7 +3354,10 @@ class RemoteProject(core_models.UuidMixin, models.Model):
 
         if self.membership_control:
             extras["membership_control"] = self.membership_control
-        if self.allowed_domains:
+        # None and [] mean different things here — None is "no restriction",
+        # [] is "nothing allowed" — so an empty list has to be forwarded
+        # rather than treated as unset.
+        if self.allowed_domains is not None:
             extras["allowed_domains"] = self.allowed_domains
         if self.breakdown:
             extras["breakdown"] = self.breakdown
@@ -3238,6 +3465,14 @@ class RemoteProjectAttachment(models.Model):
 
     The open attachment (detached_at=None) always matches
     RemoteProject.current_project.
+
+    Also records the key the award's usage was filed under while attached.
+    That key is the local project identifier - "{shortname}.{portal}" - so it
+    belongs to the *project*, not the award: move an award from X to Y and its
+    usage from then on is fetched and cached under Y's identifier. One award's
+    history is therefore spread across one key per project it has been
+    attached to, and only the attachment knows which key covers which days.
+    See utils.get_remote_project_windows().
     """
 
     remote_project = models.ForeignKey(
@@ -3255,8 +3490,13 @@ class RemoteProjectAttachment(models.Model):
         verbose_name=_("project"),
     )
 
+    # A plain default rather than auto_now_add, so that reconstructed rows can
+    # be backdated to when the award was really attached - as
+    # ManagedProjectAttachment does. With auto_now_add every reconstructed
+    # attachment would claim to start today, and clipping usage to it would
+    # throw away the award's entire history.
     attached_at = models.DateTimeField(
-        auto_now_add=True,
+        default=timezone.now,
         verbose_name=_("attached at"),
     )
 
@@ -3267,6 +3507,18 @@ class RemoteProjectAttachment(models.Model):
         help_text=_("Null while this is the current attachment."),
     )
 
+    project_identifier = models.CharField(
+        max_length=MAX_PROJECTIDENTIFIER_LENGTH,
+        blank=True,
+        null=True,
+        verbose_name=_("project identifier"),
+        help_text=_(
+            "The local project identifier ({shortname}.{portal}) that this "
+            "award's usage was fetched and cached under while attached. Null "
+            "until recorded or backfilled."
+        ),
+    )
+
     note = models.TextField(
         blank=True,
         verbose_name=_("note"),
@@ -3274,7 +3526,7 @@ class RemoteProjectAttachment(models.Model):
     )
 
     class Meta:
-        ordering = ["-attached_at"]
+        ordering = ["-attached_at", "id"]
         verbose_name = _("Remote Project Attachment")
         verbose_name_plural = _("Remote Project Attachments")
 
@@ -3379,7 +3631,7 @@ class RemoteProjectAllocationEntry(models.Model):
     )
 
     class Meta:
-        ordering = ["-submitted_at"]
+        ordering = ["-submitted_at", "id"]
         verbose_name = _("Remote Project Allocation Entry")
         verbose_name_plural = _("Remote Project Allocation Entries")
 
@@ -3524,7 +3776,7 @@ class RemoteProjectAuditEntry(models.Model):
     )
 
     class Meta:
-        ordering = ["-timestamp"]
+        ordering = ["-timestamp", "id"]
         verbose_name = _("Remote Project Audit Entry")
         verbose_name_plural = _("Remote Project Audit Entries")
 

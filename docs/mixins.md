@@ -7,16 +7,17 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`BaseChecklistMixin`](#basechecklistmixin) | `waldur_core.checklist.mixins` | Base mixin providing common checklist functionality |
 | [`ReviewerChecklistMixin`](#reviewerchecklistmixin) | `waldur_core.checklist.mixins` | Mixin for ViewSets that provide checklist review functionality to reviewers |
 | [`UserChecklistMixin`](#userchecklistmixin) | `waldur_core.checklist.mixins` | Mixin for ViewSets that provide checklist functionality to end users |
+| [`LatestAnswerTestMixin`](#latestanswertestmixin) | `waldur_core.checklist.tests.test_latest_answers` | No description available |
 | [`CopyButtonMixin`](#copybuttonmixin) | `waldur_core.core.admin` | Mixin to add copy-to-clipboard functionality to form fields in Django admin |
 | [`ExcludedFieldsAdminMixin`](#excludedfieldsadminmixin) | `waldur_core.core.admin` | This mixin allows to toggle display of fields in Django model admin according... |
 | [`ExtraActionsMixin`](#extraactionsmixin) | `waldur_core.core.admin` | Allows to add extra actions to admin list page |
 | [`ExtraActionsObjectMixin`](#extraactionsobjectmixin) | `waldur_core.core.admin` | Allows to add extra actions to admin object edit page |
 | [`HideAdminOriginalMixin`](#hideadminoriginalmixin) | `waldur_core.core.admin` | Encapsulate all admin options and functionality for a given model |
-| [`NativeNameAdminMixin`](#nativenameadminmixin) | `waldur_core.core.admin` | This mixin allows to toggle display of fields in Django model admin according... |
 | [`ReadOnlyAdminMixin`](#readonlyadminmixin) | `waldur_core.core.admin` | Disables all editing capabilities |
 | [`DeleteExecutorMixin`](#deleteexecutormixin) | `waldur_core.core.executors` | Delete object on success or if force flag is enabled |
 | [`ErrorExecutorMixin`](#errorexecutormixin) | `waldur_core.core.executors` | Set object as erred on fail |
 | [`SuccessExecutorMixin`](#successexecutormixin) | `waldur_core.core.executors` | Set object as OK on success, cleanup action and its details |
+| [`SelectiveEncryptionMixin`](#selectiveencryptionmixin) | `waldur_core.core.fields` | Encrypts the values under sensitive keys of a JSON-valued field |
 | [`GenericKeyMixin`](#generickeymixin) | `waldur_core.core.managers` | Filtering by generic key field  Support filtering by:  - generic key directly... |
 | [`CreateExecutorMixin`](#createexecutormixin) | `waldur_core.core.mixins` | Mixin to execute create operations using background executors |
 | [`DeleteExecutorMixin`](#deleteexecutormixin) | `waldur_core.core.mixins` | Mixin to execute delete operations using background executors |
@@ -29,6 +30,8 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`ScopeMixin`](#scopemixin) | `waldur_core.core.mixins` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`UpdateExecutorMixin`](#updateexecutormixin) | `waldur_core.core.mixins` | Mixin to execute update operations using background executors |
 | [`ActionMixin`](#actionmixin) | `waldur_core.core.models` | Mixin for action tracking with state management |
+| [`AvailableMixin`](#availablemixin) | `waldur_core.core.models` | Make subclasses preserve the alters_data attribute on overridden methods |
+| [`BackendMissingMixin`](#backendmissingmixin) | `waldur_core.core.models` | Mixin for resources that may disappear from the backend |
 | [`BackendMixin`](#backendmixin) | `waldur_core.core.models` | Mixin to add standard backend_id field |
 | [`BackendModelMixin`](#backendmodelmixin) | `waldur_core.core.models` | Mixin for models connected to backend objects |
 | [`DescendantMixin`](#descendantmixin) | `waldur_core.core.models` | Mixin to provide child-parent relationships |
@@ -45,15 +48,19 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`UuidMixin`](#uuidmixin) | `waldur_core.core.models` | Mixin to identify models by UUID |
 | [`LookupMixin`](#lookupmixin) | `waldur_core.core.nested_routers` | Deprecated |
 | [`NestedMixin`](#nestedmixin) | `waldur_core.core.nested_routers` | Mixin for creating nested routers that handle hierarchical URL structures |
+| [`AccessSubnetMixin`](#accesssubnetmixin) | `waldur_core.core.serializers` | Shared mask and provenance rules for the access-subnet serializers |
 | [`AugmentedSerializerMixin`](#augmentedserializermixin) | `waldur_core.core.serializers` | This mixin provides several extensions to stock Serializer class:  1 |
+| [`NetworkAclValidationMixin`](#networkaclvalidationmixin) | `waldur_core.core.serializers` | Validate + canonicalise ``allowed_networks`` and enforce the entry cap |
 | [`RestrictedSerializerMixin`](#restrictedserializermixin) | `waldur_core.core.serializers` | This mixin allows to specify list of fields to be rendered by serializer |
 | [`SlugSerializerMixin`](#slugserializermixin) | `waldur_core.core.serializers` | Ensures that slug is editable only by staff |
 | [`TranslatedModelSerializerMixin`](#translatedmodelserializermixin) | `waldur_core.core.serializers` | A `ModelSerializer` is just a regular `Serializer`, except that:  * A set of ... |
+| [`UserEmailPatternsValidatorMixin`](#useremailpatternsvalidatormixin) | `waldur_core.core.serializers` | Provides validate_user_email_patterns for serializers with a user_email_patte... |
 | [`ExtensionTaskMixin`](#extensiontaskmixin) | `waldur_core.core.tasks` | This mixin allows to skip task scheduling if extension is disabled |
 | [`ActionMethodMixin`](#actionmethodmixin) | `waldur_core.core.views` | Implements helper methods for viewset when use separate nested endpoints for ... |
 | [`CheckExtensionMixin`](#checkextensionmixin) | `waldur_core.core.views` | Raise exception if extension is disabled |
 | [`ConstanceCheckExtensionMixin`](#constancecheckextensionmixin) | `waldur_core.core.views` | Raise exception if extension is disabled |
 | [`CreateReversionMixin`](#createreversionmixin) | `waldur_core.core.views` | Mixin to automatically create revision tracking for create operations |
+| [`HistoryViewSetMixin`](#historyviewsetmixin) | `waldur_core.core.views` | Mixin that adds version history endpoints to ViewSets |
 | [`UpdateReversionMixin`](#updatereversionmixin) | `waldur_core.core.views` | Mixin to automatically create revision tracking for update operations |
 | [`LoggableMixin`](#loggablemixin) | `waldur_core.logging.mixins` | Mixin to serialize model in logs |
 | [`EventTypesMixin`](#eventtypesmixin) | `waldur_core.logging.models` | Mixin to add a event_types and event_groups fields |
@@ -69,6 +76,7 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`ProtectedModelMixin`](#protectedmodelmixin) | `waldur_core.structure.admin` | Mixin to handle protected model deletion errors gracefully in Django admin |
 | [`CoordinatesMixin`](#coordinatesmixin) | `waldur_core.structure.mixins` | Mixin to add a latitude and longitude fields |
 | [`IPCoordinatesMixin`](#ipcoordinatesmixin) | `waldur_core.structure.mixins` | Mixin to add a latitude and longitude fields |
+| [`CustomerAddressDetailsMixin`](#customeraddressdetailsmixin) | `waldur_core.structure.models` | Mixin contains customer address detail fields |
 | [`CustomerDetailsMixin`](#customerdetailsmixin) | `waldur_core.structure.models` | Mixin containing customer detail fields |
 | [`ProjectOECDFOS2007CodeMixin`](#projectoecdfos2007codemixin) | `waldur_core.structure.models` | Mixin providing OECD FOS 2007 classification codes for research projects |
 | [`ServiceAccountMixin`](#serviceaccountmixin) | `waldur_core.structure.models` | Mixin for models that support service accounts |
@@ -78,8 +86,12 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`FieldFilteringMixin`](#fieldfilteringmixin) | `waldur_core.structure.serializers` | Mixin allowing to filter fields by user |
 | [`PermissionFieldFilteringMixin`](#permissionfieldfilteringmixin) | `waldur_core.structure.serializers` | Mixin allowing to filter related fields |
 | [`SshPublicKeySerializerMixin`](#sshpublickeyserializermixin) | `waldur_core.structure.serializers` | A type of `ModelSerializer` that uses hyperlinked relationships instead of pr... |
+| [`DashboardFeedHelpersMixin`](#dashboardfeedhelpersmixin) | `waldur_core.structure.tests.test_dashboard` | Helpers for driving the dashboard feed from throwaway providers |
 | [`ProjectMetadataTestMixin`](#projectmetadatatestmixin) | `waldur_core.structure.tests.test_project_metadata` | Shared test setup and utilities for project metadata tests |
+| [`AvailabilityCheckViewMixin`](#availabilitycheckviewmixin) | `waldur_core.structure.views` | A viewset that provides default `create()`, `retrieve()`, `update()`, `partia... |
+| [`ScopeInvitationMixin`](#scopeinvitationmixin) | `waldur_core.users.models` | Mixin for invitations scoped to a Customer with a system Role |
 | [`CheckExtensionMixin`](#checkextensionmixin) | `waldur_freeipa.views` | Raise exception if extension is disabled |
+| [`LLMConfigurationMixin`](#llmconfigurationmixin) | `waldur_mastermind.chat.views` | Validates that AI Assistant is enabled, the user has the required role, and t... |
 | [`PeriodMixin`](#periodmixin) | `waldur_mastermind.invoices.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`ConnectedResourceMixin`](#connectedresourcemixin) | `waldur_mastermind.marketplace.admin` | Protects object from modification if there are connected resources |
 | [`ParentInlineMixin`](#parentinlinemixin) | `waldur_mastermind.marketplace.admin` | Mixin to get parent object from request in Django admin inline views |
@@ -87,28 +99,42 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`CostEstimateMixin`](#costestimatemixin) | `waldur_mastermind.marketplace.models` | Mixin for cost estimation functionality |
 | [`ResourceDetailsMixin`](#resourcedetailsmixin) | `waldur_mastermind.marketplace.models` | Mixin combining resource details with cost estimation |
 | [`SafeAttributesMixin`](#safeattributesmixin) | `waldur_mastermind.marketplace.models` | Mixin for safe attribute handling |
+| [`MemberSyncFieldsMixin`](#membersyncfieldsmixin) | `waldur_mastermind.marketplace.serializers` | Adds agent-reported sync fields to a UserRole-shaped serializer |
+| [`DerivedLimitsOrderMixin`](#derivedlimitsordermixin) | `waldur_mastermind.marketplace.tests.test_derived_limits` | No description available |
+| [`LimitActionPermissionMixin`](#limitactionpermissionmixin) | `waldur_mastermind.marketplace.tests.test_order_creation_permission` | No description available |
 | [`ConnectedOfferingDetailsMixin`](#connectedofferingdetailsmixin) | `waldur_mastermind.marketplace.views` | Mixin to provide offering details action for connected resources |
+| [`ConnectedResourceDetailsMixin`](#connectedresourcedetailsmixin) | `waldur_mastermind.marketplace.views` | Mixin to provide resource details action for connected resources |
+| [`OfferingUsageMixin`](#offeringusagemixin) | `waldur_mastermind.marketplace.views` | Shared logic for customer/project per-offering usage ViewSets |
 | [`PublicViewsetMixin`](#publicviewsetmixin) | `waldur_mastermind.marketplace.views` | Mixin to allow anonymous access to offerings when configured |
 | [`TenantMixin`](#tenantmixin) | `waldur_mastermind.marketplace_openstack.processors` | No description available |
 | [`SelectiveDNSMockMixin`](#selectivednsmockmixin) | `waldur_mastermind.marketplace_remote.tests.dns_utils` | Mixin class that provides selective DNS mocking for test classes |
 | [`ContainerExecutorMixin`](#containerexecutormixin) | `waldur_mastermind.marketplace_script.utils` | Mixin to execute scripts in containers for marketplace script processing |
+| [`MatrixEnabledWriteGuardMixin`](#matrixenabledwriteguardmixin) | `waldur_mastermind.matrix_chat.views` | Reject mutating requests while the Matrix integration is disabled |
 | [`EstimatedCostPolicyMixin`](#estimatedcostpolicymixin) | `waldur_mastermind.policy.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`OfferingPolicySerializerMixin`](#offeringpolicyserializermixin) | `waldur_mastermind.policy.serializers` | This mixin provides several extensions to stock Serializer class:  1 |
+| [`CallNotArchivedCreateMixin`](#callnotarchivedcreatemixin) | `waldur_mastermind.proposal.serializers` | Provide the ``validate_call_not_archived`` hook used by ``ActionMethodMixin |
+| [`AssignmentBatchTestMixin`](#assignmentbatchtestmixin) | `waldur_mastermind.proposal.tests.test_assignment_batch_notifications` | No description available |
+| [`ManagerSetupMixin`](#managersetupmixin) | `waldur_mastermind.proposal.tests.test_pool_invitation_expiry` | No description available |
+| [`ProposalComplianceTestMixin`](#proposalcompliancetestmixin) | `waldur_mastermind.proposal.tests.test_proposal_compliance` | Common setup for proposal compliance tests |
+| [`InvitationAcceptanceMixin`](#invitationacceptancemixin) | `waldur_mastermind.proposal.views` | Mixin providing common logic for accepting/declining reviewer pool invitations |
 | [`BackendNameMixin`](#backendnamemixin) | `waldur_mastermind.support.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`FileMixin`](#filemixin) | `waldur_mastermind.support.models` | Mixin to provide file-related functionality and properties |
+| [`SettingsFileMixin`](#settingsfilemixin) | `waldur_mastermind.support.tests.test_constance_override` | No description available |
 | [`CheckExtensionMixin`](#checkextensionmixin) | `waldur_mastermind.support.views` | Raise exception if extension is disabled |
+| [`UsageMixin`](#usagemixin) | `waldur_openportal.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`ActionDetailsMixin`](#actiondetailsmixin) | `waldur_openstack.admin` | Encapsulate all admin options and functionality for a given model |
 | [`ImageMetadataMixin`](#imagemetadatamixin) | `waldur_openstack.admin` | Encapsulate all admin options and functionality for a given model |
 | [`MetadataMixin`](#metadatamixin) | `waldur_openstack.admin` | Encapsulate all admin options and functionality for a given model |
 | [`TenantQuotaMixin`](#tenantquotamixin) | `waldur_openstack.models` | It allows to update both service settings and shared tenant quotas |
 | [`LimitedPerTypeThrottleMixin`](#limitedpertypethrottlemixin) | `waldur_openstack.tasks` | No description available |
 | [`TenantMixin`](#tenantmixin) | `waldur_openstack.tests.factories` | No description available |
+| [`LBaaSAuditMixin`](#lbaasauditmixin) | `waldur_openstack.views` | Emit lifecycle audit events for LBaaS resources on create/update/delete |
 | [`DataciteMixin`](#datacitemixin) | `waldur_pid.mixins` | A marker model for models that can be registered with PIDs and referred to in... |
 | [`RoleMixin`](#rolemixin) | `waldur_rancher.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`SettingsMixin`](#settingsmixin) | `waldur_rancher.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`SyncDestroyMixin`](#syncdestroymixin) | `waldur_rancher.views` | No description available |
 | [`YamlMixin`](#yamlmixin) | `waldur_rancher.views` | No description available |
-| [`UsageMixin`](#usagemixin) | `waldur_slurm.models` | Make subclasses preserve the alters_data attribute on overridden methods |
+| [`SramIntegrationEnabledMixin`](#sramintegrationenabledmixin) | `waldur_sram.rest_views` | No description available |
 | [`VirtualMachineMixin`](#virtualmachinemixin) | `waldur_vmware.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 
 ## Detailed Descriptions
@@ -175,6 +201,12 @@ Default permissions are IsAdminUser but should be overridden with app-specific p
 
 **Base classes:** `BaseChecklistMixin`
 
+### LatestAnswerTestMixin
+
+**Module:** `waldur_core.checklist.tests.test_latest_answers`
+
+**Description:** No description available.
+
 ### CopyButtonMixin
 
 **Module:** `waldur_core.core.admin`
@@ -220,17 +252,6 @@ Encapsulate all admin options and functionality for a given model.
 
 **Base classes:** `ModelAdmin`
 
-### NativeNameAdminMixin
-
-**Module:** `waldur_core.core.admin`
-
-**Description:**
-
-This mixin allows to toggle display of fields in Django model admin according to custom logic.
-It's expected that inherited class has implemented excluded_fields property.
-
-**Base classes:** `ExcludedFieldsAdminMixin`
-
 ### ReadOnlyAdminMixin
 
 **Module:** `waldur_core.core.admin`
@@ -263,6 +284,34 @@ Set object as erred on fail.
 **Description:**
 
 Set object as OK on success, cleanup action and its details.
+
+### SelectiveEncryptionMixin
+
+**Module:** `waldur_core.core.fields`
+
+**Description:**
+
+Encrypts the values under sensitive keys of a JSON-valued field.
+
+Only the values whose key satisfies :meth:`_is_sensitive_key` are Fernet-encrypted;
+JSON keys and non-sensitive values stay plaintext, so ``has_key`` / value lookups
+keep working against the column.
+
+Encryption and decryption use the **same** key predicate, and encryption is
+unconditional: a token-shaped value under a sensitive key is wrapped rather than
+passed through, and only sensitive keys are decrypted on read. That symmetry is
+what stops the field being used as a decryption oracle (a caller planting a stolen
+ciphertext under a non-sensitive key, or a token-shaped value under a sensitive
+one, cannot read back another row's plaintext).
+
+Encryption happens in ``pre_save`` and never writes ciphertext back to the instance
+attribute — the attribute stays the plaintext dict, so FieldTracker compares
+plaintext on both sides and handlers do not fire on an unchanged save.
+
+Mixed into a concrete JSON field class, so the same behaviour applies to the
+``jsonb``-backed :class:`EncryptedJSONField` and to the legacy text-backed
+:class:`EncryptedOptionsField` without duplicating the logic. Subclasses must
+implement :meth:`_is_sensitive_key`.
 
 ### GenericKeyMixin
 
@@ -390,6 +439,30 @@ action details (JSON), and task ID for background task tracking.
 Used for models that need to track ongoing operations.
 
 **Base classes:** `StateMixin`
+
+### AvailableMixin
+
+**Module:** `waldur_core.core.models`
+
+**Description:**
+
+Make subclasses preserve the alters_data attribute on overridden methods.
+
+**Base classes:** `Model`
+
+### BackendMissingMixin
+
+**Module:** `waldur_core.core.models`
+
+**Description:**
+
+Mixin for resources that may disappear from the backend.
+
+Records the moment a resource was first observed as missing, so that a fresh
+disappearance can be told apart from a long-dead leftover. The field is
+cleared as soon as the resource is seen at the backend again.
+
+**Base classes:** `Model`
 
 ### BackendMixin
 
@@ -587,6 +660,28 @@ No method override is needed since Django Rest Framework 2.4.
 
 Mixin for creating nested routers that handle hierarchical URL structures.
 
+### AccessSubnetMixin
+
+**Module:** `waldur_core.core.serializers`
+
+**Description:**
+
+Shared mask and provenance rules for the access-subnet serializers.
+
+Two rules, both of which need to know who is acting and therefore cannot
+live on the model field:
+
+- mask width — non-staff may only enter single hosts, staff any width but
+  ``/0`` (see ``core_utils.validate_access_subnet_for_user``);
+- provenance — an entry staff created is flagged ``is_staff_managed`` and
+
+  becomes read-only for everyone else whatever its width, so a consumer
+  cannot quietly remove a range an operator pinned. Deletion is guarded
+  separately in the viewset, which the serializer never sees.
+
+``is_staff_managed`` is derived from the acting user on create and is never
+writable through the API.
+
 ### AugmentedSerializerMixin
 
 **Module:** `waldur_core.core.serializers`
@@ -682,6 +777,14 @@ Example:
 
 or uses URL name specified in a model of serialized object.
 
+### NetworkAclValidationMixin
+
+**Module:** `waldur_core.core.serializers`
+
+**Description:**
+
+Validate + canonicalise ``allowed_networks`` and enforce the entry cap.
+
 ### RestrictedSerializerMixin
 
 **Module:** `waldur_core.core.serializers`
@@ -725,6 +828,14 @@ you need you should either declare the extra/differing fields explicitly on
 the serializer class, or simply use a `Serializer` class.
 
 **Base classes:** `ModelSerializer`
+
+### UserEmailPatternsValidatorMixin
+
+**Module:** `waldur_core.core.serializers`
+
+**Description:**
+
+Provides validate_user_email_patterns for serializers with a user_email_patterns field.
 
 ### ExtensionTaskMixin
 
@@ -797,6 +908,29 @@ Raise exception if extension is disabled
 **Description:**
 
 Mixin to automatically create revision tracking for create operations.
+
+### HistoryViewSetMixin
+
+**Module:** `waldur_core.core.views`
+
+**Description:**
+
+Mixin that adds version history endpoints to ViewSets.
+
+Requirements:
+
+- Model must be registered with django-reversion
+- ViewSet must have get_object() method
+- ViewSet must support pagination
+
+Provides:
+
+- GET /{resource}/{uuid}/history/ - List version history
+- GET /{resource}/{uuid}/history/at/?timestamp=... - State at timestamp
+
+Configuration (optional class attributes):
+
+- history_serializer_class: Serializer for version objects (default: VersionHistorySerializer)
 
 ### UpdateReversionMixin
 
@@ -966,6 +1100,16 @@ Mixin to add a latitude and longitude fields
 
 **Base classes:** `CoordinatesMixin`
 
+### CustomerAddressDetailsMixin
+
+**Module:** `waldur_core.structure.models`
+
+**Description:**
+
+Mixin contains customer address detail fields.
+
+**Base classes:** `Model`
+
 ### CustomerDetailsMixin
 
 **Module:** `waldur_core.structure.models`
@@ -978,7 +1122,7 @@ Provides comprehensive customer information fields including
 native name, contact details, agreement number, email, phone,
 address, banking information, and external system integration.
 
-**Base classes:** `NameMixin`, `VATMixin`, `CoordinatesMixin`
+**Base classes:** `NameMixin`, `VATMixin`, `CoordinatesMixin`, `CustomerAddressDetailsMixin`
 
 ### ProjectOECDFOS2007CodeMixin
 
@@ -1107,6 +1251,17 @@ of primary key relationships. Specifically:
 
 **Base classes:** `HyperlinkedModelSerializer`
 
+### DashboardFeedHelpersMixin
+
+**Module:** `waldur_core.structure.tests.test_dashboard`
+
+**Description:**
+
+Helpers for driving the dashboard feed from throwaway providers.
+
+Shared rather than copied: _item encodes the eight-key feed contract, so
+two copies drift the moment that contract changes.
+
 ### ProjectMetadataTestMixin
 
 **Module:** `waldur_core.structure.tests.test_project_metadata`
@@ -1115,6 +1270,27 @@ of primary key relationships. Specifically:
 
 Shared test setup and utilities for project metadata tests.
 
+### AvailabilityCheckViewMixin
+
+**Module:** `waldur_core.structure.views`
+
+**Description:**
+
+A viewset that provides default `create()`, `retrieve()`, `update()`,
+`partial_update()`, `destroy()` and `list()` actions.
+
+**Base classes:** `ModelViewSet`
+
+### ScopeInvitationMixin
+
+**Module:** `waldur_core.users.models`
+
+**Description:**
+
+Mixin for invitations scoped to a Customer with a system Role.
+
+**Base classes:** `Model`
+
 ### CheckExtensionMixin
 
 **Module:** `waldur_freeipa.views`
@@ -1122,6 +1298,20 @@ Shared test setup and utilities for project metadata tests.
 **Description:**
 
 Raise exception if extension is disabled
+
+**Base classes:** `ConstanceCheckExtensionMixin`
+
+### LLMConfigurationMixin
+
+**Module:** `waldur_mastermind.chat.views`
+
+**Description:**
+
+Validates that AI Assistant is enabled, the user has the required role,
+and the inference API is properly configured.
+
+AI_ASSISTANT_ENABLED (boolean) is the master on/off switch.
+AI_ASSISTANT_ENABLED_ROLES controls which user roles can access the feature.
 
 **Base classes:** `ConstanceCheckExtensionMixin`
 
@@ -1203,6 +1393,36 @@ information like passwords and credentials.
 
 **Base classes:** `Model`
 
+### MemberSyncFieldsMixin
+
+**Module:** `waldur_mastermind.marketplace.serializers`
+
+**Description:**
+
+Adds agent-reported sync fields to a UserRole-shaped serializer.
+
+The fields are emitted only when the view put a ``member_sync_index``
+into the context (i.e. the offering opted in via
+``enable_membership_sync_status`` and the view prefetched the rows).
+Otherwise they are dropped from the payload entirely, so opted-out
+offerings keep today's exact response shape. An index hit of None
+serializes as null — "the agent has not reported on this grant",
+which is distinct from any real state.
+
+**Base classes:** `Serializer`
+
+### DerivedLimitsOrderMixin
+
+**Module:** `waldur_mastermind.marketplace.tests.test_derived_limits`
+
+**Description:** No description available.
+
+### LimitActionPermissionMixin
+
+**Module:** `waldur_mastermind.marketplace.tests.test_order_creation_permission`
+
+**Description:** No description available.
+
 ### ConnectedOfferingDetailsMixin
 
 **Module:** `waldur_mastermind.marketplace.views`
@@ -1210,6 +1430,29 @@ information like passwords and credentials.
 **Description:**
 
 Mixin to provide offering details action for connected resources.
+
+### ConnectedResourceDetailsMixin
+
+**Module:** `waldur_mastermind.marketplace.views`
+
+**Description:**
+
+Mixin to provide resource details action for connected resources.
+
+### OfferingUsageMixin
+
+**Module:** `waldur_mastermind.marketplace.views`
+
+**Description:**
+
+Shared logic for customer/project per-offering usage ViewSets.
+
+Subclasses provide:
+
+- `queryset` — Customer or Project queryset (the route lookup target)
+- `_scope_resources(scope, offering=None)` — returns the non-terminated
+
+  resources visible at this scope, optionally filtered to one offering
 
 ### PublicViewsetMixin
 
@@ -1249,6 +1492,19 @@ class MyTestClass(SelectiveDNSMockMixin, test.APITransactionTestCase):
 **Description:**
 
 Mixin to execute scripts in containers for marketplace script processing.
+
+### MatrixEnabledWriteGuardMixin
+
+**Module:** `waldur_mastermind.matrix_chat.views`
+
+**Description:**
+
+Reject mutating requests while the Matrix integration is disabled.
+
+Reads stay open so the rooms list remains viewable, but a write would only
+enqueue a Celery task against a non-existent homeserver: the row is left
+stranded in a transient state (creating/disabling) that never resolves. The
+frontend hides these actions; this is the backstop for direct or stale calls.
 
 ### EstimatedCostPolicyMixin
 
@@ -1357,6 +1613,50 @@ or uses URL name specified in a model of serialized object.
 
 **Base classes:** `AugmentedSerializerMixin`
 
+### CallNotArchivedCreateMixin
+
+**Module:** `waldur_mastermind.proposal.serializers`
+
+**Description:**
+
+Provide the ``validate_call_not_archived`` hook used by
+``ActionMethodMixin.action_list_method``'s ``additional_validators``.
+
+The hook is looked up by name on the serializer and called with the parent
+Call. It keeps archived calls read-only across their nested-create surface
+(offerings / resource templates / workflow steps).
+
+### AssignmentBatchTestMixin
+
+**Module:** `waldur_mastermind.proposal.tests.test_assignment_batch_notifications`
+
+**Description:** No description available.
+
+### ManagerSetupMixin
+
+**Module:** `waldur_mastermind.proposal.tests.test_pool_invitation_expiry`
+
+**Description:** No description available.
+
+### ProposalComplianceTestMixin
+
+**Module:** `waldur_mastermind.proposal.tests.test_proposal_compliance`
+
+**Description:**
+
+Common setup for proposal compliance tests.
+
+### InvitationAcceptanceMixin
+
+**Module:** `waldur_mastermind.proposal.views`
+
+**Description:**
+
+Mixin providing common logic for accepting/declining reviewer pool invitations.
+
+Used by both CallReviewerPoolViewSet and PublicReviewerInvitationViewSet
+to avoid code duplication.
+
 ### BackendNameMixin
 
 **Module:** `waldur_mastermind.support.models`
@@ -1375,6 +1675,12 @@ Make subclasses preserve the alters_data attribute on overridden methods.
 
 Mixin to provide file-related functionality and properties.
 
+### SettingsFileMixin
+
+**Module:** `waldur_mastermind.support.tests.test_constance_override`
+
+**Description:** No description available.
+
 ### CheckExtensionMixin
 
 **Module:** `waldur_mastermind.support.views`
@@ -1384,6 +1690,16 @@ Mixin to provide file-related functionality and properties.
 Raise exception if extension is disabled
 
 **Base classes:** `ConstanceCheckExtensionMixin`
+
+### UsageMixin
+
+**Module:** `waldur_openportal.models`
+
+**Description:**
+
+Make subclasses preserve the alters_data attribute on overridden methods.
+
+**Base classes:** `Model`
 
 ### ActionDetailsMixin
 
@@ -1437,6 +1753,18 @@ It allows to update both service settings and shared tenant quotas.
 
 **Description:** No description available.
 
+### LBaaSAuditMixin
+
+**Module:** `waldur_openstack.views`
+
+**Description:**
+
+Emit lifecycle audit events for LBaaS resources on create/update/delete.
+
+Designed to be mixed into ViewSets that also use ExecutorMixin. The events
+fire from the API request thread, so they carry actor context (user, IP,
+request id) auto-attached by CaptureEventContextMiddleware.
+
 ### DataciteMixin
 
 **Module:** `waldur_pid.mixins`
@@ -1479,15 +1807,11 @@ Make subclasses preserve the alters_data attribute on overridden methods.
 
 **Description:** No description available.
 
-### UsageMixin
+### SramIntegrationEnabledMixin
 
-**Module:** `waldur_slurm.models`
+**Module:** `waldur_sram.rest_views`
 
-**Description:**
-
-Make subclasses preserve the alters_data attribute on overridden methods.
-
-**Base classes:** `Model`
+**Description:** No description available.
 
 ### VirtualMachineMixin
 

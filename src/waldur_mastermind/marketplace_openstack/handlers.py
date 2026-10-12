@@ -192,9 +192,12 @@ def synchronize_directly_connected_ips(
 
 def synchronize_ports(sender, instance: Port, created=False, **kwargs):
     port = instance
+    # backend_id is watched too: a port requested with a fixed IP already
+    # carries that address, so Neutron echoes it back and fixed_ips never changes.
     if not created and not set(port.tracker.changed()) & {
         "fixed_ips",
         "instance_id",
+        "backend_id",
     }:
         return
 
@@ -286,6 +289,14 @@ def create_resource_of_volume_if_instance_created(
 ):
     resource = instance
 
+    scope_just_set = (
+        created
+        or resource.tracker.has_changed("content_type_id")
+        or resource.tracker.has_changed("object_id")
+    )
+    if not scope_just_set:
+        return
+
     if not resource.scope or not getattr(resource.offering, "scope", None):
         return
 
@@ -326,8 +337,24 @@ def create_marketplace_resource_for_imported_resources(
 def import_resource_metadata_when_resource_is_created(
     sender, instance: marketplace_models.Resource, created=False, **kwargs
 ):
-    """Import OpenStack resource metadata when marketplace resource is created."""
-    if not created:
+    """Import OpenStack resource metadata when marketplace resource is created
+    or linked to its OpenStack scope.
+
+    Order processing creates the resource first and links the instance later,
+    so importing only on creation left internal_ips empty for ports whose
+    requested fixed IP never changes afterwards.
+    """
+    update_fields = kwargs.get("update_fields")
+    scope_fields = {"content_type", "content_type_id", "object_id"}
+    # The metadata import saves the resource again with update_fields that
+    # never include the scope, which keeps this handler from recursing.
+    scope_just_set = (
+        update_fields is None or bool(scope_fields & set(update_fields))
+    ) and (
+        instance.tracker.has_changed("content_type_id")
+        or instance.tracker.has_changed("object_id")
+    )
+    if not created and not scope_just_set:
         return
 
     #  If the resource has just been created and the save_base method has not yet completed,
@@ -366,6 +393,23 @@ def update_openstack_tenant_usages(
     transaction.on_commit(lambda: utils.import_usage(resource))
 
 
+def import_usage_on_tenant_quotas_pulled(
+    sender, instance: openstack_models.Tenant, **kwargs
+):
+    tenant = instance
+    try:
+        resource = marketplace_models.Resource.objects.get(scope=tenant)
+    except ObjectDoesNotExist:
+        logger.debug(
+            "Skipping usages synchronization for tenant because "
+            "resource does not exist. OpenStack tenant ID: %s",
+            tenant.id,
+        )
+        return
+
+    utils.import_usage(resource)
+
+
 def create_offering_component_for_volume_type(
     sender, instance: VolumeType, created=False, **kwargs
 ):
@@ -395,18 +439,29 @@ def create_offering_component_for_volume_type(
 
     content_type = ContentType.objects.get_for_model(volume_type)
 
-    # It is assumed that article code and product code are filled manually via UI
+    # Fields that mirror the volume type, refreshed on every sync.
+    synced = dict(
+        offering=offering,
+        name="Storage (%s)" % volume_type.name,
+        # It is expected that internal name of offering component related to volume type
+        # matches storage quota name generated in OpenStack
+        type=volume_type_name_to_quota_name(volume_type.name),
+        description=volume_type.description,
+        # Created by the volume type sync, not by the provider, so it
+        # follows the plan like the other builtin components.
+        billed_per_plan=True,
+    )
+    # It is assumed that article code and product code are filled manually via UI.
+    # Accounting is the provider's to change as well, so it is set only when the
+    # component is created: every sync re-saves each volume type, and writing it
+    # here on update would revert whatever the provider chose.
     marketplace_models.OfferingComponent.objects.update_or_create(
         object_id=volume_type.id,
         content_type=content_type,
-        defaults=dict(
-            offering=offering,
-            name="Storage (%s)" % volume_type.name,
-            # It is expected that internal name of offering component related to volume type
-            # matches storage quota name generated in OpenStack
-            type=volume_type_name_to_quota_name(volume_type.name),
+        defaults=synced,
+        create_defaults=dict(
+            synced,
             measured_unit="GB",
-            description=volume_type.description,
             billing_type=BillingTypes.LIMIT,
             limit_period=LimitPeriods.MONTH,
         ),
@@ -472,16 +527,9 @@ def import_instances_and_volumes_if_tenant_has_been_imported(
 ):
     tenant = instance
 
-    if not (
-        marketplace_models.Category.objects.filter(default_vm_category=True).exists()
-        and marketplace_models.Category.objects.filter(
-            default_volume_category=True
-        ).exists()
-    ):
-        logger.info(
-            "An import of instances and volumes is impossible because categories for them are not setted."
-        )
-        return
+    # Ensure default categories exist before importing
+    utils.get_offering_category_for_instance()
+    utils.get_offering_category_for_volume()
 
     serialized_resource = core_utils.serialize_instance(tenant)
     transaction.on_commit(
@@ -580,8 +628,15 @@ def set_mtu_when_network_has_been_created(
 def update_floating_ip_external_addresses(
     sender, instance: FloatingIP, created=False, **kwargs
 ):
-    # Process if address changed OR if this is a newly created IP with an address
-    if not (instance.tracker.has_changed("address") or (created and instance.address)):
+    # Recompute when the address OR the port association changes. A floating IP
+    # is often attached to an instance port in a later save that leaves the
+    # address untouched, so triggering on address alone leaves external_address
+    # (the 1:1 NAT public IP) unset and the VM looks like it has no public IP.
+    if not (
+        instance.tracker.has_changed("address")
+        or instance.tracker.has_changed("port_id")
+        or (created and instance.address)
+    ):
         return
 
     utils.update_external_addresses_of_floating_ip(instance)
@@ -646,3 +701,37 @@ def handle_openstack_tenant_order_termination(
         )
     ):
         utils.set_ports_status_for_order(order, "DOWN")
+
+
+def synchronize_volume_metadata_on_resource_post_save(
+    sender, instance: marketplace_models.Resource, created=False, **kwargs
+):
+    if created:
+        return
+
+    update_fields = kwargs.get("update_fields")
+    if update_fields is not None and "object_id" not in update_fields:
+        return
+
+    if not instance.tracker.has_changed("object_id"):
+        return
+
+    if isinstance(instance.scope, openstack_models.Volume):
+        utils.import_volume_metadata(instance)
+
+
+def populate_volume_metadata_on_resource_creation(
+    sender, instance: marketplace_models.Resource, created=False, **kwargs
+):
+    if not created:
+        return
+
+    if instance.offering.type != OPENSTACK_VOLUME_OFFERING:
+        return
+
+    size = instance.attributes.get("size")
+    if not size:
+        return
+
+    instance.backend_metadata["size"] = size
+    instance.save(update_fields=["backend_metadata"])

@@ -1,12 +1,21 @@
+import base64
+import json
+from io import BytesIO
 from unittest import mock, skip
 
+import responses
 from constance.test.unittest import override_config
+from django.core.cache import cache
 from django.test import TestCase
+from freezegun import freeze_time
 
 from waldur_core.core.tests.helpers import load_json_resource
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_mastermind.support import models
-from waldur_mastermind.support.backend.atlassian import ServiceDeskBackend
+from waldur_mastermind.support.backend.atlassian import (
+    ATLASSIAN_OAUTH2_TOKEN_URL,
+    ServiceDeskBackend,
+)
 from waldur_mastermind.support.tests import factories, fixtures
 
 
@@ -100,8 +109,10 @@ class IssueCreateTest(BaseBackendTest):
         )
 
     def test_original_reporter_is_specified_in_custom_field(self):
-        # Mock get_request_types for pull_request_types
-        self.mocked_jira.get_request_types.return_value = {"values": []}
+        # Mock _get_request_types_fallback for pull_request_types
+        self.backend._get_request_types_fallback = mock.Mock(
+            return_value={"values": []}
+        )
 
         # Create the needed RequestType since create_issue checks for it
         from waldur_mastermind.support.tests.factories import RequestTypeFactory
@@ -299,13 +310,15 @@ class GetUsersTest(BaseBackendTest):
         self.assertEqual(users[1].backend_id, "user-456")
 
 
-class TypeMappingTest(BaseBackendTest):
-    """Test type mapping functionality for ATLASSIAN_SUPPORT_TYPE_MAPPING."""
+class RequestTypeLookupTest(BaseBackendTest):
+    """Test direct request type lookup functionality (no mapping)."""
 
     def setUp(self):
         super().setUp()
-        # Mock get_request_types for pull_request_types
-        self.mocked_jira.get_request_types.return_value = {"values": []}
+        # Mock _get_request_types_fallback for pull_request_types
+        self.backend._get_request_types_fallback = mock.Mock(
+            return_value={"values": []}
+        )
 
         # Mock create_customer_request to return Service Desk API format
         self.mocked_jira.create_customer_request.return_value = {
@@ -316,15 +329,16 @@ class TypeMappingTest(BaseBackendTest):
             "_links": {"agent": "http://example.com/TST-101"},
         }
 
-    @override_config(ATLASSIAN_SUPPORT_TYPE_MAPPING={"Informational": "Get IT help"})
-    def test_create_issue_uses_type_mapping(self):
-        """Test that create_issue maps frontend types to backend types using ATLASSIAN_SUPPORT_TYPE_MAPPING."""
-        # Create RequestType for the mapped backend type
-        factories.RequestTypeFactory(name="Get IT help", issue_type_name="Get IT help")
+    def test_create_issue_uses_direct_type_lookup(self):
+        """Test that create_issue looks up request type directly by name."""
+        # Create active RequestType
+        factories.RequestTypeFactory(
+            name="Get IT help", issue_type_name="Get IT help", is_active=True
+        )
 
-        # Create issue with frontend type
+        # Create issue with type matching RequestType name
         issue = self.fixture.issue
-        issue.type = "Informational"  # Frontend type
+        issue.type = "Get IT help"
         issue.save()
 
         # Call create_issue
@@ -333,7 +347,7 @@ class TypeMappingTest(BaseBackendTest):
         # Verify create_customer_request was called
         self.mocked_jira.create_customer_request.assert_called_once()
 
-        # Verify the correct RequestType was used (backend type should be "Get IT help")
+        # Verify the correct RequestType was used
         call_args = self.mocked_jira.create_customer_request.call_args
         request_type_id = call_args[0][1]  # Second argument is request_type.backend_id
 
@@ -341,70 +355,75 @@ class TypeMappingTest(BaseBackendTest):
         used_request_type = models.RequestType.objects.get(backend_id=request_type_id)
         self.assertEqual(used_request_type.name, "Get IT help")
 
-    @override_config(ATLASSIAN_SUPPORT_TYPE_MAPPING={})
-    def test_create_issue_without_mapping_uses_original_type(self):
-        """Test that create_issue uses original type when no mapping is configured."""
-        # Create RequestType for the original type
-        factories.RequestTypeFactory(
-            name="Informational", issue_type_name="Informational"
-        )
+    def test_create_issue_fails_when_type_not_found(self):
+        """Test that create_issue raises error when request type doesn't exist."""
+        # Don't create the RequestType - should fail
 
-        # Create issue with frontend type
+        # Create issue with type
         issue = self.fixture.issue
-        issue.type = "Informational"
-        issue.save()
-
-        # Call create_issue
-        self.backend.create_issue(issue)
-
-        # Verify create_customer_request was called
-        self.mocked_jira.create_customer_request.assert_called_once()
-
-        # Verify the original type was used
-        call_args = self.mocked_jira.create_customer_request.call_args
-        request_type_id = call_args[0][1]
-
-        used_request_type = models.RequestType.objects.get(backend_id=request_type_id)
-        self.assertEqual(used_request_type.name, "Informational")
-
-    @override_config(ATLASSIAN_SUPPORT_TYPE_MAPPING={"Informational": "Get IT help"})
-    def test_create_issue_fails_when_mapped_type_not_found(self):
-        """Test that create_issue raises error when mapped type doesn't exist in DB."""
-        # Don't create the mapped RequestType - should fail
-
-        # Create issue with frontend type
-        issue = self.fixture.issue
-        issue.type = "Informational"
+        issue.type = "Nonexistent Type"
         issue.save()
 
         # Call create_issue and expect error
         with self.assertRaises(ServiceBackendError) as cm:
             self.backend.create_issue(issue)
 
-        # Verify the error message mentions both types
+        # Verify the error message mentions the type
         error_message = str(cm.exception)
-        self.assertIn("Informational", error_message)
-        self.assertIn("Get IT help", error_message)
+        self.assertIn("Nonexistent Type", error_message)
+
+    def test_create_issue_fails_when_type_not_active(self):
+        """Test that create_issue raises error when request type is not active."""
+        # Create inactive RequestType
+        factories.RequestTypeFactory(
+            name="Inactive Type", issue_type_name="Inactive Type", is_active=False
+        )
+
+        # Create issue with type
+        issue = self.fixture.issue
+        issue.type = "Inactive Type"
+        issue.save()
+
+        # Call create_issue and expect error
+        with self.assertRaises(ServiceBackendError) as cm:
+            self.backend.create_issue(issue)
+
+        # Verify the error message mentions the type
+        error_message = str(cm.exception)
+        self.assertIn("Inactive Type", error_message)
 
 
 class PullRequestTypesTest(BaseBackendTest):
-    """Test pull_request_types functionality."""
+    """Test pull_request_types functionality.
+
+    pull_request_types uses _get_request_types_fallback (direct HTTP) instead of
+    the atlassian library's get_request_types to avoid TypeError in the library's
+    raise_for_status when API returns non-dict JSON error body (Sentry CSCS-PY).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.mock_request_types_response = {
+            "values": [
+                {"id": "125", "name": "Get IT help"},
+                {"id": "128", "name": "Request a new account"},
+            ]
+        }
+        self.fallback_patcher = mock.patch.object(
+            self.backend, "_get_request_types_fallback"
+        )
+        self.mock_fallback = self.fallback_patcher.start()
+        self.mock_fallback.return_value = self.mock_request_types_response
+
+    def tearDown(self):
+        self.fallback_patcher.stop()
+        super().tearDown()
 
     def test_pull_request_types_sets_issue_type_name(self):
         """Test that pull_request_types correctly sets issue_type_name field."""
-        # Mock request types response from Atlassian
-        mock_request_types = [
-            {"id": "125", "name": "Get IT help"},
-            {"id": "128", "name": "Request a new account"},
-        ]
-        self.mocked_jira.get_request_types.return_value = {"values": mock_request_types}
-
-        # Call pull_request_types
         self.backend.pull_request_types()
 
-        # Verify RequestTypes were created with correct issue_type_name
         request_types = models.RequestType.objects.all()
-
         self.assertEqual(request_types.count(), 2)
 
         rt1 = models.RequestType.objects.get(backend_id="125")
@@ -418,13 +437,301 @@ class PullRequestTypesTest(BaseBackendTest):
     @override_config(WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE="atlassian")
     def test_pull_request_types_sets_backend_name(self):
         """Test that pull_request_types correctly sets backend_name from config."""
-        # Mock request types response
-        mock_request_types = [{"id": "125", "name": "Get IT help"}]
-        self.mocked_jira.get_request_types.return_value = {"values": mock_request_types}
+        self.mock_fallback.return_value = {
+            "values": [{"id": "125", "name": "Get IT help"}]
+        }
 
-        # Call pull_request_types
         self.backend.pull_request_types()
 
-        # Verify backend_name is set correctly
         request_type = models.RequestType.objects.get(backend_id="125")
         self.assertEqual(request_type.backend_name, "atlassian")
+
+    def test_pull_request_types_handles_api_error_gracefully(self):
+        """Test that pull_request_types wraps API errors in ServiceBackendError.
+
+        Reproduces Sentry CSCS-PY: previously, pull_request_types used the
+        atlassian library's get_request_types which could trigger TypeError
+        in raise_for_status when the API returned a non-dict JSON error body.
+        The fix uses direct HTTP calls that raise ServiceBackendError instead.
+        """
+        self.mock_fallback.side_effect = ServiceBackendError(
+            "Jira REST API request failed: 403 Forbidden"
+        )
+
+        with self.assertRaises(ServiceBackendError):
+            self.backend.pull_request_types()
+
+    def test_pull_request_types_does_not_use_library_get_request_types(self):
+        """Verify pull_request_types uses direct API call, not atlassian library method.
+
+        The library's get_request_types triggers TypeError in raise_for_status
+        when the API returns a non-dict JSON error body (Sentry CSCS-PY).
+        """
+        self.backend.pull_request_types()
+
+        # The library method should NOT be called
+        self.mocked_jira.get_request_types.assert_not_called()
+        # The direct API fallback SHOULD be called
+        self.mock_fallback.assert_called_once()
+
+
+def _basic(username, password):
+    token = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return f"Basic {token}"
+
+
+class DirectRestAuthTest(TestCase):
+    """Direct REST calls must carry the credentials of the configured auth mode.
+
+    Uses a real ServiceDesk client and stubs HTTP at the transport level, so the
+    assertions see the Authorization header that is actually sent.
+    """
+
+    BASE_URL = "https://jira.example.com"
+    # The settings wizard blanks every credential except the selected one.
+    NO_CREDENTIALS = {
+        "ATLASSIAN_USERNAME": "",
+        "ATLASSIAN_PASSWORD": "",
+        "ATLASSIAN_EMAIL": "",
+        "ATLASSIAN_TOKEN": "",
+        "ATLASSIAN_PERSONAL_ACCESS_TOKEN": "",
+        "ATLASSIAN_OAUTH2_CLIENT_ID": "",
+        "ATLASSIAN_OAUTH2_CLIENT_SECRET": "",
+        "ATLASSIAN_OAUTH2_ACCESS_TOKEN": "",
+    }
+    AUTH_MODES = {
+        "personal_access_token": (
+            {"ATLASSIAN_PERSONAL_ACCESS_TOKEN": "pat-secret"},
+            "Bearer pat-secret",
+        ),
+        "oauth2": (
+            {
+                "ATLASSIAN_OAUTH2_CLIENT_ID": "client-id",
+                "ATLASSIAN_OAUTH2_ACCESS_TOKEN": "oauth-secret",
+                "ATLASSIAN_OAUTH2_TOKEN_TYPE": "Bearer",
+            },
+            "Bearer oauth-secret",
+        ),
+        "api_token": (
+            {"ATLASSIAN_EMAIL": "bot@example.com", "ATLASSIAN_TOKEN": "api-secret"},
+            _basic("bot@example.com", "api-secret"),
+        ),
+        "basic": (
+            {"ATLASSIAN_USERNAME": "bot", "ATLASSIAN_PASSWORD": "secret"},
+            _basic("bot", "secret"),
+        ),
+    }
+
+    def _config(self, credentials, **extra):
+        return {
+            "ATLASSIAN_API_URL": self.BASE_URL,
+            "ATLASSIAN_PROJECT_ID": "10",
+            **self.NO_CREDENTIALS,
+            **credentials,
+            **extra,
+        }
+
+    def test_pull_request_types_uses_configured_credentials(self):
+        url = f"{self.BASE_URL}/rest/servicedeskapi/servicedesk/10/requesttype"
+        for mode, (credentials, expected_auth) in self.AUTH_MODES.items():
+            with (
+                self.subTest(mode=mode),
+                override_config(**self._config(credentials)),
+                responses.RequestsMock() as rsps,
+            ):
+                rsps.get(url, json={"values": [{"id": "125", "name": "Get IT help"}]})
+
+                ServiceDeskBackend().pull_request_types()
+
+                self.assertEqual(
+                    rsps.calls[0].request.headers["Authorization"], expected_auth
+                )
+                self.assertTrue(
+                    models.RequestType.objects.filter(
+                        backend_id="125", name="Get IT help"
+                    ).exists()
+                )
+
+    def test_upload_file_uses_configured_credentials(self):
+        url = f"{self.BASE_URL}/rest/api/2/issue/TST-1/attachments"
+        issue = mock.Mock(key="TST-1")
+        for mode, (credentials, expected_auth) in self.AUTH_MODES.items():
+            with (
+                self.subTest(mode=mode),
+                override_config(**self._config(credentials)),
+                responses.RequestsMock() as rsps,
+            ):
+                rsps.post(url, json=[{"id": "1"}])
+
+                ServiceDeskBackend()._upload_file(issue, BytesIO(b"data"), "a.txt")
+
+                headers = rsps.calls[0].request.headers
+                self.assertEqual(headers["Authorization"], expected_auth)
+                self.assertEqual(headers["X-Atlassian-Token"], "no-check")
+                self.assertTrue(headers["Content-Type"].startswith("multipart/"))
+
+    def test_service_account_gateway_url(self):
+        gateway = "https://api.atlassian.com/ex/jira/cloud-id"
+        credentials, expected_auth = self.AUTH_MODES["personal_access_token"]
+        with (
+            override_config(**self._config(credentials, ATLASSIAN_API_URL=gateway)),
+            responses.RequestsMock() as rsps,
+        ):
+            rsps.get(
+                f"{gateway}/rest/servicedeskapi/servicedesk/10/requesttype",
+                json={"values": []},
+            )
+
+            ServiceDeskBackend().pull_request_types()
+
+            self.assertEqual(
+                rsps.calls[0].request.headers["Authorization"], expected_auth
+            )
+
+    def test_ssl_verification_setting_is_honoured(self):
+        credentials, _ = self.AUTH_MODES["personal_access_token"]
+        with (
+            override_config(**self._config(credentials, ATLASSIAN_VERIFY_SSL=False)),
+            responses.RequestsMock() as rsps,
+        ):
+            rsps.get(
+                f"{self.BASE_URL}/rest/servicedeskapi/servicedesk/10/requesttype",
+                json={"values": []},
+            )
+            rsps.post(f"{self.BASE_URL}/rest/api/2/issue/TST-1/attachments", json=[])
+            backend = ServiceDeskBackend()
+
+            backend.pull_request_types()
+            backend._upload_file(mock.Mock(key="TST-1"), BytesIO(b"data"), "a.txt")
+
+            for call in rsps.calls:
+                self.assertIs(call.request.req_kwargs["verify"], False)
+
+    def test_non_dict_error_body_raises_service_backend_error(self):
+        """A list-shaped JSON error body must not surface as TypeError (CSCS-PY)."""
+        credentials, _ = self.AUTH_MODES["personal_access_token"]
+        with (
+            override_config(**self._config(credentials)),
+            responses.RequestsMock() as rsps,
+        ):
+            rsps.get(
+                f"{self.BASE_URL}/rest/servicedeskapi/servicedesk/10/requesttype",
+                json=["Forbidden"],
+                status=403,
+            )
+
+            with self.assertRaises(ServiceBackendError):
+                ServiceDeskBackend().pull_request_types()
+
+
+class ClientCredentialsTokenTest(TestCase):
+    """With a client ID and secret, Waldur obtains its own tokens and renews them."""
+
+    BASE_URL = "https://api.atlassian.com/ex/jira/cloud-id"
+    REQUEST_TYPES_URL = f"{BASE_URL}/rest/servicedeskapi/servicedesk/10/requesttype"
+    CONFIG = {
+        **DirectRestAuthTest.NO_CREDENTIALS,
+        "ATLASSIAN_API_URL": BASE_URL,
+        "ATLASSIAN_PROJECT_ID": "10",
+        "ATLASSIAN_OAUTH2_CLIENT_ID": "client-id",
+        "ATLASSIAN_OAUTH2_CLIENT_SECRET": "client-secret",
+    }
+
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+
+    def _add_tokens(self, rsps, *tokens):
+        # Registered responses for one URL are served in order.
+        for token in tokens:
+            rsps.post(
+                ATLASSIAN_OAUTH2_TOKEN_URL,
+                json={
+                    "access_token": token,
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                },
+            )
+
+    def _token_requests(self, rsps):
+        return [c for c in rsps.calls if c.request.url == ATLASSIAN_OAUTH2_TOKEN_URL]
+
+    def _api_authorizations(self, rsps):
+        return [
+            c.request.headers["Authorization"]
+            for c in rsps.calls
+            if c.request.url.startswith(self.BASE_URL)
+        ]
+
+    def test_token_is_requested_with_client_credentials(self):
+        with override_config(**self.CONFIG), responses.RequestsMock() as rsps:
+            self._add_tokens(rsps, "token-1")
+            rsps.get(self.REQUEST_TYPES_URL, json={"values": []})
+
+            backend = ServiceDeskBackend()
+            backend.pull_request_types()
+
+            self.assertEqual(backend.get_authentication_method(), "OAuth 2.0")
+            self.assertTrue(backend.validate_authentication_config())
+            self.assertEqual(
+                json.loads(self._token_requests(rsps)[0].request.body),
+                {
+                    "grant_type": "client_credentials",
+                    "client_id": "client-id",
+                    "client_secret": "client-secret",
+                },
+            )
+            self.assertEqual(self._api_authorizations(rsps), ["Bearer token-1"])
+
+    def test_token_is_shared_and_renewed_before_it_expires(self):
+        with (
+            freeze_time("2026-09-15 10:00:00") as frozen,
+            override_config(**self.CONFIG),
+            responses.RequestsMock() as rsps,
+        ):
+            self._add_tokens(rsps, "token-1", "token-2")
+            rsps.get(self.REQUEST_TYPES_URL, json={"values": []})
+            backend = ServiceDeskBackend()
+
+            backend.pull_request_types()
+            # Another backend instance (another process in production) reuses it.
+            ServiceDeskBackend().pull_request_types()
+            # Just outside the renewal margin the cached token is still used.
+            frozen.tick(3600 - 61)
+            backend.pull_request_types()
+            # Inside the margin the same client object obtains a new token.
+            frozen.tick(2)
+            backend.pull_request_types()
+
+            self.assertEqual(len(self._token_requests(rsps)), 2)
+            self.assertEqual(
+                self._api_authorizations(rsps),
+                ["Bearer token-1"] * 3 + ["Bearer token-2"],
+            )
+
+    def test_rotated_secret_does_not_reuse_the_cached_token(self):
+        with responses.RequestsMock() as rsps:
+            self._add_tokens(rsps, "token-1", "token-2")
+            rsps.get(self.REQUEST_TYPES_URL, json={"values": []})
+
+            with override_config(**self.CONFIG):
+                ServiceDeskBackend().pull_request_types()
+            with override_config(
+                **{**self.CONFIG, "ATLASSIAN_OAUTH2_CLIENT_SECRET": "rotated"}
+            ):
+                ServiceDeskBackend().pull_request_types()
+
+            self.assertEqual(
+                self._api_authorizations(rsps), ["Bearer token-1", "Bearer token-2"]
+            )
+
+    def test_token_request_failure_raises_service_backend_error(self):
+        with override_config(**self.CONFIG), responses.RequestsMock() as rsps:
+            rsps.post(
+                ATLASSIAN_OAUTH2_TOKEN_URL,
+                json={"error": "invalid_client"},
+                status=401,
+            )
+
+            with self.assertRaises(ServiceBackendError):
+                ServiceDeskBackend().pull_request_types()

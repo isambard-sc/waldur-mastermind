@@ -13,7 +13,7 @@ from . import factories, fixtures
 from .helpers import override_openstack_settings
 
 
-class VolumeDeleteTest(test.APITransactionTestCase):
+class VolumeDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.volume = self.fixture.volume
@@ -44,7 +44,7 @@ class VolumeDeleteTest(test.APITransactionTestCase):
 
 
 @ddt
-class VolumeExtendTestCase(test.APITransactionTestCase):
+class VolumeExtendTestCase(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.admin = self.fixture.admin
@@ -120,7 +120,7 @@ class VolumeExtendTestCase(test.APITransactionTestCase):
         self.assertEqual(new_size / 1024, tenant.get_quota_usage(key))
 
 
-class VolumeAttachTestCase(test.APITransactionTestCase):
+class VolumeAttachTestCase(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.volume = self.fixture.volume
@@ -203,7 +203,7 @@ class VolumeAttachTestCase(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
 
 
-class VolumeDetachTestCase(test.APITransactionTestCase):
+class VolumeDetachTestCase(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.volume = self.fixture.volume
@@ -244,7 +244,7 @@ class VolumeDetachTestCase(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT, response.data)
 
 
-class VolumeSnapshotTestCase(test.APITransactionTestCase):
+class VolumeSnapshotTestCase(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.volume = self.fixture.volume
@@ -279,7 +279,7 @@ class VolumeSnapshotTestCase(test.APITransactionTestCase):
         self.assertEqual(old_usage, new_usage)
 
 
-class BaseVolumeCreateTest(test.APITransactionTestCase):
+class BaseVolumeCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.tenant = self.fixture.tenant
@@ -457,7 +457,7 @@ class VolumeAvailabilityZoneCreateTest(BaseVolumeCreateTest):
 
 
 @ddt
-class VolumeRetypeTestCase(test.APITransactionTestCase):
+class VolumeRetypeTestCase(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.tenant = self.fixture.tenant
@@ -535,7 +535,7 @@ class VolumeRetypeTestCase(test.APITransactionTestCase):
         self.assertEqual(self.volume.size / 1024, tenant.get_quota_usage(new_type_key))
 
 
-class VolumeFilterTest(test.APITransactionTestCase):
+class VolumeFilterTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.OpenStackFixture()
         self.url = factories.VolumeFactory.get_list_url()
@@ -575,3 +575,26 @@ class VolumeFilterTest(test.APITransactionTestCase):
     def test_filter_volumes_by_invalid_instance_uuid(self):
         response = self.client.get(self.url, {"attach_instance_uuid": "invalid"})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class VolumeDisabledActionsTest(test.APITestCase):
+    """Tests to verify that create and destroy actions are disabled for the volume endpoint."""
+
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.client.force_authenticate(self.fixture.staff)
+
+    def test_volume_create_action_is_not_allowed(self):
+        url = factories.VolumeFactory.get_list_url()
+        data = {"name": "Test volume", "size": 1024}
+
+        response = self.client.post(url, data)
+
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_volume_destroy_action_is_not_allowed(self):
+        url = factories.VolumeFactory.get_url(self.fixture.volume)
+
+        response = self.client.delete(url)
+
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)

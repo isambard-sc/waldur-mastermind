@@ -1,0 +1,349 @@
+import uuid
+from unittest.mock import patch
+
+from rest_framework import status, test
+
+from waldur_autoprovisioning.tests import factories as autoprovisioning_factories
+from waldur_core.core.models import User
+from waldur_core.core.tests.helpers import override_waldur_core_settings
+from waldur_core.structure import models as structure_models
+from waldur_core.structure.tests import factories as structure_factories
+
+
+def _user(**kwargs):
+    return User.objects.create(
+        username=kwargs.pop("username", f"u-{uuid.uuid4().hex[:8]}"),
+        email=kwargs.pop("email", "u@example.com"),
+        **kwargs,
+    )
+
+
+@patch("waldur_autoprovisioning.handlers.process_order_on_commit")
+class RuleTestMatchEndpointTest(test.APITestCase):
+    """Tests for POST /api/autoprovisioning-rules/{uuid}/test-match/."""
+
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        self.regular = structure_factories.UserFactory()
+
+    def _post(self, rule, user_uuid):
+        url = autoprovisioning_factories.RuleFactory.get_url(rule, "test-match")
+        return self.client.post(url, {"user_uuid": str(user_uuid)})
+
+    def test_non_staff_cannot_call(self, _):
+        rule = autoprovisioning_factories.RuleFactory()
+        target = _user()
+        self.client.force_authenticate(self.regular)
+        response = self._post(rule, target.uuid)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_unknown_user_uuid_returns_404(self, _):
+        rule = autoprovisioning_factories.RuleFactory()
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, uuid.uuid4())
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_malformed_user_uuid_returns_400(self, _):
+        rule = autoprovisioning_factories.RuleFactory()
+        self.client.force_authenticate(self.staff)
+        url = autoprovisioning_factories.RuleFactory.get_url(rule, "test-match")
+        response = self.client.post(url, {"user_uuid": "not-a-uuid"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_happy_path_would_provision_true(self, _):
+        rule = autoprovisioning_factories.RuleFactory(
+            user_email_patterns=[r".+@example\.com"]
+        )
+        target = _user(email="hit@example.com")
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["would_provision"])
+        self.assertEqual(response.data["block_reason"], "")
+        self.assertEqual(response.data["resolved_project_name"], target.username)
+        # Seven filter results, email_patterns matched
+        filter_names = {fr["name"] for fr in response.data["filter_results"]}
+        self.assertEqual(
+            filter_names,
+            {
+                "affiliations",
+                "email_patterns",
+                "identity_sources",
+                "nationalities",
+                "organization_types",
+                "assurance_levels",
+                "claims",
+            },
+        )
+        email_fr = next(
+            fr
+            for fr in response.data["filter_results"]
+            if fr["name"] == "email_patterns"
+        )
+        self.assertTrue(email_fr["configured"])
+        self.assertTrue(email_fr["matched"])
+        self.assertFalse(response.data["customer_lookup_performed"])
+
+    def test_rule_filters_block_user(self, _):
+        rule = autoprovisioning_factories.RuleFactory(
+            user_email_patterns=[r".+@allowed\.com"]
+        )
+        target = _user(email="miss@other.com")
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["would_provision"])
+        self.assertIn("filters do not match", response.data["block_reason"])
+        # Filter-block short-circuits before customer lookup is even relevant
+        self.assertFalse(response.data["customer_lookup_performed"])
+
+    @override_waldur_core_settings(
+        PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS=["PROTECTED"]
+    )
+    def test_customer_not_found_when_org_flag_on(self, _):
+        rule = autoprovisioning_factories.RuleFactory(
+            customer=None,
+            user_email_patterns=[r".+@example\.com"],
+            use_user_organization_as_customer_name=True,
+        )
+        target = _user(
+            email="hit@example.com",
+            organization="NotARealOrg",
+            registration_method="PROTECTED",
+        )
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["would_provision"])
+        self.assertTrue(response.data["customer_lookup_performed"])
+        self.assertEqual(response.data["customer_candidates"], [])
+        self.assertIn("No organization found", response.data["block_reason"])
+        self.assertFalse(response.data["customer_lookup_ambiguous"])
+
+    def test_user_not_protected_blocks_org_lookup(self, _):
+        rule = autoprovisioning_factories.RuleFactory(
+            customer=None,
+            user_email_patterns=[r".+@example\.com"],
+            use_user_organization_as_customer_name=True,
+        )
+        target = _user(
+            email="hit@example.com",
+            organization="UnprotectedOrg",
+            registration_method="LOCAL",
+        )
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["would_provision"])
+        self.assertIn(
+            "PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS",
+            response.data["block_reason"],
+        )
+
+    @override_waldur_core_settings(
+        PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS=["PROTECTED"]
+    )
+    def test_user_no_organization_claim(self, _):
+        rule = autoprovisioning_factories.RuleFactory(
+            customer=None,
+            user_email_patterns=[r".+@example\.com"],
+            use_user_organization_as_customer_name=True,
+        )
+        target = _user(
+            email="hit@example.com", organization="", registration_method="PROTECTED"
+        )
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["would_provision"])
+        self.assertIn("organization claim", response.data["block_reason"])
+
+    @override_waldur_core_settings(
+        PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS=["PROTECTED"]
+    )
+    def test_ambiguous_customer_returned(self, _):
+        org_name = "SharedOrgName"
+        structure_models.Customer.objects.create(name=org_name)
+        structure_models.Customer.objects.create(name=org_name)
+        rule = autoprovisioning_factories.RuleFactory(
+            customer=None,
+            user_email_patterns=[r".+@example\.com"],
+            use_user_organization_as_customer_name=True,
+        )
+        target = _user(
+            email="hit@example.com",
+            organization=org_name,
+            registration_method="PROTECTED",
+        )
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["would_provision"])
+        self.assertTrue(response.data["customer_lookup_ambiguous"])
+        self.assertEqual(len(response.data["customer_candidates"]), 2)
+        for candidate in response.data["customer_candidates"]:
+            self.assertEqual(candidate["name"], org_name)
+            self.assertIn("uuid", candidate)
+            self.assertIn("url", candidate)
+
+    @override_waldur_core_settings(
+        PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS=["PROTECTED"]
+    )
+    def test_single_customer_match_resolves_project_name(self, _):
+        org_name = "ResolvableOrg"
+        structure_models.Customer.objects.create(name=org_name)
+        rule = autoprovisioning_factories.RuleFactory(
+            customer=None,
+            user_email_patterns=[r".+@example\.com"],
+            use_user_organization_as_customer_name=True,
+            project_name_template="{username}_workspace",
+        )
+        target = _user(
+            email="hit@example.com",
+            organization=org_name,
+            registration_method="PROTECTED",
+        )
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["would_provision"])
+        self.assertTrue(response.data["customer_lookup_performed"])
+        self.assertEqual(len(response.data["customer_candidates"]), 1)
+        self.assertEqual(
+            response.data["resolved_project_name"], f"{target.username}_workspace"
+        )
+
+    def test_project_action_reports_a_project_to_create(self, _):
+        # The account predates the rule, so nothing was provisioned for it yet.
+        target = _user(email="hit@example.com")
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_email_patterns=[r".+@example\.com"]
+        )
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertTrue(response.data["would_provision"])
+        self.assertEqual(response.data["project_action"], "create")
+
+    def test_project_action_reports_an_existing_project(self, _):
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_email_patterns=[r".+@example\.com"]
+        )
+        # Provisioned on account creation.
+        target = _user(email="hit@example.com")
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertTrue(response.data["would_provision"])
+        self.assertEqual(response.data["project_action"], "existing")
+
+    def test_deleted_project_blocks_a_rule_that_only_grants_a_project_role(self, _):
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_email_patterns=[r".+@example\.com"]
+        )
+        target = _user(email="hit@example.com")
+        structure_models.Project.available_objects.get(
+            customer=rule.customer, name=target.username
+        ).delete()
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertFalse(response.data["would_provision"])
+        self.assertEqual(response.data["project_action"], "not_recreated")
+        self.assertIn("not recreated", response.data["block_reason"])
+
+    def test_project_action_is_null_for_an_organization_only_rule(self, _):
+        from waldur_core.permissions.fixtures import CustomerRole
+
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None,
+            create_project=False,
+            customer_role=CustomerRole.OWNER,
+            user_email_patterns=[r".+@example\.com"],
+        )
+        target = _user(email="hit@example.com")
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertTrue(response.data["would_provision"])
+        self.assertIsNone(response.data["project_action"])
+
+
+@patch("waldur_autoprovisioning.handlers.process_order_on_commit")
+class UnconfiguredClaimsTest(test.APITestCase):
+    """`unconfigured_claims` tells two look-alike failures apart.
+
+    An empty user value in the dry-run reads the same whether the provider sent
+    a different value or never sent the claim at all — but the fixes are
+    opposite: adjust the rule, versus add the claim to the provider's extra
+    fields. Without this an administrator cannot tell which they are looking at.
+    """
+
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        self.target = User.objects.create(
+            username="claims-target", email="target@example.com"
+        )
+
+    def _post(self, rule):
+        self.client.force_authenticate(self.staff)
+        return self.client.post(
+            autoprovisioning_factories.RuleFactory.get_url(rule, "test-match"),
+            {"user_uuid": self.target.uuid.hex},
+        )
+
+    def _provider(self, **kwargs):
+        from waldur_auth_social.models import IdentityProvider
+
+        return IdentityProvider.objects.create(
+            provider="keycloak",
+            client_id="cid",
+            client_secret="secret",
+            discovery_url="http://idp.test/.well-known/openid-configuration",
+            userinfo_url="http://idp.test/userinfo",
+            token_url="http://idp.test/token",
+            auth_url="http://idp.test/auth",
+            **kwargs,
+        )
+
+    def test_claim_nobody_passes_through_is_reported(self, _):
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_claims={"entitlements": ["urn:x:*"]}
+        )
+        response = self._post(rule)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["unconfigured_claims"], ["entitlements"])
+
+    def test_claim_listed_in_extra_fields_is_not_reported(self, _):
+        self._provider(extra_fields="roles")
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_claims={"roles": ["acme-owner"]}
+        )
+        response = self._post(rule)
+        self.assertEqual(response.data["unconfigured_claims"], [])
+
+    def test_only_the_unpassed_claims_are_reported(self, _):
+        self._provider(extra_fields="roles")
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None,
+            user_claims={"roles": ["acme-owner"], "entitlements": ["urn:x:*"]},
+        )
+        response = self._post(rule)
+        self.assertEqual(response.data["unconfigured_claims"], ["entitlements"])
+
+    def test_a_claim_mapped_onto_a_profile_field_counts_as_passed_through(self, _):
+        self._provider(attribute_mapping={"organization": "schac_home_organization"})
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_claims={"schac_home_organization": ["example.org"]}
+        )
+        response = self._post(rule)
+        self.assertEqual(response.data["unconfigured_claims"], [])
+
+    def test_an_inactive_provider_does_not_count(self, _):
+        self._provider(extra_fields="roles", is_active=False)
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_claims={"roles": ["acme-owner"]}
+        )
+        response = self._post(rule)
+        self.assertEqual(response.data["unconfigured_claims"], ["roles"])
+
+    def test_a_rule_without_claims_reports_nothing(self, _):
+        rule = autoprovisioning_factories.RuleFactory(plan=None)
+        response = self._post(rule)
+        self.assertEqual(response.data["unconfigured_claims"], [])

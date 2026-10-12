@@ -24,7 +24,6 @@ from waldur_core.core.admin import (
     ExecutorAdminAction,
     ExtraActionsMixin,
     JsonWidget,
-    NativeNameAdminMixin,
     PasswordWidget,
     ReadOnlyAdminMixin,
 )
@@ -195,7 +194,6 @@ class CustomerAdminForm(ModelForm):
 class CustomerAdmin(
     VersionAdmin,
     FormRequestAdminMixin,
-    NativeNameAdminMixin,
     ProtectedModelMixin,
     admin.ModelAdmin,
 ):
@@ -229,6 +227,7 @@ class CustomerAdmin(
         "default_tax_percent",
         "blocked",
         "archived",
+        "grace_period_days",
     )
     list_display = (
         "name",
@@ -245,9 +244,15 @@ class CustomerAdmin(
 
     def get_readonly_fields(self, request, obj=None):
         fields = super().get_readonly_fields(request, obj)
+        readonly_fields = list(fields)
+
         if obj and obj.is_billable():
-            return fields + ("accounting_start_date",)
-        return fields
+            readonly_fields.append("accounting_start_date")
+
+        if not request.user.is_staff:
+            readonly_fields.append("grace_period_days")
+
+        return readonly_fields
 
     @transaction.atomic
     def delete_queryset(self, request, queryset):
@@ -264,30 +269,32 @@ class ProjectAdmin(
 ):
     fields = (
         "name",
-        "short_name",
         "description",
         "customer",
         "type",
         "oecd_fos_2007_code",
         "image",
+        "grace_period_days",
     )
-
-    readonly_fields = [
-        "short_name",
-    ]
 
     list_display = [
         "name",
-        "short_name",
         "uuid",
         "customer",
         "created",
         "get_type_name",
+        "is_removed",
     ]
-    list_filter = ["customer"]
-    search_fields = ["name", "short_name", "uuid"]
+    list_filter = ["customer", "is_removed"]
+    search_fields = ["name", "uuid"]
     change_readonly_fields = ["customer"]
-    actions = ("cleanup", "sync_remote")
+    actions = ("cleanup", "sync_remote", "hard_delete_soft_deleted")
+
+    def get_readonly_fields(self, request, obj=None):
+        readonly_fields = super().get_readonly_fields(request, obj)
+        if not request.user.is_staff:
+            readonly_fields = list(readonly_fields) + ["grace_period_days"]
+        return readonly_fields
 
     class Cleanup(ExecutorAdminAction):
         executor = executors.ProjectCleanupExecutor
@@ -335,8 +342,32 @@ class ProjectAdmin(
         self.message_user(request, _("Cleaning up remote projects has been scheduled."))
         return redirect(reverse("admin:structure_project_changelist"))
 
+    @transaction.atomic
+    def hard_delete_soft_deleted(self, request, queryset):
+        soft_deleted = queryset.filter(is_removed=True)
+        count = soft_deleted.count()
+        if count == 0:
+            self.message_user(
+                request,
+                _("No soft-deleted projects in the selection."),
+                messages.WARNING,
+            )
+            return
+        for project in soft_deleted:
+            project.delete(soft=False)
+        message = ngettext(
+            "%(count)d soft-deleted project has been permanently removed.",
+            "%(count)d soft-deleted projects have been permanently removed.",
+            count,
+        )
+        self.message_user(request, message % {"count": count}, messages.SUCCESS)
+
+    hard_delete_soft_deleted.short_description = _(
+        "Hard delete selected soft-deleted projects"
+    )
+
     def get_queryset(self, request):
-        return models.Project.available_objects.all()
+        return models.Project.objects.all()
 
 
 class ServiceSettingsAdminForm(ModelForm):
@@ -620,11 +651,28 @@ class OrganizationGroupAdmin(admin.ModelAdmin):
     search_fields = ["name"]
 
 
+class AffiliatedOrganizationAdmin(admin.ModelAdmin):
+    list_display = ("name", "code", "abbreviation", "country", "email", "uuid")
+    search_fields = ["name", "code", "abbreviation"]
+
+
+class ScienceDomainAdmin(admin.ModelAdmin):
+    list_display = ("code", "name", "uuid")
+    search_fields = ["name", "code"]
+
+
+class ScienceSubDomainAdmin(admin.ModelAdmin):
+    list_display = ("code", "name", "domain", "uuid")
+    search_fields = ["name", "code", "domain__name"]
+    list_filter = ("domain",)
+
+
 class UserAgreementAdmin(admin.ModelAdmin):
-    fields = ("content", "agreement_type", "created", "modified")
+    fields = ("content", "agreement_type", "language", "created", "modified")
     readonly_fields = ("created", "modified")
     search_fields = ["content"]
-    list_filter = ("agreement_type",)
+    list_filter = ("agreement_type", "language")
+    list_display = ("agreement_type", "language", "created", "modified")
 
 
 class TemplateInline(admin.TabularInline):
@@ -641,7 +689,7 @@ class NotificationAdmin(admin.ModelAdmin):
     exclude = ("templates",)
 
 
-class NotificationTemplateAdmin(admin.ModelAdmin):
+class NotificationTemplateAdmin(VersionAdmin):
     list_display = ("path", "name")
     search_fields = ("path", "name")
     inlines = [
@@ -653,13 +701,23 @@ class CustomerPermissionReviewAdmin(admin.ModelAdmin):
     list_display = ("customer", "is_pending", "reviewer", "created")
 
 
+class ProjectEndDateChangeRequestAdmin(admin.ModelAdmin):
+    list_display = ("project", "requested_end_date", "state", "created_by", "created")
+
+
 admin.site.register(models.Customer, CustomerAdmin)
 admin.site.register(models.ProjectType, admin.ModelAdmin)
 admin.site.register(models.CustomerPermissionReview, CustomerPermissionReviewAdmin)
+admin.site.register(
+    models.ProjectEndDateChangeRequest, ProjectEndDateChangeRequestAdmin
+)
 admin.site.register(models.Project, ProjectAdmin)
 admin.site.register(models.PrivateServiceSettings, PrivateServiceSettingsAdmin)
 admin.site.register(models.SharedServiceSettings, SharedServiceSettingsAdmin)
 admin.site.register(models.OrganizationGroup, OrganizationGroupAdmin)
+admin.site.register(models.AffiliatedOrganization, AffiliatedOrganizationAdmin)
+admin.site.register(models.ScienceDomain, ScienceDomainAdmin)
+admin.site.register(models.ScienceSubDomain, ScienceSubDomainAdmin)
 admin.site.register(models.UserAgreement, UserAgreementAdmin)
 admin.site.register(NotificationTemplate, NotificationTemplateAdmin)
 admin.site.register(Notification, NotificationAdmin)

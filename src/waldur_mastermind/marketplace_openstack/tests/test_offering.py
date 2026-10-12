@@ -28,7 +28,12 @@ from waldur_mastermind.marketplace_openstack import (
     STORAGE_MODE_DYNAMIC,
     STORAGE_MODE_FIXED,
 )
+from waldur_mastermind.marketplace_openstack.utils import (
+    get_external_ip,
+    update_external_addresses_of_resource,
+)
 from waldur_openstack import models as openstack_models
+from waldur_openstack.backend import OpenStackBackend
 from waldur_openstack.tests import factories as openstack_factories
 from waldur_openstack.tests import fixtures as openstack_fixtures
 from waldur_openstack.tests.factories import VolumeTypeFactory
@@ -40,7 +45,7 @@ from ...marketplace.enums import OPENSTACK_VOLUME_OFFERING
 from .utils import BaseOpenStackTest, override_plugin_settings
 
 
-class PlanComponentsTest(test.APITransactionTestCase):
+class PlanComponentsTest(test.APITestCase):
     prices = {
         "cores": 10,
         "ram": 100,
@@ -149,6 +154,46 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
         offering = marketplace_models.Offering.objects.get(type=offering_type)
         self.assertEqual(offering.state, OfferingStates.ARCHIVED)
 
+    @data(OPENSTACK_INSTANCE_OFFERING, OPENSTACK_VOLUME_OFFERING)
+    def test_recreates_offering_when_existing_one_is_archived(self, offering_type):
+        from waldur_mastermind.marketplace_openstack import utils
+
+        tenant = self.trigger_offering_creation()
+        offering = marketplace_models.Offering.objects.get(
+            type=offering_type, scope=tenant
+        )
+        offering.state = OfferingStates.ARCHIVED
+        offering.save(update_fields=["state"])
+
+        utils.create_offerings_for_volume_and_instance(tenant)
+
+        live_offerings = marketplace_models.Offering.objects.filter(
+            type=offering_type, scope=tenant
+        ).exclude(state=OfferingStates.ARCHIVED)
+        self.assertEqual(live_offerings.count(), 1)
+
+    @data(OPENSTACK_INSTANCE_OFFERING, OPENSTACK_VOLUME_OFFERING)
+    def test_tenant_resource_is_exposed_in_offering_details(self, offering_type):
+        tenant = self.trigger_offering_creation()
+        tenant_resource = marketplace_models.Resource.objects.get(scope=tenant)
+        offering = marketplace_models.Offering.objects.get(
+            type=offering_type, scope=tenant
+        )
+        self.client.force_authenticate(structure_factories.UserFactory(is_staff=True))
+
+        response = self.client.get(
+            marketplace_factories.OfferingFactory.get_url(offering)
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["scope_resource_uuid"], tenant_resource.uuid.hex)
+        self.assertEqual(response.data["scope_resource_name"], tenant_resource.name)
+        self.assertTrue(
+            response.data["scope_resource"].endswith(
+                marketplace_factories.ResourceFactory.get_url(tenant_resource)
+            )
+        )
+
     def trigger_offering_creation(self):
         fixture = OpenStackFixture()
         tenant = openstack_models.Tenant.objects.create(
@@ -164,7 +209,7 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
         return tenant
 
 
-class OfferingComponentForVolumeTypeTest(test.APITransactionTestCase):
+class OfferingComponentForVolumeTypeTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
@@ -209,6 +254,46 @@ class OfferingComponentForVolumeTypeTest(test.APITransactionTestCase):
             scope=self.volume_type
         )
         self.assertEqual(component.name, "Storage (%s)" % self.volume_type.name)
+
+    def _resync_volume_type(self):
+        # The same write the backend pull makes for every volume type on each sync.
+        openstack_models.VolumeType.objects.update_or_create(
+            settings=self.volume_type.settings,
+            backend_id=self.volume_type.backend_id,
+            defaults={
+                "name": self.volume_type.name,
+                "description": self.volume_type.description,
+                "disabled": self.volume_type.disabled,
+            },
+        )
+
+    def test_provider_accounting_survives_volume_type_resync(self):
+        component = marketplace_models.OfferingComponent.objects.get(
+            scope=self.volume_type
+        )
+        component.billing_type = BillingTypes.USAGE
+        component.measured_unit = "GB-hours"
+        component.save()
+
+        self._resync_volume_type()
+
+        component.refresh_from_db()
+        self.assertEqual(component.billing_type, BillingTypes.USAGE)
+        self.assertEqual(component.measured_unit, "GB-hours")
+
+    def test_prepaid_component_survives_volume_type_resync(self):
+        component = marketplace_models.OfferingComponent.objects.get(
+            scope=self.volume_type
+        )
+        component.billing_type = BillingTypes.ONE_TIME
+        component.is_prepaid = True
+        component.save()
+
+        self._resync_volume_type()
+
+        component.refresh_from_db()
+        self.assertEqual(component.billing_type, BillingTypes.ONE_TIME)
+        self.assertTrue(component.is_prepaid)
 
     def test_offering_component_is_deleted(self):
         self.volume_type.delete()
@@ -372,7 +457,7 @@ class OfferingCreateTest(BaseBackendTestCase):
 
 
 @ddt
-class OfferingUpdateTest(test.APITransactionTestCase):
+class OfferingUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
@@ -418,7 +503,7 @@ class OfferingUpdateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class OfferingDetailsTest(test.APITransactionTestCase):
+class OfferingDetailsTest(test.APITestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
@@ -459,8 +544,53 @@ class OfferingDetailsTest(test.APITransactionTestCase):
         self.assertEqual(actual_types, expected_types)
 
 
+class OfferingQuotasVisibilityTest(test.APITestCase):
+    """The public payload may carry tenant quotas, but not provider capacity.
+
+    The tenant offering is scoped to the provider's service settings; the
+    per-tenant offerings created for it are scoped to a single customer's tenant.
+    """
+
+    def setUp(self):
+        self.fixture = openstack_fixtures.OpenStackFixture()
+        self.fixture.settings.set_quota_limit("vcpu", 100)
+        self.fixture.settings.set_quota_usage("vcpu", 40)
+        self.tenant_offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_TENANT_OFFERING,
+            shared=True,
+            scope=self.fixture.settings,
+        )
+        marketplace_factories.PlanFactory(offering=self.tenant_offering)
+
+        self.tenant = self.fixture.tenant
+        self.tenant.set_quota_limit("vcpu", 8)
+        self.tenant.set_quota_usage("vcpu", 3)
+        self.instance_offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_INSTANCE_OFFERING,
+            shared=False,
+            customer=self.tenant.project.customer,
+            project=self.tenant.project,
+            parent=self.tenant_offering,
+            scope=self.tenant,
+        )
+
+    def _get_public_quotas(self, offering):
+        self.client.force_authenticate(self.fixture.staff)
+        url = marketplace_factories.OfferingFactory.get_public_url(offering)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return {quota["name"]: quota for quota in response.data["quotas"]}
+
+    def test_tenant_offering_conceals_provider_capacity(self):
+        self.assertEqual(self._get_public_quotas(self.tenant_offering), {})
+
+    def test_per_tenant_offering_exposes_tenant_quotas(self):
+        quotas = self._get_public_quotas(self.instance_offering)
+        self.assertEqual(quotas["vcpu"], {"name": "vcpu", "usage": 3, "limit": 8})
+
+
 @ddt
-class OfferingNameTest(test.APITransactionTestCase):
+class OfferingNameTest(test.APITestCase):
     def setUp(self):
         self.fixture = OpenStackFixture()
 
@@ -478,7 +608,7 @@ class OfferingNameTest(test.APITransactionTestCase):
         self.assertTrue("new_name" in offering.name)
 
 
-class RouterExternalIPTest(test.APITransactionTestCase):
+class RouterExternalIPTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.UserFixture()
         self.router = openstack_factories.RouterFactory(fixed_ips=["100.100.100.1"])
@@ -511,7 +641,7 @@ class RouterExternalIPTest(test.APITransactionTestCase):
         self.assertEqual(response.data["offering_external_ips"], [])
 
 
-class InstanceExternalIPTest(test.APITransactionTestCase):
+class InstanceExternalIPTest(test.APITestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.instance = self.fixture.instance
@@ -602,7 +732,7 @@ class InstanceExternalIPTest(test.APITransactionTestCase):
         self.assertEqual(len(response.data), 1)
 
 
-class ImportedFloatingIPExternalMappingTest(test.APITransactionTestCase):
+class ImportedFloatingIPExternalMappingTest(test.APITestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.parent_offering = marketplace_factories.OfferingFactory(
@@ -682,8 +812,300 @@ class ImportedFloatingIPExternalMappingTest(test.APITransactionTestCase):
         floating_ip.refresh_from_db()
         self.assertEqual(floating_ip.external_address, None)
 
+    def test_floating_ip_gets_external_address_when_port_attached_later(self):
+        # A floating IP is frequently allocated with its address first and only
+        # associated to an instance port in a later save (e.g. during pull),
+        # which does not change the address. The external_address (1:1 NAT
+        # public IP) must still be computed once the port is attached, otherwise
+        # the VM looks like it has no public IP when it actually does.
+        floating_ip = openstack_factories.FloatingIPFactory(
+            port=None,
+            address="100.100.100.50",
+            service_settings=self.fixture.settings,
+            project=self.fixture.project,
+            tenant=self.fixture.tenant,
+            state=CoreStates.OK,
+        )
+        marketplace_factories.ResourceFactory(
+            offering=self.offering,
+            scope=self.fixture.instance,
+        )
 
-class UpdateSecretOptionsTest(test.APITransactionTestCase):
+        # Not attached to any instance yet, so no mapping can be resolved.
+        floating_ip.refresh_from_db()
+        self.assertIsNone(floating_ip.external_address)
+
+        # Attach to the instance port in a save that changes only the port.
+        floating_ip.port = self.fixture.port
+        floating_ip.save()
+
+        floating_ip.refresh_from_db()
+        self.assertEqual(floating_ip.external_address, "200.200.200.50")
+
+    def test_external_address_is_cleared_when_floating_ip_address_is_removed(self):
+        # When a floating IP loses its address, its external_address must be
+        # reset to None. external_address is a GenericIPAddressField, so it must
+        # not be assigned a list.
+        marketplace_factories.ResourceFactory(
+            offering=self.offering,
+            scope=self.fixture.instance,
+        )
+        floating_ip = openstack_factories.FloatingIPFactory(
+            port=self.fixture.port,
+            address="100.100.100.50",
+            service_settings=self.fixture.settings,
+            project=self.fixture.project,
+            tenant=self.fixture.tenant,
+            state=CoreStates.OK,
+        )
+        floating_ip.refresh_from_db()
+        self.assertEqual(floating_ip.external_address, "200.200.200.50")
+
+        floating_ip.address = None
+        floating_ip.save()
+
+        floating_ip.refresh_from_db()
+        self.assertIsNone(floating_ip.external_address)
+
+
+class PullFloatingIpExternalMappingTest(test.APITestCase):
+    def setUp(self):
+        super().setUp()
+        self.mocked_neutron = mock.patch("neutronclient.v2_0.client.Client").start()()
+        openstack_fixtures.mock_session()
+        self.fixture = openstack_fixtures.OpenStackFixture()
+        self.parent_offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_TENANT_OFFERING,
+            secret_options={
+                "ipv4_external_ip_mapping": [
+                    {
+                        "floating_ip": "100.100.100.0/24",
+                        "external_ip": "200.200.200.0/24",
+                    }
+                ]
+            },
+        )
+        self.offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_INSTANCE_OFFERING,
+            parent=self.parent_offering,
+        )
+        marketplace_factories.ResourceFactory(
+            offering=self.offering,
+            scope=self.fixture.instance,
+        )
+        self.backend = OpenStackBackend(self.fixture.tenant.service_settings)
+
+    def tearDown(self):
+        super().tearDown()
+        mock.patch.stopall()
+
+    def test_pull_computes_external_address_when_port_gets_attached(self):
+        # Reproduces the real production trigger: the floating IP already has
+        # an address but is bound to a port that is not on the instance; a pull
+        # rebinds it to the instance's port in a save that only changes `port`.
+        instance = self.fixture.instance
+        subnet = self.fixture.subnet
+        detached_port = openstack_factories.PortFactory(
+            tenant=self.fixture.tenant,
+            subnet=subnet,
+            backend_id="port_detached",
+            fixed_ips=[{"ip_address": "192.168.42.10", "subnet_id": subnet.backend_id}],
+        )
+        instance_port = openstack_factories.PortFactory(
+            tenant=self.fixture.tenant,
+            subnet=subnet,
+            backend_id="port_instance",
+            fixed_ips=[{"ip_address": "192.168.42.20", "subnet_id": subnet.backend_id}],
+            instance=instance,
+        )
+        floating_ip = openstack_factories.FloatingIPFactory(
+            tenant=self.fixture.tenant,
+            address="100.100.100.50",
+            port=detached_port,
+        )
+        # Bound to a port with no instance, so the mapping cannot resolve yet.
+        floating_ip.refresh_from_db()
+        self.assertIsNone(floating_ip.external_address)
+
+        self.mocked_neutron.list_floatingips.return_value = {
+            "floatingips": [
+                {
+                    "floating_ip_address": floating_ip.address,
+                    "floating_network_id": "backend_network_id",
+                    "status": "DOWN",
+                    "id": floating_ip.backend_id,
+                    "port_id": instance_port.backend_id,
+                }
+            ]
+        }
+
+        self.backend.pull_instance_floating_ips(instance)
+
+        floating_ip.refresh_from_db()
+        self.assertEqual(floating_ip.port, instance_port)
+        self.assertEqual(floating_ip.external_address, "200.200.200.50")
+
+
+class ExternalIPMappingAddressFamilyTest(test.APITestCase):
+    # The mapping is a 1:1 NAT of IPv4 addresses into a public range. IPv6 is
+    # routed, not NATed: an IPv6 address on the provider's external network is
+    # reachable as it is, while one on a tenant subnet is not external at all.
+    # Neither may be cut into octets.
+    def setUp(self):
+        self.fixture = openstack_fixtures.OpenStackFixture()
+        self.offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_TENANT_OFFERING,
+            scope=self.fixture.settings,
+            secret_options={
+                "ipv4_external_ip_mapping": [
+                    {
+                        "floating_ip": "100.100.100.0/24",
+                        "external_ip": "200.200.200.0/24",
+                    }
+                ]
+            },
+        )
+
+    def test_ipv4_address_is_mapped_as_before(self):
+        self.assertEqual(
+            get_external_ip(self.offering, "100.100.100.7"), "200.200.200.7"
+        )
+
+    def test_ipv4_address_outside_mapping_is_not_mapped(self):
+        self.assertIsNone(get_external_ip(self.offering, "1.100.100.7"))
+
+    def _external_subnet(self, cidr, ip_version=6, public_ip_range=""):
+        return openstack_factories.ExternalSubnetFactory(
+            network=openstack_factories.ExternalNetworkFactory(
+                settings=self.fixture.settings
+            ),
+            cidr=cidr,
+            gateway_ip=None,
+            ip_version=ip_version,
+            public_ip_range=public_ip_range,
+        )
+
+    def test_ipv6_address_on_external_subnet_is_reported_unchanged(self):
+        self._external_subnet("2001:db8::/64")
+        self.assertEqual(get_external_ip(self.offering, "2001:db8::7"), "2001:db8::7")
+
+    def test_ipv6_address_off_external_subnets_is_not_external(self):
+        self._external_subnet("2001:db8::/64")
+        self.assertIsNone(get_external_ip(self.offering, "fd00:a:1::5"))
+
+    def test_ipv6_address_without_external_subnets_is_not_external(self):
+        self.assertIsNone(get_external_ip(self.offering, "2001:db8::7"))
+
+    def test_ipv6_address_matching_an_ipv6_mapping_entry_is_not_translated(self):
+        self.offering.secret_options["ipv4_external_ip_mapping"] = [
+            {"floating_ip": "2001:db8::/64", "external_ip": "2001:db8:1::/64"}
+        ]
+        self.offering.save()
+        self.assertIsNone(get_external_ip(self.offering, "2001:db8::7"))
+
+    def test_ipv6_address_in_external_subnet_with_public_range_is_unchanged(self):
+        self.offering.secret_options = {}
+        self.offering.save()
+        self._external_subnet("2001:db8::/64", public_ip_range="203.0.113.0/24")
+        self.assertEqual(get_external_ip(self.offering, "2001:db8::7"), "2001:db8::7")
+
+    def test_internal_ipv6_router_interface_is_not_external(self):
+        self.offering.secret_options = {}
+        self.offering.save()
+        self._external_subnet(
+            "fd6e:7a1d:5c00:ff::/64", public_ip_range="203.0.113.0/24"
+        )
+        self.assertIsNone(
+            get_external_ip(self.offering, "fd00:a:2:0:f816:3eff:fe17:6434")
+        )
+
+    def test_ipv4_address_in_external_subnet_with_public_range_is_mapped(self):
+        self.offering.secret_options = {}
+        self.offering.save()
+        openstack_factories.ExternalSubnetFactory(
+            network=openstack_factories.ExternalNetworkFactory(
+                settings=self.fixture.settings
+            ),
+            cidr="10.0.0.0/24",
+            public_ip_range="203.0.113.0/24",
+        )
+        self.assertEqual(get_external_ip(self.offering, "10.0.0.9"), "203.0.113.9")
+
+    def test_no_mapping_configured_reports_nothing_for_either_family(self):
+        self.offering.secret_options = {}
+        self.offering.save()
+        self.assertIsNone(get_external_ip(self.offering, "100.100.100.7"))
+        self.assertIsNone(get_external_ip(self.offering, "2001:db8::7"))
+
+    def test_no_mapping_configured_reports_nothing_even_on_external_subnet(self):
+        self.offering.secret_options = {}
+        self.offering.save()
+        self._external_subnet("2001:db8::/64")
+        self._external_subnet("10.0.0.0/24", ip_version=4)
+        self.assertIsNone(get_external_ip(self.offering, "2001:db8::7"))
+        self.assertIsNone(get_external_ip(self.offering, "10.0.0.9"))
+
+    def _get_router_external_ips(self, fixed_ips):
+        router = openstack_factories.RouterFactory(fixed_ips=fixed_ips)
+        marketplace_factories.ResourceFactory(
+            offering=self.offering, scope=router.tenant
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(openstack_factories.RouterFactory.get_url(router))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data["offering_external_ips"]
+
+    def test_dual_stack_router_reports_only_external_addresses(self):
+        self._external_subnet("2001:db8::/64")
+        self.assertEqual(
+            self._get_router_external_ips(
+                ["100.100.100.1", "2001:db8::1", "fd00:a:1::1"]
+            ),
+            ["200.200.200.1", "2001:db8::1"],
+        )
+
+    def test_ipv6_only_router_reports_only_its_external_gateway(self):
+        self.offering.secret_options = {}
+        self.offering.save()
+        self._external_subnet(
+            "fd6e:7a1d:5c00:ff::/64", public_ip_range="203.0.113.0/24"
+        )
+        self.assertEqual(
+            self._get_router_external_ips(
+                [
+                    "fd00:a:2:0:f816:3eff:fe17:6434",
+                    "fd00:a:1::",
+                    "fd6e:7a1d:5c00:ff::2d9",
+                ]
+            ),
+            ["fd6e:7a1d:5c00:ff::2d9"],
+        )
+
+    def test_instance_with_only_ipv6_addresses_does_not_raise(self):
+        instance_offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_INSTANCE_OFFERING, parent=self.offering
+        )
+        resource = marketplace_factories.ResourceFactory(
+            offering=instance_offering, scope=self.fixture.instance
+        )
+        openstack_factories.PortFactory(
+            tenant=self.fixture.tenant,
+            subnet=self.fixture.subnet,
+            instance=self.fixture.instance,
+            fixed_ips=[
+                {
+                    "ip_address": "2001:db8::10",
+                    "subnet_id": self.fixture.subnet.backend_id,
+                }
+            ],
+        )
+
+        update_external_addresses_of_resource(resource)
+
+        self.assertEqual(resource.backend_metadata["external_address"], [])
+
+
+class UpdateSecretOptionsTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.UserFixture()
         self.secret_options = {
@@ -711,7 +1133,7 @@ class UpdateSecretOptionsTest(test.APITransactionTestCase):
         self.assertEqual(self.offering.secret_options, self.secret_options)
 
 
-class OfferingPluginOptionsMaxSecurityGroupsTest(test.APITransactionTestCase):
+class OfferingPluginOptionsMaxSecurityGroupsTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.offering = marketplace_factories.OfferingFactory(
@@ -759,3 +1181,42 @@ class OfferingPluginOptionsMaxSecurityGroupsTest(test.APITransactionTestCase):
 
         self.offering.refresh_from_db()
         self.assertEqual(self.offering.plugin_options["max_security_groups"], 25)
+
+
+class ConfigDriveDefaultPublicFieldTest(test.APITestCase):
+    """config_drive_default reflects the provider service_settings.options value."""
+
+    def _create_offering(self, options=None):
+        offering = marketplace_factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        if options is not None:
+            offering.scope = structure_factories.ServiceSettingsFactory(options=options)
+            offering.save()
+        return offering
+
+    def test_returns_true_when_provider_enables_config_drive(self):
+        offering = self._create_offering(options={"config_drive": True})
+        url = marketplace_factories.OfferingFactory.get_public_url(offering)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIs(response.data["config_drive_default"], True)
+
+    def test_returns_false_when_provider_disables_config_drive(self):
+        offering = self._create_offering(options={"config_drive": False})
+        url = marketplace_factories.OfferingFactory.get_public_url(offering)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIs(response.data["config_drive_default"], False)
+
+    def test_returns_false_when_option_unset(self):
+        offering = self._create_offering(options={})
+        url = marketplace_factories.OfferingFactory.get_public_url(offering)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIs(response.data["config_drive_default"], False)
+
+    def test_returns_false_when_offering_has_no_service_settings(self):
+        offering = self._create_offering(options=None)
+        url = marketplace_factories.OfferingFactory.get_public_url(offering)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIs(response.data["config_drive_default"], False)

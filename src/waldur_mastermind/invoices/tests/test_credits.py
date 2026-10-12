@@ -1,22 +1,28 @@
 import datetime
+import threading
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
+from unittest import mock
 
 from ddt import data, ddt
+from django.contrib.contenttypes.models import ContentType
 from django.db.models.aggregates import Sum
+from django.test import TransactionTestCase
 from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
 
 from waldur_core.logging import models as logging_models
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_mastermind.billing import models as billing_models
 from waldur_mastermind.invoices import compensations, models, tasks
+from waldur_mastermind.invoices.audit import skip_credit_audit
 from waldur_mastermind.invoices.tests import factories, fixtures
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
 @ddt
-class CustomerCreditRetrieveTest(test.APITransactionTestCase):
+class CustomerCreditRetrieveTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
         self.url = factories.CustomerCreditFactory.get_url(self.fixture.customer_credit)
@@ -35,7 +41,7 @@ class CustomerCreditRetrieveTest(test.APITransactionTestCase):
 
 
 @ddt
-class CustomerCreditCreateTest(test.APITransactionTestCase):
+class CustomerCreditCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
 
@@ -124,7 +130,7 @@ class CustomerCreditCreateTest(test.APITransactionTestCase):
 
 
 @ddt
-class CustomerCreditUpdateTest(test.APITransactionTestCase):
+class CustomerCreditUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
         self.fixture.customer_credit
@@ -166,7 +172,7 @@ class CustomerCreditUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class CustomerCreditDeleteTest(test.APITransactionTestCase):
+class CustomerCreditDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
 
@@ -187,26 +193,107 @@ class CustomerCreditDeleteTest(test.APITransactionTestCase):
 
 
 @ddt
-class ProjectCreditRetrieveTest(test.APITransactionTestCase):
+class ProjectCreditRetrieveTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
         self.url = factories.ProjectCreditFactory.get_url(self.fixture.project_credit)
 
-    @data("staff", "global_support", "owner")
+    # Project roles are included: the credit funds their project, and the
+    # project dashboard cannot explain a paused resource or a credit-adjusted
+    # cost without it. Users with no role on the project still see nothing.
+    @data("staff", "global_support", "owner", "manager", "admin", "member")
     def test_user_with_access_can_retrieve_credit(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-    @data("manager", "admin", "user")
+    @data("user")
     def test_user_cannot_retrieve_credit(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_project_role_does_not_leak_credit_of_another_project(self):
+        other_credit = factories.ProjectCreditFactory(
+            project=structure_factories.ProjectFactory(customer=self.fixture.customer)
+        )
+        self.client.force_authenticate(self.fixture.member)
+        response = self.client.get(factories.ProjectCreditFactory.get_url(other_credit))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_project_role_sees_only_own_project_in_list(self):
+        factories.ProjectCreditFactory(
+            project=structure_factories.ProjectFactory(customer=self.fixture.customer)
+        )
+        self.client.force_authenticate(self.fixture.member)
+        response = self.client.get(factories.ProjectCreditFactory.get_list_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [item["uuid"] for item in response.data],
+            [self.fixture.project_credit.uuid.hex],
+        )
+
+    def test_project_role_cannot_retrieve_customer_credit(self):
+        self.client.force_authenticate(self.fixture.member)
+        response = self.client.get(
+            factories.CustomerCreditFactory.get_url(self.fixture.customer_credit)
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_organization_wide_figures_are_hidden_from_project_roles(self):
+        self.client.force_authenticate(self.fixture.member)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        for field in ("customer_credit", "allocated_customer_credit", "offerings"):
+            self.assertNotIn(field, response.data)
+
+    @data("staff", "global_support", "owner")
+    def test_organization_wide_figures_are_visible_to_customer_roles(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        for field in ("customer_credit", "allocated_customer_credit", "offerings"):
+            self.assertIn(field, response.data)
+
+    def test_spendable_value_is_serialised_as_a_decimal_string(self):
+        # Same shape as `value` and `customer_credit`; the generated SDK types
+        # this field from the schema, so a number here would be a lie.
+        self.client.force_authenticate(self.fixture.member)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(response.data["spendable_value"], str)
+
+    def test_spendable_value_is_capped_by_organization_credit(self):
+        credit = self.fixture.project_credit
+        credit.value = 100
+        credit.save()
+        customer_credit = self.fixture.customer_credit
+        customer_credit.value = 30
+        customer_credit.save()
+
+        self.client.force_authenticate(self.fixture.member)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(response.data["spendable_value"]), Decimal(30))
+        self.assertTrue(response.data["is_limited_by_organization_credit"])
+
+    def test_spendable_value_equals_allocation_when_organization_credit_suffices(self):
+        credit = self.fixture.project_credit
+        credit.value = 20
+        credit.save()
+        customer_credit = self.fixture.customer_credit
+        customer_credit.value = 500
+        customer_credit.save()
+
+        self.client.force_authenticate(self.fixture.member)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(response.data["spendable_value"]), Decimal(20))
+        self.assertFalse(response.data["is_limited_by_organization_credit"])
+
 
 @ddt
-class ProjectCreditCreateTest(test.APITransactionTestCase):
+class ProjectCreditCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
         self.fixture.customer_credit
@@ -224,6 +311,11 @@ class ProjectCreditCreateTest(test.APITransactionTestCase):
     def test_user_with_access_can_create_credit(self, user):
         response = self.create_credit(user)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="create_of_project_credit_by_staff"
+            ).exists()
+        )
 
     @data("global_support", "manager", "admin", "user")
     def test_user_cannot_create_credit(self, user):
@@ -232,7 +324,7 @@ class ProjectCreditCreateTest(test.APITransactionTestCase):
 
 
 @ddt
-class ProjectCreditUpdateTest(test.APITransactionTestCase):
+class ProjectCreditUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
 
@@ -246,11 +338,23 @@ class ProjectCreditUpdateTest(test.APITransactionTestCase):
     def test_user_with_access_can_update_credit(self, user):
         response = self.update_credit(user)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="update_of_project_credit_by_staff"
+            ).exists()
+        )
 
-    @data("manager", "admin", "user")
+    @data("user")
     def test_user_cannot_update_credit(self, user):
         response = self.update_credit(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    # Project roles can read the credit, so an unauthorised write is a 403
+    # rather than a 404 — same shape as global_support below.
+    @data("manager", "admin", "member")
+    def test_project_role_cannot_update_credit(self, user):
+        response = self.update_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     @data(
         "global_support",
@@ -261,7 +365,7 @@ class ProjectCreditUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class ProjectCreditDeleteTest(test.APITransactionTestCase):
+class ProjectCreditDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
         self.project_credit = self.fixture.project_credit
@@ -277,10 +381,17 @@ class ProjectCreditDeleteTest(test.APITransactionTestCase):
         response = self.delete_credit(user)
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
 
-    @data("manager", "admin", "user")
+    @data("user")
     def test_user_cannot_delete_credit(self, user):
         response = self.delete_credit(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    # Project roles can read the credit, so an unauthorised delete is a 403
+    # rather than a 404 — same shape as global_support below.
+    @data("manager", "admin", "member")
+    def test_project_role_cannot_delete_credit(self, user):
+        response = self.delete_credit(user)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     @data(
         "global_support",
@@ -315,7 +426,7 @@ class ProjectCreditDeleteTest(test.APITransactionTestCase):
 
 @ddt
 @freeze_time("2024-01-01")
-class CustomerCreditTest(test.APITransactionTestCase):
+class CustomerCreditTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
         self.invoice = self.fixture.invoice
@@ -398,9 +509,235 @@ class CustomerCreditTest(test.APITransactionTestCase):
             ).exists()
         )
 
+    def test_task_set_to_zero_overdue_project_credits(self):
+        """Test that set_to_zero_overdue_credits also zeros expired project credits."""
+        customer_credit = factories.CustomerCreditFactory(
+            customer=self.invoice.customer, value=1000
+        )
+        project = structure_factories.ProjectFactory(customer=self.invoice.customer)
+        # Active project credit — should be untouched
+        pc_active = factories.ProjectCreditFactory(
+            project=project,
+            value=100,
+            end_date=datetime.date.today() + datetime.timedelta(days=31),
+        )
+        # Expired project credit — should be zeroed
+        project2 = structure_factories.ProjectFactory(customer=self.invoice.customer)
+        pc_expired = factories.ProjectCreditFactory(
+            project=project2,
+            value=500,
+            end_date=datetime.date.today() - datetime.timedelta(days=31),
+        )
+        # No end_date — should be untouched
+        project3 = structure_factories.ProjectFactory(customer=self.invoice.customer)
+        pc_no_end = factories.ProjectCreditFactory(
+            project=project3,
+            value=200,
+        )
+
+        old_customer_value = customer_credit.value
+        tasks.set_to_zero_overdue_credits()
+
+        pc_active.refresh_from_db()
+        pc_expired.refresh_from_db()
+        pc_no_end.refresh_from_db()
+        customer_credit.refresh_from_db()
+
+        self.assertEqual(pc_active.value, 100)
+        self.assertEqual(pc_expired.value, 0)
+        self.assertEqual(pc_no_end.value, 200)
+        # Customer credit should not be affected
+        self.assertEqual(customer_credit.value, old_customer_value)
+
+    def test_expired_project_credit_is_ledgered_as_forfeiture(self):
+        """A project allocation that expires unspent has to be visible as such.
+
+        The organization balance has recorded its own expiry since the ledger
+        existed; project allocations only started being recorded when the
+        handler was wired to ProjectCredit, and nothing pinned that they are.
+        The dashboard reads forfeiture as `minimal_draw` plus `expiry`, so an
+        unrecorded project expiry is credit that leaves the balance and appears
+        nowhere.
+        """
+        factories.CustomerCreditFactory(customer=self.invoice.customer, value=1000)
+        project = structure_factories.ProjectFactory(customer=self.invoice.customer)
+        credit = factories.ProjectCreditFactory(
+            project=project,
+            value=500,
+            end_date=datetime.date.today().replace(day=1) - datetime.timedelta(days=31),
+        )
+
+        tasks.set_to_zero_overdue_credits()
+
+        (row,) = credit.transactions.filter(
+            transaction_type=models.CreditTransaction.Types.EXPIRY
+        )
+        self.assertEqual(row.amount, -500)
+        self.assertEqual(row.project_uuid, project.uuid.hex)
+        self.assertEqual(row.project_name, project.name)
+        # Dated to the month the balance was forfeited in, so a per-month total
+        # of forfeited credit includes it rather than silently dropping it.
+        self.assertEqual(row.billing_period, datetime.date.today().replace(day=1))
+
+    def test_expired_organization_credit_is_dated_too(self):
+        credit = factories.CustomerCreditFactory(
+            value=700,
+            end_date=datetime.date.today().replace(day=1) - datetime.timedelta(days=31),
+        )
+
+        tasks.set_to_zero_overdue_credits()
+
+        (row,) = credit.transactions.filter(
+            transaction_type=models.CreditTransaction.Types.EXPIRY
+        )
+        self.assertEqual(row.amount, -700)
+        self.assertEqual(row.billing_period, datetime.date.today().replace(day=1))
+
+    def test_set_to_zero_continues_after_failing_customer_credit(self):
+        """One credit failing to save must not block zeroing of the rest."""
+        bad_credit = factories.CustomerCreditFactory(
+            end_date=datetime.date.today() - datetime.timedelta(days=31)
+        )
+        good_credit = factories.CustomerCreditFactory(
+            end_date=datetime.date.today() - datetime.timedelta(days=31)
+        )
+        project = structure_factories.ProjectFactory(customer=good_credit.customer)
+        project_credit = factories.ProjectCreditFactory(
+            project=project,
+            value=100,
+            end_date=datetime.date.today() - datetime.timedelta(days=31),
+        )
+
+        original_save = models.CustomerCredit.save
+
+        def failing_save(credit, *args, **kwargs):
+            if credit.pk == bad_credit.pk:
+                raise ValueError("Simulated save failure.")
+            return original_save(credit, *args, **kwargs)
+
+        with mock.patch.object(models.CustomerCredit, "save", failing_save):
+            tasks.set_to_zero_overdue_credits()
+
+        bad_credit.refresh_from_db()
+        good_credit.refresh_from_db()
+        project_credit.refresh_from_db()
+        self.assertTrue(bad_credit.value)
+        self.assertFalse(good_credit.value)
+        self.assertFalse(project_credit.value)
+
+    def test_set_to_zero_continues_after_failing_project_credit(self):
+        """One project credit failing to save must not block zeroing of the rest."""
+        customer = structure_factories.CustomerFactory()
+        factories.CustomerCreditFactory(customer=customer, value=1000)
+        bad_project_credit = factories.ProjectCreditFactory(
+            project=structure_factories.ProjectFactory(customer=customer),
+            value=100,
+            end_date=datetime.date.today() - datetime.timedelta(days=31),
+        )
+        good_project_credit = factories.ProjectCreditFactory(
+            project=structure_factories.ProjectFactory(customer=customer),
+            value=200,
+            end_date=datetime.date.today() - datetime.timedelta(days=31),
+        )
+
+        original_save = models.ProjectCredit.save
+
+        def failing_save(credit, *args, **kwargs):
+            if credit.pk == bad_project_credit.pk:
+                raise ValueError("Simulated save failure.")
+            return original_save(credit, *args, **kwargs)
+
+        with mock.patch.object(models.ProjectCredit, "save", failing_save):
+            tasks.set_to_zero_overdue_credits()
+
+        bad_project_credit.refresh_from_db()
+        good_project_credit.refresh_from_db()
+        self.assertTrue(bad_project_credit.value)
+        self.assertFalse(good_project_credit.value)
+
+    def test_set_to_zero_includes_system_robot_in_event_context(self):
+        """Events from set_to_zero_overdue_credits should have system robot user context."""
+        factories.CustomerCreditFactory(
+            end_date=datetime.date.today() - datetime.timedelta(days=31)
+        )
+        tasks.set_to_zero_overdue_credits()
+        event = logging_models.Event.objects.filter(
+            event_type="set_to_zero_overdue_credit"
+        ).first()
+        self.assertIsNotNone(event)
+        self.assertIn("user_uuid", event.context)
+        self.assertEqual(event.context["user_full_name"], "System Robot")
+
+    def test_compensation_does_not_produce_update_of_credit_by_staff_event(self):
+        """When compensation reduces credit, only REDUCTION events should fire,
+        not the misleading update_of_credit_by_staff event."""
+        credit = factories.CustomerCreditFactory(
+            customer=self.invoice.customer,
+            value=self.invoice.total * 2,
+        )
+        tasks.process_invoice_credits(self.invoice)
+        credit.refresh_from_db()
+        # REDUCTION event should exist
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="reduction_of_customer_credit"
+            ).exists()
+        )
+        # update_of_credit_by_staff should NOT exist (it's a side effect of credit.save())
+        self.assertFalse(
+            logging_models.Event.objects.filter(
+                event_type="update_of_credit_by_staff"
+            ).exists()
+        )
+
+    def test_compensation_does_not_produce_update_of_project_credit_by_staff_event(
+        self,
+    ):
+        """When compensation reduces project credit, only REDUCTION events should fire,
+        not the misleading update_of_project_credit_by_staff event."""
+        project = structure_factories.ProjectFactory(customer=self.invoice.customer)
+        self.invoice_item.project = project
+        self.invoice_item.save()
+        factories.CustomerCreditFactory(
+            customer=self.invoice.customer,
+            value=self.invoice.total * 2,
+        )
+        factories.ProjectCreditFactory(
+            project=project,
+            value=self.invoice.total * 2,
+        )
+        tasks.process_invoice_credits(self.invoice)
+        # REDUCTION event should exist
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="reduction_of_project_credit"
+            ).exists()
+        )
+        # update_of_project_credit_by_staff should NOT exist
+        self.assertFalse(
+            logging_models.Event.objects.filter(
+                event_type="update_of_project_credit_by_staff"
+            ).exists()
+        )
+
+    def test_api_update_still_produces_update_of_credit_by_staff_event(self):
+        """When staff updates credit via API, update_of_credit_by_staff should fire."""
+        credit = factories.CustomerCreditFactory(
+            customer=self.fixture.customer, value=1000
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.CustomerCreditFactory.get_url(credit)
+        response = self.client.patch(url, {"value": 500})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="update_of_credit_by_staff"
+            ).exists()
+        )
+
 
 @freeze_time("2024-01-01")
-class ProjectCreditTest(test.APITransactionTestCase):
+class ProjectCreditTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
         self.customer_credit = self.fixture.customer_credit
@@ -456,6 +793,107 @@ class ProjectCreditTest(test.APITransactionTestCase):
         )
 
 
+@freeze_time("2024-01-01")
+class PriceEstimateAfterCompensationTest(test.APITestCase):
+    """PriceEstimate.total sums every invoice item for the month, compensations
+    included, so it is a cost net of credit. It is maintained by a post_save
+    handler that bulk_create does not fire — and no post_delete handler is
+    connected at all — so the compensation flow has to refresh it itself.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+        self.customer_credit = self.fixture.customer_credit
+        self.invoice = self.fixture.invoice
+        self.invoice_item = self.fixture.invoice_item
+        self.project = self.fixture.project
+
+    def get_estimate(self, scope):
+        return billing_models.PriceEstimate.objects.get(
+            content_type=ContentType.objects.get_for_model(scope), object_id=scope.id
+        )
+
+    def get_net_cost(self, scope_filter):
+        return sum(
+            item.unit_price * item.quantity
+            for item in models.InvoiceItem.objects.filter(**scope_filter)
+        )
+
+    def test_project_estimate_matches_cost_after_credit_is_applied(self):
+        gross = self.get_estimate(self.project).total
+        self.assertEqual(
+            gross, self.invoice_item.unit_price * self.invoice_item.quantity
+        )
+
+        compensations.MonthlyCompensation(self.fixture.customer).apply_compensations()
+
+        net = self.get_net_cost({"project": self.project})
+        self.assertLess(net, gross)
+        self.assertEqual(self.get_estimate(self.project).total, net)
+
+    def test_customer_estimate_matches_cost_after_credit_is_applied(self):
+        compensations.MonthlyCompensation(self.fixture.customer).apply_compensations()
+
+        net = self.get_net_cost({"invoice__customer": self.fixture.customer})
+        self.assertEqual(self.get_estimate(self.fixture.customer).total, net)
+
+    def test_only_projects_with_compensation_items_are_recomputed(self):
+        # A project with no invoice items cannot be compensated, so recomputing
+        # its estimate would be pure cost — one aggregate per project adds up
+        # for a customer with many of them.
+        untouched = structure_factories.ProjectFactory(customer=self.fixture.customer)
+
+        with mock.patch(
+            "waldur_mastermind.billing.handlers.update_estimates_for_scopes"
+        ) as mocked:
+            compensations.MonthlyCompensation(
+                self.fixture.customer
+            ).apply_compensations()
+
+        refreshed = {scope for call in mocked.call_args_list for scope in call[0][0]}
+        self.assertIn(self.project, refreshed)
+        self.assertIn(self.fixture.customer, refreshed)
+        self.assertNotIn(untouched, refreshed)
+
+    def test_estimate_returns_to_gross_when_compensations_are_cleared(self):
+        gross = self.get_estimate(self.project).total
+        monthly = compensations.MonthlyCompensation(self.fixture.customer)
+        monthly.apply_compensations()
+        self.assertLess(self.get_estimate(self.project).total, gross)
+
+        compensations.MonthlyCompensation(self.fixture.customer).clear_compensations()
+        self.assertEqual(self.get_estimate(self.project).total, gross)
+
+
+@ddt
+class CompensationActionTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+        self.fixture.invoice_item
+        self.url = factories.CustomerCreditFactory.get_url(
+            self.fixture.customer_credit, action="apply_compensations"
+        )
+        self.clear_url = factories.CustomerCreditFactory.get_url(
+            self.fixture.customer_credit, action="clear_compensations"
+        )
+
+    def test_apply_compensations_returns_ok(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_clear_compensations_returns_ok(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.clear_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @data("owner", "manager", "admin", "user")
+    def test_non_staff_cannot_apply_compensations(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(self.url)
+        self.assertNotEqual(response.status_code, status.HTTP_200_OK)
+
+
 @dataclass
 class CompensationTestResult:
     """Holds the state of credits before and after compensation"""
@@ -472,7 +910,47 @@ class CompensationTestResult:
         return max(self.consumption, self.expected_consumption)
 
 
-class ProcessingCreditTest(test.APITransactionTestCase):
+class DiscountCompensationTest(test.APITestCase):
+    """Credit compensation must draw on the cost net of a paired volume
+    discount, not the gross price — otherwise credit is over-consumed and the
+    invoice can go negative."""
+
+    def setUp(self):
+        self.fixture = fixtures.InvoiceFixture()
+        self.invoice = self.fixture.invoice
+        self.main_item = self.fixture.invoice_item  # price = 10 * 30 = 300
+        self.credit = factories.CustomerCreditFactory(
+            customer=self.fixture.customer, value=Decimal("1000")
+        )
+        # A 20% volume discount paired with the main item: -60.
+        factories.InvoiceItemFactory(
+            name="OFFERING-001 / Volume discount (20%)",
+            resource=self.fixture.resource,
+            project=self.fixture.project,
+            invoice=self.invoice,
+            unit_price=Decimal("-60"),
+            quantity=1,
+            details={
+                "is_discount": True,
+                "discount_of_item": self.main_item.uuid.hex,
+            },
+        )
+
+    def test_credit_is_drawn_net_of_the_volume_discount(self):
+        compensations.MonthlyCompensation(
+            self.fixture.customer, invoice=self.invoice
+        ).apply_compensations()
+
+        self.credit.refresh_from_db()
+        # Net cost is 300 - 60 = 240, so only 240 (not the gross 300) is drawn.
+        self.assertEqual(self.credit.value, Decimal("760"))
+        # The compensation offsets the net, so the invoice does not go negative.
+        self.assertEqual(
+            models.Invoice.objects.get(pk=self.invoice.pk).price, Decimal("0")
+        )
+
+
+class ProcessingCreditTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
         self.customer_credit = self.fixture.customer_credit
@@ -597,9 +1075,224 @@ class ProcessingCreditTest(test.APITransactionTestCase):
             "Minimal consumption should be greater than actual consumption",
         )
 
+    @freeze_time("2026-03-01")
+    def test_linear_expected_consumption_is_set_for_project_credit(self):
+        """Test that project credits with LINEAR logic get expected_consumption updated.
+
+        Reproduces HPCMP-451: when expected_consumption starts at 0,
+        minimal_consumption is also 0, so the credit never enters _project_tails
+        and update_linear_expected_consumption() skips it.
+        """
+        # Set large credit values so project credit isn't fully consumed
+        self.customer_credit.value = 1000
+        self.customer_credit.save()
+
+        self.project_credit.value = 500
+        self.project_credit.minimal_consumption_logic = (
+            models.ProjectCredit.MinimalConsumptionLogic.LINEAR
+        )
+        self.project_credit.end_date = datetime.date(2026, 7, 1)
+        self.project_credit.expected_consumption = 0
+        self.project_credit.save()
+
+        tasks.process_invoice_credits(self.invoice)
+        self.project_credit.refresh_from_db()
+
+        self.assertGreater(self.project_credit.expected_consumption, 0)
+
+    @freeze_time("2026-03-01")
+    def test_linear_expected_consumption_near_end_date(self):
+        """Test that a project credit near its end_date gets expected_consumption
+        close to remaining value.
+
+        Simulates production scenario: credit with LINEAR logic has had
+        expected_consumption=0 for months due to HPCMP-451 bug, and is now
+        close to expiry. The first fix-up should set expected_consumption
+        to approximately the remaining credit value.
+        """
+        self.customer_credit.value = 1000
+        self.customer_credit.save()
+
+        # Credit expires next month — time_left_factor = 31/31 = 1.0
+        self.project_credit.value = 500
+        self.project_credit.minimal_consumption_logic = (
+            models.ProjectCredit.MinimalConsumptionLogic.LINEAR
+        )
+        self.project_credit.end_date = datetime.date(2026, 4, 1)
+        self.project_credit.expected_consumption = 0
+        self.project_credit.save()
+
+        tasks.process_invoice_credits(self.invoice)
+        self.project_credit.refresh_from_db()
+
+        # Invoice item costs 300 (10 * 30 days), leaving 200 in project credit.
+        # With time_left_factor=1.0, expected_consumption = remaining_value = 200.
+        self.assertEqual(
+            self.project_credit.expected_consumption,
+            Decimal("200.00000"),
+        )
+
+    @freeze_time("2026-03-01")
+    def test_linear_expected_consumption_skips_expired_credits(self):
+        """Test that update_linear_expected_consumption skips project credits
+        whose end_date has already passed."""
+        self.customer_credit.value = 1000
+        self.customer_credit.save()
+
+        self.project_credit.value = 500
+        self.project_credit.minimal_consumption_logic = (
+            models.ProjectCredit.MinimalConsumptionLogic.LINEAR
+        )
+        # end_date in the past
+        self.project_credit.end_date = datetime.date(2026, 2, 1)
+        self.project_credit.expected_consumption = 0
+        self.project_credit.save()
+
+        tasks.process_invoice_credits(self.invoice)
+        self.project_credit.refresh_from_db()
+
+        # Expired credit should not get expected_consumption updated
+        self.assertEqual(self.project_credit.expected_consumption, 0)
+
+
+class ExpiredProjectCreditProductionBugTest(test.APITestCase):
+    """Reproduces the production bug where expired project credits keep
+    being used for compensations.
+
+    Production timeline (project a115, SwissAI Initiative):
+    - Project credit created 2025-06-24, end_date=2026-01-01, value≈35k
+    - Monthly compensations deducted normally (Aug-Dec 2025)
+    - Credit should have stopped being used after 2026-01-01
+    - BUG: compensations continued in Jan, Feb 2026
+    - Root cause: set_to_zero_overdue_credits only zeroed CustomerCredits,
+      not ProjectCredits
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+        self.customer_credit = self.fixture.customer_credit
+        self.project_credit = self.fixture.project_credit
+        self.invoice = self.fixture.invoice
+        self.invoice_item = self.fixture.invoice_item
+
+    def _simulate_month_end_old_code(self, effective_date):
+        """Simulates month-end processing as it was BEFORE the fix:
+        set_to_zero_overdue_credits only zeros CustomerCredits."""
+        # Old code: only CustomerCredit zeroing
+        for credit in models.CustomerCredit.objects.filter(
+            end_date__lt=effective_date
+        ).exclude(value=0):
+            credit.value = 0
+            credit.save()
+        # NOTE: ProjectCredit zeroing was MISSING
+        tasks.process_invoice_credits(self.invoice)
+
+    def _simulate_month_end_new_code(self, effective_date):
+        """Simulates month-end processing WITH the fix:
+        set_to_zero_overdue_credits zeros both Customer and ProjectCredits."""
+        tasks.set_to_zero_overdue_credits(effective_date)
+        tasks.process_invoice_credits(self.invoice)
+
+    @freeze_time("2026-02-01")
+    def test_old_code_bug_expired_credit_still_used(self):
+        """Reproduces the bug: with old code, expired project credit
+        continues to be used for compensations."""
+        # Setup: large credits, item cost = 300 (10 * 30)
+        self.customer_credit.value = 100000
+        self.customer_credit.save()
+
+        self.project_credit.value = 50000
+        self.project_credit.end_date = datetime.date(2026, 1, 1)  # Already expired
+        self.project_credit.save()
+
+        # Simulate month-end with OLD code (no ProjectCredit zeroing)
+        self._simulate_month_end_old_code(datetime.date(2026, 2, 1))
+
+        self.project_credit.refresh_from_db()
+        self.customer_credit.refresh_from_db()
+
+        # BUG: expired project credit was still used (value reduced from 50000)
+        self.assertLess(
+            self.project_credit.value,
+            50000,
+            "Bug reproduced: expired project credit was used for compensation",
+        )
+        self.assertGreater(
+            self.project_credit.value,
+            0,
+            "Bug reproduced: expired credit still has remaining value",
+        )
+        # Customer credit was also reduced (both deducted in tandem)
+        self.assertLess(self.customer_credit.value, 100000)
+
+    @freeze_time("2026-02-01")
+    def test_new_code_fix_expired_credit_zeroed(self):
+        """After upgrade: expired project credit is zeroed and stays at zero."""
+        self.customer_credit.value = 100000
+        self.customer_credit.save()
+
+        self.project_credit.value = 50000
+        self.project_credit.end_date = datetime.date(2026, 1, 1)  # Already expired
+        self.project_credit.save()
+
+        # Simulate month-end with NEW code (ProjectCredit zeroing included)
+        self._simulate_month_end_new_code(datetime.date(2026, 2, 1))
+
+        self.project_credit.refresh_from_db()
+        self.customer_credit.refresh_from_db()
+
+        # Project credit must be zero — expired and zeroed
+        self.assertEqual(
+            self.project_credit.value,
+            0,
+            "Expired project credit should be zeroed after upgrade",
+        )
+        # Customer credit unchanged — zeroed project credit blocks fallback
+        self.assertEqual(
+            self.customer_credit.value,
+            100000,
+            "Customer credit should not be used when project credit exists (even zeroed)",
+        )
+
+    @freeze_time("2026-02-01")
+    def test_old_code_then_upgrade(self):
+        """Simulates upgrade scenario: credit was used under old code
+        (no ProjectCredit zeroing), then the new code runs.
+
+        After upgrade, set_to_zero_overdue_credits must zero the credit
+        that was never zeroed by the old code.
+        """
+        # Item cost = 10 * 30 = 300
+        self.customer_credit.value = 100000
+        self.customer_credit.save()
+
+        self.project_credit.value = 50000
+        self.project_credit.end_date = datetime.date(2026, 1, 1)  # Expired
+        self.project_credit.save()
+
+        # Step 1: Old code processed previous invoice — expired credit was
+        # used because old set_to_zero didn't handle ProjectCredits.
+        # Simulate this by just processing the invoice without zeroing.
+        tasks.process_invoice_credits(self.invoice)
+
+        self.project_credit.refresh_from_db()
+        # Old code: credit was used (300 deducted) despite being expired
+        self.assertEqual(self.project_credit.value, Decimal("49700"))
+
+        # Step 2: Upgrade deployed. Next month-end runs NEW code.
+        # set_to_zero_overdue_credits now zeros ProjectCredits.
+        tasks.set_to_zero_overdue_credits(datetime.date(2026, 2, 1))
+
+        self.project_credit.refresh_from_db()
+        self.assertEqual(
+            self.project_credit.value,
+            0,
+            "After upgrade: expired project credit is finally zeroed",
+        )
+
 
 @freeze_time("2025-08-01")
-class CalculateMinimalConsumptionTest(test.APITransactionTestCase):
+class CalculateMinimalConsumptionTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
         self.customer_credit = self.fixture.customer_credit
@@ -648,7 +1341,7 @@ class CalculateMinimalConsumptionTest(test.APITransactionTestCase):
 
 
 @ddt
-class CustomerCreditHistoricalValuesTest(test.APITransactionTestCase):
+class CustomerCreditHistoricalValuesTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CreditFixture()
         self.url = factories.CustomerCreditFactory.get_url(
@@ -693,7 +1386,7 @@ class CustomerCreditHistoricalValuesTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
-class CompensationQueryOptimizationTest(test.APITransactionTestCase):
+class CompensationQueryOptimizationTest(test.APITestCase):
     """Test to validate N+1 query optimization in compensation calculations"""
 
     def setUp(self):
@@ -819,3 +1512,279 @@ class CompensationQueryOptimizationTest(test.APITransactionTestCase):
                 len(actual_compensations) > 0,
                 "No compensations were generated when no credit offerings specified",
             )
+
+
+@freeze_time("2024-03-01")
+class ConcurrentCreditDeductionTest(TransactionTestCase):
+    """WAL-9806: Verify that concurrent invoice credit processing does not lose updates.
+
+    Without proper locking, two concurrent process_invoice_credits() calls for the
+    same customer can both read the same credit value, each deduct their amount,
+    and the last save wins — losing one deduction entirely.
+    """
+
+    def test_concurrent_credit_deduction_preserves_both(self):
+        """Two concurrent compensations must both deduct from the same credit."""
+        customer = structure_factories.CustomerFactory()
+        credit = factories.CustomerCreditFactory(
+            customer=customer, value=Decimal("100.00")
+        )
+
+        project = structure_factories.ProjectFactory(customer=customer)
+
+        offering = marketplace_factories.OfferingFactory(customer=customer)
+        resource1 = marketplace_factories.ResourceFactory(
+            project=project, offering=offering
+        )
+        resource2 = marketplace_factories.ResourceFactory(
+            project=project, offering=offering
+        )
+
+        invoice1 = factories.InvoiceFactory(customer=customer, month=3, year=2024)
+        factories.InvoiceItemFactory(
+            invoice=invoice1,
+            resource=resource1,
+            project=project,
+            unit_price=Decimal("40.00"),
+            quantity=1,
+        )
+
+        invoice2 = factories.InvoiceFactory(customer=customer, month=2, year=2024)
+        factories.InvoiceItemFactory(
+            invoice=invoice2,
+            resource=resource2,
+            project=project,
+            unit_price=Decimal("30.00"),
+            quantity=1,
+        )
+
+        barrier = threading.Barrier(2, timeout=10)
+        errors = []
+
+        def process_with_barrier(invoice):
+            try:
+                barrier.wait()
+                tasks.process_invoice_credits(invoice)
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=process_with_barrier, args=(invoice1,))
+        t2 = threading.Thread(target=process_with_barrier, args=(invoice2,))
+        t1.start()
+        t2.start()
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+
+        self.assertEqual(errors, [], f"Threads raised errors: {errors}")
+
+        credit.refresh_from_db()
+        # Expected: 100 - 40 - 30 = 30
+        # Without locking: 60 or 70 (one deduction lost)
+        self.assertEqual(
+            credit.value,
+            Decimal("30.00"),
+            f"Credit should be 30 (100 - 40 - 30), got {credit.value}. "
+            "Lost update indicates missing database locking.",
+        )
+
+
+class SetToZeroOverdueCreditsGuardTest(test.APITestCase):
+    """set_to_zero_overdue_credits must refuse a future effective_date.
+
+    Regression: a manual run with an effective_date in the future zeroed out
+    project credits whose end_date had not actually arrived yet.
+    """
+
+    def test_future_effective_date_is_rejected(self):
+        with freeze_time("2026-03-17"):
+            future = datetime.date(2026, 12, 1)
+            project = structure_factories.ProjectFactory()
+            credit = factories.CustomerCreditFactory(
+                customer=project.customer,
+                value=1000,
+                end_date=datetime.date(2026, 7, 1),
+            )
+            pc = factories.ProjectCreditFactory(
+                project=project,
+                value=200,
+                end_date=datetime.date(2026, 7, 1),
+            )
+            with self.assertRaises(ValueError):
+                tasks.set_to_zero_overdue_credits(effective_date=future)
+            credit.refresh_from_db()
+            pc.refresh_from_db()
+            # Nothing should have been touched.
+            self.assertEqual(credit.value, 1000)
+            self.assertEqual(pc.value, 200)
+            self.assertFalse(
+                logging_models.Event.objects.filter(
+                    event_type="set_to_zero_overdue_credit"
+                ).exists()
+            )
+
+    def test_today_effective_date_is_accepted(self):
+        with freeze_time("2026-03-17"):
+            today = datetime.date(2026, 3, 17)
+            expired = factories.CustomerCreditFactory(
+                value=100, end_date=datetime.date(2026, 3, 1)
+            )
+            tasks.set_to_zero_overdue_credits(effective_date=today)
+            expired.refresh_from_db()
+            self.assertEqual(expired.value, 0)
+
+
+class CreditAuditOnSilentSavesTest(test.APITestCase):
+    """Manual saves with update_fields=['value'] must still be audited.
+
+    Regression: log_project_credit/log_credit used to short-circuit on any
+    update_fields, which let any caller (integration script, shell, third-party
+    subsystem) silently mutate credit value with no audit trail, causing
+    material credit-value drift in production. Now, only callers inside
+    skip_credit_audit() are exempted.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+
+    def test_manual_value_save_with_update_fields_emits_audit(self):
+        pc = self.fixture.project_credit
+        pc.value = Decimal("75.00")  # well below the customer-credit cap of 100
+        pc.save(update_fields=["value"])
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                event_type="update_of_project_credit_by_staff"
+            ).exists()
+        )
+
+    def test_save_with_unrelated_update_fields_does_not_emit(self):
+        # Saving a non-value field (e.g. only end_date) must NOT produce
+        # a value-mutation audit event.
+        pc = self.fixture.project_credit
+        pc.end_date = datetime.date(2026, 7, 1)
+        pc.save(update_fields=["end_date"])
+        self.assertFalse(
+            logging_models.Event.objects.filter(
+                event_type="update_of_project_credit_by_staff"
+            ).exists()
+        )
+
+    def test_skip_credit_audit_suppresses_event(self):
+        pc = self.fixture.project_credit
+        with skip_credit_audit():
+            pc.value = Decimal("80.00")
+            pc.save(update_fields=["value"])
+        self.assertFalse(
+            logging_models.Event.objects.filter(
+                event_type="update_of_project_credit_by_staff"
+            ).exists()
+        )
+
+
+class CreditEndDateValidationScopeTest(test.APITestCase):
+    """The end_date day=1 validator must only fire when end_date is written.
+
+    Legacy rows created before WAL-8788 may have an end_date that is not the
+    first of the month. Unrelated partial saves (e.g. update_fields=['value']
+    from set_to_zero_overdue_credits) must not raise on those rows.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+
+    def _set_legacy_end_date(self, credit, end_date):
+        type(credit).objects.filter(pk=credit.pk).update(end_date=end_date)
+        credit.refresh_from_db()
+
+    def test_partial_save_without_end_date_skips_validation(self):
+        pc = self.fixture.project_credit
+        self._set_legacy_end_date(pc, datetime.date(2025, 9, 15))
+        pc.value = Decimal("10.00")
+        pc.save(update_fields=["value"])
+        pc.refresh_from_db()
+        self.assertEqual(pc.value, Decimal("10.00"))
+        self.assertEqual(pc.end_date, datetime.date(2025, 9, 15))
+
+    def test_save_touching_end_date_still_validates(self):
+        from rest_framework import exceptions as rf_exceptions
+
+        pc = self.fixture.project_credit
+        pc.end_date = datetime.date(2025, 9, 15)
+        with self.assertRaises(rf_exceptions.ValidationError):
+            pc.save(update_fields=["end_date"])
+
+    def test_set_to_zero_overdue_credits_handles_legacy_end_date(self):
+        with freeze_time("2026-03-17"):
+            cc = factories.CustomerCreditFactory(value=500)
+            self._set_legacy_end_date(cc, datetime.date(2025, 9, 15))
+            tasks.set_to_zero_overdue_credits()
+            cc.refresh_from_db()
+            self.assertEqual(cc.value, 0)
+
+
+class CompensationProjectAttributionTest(test.APITestCase):
+    """Compensation items are written with bulk_create, which does not fire the
+    post_save handler that denormalises project_name/project_uuid. The
+    project-scoped costs endpoint filters on project_uuid, so without those
+    columns a project's credit consumption reads as zero.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.CreditFixture()
+        self.customer_credit = self.fixture.customer_credit
+        self.project_credit = self.fixture.project_credit
+        self.invoice = self.fixture.invoice
+        self.invoice_item = self.fixture.invoice_item
+        self.project = self.fixture.project
+
+        compensations.MonthlyCompensation(
+            self.fixture.customer, invoice=self.invoice
+        ).apply_compensations()
+
+        self.compensation = models.InvoiceItem.objects.get(
+            invoice=self.invoice, credit=self.customer_credit
+        )
+
+    def test_compensation_item_carries_denormalised_project(self):
+        self.assertEqual(self.compensation.project_uuid, self.project.uuid.hex)
+        self.assertEqual(self.compensation.project_name, self.project.name)
+
+    def test_costs_endpoint_reports_the_compensation(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            factories.InvoiceItemFactory.get_list_url("costs"),
+            {"project_uuid": self.project.uuid.hex},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        current = [
+            row
+            for row in response.data
+            if row["year"] == self.invoice.year and row["month"] == self.invoice.month
+        ]
+        self.assertTrue(current, "no costs row for the compensated period")
+        self.assertLess(
+            Decimal(current[0]["compensation"]),
+            Decimal("0"),
+            "compensation is missing from the project-scoped costs endpoint",
+        )
+
+    def test_costs_endpoint_exposes_the_gross_and_net_figures(self):
+        """price nets compensation off incurred, so clients need all three to
+        tell "nothing was spent" apart from "credit covered the spend"."""
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            factories.InvoiceItemFactory.get_list_url("costs"),
+            {"project_uuid": self.project.uuid.hex},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        row = next(
+            row
+            for row in response.data
+            if row["year"] == self.invoice.year and row["month"] == self.invoice.month
+        )
+        for field in ("price", "incurred", "compensation"):
+            self.assertIn(field, row)
+        self.assertGreater(Decimal(row["incurred"]), Decimal("0"))
+        self.assertEqual(
+            Decimal(row["price"]),
+            Decimal(row["incurred"]) + Decimal(row["compensation"]),
+        )

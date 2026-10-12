@@ -7,6 +7,13 @@ from waldur_mastermind.marketplace.tests import factories as marketplace_factori
 
 from .. import models
 
+# Re-export commonly used factories for convenience
+OfferingFactory = marketplace_factories.OfferingFactory
+CustomerFactory = structure_factories.CustomerFactory
+ProjectFactory = structure_factories.ProjectFactory
+ResourceFactory = marketplace_factories.ResourceFactory
+OfferingComponentFactory = marketplace_factories.OfferingComponentFactory
+
 
 class ProjectEstimatedCostPolicyFactory(
     factory.django.DjangoModelFactory,
@@ -76,6 +83,7 @@ class OfferingEstimatedCostPolicyFactory(
     scope = factory.SubFactory(marketplace_factories.OfferingFactory)
     limit_cost = 10
     actions = "notify_organization_owners,block_creation_of_new_resources"
+    apply_to_all = True  # Simpler default for most tests
 
     @classmethod
     def get_list_url(cls, action=None):
@@ -104,6 +112,9 @@ class OfferingUsagePolicyFactory(
 
     scope = factory.SubFactory(marketplace_factories.OfferingFactory)
     actions = "notify_organization_owners,block_creation_of_new_resources"
+    apply_to_all = (
+        False  # Use organization_groups for compatibility with existing tests
+    )
 
     @classmethod
     def get_list_url(cls, action=None):
@@ -156,6 +167,42 @@ class CustomerComponentUsagePolicyFactory(
             policy = CustomerComponentUsagePolicyFactory()
         url = "http://testserver" + reverse(
             "marketplace-customer-component-usage-policy-detail",
+            kwargs={"uuid": policy.uuid.hex},
+        )
+        return url if action is None else url + action + "/"
+
+
+class SlurmPeriodicUsagePolicyFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.SlurmPeriodicUsagePolicy],
+):
+    class Meta:
+        model = models.SlurmPeriodicUsagePolicy
+
+    scope = factory.SubFactory(marketplace_factories.OfferingFactory)
+    actions = "notify_organization_owners"
+    apply_to_all = True
+    limit_type = "GrpTRESMins"
+    tres_billing_enabled = True
+    grace_ratio = 0.2
+    carryover_enabled = True
+    carryover_factor = 50
+    raw_usage_reset = True
+    qos_strategy = "threshold"
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = "http://testserver" + reverse(
+            "marketplace-slurm-periodic-usage-policy-list"
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_url(cls, policy=None, action=None):
+        if policy is None:
+            policy = SlurmPeriodicUsagePolicyFactory()
+        url = "http://testserver" + reverse(
+            "marketplace-slurm-periodic-usage-policy-detail",
             kwargs={"uuid": policy.uuid.hex},
         )
         return url if action is None else url + action + "/"

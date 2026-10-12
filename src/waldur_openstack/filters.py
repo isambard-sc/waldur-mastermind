@@ -1,9 +1,14 @@
+from typing import cast
+
 import django_filters
 from django.db.models import Q
 from django_filters.widgets import BooleanWidget
 
 from waldur_core.core import filters as core_filters
+from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import CoreStates
 from waldur_core.structure import filters as structure_filters
+from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace.models import Offering
 from waldur_openstack.utils import get_valid_availability_zones
 
@@ -11,18 +16,32 @@ from . import models
 
 
 class TenantFilterSet(django_filters.FilterSet):
-    tenant_uuid = django_filters.UUIDFilter(field_name="tenant__uuid")
+    tenant_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-tenant-detail",
+        field_name="tenant__uuid",
+        label="Tenant UUID",
+    )
     tenant = core_filters.URLFilter(
-        view_name="openstack-tenant-detail", field_name="tenant__uuid"
+        view_name="openstack-tenant-detail",
+        field_name="tenant__uuid",
+        label="Tenant URL",
     )
 
 
 class SharedTenantFilterSet(django_filters.FilterSet):
-    tenant_uuid = django_filters.UUIDFilter(method="filter_tenant")
-    tenant = core_filters.URLFilter(
-        view_name="openstack-tenant-detail", method="filter_tenant"
+    tenant_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-tenant-detail", method="filter_tenant", label="Tenant UUID"
     )
-    offering_uuid = django_filters.UUIDFilter(method="filter_offering")
+    tenant = core_filters.URLFilter(
+        view_name="openstack-tenant-detail",
+        method="filter_tenant",
+        label="Tenant URL",
+    )
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        method="filter_offering",
+        label="Offering UUID",
+    )
 
     def filter_tenant(self, queryset, name, value):
         try:
@@ -32,15 +51,31 @@ class SharedTenantFilterSet(django_filters.FilterSet):
         return queryset.filter(tenants=tenant)
 
     def filter_offering(self, queryset, name, value):
+        """Narrow service properties to those an offering can use.
+
+        An offering's scope is a generic relation, and OpenStack uses two kinds.
+        The tenant-provisioning offering is scoped to the service settings,
+        while the per-tenant instance and volume offerings that Waldur creates
+        alongside a tenant are scoped to that tenant. Assuming settings meant a
+        tenant-scoped offering reached a Tenant queryset with a Tenant instance,
+        which Django rejects outright — the request failed with a 500 rather
+        than an empty or filtered result.
+        """
         try:
             offering = Offering.objects.get(uuid=value)
         except Offering.DoesNotExist:
             return queryset.none()
-        if not offering.scope:
-            return queryset.none()
 
-        tenants = models.Tenant.objects.filter(service_settings=offering.scope)
-        return queryset.filter(tenants__in=tenants).distinct()
+        scope = offering.scope
+        if isinstance(scope, models.Tenant):
+            return queryset.filter(tenants=scope).distinct()
+        if isinstance(scope, structure_models.ServiceSettings):
+            tenants = models.Tenant.objects.filter(service_settings=scope)
+            if tenants.exists():
+                return queryset.filter(tenants__in=tenants).distinct()
+            # Fall back to service settings level when no tenants exist yet
+            return queryset.filter(settings=scope)
+        return queryset.none()
 
 
 class SecurityGroupFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
@@ -65,7 +100,7 @@ class ServerGroupFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
 
 class FloatingIPFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
     free = django_filters.BooleanFilter(
-        field_name="port", lookup_expr="isnull", widget=BooleanWidget
+        field_name="port", lookup_expr="isnull", widget=BooleanWidget, label="Is free"
     )
 
     class Meta(structure_filters.BaseResourceFilter.Meta):
@@ -79,8 +114,10 @@ class FloatingIPFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
 class FlavorFilter(
     SharedTenantFilterSet, structure_filters.ServicePropertySettingsFilter
 ):
-    o = django_filters.OrderingFilter(fields=("cores", "ram", "disk"))
-    name_iregex = django_filters.CharFilter(field_name="name", lookup_expr="iregex")
+    o = django_filters.OrderingFilter(fields=("cores", "ram", "disk"), label="Ordering")
+    name_iregex = django_filters.CharFilter(
+        field_name="name", lookup_expr="iregex", label="Name (regex)"
+    )
 
     class Meta(structure_filters.ServicePropertySettingsFilter.Meta):
         model = models.Flavor
@@ -100,8 +137,31 @@ class FlavorFilter(
 class ImageFilter(
     SharedTenantFilterSet, structure_filters.ServicePropertySettingsFilter
 ):
+    show_duplicate_names = django_filters.BooleanFilter(
+        method="filter_show_duplicate_names",
+        label="Show duplicate image names",
+        widget=BooleanWidget,
+    )
+    is_rescue_image = django_filters.BooleanFilter(
+        method="filter_is_rescue_image",
+        label="Filter to images usable as Nova rescue images.",
+        widget=BooleanWidget,
+    )
+
     class Meta(structure_filters.ServicePropertySettingsFilter.Meta):
         model = models.Image
+
+    def filter_show_duplicate_names(self, queryset, name, value):
+        if value:
+            return queryset.model.all_objects.all()  # type: ignore[attr-defined]
+        return queryset
+
+    def filter_is_rescue_image(self, queryset, name, value):
+        if value is None:
+            return queryset
+        # Either property is sufficient to mark an image as a rescue image.
+        rescue_q = ~Q(hw_rescue_device="") | ~Q(hw_rescue_bus="")
+        return queryset.filter(rescue_q) if value else queryset.exclude(rescue_q)
 
 
 class VolumeTypeFilter(
@@ -111,14 +171,190 @@ class VolumeTypeFilter(
         model = models.VolumeType
 
 
+class ExternalNetworkFilter(structure_filters.ServicePropertySettingsFilter):
+    class Meta(structure_filters.ServicePropertySettingsFilter.Meta):
+        model = models.ExternalNetwork
+
+
+class HypervisorFilter(structure_filters.ServicePropertySettingsFilter):
+    trait = django_filters.CharFilter(
+        method="filter_traits_and",
+        label="Trait names with AND logic (comma-separated)",
+    )
+
+    class Meta(structure_filters.ServicePropertySettingsFilter.Meta):
+        model = models.Hypervisor
+        fields = structure_filters.ServicePropertySettingsFilter.Meta.fields + (
+            "hypervisor_type",
+            "state",
+            "status",
+        )
+
+    def filter_traits_and(self, queryset, name, value):
+        """Filter hypervisors that have ALL specified traits (AND logic).
+
+        Accepts comma-separated trait names (case-insensitive exact match);
+        a single value degenerates to a plain single-trait filter. Note that
+        CUSTOM_* trait names are only meaningful within a single source, so
+        callers should scope by settings_uuid when filtering on them.
+        """
+        if not value:
+            return queryset
+        names = [n.strip() for n in value.split(",") if n.strip()]
+        for trait_name in names:
+            queryset = queryset.filter(traits__name__iexact=trait_name)
+        return queryset.distinct()
+
+
+class HypervisorInventoryFilter(django_filters.FilterSet):
+    hypervisor_uuid = core_filters.RelatedUUIDFilter(
+        field_name="hypervisor__uuid",
+        view_name="openstack-hypervisor-detail",
+    )
+    settings_uuid = core_filters.RelatedUUIDFilter(
+        field_name="hypervisor__settings__uuid",
+        view_name="servicesettings-detail",
+    )
+    resource_class = django_filters.CharFilter(lookup_expr="iexact")
+
+    class Meta:
+        model = models.HypervisorInventory
+        fields = ("hypervisor_uuid", "settings_uuid", "resource_class")
+
+
 class RouterFilter(TenantFilterSet, structure_filters.NameFilterSet):
+    state = core_filters.MappedMultipleChoiceFilter(CoreStates.choices, label="State")
+
     class Meta:
         model = models.Router
-        fields = ()
+        fields = ("state",)
+
+
+class LoadBalancerFilter(TenantFilterSet, structure_filters.NameFilterSet):
+    state = core_filters.MappedMultipleChoiceFilter(CoreStates.choices, label="State")
+
+    class Meta:
+        model = models.LoadBalancer
+        fields = ("state",)
+
+
+class PoolFilter(structure_filters.NameFilterSet):
+    load_balancer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-loadbalancer-detail",
+        field_name="load_balancer__uuid",
+        label="Load balancer UUID",
+    )
+    load_balancer = core_filters.URLFilter(
+        view_name="openstack-loadbalancer-detail",
+        field_name="load_balancer__uuid",
+        label="Load balancer URL",
+    )
+    tenant_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-tenant-detail",
+        field_name="load_balancer__tenant__uuid",
+        label="Tenant UUID",
+    )
+    state = core_filters.MappedMultipleChoiceFilter(CoreStates.choices, label="State")
+
+    class Meta:
+        model = models.Pool
+        fields = ("state",)
+
+
+class ListenerFilter(structure_filters.NameFilterSet):
+    load_balancer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-loadbalancer-detail",
+        field_name="load_balancer__uuid",
+        label="Load balancer UUID",
+    )
+    load_balancer = core_filters.URLFilter(
+        view_name="openstack-loadbalancer-detail",
+        field_name="load_balancer__uuid",
+        label="Load balancer URL",
+    )
+    tenant_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-tenant-detail",
+        field_name="load_balancer__tenant__uuid",
+        label="Tenant UUID",
+    )
+    state = core_filters.MappedMultipleChoiceFilter(CoreStates.choices, label="State")
+
+    class Meta:
+        model = models.Listener
+        fields = ("state",)
+
+
+class PoolMemberFilter(structure_filters.NameFilterSet):
+    pool_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-pool-detail",
+        field_name="pool__uuid",
+        label="Pool UUID",
+    )
+    pool = core_filters.URLFilter(
+        view_name="openstack-pool-detail",
+        field_name="pool__uuid",
+        label="Pool URL",
+    )
+    load_balancer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-loadbalancer-detail",
+        field_name="pool__load_balancer__uuid",
+        label="Load balancer UUID",
+    )
+    tenant_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-tenant-detail",
+        field_name="pool__load_balancer__tenant__uuid",
+        label="Tenant UUID",
+    )
+    state = core_filters.MappedMultipleChoiceFilter(CoreStates.choices, label="State")
+
+    class Meta:
+        model = models.PoolMember
+        fields = ("state",)
+
+
+class HealthMonitorFilter(structure_filters.NameFilterSet):
+    pool_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-pool-detail",
+        field_name="pool__uuid",
+        label="Pool UUID",
+    )
+    pool = core_filters.URLFilter(
+        view_name="openstack-pool-detail",
+        field_name="pool__uuid",
+        label="Pool URL",
+    )
+    load_balancer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-loadbalancer-detail",
+        field_name="pool__load_balancer__uuid",
+        label="Load balancer UUID",
+    )
+    tenant_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-tenant-detail",
+        field_name="pool__load_balancer__tenant__uuid",
+        label="Tenant UUID",
+    )
+    state = core_filters.MappedMultipleChoiceFilter(CoreStates.choices, label="State")
+
+    class Meta:
+        model = models.HealthMonitor
+        fields = ("state",)
 
 
 class PortFilter(TenantFilterSet, structure_filters.NameFilterSet):
-    o = django_filters.OrderingFilter(fields=(("network__name", "network_name"),))
+    o = django_filters.OrderingFilter(
+        fields=(
+            ("name", "name"),
+            ("created", "created"),
+            ("mac_address", "mac_address"),
+            ("device_owner", "device_owner"),
+            ("admin_state_up", "admin_state_up"),
+            ("status", "status"),
+            ("network__name", "network_name"),
+            ("subnet__name", "subnet_name"),
+            ("instance__name", "instance_name"),
+        ),
+        label="Ordering",
+    )
     query = django_filters.CharFilter(
         method="filter_query", label="Search by name, MAC address or backend ID"
     )
@@ -128,6 +364,17 @@ class PortFilter(TenantFilterSet, structure_filters.NameFilterSet):
     exclude_subnet_uuids = django_filters.CharFilter(
         method="filter_exclude_subnet_uuids",
         label="Exclude Subnet UUIDs (comma-separated)",
+    )
+    network_name = django_filters.CharFilter(
+        label="Search by network name", field_name="network__name"
+    )
+    network_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-network-detail",
+        label="Search by network UUID",
+        field_name="network__uuid",
+    )
+    fixed_ips = django_filters.CharFilter(
+        label="Search by fixed IP", lookup_expr="icontains"
     )
 
     def filter_has_device_owner(self, queryset, name, value):
@@ -200,7 +447,9 @@ def filter_tenant_fabric(model):
 
 
 class NetworkFilter(structure_filters.BaseResourceFilter):
-    tenant_uuid = django_filters.UUIDFilter(method="filter_tenant", label="Tenant UUID")
+    tenant_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-tenant-detail", method="filter_tenant", label="Tenant UUID"
+    )
     tenant = core_filters.URLFilter(
         view_name="openstack-tenant-detail", method="filter_tenant", label="Tenant URL"
     )
@@ -228,12 +477,20 @@ class NetworkFilter(structure_filters.BaseResourceFilter):
 
 
 class SubNetFilter(structure_filters.BaseResourceFilter):
-    network_uuid = django_filters.UUIDFilter(field_name="network__uuid")
+    network_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-network-detail",
+        field_name="network__uuid",
+        label="Network UUID",
+    )
     network = core_filters.URLFilter(
-        view_name="openstack-network-detail", field_name="network__uuid"
+        view_name="openstack-network-detail",
+        field_name="network__uuid",
+        label="Network URL",
     )
 
-    tenant_uuid = django_filters.UUIDFilter(method="filter_tenant", label="Tenant UUID")
+    tenant_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-tenant-detail", method="filter_tenant", label="Tenant UUID"
+    )
     tenant = core_filters.URLFilter(
         view_name="openstack-tenant-detail", method="filter_tenant", label="Tenant URL"
     )
@@ -262,21 +519,36 @@ class SubNetFilter(structure_filters.BaseResourceFilter):
 
 class VolumeFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
     instance = core_filters.URLFilter(
-        view_name="openstack-instance-detail", field_name="instance__uuid"
+        view_name="openstack-instance-detail",
+        field_name="instance__uuid",
+        label="Instance URL",
     )
-    instance_uuid = django_filters.UUIDFilter(field_name="instance__uuid")
+    instance_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-instance-detail",
+        field_name="instance__uuid",
+        label="Instance UUID",
+    )
 
     snapshot = core_filters.URLFilter(
         view_name="openstack-snapshot-detail",
         field_name="restoration__snapshot__uuid",
+        label="Snapshot URL",
     )
-    snapshot_uuid = django_filters.UUIDFilter(field_name="restoration__snapshot__uuid")
+    snapshot_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-snapshot-detail",
+        field_name="restoration__snapshot__uuid",
+        label="Snapshot UUID",
+    )
 
     availability_zone_name = django_filters.CharFilter(
-        field_name="availability_zone__name"
+        field_name="availability_zone__name", label="Availability zone name"
     )
 
-    attach_instance_uuid = django_filters.UUIDFilter(method="filter_attach_instance")
+    attach_instance_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-instance-detail",
+        method="filter_attach_instance",
+        label="Filter for attachment to instance UUID",
+    )
 
     def filter_attach_instance(self, queryset, name, value):
         """
@@ -316,13 +588,25 @@ class VolumeFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
 
 
 class SnapshotFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
-    source_volume_uuid = django_filters.UUIDFilter(field_name="source_volume__uuid")
-    source_volume = core_filters.URLFilter(
-        view_name="openstack-volume-detail", field_name="source_volume__uuid"
+    source_volume_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-volume-detail",
+        field_name="source_volume__uuid",
+        label="Source volume UUID",
     )
-    backup_uuid = django_filters.UUIDFilter(field_name="backups__uuid")
+    source_volume = core_filters.URLFilter(
+        view_name="openstack-volume-detail",
+        field_name="source_volume__uuid",
+        label="Source volume URL",
+    )
+    backup_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-backup-detail",
+        field_name="backups__uuid",
+        label="Backup UUID",
+    )
     backup = core_filters.URLFilter(
-        view_name="openstack-backup-detail", field_name="backups__uuid"
+        view_name="openstack-backup-detail",
+        field_name="backups__uuid",
+        label="Backup URL",
     )
 
     class Meta(structure_filters.BaseResourceFilter.Meta):
@@ -343,14 +627,51 @@ class InstanceAvailabilityZoneFilter(
 
 
 class InstanceFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
-    external_ip = django_filters.CharFilter(field_name="ports__floating_ips__address")
-    availability_zone_name = django_filters.CharFilter(
-        field_name="availability_zone__name"
+    external_ip = django_filters.CharFilter(
+        field_name="ports__floating_ips__address", label="External IP"
     )
-    attach_volume_uuid = django_filters.UUIDFilter(method="filter_attach_volume")
+    availability_zone_name = django_filters.CharFilter(
+        field_name="availability_zone__name", label="Availability zone name"
+    )
+    attach_volume_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-volume-detail",
+        method="filter_attach_volume",
+        label="Filter for attachment to volume UUID",
+    )
+    security_group = core_filters.URLFilter(
+        view_name="openstack-sgp-detail",
+        method="filter_security_group_url",
+        label="Security group URL",
+    )
+    security_group_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-sgp-detail",
+        method="filter_security_group",
+        label="Security group UUID",
+    )
     query = django_filters.CharFilter(
         method="filter_query", label="Search by name, internal IP, or external IP"
     )
+
+    def filter_security_group(self, queryset, name, value):
+        """
+        A security group is attached to an instance directly, as reported by
+        Nova, and to its ports, as applied by Neutron. Both relations are
+        traversed, since the direct one is refreshed by instance pull only.
+        """
+        return queryset.filter(
+            Q(security_groups__uuid=value) | Q(ports__security_groups__uuid=value)
+        ).distinct()
+
+    def filter_security_group_url(self, queryset, name, value):
+        # A filter method replaces Filter.filter, so the URL is resolved to the
+        # UUID here instead of by URLFilter itself.
+        security_group_filter = cast(
+            core_filters.URLFilter, self.filters["security_group"]
+        )
+        uuid = security_group_filter.get_uuid(value)
+        if not uuid or not core_utils.is_uuid_like(uuid):
+            return queryset.none()
+        return self.filter_security_group(queryset, name, uuid)
 
     def filter_attach_volume(self, queryset, name, value):
         """
@@ -404,9 +725,15 @@ class InstanceFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
 
 class BackupFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
     instance = core_filters.URLFilter(
-        view_name="openstack-instance-detail", field_name="instance__uuid"
+        view_name="openstack-instance-detail",
+        field_name="instance__uuid",
+        label="Instance URL",
     )
-    instance_uuid = django_filters.UUIDFilter(field_name="instance__uuid")
+    instance_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-instance-detail",
+        field_name="instance__uuid",
+        label="Instance UUID",
+    )
 
     class Meta(structure_filters.BaseResourceFilter.Meta):
         model = models.Backup
@@ -420,20 +747,75 @@ class VolumeAvailabilityZoneFilter(
 
 
 class NetworkRBACPolicyFilter(django_filters.FilterSet):
-    tenant_uuid = django_filters.UUIDFilter(field_name="network__tenant__uuid")
+    tenant_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-tenant-detail",
+        field_name="network__tenant__uuid",
+        label="Tenant UUID",
+    )
     tenant = core_filters.URLFilter(
-        view_name="openstack-tenant-detail", field_name="network__tenant__uuid"
+        view_name="openstack-tenant-detail",
+        field_name="network__tenant__uuid",
+        label="Tenant URL",
     )
 
-    network_uuid = django_filters.UUIDFilter(field_name="network__uuid")
+    network_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-network-detail",
+        field_name="network__uuid",
+        label="Network UUID",
+    )
     network = core_filters.URLFilter(
-        view_name="openstack-network-detail", field_name="network__uuid"
+        view_name="openstack-network-detail",
+        field_name="network__uuid",
+        label="Network URL",
     )
 
-    target_tenant_uuid = django_filters.UUIDFilter(field_name="target_tenant__uuid")
-    target_tenant = core_filters.URLFilter(
-        view_name="openstack-tenant-detail", field_name="target_tenant__uuid"
+    target_tenant_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-tenant-detail",
+        field_name="target_tenant__uuid",
+        label="Target tenant UUID",
     )
+    target_tenant = core_filters.URLFilter(
+        view_name="openstack-tenant-detail",
+        field_name="target_tenant__uuid",
+        label="Target tenant URL",
+    )
+
+    DIRECTION_CHOICES = (
+        ("outbound", "Outbound"),
+        ("inbound", "Inbound"),
+        ("all", "All"),
+    )
+    direction = django_filters.ChoiceFilter(
+        choices=DIRECTION_CHOICES,
+        method="filter_direction",
+        label="Direction relative to the requesting user",
+    )
+
+    def filter_direction(self, queryset, name, value):
+        request = self.request
+        user = getattr(request, "user", None) if request else None
+        if value == "all" or user is None or not user.is_authenticated:
+            return queryset
+        if user.is_staff or user.is_support:
+            return queryset
+        from waldur_core.structure.managers import (
+            get_connected_customers,
+            get_connected_projects,
+        )
+
+        connected_projects = get_connected_projects(user)
+        connected_customers = get_connected_customers(user)
+        if value == "outbound":
+            return queryset.filter(
+                Q(network__tenant__project__in=connected_projects)
+                | Q(network__tenant__project__customer__in=connected_customers)
+            )
+        if value == "inbound":
+            return queryset.filter(
+                Q(target_tenant__project__in=connected_projects)
+                | Q(target_tenant__project__customer__in=connected_customers)
+            )
+        return queryset
 
     class Meta:
         model = models.NetworkRBACPolicy

@@ -6,17 +6,21 @@ from rest_framework import status, test
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure.tests import fixtures as structure_fixtures
-from waldur_mastermind.marketplace.enums import BASIC_OFFERING
+from waldur_mastermind.marketplace.enums import (
+    BASIC_OFFERING,
+    OPENSTACK_INSTANCE_OFFERING,
+)
 from waldur_mastermind.marketplace.tests import factories
-from waldur_mastermind.marketplace_azure import VIRTUAL_MACHINE_TYPE
 
 
 @ddt
-class ImportableOfferingsListTest(test.APITransactionTestCase):
+class ImportableOfferingsListTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ServiceFixture()
 
-    def list_offerings(self, shared, user, project=None, type=VIRTUAL_MACHINE_TYPE):
+    def list_offerings(
+        self, shared, user, project=None, type=OPENSTACK_INSTANCE_OFFERING
+    ):
         factories.OfferingFactory(
             scope=self.fixture.service_settings,
             shared=shared,
@@ -62,7 +66,7 @@ class ImportableOfferingsListTest(test.APITransactionTestCase):
         self.assertEqual(1, len(offerings))
 
 
-class ImportableResourcesListTest(test.APITransactionTestCase):
+class ImportableResourcesListTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ServiceFixture()
 

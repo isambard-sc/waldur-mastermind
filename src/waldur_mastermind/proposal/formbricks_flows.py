@@ -29,11 +29,19 @@ Step dict shape:
                  integer_field_map - parsed with int().
                  boolean_field_map - "Yes"/"No" (case-insensitive) parsed to
                                       True/False; anything else fails loudly.
-               Only present on steps whose answers feed directly into
-               Proposal fields - currently only "project_details". Steps
-               without these (team_details, compliance, assessment) are
-               still snapshotted (see models.FormStepResponse) but are never
-               turned into structured Waldur data.
+               Only meaningful for questions that feed directly into a real
+               Proposal field - project_details currently only uses
+               field_map (name, project_summary). integer_field_map/
+               boolean_field_map have no current users: the project's
+               duration is now set by the call manager as a fixed value
+               for every proposal under the call (Call.fixed_duration_in_days),
+               not requested per-applicant, and the confidentiality/civilian-
+               purpose flags were dropped as unused native fields - but the
+               survey still asks all three questions, and their answers are
+               still snapshotted (see models.FormStepResponse) for reviewers
+               to read, just not turned into structured Waldur data. Steps
+               without any of these maps (team_details, compliance,
+               assessment) are snapshotted the same way.
     mapper:    (optional) name of a function in formbricks_mapper.py that
                knows how to apply the field maps plus any step-specific
                logic (e.g. resource selection) to a Proposal.
@@ -65,19 +73,17 @@ PROJECT_DETAILS_STEP = {
         "fjxcnvv5q1ny48q2wazmq2eb": "name",  # "Project title"
         "drihiecfnvzubpjfjc39ai6p": "project_summary",  # "Project summary"
     },
-    "integer_field_map": {
-        "otdzfok26gyprjg6cttxvas4": "duration_in_days",  # "Project duration, in days"
-    },
-    "boolean_field_map": {
-        # "Does the project involve confidential, sensitive or GDPR-protected information?"
-        "cy3gskc7izzurxbrnk4b3mc8": "project_is_confidential",
-        # "Is the project non-commercial or research only?" - not a precise
-        # match for project_has_civilian_purpose (commercial/non-commercial
-        # is a different axis from civilian/military use), but mapped here
-        # deliberately per product decision - there's no dedicated field for
-        # "non-commercial/research-only" on Proposal.
-        "xn6ybk9fk265kjgv37xx0wac": "project_has_civilian_purpose",
-    },
+    # No integer_field_map/boolean_field_map: the survey still asks "Project
+    # duration, in days" (otdzfok26gyprjg6cttxvas4), "Does the project
+    # involve confidential, sensitive or GDPR-protected information?"
+    # (cy3gskc7izzurxbrnk4b3mc8), and "Is the project non-commercial or
+    # research only?" (xn6ybk9fk265kjgv37xx0wac) - all three are still
+    # captured in the FormStepResponse snapshot for reviewers - but none map
+    # to a Proposal field. Duration is now a call-level fixed value
+    # (Call.fixed_duration_in_days) rather than a per-applicant request; the
+    # other two were dropped as unused native fields. See this module's
+    # docstring.
+    #
     # Multi-select: "AIRR service requested". Formbricks records the
     # selected choice's *label text* as the answer (e.g. "Isambard-AI"), not
     # a stable id or slug - resource_label_to_slug translates that

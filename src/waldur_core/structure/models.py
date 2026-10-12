@@ -1,4 +1,7 @@
+import ipaddress
+import logging
 import re
+from datetime import timedelta
 from decimal import Decimal
 from functools import lru_cache
 from typing import cast
@@ -10,14 +13,13 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.core.validators import (
     MaxLengthValidator,
-    MinLengthValidator,
     MaxValueValidator,
     MinValueValidator,
-    RegexValidator,
 )
 from django.db import models, transaction
 from django.db.models import Model, Q, signals
 from django.utils import timezone
+from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
 from model_utils import FieldTracker
 from model_utils.fields import AutoCreatedField
@@ -30,7 +32,9 @@ from reversion import revisions as reversion
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist.enums import ChecklistTypes
 from waldur_core.core import fields as core_fields
+from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
+from waldur_core.core.enums import ReviewStates
 from waldur_core.core.fields import COUNTRIES_DICT, JSONField
 from waldur_core.core.models import User
 from waldur_core.core.validators import (
@@ -141,8 +145,8 @@ class VATMixin(models.Model):
         if not vat_code:
             return False
 
-        # Remove spaces and convert to uppercase
-        vat_code = vat_code.replace(" ", "").upper()
+        # Remove spaces and dashes, then convert to uppercase
+        vat_code = vat_code.replace(" ", "").replace("-", "").upper()
 
         # European VAT number patterns extracted from regex documentation
         vat_patterns = {
@@ -267,7 +271,7 @@ class OrganizationGroup(core_models.UuidMixin, core_models.NameMixin, models.Mod
 
     class Meta:
         verbose_name = _("organization group")
-        ordering = ("name",)
+        ordering = ["name", "id"]
 
     @classmethod
     def get_url_name(cls):
@@ -282,6 +286,144 @@ class OrganizationGroup(core_models.UuidMixin, core_models.NameMixin, models.Mod
             d = d.parent
 
         return " -> ".join(full_path[::-1])
+
+
+class AffiliatedOrganization(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    core_models.DescribableMixin,
+    TimeStampedModel,
+):
+    """
+    External organization (affiliation) that a project can be tied to.
+
+    Flat registry separate from Customer. Each project can be affiliated with
+    at most one entry. Staff manages the registry; per-Customer staff selects
+    which affiliations are surfaced as defaults to project creators.
+    """
+
+    code = models.CharField(
+        max_length=20,
+        unique=True,
+        help_text=_("Unique short identifier, e.g. CERN, EMBL."),
+    )
+    abbreviation = models.CharField(max_length=12, blank=True)
+    email = models.EmailField(max_length=75, blank=True)
+    homepage = models.URLField(max_length=255, blank=True)
+    country = models.CharField(max_length=2, blank=True)
+    address = models.CharField(max_length=300, blank=True)
+
+    class Meta:
+        verbose_name = _("affiliation")
+        verbose_name_plural = _("affiliations")
+        ordering = ["name", "id"]
+
+    @classmethod
+    def get_url_name(cls):
+        return "affiliated-organization"
+
+    def __str__(self):
+        return self.name
+
+
+class ScienceDomain(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    TimeStampedModel,
+):
+    """
+    Top-level science domain for classifying projects (e.g. Physics, Life Science).
+
+    Part of a two-level taxonomy: ScienceDomain → ScienceSubDomain.
+    Staff-managed; any authenticated user can read.
+    """
+
+    code = models.CharField(
+        max_length=20,
+        blank=True,
+        verbose_name=_("code"),
+        help_text=_("Domain code (e.g. '1'). Auto-derived if left blank."),
+    )
+
+    class Meta:
+        verbose_name = _("science domain")
+        ordering = ["code", "name", "id"]
+
+    @classmethod
+    def get_url_name(cls):
+        return "science-domain"
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            max_code = (
+                ScienceDomain.objects.exclude(pk=self.pk)
+                .exclude(code="")
+                .order_by("-code")
+                .values_list("code", flat=True)
+                .first()
+            )
+            next_num = int(max_code) + 1 if max_code and max_code.isdigit() else 1
+            self.code = str(next_num)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.code} {self.name}"
+
+
+class ScienceSubDomain(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    TimeStampedModel,
+):
+    """
+    Sub-domain within a science domain (e.g. Astrophysics & Cosmology under Physics).
+
+    Projects and proposals reference a ScienceSubDomain; the parent domain
+    is always derivable from the FK.
+    """
+
+    domain = models.ForeignKey(
+        ScienceDomain,
+        on_delete=models.CASCADE,
+        related_name="subdomains",
+    )
+    code = models.CharField(
+        max_length=20,
+        blank=True,
+        verbose_name=_("code"),
+        help_text=_(
+            "Sub-domain code (e.g. '1.1'). Auto-derived from domain code if left blank."
+        ),
+    )
+
+    class Meta:
+        verbose_name = _("science sub-domain")
+        ordering = ["code", "name", "id"]
+
+    @classmethod
+    def get_url_name(cls):
+        return "science-sub-domain"
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            prefix = self.domain.code or "0"
+            max_code = (
+                ScienceSubDomain.objects.filter(domain=self.domain)
+                .exclude(pk=self.pk)
+                .exclude(code="")
+                .order_by("-code")
+                .values_list("code", flat=True)
+                .first()
+            )
+            if max_code and "." in max_code:
+                next_num = int(max_code.split(".")[-1]) + 1
+            else:
+                next_num = 1
+            self.code = f"{prefix}.{next_num}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.code} {self.name}"
 
 
 CUSTOMER_DETAILS_FIELDS = (
@@ -307,6 +449,14 @@ CUSTOMER_DETAILS_FIELDS = (
     "bank_account",
     "country",
     "notification_emails",
+    "city",
+    "state",
+    "parish",
+    "street",
+    "house_nr",
+    "apartment_nr",
+    "household",
+    "project_slug_template",
 )
 
 
@@ -327,32 +477,114 @@ def validate_cidr_32(value):
         raise ValidationError("Only /32 mask is allowed.")
 
 
+def validate_access_subnet_cidr(value):
+    """
+    Validate a CIDR address usable as an access-subnet entry.
+
+    Rejects a zero-length prefix outright: ``0.0.0.0/0`` (or ``::/0``) matches
+    every address, which would silently neutralise any restriction built on
+    these entries. Every other width is accepted here — the narrower "single
+    host only" rule that applies to non-staff users is enforced in the
+    serializer, which is the only layer that knows who is making the request.
+
+    Args:
+        value: CIDR address string to validate
+
+    Raises:
+        ValidationError: If the value is malformed or has a /0 prefix
+    """
+    try:
+        network = ipaddress.ip_network(str(value), strict=False)
+    except ValueError as e:
+        raise ValidationError(str(e))
+    if network.prefixlen == 0:
+        raise ValidationError("A /0 mask is not allowed: it matches every address.")
+
+
 class AccessSubnet(core_models.UuidMixin, core_models.DescribableMixin, LoggableMixin):
     """
     Model for customer access subnets.
 
-    Stores CIDR addresses with /32 mask validation for IP-based access control.
-    Used to restrict access to customer resources based on source IP addresses.
+    One trusted network for the organization, plus what it is trusted for.
+
+    A single entry can apply to portal sign-in (``applies_to_portal``) and/or to
+    the organization's resources of particular offerings, the latter recorded
+    outside this app so that structure keeps no knowledge of the marketplace.
+    Keeping it as one row per address means a consumer describes a network once
+    ("office egress") rather than maintaining parallel lists.
+
+    ``applies_to_portal`` defaults to False deliberately. Any portal-scoped
+    entry restricts sign-in for the whole organization, so adding a network in
+    order to reach a bucket must not quietly lock people out of the portal.
+
+    Non-staff users may only enter single hosts (``/32``); staff may enter wider
+    ranges, which are then flagged ``is_staff_managed`` so consumers cannot edit
+    or remove them. Both rules live in the serializer, which is the layer that
+    knows the acting user.
     """
 
     customer = models.ForeignKey["Customer"](
         on_delete=models.CASCADE, to="Customer", related_name="access_subnet_set"
     )
-    inet = CidrAddressField(null=True, blank=True, validators=[validate_cidr_32])
+    inet = CidrAddressField(
+        null=True, blank=True, validators=[validate_access_subnet_cidr]
+    )
+    applies_to_portal = models.BooleanField(
+        default=False,
+        help_text="Whether this network may sign in to the portal on behalf of "
+        "the organization. Off by default: any portal-scoped entry restricts "
+        "sign-in for everyone in the organization.",
+    )
+    is_staff_managed = models.BooleanField(
+        default=False,
+        help_text="Set when staff created the entry. Such entries are read-only "
+        "for everyone else, regardless of mask width.",
+    )
     tracker = cast(FieldInstanceTracker, FieldTracker())
+    # Queries now start from this model rather than joining in from Customer
+    # (which carries its own NetManager), so the netfields lookups —
+    # inet__net_contains_or_equals — have to be available here too.
+    objects = NetManager()
 
     class Meta:
         unique_together = ("customer", "inet")
-        ordering = ["inet"]
+        ordering = ["inet", "id"]
 
     def __str__(self):
         return self.customer.name + " | " + str(self.inet)
 
     def get_log_fields(self):
-        return "description", "inet", "customer"
+        return (
+            "description",
+            "inet",
+            "customer",
+            "applies_to_portal",
+            "is_staff_managed",
+        )
 
 
-class CustomerDetailsMixin(core_models.NameMixin, VATMixin, CoordinatesMixin):
+class CustomerAddressDetailsMixin(models.Model):
+    """
+    Mixin contains customer address detail fields.
+    """
+
+    class Meta:
+        abstract = True
+
+    address = models.CharField(blank=True, max_length=300)
+    contact_details = models.TextField(blank=True, validators=[MaxLengthValidator(500)])
+    city = models.CharField(blank=True, max_length=100)
+    state = models.CharField(blank=True, max_length=100)
+    parish = models.CharField(blank=True, max_length=100)
+    street = models.CharField(blank=True, max_length=200)
+    house_nr = models.CharField(blank=True, max_length=100)
+    apartment_nr = models.CharField(blank=True, max_length=100)
+    household = models.CharField(blank=True, max_length=100)
+
+
+class CustomerDetailsMixin(
+    core_models.NameMixin, VATMixin, CoordinatesMixin, CustomerAddressDetailsMixin
+):
     """
     Mixin containing customer detail fields.
 
@@ -366,7 +598,6 @@ class CustomerDetailsMixin(core_models.NameMixin, VATMixin, CoordinatesMixin):
 
     native_name = models.CharField(max_length=160, default="", blank=True)
     abbreviation = models.CharField(max_length=12, blank=True)
-    contact_details = models.TextField(blank=True, validators=[MaxLengthValidator(500)])
 
     agreement_number = models.CharField(max_length=160, default="", blank=True)
     sponsor_number = models.PositiveIntegerField(
@@ -400,7 +631,6 @@ class CustomerDetailsMixin(core_models.NameMixin, VATMixin, CoordinatesMixin):
     homepage = models.URLField(max_length=255, blank=True)
     domain = models.CharField(max_length=255, blank=True)
 
-    address = models.CharField(blank=True, max_length=300)
     postal = models.CharField(blank=True, max_length=20)
     bank_name = models.CharField(blank=True, max_length=150)
     bank_account = models.CharField(blank=True, max_length=50)
@@ -462,6 +692,7 @@ class Customer(
     core_models.DescribableMixin,
     core_models.DescendantMixin,
     core_models.SlugMixin,
+    core_models.UserDetailsMatchMixin,
     quotas_models.ExtendableQuotaModelMixin,
     PermissionMixin,
     StructureLoggableMixin,
@@ -511,6 +742,32 @@ class Customer(
         blank=True,
         help_text=_("Checklist used for project metadata collection"),
     )
+    grace_period_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=_(
+            "Number of extra days after project end date before resources are terminated"
+        ),
+    )
+    project_slug_template = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text=(
+            "Template for project slugs. Supports: {customer_slug}, {project_name}, "
+            "{year}, {month}, {counter}, {counter_padded}. "
+            "Default: slugified project name"
+        ),
+    )
+    default_affiliations = models.ManyToManyField(
+        to=AffiliatedOrganization,
+        related_name="default_for_customers",
+        blank=True,
+        help_text=_(
+            "Affiliations offered to project creators of this organization. "
+            "Staff users can select any affiliation; non-staff are limited to this list."
+        ),
+    )
     tracker = cast(
         FieldInstanceTracker, FieldTracker(fields=["project_metadata_checklist"])
     )
@@ -518,7 +775,7 @@ class Customer(
 
     class Meta:
         verbose_name = _("organization")
-        ordering = ("name",)
+        ordering = ["name", "id"]
 
     class Quotas(quotas_models.QuotaModelMixin.Quotas):
         enable_fields_caching = False
@@ -619,7 +876,7 @@ class ProjectType(
     class Meta:
         verbose_name = _("Project type")
         verbose_name_plural = _("Project types")
-        ordering = ["name"]
+        ordering = ["name", "id"]
 
     @classmethod
     def get_url_name(cls):
@@ -642,7 +899,6 @@ class SoftDeletableManager(SoftDeletableManagerMixin, models.Manager):
 
 
 PROJECT_NAME_LENGTH = 500
-PROJECT_GRACE_PERIOD_DAYS = 30
 
 PROJECT_DETAILS_FIELDS = (
     "name",
@@ -729,6 +985,7 @@ class Project(
     core_models.DescendantMixin,
     core_models.BackendMixin,
     core_models.SlugMixin,
+    core_models.UserDetailsMatchMixin,
     quotas_models.ExtendableQuotaModelMixin,
     PermissionMixin,
     StructureLoggableMixin,
@@ -762,27 +1019,6 @@ class Project(
         _("name"), max_length=PROJECT_NAME_LENGTH, validators=[validate_name]
     )
 
-    short_name = models.CharField(
-        verbose_name=_("short name"),
-        max_length=50,
-        null=True,
-        blank=True,
-        help_text=_(
-            "A short, unique name for the project used as an identifier. Should only contain lower-case letters, digits, underscores and hyphens"
-        ),
-        validators=[
-            RegexValidator(
-                regex=r"^[a-z0-9\-_]+$",
-            ),
-            RegexValidator(
-                regex=r"(-admin)|(-root)$",
-                inverse_match=True,
-            ),
-            MinLengthValidator(3),
-            MaxLengthValidator(30),
-        ],
-    )
-
     start_date = models.DateField(null=True, blank=True)
 
     end_date = models.DateField(
@@ -798,6 +1034,11 @@ class Project(
         blank=True,
         null=True,
         related_name="+",
+    )
+    end_date_updated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=_("Timestamp of the last end_date change."),
     )
     type = models.ForeignKey(
         ProjectType,
@@ -834,6 +1075,28 @@ class Project(
         blank=True,
         help_text=_("Internal notes visible only to staff and support users"),
     )
+    grace_period_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=_(
+            "Number of extra days after project end date before resources are terminated. Overrides customer-level setting."
+        ),
+    )
+    affiliation = models.ForeignKey(
+        AffiliatedOrganization,
+        related_name="projects",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
+    science_sub_domain = models.ForeignKey(
+        ScienceSubDomain,
+        verbose_name=_("science sub-domain"),
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="projects",
+    )
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
     # Entities returned in manager available_objects are limited to not-deleted instances.
@@ -842,47 +1105,123 @@ class Project(
     objects = models.Manager()
     id: int
 
-    @property
-    def grace_period_days(self):
-        """Number of days grace period after project end date.
+    def save(self, *args, **kwargs):
+        end_date_changed = not self._state.adding and self.tracker.has_changed(
+            "end_date"
+        )
+        super().save(*args, **kwargs)
+        if end_date_changed:
+            Project.objects.filter(pk=self.pk).update(
+                end_date_updated_at=timezone.now()
+            )
 
-        During grace period, the project remains active but credits are set to zero.
-        This allows for a transition period before full termination.
-        """
-        return PROJECT_GRACE_PERIOD_DAYS
+    def generate_slug(self):
+        if self.customer and self.customer.project_slug_template:
+            return self._generate_template_slug()
+        return super().generate_slug()
 
-    @property
-    def end_date_with_grace(self):
-        """Calculate the actual termination date including grace period.
+    def _generate_template_slug(self):
+        logger = logging.getLogger(__name__)
+        template = self.customer.project_slug_template
+        if not template:
+            return super().generate_slug()
+        context = self._get_slug_context()
 
-        Returns:
-            date: The end_date plus grace_period_days, or None if no end_date is set
-        """
+        try:
+            raw_slug = template.format(**context)
+        except (KeyError, ValueError) as e:
+            logger.error(
+                "Failed to format project slug template '%s' "
+                "for project '%s' in customer '%s': %s. "
+                "Falling back to default slug generation.",
+                template,
+                self.name,
+                self.customer,
+                e,
+            )
+            return super().generate_slug()
+
+        base_slug = core_models.clean_slug_hyphens(slugify(raw_slug))
+        return self._ensure_slug_unique(base_slug)
+
+    def _get_slug_context(self):
+        now = timezone.now()
+        counter = self._calculate_project_counter()
+        return {
+            "customer_slug": self.customer.slug if self.customer else "",
+            "project_name": slugify(self.name) if self.name else "",
+            "year": now.strftime("%Y"),
+            "month": now.strftime("%m"),
+            "counter": str(counter),
+            "counter_padded": f"{counter:03d}",
+        }
+
+    def _calculate_project_counter(self):
+        existing_count = (
+            Project.objects.filter(customer=self.customer)
+            .exclude(pk=self.pk if self.pk else None)
+            .count()
+        )
+        return existing_count + 1
+
+    def _ensure_slug_unique(self, base_slug):
+        existing_slugs = Project.objects.filter(slug__startswith=base_slug).values_list(
+            "slug", flat=True
+        )
+
+        if base_slug not in existing_slugs:
+            return base_slug
+
+        max_num = 1
+        for slug in existing_slugs:
+            if slug == base_slug:
+                continue
+            try:
+                num = int(slug.split("-")[-1])
+                if num > max_num:
+                    max_num = num
+            except ValueError:
+                pass
+        return f"{base_slug}-{max_num + 1}"
+
+    def get_grace_period_days(self):
+        """Get the grace period days, with project-level setting overriding customer-level."""
+        if self.grace_period_days is not None:
+            return self.grace_period_days
+        if self.customer.grace_period_days is not None:
+            return self.customer.grace_period_days
+        return 0
+
+    def get_effective_end_date(self):
+        """Get the effective end date including grace period."""
         if not self.end_date:
             return None
-        return self.end_date + timezone.timedelta(days=self.grace_period_days)
-
-    @property
-    def is_in_grace_period(self):
-        """Check if project is currently in the grace period.
-
-        Returns:
-            bool: True if current date is after end_date but before end_date_with_grace
-        """
-        if not self.end_date:
-            return False
-        today = timezone.now().date()
-        return self.end_date <= today <= self.end_date_with_grace
+        grace_days = self.get_grace_period_days()
+        return self.end_date + timedelta(days=grace_days)
 
     @property
     def is_expired(self):
-        """Check if project end date has been reached (not including grace period).
+        effective_end_date = self.get_effective_end_date()
+        return effective_end_date and effective_end_date <= timezone.now().date()
 
-        Note: This property indicates the project has reached its end_date,
-        but resources may still be active during the grace period.
-        For termination logic, use end_date_with_grace instead.
-        """
-        return self.end_date and self.end_date <= timezone.now().date()
+    @property
+    def is_in_grace_period(self):
+        """Check if project is currently in grace period (past end_date but before effective_end_date)."""
+        if not self.end_date:
+            return False
+
+        today = timezone.now().date()
+        effective_end_date = self.get_effective_end_date()
+
+        # In grace period if past end_date but before effective_end_date
+        return (
+            self.end_date < today and effective_end_date and today <= effective_end_date
+        )
+
+    @property
+    def end_date_with_grace(self):
+        """Get the end date including grace period (same as get_effective_end_date but as property)."""
+        return self.get_effective_end_date()
 
     @property
     def full_name(self) -> str:
@@ -908,62 +1247,6 @@ class Project(
         self.save(using=using)
 
         signals.post_delete.send(sender=self.__class__, instance=self, using=using)
-
-    def save(self, *args, **kwargs):
-        # We will let the short name change here as a first step to removing it.
-        # The unique shortname is now stored in the waldur_openportal plugin,
-        # and this cannot be changed once set.
-
-        # Capture whether short_name changed BEFORE saving (tracker resets after save)
-        short_name_changed = hasattr(self, "tracker") and self.tracker.has_changed(
-            "short_name"
-        )
-
-        super().save(*args, **kwargs)
-
-        # Sync short_name changes to ProjectInfo.shortname and Project.slug
-        # Use _syncing_to_projectinfo flag to prevent circular updates
-        if short_name_changed:
-            if self.short_name and not getattr(self, "_syncing_to_projectinfo", False):
-                try:
-                    from waldur_openportal.models import ProjectInfo
-
-                    project_info = ProjectInfo.objects.filter(project=self).first()
-                    if project_info:
-                        # ProjectInfo exists - sync through set_shortname which will update slug
-                        if project_info.shortname != self.short_name:
-                            project_info.set_shortname(self.short_name, force=True)
-                    else:
-                        # ProjectInfo doesn't exist yet - check if we should update slug
-                        # Only update slug if NOT in application_portal_only mode
-                        try:
-                            from waldur_core.core.models import Feature
-
-                            application_portal_only = Feature.objects.get(
-                                key="deployment.application_portal_only"
-                            ).value
-                        except Exception:
-                            # Default to False if feature flag doesn't exist
-                            application_portal_only = False
-
-                        if not application_portal_only and self.slug != self.short_name:
-                            Project.objects.filter(pk=self.pk).update(
-                                slug=self.short_name
-                            )
-                except Exception:
-                    # waldur_openportal may not be installed
-                    # In this case, try to update slug if not in portal mode
-                    try:
-                        from waldur_core.core.models import Feature
-
-                        application_portal_only = Feature.objects.get(
-                            key="deployment.application_portal_only"
-                        ).value
-                    except Exception:
-                        application_portal_only = False
-
-                    if not application_portal_only and self.slug != self.short_name:
-                        Project.objects.filter(pk=self.pk).update(slug=self.short_name)
 
     def delete(self, using=None, soft=True, *args, **kwargs):
         """Use soft delete, i.e. mark a project as 'removed'."""
@@ -992,7 +1275,7 @@ class Project(
 
     class Meta:
         base_manager_name = "objects"
-        ordering = ["name"]
+        ordering = ["name", "id"]
 
 
 class PermissionReview(core_models.UuidMixin, LoggableMixin):
@@ -1028,6 +1311,9 @@ class CustomerPermissionReview(PermissionReview):
     Inherits from PermissionReview and adds customer-specific fields.
     """
 
+    class Meta:
+        ordering = ["-created", "id"]
+
     class Permissions:
         customer_path = "customer"
         list_permission = PermissionEnum.LIST_CUSTOMER_PERMISSION_REVIEWS
@@ -1050,6 +1336,9 @@ class ProjectPermissionReview(PermissionReview):
 
     Inherits from PermissionReview and adds project-specific fields.
     """
+
+    class Meta:
+        ordering = ["-created", "id"]
 
     class Permissions:
         customer_path = "project__customer"
@@ -1102,7 +1391,7 @@ class ServiceSettings(
     class Meta:
         verbose_name = "Service settings"
         verbose_name_plural = "Service settings"
-        ordering = ("name",)
+        ordering = ["name", "id"]
 
     class Permissions:
         customer_path = "customer"
@@ -1119,16 +1408,18 @@ class ServiceSettings(
     )
     backend_url = core_fields.BackendURLField(max_length=200, blank=True, null=True)
     username = models.CharField(max_length=100, blank=True, null=True)
-    password = models.CharField(max_length=100, blank=True, null=True)
+    password = core_fields.EncryptedTextField(blank=True, null=True)
     domain = models.CharField(max_length=200, blank=True, null=True)
-    token = models.CharField(max_length=255, blank=True, null=True)
+    token = core_fields.EncryptedTextField(blank=True, null=True)
     certificate = models.FileField(
         upload_to="certs", blank=True, null=True, validators=[CertificateValidator]
     )
     type = models.CharField(
         max_length=255, db_index=True, validators=[validate_service_type]
     )
-    options = JSONField(default=dict, help_text=_("Extra options"), blank=True)
+    options = core_fields.EncryptedOptionsField(
+        default=dict, help_text=_("Extra options"), blank=True
+    )
     shared = models.BooleanField(default=False, help_text=_("Anybody can use it"))
     terms_of_services = models.URLField(max_length=255, blank=True)
 
@@ -1297,7 +1588,7 @@ class BaseResource(
 
     class Meta:
         abstract = True
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     class Permissions:
         customer_path = "project__customer"
@@ -1389,7 +1680,7 @@ class VirtualMachine(IPCoordinatesMixin, core_models.RuntimeStateMixin, BaseReso
     for all VM implementations across different cloud providers.
     """
 
-    class Meta:
+    class Meta(BaseResource.Meta):
         abstract = True
 
     cores = models.PositiveSmallIntegerField(
@@ -1461,7 +1752,7 @@ class Storage(core_models.RuntimeStateMixin, BaseResource):
 
     size = models.PositiveIntegerField(help_text=_("Size in MiB"))
 
-    class Meta:
+    class Meta(BaseResource.Meta):
         abstract = True
 
 
@@ -1472,6 +1763,9 @@ class UserAgreement(core_models.UuidMixin, LoggableMixin, TimeStampedModel):
     Stores different types of user agreements such as Terms of Service
     and Privacy Policy with content and agreement type classification.
     Used for legal compliance and user consent tracking.
+
+    Supports multiple language versions per agreement type.
+    If language is empty, it's the default/fallback version.
     """
 
     class UserAgreements:
@@ -1485,14 +1779,24 @@ class UserAgreement(core_models.UuidMixin, LoggableMixin, TimeStampedModel):
 
     content = models.TextField(blank=True)
     agreement_type = models.CharField(
-        max_length=5, choices=UserAgreements.CHOICES, unique=True
+        max_length=5,
+        choices=UserAgreements.CHOICES,
+    )
+    language = models.CharField(
+        max_length=10,
+        blank=True,
+        help_text="ISO 639-1 language code (e.g., 'en', 'de', 'et'). "
+        "Leave empty for the default version.",
     )
 
     class Meta:
-        ordering = ["created"]
+        ordering = ["created", "id"]
+        unique_together = [("agreement_type", "language")]
 
     def __str__(self):
-        return self.agreement_type
+        if self.language:
+            return f"{self.agreement_type} ({self.language})"
+        return f"{self.agreement_type} (default)"
 
 
 reversion.register(Customer)
@@ -1515,6 +1819,103 @@ class ExternalLink(
     class Meta:
         verbose_name = _("External link")
         verbose_name_plural = _("External links")
-        ordering = ("name",)
+        ordering = ["name", "id"]
 
     link = models.URLField(max_length=500)
+
+
+class ProjectDigestConfiguration(
+    core_models.UuidMixin,
+    TimeStampedModel,
+):
+    """Organization-level configuration for periodic project member digest emails."""
+
+    class Frequency(models.TextChoices):
+        WEEKLY = "weekly", _("Weekly")
+        BIWEEKLY = "biweekly", _("Bi-weekly")
+        MONTHLY = "monthly", _("Monthly")
+
+    customer = models.OneToOneField(
+        "structure.Customer",
+        on_delete=models.CASCADE,
+        related_name="project_digest_config",
+    )
+    is_enabled = models.BooleanField(default=False)
+    frequency = models.CharField(
+        max_length=20,
+        choices=Frequency.choices,
+        default=Frequency.MONTHLY,
+    )
+    enabled_sections = JSONField(
+        default=list,
+        blank=True,
+        help_text=_("List of section keys to include. Empty means all."),
+    )
+    last_sent_at = models.DateTimeField(null=True, blank=True)
+    day_of_week = models.PositiveSmallIntegerField(
+        default=1,
+        validators=[MaxValueValidator(6)],
+        help_text=_("For weekly/biweekly: 0=Sunday..6=Saturday"),
+    )
+    day_of_month = models.PositiveSmallIntegerField(
+        default=1,
+        validators=[MinValueValidator(1), MaxValueValidator(28)],
+        help_text=_("For monthly: day of month (1-28)"),
+    )
+    created_by = models.ForeignKey(
+        "core.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        verbose_name = _("Project digest configuration")
+        verbose_name_plural = _("Project digest configurations")
+
+    def __str__(self):
+        return f"Digest config for {self.customer} ({self.frequency})"
+
+
+class ProjectEndDateChangeRequest(core_models.UuidMixin, core_mixins.ReviewMixin):
+    """
+    Request from project member (without UPDATE_PROJECT) to change project end date.
+    Organization owners can approve or reject.
+    """
+
+    class Meta:
+        ordering = ["created", "id"]
+        verbose_name = _("Project end date change request")
+        verbose_name_plural = _("Project end date change requests")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "requested_end_date"],
+                condition=Q(state=ReviewStates.PENDING),
+                name="unique_pending_request_per_project_date",
+            )
+        ]
+
+    tracker = cast(FieldInstanceTracker, FieldTracker())
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.CASCADE,
+        related_name="end_date_change_requests",
+    )
+    requested_end_date = models.DateField(
+        help_text=_("The requested new end date for the project"),
+    )
+    created_by = models.ForeignKey(
+        "core.User",
+        on_delete=models.SET_NULL,
+        related_name="+",
+        null=True,
+    )
+    comment = models.TextField(
+        blank=True,
+        null=True,
+        help_text=_("Optional comment from the requester"),
+    )
+
+    class Permissions:
+        customer_path = "project__customer"
+        project_path = "project"

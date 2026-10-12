@@ -19,7 +19,7 @@ VS Code will build the dev container and set up the environment automatically. T
 - Installing VS Code extensions
 - Installing uv and project dependencies
 - Installing PostgreSQL
-- Configuring pre-commit hooks
+- Configuring git hooks
 
 Once the container is built and running, you'll have a fully configured development environment ready to use.
 
@@ -54,8 +54,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ```bash
 curl https://pyenv.run | bash
-pyenv install 3.11.9
-pyenv global 3.11.9
+pyenv install 3.13.13
+pyenv global 3.13.13
 ```
 
 #### Get the code
@@ -69,8 +69,7 @@ cd waldur-mastermind
 
 ```bash
 uv sync --dev
-uv pip install -e .
-uv run pre-commit install
+uv tool install prek
 ```
 
 **NB**: If you use a machine with Apple M1 CPU, run this before:
@@ -109,10 +108,20 @@ ALTER DATABASE waldur OWNER TO waldur;
 
 #### Final Setup Steps
 
-Run migrations:
+Create the database schema (`migrate_fresh` builds it from the models in seconds when
+the database is empty; use `migrate` for an existing database):
 
 ```bash
-uv run waldur migrate --noinput
+uv run waldur migrate_fresh
+```
+
+Load the system roles, notifications and feature flags (migrations do not seed them;
+the Docker image's `initdb` runs the same commands):
+
+```bash
+uv run waldur import_roles docker/rootfs/etc/waldur/permissions.yaml
+uv run waldur load_notifications docker/rootfs/etc/waldur/notifications.json
+uv run waldur load_features docker/rootfs/etc/waldur/features.json
 ```
 
 Collect static files:

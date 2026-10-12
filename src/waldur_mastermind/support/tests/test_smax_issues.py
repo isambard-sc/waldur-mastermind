@@ -1,14 +1,24 @@
 from unittest import mock
 
-from dbtemplates.models import Template
 from rest_framework import status
 
 from waldur_core.core import utils as core_utils
+from waldur_core.core.models import NotificationTemplate
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.support import models, tasks
 from waldur_mastermind.support.backend.smax import SmaxServiceBackend
 from waldur_mastermind.support.backend.smax_utils import Issue
 from waldur_mastermind.support.tests import factories, fixtures, smax_base
+from waldur_mastermind.support.utils import get_issue_thread_headers
+
+
+def _set_notification_template(path, content):
+    # update_or_create rather than a bare .create(): path is now unique, and
+    # this notification path is real (part of the registered NOTIFICATIONS),
+    # so another test setting it up first must not fail this one.
+    NotificationTemplate.objects.update_or_create(
+        path=path, defaults={"name": path, "content": content}
+    )
 
 
 class IssueCreateTest(smax_base.BaseTest):
@@ -19,11 +29,14 @@ class IssueCreateTest(smax_base.BaseTest):
         self.caller = self.fixture.support_user.user
         self.smax_issue = Issue(1, "test", "description", "RequestStatusReady")
         self.mock_smax().add_issue.return_value = self.smax_issue
+        # Create a RequestType for issue type validation
+        self.request_type = factories.RequestTypeFactory()
 
     def _get_valid_payload(self, **additional):
         payload = {
             "summary": "test_issue",
             "caller": structure_factories.UserFactory.get_url(user=self.caller),
+            "type": self.request_type.name,
         }
         payload.update(additional)
         return payload
@@ -82,12 +95,29 @@ class SyncFromSmaxTest(smax_base.BaseTest):
 
     def test_web_hook(self):
         url = "/api/support-smax-webhook/"
-        response = self.client.post(url, data={"id": self.issue.backend_id})
+        response = self.client.post(
+            url,
+            data={"id": self.issue.backend_id},
+            HTTP_X_WEBHOOK_SECRET=smax_base.SMAX_WEBHOOK_TEST_SECRET,
+        )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.mock_smax().get_issue.assert_called_once()
         self.issue.refresh_from_db()
         self.assertEqual(self.issue.status, self.smax_issue.status)
         self.assertEqual(self.issue.summary, self.smax_issue.summary)
+
+    def test_sync_skips_issue_without_backend_id(self):
+        """Issues that have not been pushed to SMAX yet (backend_id IS NULL)
+        must be skipped without calling the SMAX API — otherwise SMAX returns
+        HTTP 500 "Invalid entity id 'None'".
+        """
+        self.issue.backend_id = None
+        self.issue.save()
+        self.mock_smax().get_issue.reset_mock()
+
+        self.backend.sync_issues()
+
+        self.mock_smax().get_issue.assert_not_called()
 
 
 class IssueLinksTest(smax_base.BaseTest):
@@ -120,21 +150,22 @@ class IssueNotificationTest(smax_base.BaseTest):
         structure_factories.NotificationFactory(
             key="support.notification_issue_updated", enabled=True
         )
-        Template.objects.create(
-            name="support/notification_issue_updated_message.html",
-            content="New: {{ description|safe }}, old: {{ old_description|safe }}",
+        _set_notification_template(
+            "support/notification_issue_updated_message.html",
+            "New: {{ description|safe }}, old: {{ old_description|safe }}",
         )
-        Template.objects.create(
-            name="support/notification_issue_updated_message.txt",
-            content="New: {{ description }}, old: {{ old_description }}",
+        _set_notification_template(
+            "support/notification_issue_updated_message.txt",
+            "New: {{ description }}, old: {{ old_description }}",
         )
         serialized_issue = core_utils.serialize_instance(self.issue)
         tasks.send_issue_updated_notification(
             serialized_issue, {"description": "<p>old message</p>"}
         )
         mock_send_mail.assert_called_once_with(
-            f"Updated issue: {self.issue.key} {self.issue.summary}",
-            "New: message\n\n, old: old message\n\n",
+            f"[{self.issue.key}] Updated issue: {self.issue.summary}",
+            "New: message, old: old message",
             [self.issue.caller.email],
             html_message="New: <p>message</p>, old: <p>old message</p>",
+            headers=get_issue_thread_headers(self.issue.uuid),
         )

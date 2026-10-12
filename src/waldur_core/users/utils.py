@@ -1,22 +1,34 @@
+import collections
 import logging
+from typing import Any
 
 import requests
 from constance import config
 from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
 from django.core.signing import BadSignature, TimestampSigner
 from django.db import transaction
+from django.db.models import Q
 from python_freeipa import exceptions as freeipa_exceptions
 from rest_framework import serializers
 
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
+from waldur_core.core.enums import ReviewStates
 from waldur_core.core.utils import pwgen
+from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.utils import (
+    build_role_index,
     get_create_permission,
     get_customer,
+    get_permissions,
+    get_scope_ancestors,
+    get_scope_ids,
     get_users_with_permission,
+    get_valid_content_types,
     has_permission,
 )
+from waldur_core.structure import managers as structure_managers
 from waldur_core.users import models
 from waldur_core.users.enums import InvitationState
 from waldur_freeipa import tasks
@@ -26,9 +38,54 @@ from waldur_freeipa.utils import generate_username
 
 logger = logging.getLogger(__name__)
 
+# Calls and proposals are valid invitation scopes, but the shared
+# users/invitation_created template is phrased for organization and project
+# roles, so they render their own notifications instead. Scopes are matched by
+# model label rather than by class because waldur_core must not import
+# waldur_mastermind.
+CALL_LABEL = "proposal.call"
+PROPOSAL_LABEL = "proposal.proposal"
+
+DEFAULT_INVITATION_EVENT_TYPE = "invitation_created"
+
+SCOPE_INVITATION_EVENT_TYPES = {
+    CALL_LABEL: "call_invitation_created",
+    PROPOSAL_LABEL: "proposal_invitation_created",
+}
+
+
+def get_invitation_event_type(invitation: models.Invitation) -> str:
+    """Return the notification key matching the invitation scope."""
+    if invitation.scope is None:
+        return DEFAULT_INVITATION_EVENT_TYPE
+    return SCOPE_INVITATION_EVENT_TYPES.get(
+        invitation.scope._meta.label_lower, DEFAULT_INVITATION_EVENT_TYPE
+    )
+
+
+def get_scope_specific_context(scope) -> dict[str, Any]:
+    """Return extra template variables for the call-for-proposals scopes."""
+    label = scope._meta.label_lower
+    if label == CALL_LABEL:
+        return {"organizer_name": scope.manager.customer.name}
+    if label == PROPOSAL_LABEL:
+        return {
+            "call_name": scope.round.call.name,
+            "round_cutoff_time": scope.round.cutoff_time,
+        }
+    return {}
+
 
 def get_invitation_context(invitation: models.Invitation, sender):
-    context = {"extra_invitation_text": invitation.extra_invitation_text}
+    context: dict[str, Any] = {
+        "extra_invitation_text": invitation.extra_invitation_text
+    }
+
+    if invitation.scope is None:
+        raise ValueError(
+            f"Invitation {invitation.uuid} has no scope - "
+            "the related object may have been deleted"
+        )
 
     context.update(
         dict(
@@ -39,6 +96,7 @@ def get_invitation_context(invitation: models.Invitation, sender):
             role=invitation.role.description,
         )
     )
+    context.update(get_scope_specific_context(invitation.scope))
     context["sender"] = sender
     context["invitation"] = invitation
     return context
@@ -120,22 +178,12 @@ def get_or_create_user(invitation):
     if user:
         return user, False
 
-    payload = {
-        field: getattr(invitation, field)
-        for field in (
-            "full_name",
-            "native_name",
-            "organization",
-            "civil_number",
-            "job_title",
-            "phone_number",
-        )
-    }
+    # Create user with minimal data - profile fields should come from IdP or self-assertion,
+    # not from invitation. Invitation fields are for email personalization only.
     user = core_models.User.objects.create_user(
         username=username,
         email=invitation.email,
         registration_method="FREEIPA",
-        **payload,
     )
     user.set_unusable_password()
     user.save()
@@ -169,14 +217,38 @@ def get_scope_link(scope_type, scope_uuid):
         "project": "projects",
         "organization": "organizations",
         "call": "calls",
+        "proposal": "proposals",
+        "resource": "resources",
+        "resource project": "resource-projects",
+        # Offerings are a valid invitation scope (see TYPE_MAP). The
+        # provider-side offering page is nested under its customer, so link to
+        # the public offering route, which is keyed by the offering uuid alone.
+        "offering": "marketplace-public-offering",
     }
-    api_suffix = scope_to_homeport_prefix_map.get(scope_type, "unknown")
+    # ``scope_type`` is the model's verbose_name and its capitalization is not
+    # consistent across models — Customer declares "organization" while
+    # Offering declares "Offering". Match case-insensitively so a capitalized
+    # verbose_name does not silently fall through to /unknown/.
+    api_suffix = scope_to_homeport_prefix_map.get(str(scope_type).lower(), "unknown")
+    if api_suffix == "unknown":
+        logger.warning(
+            "No HomePort route is mapped for invitation scope type %s; "
+            "the notification will contain a dead scope link.",
+            scope_type,
+        )
     return core_utils.format_homeport_link(
         "{api_suffix}/{scope_uuid}/", api_suffix=api_suffix, scope_uuid=scope_uuid
     )
 
 
-def can_manage_invitation_with(request, scope):
+def can_manage_invitation_with(request, scope, role_index=None):
+    """Whether the user may manage an invitation whose scope is ``scope``.
+
+    ``role_index`` is an optional lookup table from
+    ``permissions.utils.build_role_index``, threaded straight through to every
+    ``has_permission`` call so a batched caller runs this exact decision tree
+    rather than a second, drifting copy of it.
+    """
     # Check if the scope is a soft-deleted project
     if scope._meta.model_name == "project" and getattr(scope, "is_removed", False):
         return False
@@ -188,44 +260,325 @@ def can_manage_invitation_with(request, scope):
     if not permission:
         return False
 
-    if has_permission(request, permission, scope):
+    if has_permission(request, permission, scope, role_index):
+        return True
+
+    # Walk up to the parent project (e.g. Resource → Project) so project
+    # admins/managers can invite into resources within their project.
+    project = getattr(scope, "project", None)
+    if project is not None and has_permission(request, permission, project, role_index):
         return True
 
     customer = get_customer(scope)
-    if has_permission(request, permission, customer):
+    if has_permission(request, permission, customer, role_index):
         return True
+
+    # Also allow users who have authority over the customer org itself (e.g. CUSTOMER.OWNER)
+    # to manage invitations for any nested scope (project, offering, etc.).
+    if customer is not scope:
+        customer_permission = get_create_permission(customer)
+        if customer_permission and has_permission(
+            request, customer_permission, customer, role_index
+        ):
+            return True
 
     # In the call scope, to allow call_organizer role to manage invitation, we have to set permission scope to callmanagingorganisation
     if scope._meta.model_name == "call" and customer.callmanagingorganisation:
-        if has_permission(request, permission, customer.callmanagingorganisation):
+        if has_permission(
+            request, permission, customer.callmanagingorganisation, role_index
+        ):
             return True
 
     return False
 
 
+def can_manage_permission_request(request, invitation, role_index=None):
+    # Approving an auto_create_project invitation creates a project and grants a
+    # PROJECT role on it (see PermissionRequest.approve), so the relevant authority
+    # is project creation within the customer rather than customer membership
+    # management. Without this, a customer role that has CREATE_PROJECT_PERMISSION
+    # but not CREATE_CUSTOMER_PERMISSION is offered the approve action in the UI
+    # yet receives a 404 from the API.
+    if invitation.auto_create_project:
+        if request.user.is_staff:
+            return True
+        return has_permission(
+            request,
+            PermissionEnum.CREATE_PROJECT_PERMISSION,
+            invitation.customer,
+            role_index,
+        )
+    return can_manage_invitation_with(request, invitation.scope, role_index)
+
+
+def get_manageable_permission_requests(request):
+    """Pending permission requests the user is actually able to act on.
+
+    ``can_manage_permission_request`` is the authority — it is what
+    ``PermissionRequestViewSet.perform_action`` gates on — but it walks scope
+    parents and branches on ``auto_create_project``, so it has no single SQL
+    equivalent. Narrowing in SQL to the scopes the user holds a create-role on
+    (plus their customers) and confirming each candidate in Python keeps a
+    badge count and the approve endpoint from ever disagreeing.
+
+    Deliberately not ``filter_queryset_for_user``: ``PermissionRequest`` has no
+    ``list_permission``, so that yields who may *see* a request — any role on
+    the customer, plus its author — not who may approve it.
+
+    Staff are narrowed by the same SQL as everyone else even though
+    ``can_manage_permission_request`` lets them approve anything: this backs a
+    personal dashboard, not an admin queue, matching how the resource and
+    invoice providers scope staff to their own organizations.
+
+    The per-candidate confirmation runs against a role index built once up
+    front, so the query count stays flat rather than growing with the number of
+    pending requests — see ``_build_permission_request_role_index``.
+    """
+    user = request.user
+    subquery = Q(
+        invitation__customer__in=structure_managers.get_connected_customers(user)
+    )
+    for content_type in get_valid_content_types():
+        permission = get_create_permission(content_type.model_class())
+        if not permission:
+            continue
+        subquery |= Q(
+            invitation__content_type=content_type,
+            invitation__object_id__in=get_scope_ids(
+                user, content_type, permission=permission
+            ),
+        )
+
+    candidates = list(
+        models.PermissionRequest.objects.filter(subquery, state=ReviewStates.PENDING)
+        .select_related("invitation", "invitation__customer")
+        # can_manage_invitation_with reads invitation.scope, a generic FK, so
+        # without this each candidate costs its own query.
+        .prefetch_related("invitation__scope")
+    )
+    role_index = _build_permission_request_role_index(user, candidates)
+    return [
+        permission_request
+        for permission_request in candidates
+        if can_manage_permission_request(
+            request, permission_request.invitation, role_index
+        )
+    ]
+
+
+def _build_permission_request_role_index(user, permission_requests):
+    """Pre-answer every role lookup ``can_manage_permission_request`` will make.
+
+    The prefetch above only spares the generic-FK fetch; without this, each
+    candidate still costs up to four ``has_permission`` queries as the tree
+    walks scope → parent project → customer → call organiser. That is a per-row
+    cost on an endpoint hit on every page load.
+
+    The pairs collected here deliberately **over-cover** the decision tree
+    rather than mirroring it — a pair the tree never consults only widens an
+    ``IN`` list, whereas a pair it consults but which is missing falls back to
+    its own query (see ``has_permission``). So this stays correct as the tree
+    changes.
+    """
+    pairs = []
+    for permission_request in permission_requests:
+        invitation = permission_request.invitation
+        customer = invitation.customer
+        scope = invitation.scope
+        permissions = {PermissionEnum.CREATE_PROJECT_PERMISSION}
+        if scope is not None:
+            permissions.add(get_create_permission(scope))
+        if customer is not None:
+            permissions.add(get_create_permission(customer))
+        scopes = [customer]
+        if scope is not None:
+            scopes.extend(get_scope_ancestors(scope))
+            if scope._meta.model_name == "call" and customer is not None:
+                scopes.append(
+                    getattr(customer, "callmanagingorganisation", None),
+                )
+        for permission in permissions:
+            for candidate_scope in scopes:
+                pairs.append((permission, candidate_scope))
+    return build_role_index(user, pairs)
+
+
+def get_invitation_duplicates(scope, invitations):
+    if not invitations:
+        return []
+
+    pair_conditions = Q()
+    for item in invitations:
+        pair_conditions |= Q(email__iexact=item["email"], role=item["role"])
+
+    pending_states = [
+        InvitationState.PENDING,
+        InvitationState.PENDING_PROJECT,
+        InvitationState.REQUESTED,
+    ]
+    existing_invitations = (
+        models.Invitation.objects.filter(
+            content_type=ContentType.objects.get_for_model(scope),
+            object_id=scope.id,
+            state__in=pending_states,
+        )
+        .filter(pair_conditions)
+        .order_by("created")
+    )
+
+    existing_by_pair = {}
+    for invitation in existing_invitations:
+        key = (invitation.email.lower(), invitation.role.uuid)
+        if key not in existing_by_pair:
+            existing_by_pair[key] = invitation
+
+    duplicates = []
+    added = set()
+    seen = set()
+    for item in invitations:
+        key = (item["email"].lower(), item["role"].uuid)
+        is_request_duplicate = key in seen
+        seen.add(key)
+        if key in added:
+            continue
+        if key in existing_by_pair or is_request_duplicate:
+            existing = existing_by_pair.get(key)
+            duplicates.append(
+                {
+                    "email": item["email"],
+                    "role": item["role"].uuid,
+                    "existing_invitation_uuid": (
+                        existing.uuid if existing is not None else None
+                    ),
+                }
+            )
+            added.add(key)
+
+    return duplicates
+
+
+def get_invitation_existing_roles(scope, invitations):
+    """Active roles the invitees already hold in ``scope``.
+
+    The invitee is known only by email here, so resolution goes through
+    ``User.email``, which carries no unique constraint: one address may resolve
+    to several accounts, and the roles of all of them are reported. Entries are
+    keyed by (email as written, requested role, held role) and carry no user
+    identity, so two accounts sharing an address and a role collapse into one
+    entry, while two rows differing only in case each keep their own.
+
+    This reports what the scope holds, not what a grant would do — acceptance is
+    decided for the accepting user by ``validate_role_grant``, which also
+    consults INVITATION_DISABLE_MULTIPLE_ROLES and ONLY_ONE_PROJECT_MANAGER. The
+    caller decides how loudly to say it.
+    """
+    if not invitations:
+        return []
+
+    email_conditions = Q()
+    for item in invitations:
+        email_conditions |= Q(email__iexact=item["email"])
+
+    users_by_email = collections.defaultdict(list)
+    for user in core_models.User.objects.filter(email_conditions, is_active=True):
+        users_by_email[user.email.lower()].append(user)
+
+    if not users_by_email:
+        return []
+
+    user_ids = [user.id for users in users_by_email.values() for user in users]
+    roles_by_user_id = collections.defaultdict(list)
+    for permission in get_permissions(scope).filter(user_id__in=user_ids):
+        roles_by_user_id[permission.user_id].append(permission.role)
+
+    existing_roles = []
+    seen = set()
+    for item in invitations:
+        requested_role = item["role"]
+        # Sorted here rather than in the query: ordering the UserRole rows would
+        # only settle the order within one account, leaving the order across
+        # accounts sharing the address up to the database.
+        held_roles = sorted(
+            (
+                role
+                for user in users_by_email.get(item["email"].lower(), [])
+                for role in roles_by_user_id.get(user.id, [])
+            ),
+            key=lambda role: (role.name, role.uuid),
+        )
+        for role in held_roles:
+            # Keyed on the email as written, so a caller matching entries back
+            # to its request rows by email still finds a row that differs from
+            # another only in case.
+            key = (item["email"], requested_role.uuid, role.uuid)
+            if key in seen:
+                continue
+            seen.add(key)
+            existing_roles.append(
+                {
+                    "email": item["email"],
+                    "role": requested_role.uuid,
+                    "existing_role": role.uuid,
+                    "existing_role_name": role.name,
+                    "existing_role_description": role.description or role.name,
+                    "is_same_role": role.pk == requested_role.pk,
+                }
+            )
+
+    return existing_roles
+
+
 def get_users_for_notification_about_request_has_been_submitted(
     permission_request: models.PermissionRequest,
 ):
-    staff_users = (
+    invitation = permission_request.invitation
+
+    # Notify the users who are actually authorized to approve the request. This
+    # must mirror can_manage_permission_request: for an auto_create_project
+    # invitation approval creates a project and grants a project role within the
+    # customer, so the relevant authority is project creation within the customer
+    # (typically the customer owners), NOT customer creation. Resolving the
+    # permission from the scope type via get_create_permission() would yield
+    # CREATE_CUSTOMER_PERMISSION for a customer-scoped invitation, which no owner
+    # holds, leaving the recipient list empty.
+    if invitation.auto_create_project:
+        users = get_users_with_permission(
+            invitation.customer, PermissionEnum.CREATE_PROJECT_PERMISSION
+        )
+    else:
+        scope = invitation.scope
+        permission = get_create_permission(scope)
+        if not permission:
+            return core_models.User.objects.none()
+
+        users = get_users_with_permission(scope, permission)
+        customer = get_customer(scope)
+        if customer != scope:
+            users |= get_users_with_permission(customer, permission)
+
+    return users.exclude(email="").exclude(notifications_enabled=False)
+
+
+def get_staff_users_for_notification():
+    return (
         core_models.User.objects.filter(is_staff=True, is_active=True)
         .exclude(email="")
         .exclude(notifications_enabled=False)
     )
 
-    scope = permission_request.invitation.scope
 
-    permission = get_create_permission(scope)
-    if not permission:
-        return staff_users
-
-    users = get_users_with_permission(scope, permission)
-    customer = get_customer(scope)
-    if customer != scope:
-        users |= get_users_with_permission(customer, permission)
-
-    users = users.exclude(email="").exclude(notifications_enabled=False)
-
-    return users or staff_users
+def get_customer_notification_emails(customer):
+    """Return the customer's contact email plus its configured notification emails."""
+    emails = []
+    if customer.email:
+        emails.append(customer.email)
+    if customer.notification_emails:
+        emails += [
+            email.strip()
+            for email in customer.notification_emails.split(",")
+            if email.strip()
+        ]
+    return emails
 
 
 def post_invitation_to_url(url: str, context):

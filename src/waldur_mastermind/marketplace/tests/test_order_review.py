@@ -12,15 +12,18 @@ from rest_framework import status, test
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
     CustomerRole,
+    OfferingRole,
     ProjectRole,
     ServiceProviderRole,
 )
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures
 from waldur_core.structure.tests import fixtures as structure_fixtures
-from waldur_mastermind.marketplace import models, tasks
+from waldur_mastermind.marketplace import models, tasks, utils, views
 from waldur_mastermind.marketplace.enums import (
     BASIC_OFFERING,
+    SCRIPT_OFFERING,
+    SITE_AGENT_OFFERING,
     BillingTypes,
     OrderStates,
     OrderTypes,
@@ -31,7 +34,7 @@ from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
 
 
-class OrderApproveByConsumerTest(test.APITransactionTestCase):
+class OrderApproveByConsumerTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -198,6 +201,36 @@ class OrderApproveByConsumerTest(test.APITransactionTestCase):
         order.refresh_from_db()
         self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
 
+    def test_update_order_requires_purchase_order_when_configured(self):
+        self.order.type = OrderTypes.UPDATE
+        self.order.offering.plugin_options = {"require_purchase_order_upload": True}
+        self.order.offering.save()
+        self.order.save(update_fields=["type"])
+        response = self.approve_order(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_terminate_order_does_not_require_purchase_order(self):
+        # A purchase order authorises spending, so it must never stand between
+        # a user and stopping a resource — there is no way to attach one to a
+        # terminate order either.
+        self.order.type = OrderTypes.TERMINATE
+        self.order.offering.plugin_options = {"require_purchase_order_upload": True}
+        self.order.offering.save()
+        self.order.save(update_fields=["type"])
+        response = self.approve_order(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_update_order_with_attachment_is_approved_when_purchase_order_required(
+        self,
+    ):
+        self.order.type = OrderTypes.UPDATE
+        self.order.offering.plugin_options = {"require_purchase_order_upload": True}
+        self.order.offering.save()
+        self.order.attachment = "marketplace_order_attachments/po.pdf"
+        self.order.save(update_fields=["type", "attachment"])
+        response = self.approve_order(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
     def approve_order(self, user, order=None):
         order = order or self.order
         self.client.force_authenticate(user)
@@ -341,7 +374,7 @@ class OrderApproveByProviderTest(test.APITransactionTestCase):
 
 
 @ddt
-class OrderRejectByConsumerTest(test.APITransactionTestCase):
+class OrderRejectByConsumerTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -353,10 +386,10 @@ class OrderRejectByConsumerTest(test.APITransactionTestCase):
         ProjectRole.MANAGER.add_permission(PermissionEnum.REJECT_ORDER)
         ProjectRole.ADMIN.add_permission(PermissionEnum.REJECT_ORDER)
 
-    def reject_order(self, user):
+    def reject_order(self, user, data=None):
         url = factories.OrderFactory.get_url(self.order, "reject_by_consumer")
         self.client.force_authenticate(user)
-        return self.client.post(url)
+        return self.client.post(url, data=data)
 
     @data("staff", "manager", "admin", "owner")
     def test_authorized_user_can_reject_order(self, user):
@@ -384,9 +417,63 @@ class OrderRejectByConsumerTest(test.APITransactionTestCase):
         response = self.reject_order(self.fixture.manager)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_error_details_are_saved_when_provided(self):
+        error_data = {
+            "error_message": "Test error message",
+            "error_traceback": "Test stack trace",
+        }
+        response = self.reject_order(self.fixture.staff, data=error_data)
+
+        self.order.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.state, OrderStates.REJECTED)
+        self.assertEqual(self.order.error_message, "Test error message")
+        self.assertEqual(self.order.error_traceback, "Test stack trace")
+        self.assertIsNotNone(self.order.error_updated_at)
+
+    def test_empty_request_still_works(self):
+        response = self.reject_order(self.fixture.staff)
+
+        self.order.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.state, OrderStates.REJECTED)
+        self.assertEqual(self.order.error_message, "")
+        self.assertEqual(self.order.error_traceback, "")
+
+    def test_partial_error_data_works(self):
+        error_data = {"error_message": "Only message provided"}
+        response = self.reject_order(self.fixture.staff, data=error_data)
+
+        self.order.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.state, OrderStates.REJECTED)
+        self.assertEqual(self.order.error_message, "Only message provided")
+        self.assertEqual(self.order.error_traceback, "")
+
+    def test_consumer_rejection_comment_is_saved(self):
+        data = {"consumer_rejection_comment": "Budget not approved"}
+        response = self.reject_order(self.fixture.staff, data=data)
+
+        self.order.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.state, OrderStates.REJECTED)
+        self.assertEqual(self.order.consumer_rejection_comment, "Budget not approved")
+
+    def test_consumer_rejection_comment_defaults_to_empty(self):
+        response = self.reject_order(self.fixture.staff)
+
+        self.order.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.consumer_rejection_comment, "")
+
 
 @ddt
-class OrderRejectByProviderTest(test.APITransactionTestCase):
+class OrderRejectByProviderTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -484,15 +571,49 @@ class OrderRejectByProviderTest(test.APITransactionTestCase):
         self.order.refresh_from_db()
         self.assertEqual(ResourceStates.OK, self.order.resource.state)
 
-    def reject_order(self, user):
+    def reject_order(self, user, data=None):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
         url = factories.OrderFactory.get_url(self.order, "reject_by_provider")
-        return self.client.post(url)
+        return self.client.post(url, data=data)
+
+    def test_provider_rejection_comment_is_saved(self):
+        data = {"provider_rejection_comment": "Insufficient resources available"}
+        response = self.reject_order("owner", data=data)
+
+        self.order.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.state, OrderStates.REJECTED)
+        self.assertEqual(
+            self.order.provider_rejection_comment, "Insufficient resources available"
+        )
+
+    def test_empty_body_still_works_for_provider_rejection(self):
+        response = self.reject_order("owner")
+
+        self.order.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.state, OrderStates.REJECTED)
+        self.assertEqual(self.order.provider_rejection_comment, "")
+
+    def test_provider_rejection_comment_visible_in_order_detail(self):
+        data = {"provider_rejection_comment": "Cannot fulfill order"}
+        self.reject_order("owner", data=data)
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OrderFactory.get_url(self.order)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["provider_rejection_comment"], "Cannot fulfill order"
+        )
 
 
 @ddt
-class ApproveOrderAsProviderFilterTest(test.APITransactionTestCase):
+class ApproveOrderAsProviderFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.order = self.fixture.order
@@ -523,7 +644,7 @@ class ApproveOrderAsProviderFilterTest(test.APITransactionTestCase):
 
 
 @ddt
-class ApproveOrderAsConsumerFilterTest(test.APITransactionTestCase):
+class ApproveOrderAsConsumerFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.fixture.order.state = OrderStates.PENDING_CONSUMER
@@ -555,7 +676,7 @@ class ApproveOrderAsConsumerFilterTest(test.APITransactionTestCase):
         self.assertEqual(len(response.json()), expected)
 
 
-class OrderApprovalByConsumerNotificationTest(test.APITransactionTestCase):
+class OrderApprovalByConsumerNotificationTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
 
@@ -588,7 +709,7 @@ class OrderApprovalByConsumerNotificationTest(test.APITransactionTestCase):
         self.assertEqual(len(mail.outbox), 0)
 
 
-class OrderApprovalByProviderNotificationTest(test.APITransactionTestCase):
+class OrderApprovalByProviderNotificationTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.order = self.fixture.order
@@ -614,3 +735,158 @@ class OrderApprovalByProviderNotificationTest(test.APITransactionTestCase):
     def test_notification_is_not_sent_when_there_are_no_approvers(self):
         tasks.notify_provider_about_pending_order(self.fixture.order.uuid.hex)
         self.assertEqual(len(mail.outbox), 0)
+
+
+class ScriptOfferingOrderReviewTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.project = self.fixture.project
+        self.manager = self.fixture.manager
+        CustomerRole.OWNER.add_permission(PermissionEnum.APPROVE_ORDER)
+
+    def test_script_offering_auto_approves_by_default(self):
+        """Test that SCRIPT_OFFERING orders skip provider approval by default."""
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer, type=SCRIPT_OFFERING
+        )
+        order = factories.OrderFactory(
+            offering=offering, project=self.project, created_by=self.manager
+        )
+
+        # Should return True (skip approval) by default
+        result = utils.order_should_not_be_reviewed_by_provider(order)
+        self.assertTrue(result)
+
+    def test_script_offering_requires_approval_when_flag_is_false(self):
+        """Test that SCRIPT_OFFERING orders require provider approval when auto_approve_marketplace_script=False."""
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            type=SCRIPT_OFFERING,
+            plugin_options={"auto_approve_marketplace_script": False},
+        )
+        order = factories.OrderFactory(
+            offering=offering, project=self.project, created_by=self.manager
+        )
+
+        # Should return False (require approval) when flag is False
+        result = utils.order_should_not_be_reviewed_by_provider(order)
+        self.assertFalse(result)
+
+    def test_script_offering_requires_approval_for_service_provider_owner_when_disabled(
+        self,
+    ):
+        """Test that service provider owners require approval when auto_approve_marketplace_script=False."""
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            type=SCRIPT_OFFERING,
+            plugin_options={"auto_approve_marketplace_script": False},
+        )
+        order = factories.OrderFactory(
+            offering=offering,
+            project=self.project,
+            created_by=self.fixture.owner,  # Owner is also the offering owner
+        )
+
+        # Should return False (require approval) even for service provider owner
+        result = utils.order_should_not_be_reviewed_by_provider(order)
+        self.assertFalse(result)
+
+    def test_script_offering_requires_approval_for_staff_when_disabled(self):
+        """Test that staff users require approval when auto_approve_marketplace_script=False."""
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            type=SCRIPT_OFFERING,
+            plugin_options={"auto_approve_marketplace_script": False},
+        )
+        order = factories.OrderFactory(
+            offering=offering,
+            project=self.project,
+            created_by=self.fixture.staff,
+        )
+
+        # Should return False (require approval) even for staff user
+        result = utils.order_should_not_be_reviewed_by_provider(order)
+        self.assertFalse(result)
+
+
+@ddt
+class ProviderOrderReviewOfferingScopeTest(test.APITestCase):
+    """A site agent runs as OFFERING.MANAGER, and every order of a site-agent
+    offering waits for provider review, so the agent must be able to approve
+    and reject it without a customer-wide role.
+    See waldur/waldur-mastermind#400.
+    """
+
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(type=SITE_AGENT_OFFERING)
+        self.order = self.pending_order(self.offering)
+        self.offering_manager = structure_factories.UserFactory()
+        self.offering.add_user(self.offering_manager, OfferingRole.MANAGER)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.LIST_ORDERS)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.APPROVE_ORDER)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.REJECT_ORDER)
+
+    def pending_order(self, offering):
+        return factories.OrderFactory(
+            project=self.fixture.project,
+            created_by=self.fixture.manager,
+            offering=offering,
+            resource=factories.ResourceFactory(offering=offering),
+            state=OrderStates.PENDING_PROVIDER,
+        )
+
+    def review(self, action, order=None):
+        order = order or self.order
+        self.client.force_authenticate(self.offering_manager)
+        response = self.client.post(factories.OrderFactory.get_url(order, action))
+        order.refresh_from_db()
+        return response
+
+    def test_offering_manager_can_approve_order(self):
+        response = self.review("approve_by_provider")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self.order.state, OrderStates.EXECUTING)
+
+    def test_offering_manager_can_reject_order(self):
+        response = self.review("reject_by_provider")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.state, OrderStates.REJECTED)
+
+    @data("approve_by_provider", "reject_by_provider")
+    def test_offering_manager_can_not_review_order_of_another_offering(self, action):
+        other = self.pending_order(factories.OfferingFactory(type=SITE_AGENT_OFFERING))
+
+        response = self.review(action, other)
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(other.state, OrderStates.PENDING_PROVIDER)
+
+    @data(
+        ("approve_by_provider", PermissionEnum.APPROVE_ORDER),
+        ("reject_by_provider", PermissionEnum.REJECT_ORDER),
+    )
+    def test_role_without_the_permission_is_still_refused(self, case):
+        """The grant is what unlocks this — not membership of the offering."""
+        action, permission = case
+        OfferingRole.MANAGER.delete_permission(permission)
+
+        response = self.review(action)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.order.state, OrderStates.PENDING_PROVIDER)
+
+    @data("approve_by_provider", "reject_by_provider")
+    def test_order_reviewed_after_validation_is_refused(self, action):
+        """A concurrent review can land between the state validator and the
+        row lock; the re-check under the lock must refuse the second one."""
+        self.order.state = OrderStates.EXECUTING
+        self.order.save(update_fields=["state"])
+
+        with mock.patch.object(views.OrderViewSet, f"{action}_validators", []):
+            response = self.review(action)
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(self.order.state, OrderStates.EXECUTING)

@@ -1,10 +1,17 @@
-from enum import Enum
+from enum import Enum, StrEnum
 
 
-class EventType(str, Enum):
+class EventType(StrEnum):
     ACCESS_SUBNET_CREATION_SUCCEEDED = "access_subnet_creation_succeeded"
     ACCESS_SUBNET_DELETION_SUCCEEDED = "access_subnet_deletion_succeeded"
     ACCESS_SUBNET_UPDATE_SUCCEEDED = "access_subnet_update_succeeded"
+    OFFERING_ACCESS_SUBNET_CREATION_SUCCEEDED = (
+        "offering_access_subnet_creation_succeeded"
+    )
+    OFFERING_ACCESS_SUBNET_DELETION_SUCCEEDED = (
+        "offering_access_subnet_deletion_succeeded"
+    )
+    OFFERING_ACCESS_SUBNET_UPDATE_SUCCEEDED = "offering_access_subnet_update_succeeded"
     ALLOWED_OFFERINGS_HAVE_BEEN_UPDATED = "allowed_offerings_have_been_updated"
     ATTACHMENT_CREATED = "attachment_created"
     ATTACHMENT_DELETED = "attachment_deleted"
@@ -21,7 +28,9 @@ class EventType(str, Enum):
     )
     CALL_DOCUMENT_ADDED = "call_document_added"
     CALL_DOCUMENT_REMOVED = "call_document_removed"
+    CREATE_OF_AFFILIATE_BY_STAFF = "create_of_affiliate_by_staff"
     CREATE_OF_CREDIT_BY_STAFF = "create_of_credit_by_staff"
+    CREATE_OF_PROJECT_CREDIT_BY_STAFF = "create_of_project_credit_by_staff"
     CUSTOM_NOTIFICATION = "custom_notification"
     CUSTOMER_CREATION_SUCCEEDED = "customer_creation_succeeded"
     CUSTOMER_DELETION_SUCCEEDED = "customer_deletion_succeeded"
@@ -47,15 +56,26 @@ class EventType(str, Enum):
     MARKETPLACE_OFFERING_COMPONENT_DELETED = "marketplace_offering_component_deleted"
     MARKETPLACE_OFFERING_COMPONENT_UPDATED = "marketplace_offering_component_updated"
     MARKETPLACE_OFFERING_CREATED = "marketplace_offering_created"
-    MARKETPLACE_OFFERING_ROLE_CREATED = "marketplace_offering_role_created"
-    MARKETPLACE_OFFERING_ROLE_DELETED = "marketplace_offering_role_deleted"
-    MARKETPLACE_OFFERING_ROLE_UPDATED = "marketplace_offering_role_updated"
+    MARKETPLACE_OFFERING_MERGE_CREATED = "marketplace_offering_merge_created"
+    MARKETPLACE_OFFERING_MERGE_EXECUTED = "marketplace_offering_merge_executed"
+    MARKETPLACE_OFFERING_MERGE_FAILED = "marketplace_offering_merge_failed"
+    MARKETPLACE_OFFERING_MERGE_UNDONE = "marketplace_offering_merge_undone"
+    MARKETPLACE_OFFERING_MERGE_VERIFICATION_FAILED = (
+        "marketplace_offering_merge_verification_failed"
+    )
     MARKETPLACE_OFFERING_UPDATED = "marketplace_offering_updated"
+    MARKETPLACE_OFFERING_OPTIONS_UPDATED = "marketplace_offering_options_updated"
+    MARKETPLACE_OFFERING_RESOURCE_OPTIONS_UPDATED = (
+        "marketplace_offering_resource_options_updated"
+    )
     MARKETPLACE_OFFERING_USER_CREATED = "marketplace_offering_user_created"
     MARKETPLACE_OFFERING_USER_UPDATED = "marketplace_offering_user_updated"
     MARKETPLACE_OFFERING_USER_DELETED = "marketplace_offering_user_deleted"
     MARKETPLACE_OFFERING_USER_RESTRICTION_UPDATED = (
         "marketplace_offering_user_restriction_updated"
+    )
+    MARKETPLACE_PROVIDER_PROJECT_GROUP_GID_UPDATED = (
+        "marketplace_provider_project_group_gid_updated"
     )
     MARKETPLACE_ORDER_APPROVED = "marketplace_order_approved"
     MARKETPLACE_ORDER_COMPLETED = "marketplace_order_completed"
@@ -97,6 +117,8 @@ class EventType(str, Enum):
     MARKETPLACE_RESOURCE_UPDATE_END_DATE_SUCCEEDED = (
         "marketplace_resource_update_end_date_succeeded"
     )
+    MARKETPLACE_RESOURCE_API_KEY_ROTATED = "marketplace_resource_api_key_rotated"
+    MARKETPLACE_RESOURCE_API_KEY_REVEALED = "marketplace_resource_api_key_revealed"
     MARKETPLACE_RESOURCE_UPDATE_FAILED = "marketplace_resource_update_failed"
     MARKETPLACE_RESOURCE_UPDATE_LIMITS_FAILED = (
         "marketplace_resource_update_limits_failed"
@@ -104,10 +126,41 @@ class EventType(str, Enum):
     MARKETPLACE_RESOURCE_UPDATE_LIMITS_SUCCEEDED = (
         "marketplace_resource_update_limits_succeeded"
     )
+    MARKETPLACE_RESOURCE_PLAN_SWITCHED = "marketplace_resource_plan_switched"
+    MARKETPLACE_RESOURCE_PROJECT_CREATED = "marketplace_resource_project_created"
+    MARKETPLACE_RESOURCE_PROJECT_RECOVERED = "marketplace_resource_project_recovered"
+    MARKETPLACE_RESOURCE_PROJECT_REMOVED = "marketplace_resource_project_removed"
     MARKETPLACE_RESOURCE_UPDATE_REQUESTED = "marketplace_resource_update_requested"
     MARKETPLACE_RESOURCE_UPDATE_SUCCEEDED = "marketplace_resource_update_succeeded"
-    MARKETPLACE_RESOURCE_USER_CREATED = "marketplace_resource_user_created"
-    MARKETPLACE_RESOURCE_USER_DELETED = "marketplace_resource_user_deleted"
+    MARKETPLACE_RESOURCE_LIMIT_CHANGE_REQUEST_CREATED = (
+        "marketplace_resource_limit_change_request_created"
+    )
+    MARKETPLACE_RESOURCE_LIMIT_CHANGE_REQUEST_APPROVED = (
+        "marketplace_resource_limit_change_request_approved"
+    )
+    MARKETPLACE_RESOURCE_LIMIT_CHANGE_REQUEST_REJECTED = (
+        "marketplace_resource_limit_change_request_rejected"
+    )
+    MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_CREATED = (
+        "marketplace_resource_end_date_change_request_created"
+    )
+    MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_APPROVED = (
+        "marketplace_resource_end_date_change_request_approved"
+    )
+    MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_REJECTED = (
+        "marketplace_resource_end_date_change_request_rejected"
+    )
+    MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_CANCELED = (
+        "marketplace_resource_end_date_change_request_canceled"
+    )
+    MAINTENANCE_ANNOUNCEMENT_CANCELLED = "maintenance_announcement_cancelled"
+    MAINTENANCE_ANNOUNCEMENT_COMPLETED = "maintenance_announcement_completed"
+    MAINTENANCE_ANNOUNCEMENT_CREATED = "maintenance_announcement_created"
+    MAINTENANCE_ANNOUNCEMENT_DELETED = "maintenance_announcement_deleted"
+    MAINTENANCE_ANNOUNCEMENT_SCHEDULED = "maintenance_announcement_scheduled"
+    MAINTENANCE_ANNOUNCEMENT_STARTED = "maintenance_announcement_started"
+    MAINTENANCE_ANNOUNCEMENT_UNSCHEDULED = "maintenance_announcement_unscheduled"
+    MAINTENANCE_ANNOUNCEMENT_UPDATED = "maintenance_announcement_updated"
     NOTIFY_EXTERNAL_USER = "notify_external_user"
     NOTIFY_ORGANIZATION_OWNERS = "notify_organization_owners"
     NOTIFY_PROJECT_TEAM = "notify_project_team"
@@ -118,19 +171,48 @@ class EventType(str, Enum):
     )
     OPENSTACK_FLOATING_IP_DETACHED = "openstack_floating_ip_detached"
     OPENSTACK_FLOATING_IP_DISCONNECTED = "openstack_floating_ip_disconnected"
+    OPENSTACK_INSTANCE_SECURITY_GROUPS_CHANGED = (
+        "openstack_instance_security_groups_changed"
+    )
     OPENSTACK_NETWORK_CLEANED = "openstack_network_cleaned"
     OPENSTACK_NETWORK_CREATED = "openstack_network_created"
     OPENSTACK_NETWORK_DELETED = "openstack_network_deleted"
     OPENSTACK_NETWORK_IMPORTED = "openstack_network_imported"
     OPENSTACK_NETWORK_PULLED = "openstack_network_pulled"
     OPENSTACK_NETWORK_UPDATED = "openstack_network_updated"
+    OPENSTACK_LOAD_BALANCER_CREATED = "openstack_load_balancer_created"
+    OPENSTACK_LOAD_BALANCER_UPDATED = "openstack_load_balancer_updated"
+    OPENSTACK_LOAD_BALANCER_DELETED = "openstack_load_balancer_deleted"
+    OPENSTACK_LOAD_BALANCER_SECURITY_GROUPS_CHANGED = (
+        "openstack_load_balancer_security_groups_changed"
+    )
+    OPENSTACK_LISTENER_CREATED = "openstack_listener_created"
+    OPENSTACK_LISTENER_UPDATED = "openstack_listener_updated"
+    OPENSTACK_LISTENER_DELETED = "openstack_listener_deleted"
+    OPENSTACK_POOL_CREATED = "openstack_pool_created"
+    OPENSTACK_POOL_UPDATED = "openstack_pool_updated"
+    OPENSTACK_POOL_DELETED = "openstack_pool_deleted"
+    OPENSTACK_POOL_MEMBER_CREATED = "openstack_pool_member_created"
+    OPENSTACK_POOL_MEMBER_UPDATED = "openstack_pool_member_updated"
+    OPENSTACK_POOL_MEMBER_DELETED = "openstack_pool_member_deleted"
     OPENSTACK_PORT_CLEANED = "openstack_port_cleaned"
     OPENSTACK_PORT_CREATED = "openstack_port_created"
     OPENSTACK_PORT_DELETED = "openstack_port_deleted"
     OPENSTACK_PORT_IMPORTED = "openstack_port_imported"
     OPENSTACK_PORT_PULLED = "openstack_port_pulled"
     OPENSTACK_PORT_UPDATED = "openstack_port_updated"
+    OPENSTACK_PORT_SECURITY_ENABLED = "openstack_port_security_enabled"
+    OPENSTACK_PORT_SECURITY_DISABLED = "openstack_port_security_disabled"
+    OPENSTACK_PORT_ALLOWED_ADDRESS_PAIRS_CHANGED = (
+        "openstack_port_allowed_address_pairs_changed"
+    )
+    OPENSTACK_PORT_SECURITY_GROUPS_CHANGED = "openstack_port_security_groups_changed"
+    OPENSTACK_RBAC_POLICY_CREATED = "openstack_rbac_policy_created"
+    OPENSTACK_RBAC_POLICY_DELETED = "openstack_rbac_policy_deleted"
+    OPENSTACK_ROUTER_INTERFACE_ADDED = "openstack_router_interface_added"
+    OPENSTACK_ROUTER_INTERFACE_REMOVED = "openstack_router_interface_removed"
     OPENSTACK_ROUTER_UPDATED = "openstack_router_updated"
+    OPENSTACK_SUBNET_HOST_ROUTES_CHANGED = "openstack_subnet_host_routes_changed"
     OPENSTACK_SECURITY_GROUP_CLEANED = "openstack_security_group_cleaned"
     OPENSTACK_SECURITY_GROUP_CREATED = "openstack_security_group_created"
     OPENSTACK_SECURITY_GROUP_DELETED = "openstack_security_group_deleted"
@@ -141,6 +223,7 @@ class EventType(str, Enum):
     OPENSTACK_SECURITY_GROUP_RULE_DELETED = "openstack_security_group_rule_deleted"
     OPENSTACK_SECURITY_GROUP_RULE_IMPORTED = "openstack_security_group_rule_imported"
     OPENSTACK_SECURITY_GROUP_RULE_UPDATED = "openstack_security_group_rule_updated"
+    OPENSTACK_SECURITY_GROUP_RULES_CHANGED = "openstack_security_group_rules_changed"
     OPENSTACK_SECURITY_GROUP_UPDATED = "openstack_security_group_updated"
     OPENSTACK_SECURITY_GROUP_ADDED_REMOTELY = "openstack_security_group_added_remotely"
     OPENSTACK_SECURITY_GROUP_REMOVED_REMOTELY = (
@@ -172,13 +255,24 @@ class EventType(str, Enum):
     PROJECT_UPDATE_REQUEST_APPROVED = "project_update_request_approved"
     PROJECT_UPDATE_REQUEST_CREATED = "project_update_request_created"
     PROJECT_UPDATE_REQUEST_REJECTED = "project_update_request_rejected"
+    PROJECT_END_DATE_CHANGE_REQUEST_APPROVED = (
+        "project_end_date_change_request_approved"
+    )
+    PROJECT_END_DATE_CHANGE_REQUEST_CREATED = "project_end_date_change_request_created"
+    PROJECT_END_DATE_CHANGE_REQUEST_REJECTED = (
+        "project_end_date_change_request_rejected"
+    )
     PROJECT_UPDATE_SUCCEEDED = "project_update_succeeded"
     PROJECT_PERMISSION_REVIEW_CREATED = "project_permission_review_created"
     PROJECT_PERMISSION_REVIEW_CLOSED = "project_permission_review_closed"
     PROPOSAL_CANCELED = "proposal_canceled"
     PROPOSAL_DOCUMENT_ADDED = "proposal_document_added"
     PROPOSAL_DOCUMENT_REMOVED = "proposal_document_removed"
+    PROPOSAL_WORKFLOW_ADVANCED = "proposal_workflow_advanced"
     QUERY_EXECUTED = "query_executed"
+    INCREASE_OF_CUSTOMER_CREDIT_DUE_TO_AFFILIATE_FEE = (
+        "increase_of_customer_credit_due_to_affiliate_fee"
+    )
     REDUCTION_OF_CUSTOMER_CREDIT = "reduction_of_customer_credit"
     REDUCTION_OF_CUSTOMER_CREDIT_DUE_TO_MINIMAL_CONSUMPTION = (
         "reduction_of_customer_credit_due_to_minimal_consumption"
@@ -195,6 +289,11 @@ class EventType(str, Enum):
     )
     REQUEST_DOWNSCALING = "request_downscaling"
     REQUEST_PAUSING = "request_pausing"
+    REQUEST_SLURM_RESOURCE_DOWNSCALING = "request_slurm_resource_downscaling"
+    REQUEST_SLURM_RESOURCE_PAUSING = "request_slurm_resource_pausing"
+    RESET_DOWNSCALING = "reset_downscaling"
+    RESET_MEMBER_RESTRICTION = "reset_member_restriction"
+    RESET_PAUSING = "reset_pausing"
     RESOURCE_ASSIGN_FLOATING_IP_FAILED = "resource_assign_floating_ip_failed"
     RESOURCE_ASSIGN_FLOATING_IP_SCHEDULED = "resource_assign_floating_ip_scheduled"
     RESOURCE_ASSIGN_FLOATING_IP_SUCCEEDED = "resource_assign_floating_ip_succeeded"
@@ -232,6 +331,9 @@ class EventType(str, Enum):
     RESOURCE_PULL_FAILED = "resource_pull_failed"
     RESOURCE_PULL_SCHEDULED = "resource_pull_scheduled"
     RESOURCE_PULL_SUCCEEDED = "resource_pull_succeeded"
+    RESOURCE_RESCUE_FAILED = "resource_rescue_failed"
+    RESOURCE_RESCUE_SCHEDULED = "resource_rescue_scheduled"
+    RESOURCE_RESCUE_SUCCEEDED = "resource_rescue_succeeded"
     RESOURCE_RESTART_FAILED = "resource_restart_failed"
     RESOURCE_RESTART_SCHEDULED = "resource_restart_scheduled"
     RESOURCE_RESTART_SUCCEEDED = "resource_restart_succeeded"
@@ -251,6 +353,9 @@ class EventType(str, Enum):
     RESOURCE_UNASSIGN_FLOATING_IP_FAILED = "resource_unassign_floating_ip_failed"
     RESOURCE_UNASSIGN_FLOATING_IP_SCHEDULED = "resource_unassign_floating_ip_scheduled"
     RESOURCE_UNASSIGN_FLOATING_IP_SUCCEEDED = "resource_unassign_floating_ip_succeeded"
+    RESOURCE_UNRESCUE_FAILED = "resource_unrescue_failed"
+    RESOURCE_UNRESCUE_SCHEDULED = "resource_unrescue_scheduled"
+    RESOURCE_UNRESCUE_SUCCEEDED = "resource_unrescue_succeeded"
     RESOURCE_UPDATE_ALLOWED_ADDRESS_PAIRS_FAILED = (
         "resource_update_allowed_address_pairs_failed"
     )
@@ -263,6 +368,9 @@ class EventType(str, Enum):
     RESOURCE_UPDATE_FLOATING_IPS_FAILED = "resource_update_floating_ips_failed"
     RESOURCE_UPDATE_FLOATING_IPS_SCHEDULED = "resource_update_floating_ips_scheduled"
     RESOURCE_UPDATE_FLOATING_IPS_SUCCEEDED = "resource_update_floating_ips_succeeded"
+    RESOURCE_UPDATE_METADATA_FAILED = "resource_update_metadata_failed"
+    RESOURCE_UPDATE_METADATA_SCHEDULED = "resource_update_metadata_scheduled"
+    RESOURCE_UPDATE_METADATA_SUCCEEDED = "resource_update_metadata_succeeded"
     RESOURCE_UPDATE_PORTS_FAILED = "resource_update_ports_failed"
     RESOURCE_UPDATE_PORTS_SCHEDULED = "resource_update_ports_scheduled"
     RESOURCE_UPDATE_PORTS_SUCCEEDED = "resource_update_ports_succeeded"
@@ -276,7 +384,16 @@ class EventType(str, Enum):
     RESOURCE_UPDATE_SUCCEEDED = "resource_update_succeeded"
     RESTRICT_MEMBERS = "restrict_members"
     REVIEW_CANCELED = "review_canceled"
+    REVIEWER_WORKLOAD_LIMIT_OVERRIDDEN = "reviewer_workload_limit_overridden"
+    ROLE_CLONED = "role_cloned"
+    ROLE_CONCEALED = "role_concealed"
+    ROLE_DEFINITION_CREATED = "role_definition_created"
+    ROLE_DEFINITION_DELETED = "role_definition_deleted"
+    ROLE_DEFINITION_UPDATED = "role_definition_updated"
+    ROLE_DISABLED = "role_disabled"
+    ROLE_ENABLED = "role_enabled"
     ROLE_GRANTED = "role_granted"
+    ROLE_REVEALED = "role_revealed"
     ROLE_REVOKED = "role_revoked"
     ROLE_UPDATED = "role_updated"
     ROLL_BACK_CUSTOMER_CREDIT = "roll_back_customer_credit"
@@ -285,15 +402,20 @@ class EventType(str, Enum):
     SERVICE_ACCOUNT_DELETED = "service_account_deleted"
     SERVICE_ACCOUNT_UPDATED = "service_account_updated"
     SET_TO_ZERO_OVERDUE_CREDIT = "set_to_zero_overdue_credit"
+    SLURM_POLICY_EVALUATION = "slurm_policy_evaluation"
     SSH_KEY_CREATION_SUCCEEDED = "ssh_key_creation_succeeded"
     SSH_KEY_DELETION_SUCCEEDED = "ssh_key_deletion_succeeded"
     TERMINATE_RESOURCES = "terminate_resources"
     TOKEN_CREATED = "token_created"
     TOKEN_LIFETIME_UPDATED = "token_lifetime_updated"
+    UPDATE_OF_AFFILIATE_BY_STAFF = "update_of_affiliate_by_staff"
     UPDATE_OF_CREDIT_BY_STAFF = "update_of_credit_by_staff"
+    UPDATE_OF_PROJECT_CREDIT_BY_STAFF = "update_of_project_credit_by_staff"
     AUTOMATIC_CREDIT_ADJUSTMENT = "automatic_credit_adjustment"
     USER_ACTIVATED = "user_activated"
+    USER_BLOCKED = "user_blocked"
     USER_CREATION_SUCCEEDED = "user_creation_succeeded"
+    USER_DATA_ACCESSED = "user_data_accessed"
     USER_DEACTIVATED = "user_deactivated"
     USER_DEACTIVATED_NO_ROLES = "user_deactivated_no_roles"
     USER_DELETION_SUCCEEDED = "user_deletion_succeeded"
@@ -301,19 +423,62 @@ class EventType(str, Enum):
     USER_HAS_BEEN_CREATED_BY_STAFF = "user_has_been_created_by_staff"
     USER_PASSWORD_UPDATED = "user_password_updated"
     USER_PASSWORD_UPDATED_BY_STAFF = "user_password_updated_by_staff"
+    USER_PASSWORD_REMOVED_BY_STAFF = "user_password_removed_by_staff"
     USER_UPDATE_SUCCEEDED = "user_update_succeeded"
+    USER_GROUP_INVITATION_UPDATED = "user_group_invitation_updated"
+    USER_INVITATION_UPDATED = "user_invitation_updated"
+    USER_INVITATION_DELETED = "user_invitation_deleted"
     TERMS_OF_SERVICE_CONSENT_GRANTED = "terms_of_service_consent_granted"
     TERMS_OF_SERVICE_CONSENT_REVOKED = "terms_of_service_consent_revoked"
+    CHAT_SESSION_ACCESSED = "chat_session_accessed"
+    CHAT_THREAD_ACCESSED = "chat_thread_accessed"
+    CHAT_INJECTION_DETECTED = "chat_injection_detected"
+    CHAT_PII_DETECTED = "chat_pii_detected"
+    CHAT_FEEDBACK_SUBMITTED = "chat_feedback_submitted"
+    ONBOARDING_VERIFICATION_DELETED = "onboarding_verification_deleted"
+    ONBOARDING_VERIFICATION_DELETED_BY_TASK = "onboarding_verification_deleted_by_task"
+    PAT_CREATED = "pat_created"
+    PAT_REVOKED = "pat_revoked"
+    PAT_ROTATED = "pat_rotated"
+    PAT_EXPIRED = "pat_expired"
+    PAT_USED_FROM_NEW_IP = "pat_used_from_new_ip"
+    PAT_ACCESS_DENIED_FROM_IP = "pat_access_denied_from_ip"
+    PAT_NETWORK_ACL_UPDATED = "pat_network_acl_updated"
+    PAT_AUTHENTICATION_REJECTED = "pat_authentication_rejected"
+    PASSKEY_REGISTERED = "passkey_registered"
+    PASSKEY_RENAMED = "passkey_renamed"
+    PASSKEY_REVOKED = "passkey_revoked"
+    PASSKEY_REVOKED_BY_STAFF = "passkey_revoked_by_staff"
+    PASSKEY_AUTHENTICATION_SUCCEEDED = "passkey_authentication_succeeded"
+    PASSKEY_AUTHENTICATION_FAILED = "passkey_authentication_failed"
+    EVENT_CONSUMER_REGISTERED_WITH_BROAD_CREDENTIAL = (
+        "event_consumer_registered_with_broad_credential"
+    )
 
 
-class EventGroup(str, Enum):
+class EventGroup(StrEnum):
     ACCESS_SUBNETS = "access_subnets"
     AUTH = "auth"
     CALL = "call"
+    CHAT = "chat"
     CREDITS = "credits"
     CUSTOMERS = "customers"
     INVOICES = "invoices"
     OFFERING_ACCOUNTING = "offering_accounting"
+    ONBOARDING = "onboarding"
+    # Per-category OpenStack network event chips. Consumed via the
+    # existing /api/events/?feature=<group> filter — no dedicated
+    # endpoint. Each maps to a discrete subset of OPENSTACK_*
+    # event types in EVENT_GROUP_MAPPING below.
+    OPENSTACK_FLOATING_IP = "openstack_floating_ip"
+    OPENSTACK_NETWORK = "openstack_network"
+    OPENSTACK_PORT = "openstack_port"
+    OPENSTACK_RBAC = "openstack_rbac"
+    # Every OpenStack-specific resource event, composed out of RESOURCES below.
+    OPENSTACK_RESOURCES = "openstack_resources"
+    OPENSTACK_ROUTER = "openstack_router"
+    OPENSTACK_SECURITY_GROUP = "openstack_security_group"
+    OPENSTACK_SUBNET = "openstack_subnet"
     PERMISSIONS = "permissions"
     PROJECTS = "projects"
     PROPOSAL = "proposal"
@@ -331,22 +496,46 @@ EVENT_GROUP_MAPPING = {
         EventType.ACCESS_SUBNET_CREATION_SUCCEEDED,
         EventType.ACCESS_SUBNET_DELETION_SUCCEEDED,
         EventType.ACCESS_SUBNET_UPDATE_SUCCEEDED,
+        EventType.OFFERING_ACCESS_SUBNET_CREATION_SUCCEEDED,
+        EventType.OFFERING_ACCESS_SUBNET_DELETION_SUCCEEDED,
+        EventType.OFFERING_ACCESS_SUBNET_UPDATE_SUCCEEDED,
     ],
     EventGroup.AUTH: [
         EventType.AUTH_LOGGED_IN_WITH_USERNAME,
+        EventType.AUTH_LOGGED_IN_WITH_OAUTH,
         EventType.AUTH_LOGGED_OUT,
         EventType.AUTH_LOGIN_FAILED_WITH_USERNAME,
+        EventType.USER_BLOCKED,
         EventType.TOKEN_CREATED,
         EventType.TOKEN_LIFETIME_UPDATED,
+        EventType.PAT_CREATED,
+        EventType.PAT_REVOKED,
+        EventType.PAT_ROTATED,
+        EventType.PAT_EXPIRED,
+        EventType.PAT_USED_FROM_NEW_IP,
+        EventType.PAT_ACCESS_DENIED_FROM_IP,
+        EventType.PAT_NETWORK_ACL_UPDATED,
+        EventType.PAT_AUTHENTICATION_REJECTED,
+        EventType.PASSKEY_REGISTERED,
+        EventType.PASSKEY_RENAMED,
+        EventType.PASSKEY_REVOKED,
+        EventType.PASSKEY_REVOKED_BY_STAFF,
+        EventType.PASSKEY_AUTHENTICATION_SUCCEEDED,
+        EventType.PASSKEY_AUTHENTICATION_FAILED,
+        EventType.EVENT_CONSUMER_REGISTERED_WITH_BROAD_CREDENTIAL,
     ],
     EventGroup.CALL: [
         EventType.CALL_DOCUMENT_ADDED,
         EventType.CALL_DOCUMENT_REMOVED,
+        EventType.REVIEWER_WORKLOAD_LIMIT_OVERRIDDEN,
     ],
     EventGroup.CREDITS: [
         EventType.ALLOWED_OFFERINGS_HAVE_BEEN_UPDATED,
         EventType.AUTOMATIC_CREDIT_ADJUSTMENT,
+        EventType.CREATE_OF_AFFILIATE_BY_STAFF,
         EventType.CREATE_OF_CREDIT_BY_STAFF,
+        EventType.CREATE_OF_PROJECT_CREDIT_BY_STAFF,
+        EventType.INCREASE_OF_CUSTOMER_CREDIT_DUE_TO_AFFILIATE_FEE,
         EventType.REDUCTION_OF_CUSTOMER_CREDIT,
         EventType.REDUCTION_OF_CUSTOMER_CREDIT_DUE_TO_MINIMAL_CONSUMPTION,
         EventType.REDUCTION_OF_CUSTOMER_EXPECTED_CONSUMPTION,
@@ -356,15 +545,20 @@ EVENT_GROUP_MAPPING = {
         EventType.ROLL_BACK_CUSTOMER_CREDIT,
         EventType.ROLL_BACK_PROJECT_CREDIT,
         EventType.SET_TO_ZERO_OVERDUE_CREDIT,
+        EventType.UPDATE_OF_AFFILIATE_BY_STAFF,
         EventType.UPDATE_OF_CREDIT_BY_STAFF,
+        EventType.UPDATE_OF_PROJECT_CREDIT_BY_STAFF,
     ],
     EventGroup.CUSTOMERS: [
         EventType.ALLOWED_OFFERINGS_HAVE_BEEN_UPDATED,
         EventType.AUTOMATIC_CREDIT_ADJUSTMENT,
+        EventType.CREATE_OF_AFFILIATE_BY_STAFF,
         EventType.CREATE_OF_CREDIT_BY_STAFF,
+        EventType.CREATE_OF_PROJECT_CREDIT_BY_STAFF,
         EventType.CUSTOMER_CREATION_SUCCEEDED,
         EventType.CUSTOMER_DELETION_SUCCEEDED,
         EventType.CUSTOMER_UPDATE_SUCCEEDED,
+        EventType.INCREASE_OF_CUSTOMER_CREDIT_DUE_TO_AFFILIATE_FEE,
         EventType.PAYMENT_ADDED,
         EventType.PAYMENT_REMOVED,
         EventType.REDUCTION_OF_CUSTOMER_CREDIT,
@@ -376,7 +570,9 @@ EVENT_GROUP_MAPPING = {
         EventType.ROLL_BACK_CUSTOMER_CREDIT,
         EventType.ROLL_BACK_PROJECT_CREDIT,
         EventType.SET_TO_ZERO_OVERDUE_CREDIT,
+        EventType.UPDATE_OF_AFFILIATE_BY_STAFF,
         EventType.UPDATE_OF_CREDIT_BY_STAFF,
+        EventType.UPDATE_OF_PROJECT_CREDIT_BY_STAFF,
         EventType.CUSTOMER_PERMISSION_REVIEW_CREATED,
         EventType.CUSTOMER_PERMISSION_REVIEW_CLOSED,
     ],
@@ -384,6 +580,7 @@ EVENT_GROUP_MAPPING = {
         EventType.ALLOWED_OFFERINGS_HAVE_BEEN_UPDATED,
         EventType.AUTOMATIC_CREDIT_ADJUSTMENT,
         EventType.CREATE_OF_CREDIT_BY_STAFF,
+        EventType.CREATE_OF_PROJECT_CREDIT_BY_STAFF,
         EventType.INVOICE_CANCELED,
         EventType.INVOICE_CREATED,
         EventType.INVOICE_ITEM_CREATED,
@@ -402,11 +599,19 @@ EVENT_GROUP_MAPPING = {
         EventType.ROLL_BACK_PROJECT_CREDIT,
         EventType.SET_TO_ZERO_OVERDUE_CREDIT,
         EventType.UPDATE_OF_CREDIT_BY_STAFF,
+        EventType.UPDATE_OF_PROJECT_CREDIT_BY_STAFF,
     ],
     EventGroup.OFFERING_ACCOUNTING: [
         EventType.MARKETPLACE_OFFERING_COMPONENT_CREATED,
         EventType.MARKETPLACE_OFFERING_COMPONENT_DELETED,
         EventType.MARKETPLACE_OFFERING_COMPONENT_UPDATED,
+        EventType.MARKETPLACE_OFFERING_MERGE_CREATED,
+        EventType.MARKETPLACE_OFFERING_MERGE_EXECUTED,
+        EventType.MARKETPLACE_OFFERING_MERGE_FAILED,
+        EventType.MARKETPLACE_OFFERING_MERGE_UNDONE,
+        EventType.MARKETPLACE_OFFERING_MERGE_VERIFICATION_FAILED,
+        EventType.MARKETPLACE_OFFERING_OPTIONS_UPDATED,
+        EventType.MARKETPLACE_OFFERING_RESOURCE_OPTIONS_UPDATED,
         EventType.MARKETPLACE_PLAN_ARCHIVED,
         EventType.MARKETPLACE_PLAN_COMPONENT_CURRENT_PRICE_UPDATED,
         EventType.MARKETPLACE_PLAN_COMPONENT_FUTURE_PRICE_UPDATED,
@@ -419,6 +624,17 @@ EVENT_GROUP_MAPPING = {
         EventType.ROLE_GRANTED,
         EventType.ROLE_REVOKED,
         EventType.ROLE_UPDATED,
+        # Role definition changes. ROLE_UPDATED above means an assignment's
+        # expiry changed, so a definition change gets its own type rather than
+        # silently redefining what existing audit queries match.
+        EventType.ROLE_DEFINITION_CREATED,
+        EventType.ROLE_DEFINITION_UPDATED,
+        EventType.ROLE_DEFINITION_DELETED,
+        EventType.ROLE_ENABLED,
+        EventType.ROLE_DISABLED,
+        EventType.ROLE_CLONED,
+        EventType.ROLE_CONCEALED,
+        EventType.ROLE_REVEALED,
     ],
     EventGroup.PROJECTS: [
         EventType.PROJECT_CREATION_SUCCEEDED,
@@ -435,8 +651,10 @@ EVENT_GROUP_MAPPING = {
         EventType.PROPOSAL_CANCELED,
         EventType.PROPOSAL_DOCUMENT_ADDED,
         EventType.PROPOSAL_DOCUMENT_REMOVED,
+        EventType.PROPOSAL_WORKFLOW_ADVANCED,
     ],
     EventGroup.PROVIDERS: [
+        EventType.MARKETPLACE_PROVIDER_PROJECT_GROUP_GID_UPDATED,
         EventType.MARKETPLACE_RESOURCE_CREATE_CANCELED,
         EventType.MARKETPLACE_RESOURCE_CREATE_FAILED,
         EventType.MARKETPLACE_RESOURCE_CREATE_REQUESTED,
@@ -447,11 +665,29 @@ EVENT_GROUP_MAPPING = {
         EventType.MARKETPLACE_RESOURCE_UPDATE_FAILED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_LIMITS_FAILED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_LIMITS_SUCCEEDED,
+        EventType.MARKETPLACE_RESOURCE_PROJECT_CREATED,
+        EventType.MARKETPLACE_RESOURCE_PROJECT_RECOVERED,
+        EventType.MARKETPLACE_RESOURCE_PROJECT_REMOVED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_REQUESTED,
+        EventType.MARKETPLACE_RESOURCE_LIMIT_CHANGE_REQUEST_CREATED,
+        EventType.MARKETPLACE_RESOURCE_LIMIT_CHANGE_REQUEST_APPROVED,
+        EventType.MARKETPLACE_RESOURCE_LIMIT_CHANGE_REQUEST_REJECTED,
+        EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_CREATED,
+        EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_APPROVED,
+        EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_REJECTED,
+        EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_CANCELED,
         EventType.RESOURCE_ROBOT_ACCOUNT_CREATED,
         EventType.RESOURCE_ROBOT_ACCOUNT_DELETED,
         EventType.RESOURCE_ROBOT_ACCOUNT_STATE_CHANGED,
         EventType.RESOURCE_ROBOT_ACCOUNT_UPDATED,
+        EventType.MAINTENANCE_ANNOUNCEMENT_CREATED,
+        EventType.MAINTENANCE_ANNOUNCEMENT_UPDATED,
+        EventType.MAINTENANCE_ANNOUNCEMENT_DELETED,
+        EventType.MAINTENANCE_ANNOUNCEMENT_SCHEDULED,
+        EventType.MAINTENANCE_ANNOUNCEMENT_UNSCHEDULED,
+        EventType.MAINTENANCE_ANNOUNCEMENT_STARTED,
+        EventType.MAINTENANCE_ANNOUNCEMENT_COMPLETED,
+        EventType.MAINTENANCE_ANNOUNCEMENT_CANCELLED,
     ],
     EventGroup.RESOURCES: [
         EventType.MARKETPLACE_ORDER_APPROVED,
@@ -468,36 +704,80 @@ EVENT_GROUP_MAPPING = {
         EventType.MARKETPLACE_RESOURCE_DOWNSCALED,
         EventType.MARKETPLACE_RESOURCE_ERRED_ON_BACKEND,
         EventType.MARKETPLACE_RESOURCE_PAUSED,
+        EventType.REQUEST_DOWNSCALING,
+        EventType.REQUEST_PAUSING,
+        EventType.REQUEST_SLURM_RESOURCE_DOWNSCALING,
+        EventType.REQUEST_SLURM_RESOURCE_PAUSING,
+        EventType.RESET_DOWNSCALING,
+        EventType.RESET_MEMBER_RESTRICTION,
+        EventType.RESET_PAUSING,
+        EventType.RESTRICT_MEMBERS,
+        EventType.SLURM_POLICY_EVALUATION,
         EventType.MARKETPLACE_RESOURCE_TERMINATE_CANCELED,
         EventType.MARKETPLACE_RESOURCE_TERMINATE_FAILED,
         EventType.MARKETPLACE_RESOURCE_TERMINATE_REQUESTED,
         EventType.MARKETPLACE_RESOURCE_TERMINATE_SUCCEEDED,
         EventType.MARKETPLACE_RESOURCE_UNLINKED,
+        EventType.MARKETPLACE_RESOURCE_API_KEY_REVEALED,
+        EventType.MARKETPLACE_RESOURCE_API_KEY_ROTATED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_CANCELED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_END_DATE_SUCCEEDED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_FAILED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_LIMITS_FAILED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_LIMITS_SUCCEEDED,
+        EventType.MARKETPLACE_RESOURCE_PROJECT_CREATED,
+        EventType.MARKETPLACE_RESOURCE_PROJECT_RECOVERED,
+        EventType.MARKETPLACE_RESOURCE_PROJECT_REMOVED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_REQUESTED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_SUCCEEDED,
+        EventType.MARKETPLACE_RESOURCE_LIMIT_CHANGE_REQUEST_CREATED,
+        EventType.MARKETPLACE_RESOURCE_LIMIT_CHANGE_REQUEST_APPROVED,
+        EventType.MARKETPLACE_RESOURCE_LIMIT_CHANGE_REQUEST_REJECTED,
+        EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_CREATED,
+        EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_APPROVED,
+        EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_REJECTED,
+        EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_CANCELED,
         EventType.OPENSTACK_FLOATING_IP_ATTACHED,
         EventType.OPENSTACK_FLOATING_IP_CONNECTED,
         EventType.OPENSTACK_FLOATING_IP_DESCRIPTION_UPDATED,
         EventType.OPENSTACK_FLOATING_IP_DETACHED,
         EventType.OPENSTACK_FLOATING_IP_DISCONNECTED,
+        EventType.OPENSTACK_INSTANCE_SECURITY_GROUPS_CHANGED,
         EventType.OPENSTACK_NETWORK_CLEANED,
         EventType.OPENSTACK_NETWORK_CREATED,
         EventType.OPENSTACK_NETWORK_DELETED,
         EventType.OPENSTACK_NETWORK_IMPORTED,
         EventType.OPENSTACK_NETWORK_PULLED,
         EventType.OPENSTACK_NETWORK_UPDATED,
+        EventType.OPENSTACK_LOAD_BALANCER_CREATED,
+        EventType.OPENSTACK_LOAD_BALANCER_UPDATED,
+        EventType.OPENSTACK_LOAD_BALANCER_DELETED,
+        EventType.OPENSTACK_LOAD_BALANCER_SECURITY_GROUPS_CHANGED,
+        EventType.OPENSTACK_LISTENER_CREATED,
+        EventType.OPENSTACK_LISTENER_UPDATED,
+        EventType.OPENSTACK_LISTENER_DELETED,
+        EventType.OPENSTACK_POOL_CREATED,
+        EventType.OPENSTACK_POOL_UPDATED,
+        EventType.OPENSTACK_POOL_DELETED,
+        EventType.OPENSTACK_POOL_MEMBER_CREATED,
+        EventType.OPENSTACK_POOL_MEMBER_UPDATED,
+        EventType.OPENSTACK_POOL_MEMBER_DELETED,
         EventType.OPENSTACK_PORT_CLEANED,
         EventType.OPENSTACK_PORT_CREATED,
         EventType.OPENSTACK_PORT_DELETED,
         EventType.OPENSTACK_PORT_IMPORTED,
         EventType.OPENSTACK_PORT_PULLED,
         EventType.OPENSTACK_PORT_UPDATED,
+        EventType.OPENSTACK_PORT_SECURITY_ENABLED,
+        EventType.OPENSTACK_PORT_SECURITY_DISABLED,
+        EventType.OPENSTACK_PORT_ALLOWED_ADDRESS_PAIRS_CHANGED,
+        EventType.OPENSTACK_PORT_SECURITY_GROUPS_CHANGED,
+        EventType.OPENSTACK_RBAC_POLICY_CREATED,
+        EventType.OPENSTACK_RBAC_POLICY_DELETED,
+        EventType.OPENSTACK_ROUTER_INTERFACE_ADDED,
+        EventType.OPENSTACK_ROUTER_INTERFACE_REMOVED,
         EventType.OPENSTACK_ROUTER_UPDATED,
+        EventType.OPENSTACK_SUBNET_HOST_ROUTES_CHANGED,
         EventType.OPENSTACK_SECURITY_GROUP_CLEANED,
         EventType.OPENSTACK_SECURITY_GROUP_CREATED,
         EventType.OPENSTACK_SECURITY_GROUP_DELETED,
@@ -508,6 +788,7 @@ EVENT_GROUP_MAPPING = {
         EventType.OPENSTACK_SECURITY_GROUP_RULE_DELETED,
         EventType.OPENSTACK_SECURITY_GROUP_RULE_IMPORTED,
         EventType.OPENSTACK_SECURITY_GROUP_RULE_UPDATED,
+        EventType.OPENSTACK_SECURITY_GROUP_RULES_CHANGED,
         EventType.OPENSTACK_SECURITY_GROUP_UPDATED,
         EventType.OPENSTACK_SERVER_GROUP_CLEANED,
         EventType.OPENSTACK_SERVER_GROUP_CREATED,
@@ -549,6 +830,9 @@ EVENT_GROUP_MAPPING = {
         EventType.RESOURCE_PULL_FAILED,
         EventType.RESOURCE_PULL_SCHEDULED,
         EventType.RESOURCE_PULL_SUCCEEDED,
+        EventType.RESOURCE_RESCUE_FAILED,
+        EventType.RESOURCE_RESCUE_SCHEDULED,
+        EventType.RESOURCE_RESCUE_SUCCEEDED,
         EventType.RESOURCE_RESTART_FAILED,
         EventType.RESOURCE_RESTART_SCHEDULED,
         EventType.RESOURCE_RESTART_SUCCEEDED,
@@ -568,12 +852,18 @@ EVENT_GROUP_MAPPING = {
         EventType.RESOURCE_UNASSIGN_FLOATING_IP_FAILED,
         EventType.RESOURCE_UNASSIGN_FLOATING_IP_SCHEDULED,
         EventType.RESOURCE_UNASSIGN_FLOATING_IP_SUCCEEDED,
+        EventType.RESOURCE_UNRESCUE_FAILED,
+        EventType.RESOURCE_UNRESCUE_SCHEDULED,
+        EventType.RESOURCE_UNRESCUE_SUCCEEDED,
         EventType.RESOURCE_UPDATE_ALLOWED_ADDRESS_PAIRS_FAILED,
         EventType.RESOURCE_UPDATE_ALLOWED_ADDRESS_PAIRS_SCHEDULED,
         EventType.RESOURCE_UPDATE_ALLOWED_ADDRESS_PAIRS_SUCCEEDED,
         EventType.RESOURCE_UPDATE_FLOATING_IPS_FAILED,
         EventType.RESOURCE_UPDATE_FLOATING_IPS_SCHEDULED,
         EventType.RESOURCE_UPDATE_FLOATING_IPS_SUCCEEDED,
+        EventType.RESOURCE_UPDATE_METADATA_FAILED,
+        EventType.RESOURCE_UPDATE_METADATA_SCHEDULED,
+        EventType.RESOURCE_UPDATE_METADATA_SUCCEEDED,
         EventType.RESOURCE_UPDATE_PORTS_FAILED,
         EventType.RESOURCE_UPDATE_PORTS_SCHEDULED,
         EventType.RESOURCE_UPDATE_PORTS_SUCCEEDED,
@@ -611,19 +901,130 @@ EVENT_GROUP_MAPPING = {
         EventType.SSH_KEY_DELETION_SUCCEEDED,
         EventType.USER_ACTIVATED,
         EventType.USER_CREATION_SUCCEEDED,
+        EventType.USER_DATA_ACCESSED,
         EventType.USER_DEACTIVATED,
         EventType.USER_DELETION_SUCCEEDED,
         EventType.USER_DETAILS_UPDATE_SUCCEEDED,
         EventType.USER_HAS_BEEN_CREATED_BY_STAFF,
         EventType.USER_PASSWORD_UPDATED,
         EventType.USER_PASSWORD_UPDATED_BY_STAFF,
+        EventType.USER_PASSWORD_REMOVED_BY_STAFF,
         EventType.USER_UPDATE_SUCCEEDED,
+        EventType.USER_GROUP_INVITATION_UPDATED,
+        EventType.USER_INVITATION_UPDATED,
+        EventType.USER_INVITATION_DELETED,
     ],
     EventGroup.TERMS_OF_SERVICE: [
         EventType.TERMS_OF_SERVICE_CONSENT_GRANTED,
         EventType.TERMS_OF_SERVICE_CONSENT_REVOKED,
     ],
+    EventGroup.ONBOARDING: [
+        EventType.ONBOARDING_VERIFICATION_DELETED,
+        EventType.ONBOARDING_VERIFICATION_DELETED_BY_TASK,
+    ],
+    EventGroup.CHAT: [
+        EventType.CHAT_SESSION_ACCESSED,
+        EventType.CHAT_THREAD_ACCESSED,
+        EventType.CHAT_INJECTION_DETECTED,
+        EventType.CHAT_PII_DETECTED,
+        EventType.CHAT_FEEDBACK_SUBMITTED,
+    ],
+    # Per-category OpenStack networking chips for the tenant audit view.
+    # Consumed via /api/events/?feature=openstack_router (multi-select)
+    # alongside ?scope=<tenant-URL>&created_from=&created_to=.
+    EventGroup.OPENSTACK_ROUTER: [
+        EventType.OPENSTACK_ROUTER_UPDATED,
+        EventType.OPENSTACK_ROUTER_INTERFACE_ADDED,
+        EventType.OPENSTACK_ROUTER_INTERFACE_REMOVED,
+    ],
+    EventGroup.OPENSTACK_NETWORK: [
+        EventType.OPENSTACK_NETWORK_CREATED,
+        EventType.OPENSTACK_NETWORK_UPDATED,
+        EventType.OPENSTACK_NETWORK_DELETED,
+        EventType.OPENSTACK_NETWORK_IMPORTED,
+        EventType.OPENSTACK_NETWORK_PULLED,
+        EventType.OPENSTACK_NETWORK_CLEANED,
+    ],
+    EventGroup.OPENSTACK_SUBNET: [
+        EventType.OPENSTACK_SUBNET_CREATED,
+        EventType.OPENSTACK_SUBNET_UPDATED,
+        EventType.OPENSTACK_SUBNET_DELETED,
+        EventType.OPENSTACK_SUBNET_IMPORTED,
+        EventType.OPENSTACK_SUBNET_PULLED,
+        EventType.OPENSTACK_SUBNET_CLEANED,
+        EventType.OPENSTACK_SUBNET_HOST_ROUTES_CHANGED,
+    ],
+    EventGroup.OPENSTACK_PORT: [
+        EventType.OPENSTACK_PORT_CREATED,
+        EventType.OPENSTACK_PORT_UPDATED,
+        EventType.OPENSTACK_PORT_DELETED,
+        EventType.OPENSTACK_PORT_IMPORTED,
+        EventType.OPENSTACK_PORT_PULLED,
+        EventType.OPENSTACK_PORT_CLEANED,
+        EventType.OPENSTACK_PORT_SECURITY_ENABLED,
+        EventType.OPENSTACK_PORT_SECURITY_DISABLED,
+        EventType.OPENSTACK_PORT_SECURITY_GROUPS_CHANGED,
+        EventType.OPENSTACK_PORT_ALLOWED_ADDRESS_PAIRS_CHANGED,
+    ],
+    EventGroup.OPENSTACK_FLOATING_IP: [
+        EventType.OPENSTACK_FLOATING_IP_ATTACHED,
+        EventType.OPENSTACK_FLOATING_IP_DETACHED,
+        EventType.OPENSTACK_FLOATING_IP_CONNECTED,
+        EventType.OPENSTACK_FLOATING_IP_DISCONNECTED,
+        EventType.OPENSTACK_FLOATING_IP_DESCRIPTION_UPDATED,
+    ],
+    EventGroup.OPENSTACK_RBAC: [
+        EventType.OPENSTACK_RBAC_POLICY_CREATED,
+        EventType.OPENSTACK_RBAC_POLICY_DELETED,
+    ],
+    EventGroup.OPENSTACK_SECURITY_GROUP: [
+        EventType.OPENSTACK_SECURITY_GROUP_CREATED,
+        EventType.OPENSTACK_SECURITY_GROUP_UPDATED,
+        EventType.OPENSTACK_SECURITY_GROUP_DELETED,
+        EventType.OPENSTACK_SECURITY_GROUP_IMPORTED,
+        EventType.OPENSTACK_SECURITY_GROUP_PULLED,
+        EventType.OPENSTACK_SECURITY_GROUP_CLEANED,
+        EventType.OPENSTACK_SECURITY_GROUP_RULE_CREATED,
+        EventType.OPENSTACK_SECURITY_GROUP_RULE_UPDATED,
+        EventType.OPENSTACK_SECURITY_GROUP_RULE_DELETED,
+        EventType.OPENSTACK_SECURITY_GROUP_RULES_CHANGED,
+    ],
 }
+
+# Every AUTH event concerns exactly one account, so it also belongs in that
+# account's own audit log. The profile audit log queries
+# /api/events/?feature=users, so without this a user cannot see their own
+# logins, failed attempts, blocks, passkey activity or personal-access-token
+# history — the events are written and scoped to them, but the one page they
+# would look at filters them out.
+#
+# Composed rather than hand-copied so a newly added AUTH event is visible to
+# the user it concerns by default. Duplicating the list is what let the
+# passkey events, and OIDC logins before them, go unseen.
+EVENT_GROUP_MAPPING[EventGroup.USERS] = list(
+    dict.fromkeys(
+        EVENT_GROUP_MAPPING[EventGroup.USERS] + EVENT_GROUP_MAPPING[EventGroup.AUTH]
+    )
+)
+
+# RESOURCES is the generic marketplace resource lifecycle group, offered to every
+# deployment. Two thirds of its entries used to be OpenStack-specific (load
+# balancers, listeners, pools, ports, floating IPs), so a deployment running no
+# OpenStack still advertised them - see waldur/waldur-mastermind#340.
+#
+# Composed rather than hand-split for the same reason USERS is composed above: an
+# OPENSTACK_* event appended to the RESOURCES literal lands in the OpenStack group
+# by itself, instead of quietly re-entering the generic one.
+EVENT_GROUP_MAPPING[EventGroup.OPENSTACK_RESOURCES] = [
+    event
+    for event in EVENT_GROUP_MAPPING[EventGroup.RESOURCES]
+    if event.name.startswith("OPENSTACK_")
+]
+EVENT_GROUP_MAPPING[EventGroup.RESOURCES] = [
+    event
+    for event in EVENT_GROUP_MAPPING[EventGroup.RESOURCES]
+    if not event.name.startswith("OPENSTACK_")
+]
 
 RESOURCE_CHANGE_EVENTS = (
     EventType.MARKETPLACE_RESOURCE_CREATE_SUCCEEDED,
@@ -634,3 +1035,84 @@ RESOURCE_CHANGE_EVENTS = (
     EventType.MARKETPLACE_RESOURCE_TERMINATE_FAILED,
     EventType.MARKETPLACE_RESOURCE_UPDATE_LIMITS_FAILED,
 )
+
+
+class ObservableObjectType(Enum):
+    ORDER = "order"
+    USER_ROLE = "user_role"
+    RESOURCE = "resource"
+    OFFERING_USER = "offering_user"
+    IMPORTABLE_RESOURCES = "importable_resources"
+    SERVICE_ACCOUNT = "service_account"
+    COURSE_ACCOUNT = "course_account"
+    RESOURCE_PERIODIC_LIMITS = "resource_periodic_limits"
+    OFFERING_RESOURCES_SYNC = "offering_resources_sync"
+    RESOURCE_API_KEY_ROTATION = "resource_api_key_rotation"
+    # Lets an external approval system pick up end date change requests and
+    # report a verdict back through the request's approve/reject actions.
+    RESOURCE_END_DATE_CHANGE_REQUEST = "resource_end_date_change_request"
+    # User-centric events for global (empty-scope) consumers — IdM/IGA sync.
+    USER_PROFILE = "user_profile"
+    USER_SSH_KEY = "user_ssh_key"
+    USER_LIFECYCLE = "user_lifecycle"
+    # Provider-scoped account changes. Emitted alongside the per-offering
+    # OFFERING_USER events rather than instead of them, so a consumer that only
+    # knows the older type keeps working -- and one that does not recognise this
+    # one drops it with a warning rather than mis-handling it.
+    SERVICE_PROVIDER_ACCOUNT = "service_provider_account"
+    # Proposal-domain state changes, scoped to the call and its organiser so
+    # consumers bound to a call or a proposal receive them.
+    CALL = "call"
+    PROPOSAL = "proposal"
+
+    @classmethod
+    def choices(cls):
+        return [(t.value, t.value) for t in cls]
+
+
+class QueueKind(StrEnum):
+    """How Waldur uses a RabbitMQ queue, as opposed to RabbitMQ's own queue type.
+
+    Derived from the queue name: ``consumer_{uuid}`` is a unified consumer
+    queue, ``subscription_{uuid}_offering_{uuid}_{type}`` a legacy subscription
+    one, and anything else is not ours to classify.
+    """
+
+    CONSUMER = "consumer"
+    LEGACY = "legacy"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def choices(cls):
+        return [(k.value, k.value) for k in cls]
+
+
+class ConsumerAuthorization(StrEnum):
+    """Which permission branch let a caller register an event consumer.
+
+    Recorded on ``EventConsumer.authorized_via`` at every registration, so an
+    operator can tell a site agent running on a staff session from one on a
+    scoped credential of an offering manager. ``staff``, ``customer_owner``,
+    ``offering_manager`` and ``identity_manager`` are the branches of
+    ``_can_manage_offering_agent`` (the site-agent path); ``staff``,
+    ``support``, ``scope_role`` and ``self`` are the standalone
+    ``/api/event-consumers/register/`` path.
+    """
+
+    STAFF = "staff"
+    SUPPORT = "support"
+    CUSTOMER_OWNER = "customer_owner"
+    OFFERING_MANAGER = "offering_manager"
+    IDENTITY_MANAGER = "identity_manager"
+    SCOPE_ROLE = "scope_role"
+    SELF = "self"
+
+    @classmethod
+    def choices(cls, include_blank=False):
+        """``include_blank`` adds the empty string a row registered before the
+        branch was recorded holds; a read-only serializer field must declare it
+        or the generated SDK enum rejects those rows."""
+        choices = [(a.value, a.value) for a in cls]
+        if include_blank:
+            choices.insert(0, ("", ""))
+        return choices

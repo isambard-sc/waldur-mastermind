@@ -2,24 +2,29 @@ import calendar
 import datetime
 import functools
 import importlib
+import ipaddress
 import logging
 import os
 import re
+import socket
 import time
 import unicodedata
 import uuid
 import warnings
-from itertools import chain
+from itertools import chain, groupby
 from secrets import choice
 from string import ascii_letters, digits
+from urllib.parse import urlsplit
 
 import jwt
 import requests
 import textile
 from constance import config
+from dateutil.relativedelta import relativedelta
 from django.apps import apps
 from django.conf import settings
-from django.core.mail import EmailMultiAlternatives
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.mail import EmailMultiAlternatives, get_connection
 from django.core.management.base import BaseCommand
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db.models import F, Subquery
@@ -58,6 +63,19 @@ def timestamp_to_datetime(timestamp, replace_tz=True):
 
 def timeshift(**kwargs):
     return timezone.now().replace(microsecond=0) + datetime.timedelta(**kwargs)
+
+
+def calculate_duration_months(start_date, end_date):
+    """Calculate duration in whole months, rounding up partial months.
+
+    Used by prepaid billing, cost estimation, and the site agent.
+    A partial month at the end counts as a full month.
+    """
+    delta = relativedelta(end_date, start_date)
+    months = delta.years * 12 + delta.months
+    if delta.days > 0:
+        months += 1
+    return max(1, months)
 
 
 def month_start(date):
@@ -195,10 +213,35 @@ def format_text(template_name, context):
     return "\n".join(cleaned_lines)
 
 
-def find_template_from_registry(app, event_type, template_suffix):
+def find_template_from_registry(app, event_type, template_suffix, variant=None):
+    """The template path for an event, optionally one of its variants.
+
+    A notification may declare more than the three templates named after its
+    own key — a deployment that presents the same event in different words
+    sends a different message, not the same message with conditionals threaded
+    through it, but it is still one event and so still one switch. Passing
+    ``variant`` selects such an alternative set, and it is honoured only when
+    the notification actually declares it, so a typo resolves to nothing rather
+    than to a template belonging to something else.
+    """
     app_dict = NOTIFICATIONS.get(app)
     for section in app_dict:
         if event_type == section.get("path"):
+            if not variant:
+                return f"{app}/{event_type}_{template_suffix}"
+            # Declared paths are relative to their section, as everywhere else
+            # in the registry; the app prefix is added where a path is used.
+            path = f"{variant}_{template_suffix}"
+            declared = {tpl["path"] for tpl in section.get("templates", [])}
+            if path in declared:
+                return f"{app}/{path}"
+            logger.warning(
+                "Notification '%s.%s' does not declare template '%s'; "
+                "falling back to its own.",
+                app,
+                event_type,
+                f"{app}/{path}",
+            )
             return f"{app}/{event_type}_{template_suffix}"
 
 
@@ -214,7 +257,15 @@ def send_mail(
     bcc: list[str] | None = None,
     reply_to: str | None = None,
     fail_silently: bool = False,
+    connection=None,
+    headers: dict[str, str] | None = None,
 ) -> int:
+    """Send one message.
+
+    :param headers: extra message headers, e.g. the ``Message-ID`` /
+        ``In-Reply-To`` / ``References`` trio that lets a mail client group
+        several notifications about the same object into one thread.
+    """
     from waldur_core.logging.models import EmailLog
 
     from_email = from_email or settings.DEFAULT_FROM_EMAIL
@@ -226,6 +277,8 @@ def send_mail(
         from_email=from_email,
         bcc=bcc,
         reply_to=[reply_to],
+        connection=connection,
+        headers=headers,
     )
 
     footer_text = config.COMMON_FOOTER_TEXT
@@ -266,6 +319,8 @@ def broadcast_mail(
     attachment=None,
     content_type="text/plain",
     bcc=None,
+    template_variant=None,
+    headers=None,
 ):
     """
     Shorthand to format email message from template file and sent it to all recipients.
@@ -290,6 +345,11 @@ def broadcast_mail(
     :param attachment: content of attachment
     :param content_type: the content type of attachment
     :param bcc: list of emails for sending as bcc
+    :param template_variant: alternative template set declared by the same
+        notification, used where a deployment words the same event differently.
+        The notification, and therefore the operator's on/off switch, is still
+        the one named by ``event_type``.
+    :param headers: extra message headers passed on to every recipient's copy.
     """
     from .models import Notification
 
@@ -297,39 +357,69 @@ def broadcast_mail(
     try:
         notification = Notification.objects.get(key=notification_key)
     except Notification.DoesNotExist:
+        # Both this branch and the disabled one below drop the mail. Say so:
+        # without a log line an operator cannot tell a notification that is
+        # switched off from one that is broken, since either way the only
+        # symptom is that no mail arrives.
         logger.warning(
-            f"Notification with key '{notification_key}' does not exist. Email will not be sent."
+            "Notification '%s' is not registered, so no %s mail was sent to %s "
+            "recipient(s). Run the load_notifications command to register it.",
+            notification_key,
+            event_type,
+            len(recipient_list),
         )
         return
 
     if notification.enabled:
         subject_template_name = find_template_from_registry(
-            app, event_type, "subject.txt"
+            app, event_type, "subject.txt", template_variant
         )
-        text_template_name = find_template_from_registry(app, event_type, "message.txt")
+        text_template_name = find_template_from_registry(
+            app, event_type, "message.txt", template_variant
+        )
         html_template_name = find_template_from_registry(
-            app, event_type, "message.html"
+            app, event_type, "message.html", template_variant
         )
 
         subject = format_text(subject_template_name, context)
         text_message = format_text(text_template_name, context)
         html_message = render_to_string(html_template_name, context)
 
-        for recipient in recipient_list:
-            logger.info(f"About to send {event_type} notification to {recipient}")
-            send_mail(
-                subject,
-                text_message,
-                to=[recipient],
-                html_message=html_message,
-                filename=filename,
-                attachment=attachment,
-                content_type=content_type,
-                bcc=bcc,
-            )
+        # One shared SMTP connection for the whole batch (a fresh connection
+        # per recipient can trip relay rate limits), and per-recipient error
+        # isolation so one undeliverable address cannot block the rest.
+        connection = get_connection()
+        try:
+            connection.open()
+            for recipient in recipient_list:
+                logger.info(f"About to send {event_type} notification to {recipient}")
+                try:
+                    send_mail(
+                        subject,
+                        text_message,
+                        to=[recipient],
+                        html_message=html_message,
+                        filename=filename,
+                        attachment=attachment,
+                        content_type=content_type,
+                        bcc=bcc,
+                        connection=connection,
+                        headers=headers,
+                    )
+                except Exception:
+                    logger.exception(
+                        f"Failed to send {event_type} notification to {recipient}"
+                    )
+        finally:
+            connection.close()
     else:
         logger.info(
-            f"Notification with key '{notification_key}' is disabled. Email will not be sent."
+            "Notification '%s' is disabled, so no %s mail was sent to %s "
+            "recipient(s). Enable it under Administration -> Notifications, or "
+            "in the notifications file loaded by the load_notifications command.",
+            notification_key,
+            event_type,
+            len(recipient_list),
         )
 
 
@@ -519,40 +609,32 @@ def format_homeport_link(format_str="", **kwargs):
     return link.format(**kwargs)
 
 
-def format_mastermind_link(format_str="", **kwargs):
-    mastermind_url = settings.WALDUR_CORE["MASTERMIND_URL"]  # type: ignore
+# Usernames of special accounts acting on behalf of the system rather than
+# a real person. Their email is SITE_EMAIL, so user-facing notifications
+# addressed to them must be skipped.
+ROBOT_USERNAMES = ("system_robot", "openportal_robot")
 
-    if len(format_str) > 0:
-        # make sure we don't have double slashes in the URL
-        if format_str.startswith("/") and mastermind_url.endswith("/"):
-            format_str = format_str[1:]
 
-        # make sure we have at least one slash between MASTERMIND_URL and format_str
-        if not format_str.startswith("/") and not mastermind_url.endswith("/"):
-            format_str = "/" + format_str
-
-    link = mastermind_url + format_str
-    return link.format(**kwargs)
+def is_robot_user(user) -> bool:
+    return user.username in ROBOT_USERNAMES
 
 
 def get_system_robot():
     from waldur_core.core import models
 
-    robot_user, created = models.User.objects.get_or_create(
-        username="system_robot",
-        defaults={
-            "is_staff": True,
-            "is_active": True,
-            "description": (
-                "Special user used for performing actions on behalf of a system."
-            ),
-            "first_name": "System",
-            "last_name": "Robot",
-        },
+    # make sure that system_robot is always active and staff
+    robot_user, created = models.User.all_objects.get_or_create(
+        username="system_robot", defaults={"is_staff": True, "is_active": True}
     )
+
     if created:
         robot_user.set_unusable_password()
-        robot_user.save(update_fields=["password"])
+        robot_user.description = (
+            "Special user used for performing actions on behalf of a system."
+        )
+        robot_user.first_name = "System"
+        robot_user.last_name = "Robot"
+        robot_user.save()
     return robot_user
 
 
@@ -565,6 +647,143 @@ def get_ip_address(request: HttpRequest) -> str | None:
     elif "REMOTE_ADDR" in request.META:
         return request.META["REMOTE_ADDR"]
     return None
+
+
+def _strip_port(value: str) -> str:
+    """Drop a ``host:port`` suffix, leaving a bare address.
+
+    Azure Application Gateway writes ``1.2.3.4:5678`` into X-Forwarded-For, and
+    under fail-closed enforcement an unparseable hop denies a valid token. Only
+    the two unambiguous forms are stripped: a bracketed IPv6 literal, and a
+    single-colon IPv4 pair — a bare IPv6 address is itself full of colons, so
+    the colon count is what stops us truncating one into garbage. A non-numeric
+    port is left in place so the address fails to parse rather than being
+    silently accepted.
+    """
+    if value.startswith("["):
+        host, separator, port = value.partition("]:")
+        if separator and port.isdigit():
+            return host[1:]
+        return value
+    if value.count(":") == 1:
+        host, _, port = value.partition(":")
+        try:
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            return value
+        if port.isdigit():
+            return host
+    return value
+
+
+def _normalize_ip(
+    value: str | None,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse an address, unwrapping IPv4-mapped IPv6, or return None.
+
+    A dual-stack listener reports IPv4 clients as ``::ffff:203.0.113.5``.
+    Unwrapping means such a client matches an IPv4 ACL entry and gets logged
+    under its real address, instead of being denied on a version mismatch.
+    """
+    if not value:
+        return None
+    try:
+        addr = ipaddress.ip_address(_strip_port(value))
+    except ValueError:
+        return None
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return addr
+
+
+def ip_in_networks(address: str | None, networks: list[str]) -> bool:
+    """Return True when ``address`` falls inside any of ``networks``.
+
+    Malformed input never matches — this backs an allowlist, so anything we
+    cannot parse must not be treated as permitted.
+    """
+    if not address or not networks:
+        return False
+    addr = _normalize_ip(address)
+    if addr is None:
+        return False
+    for entry in networks:
+        try:
+            if addr in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def normalize_ip_address(value: str | None) -> str | None:
+    """Canonical string form of an IP address, or None if it does not parse.
+
+    Unwraps IPv4-mapped IPv6 and strips a ``host:port`` suffix, so the
+    ingress-provided address is stored and logged in one canonical form.
+    Anything unparseable becomes None — callers treat that as "no address"
+    and, for a security control, fail closed. Keeping the value clean also
+    matters because it flows on into event-message ``.format()`` templates,
+    cache keys and ``last_used_ip`` (an inet column) unescaped.
+    """
+    address = _normalize_ip(value)
+    return str(address) if address is not None else None
+
+
+def merge_access_subnets(inet_values):
+    """Collapse CIDR strings into the minimal list of networks.
+
+    Adjacent or overlapping networks are merged (per IP version) using
+    ``ipaddress.collapse_addresses``. Invalid or null values are skipped.
+    Returns a list of ``ip_network`` objects sorted by version and address.
+    """
+    networks = []
+    for value in inet_values:
+        if value is None:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(value))
+        except ValueError:
+            continue
+
+    networks.sort(key=lambda n: (n.version, n.network_address))
+
+    merged = []
+    for _version, version_networks in groupby(networks, key=lambda n: n.version):
+        merged.extend(ipaddress.collapse_addresses(list(version_networks)))
+    return merged
+
+
+def validate_access_subnet_for_user(value, user):
+    """Normalise and validate an access-subnet CIDR for the acting user.
+
+    Non-staff users may only enter a single host, so a bare address is widened
+    to ``/32`` (``/128`` for IPv6) and anything wider is rejected: these lists
+    are how a consumer grants itself access, and an unbounded mask would let it
+    open far more than intended. Staff may enter any width except ``/0``, which
+    matches every address and would silently neutralise every restriction built
+    on these entries.
+
+    Networks with host bits set are rejected rather than silently masked —
+    quietly turning ``203.0.113.5/24`` into ``203.0.113.0/24`` would grant a
+    whole range where a single host was written.
+
+    Returns the normalised CIDR string.
+    """
+    try:
+        network = ipaddress.ip_network(str(value), strict=True)
+    except ValueError as e:
+        raise ValidationError(str(e))
+
+    if network.prefixlen == 0:
+        raise ValidationError("A /0 mask is not allowed: it matches every address.")
+
+    if not user.is_staff and network.prefixlen != network.max_prefixlen:
+        raise ValidationError(
+            "Only a single IP address (/%s) is allowed." % network.max_prefixlen
+        )
+
+    return str(network)
 
 
 def get_user_agent(request):
@@ -748,3 +967,161 @@ def get_full_quarters(start, end):
             current = current.replace(year=current.year + 1, month=current.month - 9)
 
     return quarters
+
+
+# Topological sort (Django removed django.utils.topological_sort in 5.0)
+
+
+class CyclicDependencyError(ValueError):
+    pass
+
+
+def topological_sort_as_sets(dependency_graph):
+    """
+    Variation of Kahn's algorithm (1962) that returns sets.
+
+    Take a dependency graph as a dictionary of node => dependencies.
+
+    Yield sets of items in topological order, where the first set contains
+    all nodes without dependencies, and each following set contains all
+    nodes that may depend on the nodes only in the previously yielded sets.
+    """
+    todo = dependency_graph.copy()
+    while todo:
+        current = {node for node, deps in todo.items() if not deps}
+
+        if not current:
+            raise CyclicDependencyError(
+                "Cyclic dependency in graph: {}".format(
+                    ", ".join(repr(x) for x in todo.items())
+                )
+            )
+
+        yield current
+
+        todo = {
+            node: (dependencies - current)
+            for node, dependencies in todo.items()
+            if node not in current
+        }
+
+
+def stable_topological_sort(nodes, dependency_graph):
+    result = []
+    for layer in topological_sort_as_sets(dependency_graph):
+        for node in nodes:
+            if node in layer:
+                result.append(node)
+    return result
+
+
+def chunked_queryset(queryset, chunk_size=100, max_records=None):
+    """Iterate a queryset in client-side chunks using primary-key pagination.
+
+    Avoids server-side cursors (which ``QuerySet.iterator(chunk_size=...)``
+    uses on psycopg3) — those break with PgBouncer transaction pooling
+    and load-balanced PostgreSQL connections, since a cursor opened on
+    one backend connection may not exist when the next fetch lands on a
+    different one. Each chunk here is a fresh ``LIMIT``-bounded query
+    that any pooled connection can serve.
+
+    Memory stays bounded by ``chunk_size``. When ``max_records`` is
+    set, iteration stops after yielding that many rows and emits a
+    warning — use this as a safety net against accidentally walking
+    a table that has grown unexpectedly large.
+    """
+    queryset = queryset.order_by("pk")
+    last_pk = None
+    yielded = 0
+    while True:
+        chunk_qs = queryset
+        if last_pk is not None:
+            chunk_qs = chunk_qs.filter(pk__gt=last_pk)
+        chunk = list(chunk_qs[:chunk_size])
+        if not chunk:
+            return
+        for obj in chunk:
+            if max_records is not None and yielded >= max_records:
+                logger.warning(
+                    "chunked_queryset reached max_records=%d on %s; "
+                    "iteration truncated",
+                    max_records,
+                    queryset.model.__name__,
+                )
+                return
+            yield obj
+            yielded += 1
+        if len(chunk) < chunk_size:
+            return
+        last_pk = chunk[-1].pk
+
+
+def validate_outbound_url(url: str) -> None:
+    """
+    Reject URLs that resolve to private, loopback, link-local, multicast,
+    reserved, or otherwise non-public addresses. Use as a model field
+    validator on user-supplied destination URLs (webhooks, callbacks,
+    image-import sources) to defeat SSRF.
+
+    Raises django.core.exceptions.ValidationError on rejection. The check
+    is best-effort against DNS rebinding — call this again immediately
+    before connecting (or use IP-pinned outbound HTTP) to defeat
+    time-of-check / time-of-use bypasses.
+    """
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise DjangoValidationError(
+            f"URL scheme must be http or https, got {parsed.scheme!r}."
+        )
+    if not parsed.hostname:
+        raise DjangoValidationError("URL must include a hostname.")
+
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror as exc:
+        raise DjangoValidationError(
+            f"Hostname {parsed.hostname!r} could not be resolved: {exc}."
+        )
+
+    for *_, sockaddr in infos:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except (ValueError, IndexError):
+            continue
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise DjangoValidationError(
+                f"URL host {parsed.hostname!r} resolves to a non-routable "
+                f"address ({ip}); outbound webhook destinations must be public."
+            )
+
+
+CONSTANCE_PYTHON_TYPE_NAMES = {
+    int: "integer",
+    float: "float",
+    bool: "boolean",
+    str: "string",
+    list: "list_field",
+}
+
+
+def get_constance_setting_type(key):
+    """Type name of a Constance setting, as reported to clients.
+
+    An explicit third element of the config tuple wins: a Python type is mapped
+    to its name, a field name from CONSTANCE_ADDITIONAL_FIELDS is used as is.
+    Otherwise the type is inferred from the default.
+    """
+    definition = settings.CONSTANCE_CONFIG[key]
+    if len(definition) >= 3 and definition[2]:
+        raw_type = definition[2]
+        if isinstance(raw_type, type):
+            return CONSTANCE_PYTHON_TYPE_NAMES.get(raw_type, raw_type.__name__)
+        return raw_type
+    return CONSTANCE_PYTHON_TYPE_NAMES.get(type(definition[0]), "string")

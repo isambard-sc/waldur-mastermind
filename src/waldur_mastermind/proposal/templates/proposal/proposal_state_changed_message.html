@@ -48,7 +48,7 @@
         <ul>
             <li><strong>Project created:</strong> {{ project_name }}</li>
             <li><strong>Allocation start date:</strong> {{ allocation_date }}</li>
-            <li><strong>Duration:</strong> {{ duration }} days</li>
+            {% if duration %}<li><strong>Duration:</strong> {{ duration }}</li>{% endif %}
         </ul>
         <div>
             <h4>Allocated resources:</h4>
@@ -61,21 +61,6 @@
             {% endfor %}
         </div>
         {% endif %}
-
-        {% if new_state == 'draft' %}
-        <p>
-          Your proposal has been returned by the call manager as they require further information or modifications before it can proceed to the review stage. Please review any comments or feedback provided.
-        </p>
-
-        <p>
-          <strong>Feedback:</strong> {{ rejection_feedback }}
-        </p>
-
-        <p>
-          If you still wish to continue, please make the necessary changes to your proposal and then resubmit it for review.
-        </p>
-        {% endif %}
-
 
         {% if new_state == 'rejected' %}
         <p><strong>Feedback:</strong> {{ rejection_feedback }}</p>

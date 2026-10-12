@@ -41,7 +41,8 @@ graph TB
 
 - **`CallManagingOrganisation`**: Organizations that create and manage calls for proposals
 - **`Call`**: Main entity representing calls with configuration for review settings and duration
-- **`Round`**: Time-bounded submission periods with configurable review and allocation strategies
+- **`Round`**: Time-bounded submission periods; a round holds scheduling only
+- **`CallWorkflowStep`**: Per-call evaluation policy — which steps run and how each is gated
 - **`Proposal`**: Individual proposals with project details and resource requests
 - **`RequestedResource`**: Specific resource requests within proposals linked to marketplace
 - **`Review`**: Peer review system with scoring, comments, and field-specific feedback
@@ -112,56 +113,81 @@ Reviews maintain independent state for tracking progress:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> CREATED : Review assigned
-
-    CREATED --> IN_REVIEW : Reviewer starts
-    CREATED --> REJECTED : Reviewer declines
+    [*] --> IN_REVIEW : Review assigned
 
     IN_REVIEW --> SUBMITTED : Review completed
-    IN_REVIEW --> REJECTED : Reviewer withdraws
+    IN_REVIEW --> REJECTED : Reviewer withdraws/declines
 
     SUBMITTED --> [*] : Review processed
     REJECTED --> [*] : Assignment ended
 ```
 
-## Round Management and Strategies
+## Rounds and Evaluation Policy
 
-### Review Strategies
+### What a round holds
 
-Rounds can be configured with different review timing approaches:
+A round is a submission window and nothing more. Its fields are scheduling only:
 
-| Strategy | Description | Use Case | Workflow |
-|----------|-------------|----------|----------|
-| **AFTER_ROUND** | Reviews start after submission deadline | Large competitive calls | All proposals collected → batch review assignment |
-| **AFTER_PROPOSAL** | Reviews start immediately upon submission | Rolling submissions | Individual proposal → immediate review assignment |
+| Field | Meaning |
+| --- | --- |
+| `start_time` | Submissions open |
+| `cutoff_time` | Submissions close |
+| `review_duration_in_days` | How long an individual review may stay open before it expires |
+| `allocation_date` | The date granted projects start when the allocation decision uses a fixed date |
 
-### Allocation Strategies
+A round's status (`scheduled`, `open`, `ended`) is derived from `start_time` and
+`cutoff_time`; it is not stored. Proposals can be created and submitted only while
+their round is open.
 
-Resource allocation can be automated or manual:
+Evaluation starts **per proposal, at submission**: submitting creates the
+proposal's workflow step instances and activates the first enabled step. There is
+no batch evaluation of a round after its cut-off.
 
-| Strategy | Description | Decision Maker | Allocation Logic |
-|----------|-------------|---------------|------------------|
-| **BY_CALL_MANAGER** | Manual allocation by call administrators | Human reviewers | Call manager reviews scores and allocates |
-| **AUTOMATIC** | Automated based on review scores | System algorithm | Automatic allocation above score threshold |
+### Where evaluation policy lives
 
-### Round Configuration
+Review and allocation policy is configured per call, on its workflow steps
+(`CallWorkflowStep`, one row per catalogue step, seeded when the call is created):
+
+| Setting | Meaning |
+| --- | --- |
+| `is_enabled` | Whether the step runs; `allocation_decision` is mandatory |
+| `duration_in_days` | Step deadline, counted from when the step starts |
+| `responsible_role` | Who acts on the step (call manager, offering manager, reviewer, panel member, applicant) |
+| `checklist`, `checklist_required` | Evaluation form for the step, and whether it must be answered |
+| `min_reviewers`, `min_score_threshold` | Completion gates: the step cannot be completed until enough reviews are in and their average reaches the threshold. They never decide on their own |
+| `blind_review`, `requires_coi_confirmation` | Evaluator isolation and conflict-of-interest attestation |
+| `applicant_visible` | Whether the applicant sees the step |
+| `transition_mode` | `automatic_on_completion` advances to the next step when this one is completed; `manual` waits for a separate advance |
+| `include_award_response`, `allocation_time` | On `allocation_decision` only: whether the applicant must accept the award, and whether allocation happens `on_decision` or on the round's `allocation_date` (`fixed_date`) |
+
+The step catalogue, in order: `administrative_check`, `technical_assessment`,
+`expert_review`, `panel_review`, `allocation_decision`, `award_response`.
 
 ```mermaid
 graph LR
-    subgraph "Round Configuration"
+    subgraph "Round (scheduling)"
         ST[Start Time] --> CT[Cutoff Time]
-        CT --> RD[Review Duration]
-        RD --> MR[Min Reviewers]
-        MR --> MS[Min Score]
-        MS --> AD[Allocation Date]
+        RD[Review Duration]
+        AD[Allocation Date]
     end
 
-    subgraph "Strategies"
-        RS[Review Strategy:<br/>AFTER_ROUND/<br/>AFTER_PROPOSAL]
-        AS[Allocation Strategy:<br/>BY_CALL_MANAGER/<br/>AUTOMATIC]
-        AT[Allocation Time:<br/>ON_DECISION/<br/>FIXED_DATE]
+    subgraph "CallWorkflowStep (policy, per call)"
+        EN[Enabled / Duration] --> GT[Min Reviewers / Min Score]
+        GT --> TM[Transition Mode]
+        TM --> AT[Allocation Time:<br/>on_decision / fixed_date]
     end
 ```
+
+### How long a granted project runs
+
+When a proposal is allocated, the project's end date is decided in this order:
+
+1. **The call's fixed duration** (`Call.fixed_duration_in_days`), whenever it is set.
+   Prepaid subscription lengths requested under the call are capped to fit inside
+   it, and resource end dates are clamped to the project's.
+2. **The longest requested prepaid subscription**, when the call sets no fixed
+   duration.
+3. **No end date**, when neither applies: the project runs until someone sets one.
 
 ## Resource Template System
 
@@ -215,32 +241,52 @@ graph TB
 
 ## Review System Architecture
 
+### Conflict of Interest Detection
+
+Before assigning reviewers, the system can automatically detect potential conflicts of interest between reviewers and proposals. This ensures fair and unbiased peer review processes.
+
+The COI detection system identifies:
+
+- **Named personnel conflicts**: Reviewer appears in proposal team
+- **Institutional conflicts**: Same or former institutional affiliation
+- **Co-authorship conflicts**: Shared publications with proposal team
+
+For complete documentation on COI detection, including configuration options, detection algorithms, and management workflows, see [Conflict of Interest Detection](proposals-coi.md).
+
+### Reviewer-Proposal Matching
+
+The system includes an automated matching system that computes expertise affinity scores between reviewers and proposals. This ensures qualified reviewers are matched with proposals in their area of expertise.
+
+Key features:
+
+- **Affinity scoring**: Keyword-based and TF-IDF text similarity algorithms
+- **Reviewer discovery**: Algorithm-based suggestions from published profiles
+- **Assignment**: Greedy per proposal by stored affinity, skipping pending or recused conflicts
+- **Bids**: Reviewers can record preferences; assignment does not use them yet
+
+For complete documentation on the matching system, including configuration options, scoring algorithms, and API endpoints, see [Reviewer-Proposal Matching](proposals-matching.md).
+
 ### Review Assignment
 
-The system supports flexible reviewer assignment strategies:
+Reviewers are assigned while a proposal's `expert_review` step is active. The
+step starts when the proposal reaches it in its workflow, which begins at
+submission; the call manager then assigns reviewers manually or generates
+assignment batches from the reviewer pool:
 
 ```mermaid
 sequenceDiagram
-    participant R as Round
     participant P as Proposal
-    participant RM as ReviewManager
+    participant WF as Workflow steps
+    participant CM as Call manager
     participant Rev as Reviewer
     participant N as NotificationSystem
 
-    Note over R: Review Strategy Check
-
-    alt After Round Strategy
-        R->>R: Cutoff time reached
-        R->>RM: Assign reviewers to all proposals
-    else After Proposal Strategy
-        P->>P: State changed to SUBMITTED
-        P->>RM: Assign reviewers immediately
-    end
-
-    RM->>Rev: Create review assignments
-    RM->>N: Notify assigned reviewers
+    P->>WF: Submitted, first enabled step starts
+    WF->>WF: Earlier steps completed, expert_review starts
+    CM->>Rev: Assign reviewers (manual or assignment batch)
+    WF->>N: Notify assigned reviewers
     Rev->>Rev: Complete reviews
-    RM->>RM: Aggregate review results
+    CM->>WF: Complete step once min reviewers and min score are met
 ```
 
 ### Review Scoring System
@@ -258,7 +304,6 @@ class Review:
     comment_project_title: str
     comment_project_summary: str
     comment_project_description: str
-    comment_project_duration: str
     comment_resource_requests: str
     comment_team: str
 
@@ -276,6 +321,101 @@ Calls can configure review transparency:
 |---------|-------------|--------|
 | **`reviewer_identity_visible_to_submitters`** | Whether submitters see reviewer names | `False`: Shows "Reviewer 1", "Reviewer 2" |
 | **`reviews_visible_to_submitters`** | Whether submitters see review details | `False`: Only final decision visible |
+
+## Exports for Call Managers
+
+Panel meetings, funding-body reporting and archiving work from a spreadsheet of
+proposals plus one document per application. Three exports cover that.
+
+### Proposal and review CSV
+
+Two actions on the protected call stream a CSV:
+
+| Endpoint | Rows |
+|----------|------|
+| `GET /api/proposal-protected-calls/<uuid>/export-proposals/` | One per proposal |
+| `GET /api/proposal-protected-calls/<uuid>/export-reviews/` | One per review |
+
+They take the same filters as the matching lists, so a filtered table exports
+the rows it shows:
+
+| Parameter | Proposals | Reviews | Limits the export to |
+|-----------|:---------:|:-------:|----------------------|
+| `round_uuid` | ✓ | ✓ | One round |
+| `proposal_state` (repeatable) | ✓ | | Proposals in these states |
+| `review_state` (repeatable) | | ✓ | Reviews in these states |
+| `created_by_uuid` | ✓ | | One applicant |
+| `reviewer_uuid` | | ✓ | One reviewer |
+| `proposal_uuid` | | ✓ | One proposal |
+| `proposal_name` | ✓ | ✓ | Proposals whose name contains the text |
+
+The state and name filters are prefixed rather than bare `state` / `name`
+because the call's own list filterset still runs when the endpoint resolves the
+call, and reads a bare `state` or `name` as the *call's*.
+
+An unknown state is refused with a 400 rather than ignored: a silently
+unfiltered file is worse than an error.
+
+The proposal export carries the proposal's identity, its created and submitted
+dates, its applicant and organisation, its state and current workflow step, the
+science sub-domain and the requested duration, **one column per requested
+offering component** with the amount asked for, and the review counts, average
+score and individual scores. Rejected reviews — declined, expired or dropped
+for a conflict of interest — are left out of the counts, so "assigned" minus
+"submitted" is the number still outstanding. The column set is derived from the call, not from
+the proposals that matched the filters, so every row has the same shape and two
+exports of one call line up. An offering gets columns once it is accepted, or
+when proposals already asked for it before it was cancelled; a pending offering
+cannot carry amounts yet and is left out.
+
+The duration is what the proposal asks for, not what was granted: reading the
+grant back costs a query per proposal.
+
+`Proposal.submitted_at` is recorded when the proposal leaves draft. It is empty
+for proposals submitted before that field existed: their submission was never
+stored, and the only proxy — the first workflow step instance — was backfilled
+by migration for the oldest of them, so it would read as the upgrade date. The
+column is left empty rather than filled with a date that reads as fact.
+
+The review export carries the proposal, the round, the proposal's step, the
+reviewer, the state, the score, the public comment and the review deadline.
+
+### Permissions and what is left out
+
+Both exports require `UPDATE_CALL` on the call or its managing organisation —
+staff, support (read-only) and call managers. Reviewers and panel members hold a
+role on the call but not that permission, so they get a 403; an applicant cannot
+see the protected call at all and gets a 404.
+
+- `summary_private_comment` is **never** exported. The review API keeps it from
+  call managers, and the export is open to them.
+- Reviewer identity needs no such treatment: it is already visible to exactly
+  the roles that may run an export (see `ProposalReviewSerializer.get_fields`),
+  so no export can widen it.
+- A step's `blind_review` does not apply. It hides evaluators' assessments from
+  *each other*, not from the people running the call.
+- Text that would start a spreadsheet formula (`=`, `+`, `-`, `@`, tab or
+  carriage return) is written with a leading apostrophe. Proposal names,
+  applicant profiles and review comments come from applicants and reviewers,
+  and the file is opened by call managers. Numbers, negative ones included, are
+  left as they are.
+
+### Scale
+
+The response is streamed row by row, and the queryset costs a fixed number of
+queries regardless of how many proposals a call holds — the per-component
+columns are resolved once from the call, and reviews and requested resources are
+prefetched. A call with several thousand proposals starts sending bytes
+immediately instead of waiting behind a proxy's read timeout.
+
+### Per-proposal PDF
+
+The application as the applicant filled it — fields, requested resources, team
+and the *names* of its attachments — is rendered in the browser from the
+proposal detail page (Homeport's `DownloadProposalPdfAction`). Rendering it
+client-side keeps a PDF toolchain and its system packages out of the image for
+the sake of one document, and the attachment files themselves stay behind the
+media endpoint, which applies its own access rules.
 
 ## Integration with Waldur Marketplace
 
@@ -321,6 +461,105 @@ When proposals are accepted:
 3. Users gain appropriate project permissions
 4. Resources become accessible immediately
 
+### Order Author
+
+When a call grants resources it places a marketplace order per granted
+resource. Those orders need a name on them. It is not a formality: for an
+offering fulfilled by raising a helpdesk ticket, the order's `created_by` is
+who the request is opened on behalf of and who the service desk replies to,
+and it is who Waldur addresses its own order mail to. A robot has no email
+address and cannot be either.
+
+`Call.order_author` decides whose name they carry:
+
+| Value | Orders are attributed to |
+|-------|--------------------------|
+| `applicant` (default) | The person who submitted the proposal |
+| `project_manager` | The allocated project's manager |
+| `call_manager` | A call manager on this call |
+| `specific_user` | `Call.order_author_user` — e.g. a shared grants-office account |
+
+Only someone holding a role on the call, on the organisation managing it, or on
+that organisation's customer may be named. Whoever is named starts receiving
+the call's order mail — project name, order description, limits — and, for a
+helpdesk-backed offering, gets an account created for them on the service desk,
+so the choice is kept to people already attached to the call.
+
+```python
+# Attribute every order this call places to the grants office
+call.order_author = Call.OrderAuthor.SPECIFIC_USER
+call.order_author_user = grants_office_user
+call.save()
+```
+
+If the configured role is held by nobody, allocation falls back to the
+applicant, and then to the system robot, rather than refusing to allocate.
+
+#### Being named does not grant anything
+
+The author is a name on the order, not an authorisation.
+
+- **The spend was authorised by the call review.** Accepting the proposal is
+  the consumer-side decision on the order: the granted project belongs to the
+  call's managing organisation, so whoever accepted is deciding on that
+  organisation's behalf, and they are recorded as the order's
+  `consumer_reviewed_by`. An automatic acceptance records the system robot.
+- **The order is carried out with system authority.** Provisioning replays the
+  offering plugin's own API as a user, and the person named may hold no role on
+  the granted project at all — a grants office typically does not. Allocated
+  orders are therefore processed as the system robot, and the order is flagged
+  `placed_automatically` to say so.
+- **Reading a ticket in Waldur still needs a project role.**
+
+!!! warning "Being the order's author does not grant access to its ticket in Waldur"
+    Helpdesk tickets raised for these orders are scoped to the allocated
+    project and its organization, and that scope is what decides who can read
+    and answer them in the customer portal. An author with no role on the
+    project still receives Waldur's ticket emails, but the
+    `support/issue/<uuid>/` link in them will not open for them and they cannot
+    comment in Waldur — only the helpdesk side works. This is worth weighing
+    before pointing `call_manager` or `specific_user` at someone outside the
+    project, such as a grants office.
+
+#### What the ticket says about people
+
+The creation ticket for an allocated order names the order's author as its
+requester, and adds the applicant and a link to the proposal — they differ when
+the call attributes its orders to a call manager or a named contact.
+
+The proposal team is only listed when the offering tracks team changes
+(`enable_issues_for_membership_changes`). Such an offering normally hears about
+each member through a separate membership ticket, but those are raised only
+once the project holds one of its resources, and allocation adds the team
+before creating any. The creation ticket therefore carries a snapshot of the
+project's active members with their roles; later changes raise membership
+tickets as usual. Who the team is depends on the call's
+[role mappings](#role-mapping-system): a call with none allocates an empty project.
+
+#### When the author cannot receive a ticket
+
+A helpdesk ticket needs an address. If the order's author has none — an SSO
+account provisioned without an email claim, or an order left to the system
+robot to place — the caller falls back through the project's manager,
+administrator and member roles to the organization owner, taking the first
+active user with an address. Only when nobody on the project can be reached
+does the order fail, naming the project.
+
+Because the name is on the order itself, this keeps working after allocation.
+When the scheduled end-date sweep or a cost policy terminates a granted
+resource months later, the termination order it places is attributed to the
+author of the resource's own creation order — the contact the call named — so
+its ticket reaches the same desk. The end-date sweep prefers a more specific
+name where there is one: whoever requested the end date, on the resource and
+then on the project. A candidate deactivated since is skipped. Only a creation
+order placed on somebody's behalf — as allocation places them — passes its name
+on: a resource somebody ordered themselves, an imported one, or one reconciled
+from a backend orphan is left to the robot and the fallback above.
+
+Such a termination order is flagged `placed_automatically` and carried out with
+system authority, for the same reason an allocated order is: the contact named
+on it need hold no role on the project.
+
 ## Realistic Usage Examples
 
 ### 1. Academic HPC Resource Allocation
@@ -338,15 +577,18 @@ call = Call.objects.create(
     fixed_duration_in_days=365  # 1-year allocations
 )
 
-# Round with automatic allocation
+# Round: scheduling only
 round = Round.objects.create(
     call=call,
     start_time=datetime(2024, 1, 1),
     cutoff_time=datetime(2024, 2, 15),
-    review_strategy=Round.ReviewStrategies.AFTER_ROUND,
-    deciding_entity=Round.AllocationStrategies.AUTOMATIC,
-    minimal_average_scoring=7.0,  # Require 7/10 average
-    minimum_number_of_reviewers=3
+)
+
+# Evaluation policy: expert review with three reviewers and a 7.0 average
+CallWorkflowStep.objects.filter(call=call, step="expert_review").update(
+    is_enabled=True,
+    min_reviewers=3,
+    min_score_threshold=7.0,
 )
 
 # Resource template
@@ -371,7 +613,7 @@ template = CallResourceTemplate.objects.create(
 
 1. Researchers submit proposals with resource requests
 2. Expert reviewers evaluate scientific merit
-3. Proposals scoring ≥7.0 automatically receive allocations
+3. Once three reviews averaging at least 7.0 are in, the call manager completes the review step and decides the allocation
 4. HPC accounts created with specified limits
 5. Usage tracked through marketplace billing
 
@@ -388,15 +630,19 @@ call = Call.objects.create(
     reviews_visible_to_submitters=True
 )
 
-# Quarterly rounds with manual allocation
+# Quarterly rounds; granted projects start on the round's allocation date
 round_q1 = Round.objects.create(
     call=call,
     start_time=datetime(2024, 1, 1),
     cutoff_time=datetime(2024, 3, 15),
-    review_strategy=Round.ReviewStrategies.AFTER_ROUND,
-    deciding_entity=Round.AllocationStrategies.BY_CALL_MANAGER,
-    allocation_time=Round.AllocationTimes.FIXED_DATE,
     allocation_date=datetime(2024, 4, 1)
+)
+
+CallWorkflowStep.objects.filter(call=call, step="panel_review").update(
+    is_enabled=True
+)
+CallWorkflowStep.objects.filter(call=call, step="allocation_decision").update(
+    allocation_time=AllocationTimes.FIXED_DATE
 )
 
 # Multiple resource options
@@ -443,14 +689,16 @@ call = Call.objects.create(
     reviews_visible_to_submitters=False  # Confidential evaluation
 )
 
-# Continuous rolling rounds
+# One year-long round; each proposal is reviewed as soon as it is submitted
 rolling_round = Round.objects.create(
     call=call,
     start_time=datetime(2024, 1, 1),
     cutoff_time=datetime(2024, 12, 31),
-    review_strategy=Round.ReviewStrategies.AFTER_PROPOSAL,  # Immediate review
-    deciding_entity=Round.AllocationStrategies.BY_CALL_MANAGER,
     review_duration_in_days=14  # Fast turnaround
+)
+
+CallWorkflowStep.objects.filter(call=call, step="expert_review").update(
+    is_enabled=True, duration_in_days=14
 )
 
 # Startup development package
@@ -567,7 +815,7 @@ sequenceDiagram
 
     alt Call has compliance checklist
         S->>PCC: Create completion tracking
-        PCC->>PCC: Initialize as incomplete
+        PCC->>PCC: Initialize incomplete state
     else No compliance checklist
         S->>S: No action needed
     end
@@ -1003,3 +1251,10 @@ def cleanup_proposal_resources(proposal):
 
 - Review progress tracking
 - Resource utilization monitoring
+
+## Related Documentation
+
+- [Call Eligibility and Applicant Attributes](./proposals-eligibility.md) - AAI-based eligibility restrictions and GDPR-compliant attribute exposure
+- [Conflict of Interest Detection](./proposals-coi.md) - COI management and detection workflows
+- [Reviewer Matching](./proposals-matching.md) - Affinity scoring, reviewer suggestions and assignment
+- [User Profile Attributes](../user-profile-attributes.md) - User attribute reference for AAI integration

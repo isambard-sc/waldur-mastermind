@@ -108,6 +108,20 @@ class Comment:
 - Automatic user information formatting for backends
 - Bidirectional synchronization
 
+**Editing and deleting comments:**
+
+Staff can edit and delete any comment. The author of a comment can edit or delete it only when all of the following hold:
+
+- The active backend allows author changes. Only the built-in (basic) backend does. With Atlassian, Zammad and SMAX the comment has already reached the external service desk, where an edit would be recorded under the integration account.
+- The ticket is not part of a [provider routing](provider-helpdesk.md#comment-forwarding) and the comment is not a forwarded copy. Forwarding copies a comment when it is created, so a later edit or deletion would not reach the provider's copy.
+- The backend still accepts changes to the comment. The basic backend accepts them only while the ticket is open.
+
+`is_public` can only be changed by staff; the field is ignored when an author edits their comment.
+
+The `update_is_available` and `destroy_is_available` fields of a comment tell the requesting user whether they can edit or delete it, taking all of the above into account.
+
+When the caller of a ticket edits their own public comment, the assignee is notified (or all staff and support users while the ticket is unassigned) through `support.notification_comment_updated_staff`, with the previous and the edited text. An edit by anyone else notifies the caller through `support.notification_comment_updated`. Deleting a comment notifies nobody.
+
 ### 3. Attachment Management
 
 File attachments for issues and templates:
@@ -271,6 +285,9 @@ Supports multiple authentication methods with automatic fallback:
 
    ```bash
    ATLASSIAN_OAUTH2_CLIENT_ID=your_client_id
+   # Either a client secret: Waldur obtains and renews access tokens itself
+   ATLASSIAN_OAUTH2_CLIENT_SECRET=your_client_secret
+   # ...or an access token obtained elsewhere, used as is until it expires
    ATLASSIAN_OAUTH2_ACCESS_TOKEN=your_access_token
    ATLASSIAN_OAUTH2_TOKEN_TYPE=Bearer  # Optional, defaults to Bearer
    ```
@@ -308,9 +325,36 @@ OAuth 2.0 > Personal Access Token > API Token > Basic Authentication
 **OAuth 2.0 Setup:**
 
 1. Create an OAuth 2.0 app in your Atlassian organization
-2. Obtain client_id and access_token from the OAuth flow
+2. Obtain the client ID and client secret (client credentials, e.g. an Atlassian service account's OAuth 2.0 credential), or an access token from the OAuth flow
 3. Configure the credentials in your environment variables
 4. The system will automatically use OAuth 2.0 when configured
+
+**Atlassian Service Accounts (Cloud):**
+
+A service account authenticates with a scoped API token, which Atlassian accepts only at
+the API gateway, not at the site URL:
+
+```bash
+# cloudId: https://<site>.atlassian.net/_edge/tenant_info
+ATLASSIAN_API_URL=https://api.atlassian.com/ex/jira/<cloudId>
+# Sent as a Bearer token
+ATLASSIAN_PERSONAL_ACCESS_TOKEN=<scoped API token>
+```
+
+Setting `ATLASSIAN_EMAIL` to the service account's email and `ATLASSIAN_TOKEN` to the scoped
+token (sent as Basic auth) against the same gateway URL works as well.
+
+- Token scopes: `read:servicedesk-request`, `write:servicedesk-request`,
+  `manage:servicedesk-customer`, `read:jira-work`, `write:jira-work`, `read:jira-user`.
+  Scopes are fixed when the token is created.
+- The service account needs a Jira Service Management agent licence and the Service Desk
+  Team role on the project, because Waldur raises requests on behalf of the caller.
+- Instead of a token, the service account's OAuth 2.0 credential can be used. Set
+  `ATLASSIAN_OAUTH2_CLIENT_ID` and `ATLASSIAN_OAUTH2_CLIENT_SECRET` (leave
+  `ATLASSIAN_OAUTH2_ACCESS_TOKEN` empty): Waldur requests access tokens from
+  `https://auth.atlassian.com/oauth/token` itself, keeps them in the shared cache and
+  renews them a minute before they expire (they are valid for an hour). The scopes are
+  the ones selected on the credential.
 
 **Custom Field Mapping:**
 
@@ -403,6 +447,10 @@ class SupportBackend:
     def update_comment(comment: Comment) -> Comment
     def delete_comment(comment: Comment)
 
+    # May the author of a comment change or remove it? Staff always may.
+    comment_author_update_is_supported: bool = False
+    comment_author_destroy_is_supported: bool = False
+
     # Attachment operations
     def create_attachment(attachment: Attachment) -> Attachment
     def delete_attachment(attachment: Attachment)
@@ -436,8 +484,8 @@ class SupportBackend:
 |----------|--------|-------------|
 | `/api/support-comments/` | GET | List comments |
 | `/api/support-comments/{uuid}/` | GET | Retrieve comment |
-| `/api/support-comments/{uuid}/` | PATCH | Update comment |
-| `/api/support-comments/{uuid}/` | DELETE | Delete comment |
+| `/api/support-comments/{uuid}/` | PATCH | Update comment (staff, or the author where [allowed](#2-comment-system)) |
+| `/api/support-comments/{uuid}/` | DELETE | Delete comment (staff, or the author where [allowed](#2-comment-system)) |
 
 ### Attachments
 
@@ -797,6 +845,21 @@ The support module provides several extension points:
 3. **Notification Handlers**: Custom email/notification logic
 4. **Webhook Processors**: Custom webhook payload processing
 5. **Feedback Collectors**: Alternative feedback mechanisms
+
+## Multi-Tenant Provider Helpdesk
+
+The support module includes a multi-tenant provider helpdesk system that enables service providers to register their own helpdesk backends. Tickets are automatically routed to the correct provider, with bidirectional comment forwarding between operator and provider via parent/child issue pairs.
+
+Key capabilities:
+
+- Per-provider helpdesk backends (Atlassian, Zammad, SMAX, Basic, Email)
+- Automatic ticket routing based on resource/offering/provider chain
+- SLA management with configurable deadlines and breach detection
+- Auto-assignment with least-loaded and round-robin strategies
+- Escalation workflow with provider notifications
+- Provider team management and canned responses
+
+See [Provider Helpdesk Documentation](provider-helpdesk.md) for details.
 
 ## Appendix
 

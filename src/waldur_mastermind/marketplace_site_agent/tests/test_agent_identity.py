@@ -1,13 +1,15 @@
 import textwrap
+import uuid
 from unittest import mock
 
 from ddt import data, ddt
 from rest_framework import status, test
 
+from waldur_core.logging import enums as logging_enums
 from waldur_core.logging import models as logging_models
-from waldur_core.logging import utils as logging_utils
 from waldur_core.permissions.enums import PermissionEnum
-from waldur_core.permissions.fixtures import CustomerRole
+from waldur_core.permissions.fixtures import CustomerRole, OfferingRole
+from waldur_core.structure.tests.factories import UserFactory
 from waldur_mastermind.marketplace import enums
 from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
 from waldur_mastermind.marketplace_site_agent import models
@@ -15,7 +17,7 @@ from waldur_mastermind.marketplace_site_agent.tests import factories
 
 
 @ddt
-class AgentIdentityCreateTest(test.APITransactionTestCase):
+class AgentIdentityCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -41,20 +43,20 @@ class AgentIdentityCreateTest(test.APITransactionTestCase):
                   resource_import_enabled: false
             """),
             "dependencies": [
-                "paho-mqtt=v2.1.0",
-                "pyyaml=v6.0.1",
-                "requests=v2.32.3",
-                "sentry-sdk=v2.3.1",
-                "stomp-py=v8.2.0",
-                "types-pyyaml=v6.0.12.20250822",
-                "waldur-api-client=v7.8.0",
-                "ruff=v0.12.11",
+                {"package": "pyyaml", "version": "v6.0.1"},
+                {"package": "requests", "version": "v2.32.3"},
+                {"package": "sentry-sdk", "version": "v2.3.1"},
+                {"package": "stomp-py", "version": "v8.2.0"},
+                {"package": "types-pyyaml", "version": "v6.0.12.20250822"},
+                {"package": "waldur-api-client", "version": "v7.8.0"},
+                {"package": "ruff", "version": "v0.12.11"},
             ],
         }
 
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING)
 
-    @data("staff", "offering_owner")
+    @data("staff", "offering_owner", "offering_manager")
     def test_agent_identity_create_allowed(self, user_role):
         user = getattr(self.fixture, user_role)
         self.client.force_login(user)
@@ -63,13 +65,13 @@ class AgentIdentityCreateTest(test.APITransactionTestCase):
         response = self.client.post(url, self.payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
 
-        self.assertTrue(
-            models.AgentIdentity.objects.filter(
-                name="Agent Test 00", offering=self.offering
-            ).exists()
+        agent_identity = models.AgentIdentity.objects.get(
+            name="Agent Test 00", offering=self.offering
         )
+        self.assertEqual(agent_identity.dependencies, self.payload["dependencies"])
+        self.assertEqual(response.json()["dependencies"], self.payload["dependencies"])
 
-    @data("offering_manager", "offering_admin", "admin", "manager", "global_support")
+    @data("offering_admin", "admin", "manager", "global_support")
     def test_agent_identity_create_forbidden(self, user_role):
         user = getattr(self.fixture, user_role)
         self.client.force_login(user)
@@ -82,7 +84,7 @@ class AgentIdentityCreateTest(test.APITransactionTestCase):
 
 
 @ddt
-class AgentIdentityListTest(test.APITransactionTestCase):
+class AgentIdentityListTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.fixture.offering_admin
@@ -134,7 +136,7 @@ class AgentIdentityListTest(test.APITransactionTestCase):
 @mock.patch(
     "waldur_core.logging.backend.RabbitMQManagementBackend.assign_rabbitmq_vhost_permissions"
 )
-class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
+class AgentIdentityEventSubscriptionTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -142,6 +144,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
         self.offering.save()
 
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING)
 
     def _create_agent_identity(self):
         """Helper method to create an AgentIdentity instance for testing."""
@@ -155,7 +158,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
             agent_identity, action="register_event_subscription"
         )
 
-    @data("staff", "offering_owner")
+    @data("staff", "offering_owner", "offering_manager")
     def test_register_event_subscription_success(
         self,
         user_role,
@@ -171,7 +174,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
         url = self._get_register_event_subscription_url(agent_identity)
 
         payload = {
-            "observable_object_type": logging_utils.ObservableObjectType.ORDER.value,
+            "observable_object_type": logging_enums.ObservableObjectType.ORDER.value,
             "description": "Test event subscription for orders",
         }
 
@@ -222,7 +225,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
         url = self._get_register_event_subscription_url(agent_identity)
 
         payload = {
-            "observable_object_type": logging_utils.ObservableObjectType.RESOURCE.value,
+            "observable_object_type": logging_enums.ObservableObjectType.RESOURCE.value,
         }
 
         # Create first subscription
@@ -277,7 +280,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
         url = self._get_register_event_subscription_url(agent_identity)
 
         payload = {
-            "observable_object_type": logging_utils.ObservableObjectType.RESOURCE.value,
+            "observable_object_type": logging_enums.ObservableObjectType.RESOURCE.value,
         }
 
         # Create first subscription
@@ -324,7 +327,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
         url = self._get_register_event_subscription_url(agent_identity)
 
         payload = {
-            "observable_object_type": logging_utils.ObservableObjectType.USER_ROLE.value,
+            "observable_object_type": logging_enums.ObservableObjectType.USER_ROLE.value,
         }
 
         response = self.client.post(url, payload)
@@ -339,7 +342,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
         mock_create_rabbitmq_user.assert_called_once()
         mock_assign_rabbitmq_vhost_permissions.assert_called_once()
 
-    @data("offering_manager", "offering_admin", "admin", "manager", "global_support")
+    @data("offering_admin", "admin", "manager", "global_support")
     def test_register_event_subscription_forbidden(
         self,
         user_role,
@@ -355,7 +358,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
         url = self._get_register_event_subscription_url(agent_identity)
 
         payload = {
-            "observable_object_type": logging_utils.ObservableObjectType.ORDER.value,
+            "observable_object_type": logging_enums.ObservableObjectType.ORDER.value,
         }
 
         response = self.client.post(url, payload)
@@ -443,7 +446,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
         url = f"/api/marketplace-site-agent-identities/{fake_uuid}/register_event_subscription/"
 
         payload = {
-            "observable_object_type": logging_utils.ObservableObjectType.ORDER.value,
+            "observable_object_type": logging_enums.ObservableObjectType.ORDER.value,
         }
 
         response = self.client.post(url, payload)
@@ -455,7 +458,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
 
 
 @ddt
-class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
+class AgentIdentityRegisterServiceTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -463,6 +466,7 @@ class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
         self.offering.save()
 
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING)
 
         self.agent_identity = factories.AgentIdentityFactory(
             offering=self.offering, name="Test Agent Identity"
@@ -474,7 +478,7 @@ class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
             self.agent_identity, action="register_service"
         )
 
-    @data("staff", "offering_owner")
+    @data("staff", "offering_owner", "offering_manager")
     def test_register_service_success(self, user_role):
         """Test successful registration of a new service."""
         user = getattr(self.fixture, user_role)
@@ -567,7 +571,7 @@ class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
         self.assertEqual(response1.json()["uuid"], response2.json()["uuid"])
         self.assertEqual(response2.json()["mode"], payload["mode"])
 
-    @data("staff", "offering_owner")
+    @data("staff", "offering_owner", "offering_manager")
     def test_register_multiple_services(self, user_role):
         """Test registering multiple services for the same identity."""
         user = getattr(self.fixture, user_role)
@@ -597,7 +601,7 @@ class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
         self.assertIn(payload1["name"], service_names)
         self.assertIn(payload2["name"], service_names)
 
-    @data("offering_manager", "offering_admin", "admin", "manager", "global_support")
+    @data("offering_admin", "admin", "manager", "global_support")
     def test_register_service_forbidden(self, user_role):
         """Test that forbidden roles cannot register services."""
         user = getattr(self.fixture, user_role)
@@ -673,3 +677,195 @@ class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
 
         response = self.client.post(url, payload, format="json")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class IdentityManagerAgentIdentityTest(test.APITestCase):
+    """Identity managers can create agent identities for non-archived/draft offerings
+    and manage only their own."""
+
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.offering = self.fixture.offering
+        self.offering.type = enums.SITE_AGENT_OFFERING
+        self.offering.save()
+
+        self.identity_manager = UserFactory(
+            is_identity_manager=True,
+            managed_isds=["isd:efp"],
+        )
+
+        self.other_identity_manager = UserFactory(
+            is_identity_manager=True,
+            managed_isds=["isd:fenix"],
+        )
+
+        self.payload = {
+            "name": "Agent from IdM",
+            "offering": self.offering.uuid.hex,
+        }
+
+    def test_identity_manager_can_create_without_offering_users(self):
+        """ISD manager can create agent identity even without any offering users."""
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_list_url()
+        response = self.client.post(url, self.payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        agent = models.AgentIdentity.objects.get(name="Agent from IdM")
+        self.assertEqual(agent.created_by, self.identity_manager)
+
+    def test_other_identity_manager_can_also_create(self):
+        """Any ISD manager with managed_isds can create, regardless of ISD values."""
+        self.client.force_authenticate(user=self.other_identity_manager)
+        url = factories.AgentIdentityFactory.get_list_url()
+        response = self.client.post(url, self.payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_identity_manager_cannot_create_for_archived_offering(self):
+        self.offering.state = enums.OfferingStates.ARCHIVED
+        self.offering.save()
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_list_url()
+        response = self.client.post(url, self.payload)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_identity_manager_cannot_create_for_draft_offering(self):
+        self.offering.state = enums.OfferingStates.DRAFT
+        self.offering.save()
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_list_url()
+        response = self.client.post(url, self.payload)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_identity_manager_can_destroy_own_agent_identity(self):
+        agent_identity = factories.AgentIdentityFactory(
+            offering=self.offering,
+            name="My Agent",
+            created_by=self.identity_manager,
+        )
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_url(agent_identity)
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_identity_manager_cannot_destroy_others_agent_identity(self):
+        agent_identity = factories.AgentIdentityFactory(
+            offering=self.offering,
+            name="Other's Agent",
+            created_by=self.other_identity_manager,
+        )
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_url(agent_identity)
+        response = self.client.delete(url)
+        self.assertIn(
+            response.status_code,
+            [status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND],
+        )
+
+    def test_identity_manager_can_list_own_agent_identities(self):
+        factories.AgentIdentityFactory(
+            offering=self.offering,
+            name="My Agent",
+            created_by=self.identity_manager,
+        )
+        factories.AgentIdentityFactory(
+            offering=self.offering,
+            name="Other's Agent",
+            created_by=self.other_identity_manager,
+        )
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_list_url()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["name"], "My Agent")
+
+
+@ddt
+class AgentIdentityOfferingTypeTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.offering = self.fixture.offering
+
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING)
+
+    def _create_identity(
+        self, offering_uuid, name="Agent Test", user_role="offering_manager"
+    ):
+        self.client.force_login(getattr(self.fixture, user_role))
+        return self.client.post(
+            factories.AgentIdentityFactory.get_list_url(),
+            {"name": name, "offering": offering_uuid},
+        )
+
+    @data(*sorted(enums.SITE_AGENT_COMPATIBLE_OFFERING_TYPES))
+    def test_compatible_offering_type_is_accepted(self, offering_type):
+        self.offering.type = offering_type
+        self.offering.save()
+
+        response = self._create_identity(self.offering.uuid.hex)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        self.assertTrue(
+            models.AgentIdentity.objects.filter(offering=self.offering).exists()
+        )
+
+    def test_service_desk_agent_can_register_service_and_processor(self):
+        self.offering.type = enums.SUPPORT_OFFERING
+        self.offering.save()
+
+        response = self._create_identity(self.offering.uuid.hex)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        agent_identity = models.AgentIdentity.objects.get(offering=self.offering)
+
+        response = self.client.post(
+            factories.AgentIdentityFactory.get_url(
+                agent_identity, action="register_service"
+            ),
+            {"name": "order_processing", "mode": "event_processing"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        service = models.AgentService.objects.get(identity=agent_identity)
+
+        response = self.client.post(
+            factories.AgentServiceFactory.get_url(service, action="register_processor"),
+            {
+                "name": "order_processor",
+                "backend_type": "service_desk",
+                "backend_version": "1.0.0",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        self.assertEqual(service.agentprocessor_set.count(), 1)
+
+    def test_unsupported_offering_type_is_reported_as_such(self):
+        self.offering.type = enums.BOOKING_OFFERING
+        self.offering.save()
+
+        response = self._create_identity(self.offering.uuid.hex)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(enums.BOOKING_OFFERING, str(response.json()["offering"]))
+        self.assertFalse(models.AgentIdentity.objects.exists())
+
+    def test_unknown_offering_uuid_is_reported_as_missing(self):
+        response = self._create_identity(uuid.uuid4().hex)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("does not exist", str(response.json()["offering"]))
+        self.assertFalse(models.AgentIdentity.objects.exists())
+
+    @data("admin", "manager", "global_support")
+    def test_offering_type_is_not_disclosed_to_unprivileged_user(self, user_role):
+        # The type check must not answer before the permission check does,
+        # otherwise a UUID alone tells an outsider that the offering exists.
+        self.offering.type = enums.BOOKING_OFFERING
+        self.offering.save()
+
+        response = self._create_identity(self.offering.uuid.hex, user_role=user_role)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertNotIn(enums.BOOKING_OFFERING, str(response.json()))
+        self.assertFalse(models.AgentIdentity.objects.exists())

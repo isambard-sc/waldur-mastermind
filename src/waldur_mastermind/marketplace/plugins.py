@@ -1,6 +1,11 @@
 import logging
 from dataclasses import dataclass
 
+from constance import config
+from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
+from django.db import utils as db_utils
+
 
 @dataclass
 class Component:
@@ -53,6 +58,17 @@ class PluginManager:
         :key available_limits: optional list of strings each of which corresponds to offering component type,
         which supports user-defined limits, such as VPC RAM and vCPU.
         :key limits_validator: optional function to validate limis.
+        :key max_limit_decimal_places: optional int capping how many decimal places a
+        provider may allow on this plugin's component limits. Declare 0 for a backend
+        that maps a limit onto an integer quota, so a fractional limit is rejected at
+        the API instead of being silently truncated at the backend boundary. Omit it
+        where Waldur cannot know — the operator then owns the decision.
+        :key limit_precision_advisory: optional function taking an offering and
+        returning a sentence to show its provider when they raise component limit
+        precision, or None. For a plugin whose offerings do not all share one
+        backend -- the site agent covers roughly fifteen -- the answer is not a
+        property of the offering type and no static cap can express it. This says
+        what is known about *this* offering without refusing the configuration.
         :key: can_update_limits: boolean which indicates whether plugin allows user to set limits on resource.
         :key resource_model: optional Django model class which corresponds to resource.
         :key get_filtered_components: optional function to filter out enabled offering components.
@@ -67,14 +83,27 @@ class PluginManager:
         :key get_available_resource_actions: function which returns list of strings
         identifying available resource actions
         :key is_interruptible: optional boolean indicated whether order of offering can be interrupted.
+        :key supports_order_retry: optional boolean indicating whether erred orders can be retried.
         """
         self.backends[offering_type] = kwargs
 
     def get_offering_types(self) -> list[str]:
         """
-        Return list of offering types.
+        Return list of offering types filtered by configuration.
+        If WALDUR_MARKETPLACE.DISABLED_OFFERING_TYPES is set, these types are excluded.
         """
-        return list(self.backends.keys())
+
+        all_types = list(self.backends.keys())
+        try:
+            # Constance reads values from DB; during schema generation or other non-DB contexts
+            # (e.g., Spectacular OpenAPI), accessing it may raise ImproperlyConfigured or DB errors.
+            disabled = set(config.DISABLED_OFFERING_TYPES or [])
+        except (ImproperlyConfigured, db_utils.Error):
+            default = settings.CONSTANCE_CONFIG.get("DISABLED_OFFERING_TYPES", ([],))
+            disabled = set(default[0] if default else [])
+        if not disabled:
+            return all_types
+        return [t for t in all_types if t not in disabled]
 
     def get_service_type(self, offering_type):
         """
@@ -134,6 +163,25 @@ class PluginManager:
         Returns function to validate limis.
         """
         return self.backends.get(offering_type, {}).get("limits_validator")
+
+    def get_max_limit_decimal_places(self, offering_type):
+        """
+        Returns the cap on component limit precision, or None when uncapped.
+        """
+        return self.backends.get(offering_type, {}).get("max_limit_decimal_places")
+
+    def get_limit_precision_advisory(self, offering) -> str | None:
+        """Advice for the provider raising this offering's limit precision.
+
+        Unlike the cap above this is per offering, not per type, because the
+        plugin that needs it -- the site agent -- fronts many backends that
+        disagree about whether a limit can hold a fraction. Returns None when
+        the plugin declares no advisory or has nothing to say.
+        """
+        advisory = self.backends.get(offering.type, {}).get("limit_precision_advisory")
+        if advisory is None:
+            return None
+        return advisory(offering)
 
     def get_resource_model(self, offering_type):
         """
@@ -234,6 +282,22 @@ class PluginManager:
             if fn:
                 actions.extend(fn(resource))
         return actions
+
+    def supports_order_retry(self, offering_type):
+        """
+        Returns true if erred orders for this offering type can be retried.
+        """
+        return self.backends.get(offering_type, {}).get("supports_order_retry", False)
+
+    def list_retryable_offerings(self):
+        """
+        Returns list of offering types that support order retry.
+        """
+        return [
+            offering_type
+            for offering_type, backend in self.backends.items()
+            if backend.get("supports_order_retry", False)
+        ]
 
     def list_interruptible_offerings(self):
         """

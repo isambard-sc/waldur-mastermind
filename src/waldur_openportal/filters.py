@@ -6,7 +6,7 @@ from waldur_core.core import filters as core_filters
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 
-from . import models
+from . import config, models
 
 
 class AllocationFilter(structure_filters.BaseResourceFilter):
@@ -26,10 +26,14 @@ class AllocationUserUsageFilter(django_filters.FilterSet):
         view_name="openportal-allocation-detail",
         field_name="allocation__uuid",
     )
-    allocation_uuid = django_filters.UUIDFilter(field_name="allocation__uuid")
+    allocation_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openportal-allocation-detail", field_name="allocation__uuid"
+    )
 
     user = core_filters.URLFilter(view_name="user-detail", field_name="user__uuid")
-    user_uuid = django_filters.UUIDFilter(field_name="user__uuid")
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="user__uuid"
+    )
     month = django_filters.NumberFilter(field_name="month")
     year = django_filters.NumberFilter(field_name="year")
 
@@ -38,26 +42,34 @@ class AssociationFilter(django_filters.FilterSet):
     allocation = core_filters.URLFilter(
         view_name="openportal-allocation-detail", field_name="allocation__uuid"
     )
-    allocation_uuid = django_filters.UUIDFilter(field_name="allocation__uuid")
+    allocation_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openportal-allocation-detail", field_name="allocation__uuid"
+    )
 
 
 class RemoteAssociationFilter(django_filters.FilterSet):
     allocation = core_filters.URLFilter(
         view_name="openportal-remote-allocation-detail", field_name="allocation__uuid"
     )
-    allocation_uuid = django_filters.UUIDFilter(field_name="allocation__uuid")
+    allocation_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openportal-remote-allocation-detail", field_name="allocation__uuid"
+    )
 
 
 class UserInfoFilter(django_filters.FilterSet):
     user = core_filters.URLFilter(view_name="user-detail", field_name="user__uuid")
-    user_uuid = django_filters.UUIDFilter(field_name="user__uuid")
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="user__uuid"
+    )
 
 
 class ProjectInfoFilter(django_filters.FilterSet):
     project = core_filters.URLFilter(
         view_name="project-detail", field_name="project__uuid"
     )
-    project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid"
+    )
 
 
 class ProjectTemplateFilter(django_filters.FilterSet):
@@ -74,19 +86,25 @@ def _identifiers_for_project_uuid(value):
     2. {projectinfo.shortname}.{portal} — covers cases where the allocation
        has been deleted (e.g. soft-deleted projects, or allocations removed).
     """
-    from . import op as openportal
+    import openportal
 
-    openportal.ensure_config_loaded()
+    if not config.ensure_config_loaded():
+        return set()
+
     allocation_identifiers = set(
         models.Allocation.objects.filter(project__uuid=value)
         .exclude(backend_id="")
         .values_list("backend_id", flat=True)
     )
     portal = str(openportal.get_portal())
-    shortnames = models.ProjectInfo.objects.filter(
-        project__uuid=value,
-        shortname__isnull=False,
-    ).exclude(shortname="").values_list("shortname", flat=True)
+    shortnames = (
+        models.ProjectInfo.objects.filter(
+            project__uuid=value,
+            shortname__isnull=False,
+        )
+        .exclude(shortname="")
+        .values_list("shortname", flat=True)
+    )
     shortname_identifiers = {f"{sn}.{portal}" for sn in shortnames}
     return allocation_identifiers | shortname_identifiers
 
@@ -97,7 +115,9 @@ class CachedProjectUsageReportFilter(django_filters.FilterSet):
     project_identifier = django_filters.CharFilter(field_name="project_identifier")
     resource = django_filters.CharFilter(field_name="resource")
     is_complete = django_filters.BooleanFilter(field_name="is_complete")
-    project_uuid = django_filters.UUIDFilter(method="filter_by_project_uuid")
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", method="filter_by_project_uuid"
+    )
 
     def filter_by_project_uuid(self, queryset, name, value):
         return queryset.filter(
@@ -114,7 +134,9 @@ class CachedProjectStorageReportFilter(django_filters.FilterSet):
     month = django_filters.NumberFilter(field_name="month")
     project_identifier = django_filters.CharFilter(field_name="project_identifier")
     resource = django_filters.CharFilter(field_name="resource")
-    project_uuid = django_filters.UUIDFilter(method="filter_by_project_uuid")
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", method="filter_by_project_uuid"
+    )
 
     def filter_by_project_uuid(self, queryset, name, value):
         return queryset.filter(
@@ -127,20 +149,47 @@ class CachedProjectStorageReportFilter(django_filters.FilterSet):
 
 
 class ProjectAccountingSummaryFilter(django_filters.FilterSet):
-    project_uuid = django_filters.UUIDFilter(field_name="uuid")
-    customer_uuid = django_filters.UUIDFilter(field_name="customer__uuid")
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="uuid"
+    )
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="customer__uuid"
+    )
     is_active = django_filters.BooleanFilter(method="filter_is_active")
+    offering_name = django_filters.CharFilter(method="filter_offering_name")
+
+    def filter_offering_name(self, queryset, name, value):
+        from waldur_mastermind.marketplace import models as marketplace_models
+        from waldur_mastermind.marketplace.enums import ResourceStates
+
+        project_ids = marketplace_models.Resource.objects.filter(
+            offering__name__icontains=value, state=ResourceStates.OK
+        ).values_list("project_id", flat=True)
+        return queryset.filter(id__in=project_ids)
 
     def filter_is_active(self, queryset, name, value):
         today = timezone.now().date()
         if value:
             # Active: no end_date set, or end_date is in the future
-            return queryset.filter(
-                end_date__isnull=True
-            ) | queryset.filter(end_date__gt=today)
+            return queryset.filter(end_date__isnull=True) | queryset.filter(
+                end_date__gt=today
+            )
         else:
             # Inactive: end_date is set and has passed
             return queryset.filter(end_date__lte=today)
+
+    class Meta:
+        model = structure_models.Project
+        fields = []
+
+
+class ManagedProjectAccountingSummaryFilter(django_filters.FilterSet):
+    # RelatedUUIDFilter rather than a plain UUIDFilter: it carries view_name,
+    # which is what lets the schema hook attach x-waldur-operation-id. A UUID
+    # query parameter without one fails schema generation.
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="uuid"
+    )
 
     class Meta:
         model = structure_models.Project
@@ -155,6 +204,7 @@ class ManagedProjectFilter(django_filters.FilterSet):
         field_name="local_identifier", lookup_expr="icontains"
     )
     query = django_filters.CharFilter(method="filter_search")
+    hide_embargoed = django_filters.BooleanFilter(method="filter_hide_embargoed")
 
     def filter_search(self, queryset, name, value):
         return queryset.filter(
@@ -162,6 +212,26 @@ class ManagedProjectFilter(django_filters.FilterSet):
             | Q(project__name__icontains=value)
             | Q(project_template__name__icontains=value)
             | Q(details__name__icontains=value)
+        )
+
+    def filter_hide_embargoed(self, queryset, name, value):
+        """
+        Drop awards that cannot be approved yet because earliest_approve is
+        still in the future.
+
+        AwardDetails serialises the timestamp as a canonical UTC ISO-8601
+        string of fixed width, so it orders correctly as a string and can be
+        compared inside the JSON document.  A JSON null sorts below any string
+        and so is kept by the comparison, but a missing key matches neither it
+        nor an exclude(), hence the explicit isnull branch.
+        """
+        if not value:
+            return queryset
+
+        now = timezone.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        return queryset.filter(
+            Q(details__earliest_approve__lte=now)
+            | Q(details__earliest_approve__isnull=True)
         )
 
     project = core_filters.URLFilter(
@@ -172,9 +242,12 @@ class ManagedProjectFilter(django_filters.FilterSet):
         view_name="openportal-project-template", field_name="project_template__uuid"
     )
 
-    project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
-    project_template_uuid = django_filters.UUIDFilter(
-        field_name="project_template__uuid"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid"
+    )
+    project_template_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openportal-project-template-detail",
+        field_name="project_template__uuid",
     )
     state = core_filters.ReviewStateFilter()
 
@@ -184,8 +257,8 @@ class ManagedProjectFilter(django_filters.FilterSet):
 
 
 class RemoteProjectFilter(django_filters.FilterSet):
-    project_uuid = django_filters.UUIDFilter(
-        field_name="current_project__uuid"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="current_project__uuid"
     )
     project = core_filters.URLFilter(
         view_name="project-detail",
@@ -195,7 +268,8 @@ class RemoteProjectFilter(django_filters.FilterSet):
         view_name="customer-detail",
         field_name="current_project__customer__uuid",
     )
-    customer_uuid = django_filters.UUIDFilter(
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
         field_name="current_project__customer__uuid",
     )
     state = django_filters.MultipleChoiceFilter(
@@ -223,11 +297,11 @@ class RemoteProjectFilter(django_filters.FilterSet):
 
 
 class RemoteProjectAuditEntryFilter(django_filters.FilterSet):
-    remote_project_uuid = django_filters.UUIDFilter(
-        field_name="remote_project__uuid"
+    remote_project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openportal-remote-project-detail", field_name="remote_project__uuid"
     )
-    project_uuid = django_filters.UUIDFilter(
-        field_name="remote_project__current_project__uuid"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="remote_project__current_project__uuid"
     )
     event_type = django_filters.CharFilter(field_name="event_type")
     timestamp_after = django_filters.DateTimeFilter(
@@ -253,11 +327,11 @@ class RemoteProjectAuditEntryFilter(django_filters.FilterSet):
 
 
 class RemoteProjectAllocationEntryFilter(django_filters.FilterSet):
-    remote_project_uuid = django_filters.UUIDFilter(
-        field_name="remote_project__uuid"
+    remote_project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openportal-remote-project-detail", field_name="remote_project__uuid"
     )
-    project_uuid = django_filters.UUIDFilter(
-        field_name="remote_project__current_project__uuid"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="remote_project__current_project__uuid"
     )
 
     class Meta:

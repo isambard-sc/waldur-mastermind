@@ -10,6 +10,8 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.structure import tasks as structure_tasks
 from waldur_core.structure.registry import get_resource_type
+from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import OrderStates, OrderTypes
 from waldur_mastermind.marketplace_openstack.utils import (
     create_offerings_for_volume_and_instance,
 )
@@ -20,6 +22,88 @@ from . import models, signals
 
 logger = logging.getLogger(__name__)
 
+TERMINATION_STEP_STOP = "stop"
+TERMINATION_STEP_DELETE_BACKUP = "delete_backup"
+TERMINATION_STEP_DELETE_SNAPSHOT = "delete_snapshot"
+TERMINATION_STEP_DETACH_VOLUMES = "detach_volumes"
+TERMINATION_STEP_DELETE_INSTANCE = "delete_instance"
+
+
+def get_instance_termination_log_context(instance):
+    context = {
+        "instance_uuid": instance.uuid.hex,
+        "resource_uuid": None,
+        "order_uuid": None,
+    }
+    try:
+        resource = marketplace_models.Resource.objects.get(scope=instance)
+        context["resource_uuid"] = resource.uuid.hex
+        order = (
+            marketplace_models.Order.objects.filter(
+                resource=resource,
+                type=OrderTypes.TERMINATE,
+                state=OrderStates.EXECUTING,
+            )
+            .order_by("-created")
+            .first()
+        )
+        if order:
+            context["order_uuid"] = order.uuid.hex
+    except marketplace_models.Resource.DoesNotExist:
+        pass
+    return context
+
+
+def log_instance_termination_event(instance, event, step, context=None):
+    context = context or get_instance_termination_log_context(instance)
+    logger.log(
+        logging.ERROR if event == "failed" else logging.INFO,
+        "instance_termination event=%s step=%s instance_uuid=%s resource_uuid=%s "
+        "order_uuid=%s",
+        event,
+        step,
+        context["instance_uuid"],
+        context["resource_uuid"],
+        context["order_uuid"],
+    )
+
+
+class InstanceTerminationStepMarkerTask(core_tasks.Task):
+    @classmethod
+    def get_description(cls, instance, step, **kwargs):
+        return f'Mark instance termination step "{step}" for instance "{instance}".'
+
+    def execute(self, instance, step, **kwargs):
+        action_details = dict(instance.action_details or {})
+        action_details["termination_step"] = step
+        instance.action_details = action_details
+        instance.save(update_fields=["action_details"])
+        log_instance_termination_event(instance, "started", step)
+
+
+class InstanceDeleteSuccessTask(core_tasks.DeletionTask):
+    def execute(self, instance):
+        step = (instance.action_details or {}).get(
+            "termination_step", TERMINATION_STEP_DELETE_INSTANCE
+        )
+        log_instance_termination_event(instance, "completed", step)
+        super().execute(instance)
+
+
+class InstanceDeleteFailureTask(core_tasks.ErrorStateTransitionTask):
+    def execute(self, instance):
+        step = (instance.action_details or {}).get("termination_step", "unknown")
+        log_context = get_instance_termination_log_context(instance)
+        super().execute(instance)
+        if instance.error_message and not instance.error_message.startswith(
+            "Termination failed at step"
+        ):
+            instance.error_message = (
+                f"Termination failed at step '{step}': {instance.error_message}"
+            )
+            instance.save(update_fields=["error_message"])
+        log_instance_termination_event(instance, "failed", step, context=log_context)
+
 
 class TenantCreateErrorTask(core_tasks.ErrorStateTransitionTask):
     def execute(self, tenant):
@@ -27,6 +111,8 @@ class TenantCreateErrorTask(core_tasks.ErrorStateTransitionTask):
         # Delete network and subnet if they were not created on backend,
         # mark as erred if they were created
         network = tenant.networks.first()
+        if network is None:
+            return
         subnet = network.subnets.first()
         if subnet.state == CoreStates.CREATION_SCHEDULED:
             subnet.delete()
@@ -40,9 +126,12 @@ class TenantCreateErrorTask(core_tasks.ErrorStateTransitionTask):
 
 class TenantCreateSuccessTask(core_tasks.StateTransitionTask):
     def execute(self, tenant):
-        from . import executors
-
-        executors.TenantPullExecutor.execute(tenant)
+        # Avoid triggering executors.TenantPullExecutor, which starts an asynchronous
+        # sync task that sets the tenant to UPDATING state, causing race conditions
+        # for clients (like Terraform) expecting the tenant to be immediately OK and ready.
+        # Instead, trigger only the required post-creation side-effects directly.
+        signals.tenant_pull_succeeded.send(models.Tenant, instance=tenant)
+        create_offerings_for_volume_and_instance(tenant)
         return super().execute(tenant)
 
 
@@ -50,9 +139,6 @@ class TenantPullQuotas(core_tasks.BackgroundTask):
     """Pull quota limits and usage information for all OpenStack tenants."""
 
     name = "openstack.TenantPullQuotas"
-
-    def is_equal(self, other_task):
-        return self.name == other_task.get("name")
 
     def run(self):
         from . import executors
@@ -181,9 +267,6 @@ class VolumeExtendErredTask(core_tasks.ErrorStateTransitionTask):
 class BaseDeleteExpiredResourcesTask(core_tasks.BackgroundTask):
     model = NotImplemented
 
-    def is_equal(self, other_task):
-        return self.name == other_task.get("name")
-
     def _get_executor(self):
         raise NotImplementedError()
 
@@ -251,9 +334,9 @@ class ThrottleProvisionStateTask(
 class TenantResourcesPullTask(structure_tasks.BackgroundPullTask):
     def pull(self, tenant: models.Tenant):
         backend = OpenStackBackend(tenant.service_settings)
-        backend.pull_tenant_instances(tenant)
         backend.pull_tenant_volumes(tenant)
         backend.pull_tenant_snapshots(tenant)
+        backend.pull_tenant_instances(tenant)
 
 
 class TenantResourcesListPullTask(structure_tasks.BackgroundListPullTask):
@@ -274,6 +357,11 @@ class TenantSubresourcesPullTask(structure_tasks.BackgroundPullTask):
         backend.pull_tenant_subnets(tenant)
         backend.pull_tenant_ports(tenant)
         backend.pull_tenant_routers(tenant)
+        backend.pull_tenant_load_balancers(tenant)
+        backend.pull_tenant_pools(tenant)
+        backend.pull_tenant_pool_members(tenant)
+        backend.pull_tenant_healthmonitors(tenant)
+        backend.pull_tenant_listeners(tenant)
         backend.pull_tenant_network_rbac_policies(tenant)
 
 
@@ -318,3 +406,69 @@ def mark_stuck_updating_tenants_as_erred():
     for tenant in tenants_stuck:
         tenant.set_erred()
         tenant.save(update_fields=["state"])
+
+
+@shared_task(name="openstack.PullTenantUsageQuotas")
+def pull_tenant_usage_quotas(tenant_id):
+    """Pull quotas for a single tenant during usage billing poll."""
+    try:
+        tenant = models.Tenant.objects.get(pk=tenant_id)
+    except models.Tenant.DoesNotExist:
+        logger.warning("Tenant %s not found for usage quota pull", tenant_id)
+        return
+    try:
+        backend = OpenStackBackend(tenant.service_settings)
+        backend.pull_tenant_quotas(tenant)
+    except Exception:
+        logger.exception(
+            "Failed to pull quotas for tenant %s during usage billing poll",
+            tenant.uuid,
+        )
+
+
+@shared_task(name="openstack.TenantUsageBillingPoll")
+def tenant_usage_billing_poll():
+    """Poll quota usage for tenants whose offering uses USAGE billing.
+
+    Runs on a 30-min base tick. Per-offering throttle (via Django cache)
+    ensures each offering is polled at its configured interval.
+    Dispatches a separate Celery task per tenant to leverage multiple workers.
+    """
+    from django.core.cache import cache
+
+    from waldur_mastermind.marketplace import billing_mode
+    from waldur_mastermind.marketplace import models as marketplace_models
+    from waldur_mastermind.marketplace.enums import OPENSTACK_TENANT_OFFERING
+
+    offerings = (
+        marketplace_models.Offering.objects.filter(type=OPENSTACK_TENANT_OFFERING)
+        .filter(billing_mode.usage_offering_q())
+        .distinct()
+    )
+
+    for offering in offerings:
+        interval_minutes = offering.plugin_options.get(
+            "usage_poll_interval_minutes", 60
+        )
+        interval_minutes = max(15, min(1440, interval_minutes))
+
+        throttle_key = f"usage_poll_throttle_{offering.uuid}"
+        if not cache.add(throttle_key, True, timeout=interval_minutes * 60):
+            continue
+
+        resources = marketplace_models.Resource.objects.filter(
+            offering=offering,
+            state=marketplace_models.Resource.States.OK,
+        ).prefetch_related("scope")
+
+        for resource in resources:
+            tenant = resource.scope
+            if not tenant or not isinstance(tenant, models.Tenant):
+                continue
+            if tenant.state != CoreStates.OK:
+                continue
+            # A limit plan on the same offering is billed on quotas, not on
+            # polled usage; skip its tenants.
+            if not billing_mode.resolve_for_resource(resource).is_usage_based:
+                continue
+            pull_tenant_usage_quotas.delay(tenant.pk)

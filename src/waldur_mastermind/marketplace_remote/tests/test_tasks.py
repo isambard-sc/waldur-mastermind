@@ -1,3 +1,5 @@
+import datetime
+import json
 import uuid
 from decimal import Decimal
 from unittest import mock
@@ -5,13 +7,18 @@ from unittest import mock
 import respx
 from django.core import mail
 from django.core.exceptions import ObjectDoesNotExist
+from django.db import connection
 from django.test import override_settings, testcases
+from django.test import utils as django_test
 from django.utils import timezone
 from freezegun import freeze_time
+from waldur_api_client.models.offering_user import OfferingUser
 
 from waldur_auth_social.const import ProviderChoices
+from waldur_core.core import models as core_models
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.utils import format_text, serialize_instance
+from waldur_core.logging.models import Event
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure.tests.factories import (
@@ -23,7 +30,12 @@ from waldur_core.structure.tests.fixtures import ProjectFixture
 from waldur_mastermind.marketplace import models
 from waldur_mastermind.marketplace.enums import (
     REMOTE_OFFERING,
+    MissingUsagePolicies,
     OfferingStates,
+    OfferingUserRuntimeStates,
+    OfferingUserStates,
+    OrderStates,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.tests import factories, fixtures
@@ -275,8 +287,9 @@ class SyncRemoteProjectPermissionsTest(testcases.TransactionTestCase):
             },
         )
 
-    def test_if_user_is_owner_and_admin_then_manager_role_is_created(self):
-        # Arrange
+    def test_if_user_is_owner_and_admin_then_project_role_is_kept(self):
+        # A user who is both an organization owner and a project admin keeps
+        # their project-level role on the remote; owner status is not synced.
         self.fixture.admin.registration_method = ProviderChoices.EDUTEAMS
         self.fixture.admin.save()
         self.fixture.customer.add_user(self.fixture.admin, CustomerRole.OWNER)
@@ -294,18 +307,16 @@ class SyncRemoteProjectPermissionsTest(testcases.TransactionTestCase):
             get_request_data(create_mock),
             {
                 "user": self.remote_user_uuid,
-                "role": RoleEnum.PROJECT_MANAGER.value,
+                "role": RoleEnum.PROJECT_ADMIN.value,
                 "expiration_time": None,
             },
         )
 
-    def test_skip_mapping_for_owners_if_offering_belongs_to_the_same_customer(self):
-        # Arrange
+    def test_organization_owner_is_not_synced(self):
+        # Organization owners without a project-level role are not propagated
+        # to remote Waldur instances.
         self.fixture.owner.registration_method = ProviderChoices.EDUTEAMS
         self.fixture.owner.save()
-
-        self.resource.project.customer = self.fixture.resource.offering.customer
-        self.resource.project.save()
 
         self.mock_project_exists(exists=True)
         self.mock_user_creation()
@@ -643,6 +654,38 @@ class OfferingUserPullTest(testcases.TransactionTestCase):
         )
         tasks.OfferingUserPullTask().pull(self.offering)
 
+    def test_a_backed_account_is_not_renamed_by_the_remote(self):
+        """Under provider scope the local name comes from the provider account,
+        so it will routinely differ from the remote's. Writing it here raised
+        every hour inside the Celery task once the model started refusing
+        delegated writes.
+        """
+        from waldur_mastermind.marketplace.enums import AccountScopes
+        from waldur_mastermind.marketplace.tests import (
+            factories as marketplace_factories,
+        )
+
+        user = UserFactory(username="alice@myaccessid.org")
+        provider = marketplace_factories.ServiceProviderFactory(
+            customer=self.offering.customer
+        )
+        provider.account_options["account_scope"] = AccountScopes.PROVIDER
+        provider.save()
+        account = models.ServiceProviderAccount.objects.create(
+            service_provider=provider, user=user, username="owned_by_provider"
+        )
+        offering_user = models.OfferingUser.objects.create(
+            offering=self.offering, user=user, service_provider_account=account
+        )
+        self.mock_offering_users(
+            [{"user_username": "alice@myaccessid.org", "username": "alice"}]
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.username, "owned_by_provider")
+
     def test_missing_offering_user_is_created_if_there_is_user_in_local_db(self):
         user = UserFactory(username="alice@myaccessid.org")
         self.mock_offering_users(
@@ -765,6 +808,69 @@ class ResourceOrderImportTest(testcases.TransactionTestCase):
         self.assertEqual(self.fixture.resource.state, ResourceStates.ERRED)
 
     @respx.mock
+    def test_resource_pull_imports_orders_when_state_is_unchanged(self):
+        self.fixture.resource.state = ResourceStates.OK
+        self.fixture.resource.save()
+        resource_uuid = self.resource.backend_id
+
+        self.mock_marketplace_resource(
+            resource_uuid,
+            {
+                "report": "",
+                "backend_id": "effective_id",
+                "state": "OK",
+                "attributes": {"sample_attr": 1},
+                "options": {},
+            },
+        )
+
+        respx.post(
+            f"{self.api_url}/api/marketplace-resources/{resource_uuid}/update_options/"
+        ).respond(200, json={"status": "ok"})
+
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.tasks.utils.import_resource_orders"
+        ) as mocked_import:
+            tasks.ResourcePullTask().pull(self.resource)
+
+        mocked_import.assert_called_once_with(self.resource)
+        self.fixture.resource.refresh_from_db()
+        self.assertEqual(self.fixture.resource.effective_id, "effective_id")
+
+    @respx.mock
+    def test_resource_pull_imports_orders_once_when_state_changes(self):
+        self.fixture.resource.state = ResourceStates.OK
+        self.fixture.resource.save()
+        resource_uuid = self.resource.backend_id
+
+        resource_route = respx.get(
+            f"{self.api_url}/api/marketplace-resources/{resource_uuid}/"
+        ).respond(
+            200,
+            json={
+                "report": "",
+                "backend_id": "effective_id",
+                "state": "Erred",
+                "attributes": {"sample_attr": 1},
+                "options": {},
+            },
+        )
+
+        respx.post(
+            f"{self.api_url}/api/marketplace-resources/{resource_uuid}/update_options/"
+        ).respond(200, json={"status": "ok"})
+
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.tasks.utils.import_resource_orders"
+        ) as mocked_import:
+            tasks.ResourcePullTask().pull(self.resource)
+
+        mocked_import.assert_called_once_with(self.resource)
+        self.assertEqual(resource_route.calls.call_count, 1)
+        self.fixture.resource.refresh_from_db()
+        self.assertEqual(self.fixture.resource.state, ResourceStates.ERRED)
+
+    @respx.mock
     def test_remote_resource_backend_id_is_saved_as_local_resource_effective_id(self):
         # Arrange
         self.fixture.resource.state = ResourceStates.OK
@@ -772,7 +878,8 @@ class ResourceOrderImportTest(testcases.TransactionTestCase):
         resource_uuid = self.resource.backend_id
 
         respx.get(
-            f"{self.api_url}/api/marketplace-orders/?field=uuid&resource_uuid={resource_uuid}"
+            f"{self.api_url}/api/marketplace-orders/",
+            params={"field": "uuid", "resource_uuid": resource_uuid, "page_size": 100},
         ).respond(200, json=[])
 
         respx.post(
@@ -797,6 +904,332 @@ class ResourceOrderImportTest(testcases.TransactionTestCase):
         self.fixture.resource.refresh_from_db()
         self.assertEqual(self.fixture.resource.effective_id, "effective_id")
         self.assertEqual(self.fixture.resource.attributes, {"sample_attr": 1})
+
+
+class ResourceEndDatePushTest(testcases.TransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.resource.backend_id = uuid.uuid4().hex
+        self.resource.save()
+        self.resource.offering.type = REMOTE_OFFERING
+        self.api_url = "https://example.com"
+        self.resource.offering.secret_options = {
+            "api_url": self.api_url,
+            "token": uuid.uuid4().hex,
+        }
+        self.resource.offering.save()
+        respx.start()
+
+    def tearDown(self):
+        respx.stop()
+        super().tearDown()
+        mock.patch.stopall()
+
+    @respx.mock
+    @freeze_time("2025-01-01")
+    def test_resource_end_date_is_pushed_to_remote(self):
+        end_date = datetime.date(2025, 1, 15)
+        canonical_uuid = str(uuid.UUID(self.resource.backend_id))
+        patch_request = respx.patch(
+            f"{self.api_url}/api/marketplace-resources/{canonical_uuid}/"
+        ).respond(200, json={"uuid": canonical_uuid, "name": "resource"})
+
+        self.resource.end_date = end_date
+        self.resource.save()
+
+        utils.push_resource_end_date(self.resource)
+
+        self.assertTrue(patch_request.called)
+        request_json = json.loads(patch_request.calls[0].request.content.decode())
+        self.assertEqual(request_json["end_date"], end_date.isoformat())
+
+    @respx.mock
+    @freeze_time("2025-01-15")
+    def test_reconcile_task_updates_remote_when_end_date_differs(self):
+        local_end_date = datetime.date(2025, 2, 1)
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.push_resource_end_date"
+        ):
+            self.resource.end_date = local_end_date
+            self.resource.state = ResourceStates.OK
+            self.resource.save()
+
+        resource_uuid = str(uuid.UUID(self.resource.backend_id))
+
+        respx.get(f"{self.api_url}/api/marketplace-resources/{resource_uuid}/").respond(
+            200,
+            json={
+                "uuid": resource_uuid,
+                "name": "resource",
+                "end_date": "2025-01-01",
+            },
+        )
+        patch_request = respx.patch(
+            f"{self.api_url}/api/marketplace-resources/{resource_uuid}/"
+        ).respond(
+            200,
+            json={
+                "uuid": resource_uuid,
+                "name": "resource",
+                "end_date": local_end_date.isoformat(),
+            },
+        )
+
+        tasks.reconcile_resource_end_dates()
+
+        self.assertTrue(patch_request.called)
+        request_json = json.loads(patch_request.calls[0].request.content.decode())
+        self.assertEqual(request_json["end_date"], local_end_date.isoformat())
+
+    @respx.mock
+    @freeze_time("2025-01-15")
+    def test_reconcile_task_does_not_update_when_end_date_is_same(self):
+        local_end_date = datetime.date(2025, 2, 1)
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.push_resource_end_date"
+        ):
+            self.resource.end_date = local_end_date
+            self.resource.state = ResourceStates.OK
+            self.resource.save()
+
+        canonical_uuid = str(uuid.UUID(self.resource.backend_id))
+
+        respx.get(
+            f"{self.api_url}/api/marketplace-resources/{canonical_uuid}/"
+        ).respond(
+            200,
+            json={
+                "uuid": canonical_uuid,
+                "name": "resource",
+                "end_date": local_end_date.isoformat(),
+            },
+        )
+        patch_request = respx.patch(
+            f"{self.api_url}/api/marketplace-resources/{canonical_uuid}/"
+        ).respond(
+            200,
+            json={
+                "uuid": canonical_uuid,
+                "name": "resource",
+                "end_date": local_end_date.isoformat(),
+            },
+        )
+
+        tasks.reconcile_resource_end_dates()
+
+        self.assertFalse(patch_request.called)
+
+    @respx.mock
+    @freeze_time("2025-03-01")
+    def test_push_resource_end_date_skips_past_date(self):
+        """push_resource_end_date should not push a date that is in the past."""
+        past_date = datetime.date(2025, 2, 15)
+        canonical_uuid = str(uuid.UUID(self.resource.backend_id))
+        patch_request = respx.patch(
+            f"{self.api_url}/api/marketplace-resources/{canonical_uuid}/"
+        ).respond(200, json={"uuid": canonical_uuid, "name": "resource"})
+
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.push_resource_end_date",
+            wraps=utils.push_resource_end_date,
+        ):
+            self.resource.end_date = past_date
+            self.resource.save()
+
+        utils.push_resource_end_date(self.resource)
+
+        self.assertFalse(patch_request.called)
+
+    @respx.mock
+    @freeze_time("2025-03-01")
+    def test_reconcile_pulls_remote_date_when_local_is_past(self):
+        """When local end_date is past and remote has a valid future date, pull it."""
+        past_local_date = datetime.date(2025, 2, 15)
+        future_remote_date = "2025-06-01"
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.push_resource_end_date"
+        ):
+            self.resource.end_date = past_local_date
+            self.resource.state = ResourceStates.OK
+            self.resource.save()
+
+        resource_uuid = str(uuid.UUID(self.resource.backend_id))
+
+        respx.get(f"{self.api_url}/api/marketplace-resources/{resource_uuid}/").respond(
+            200,
+            json={
+                "uuid": resource_uuid,
+                "name": "resource",
+                "end_date": future_remote_date,
+            },
+        )
+        # Mock the events endpoint
+        respx.get(f"{self.api_url}/api/events/").respond(200, json=[])
+
+        # Mock push to avoid signal handler side effects
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.push_resource_end_date"
+        ):
+            tasks.reconcile_resource_end_dates()
+
+        # Should update local resource with remote date
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.end_date, datetime.date(2025, 6, 1))
+
+    @respx.mock
+    @freeze_time("2025-03-01")
+    def test_reconcile_skips_push_when_local_past_and_remote_also_past(self):
+        """When both local and remote dates are past, skip entirely."""
+        past_local_date = datetime.date(2025, 2, 15)
+        past_remote_date = "2025-02-10"
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.push_resource_end_date"
+        ):
+            self.resource.end_date = past_local_date
+            self.resource.state = ResourceStates.OK
+            self.resource.save()
+
+        resource_uuid = str(uuid.UUID(self.resource.backend_id))
+
+        respx.get(f"{self.api_url}/api/marketplace-resources/{resource_uuid}/").respond(
+            200,
+            json={
+                "uuid": resource_uuid,
+                "name": "resource",
+                "end_date": past_remote_date,
+            },
+        )
+        patch_request = respx.patch(
+            f"{self.api_url}/api/marketplace-resources/{resource_uuid}/"
+        ).respond(200, json={})
+
+        tasks.reconcile_resource_end_dates()
+
+        # Should NOT push to remote
+        self.assertFalse(patch_request.called)
+        # Should NOT update local resource
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.end_date, past_local_date)
+
+    @respx.mock
+    def test_reconcile_skips_terminated_resources(self):
+        """TERMINATED resources should be excluded from reconciliation."""
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.push_resource_end_date"
+        ):
+            self.resource.end_date = datetime.date(2025, 6, 1)
+            self.resource.state = ResourceStates.TERMINATED
+            self.resource.save()
+
+        resource_uuid = str(uuid.UUID(self.resource.backend_id))
+        get_request = respx.get(
+            f"{self.api_url}/api/marketplace-resources/{resource_uuid}/"
+        ).respond(200, json={})
+
+        tasks.reconcile_resource_end_dates()
+
+        # Should not even fetch the remote resource
+        self.assertFalse(get_request.called)
+
+    @respx.mock
+    @freeze_time("2025-03-01")
+    @override_settings(task_always_eager=True)
+    def test_reconcile_sends_notification_when_pulling_remote_date(self):
+        """Notification email should be sent when pulling remote date."""
+        past_local_date = datetime.date(2025, 2, 15)
+        future_remote_date = "2025-06-01"
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.push_resource_end_date"
+        ):
+            self.resource.end_date = past_local_date
+            self.resource.state = ResourceStates.OK
+            self.resource.save()
+
+        resource_uuid = str(uuid.UUID(self.resource.backend_id))
+
+        respx.get(f"{self.api_url}/api/marketplace-resources/{resource_uuid}/").respond(
+            200,
+            json={
+                "uuid": resource_uuid,
+                "name": "resource",
+                "end_date": future_remote_date,
+            },
+        )
+        respx.get(f"{self.api_url}/api/events/").respond(200, json=[])
+
+        event_type = "resource_end_date_pulled_from_remote"
+        NotificationFactory(key=f"marketplace_remote.{event_type}")
+
+        # Grant APPROVE_ORDER permission to a role and assign user
+        from waldur_core.permissions.enums import PermissionEnum
+        from waldur_core.permissions.fixtures import ProjectRole
+
+        ProjectRole.ADMIN.add_permission(PermissionEnum.APPROVE_ORDER)
+        self.resource.project.add_user(self.fixture.owner, ProjectRole.ADMIN)
+
+        # Mock push to avoid signal handler side effects
+        with mock.patch(
+            "waldur_mastermind.marketplace_remote.utils.push_resource_end_date"
+        ):
+            tasks.reconcile_resource_end_dates()
+
+        self.assertTrue(len(mail.outbox) > 0)
+
+
+class ResourceEndDateTerminationGapTest(testcases.TransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.resource.backend_id = uuid.uuid4().hex
+        self.resource.state = ResourceStates.OK
+        self.resource.end_date = datetime.date(2025, 1, 1)
+        self.resource.save()
+
+    @freeze_time("2025-01-02")
+    def test_terminate_resource_skips_when_recent_erred_terminate_order_exists(self):
+        """Should not create duplicate TERMINATE orders when a recent one is ERRED."""
+        from waldur_mastermind.marketplace import utils as marketplace_utils
+
+        # Create a recent ERRED TERMINATE order
+        factories.OrderFactory(
+            resource=self.resource,
+            project=self.resource.project,
+            offering=self.resource.offering,
+            type=OrderTypes.TERMINATE,
+            state=OrderStates.ERRED,
+        )
+
+        user = self.fixture.staff
+
+        result = marketplace_utils.terminate_resource(self.resource, user)
+
+        self.assertIsNone(result)
+
+    @freeze_time("2025-01-04")
+    def test_terminate_resource_retries_after_old_erred_terminate_order(self):
+        """Should allow retry when the ERRED TERMINATE order is older than 1 day."""
+        from waldur_mastermind.marketplace import utils as marketplace_utils
+
+        # Create an old ERRED TERMINATE order (more than 1 day ago)
+        old_order = factories.OrderFactory(
+            resource=self.resource,
+            project=self.resource.project,
+            offering=self.resource.offering,
+            type=OrderTypes.TERMINATE,
+            state=OrderStates.ERRED,
+        )
+        # Backdate the modified field
+        models.Order.objects.filter(pk=old_order.pk).update(
+            modified=timezone.now() - datetime.timedelta(days=2)
+        )
+
+        user = self.fixture.staff
+
+        result = marketplace_utils.terminate_resource(self.resource, user)
+
+        # Should have created a new order (returns Response)
+        self.assertIsNotNone(result)
 
 
 class NotificationAboutPendingProjectUpdatesTest(testcases.TransactionTestCase):
@@ -995,43 +1428,278 @@ class OfferingUserListPullTaskTest(testcases.TransactionTestCase):
             backend_id=uuid.uuid4().hex,
         )
 
-    def test_offering_with_service_provider_option_is_excluded(self):
+    def test_offering_users_are_pulled_regardless_of_plugin_options(self):
         """
-        Test that offerings with service_provider_can_create_offering_user=True
-        are excluded from the pull task.
+        Accounts of a remote offering are always managed by the remote Waldur,
+        so the pull must not depend on plugin options, which are synced
+        from the remote offering and typically carry
+        service_provider_can_create_offering_user=True.
         """
         task = tasks.OfferingUserListPullTask()
         pulled_objects = list(task.get_pulled_objects())
 
-        self.assertNotIn(
-            self.offering_with_option,
-            pulled_objects,
-            "Offering with service_provider_can_create_offering_user=True should be excluded",
-        )
-        self.assertIn(
-            self.offering_without_option,
-            pulled_objects,
-            "Offering without the option should be included",
-        )
+        self.assertIn(self.offering_with_option, pulled_objects)
+        self.assertIn(self.offering_without_option, pulled_objects)
 
-    def test_offering_with_false_option_is_included(self):
-        """
-        Test that offerings with service_provider_can_create_offering_user=False
-        are included in the pull task.
-        """
-        self.offering_with_option.plugin_options = {
-            "service_provider_can_create_offering_user": False
-        }
+    def test_offering_without_credentials_is_excluded(self):
+        self.offering_with_option.secret_options = {}
         self.offering_with_option.save()
 
         task = tasks.OfferingUserListPullTask()
-        pulled_objects = task.get_pulled_objects()
+        pulled_objects = list(task.get_pulled_objects())
 
-        self.assertIn(
-            self.offering_with_option,
-            pulled_objects,
-            "Offering with service_provider_can_create_offering_user=False should be included",
+        self.assertNotIn(self.offering_with_option, pulled_objects)
+
+
+class RemoteOfferingUserRuntimeMetadataTest(testcases.SimpleTestCase):
+    def test_extracts_typed_runtime_metadata_fields(self):
+        remote_offering_user = OfferingUser.from_dict(
+            {
+                "user_username": "alice@example.com",
+                "username": "alice",
+                "runtime_state": "Pending account linking",
+                "service_provider_comment": "Please link your account",
+                "service_provider_comment_url": "https://help.example.com/link",
+            }
         )
+
+        self.assertEqual(
+            utils._remote_offering_user_runtime_metadata(remote_offering_user),
+            {
+                "runtime_state": "Pending account linking",
+                "service_provider_comment": "Please link your account",
+                "service_provider_comment_url": "https://help.example.com/link",
+            },
+        )
+
+    def test_omits_unset_runtime_metadata_fields(self):
+        remote_offering_user = OfferingUser.from_dict(
+            {
+                "user_username": "alice@example.com",
+                "username": "alice",
+            }
+        )
+
+        self.assertEqual(
+            utils._remote_offering_user_runtime_metadata(remote_offering_user), {}
+        )
+
+    def test_includes_empty_comment_fields_when_remote_sets_blank_strings(self):
+        remote_offering_user = OfferingUser.from_dict(
+            {
+                "user_username": "alice@example.com",
+                "username": "alice",
+                "service_provider_comment": "",
+                "service_provider_comment_url": "",
+            }
+        )
+
+        self.assertEqual(
+            utils._remote_offering_user_runtime_metadata(remote_offering_user),
+            {
+                "service_provider_comment": "",
+                "service_provider_comment_url": "",
+            },
+        )
+
+
+class OfferingUserPullTaskRuntimeMetadataTest(testcases.TransactionTestCase):
+    def setUp(self):
+        self.api_url = "https://example.com"
+        self.offering = factories.OfferingFactory(
+            type=REMOTE_OFFERING,
+            secret_options={"api_url": self.api_url, "token": "token"},
+            backend_id=uuid.uuid4().hex,
+        )
+        self.user = UserFactory(username="alice@example.com")
+        self.offering_user = models.OfferingUser.objects.create(
+            user=self.user,
+            offering=self.offering,
+            username="alice",
+        )
+
+    def mock_offering_users(self, users):
+        respx.get(f"{self.api_url}/api/marketplace-offering-users/").respond(
+            200, json=users
+        )
+
+    @respx.mock
+    def test_pull_requests_sparse_offering_user_fieldset(self):
+        route = respx.get(f"{self.api_url}/api/marketplace-offering-users/").respond(
+            200,
+            json=[
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.ACTIVE,
+                }
+            ],
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+
+        request_url = str(route.calls[0].request.url)
+        self.assertIn("field=user_username", request_url)
+        self.assertIn("field=username", request_url)
+        self.assertIn("field=runtime_state", request_url)
+        self.assertIn("field=service_provider_comment", request_url)
+        self.assertIn("field=service_provider_comment_url", request_url)
+
+    @respx.mock
+    def test_runtime_state_and_comments_are_synced_from_remote(self):
+        self.mock_offering_users(
+            [
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                    "service_provider_comment": "Please link your account",
+                    "service_provider_comment_url": "https://help.example.com/link",
+                }
+            ]
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+        self.offering_user.refresh_from_db()
+
+        self.assertEqual(
+            self.offering_user.runtime_state,
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+        )
+        self.assertEqual(
+            self.offering_user.service_provider_comment, "Please link your account"
+        )
+        self.assertEqual(
+            self.offering_user.service_provider_comment_url,
+            "https://help.example.com/link",
+        )
+
+    @respx.mock
+    def test_pull_emits_single_audit_event_when_runtime_metadata_changes(self):
+        baseline = Event.objects.filter(
+            event_type="marketplace_offering_user_updated"
+        ).count()
+        self.mock_offering_users(
+            [
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                    "service_provider_comment": "Please link your account",
+                    "service_provider_comment_url": "https://help.example.com/link",
+                }
+            ]
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+
+        self.assertEqual(
+            Event.objects.filter(event_type="marketplace_offering_user_updated").count()
+            - baseline,
+            1,
+        )
+        event = (
+            Event.objects.filter(event_type="marketplace_offering_user_updated")
+            .order_by("-created")
+            .first()
+        )
+        self.assertEqual(
+            event.context["changed_fields"],
+            [
+                "runtime_state",
+                "service_provider_comment",
+                "service_provider_comment_url",
+            ],
+        )
+        self.assertEqual(
+            event.context["offering_user_uuid"], self.offering_user.uuid.hex
+        )
+
+    @respx.mock
+    def test_unchanged_runtime_metadata_is_not_saved(self):
+        self.offering_user.runtime_state = (
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING
+        )
+        self.offering_user.service_provider_comment = "Existing comment"
+        self.offering_user.service_provider_comment_url = "https://example.com/existing"
+        self.offering_user.save(
+            update_fields=[
+                "runtime_state",
+                "service_provider_comment",
+                "service_provider_comment_url",
+            ]
+        )
+        self.mock_offering_users(
+            [
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                    "service_provider_comment": "Existing comment",
+                    "service_provider_comment_url": "https://example.com/existing",
+                }
+            ]
+        )
+
+        with mock.patch.object(models.OfferingUser, "save", autospec=True) as save_mock:
+            tasks.OfferingUserPullTask().pull(self.offering)
+
+        save_mock.assert_not_called()
+
+    @respx.mock
+    def test_deleted_local_offering_user_is_not_updated(self):
+        self.offering_user.state = OfferingUserStates.DELETED
+        self.offering_user.save(update_fields=["state"])
+        self.mock_offering_users(
+            [
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                    "service_provider_comment": "Please link your account",
+                    "service_provider_comment_url": "https://help.example.com/link",
+                }
+            ]
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+        self.offering_user.refresh_from_db()
+
+        self.assertEqual(
+            self.offering_user.runtime_state, OfferingUserRuntimeStates.ACTIVE
+        )
+        self.assertEqual(self.offering_user.service_provider_comment, "")
+
+    @respx.mock
+    def test_new_remote_user_gets_runtime_metadata_on_create(self):
+        remote_user = UserFactory(username="bob@example.com")
+        self.mock_offering_users(
+            [
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.ACTIVE,
+                },
+                {
+                    "user_username": remote_user.username,
+                    "username": "bob",
+                    "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                    "service_provider_comment": "Link account",
+                    "service_provider_comment_url": "https://help.example.com",
+                },
+            ]
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+
+        offering_user = models.OfferingUser.objects.get(
+            user=remote_user, offering=self.offering
+        )
+        self.assertEqual(
+            offering_user.runtime_state,
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+        )
+        self.assertEqual(offering_user.service_provider_comment, "Link account")
 
 
 @override_settings(
@@ -1099,6 +1767,111 @@ class OfferingUserPullTaskTest(testcases.TransactionTestCase):
         user = models.User.all_objects.get(username=self.deactivated_user.username)
         self.assertFalse(user.is_active, "User should be deactivated")
 
+    @respx.mock
+    def test_new_remote_users_are_created_locally(self):
+        """Test that new users from remote are created as OfferingUser locally."""
+        # Create a local user that exists in the remote system
+        local_user = UserFactory()
+
+        # Mock remote API to return this user
+        respx.get("https://example.com/api/marketplace-offering-users/").respond(
+            200,
+            json=[
+                {
+                    "uuid": uuid.uuid4().hex,
+                    "offering_uuid": self.offering.backend_id,
+                    "user_uuid": uuid.uuid4().hex,
+                    "user_username": local_user.username,
+                    "username": "remote_username_for_user",
+                }
+            ],
+        )
+
+        task = tasks.OfferingUserPullTask()
+        task.pull(self.offering)
+
+        # Verify OfferingUser was created
+        self.assertTrue(
+            models.OfferingUser.objects.filter(
+                user=local_user, offering=self.offering
+            ).exists()
+        )
+        offering_user = models.OfferingUser.objects.get(
+            user=local_user, offering=self.offering
+        )
+        self.assertEqual(offering_user.username, "remote_username_for_user")
+
+    @respx.mock
+    def test_stale_users_are_removed(self):
+        """Test that users not in remote are removed locally."""
+        # Create a local user with OfferingUser
+        local_user = UserFactory()
+        models.OfferingUser.objects.create(
+            user=local_user,
+            offering=self.offering,
+            username="local_username",
+        )
+
+        # Mock remote API to return empty (user no longer exists remotely)
+        respx.get("https://example.com/api/marketplace-offering-users/").respond(
+            200, json=[]
+        )
+
+        task = tasks.OfferingUserPullTask()
+        task.pull(self.offering)
+
+        # Verify OfferingUser was removed
+        self.assertFalse(
+            models.OfferingUser.objects.filter(
+                user=local_user, offering=self.offering
+            ).exists()
+        )
+
+    @respx.mock
+    def test_pull_with_multiple_users_uses_select_related(self):
+        """
+        Test that pulling multiple users doesn't cause N+1 queries.
+        Fixes PUHURI-PORTALS-DX3.
+        """
+        # Create multiple local users with OfferingUser records
+        users = [UserFactory() for _ in range(5)]
+        for user in users:
+            models.OfferingUser.objects.create(
+                user=user,
+                offering=self.offering,
+                username=f"username_{user.username}",
+            )
+
+        # Mock remote API to return all users
+        remote_users = [
+            {
+                "uuid": uuid.uuid4().hex,
+                "offering_uuid": self.offering.backend_id,
+                "user_uuid": uuid.uuid4().hex,
+                "user_username": user.username,
+                "username": f"username_{user.username}",
+            }
+            for user in users
+        ]
+        respx.get("https://example.com/api/marketplace-offering-users/").respond(
+            200, json=remote_users
+        )
+
+        task = tasks.OfferingUserPullTask()
+
+        # The task should complete without N+1 queries
+        # With select_related("user"), fetching local_offering_users should be 1 query
+        # Without it, it would be 1 + N queries (1 for OfferingUser, N for each User)
+        task.pull(self.offering)
+
+        # Verify all users still exist
+        for user in users:
+            self.assertTrue(
+                models.OfferingUser.objects.filter(
+                    user=user, offering=self.offering
+                ).exists()
+            )
+
 
 @freeze_time("2024-01-01T00:00:00Z")
 class UsagePullTest(testcases.TransactionTestCase):
@@ -1128,12 +1901,11 @@ class UsagePullTest(testcases.TransactionTestCase):
         ).respond(200, json=usages)
 
     def mock_component_user_usages(self, usages):
+        # Mock the upfront fetch of ALL user usages for the resource
+        # This matches the optimized API call that fetches all user usages at once
         respx.get(
             f"{self.api_url}/api/marketplace-component-user-usages/",
-            params={
-                "resource_uuid": self.resource.backend_id,
-                "component_usage__billing_period": "2024-03-01",
-            },
+            params={"resource_uuid": self.resource.backend_id},
         ).respond(200, json=usages)
 
     def test_component_usage_and_user_usage_are_created(self):
@@ -1157,6 +1929,7 @@ class UsagePullTest(testcases.TransactionTestCase):
             "username": "test_user",
             "usage": 50,
             "component_type": "cpu_k_hours",
+            "billing_period": "2024-03-01",  # Must match component usage billing_period for grouping
         }
         user = UserFactory(username="test_user")
         offering_user = models.OfferingUser.objects.create(
@@ -1180,6 +1953,141 @@ class UsagePullTest(testcases.TransactionTestCase):
         self.assertEqual(component_usage.backend_id, usage_data["uuid"])
         self.assertEqual(user_usage.usage, 50)
         self.assertEqual(user_usage.user, offering_user)
+        self.assertEqual(
+            component_usage.missing_usage_policy, MissingUsagePolicies.NONE
+        )
+
+    def test_deprecated_recurring_flag_from_remote_maps_to_reuse_policy(self):
+        """A remote Waldur predating missing_usage_policy only sends `recurring`."""
+        models.OfferingComponent.objects.create(
+            offering=self.resource.offering,
+            type="cpu_k_hours",
+            name="CPU Hours",
+        )
+        usage_data = {
+            "uuid": uuid.uuid4().hex,
+            "type": "cpu_k_hours",
+            "usage": 100,
+            "description": "Test usage",
+            "created": "2024-03-01T00:00:00Z",
+            "date": "2024-04-01T00:00:00Z",
+            "recurring": True,
+            "billing_period": "2024-03-01",
+        }
+        self.mock_component_usages([usage_data])
+        self.mock_component_user_usages([])
+        tasks.UsagePullTask().pull(self.resource)
+
+        component_usage = models.ComponentUsage.objects.get(resource=self.resource)
+        self.assertEqual(
+            component_usage.missing_usage_policy, MissingUsagePolicies.REUSE
+        )
+
+    def _usage_payloads(self, usernames, billing_period):
+        """One component usage plus one user usage per username."""
+        usage = {
+            "uuid": uuid.uuid4().hex,
+            "type": "cpu_k_hours",
+            "usage": 100,
+            "description": "Test usage",
+            "created": "2024-03-01T00:00:00Z",
+            "date": "2024-04-01T00:00:00Z",
+            "recurring": False,
+            "billing_period": billing_period,
+        }
+        user_usages = [
+            {
+                "username": username,
+                "usage": 10,
+                "component_type": "cpu_k_hours",
+                "billing_period": billing_period,
+            }
+            for username in usernames
+        ]
+        return usage, user_usages
+
+    def _prepare(self, usernames, billing_periods):
+        models.OfferingComponent.objects.get_or_create(
+            offering=self.resource.offering,
+            type="cpu_k_hours",
+            defaults={"name": "CPU Hours"},
+        )
+        for username in usernames:
+            user = core_models.User.objects.filter(username=username).first()
+            if user is None:
+                user = UserFactory(username=username)
+            models.OfferingUser.objects.get_or_create(
+                offering=self.resource.offering,
+                user=user,
+                defaults={"username": username},
+            )
+        usages, user_usages = [], []
+        for billing_period in billing_periods:
+            usage, period_user_usages = self._usage_payloads(usernames, billing_period)
+            usages.append(usage)
+            user_usages.extend(period_user_usages)
+        self.mock_component_usages(usages)
+        self.mock_component_user_usages(user_usages)
+
+    def _offering_user_selects(self, captured):
+        return [
+            q
+            for q in captured.captured_queries
+            if "marketplace_offeringuser" in q["sql"] and q["sql"].startswith("SELECT")
+        ]
+
+    def test_offering_users_are_loaded_once_per_pull(self):
+        """The offering user lookup used to run once per user usage."""
+        self._prepare([f"user_{i}" for i in range(5)], ["2024-03-01"])
+
+        # Only the pull is measured; the fixtures above issue their own
+        # queries.
+        with django_test.CaptureQueriesContext(connection) as captured:
+            tasks.UsagePullTask().pull(self.resource)
+
+        self.assertEqual(
+            len(self._offering_user_selects(captured)),
+            1,
+            "offering users must be loaded once per pull, not once per user usage",
+        )
+
+    def test_offering_user_query_count_is_flat_across_usage_volume(self):
+        self._prepare([f"user_{i}" for i in range(2)], ["2024-03-01"])
+        with django_test.CaptureQueriesContext(connection) as small:
+            tasks.UsagePullTask().pull(self.resource)
+
+        self._prepare([f"user_{i}" for i in range(6)], ["2024-03-01", "2024-04-01"])
+        with django_test.CaptureQueriesContext(connection) as large:
+            tasks.UsagePullTask().pull(self.resource)
+
+        self.assertEqual(
+            len(self._offering_user_selects(small)),
+            len(self._offering_user_selects(large)),
+        )
+
+    def test_duplicate_usernames_resolve_deterministically(self):
+        """(offering, username) is not unique - only (offering, user) is."""
+        models.OfferingComponent.objects.create(
+            offering=self.resource.offering, type="cpu_k_hours", name="CPU Hours"
+        )
+        first = models.OfferingUser.objects.create(
+            offering=self.resource.offering,
+            username="shared",
+            user=UserFactory(username="a"),
+        )
+        models.OfferingUser.objects.create(
+            offering=self.resource.offering,
+            username="shared",
+            user=UserFactory(username="b"),
+        )
+        usage, user_usages = self._usage_payloads(["shared"], "2024-03-01")
+        self.mock_component_usages([usage])
+        self.mock_component_user_usages(user_usages)
+
+        tasks.UsagePullTask().pull(self.resource)
+
+        user_usage = models.ComponentUserUsage.objects.get(username="shared")
+        self.assertEqual(user_usage.user, first)
 
     def test_invalid_usage_date_is_skipped(self):
         """
@@ -1202,6 +2110,7 @@ class UsagePullTest(testcases.TransactionTestCase):
             "billing_period": "2024-03-01",
         }
         self.mock_component_usages([usage_data])
+        self.mock_component_user_usages([])  # No user usages
 
         tasks.UsagePullTask().pull(self.resource)
 
@@ -1250,40 +2159,22 @@ class UsagePullTest(testcases.TransactionTestCase):
 
         self.mock_component_usages([cpu_usage_data, gpu_usage_data])
 
-        respx.get(
-            f"{self.api_url}/api/marketplace-component-user-usages/",
-            params={
-                "resource_uuid": self.resource.backend_id,
-                "component_usage__billing_period": "2024-03-01",
-                "type": "cpu_k_hours",
-            },
-        ).respond(
-            200,
-            json=[
+        # Mock ALL user usages in a single call (optimized N+1 fix)
+        self.mock_component_user_usages(
+            [
                 {
                     "username": "testuserusername",
                     "usage": 11.37,
                     "component_type": "cpu_k_hours",
+                    "billing_period": "2024-03-01",
                 },
-            ],
-        )
-
-        respx.get(
-            f"{self.api_url}/api/marketplace-component-user-usages/",
-            params={
-                "resource_uuid": self.resource.backend_id,
-                "component_usage__billing_period": "2024-03-01",
-                "type": "gpu_hours",
-            },
-        ).respond(
-            200,
-            json=[
                 {
                     "username": "testuserusername",
                     "usage": 0.00,
                     "component_type": "gpu_hours",
+                    "billing_period": "2024-03-01",
                 },
-            ],
+            ]
         )
 
         user = UserFactory(username="testuserusername")
@@ -1328,6 +2219,142 @@ class UsagePullTest(testcases.TransactionTestCase):
         self.assertEqual(cpu_user_usage.user, offering_user)
         self.assertEqual(gpu_user_usage.user, offering_user)
 
+    def test_user_usages_fetched_in_single_api_call(self):
+        """
+        Test that user usages are fetched in a single API call (N+1 optimization).
+
+        Previously, the pull() method made N+1 API calls - one per component usage.
+        After optimization, it should make only 2 API calls total:
+        1. One for component usages
+        2. One for ALL user usages (grouped in memory by billing_period + type)
+        """
+        cpu_component = models.OfferingComponent.objects.create(
+            offering=self.resource.offering,
+            type="cpu_k_hours",
+            name="CPU k hours",
+        )
+        gpu_component = models.OfferingComponent.objects.create(
+            offering=self.resource.offering,
+            type="gpu_hours",
+            name="GPU hours",
+        )
+        mem_component = models.OfferingComponent.objects.create(
+            offering=self.resource.offering,
+            type="mem_gb_hours",
+            name="Memory GB hours",
+        )
+
+        # Create 3 component usages - previously would trigger 3 user usage API calls
+        cpu_usage = {
+            "uuid": uuid.uuid4().hex,
+            "type": "cpu_k_hours",
+            "usage": 100,
+            "description": "CPU",
+            "created": "2024-03-01T00:00:00Z",
+            "date": "2024-04-01T00:00:00Z",
+            "recurring": False,
+            "billing_period": "2024-03-01",
+        }
+        gpu_usage = {
+            "uuid": uuid.uuid4().hex,
+            "type": "gpu_hours",
+            "usage": 50,
+            "description": "GPU",
+            "created": "2024-03-01T00:00:00Z",
+            "date": "2024-04-01T00:00:00Z",
+            "recurring": False,
+            "billing_period": "2024-03-01",
+        }
+        mem_usage = {
+            "uuid": uuid.uuid4().hex,
+            "type": "mem_gb_hours",
+            "usage": 200,
+            "description": "Memory",
+            "created": "2024-03-01T00:00:00Z",
+            "date": "2024-04-01T00:00:00Z",
+            "recurring": False,
+            "billing_period": "2024-03-01",
+        }
+
+        self.mock_component_usages([cpu_usage, gpu_usage, mem_usage])
+
+        # Mock ALL user usages in a single response - this proves the optimization
+        # If N+1 bug still existed, this mock wouldn't be hit (different params)
+        all_user_usages = [
+            {
+                "username": "user1",
+                "usage": 30,
+                "component_type": "cpu_k_hours",
+                "billing_period": "2024-03-01",
+            },
+            {
+                "username": "user2",
+                "usage": 70,
+                "component_type": "cpu_k_hours",
+                "billing_period": "2024-03-01",
+            },
+            {
+                "username": "user1",
+                "usage": 50,
+                "component_type": "gpu_hours",
+                "billing_period": "2024-03-01",
+            },
+            {
+                "username": "user1",
+                "usage": 200,
+                "component_type": "mem_gb_hours",
+                "billing_period": "2024-03-01",
+            },
+        ]
+        self.mock_component_user_usages(all_user_usages)
+
+        user1 = UserFactory(username="user1")
+        user2 = UserFactory(username="user2")
+        models.OfferingUser.objects.create(
+            offering=self.resource.offering, username="user1", user=user1
+        )
+        models.OfferingUser.objects.create(
+            offering=self.resource.offering, username="user2", user=user2
+        )
+
+        tasks.UsagePullTask().pull(self.resource)
+
+        # Verify component usages created
+        self.assertEqual(
+            models.ComponentUsage.objects.filter(resource=self.resource).count(),
+            3,
+            "Should have 3 component usages",
+        )
+
+        # Verify user usages correctly distributed (grouped from single API response)
+        cpu_component_usage = models.ComponentUsage.objects.get(
+            resource=self.resource, component=cpu_component
+        )
+        gpu_component_usage = models.ComponentUsage.objects.get(
+            resource=self.resource, component=gpu_component
+        )
+        mem_component_usage = models.ComponentUsage.objects.get(
+            resource=self.resource, component=mem_component
+        )
+
+        # CPU should have 2 user usages (user1, user2)
+        cpu_user_usages = models.ComponentUserUsage.objects.filter(
+            component_usage=cpu_component_usage
+        )
+        self.assertEqual(cpu_user_usages.count(), 2)
+
+        # GPU should have 1 user usage (user1)
+        gpu_user_usages = models.ComponentUserUsage.objects.filter(
+            component_usage=gpu_component_usage
+        )
+        self.assertEqual(gpu_user_usages.count(), 1)
+
+        # Memory should have 1 user usage (user1)
+        mem_user_usages = models.ComponentUserUsage.objects.filter(
+            component_usage=mem_component_usage
+        )
+        self.assertEqual(mem_user_usages.count(), 1)
+
     def test_missing_plan_period_is_created_during_sync(self):
         """
         Test that missing ResourcePlanPeriod is automatically created during usage sync.
@@ -1356,15 +2383,7 @@ class UsagePullTest(testcases.TransactionTestCase):
         }
 
         self.mock_component_usages([usage_data])
-
-        respx.get(
-            f"{self.api_url}/api/marketplace-component-user-usages/",
-            params={
-                "resource_uuid": self.resource.backend_id,
-                "component_usage__billing_period": "2024-03-01",
-                "type": "cpu_k_hours",
-            },
-        ).respond(200, json=[])
+        self.mock_component_user_usages([])
 
         tasks.UsagePullTask().pull(self.resource)
 
@@ -1410,15 +2429,7 @@ class UsagePullTest(testcases.TransactionTestCase):
         }
 
         self.mock_component_usages([usage_data])
-
-        respx.get(
-            f"{self.api_url}/api/marketplace-component-user-usages/",
-            params={
-                "resource_uuid": self.resource.backend_id,
-                "component_usage__billing_period": "2024-03-01",
-                "type": "cpu_k_hours",
-            },
-        ).respond(200, json=[])
+        self.mock_component_user_usages([])
 
         tasks.UsagePullTask().pull(self.resource)
 
@@ -1467,15 +2478,7 @@ class UsagePullTest(testcases.TransactionTestCase):
         }
 
         self.mock_component_usages([usage_data])
-
-        respx.get(
-            f"{self.api_url}/api/marketplace-component-user-usages/",
-            params={
-                "resource_uuid": self.resource.backend_id,
-                "component_usage__billing_period": "2024-03-01",
-                "type": "cpu_k_hours",
-            },
-        ).respond(200, json=[])
+        self.mock_component_user_usages([])
 
         tasks.UsagePullTask().pull(self.resource)
 
@@ -1490,3 +2493,77 @@ class UsagePullTest(testcases.TransactionTestCase):
         )
         self.assertEqual(component_usage.plan_period, existing_plan_period)
         self.assertEqual(component_usage.usage, 100)
+
+
+class RobotAccountStatesTest(testcases.TestCase):
+    """Test that the monkey-patched RobotAccountStates works with both enum versions.
+
+    The waldur_api_client can have two different enum implementations:
+    - IntEnum version: VALUE_1=1, VALUE_2=2, VALUE_3=3, etc.
+    - StrEnum version: REQUESTED="Requested", CREATING="Creating", OK="OK", etc.
+
+    The monkey-patch should handle both versions and convert between string/int representations.
+
+    Fixes PUHURI-PORTALS-DC4: ValueError: 3 is not a valid RobotAccountStates
+    """
+
+    def setUp(self):
+        # The patch is installed lazily on first robot-account pull (so importing
+        # tasks.py does not load the SDK enum at process startup). These tests
+        # exercise the patched enum in isolation, so apply it explicitly here.
+        from waldur_mastermind.marketplace_remote.tasks import (
+            _patch_robot_account_states,
+        )
+
+        _patch_robot_account_states()
+
+    def test_robot_account_states_enum_handles_string_display_values(self):
+        """Test that display string values like 'OK' work."""
+        from waldur_api_client.models.robot_account_states import RobotAccountStates
+
+        # These display strings should work regardless of enum version
+        state = RobotAccountStates("OK")
+        self.assertIsInstance(state, RobotAccountStates)
+
+        state = RobotAccountStates("Creating")
+        self.assertIsInstance(state, RobotAccountStates)
+
+        state = RobotAccountStates("Requested")
+        self.assertIsInstance(state, RobotAccountStates)
+
+        state = RobotAccountStates("Requested deletion")
+        self.assertIsInstance(state, RobotAccountStates)
+
+        state = RobotAccountStates("Deleted")
+        self.assertIsInstance(state, RobotAccountStates)
+
+        state = RobotAccountStates("Error")
+        self.assertIsInstance(state, RobotAccountStates)
+
+    def test_robot_account_states_enum_handles_integer_values(self):
+        """Test that integer values like 3 work."""
+        from waldur_api_client.models.robot_account_states import RobotAccountStates
+
+        # Integer values should work regardless of enum version
+        for i in range(1, 7):
+            state = RobotAccountStates(i)
+            self.assertIsInstance(state, RobotAccountStates)
+
+    def test_robot_account_states_enum_handles_numeric_string_values(self):
+        """Test that numeric string values like '3' work.
+
+        Fixes PUHURI-PORTALS-DC4: ValueError: 3 is not a valid RobotAccountStates
+        """
+        from waldur_api_client.models.robot_account_states import RobotAccountStates
+
+        # Numeric string values should work regardless of enum version
+        for i in range(1, 7):
+            state = RobotAccountStates(str(i))
+            self.assertIsInstance(state, RobotAccountStates)
+
+    def test_robot_account_states_enum_handles_invalid_string_values(self):
+        """Test that invalid string values raise ValueError."""
+        from waldur_api_client.models.robot_account_states import RobotAccountStates
+
+        with self.assertRaises(ValueError):
+            RobotAccountStates("InvalidState")

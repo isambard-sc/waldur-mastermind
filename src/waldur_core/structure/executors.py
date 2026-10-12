@@ -1,30 +1,22 @@
 from celery import chain, shared_task
 from django.core import checks
 from django.db.models import Model
-from django.utils.topological_sort import stable_topological_sort
 
 from waldur_core.core import WaldurExtension
 from waldur_core.core import executors as core_executors
 from waldur_core.core import tasks as core_tasks
+from waldur_core.core.utils import stable_topological_sort
 
 
 class ServiceSettingsCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, settings, serialized_settings, **kwargs):
-        creation_tasks = [
+        return chain(
             core_tasks.StateTransitionTask().si(
                 serialized_settings, state_transition="begin_creating"
-            )
-        ]
-        # sync settings if they have not only global properties
-        backend = settings.get_backend()
-        if not backend.has_global_properties():
-            creation_tasks.append(
-                core_tasks.IndependentBackendMethodTask().si(
-                    serialized_settings, "sync"
-                )
-            )
-        return chain(*creation_tasks)
+            ),
+            core_tasks.IndependentBackendMethodTask().si(serialized_settings, "sync"),
+        )
 
 
 class ServiceSettingsPullExecutor(core_executors.ActionExecutor):

@@ -74,8 +74,9 @@ stateDiagram-v2
     EXECUTING --> DONE : Processing complete
     EXECUTING --> ERRED : Processing failed
 
+    ERRED --> EXECUTING : Retry (if supported)
+
     DONE --> [*]
-    ERRED --> [*]
     CANCELED --> [*]
     REJECTED --> [*]
 ```
@@ -90,7 +91,7 @@ stateDiagram-v2
 | **PENDING_START_DATE** | Awaiting the order's specified start date. | Activation when a future start date is set on the order. |
 | **EXECUTING** | Resource provisioning in progress | Processor execution |
 | **DONE** | Order completed successfully | Resource provisioning success |
-| **ERRED** | Order failed with errors | Processing errors |
+| **ERRED** | Order failed with errors. Can be retried if the offering type supports it. | Processing errors |
 | **CANCELED** | Order canceled by user/system | User cancellation |
 | **REJECTED** | Order rejected by provider | Provider rejection |
 
@@ -114,6 +115,7 @@ stateDiagram-v2
     TERMINATING --> TERMINATED : Deletion success
     TERMINATING --> ERRED : Deletion failed
 
+    ERRED --> CREATING : Retry create
     ERRED --> OK : Error resolved
     ERRED --> UPDATING : Retry update
     ERRED --> TERMINATING : Force deletion
@@ -131,6 +133,37 @@ stateDiagram-v2
 | **TERMINATING** | Resource being deleted | Monitor progress |
 | **TERMINATED** | Resource deleted | Archive, billing |
 | **ERRED** | Resource in error state | Retry, investigate, delete |
+
+### Retrying Erred Orders
+
+When an order fails due to transient errors, authorized users can retry it instead of creating a new order.
+
+**Endpoint**: `POST /api/marketplace-orders/{uuid}/retry/`
+
+**Constraints**:
+
+- The offering type must have `supports_order_retry` enabled in the plugin registry
+- Order must be in `ERRED` state
+- Order must have an associated resource
+
+Currently supported offering types: **Site Agent** (`Marketplace.Slurm`) and **Basic** (`Marketplace.Basic`). Other offering types can opt in by setting `supports_order_retry=True` in their `manager.register()` call.
+
+**Permission**: `APPROVE_ORDER` on the offering's customer or the offering itself (staff, offering owners, offering managers).
+
+**Behavior**:
+
+The endpoint resets both the order and its resource to active processing states within a single transaction:
+
+- **Order**: state reset to `EXECUTING`, `error_message`, `error_traceback`, and `completed_at` cleared
+- **Resource**: state reset based on order type, `error_message` and `error_traceback` cleared
+
+| Order Type | Resource State After Retry |
+|------------|---------------------------|
+| CREATE | CREATING |
+| UPDATE | UPDATING |
+| TERMINATE | TERMINATING |
+
+After the state reset, `process_order` is triggered via Celery to reprocess the order. For agent-driven offerings (site agent), the processor is a no-op and the agent picks up the order independently.
 
 ## Billing System
 
@@ -164,7 +197,18 @@ The marketplace supports five distinct billing patterns, each handled by differe
 | **USAGE**        | Pay-as-you-consume services               | $0.10/GB of storage used          | `ComponentUsage` reports are submitted.              |
 | **LIMIT**        | Pre-allocated resource quotas             | $5/CPU core allocated per month   | Resource activation, limit changes, and monthly invoice generation. |
 | **ONE_TIME**     | Setup fees, licenses                      | $100 one-time installation fee    | Resource activation (`CREATE` order).                |
+| **ONE_TIME** (prepaid) | Upfront billing for time-limited resources | 4 cores × $1/mo × 3 months = $12 | Resource activation (`CREATE` order). Quantity = limit × months. |
 | **ON_PLAN_SWITCH** | Fees for changing service plans           | $25 fee to upgrade to a premium plan | Plan modification (`UPDATE` order).                  |
+
+#### Per-Component Billing Configuration
+
+The billing type is configurable **per offering component**, not globally per offering type. This allows the same OpenStack Tenant offering type to have different billing configurations:
+
+- **Monthly billing**: Components use `LIMIT` billing type (default for OpenStack). Customers are billed monthly.
+- **Prepaid billing**: Components use `ONE_TIME` with `is_prepaid=True`. Customers pay upfront for `limit × months`. An `end_date` is required. Mid-period limit changes create supplementary charges for `(new_limit - old_limit) × remaining_months`.
+- **One-time total**: Components use `LIMIT` with `limit_period=TOTAL`. A single charge for the full amount, regardless of duration. Useful for consultancy hours, support packages.
+
+Service providers configure the billing model by editing the component's accounting type in the offering's Accounting tab.
 
 ### Component Architecture
 
@@ -203,9 +247,21 @@ Limit-based components are billed based on the quantity of a resource a user has
 
 - **`TOTAL`**: This period represents a one-time charge for a lifetime allocation.
   - **Initial Charge**: A single invoice item is created when the resource is first provisioned (`CREATE` order).
-  - **Limit Updates**: If the limit for a `TOTAL` component is changed later, the system calculates the difference between the new limit and the sum of all previously billed quantities for that component. It then creates a new invoice item (positive or negative) to bill for only the increment or credit the decrement. This prevents double-billing and correctly handles upgrades/downgrades.
+  - **Limit Updates**: If the limit for a `TOTAL` component is changed later, the system calculates the difference between the new limit and the sum of all previously billed quantities for that component. It then creates a new invoice item (positive or negative) to bill for only the increment or reduce the invoice total for the decrement. This prevents double-billing and correctly handles upgrades/downgrades.
 
 - **`QUARTERLY`**: This period has specialized logic for billing every three months, ensuring charges align with standard financial quarters.
+
+#### Per-Plan Billing Mode
+
+`Plan.billing_mode` (`inherit` | `limit` | `usage`) overrides how the offering's **builtin** components are billed under that plan; custom components keep their own `billing_type`. Which components a plan governs is stated on the component itself, by `OfferingComponent.billed_per_plan`: it is set for the ones a plugin provides and for the OpenStack per-volume-type quotas the volume type sync creates, and it is what `OfferingComponent.is_builtin` reports to the API. Prepaid is deliberately **not** a plan mode — it is limit-based billing paid upfront for a fixed term, and it stays on `OfferingComponent.is_prepaid`; a plan mode is refused on an offering whose builtin components are prepaid, because every mode would resolve them to something that is not. Every consumer of billing type resolves through `marketplace/billing_mode.py` (`resolve_component`, `resolve_for_resource`, `resolve_for_order`, `resolve_for_plan_period`) instead of reading `OfferingComponent.billing_type` directly. With `inherit` the component values apply unchanged.
+
+Consequences:
+
+- `Resource.is_usage_based` / `is_limit_based` are resolved per resource; the offering-level flags are true when any component or any plan resolves to that type.
+- Usage import accumulates hourly for components that resolve to `USAGE` and keeps a monthly high-water mark otherwise. `ComponentUsage` rows are keyed by plan period as well as month, so a mid-month plan switch starts a fresh row under the new period and the pre-switch row stays priced by the old plan; usage invoice items carry `details.plan_period_uuid` for the same reason.
+- A plan switch closes limit items at the switch instant and re-registers the new plan. Closing an item recomputes its quantity with the plan's unit rule (`InvoiceItem.quantity_from_limit_periods`): per-day items count `limit × days`, per-month items keep the day-weighted average limit, so a monthly fee is neither multiplied by days nor reduced. Switching back to a plan within the same month continues that plan's item with a new limit period instead of opening a second full-month line (`LimitPeriodProcessor._reopen_closed_item`). Usage items are named `resource (offering / plan) / component` and carry `details.plan_name` of the plan period that priced them; usage items appear as usage is reported. Switching onto a limit plan requires the resource's current limits to pass the plugin's limits validator. The switch emits `marketplace_resource_plan_switched` and `OrderDetails` exposes `old_plan_billing_mode` / `new_plan_billing_mode`.
+- Orders on a usage plan carry no limits; the OpenStack tenant is created with backend default quotas.
+- Only OpenStack tenant plans were given an explicit mode by migration; the mechanism is inert elsewhere, because an `inherit` plan resolves to the component's own values.
 
 #### Quarterly Billing Implementation
 
@@ -272,21 +328,21 @@ graph TD
     end
 
     subgraph "2. Signal Handling"
-        TR_SaveResource -- emits `post_save` signal --> SH_ResourceHandler(`process_billing_on_resource_save`)
-        TR_SaveUsage -- emits `post_save` signal --> SH_UsageHandler(`BillingUsageProcessor.update_invoice_when_usage_is_reported`)
+        TR_SaveResource -->|emits post_save signal| SH_ResourceHandler(`process_billing_on_resource_save`)
+        TR_SaveUsage -->|emits post_save signal| SH_UsageHandler(`BillingUsageProcessor.update_invoice_when_usage_is_reported`)
     end
 
     subgraph "3. Billing Orchestration & Logic"
         MBS[MarketplaceBillingService]
 
-        SH_ResourceHandler -- calls appropriate method based on change --> MBS
+        SH_ResourceHandler -->|calls appropriate method based on change| MBS
 
-        MBS -- `_process_resource()` loops through plan components --> Decision_BillingType{What is component.billing_type?}
+        MBS -->|_process_resource loops through plan components| Decision_BillingType{What is component.billing_type?}
 
-        Decision_BillingType -- FIXED, ONE_TIME, ON_PLAN_SWITCH --> Logic_Simple(Handled directly by MarketplaceBillingService)
-        Decision_BillingType -- LIMIT --> Logic_Limit(LimitPeriodProcessor)
+        Decision_BillingType -->|FIXED ONE_TIME ON_PLAN_SWITCH| Logic_Simple(Handled directly by MarketplaceBillingService)
+        Decision_BillingType -->|LIMIT| Logic_Limit(LimitPeriodProcessor)
 
-        SH_UsageHandler -- Processes usage directly --> Logic_Usage(BillingUsageProcessor)
+        SH_UsageHandler -->|Processes usage directly| Logic_Usage(BillingUsageProcessor)
     end
 
     subgraph "4. Final Outcome"
@@ -296,22 +352,22 @@ graph TD
     end
 
     Logic_Simple --> Action_CreateItem(Create New `InvoiceItem`)
-    Logic_Limit -- process_creation/process_update --> Action_CreateOrUpdateItem(Create or Update `InvoiceItem`)
-    Logic_Usage -- _create_or_update_usage_invoice_item --> Action_CreateOrUpdateItem
+    Logic_Limit -->|process_creation/process_update| Action_CreateOrUpdateItem(Create or Update `InvoiceItem`)
+    Logic_Usage -->|_create_or_update_usage_invoice_item| Action_CreateOrUpdateItem
 
     Action_CreateItem --> InvoiceItem
     Action_CreateOrUpdateItem --> InvoiceItem
 
     %% Styling
-    classDef trigger fill:#e6f3ff,stroke:#0066cc,stroke-width:2px;
-    classDef handler fill:#fff2e6,stroke:#ff8c1a,stroke-width:2px;
-    classDef service fill:#e6fffa,stroke:#00997a,stroke-width:2px;
-    classDef outcome fill:#f0f0f0,stroke:#666,stroke-width:2px;
+    classDef trigger fill:#e6f3ff,stroke:#0066cc,stroke-width:2px
+    classDef handler fill:#fff2e6,stroke:#ff8c1a,stroke-width:2px
+    classDef service fill:#e6fffa,stroke:#00997a,stroke-width:2px
+    classDef outcome fill:#f0f0f0,stroke:#666,stroke-width:2px
 
-    class TR_Action,TR_Usage,TR_SaveResource,TR_SaveUsage trigger;
-    class SH_ResourceHandler,SH_UsageHandler handler;
-    class MBS,Decision_BillingType,Logic_Simple,Logic_Limit,Logic_Usage service;
-    class Invoice,InvoiceItem,Action_CreateItem,Action_CreateOrUpdateItem outcome;
+    class TR_Action,TR_Usage,TR_SaveResource,TR_SaveUsage trigger
+    class SH_ResourceHandler,SH_UsageHandler handler
+    class MBS,Decision_BillingType,Logic_Simple,Logic_Limit,Logic_Usage service
+    class Invoice,InvoiceItem,Action_CreateItem,Action_CreateOrUpdateItem outcome
 ```
 
 ---
@@ -542,6 +598,55 @@ Consumer approval is **skipped** when any of these conditions are met:
 | **Same Organization Auto-Approval** | Public offering with auto-approval enabled | `offering.shared && offering.customer == project.customer && auto_approve_in_service_provider_projects == True` |
 | **Termination by Service Provider** | Service provider owner terminating resource | `order.type == TERMINATE && has_owner_access(user, offering.customer)` |
 | **Project Permission** | User has order approval permission | `has_permission(APPROVE_ORDER, project)` |
+| **Project Auto-Approval Rule** | Project has an enabled `ProjectOrderAutoApproval` whose `monthly_cost_limit` is at or above the order's estimated monthly cost (and the order's plan bills nothing by usage) | See *Project-Level Auto-Approval Rule* below |
+
+#### Project-Level Auto-Approval Rule
+
+Projects can carry an optional `ProjectOrderAutoApproval` record (OneToOne with
+`Project`) that delegates the project's `APPROVE_ORDER` right to a deterministic
+ceiling. When a new order is created in `PENDING_CONSUMER` state, a post-save
+handler schedules a re-checked evaluation via `transaction.on_commit`. The order
+is auto-approved when **all** of the following hold:
+
+- An enabled rule exists for the order's project.
+- The order's plan resolves **no** component to `billing_type=USAGE`
+  (LIMIT/FIXED/ONE_TIME/ON_PLAN_SWITCH are considered predictable); a limit
+  plan on an offering that also has a usage plan still qualifies.
+- The recurring monthly cost — `plan.get_estimate(order.limits)` with no
+  start/end dates, so one-time fees and switch fees are excluded — is
+  `<= rule.monthly_cost_limit` (inclusive boundary).
+- The rule's `created_by` user still holds `APPROVE_ORDER` on the project or
+  its customer, or is staff. Otherwise the rule silently no-ops and emits a
+  warning log.
+
+Special cases:
+
+- **TERMINATE orders** are auto-approved unconditionally when a rule exists
+  (recurring monthly cost is treated as `0`).
+- **UPDATE / RESTORE** use the same recurring monthly check; `switch_price` is
+  not counted.
+- The applicator (`marketplace.order_approval.try_apply_project_auto_approval`)
+  takes a `select_for_update(of=("self",))` lock on both the order and the
+  rule rows inside `transaction.atomic`, then reuses the same state-routing
+  helper as `approve_by_consumer` so the order transitions through
+  `PENDING_PROJECT` / `PENDING_PROVIDER` / `PENDING_START_DATE` / `EXECUTING`
+  identically to a manual consumer approval.
+
+Audit fields on `Order`:
+
+- `auto_approved_by_rule` — FK to the `ProjectOrderAutoApproval` that fired
+  (`SET_NULL` on rule deletion).
+- `auto_approved_cost_limit_snapshot` — limit at the moment of approval, so
+  the original decision remains explainable if the rule is later edited.
+- `consumer_reviewed_by` is set to the rule's `created_by` so existing
+  notification, audit-log and downstream consumers behave identically to a
+  manual approval.
+
+API surface: `/api/marketplace-project-order-auto-approvals/` (CRUD). Write
+actions are gated by `permission_factory(APPROVE_ORDER, ["project", "project.customer"])`
+with a staff bypass on create. The `marketplace-orders` list endpoint gains a
+`was_auto_approved` boolean filter; `OrderDetailsSerializer` exposes
+`auto_approved`, `auto_approved_by_rule_uuid`, `auto_approved_cost_limit_snapshot`.
 
 #### Provider Approval Rules
 

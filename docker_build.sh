@@ -8,13 +8,23 @@ python3 -m pip install uv
 # Install Python dependencies for Waldur MasterMind using lock file
 # Use UV_PROJECT_ENVIRONMENT to target system Python (no venv)
 export UV_PROJECT_ENVIRONMENT=$(python -c "import sysconfig; print(sysconfig.get_config_var('prefix'))")
-uv sync
+# --frozen installs exactly what uv.lock records and never re-resolves, so the
+# image matches the lockfile the rest of CI tests against. --no-dev keeps the
+# dev group (pytest, pyright, memray, faker, ...) out of a runtime image whose
+# test directories are deleted a step earlier.
+# `uv sync` installs the project itself, so no separate `uv pip install -e .`
+# is needed - and adding one would re-resolve against pyproject.toml, outside
+# the lock.
+uv sync --frozen --no-dev
 
 # Install gunicorn separately after uv sync to ensure it's available
 python3 -m pip install gunicorn==22.0.0
 
-# Install the package in editable mode to ensure it's available
-uv pip install --python $(which python) -e .
+# Download ghostty-web, the browser terminal served by `waldur web_shell`,
+# pinned by URL and sha512 in waldur_core/web_shell/assets.py, so containers
+# need no network access to serve it. The Dockerfile points
+# WALDUR_WEB_SHELL_ASSETS_DIR at the same directory.
+WALDUR_WEB_SHELL_ASSETS_DIR=/usr/share/waldur/web-shell python3 -c "from waldur_core.web_shell import assets; assets.fetch()"
 
 cp /etc/waldur/settings.py src/waldur_core/server/settings.py
 
@@ -23,11 +33,6 @@ mkdir -p /usr/share/waldur/static
 cat > tmp_settings.py << EOF
 # Minimal settings required for 'collectstatic' command
 INSTALLED_APPS = (
-    'admin_tools',
-    'admin_tools.dashboard',
-    'admin_tools.menu',
-    'admin_tools.theming',
-    'fluent_dashboard',  # should go before 'django.contrib.admin'
     'django.contrib.contenttypes',
     'django.contrib.admin',
     'django.contrib.staticfiles',
@@ -48,7 +53,7 @@ TEMPLATES = [
         'OPTIONS': {
             'context_processors': (
                 'django.template.context_processors.debug',
-                'django.template.context_processors.request',  # required by django-admin-tools >= 0.7.0
+                'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
                 'django.template.context_processors.i18n',
@@ -59,7 +64,6 @@ TEMPLATES = [
             'loaders': (
                 'django.template.loaders.filesystem.Loader',
                 'django.template.loaders.app_directories.Loader',
-                'admin_tools.template_loaders.Loader',  # required by django-admin-tools >= 0.7.0
             ),
         },
     },

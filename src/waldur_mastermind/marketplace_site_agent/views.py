@@ -1,28 +1,83 @@
 import logging
+from collections import defaultdict
+from datetime import timedelta
 
+from django.contrib.contenttypes.models import ContentType
+from django.core.cache import cache
+from django.db import transaction
+from django.db.models import Count, Q
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, status
+from rest_framework import permissions as rf_permissions
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from waldur_core.core import utils as core_utils
-from waldur_core.core.permissions import IsStaff
-from waldur_core.core.views import ActionsViewSet, ReadOnlyActionsViewSet
+from waldur_core.core.permissions import IsStaff, IsSupport
+from waldur_core.core.views import ActionsViewSet
 from waldur_core.logging import backend as logging_backend
+from waldur_core.logging import enums as logging_enums
+from waldur_core.logging import event_dispatch
 from waldur_core.logging import models as logging_models
 from waldur_core.logging import serializers as logging_serializers
+from waldur_core.logging import utils as logging_utils
 from waldur_core.permissions.enums import PermissionEnum
-from waldur_core.permissions.utils import has_permission, permission_factory
+from waldur_core.permissions.utils import has_permission
+from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure.models import Project
+from waldur_mastermind.marketplace import enums as marketplace_enums
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_mastermind.marketplace_site_agent import filters, models, serializers
 from waldur_mastermind.marketplace_site_agent.enums import AgentServiceState
-from waldur_mastermind.marketplace_site_agent.utils import push_user_role_sync_message
+from waldur_mastermind.marketplace_site_agent.utils import (
+    can_manage_offering_agent,
+    push_resource_user_role_sync_message,
+    push_user_role_sync_message,
+    resolve_offering_agent_authorization,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_agent_rmq_password(request) -> str:
+    """Return the RabbitMQ password for the agent queue (credentials).
+
+    When the caller authenticated with a Personal Access Token, use that PAT as
+    the RMQ password: the agent presents the same PAT string as the STOMP
+    passcode, and a long-lived PAT is not invalidated by a browser logout or
+    session-token rotation — fixing the "logout kills the agent" hazard. The
+    raw secret is only in the request header (the DB stores just its hash), so
+    it is read from there.
+
+    Fallback (no gate): a caller still using a plain session token keeps the
+    previous behaviour — ``refresh_token`` get-or-creates the DRF token,
+    avoiding the ``Token.DoesNotExist`` a bare ``request.user.auth_token``
+    would raise. cleanup_stale_agent_queues is PAT-aware to match (see tasks).
+
+    Delegates to the shared core resolver so the agent and standalone
+    EventConsumer paths cannot resolve the same RMQ credential differently.
+    """
+    return logging_utils.resolve_consumer_rmq_password(request)
+
+
+# The EventConsumer-derived half of AgentConnectionInfoSerializer. Listed once
+# so the null (legacy-path) case cannot drift from the populated one.
+CONSUMER_INFO_FIELDS = (
+    "event_consumer_uuid",
+    "user_uuid",
+    "user_username",
+    "user_full_name",
+    "user_is_staff",
+    "auth_kind",
+    "auth_token_prefix",
+    "auth_token_name",
+    "authorized_via",
+    "delivery_blocked_reason",
+)
 
 
 class ProjectSyncUserRolesView(generics.GenericAPIView):
@@ -49,6 +104,71 @@ class ProjectSyncUserRolesView(generics.GenericAPIView):
         return Response(status=status.HTTP_200_OK)
 
 
+class ResourceSyncUserRolesView(generics.GenericAPIView):
+    """Trigger user role synchronization for one resource.
+
+    Resource-scoped sibling of ProjectSyncUserRolesView: staff or a
+    provider-side user (UPDATE_OFFERING at offering or customer scope)
+    can ask the offering's agent to re-sync this resource's membership.
+    Requires the offering to opt in via enable_membership_sync_status —
+    the flag also gates the UI that exposes this action, so the button
+    and the badges it heals always appear together.
+    """
+
+    # Delivery rides the offering's event subscriptions; polling-only
+    # agents pick the state up on their next cycle regardless, so the
+    # trigger is best-effort by design.
+    THROTTLE_SECONDS = 30
+
+    queryset = marketplace_models.Resource.objects.all()
+    lookup_field = "uuid"
+    permission_classes = [rf_permissions.IsAuthenticated]
+
+    def check_object_permissions(self, request, obj):
+        super().check_object_permissions(request, obj)
+        if request.user.is_staff:
+            return
+        if has_permission(
+            request, PermissionEnum.UPDATE_OFFERING, obj.offering
+        ) or has_permission(
+            request, PermissionEnum.UPDATE_OFFERING, obj.offering.customer
+        ):
+            return
+        raise PermissionDenied()
+
+    @extend_schema(
+        description="Trigger user role sync for this resource. "
+        "Sends a notification to RabbitMQ that this resource needs user "
+        "role synchronization; agents without event subscriptions apply "
+        "the change on their next polling cycle.",
+        request=None,
+        responses={
+            200: None,
+            409: marketplace_serializers.DetailResponseSerializer,
+            429: marketplace_serializers.DetailResponseSerializer,
+        },
+    )
+    def post(self, request, *args, **kwargs):
+        """Trigger a user role sync message for this resource."""
+        resource = self.get_object()
+        if not (resource.offering.plugin_options or {}).get(
+            "enable_membership_sync_status"
+        ):
+            return Response(
+                {"detail": "Membership sync status is not enabled for this offering."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        throttle_key = f"resource-sync-user-roles-{resource.uuid.hex}"
+        if cache.get(throttle_key):
+            return Response(
+                {"detail": "Sync was already requested recently."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        cache.set(throttle_key, True, self.THROTTLE_SECONDS)
+        push_resource_user_role_sync_message(resource)
+        return Response(status=status.HTTP_200_OK)
+
+
 class AgentIdentityViewSet(ActionsViewSet):
     lookup_field = "uuid"
     serializer_class = serializers.AgentIdentitySerializer
@@ -69,7 +189,15 @@ class AgentIdentityViewSet(ActionsViewSet):
             return qs
 
         offerings = marketplace_models.Offering.objects.all().filter_for_user(user)
-        return models.AgentIdentity.objects.filter(offering__in=offerings)
+        base_q = Q(offering__in=offerings)
+
+        if user.is_identity_manager and user.managed_isds:
+            base_q = base_q | Q(
+                offering__state__in=marketplace_enums.OfferingStates.ISD_ALLOWED_STATES,
+                created_by=user,
+            )
+
+        return models.AgentIdentity.objects.filter(base_q).distinct()
 
     def check_create_permissions(request, view, obj=None):
         is_browsable_api_check = request.method == "POST" and (
@@ -102,24 +230,48 @@ class AgentIdentityViewSet(ActionsViewSet):
         offering = serializer.validated_data.get("offering")
         if not offering:
             raise PermissionDenied()
-        if offering is None or not (
-            has_permission(request, PermissionEnum.CREATE_OFFERING, offering.customer)
-        ):
+        if not can_manage_offering_agent(request, offering):
             raise PermissionDenied()
 
     create_permissions = [check_create_permissions]
 
-    partial_update_permissions = destroy_permissions = (
-        register_event_subscription_permissions
-    ) = register_service_permissions = [
-        permission_factory(
-            PermissionEnum.CREATE_OFFERING,
-            ["offering.customer"],
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def _check_agent_identity_permission(request, view, obj=None):
+        if not obj:
+            if not request.user.is_authenticated:
+                raise PermissionDenied("Authentication required")
+            return
+        authorization = resolve_offering_agent_authorization(
+            request, obj.offering, agent_identity=obj
         )
+        if authorization is None:
+            raise PermissionDenied()
+        # Stash the branch that passed instead of discarding it. register_queue
+        # records it on the consumer; re-deriving it in the action would both
+        # repeat the role queries and open a window in which a concurrently
+        # revoked role turns an already-authorised registration into a blank
+        # attribution (and, for a PAT caller, a skipped audit event).
+        request.offering_agent_authorization = authorization
+
+    # `update` (PUT) is included: without it, ActionsPermission finds no
+    # `update_permissions`, falls back to an empty `unsafe_methods_permissions`,
+    # and PUT is gated only by IsAuthenticated + get_queryset — weaker than the
+    # `can_manage_offering_agent` check the sibling actions enforce. The
+    # serializer additionally pins `offering` on update (see validate_offering).
+    partial_update_permissions = update_permissions = destroy_permissions = (
+        register_event_subscription_permissions
+    ) = register_service_permissions = register_queue_permissions = [
+        _check_agent_identity_permission
     ]
 
     @extend_schema(
-        description="Register an event subscription for the specified agent identity and observable object type. Returns existing subscription if already exists.",
+        deprecated=True,
+        description="DEPRECATED: use register_queue instead, which creates a "
+        "single unified consumer queue. This per-object-type subscription path is "
+        "kept only for the deprecation window; removal is tracked in WAL-10111. "
+        "Register an event subscription for the specified agent identity and observable object type. Returns existing subscription if already exists.",
         request=serializers.AgentEventSubscriptionCreateSerializer,
         responses={
             200: logging_serializers.EventSubscriptionSerializer,
@@ -221,6 +373,201 @@ class AgentIdentityViewSet(ActionsViewSet):
 
         return Response(subscription_serializer.data, status=status.HTTP_201_CREATED)
 
+    register_queue_serializer_class = serializers.AgentQueueRegistrationSerializer
+
+    @extend_schema(
+        description="Register a unified event-consumer queue for this agent "
+        "identity. Creates a single RabbitMQ queue that receives all event "
+        "types. Returns the existing queue if already registered.",
+        request=serializers.AgentQueueRegistrationSerializer,
+        responses={
+            200: serializers.AgentQueueRegistrationResponseSerializer,
+            201: serializers.AgentQueueRegistrationResponseSerializer,
+        },
+    )
+    @action(detail=True, methods=["post"])
+    def register_queue(self, request, uuid=None):
+        """Register a unified event-consumer queue for this agent identity.
+
+        The pub/sub state lives on a generic ``EventConsumer`` (linked via
+        ``agent_identity.event_consumer``), not on the site-agent model. Creates
+        a single RabbitMQ queue named consumer_{consumer_uuid} that receives all
+        event types, replacing per-object-type queues.
+
+        Ownership is one-user-at-a-time: a second user cannot take over a
+        consumer registered by someone else. The current owner must deregister
+        first (handled by deletion or a future deregister_queue action).
+        """
+        agent_identity = self.get_object()
+        vhost = request.user.uuid.hex
+        consumer = agent_identity.event_consumer
+
+        if consumer is not None and consumer.user_id != request.user.id:
+            return Response(
+                {
+                    "detail": (
+                        f"Queue is already registered by user "
+                        f"{consumer.user}; ask them to "
+                        f"deregister before taking over."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        input_serializer = serializers.AgentQueueRegistrationSerializer(
+            data=request.data
+        )
+        input_serializer.is_valid(raise_exception=True)
+
+        # None = omitted = keep the consumer's current filter; [] = all types.
+        requested_object_types = input_serializer.validated_data.get("object_types")
+        all_object_types = [
+            member.value for member in logging_enums.ObservableObjectType
+        ]
+
+        # Ensure a consumer exists for this agent, bound to its offering and
+        # owned by the caller. A registration failure below leaves it in an
+        # unregistered state (queue_created=False) that re-registration reuses.
+        #
+        # The consumer, its offering binding and the link are created in ONE
+        # transaction: a consumer with zero bindings IS a global (all-user PII)
+        # consumer, so a half-created one would fail *open*.
+        offering_ct = ContentType.objects.get_for_model(marketplace_models.Offering)
+        if consumer is None:
+            with transaction.atomic():
+                # `consumer` was read outside any lock, so two concurrent
+                # register_queue calls (an agent restart racing a retried request)
+                # could both see None and each create an EventConsumer bound to
+                # the same offering — only one wins the SET_NULL-linked FK; the
+                # other becomes an orphan that neither cleanup_agent_identity_queue
+                # (follows the link) nor the stale sweeps (owner token still valid)
+                # ever reap, duplicating every event for the offering indefinitely.
+                # Lock the AgentIdentity row and RE-READ its consumer under the
+                # lock: the loser then reuses the winner's consumer.
+                agent_identity = models.AgentIdentity.objects.select_for_update().get(
+                    pk=agent_identity.pk
+                )
+                consumer = agent_identity.event_consumer
+                if consumer is None:
+                    consumer = logging_models.EventConsumer.objects.create(
+                        user=request.user,
+                        object_types=requested_object_types or [],
+                    )
+                    logging_models.EventConsumerScope.objects.create(
+                        consumer=consumer,
+                        content_type=offering_ct,
+                        object_id=agent_identity.offering_id,
+                    )
+                    agent_identity.event_consumer = consumer
+                    agent_identity.save(update_fields=["event_consumer"])
+        else:
+            # Reconcile the binding against the agent's CURRENT offering.
+            # `offering` is writable on AgentIdentitySerializer, so an agent can
+            # be repointed after registration; without this the consumer would
+            # keep receiving events for the old offering and none for the new
+            # one, silently and forever.
+            wanted = (offering_ct.id, agent_identity.offering_id)
+            existing = {(s.content_type_id, s.object_id) for s in consumer.scopes.all()}
+            if existing != {wanted}:
+                with transaction.atomic():
+                    consumer.scopes.all().delete()
+                    logging_models.EventConsumerScope.objects.create(
+                        consumer=consumer,
+                        content_type=offering_ct,
+                        object_id=agent_identity.offering_id,
+                    )
+
+        # Applied once here rather than separately on each exit path, so the
+        # fast path and the full-provision path can never disagree.
+        if (
+            requested_object_types is not None
+            and consumer.object_types != requested_object_types
+        ):
+            consumer.object_types = requested_object_types
+            consumer.save(update_fields=["object_types"])
+        effective_object_types = consumer.object_types or all_object_types
+
+        # Recorded on each successful exit below, never before: the attribution
+        # must describe a registration that actually completed, or a 400 from
+        # provisioning would leave the row claiming a credential the queue never
+        # got. The branch itself comes from the permission check that already
+        # ran (_check_agent_identity_permission stashes it), so it is the exact
+        # evaluation that authorised this request and costs no extra queries.
+        authorized_via = getattr(request, "offering_agent_authorization", None)
+
+        queue_name = consumer.queue_name
+
+        # Check if already registered and valid
+        if consumer.rmq_username and consumer.queue_created:
+            rmq_backend = logging_backend.RabbitMQManagementBackend()
+
+            rmq_user_info = rmq_backend.get_user(consumer.rmq_username)
+            if rmq_user_info is not None:
+                rmq_vhost_users = rmq_backend.list_rabbitmq_vhost_permissions(vhost)
+                if consumer.rmq_username in rmq_vhost_users:
+                    # PUT /api/users/{username} is an upsert; refresh the RMQ
+                    # password so it keeps matching the presented credential.
+                    password_refreshed = rmq_backend.create_rabbitmq_user(
+                        consumer.rmq_username,
+                        _resolve_agent_rmq_password(request),
+                    )
+                    if password_refreshed:
+                        # The RMQ password now matches the presented credential,
+                        # so the attribution can be recorded: a restart on a
+                        # different credential must refresh it even though the
+                        # queue itself needed no work.
+                        logging_utils.record_consumer_attribution(
+                            consumer, request, authorized_via
+                        )
+                        response_data = {
+                            "rmq_username": consumer.rmq_username,
+                            "queue_name": queue_name,
+                            "vhost": vhost,
+                            "observable_object_types": effective_object_types,
+                        }
+                        output_serializer = (
+                            serializers.AgentQueueRegistrationResponseSerializer(
+                                data=response_data
+                            )
+                        )
+                        output_serializer.is_valid(raise_exception=True)
+                        return Response(
+                            output_serializer.data, status=status.HTTP_200_OK
+                        )
+                    logger.warning(
+                        "Failed to refresh RMQ password for consumer %s, "
+                        "falling back to full recreate",
+                        consumer,
+                    )
+
+            # Stale RMQ state — clean up and recreate
+            logger.info(
+                "Stale RMQ state for consumer %s, recreating",
+                consumer,
+            )
+            rmq_backend.delete_rabbitmq_user(consumer.rmq_username)
+            consumer.rmq_username = ""
+            consumer.queue_created = False
+            consumer.save(update_fields=["rmq_username", "queue_created"])
+
+        # Fresh provision of the RMQ vhost/user/queue. Shared with the standalone
+        # EventConsumer path (logging.views) via one helper so the two cannot
+        # drift — it raises ValidationError (400) on any RMQ failure, tearing
+        # down a half-created user first. object_types was already reconciled
+        # above. The side effects are external and non-transactional, so any
+        # partial state from a mid-way failure is reconciled by
+        # cleanup_dangling_agent_queues.
+        result = logging_utils.provision_consumer_queue(
+            consumer, _resolve_agent_rmq_password(request)
+        )
+        logging_utils.record_consumer_attribution(consumer, request, authorized_via)
+        response_data = {**result, "observable_object_types": effective_object_types}
+        output_serializer = serializers.AgentQueueRegistrationResponseSerializer(
+            data=response_data
+        )
+        output_serializer.is_valid(raise_exception=True)
+        return Response(output_serializer.data, status=status.HTTP_201_CREATED)
+
     @extend_schema(
         description="Register a new processor or get the existing one for the agent service",
         request=serializers.AgentServiceCreateSerializer,
@@ -266,13 +613,60 @@ class AgentIdentityViewSet(ActionsViewSet):
         )
         return Response(output_serializer.data, status=status_code)
 
+    cleanup_orphaned_permissions = [structure_permissions.is_staff]
 
-class AgentServiceViewSet(ReadOnlyActionsViewSet):
+    @extend_schema(
+        description="Remove agent identities that have no active services. Staff only.",
+        request=serializers.CleanupRequestSerializer,
+        responses={200: serializers.CleanupResponseSerializer},
+    )
+    @action(detail=False, methods=["post"])
+    def cleanup_orphaned(self, request):
+        """
+        Remove agent identities with no active services.
+        Use dry_run=true to preview what would be deleted without actually deleting.
+        """
+        input_serializer = serializers.CleanupRequestSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        dry_run = input_serializer.validated_data.get("dry_run", True)
+
+        # Find identities with no services
+        orphaned_identities = models.AgentIdentity.objects.annotate(
+            service_count=Count("agentservice")
+        ).filter(service_count=0)
+
+        items = list(
+            orphaned_identities.values("uuid", "name", "offering__name", "created")
+        )
+        deleted_count = orphaned_identities.count()
+
+        if not dry_run:
+            logger.info(
+                "Cleaning up %d orphaned agent identities (staff user: %s)",
+                deleted_count,
+                request.user.username,
+            )
+            orphaned_identities.delete()
+
+        output_serializer = serializers.CleanupResponseSerializer(
+            data={
+                "deleted_count": deleted_count,
+                "dry_run": dry_run,
+                "items": items,
+            }
+        )
+        output_serializer.is_valid(raise_exception=True)
+        return Response(output_serializer.data, status=status.HTTP_200_OK)
+
+
+class AgentServiceViewSet(ActionsViewSet):
     lookup_field = "uuid"
     serializer_class = serializers.AgentServiceSerializer
     filterset_class = filters.AgentServiceFilter
     filter_backends = (DjangoFilterBackend,)
     queryset = models.AgentService.objects.all()
+
+    disabled_actions = ["create", "update", "partial_update"]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -285,14 +679,29 @@ class AgentServiceViewSet(ReadOnlyActionsViewSet):
             return qs
 
         offerings = marketplace_models.Offering.objects.all().filter_for_user(user)
-        return models.AgentService.objects.filter(identity__offering__in=offerings)
+        base_q = Q(identity__offering__in=offerings)
 
-    set_statistics_permissions = register_processor_permissions = [
-        permission_factory(
-            PermissionEnum.CREATE_OFFERING,
-            ["identity.offering.customer"],
-        )
-    ]
+        if user.is_identity_manager and user.managed_isds:
+            base_q = base_q | Q(
+                identity__offering__state__in=marketplace_enums.OfferingStates.ISD_ALLOWED_STATES,
+                identity__created_by=user,
+            )
+
+        return models.AgentService.objects.filter(base_q).distinct()
+
+    def _check_agent_service_permission(request, view, obj=None):
+        if not obj:
+            if not request.user.is_authenticated:
+                raise PermissionDenied("Authentication required")
+            return
+        if not can_manage_offering_agent(
+            request, obj.identity.offering, agent_identity=obj.identity
+        ):
+            raise PermissionDenied()
+
+    destroy_permissions = set_statistics_permissions = (
+        register_processor_permissions
+    ) = [_check_agent_service_permission]
 
     @extend_schema(
         description="Update statistics for the agent service",
@@ -361,13 +770,60 @@ class AgentServiceViewSet(ReadOnlyActionsViewSet):
         )
         return Response(output_serializer.data, status=status_code)
 
+    cleanup_stale_permissions = [structure_permissions.is_staff]
 
-class AgentProcessorViewSet(ReadOnlyActionsViewSet):
+    @extend_schema(
+        description="Remove agent services that have been inactive for a specified time. Staff only.",
+        request=serializers.CleanupRequestSerializer,
+        responses={200: serializers.CleanupResponseSerializer},
+    )
+    @action(detail=False, methods=["post"])
+    def cleanup_stale(self, request):
+        """
+        Remove agent services that have been inactive for more than the specified hours.
+        Use dry_run=true to preview what would be deleted without actually deleting.
+        """
+        input_serializer = serializers.CleanupRequestSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        dry_run = input_serializer.validated_data.get("dry_run", True)
+        older_than_hours = input_serializer.validated_data.get("older_than_hours", 24)
+
+        threshold = timezone.now() - timedelta(hours=older_than_hours)
+        stale_services = models.AgentService.objects.filter(modified__lt=threshold)
+
+        items = list(
+            stale_services.values("uuid", "name", "identity__name", "state", "modified")
+        )
+        deleted_count = stale_services.count()
+
+        if not dry_run:
+            logger.info(
+                "Cleaning up %d stale agent services older than %d hours (staff user: %s)",
+                deleted_count,
+                older_than_hours,
+                request.user.username,
+            )
+            stale_services.delete()
+
+        output_serializer = serializers.CleanupResponseSerializer(
+            data={
+                "deleted_count": deleted_count,
+                "dry_run": dry_run,
+                "items": items,
+            }
+        )
+        output_serializer.is_valid(raise_exception=True)
+        return Response(output_serializer.data, status=status.HTTP_200_OK)
+
+
+class AgentProcessorViewSet(ActionsViewSet):
     lookup_field = "uuid"
     serializer_class = serializers.AgentProcessorSerializer
     filterset_class = filters.AgentProcessorFilter
     queryset = models.AgentProcessor.objects.all()
     filter_backends = (DjangoFilterBackend,)
+
+    disabled_actions = ["create", "update", "partial_update"]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -380,6 +836,478 @@ class AgentProcessorViewSet(ReadOnlyActionsViewSet):
             return qs
 
         offerings = marketplace_models.Offering.objects.all().filter_for_user(user)
-        return models.AgentProcessor.objects.filter(
-            service__identity__offering__in=offerings
+        base_q = Q(service__identity__offering__in=offerings)
+
+        if user.is_identity_manager and user.managed_isds:
+            base_q = base_q | Q(
+                service__identity__offering__state__in=marketplace_enums.OfferingStates.ISD_ALLOWED_STATES,
+                service__identity__created_by=user,
+            )
+
+        return models.AgentProcessor.objects.filter(base_q).distinct()
+
+    def _check_agent_processor_permission(request, view, obj=None):
+        if not obj:
+            if not request.user.is_authenticated:
+                raise PermissionDenied("Authentication required")
+            return
+        if not can_manage_offering_agent(
+            request,
+            obj.service.identity.offering,
+            agent_identity=obj.service.identity,
+        ):
+            raise PermissionDenied()
+
+    destroy_permissions = [_check_agent_processor_permission]
+
+
+class AgentStatsViewSet(generics.GenericAPIView):
+    """API endpoint for agent monitoring statistics."""
+
+    permission_classes = [rf_permissions.IsAuthenticated, IsSupport]
+    serializer_class = serializers.AgentStatsResponseSerializer
+
+    @extend_schema(
+        description="Get aggregated statistics about agent identities, services, and processors. Support users only.",
+        responses={200: serializers.AgentStatsResponseSerializer},
+    )
+    def get(self, request, *args, **kwargs):
+        stale_service_threshold = timezone.now() - timedelta(hours=24)
+        stale_processor_threshold = timezone.now() - timedelta(hours=1)
+
+        data = {
+            "identities": {
+                "total": models.AgentIdentity.objects.count(),
+                "by_offering": list(
+                    models.AgentIdentity.objects.values(
+                        "offering__name", "offering__uuid"
+                    ).annotate(count=Count("id"))
+                ),
+            },
+            "services": {
+                "total": models.AgentService.objects.count(),
+                "by_state": {
+                    "active": models.AgentService.objects.filter(
+                        state=AgentServiceState.ACTIVE
+                    ).count(),
+                    "idle": models.AgentService.objects.filter(
+                        state=AgentServiceState.IDLE
+                    ).count(),
+                    "error": models.AgentService.objects.filter(
+                        state=AgentServiceState.ERROR
+                    ).count(),
+                },
+                "stale_count": models.AgentService.objects.filter(
+                    modified__lt=stale_service_threshold
+                ).count(),
+            },
+            "processors": {
+                "total": models.AgentProcessor.objects.count(),
+                "by_backend_type": list(
+                    models.AgentProcessor.objects.values("backend_type").annotate(
+                        count=Count("id")
+                    )
+                ),
+                "stale_count": models.AgentProcessor.objects.filter(
+                    last_run__lt=stale_processor_threshold
+                ).count(),
+            },
+        }
+        output_serializer = serializers.AgentStatsResponseSerializer(data=data)
+        output_serializer.is_valid(raise_exception=True)
+        return Response(output_serializer.data, status=status.HTTP_200_OK)
+
+
+class AgentTaskStatsViewSet(generics.GenericAPIView):
+    """API endpoint for agent-related Celery task statistics."""
+
+    permission_classes = [rf_permissions.IsAuthenticated, IsSupport]
+    serializer_class = serializers.AgentTaskStatsResponseSerializer
+
+    @extend_schema(
+        description="Get Celery task status for agent-related tasks. Support users only.",
+        responses={200: serializers.AgentTaskStatsResponseSerializer},
+    )
+    def get(self, request, *args, **kwargs):
+        from waldur_core.server.celeryconf import app
+
+        agent_tasks = [
+            "waldur_mastermind.marketplace_site_agent.tasks.sync_offering_users",
+            "waldur_mastermind.marketplace_site_agent.tasks.mark_offering_backend_as_disconnected_after_timeout",
+            "waldur_mastermind.marketplace_site_agent.tasks.sync_resources",
+            "waldur_mastermind.marketplace_site_agent.tasks.send_messages_about_pending_orders",
+            "waldur_mastermind.marketplace_site_agent.tasks.mark_agent_services_as_inactive",
+        ]
+
+        try:
+            inspect = app.control.inspect()
+            active = inspect.active() or {}
+            scheduled = inspect.scheduled() or {}
+            reserved = inspect.reserved() or {}
+
+            data = {
+                "active_tasks": [
+                    {
+                        "id": task.get("id"),
+                        "name": task.get("name"),
+                        "args": task.get("args"),
+                        "worker": worker,
+                    }
+                    for worker, worker_tasks in active.items()
+                    for task in worker_tasks
+                    if task.get("name") in agent_tasks
+                ],
+                "scheduled_tasks": [
+                    {
+                        "id": task.get("request", {}).get("id"),
+                        "name": task.get("request", {}).get("name"),
+                        "eta": task.get("eta"),
+                    }
+                    for worker_tasks in scheduled.values()
+                    for task in worker_tasks
+                    if task.get("request", {}).get("name") in agent_tasks
+                ],
+                "reserved_tasks": [
+                    {
+                        "id": task.get("id"),
+                        "name": task.get("name"),
+                    }
+                    for worker_tasks in reserved.values()
+                    for task in worker_tasks
+                    if task.get("name") in agent_tasks
+                ],
+            }
+        except Exception as e:
+            logger.warning("Failed to get Celery task stats: %s", e)
+            data = {
+                "active_tasks": [],
+                "scheduled_tasks": [],
+                "reserved_tasks": [],
+                "error": str(e),
+            }
+
+        output_serializer = serializers.AgentTaskStatsResponseSerializer(data=data)
+        output_serializer.is_valid(raise_exception=True)
+        return Response(output_serializer.data, status=status.HTTP_200_OK)
+
+
+class AgentConnectionStatsViewSet(generics.GenericAPIView):
+    """
+    API endpoint for viewing agent connection status with RabbitMQ.
+
+    Cross-references AgentIdentity data with RabbitMQ connection information
+    to provide a unified view of agent health and connectivity.
+    """
+
+    permission_classes = [rf_permissions.IsAuthenticated, IsSupport]
+    serializer_class = serializers.AgentConnectionStatsResponseSerializer
+    pagination_class = None
+
+    @extend_schema(
+        summary="Get agent connection statistics",
+        description="""Returns connection status for all registered agents.
+
+For each agent identity, provides:
+- Agent metadata (name, version, offering)
+- Services and their states
+- Event subscriptions with RabbitMQ connection status
+- RabbitMQ queues associated with the agent's offering
+
+The RMQ connection data includes:
+- Whether the agent is currently connected
+- Connection source IP, timestamp, and state
+- Traffic statistics (bytes sent/received)
+
+Requires support user permissions.""",
+        responses={
+            200: serializers.AgentConnectionStatsResponseSerializer,
+            503: {"description": "RabbitMQ unavailable"},
+        },
+    )
+    def get(self, request, *args, **kwargs):
+        rmq_backend = logging_backend.RabbitMQManagementBackend()
+
+        # Get all RMQ users and their connections for quick lookup
+        rmq_connections_by_user = {}
+        try:
+            rmq_users = rmq_backend.list_rabbitmq_users()
+            for rmq_user in rmq_users:
+                try:
+                    connections = rmq_backend.get_user_connections_enriched(rmq_user)
+                    rmq_connections_by_user[rmq_user] = connections
+                except Exception:
+                    rmq_connections_by_user[rmq_user] = []
+        except Exception as e:
+            logger.warning("Failed to get RMQ users: %s", e)
+            rmq_users = []
+
+        # Get all subscription queues for lookup
+        queues_by_offering = {}
+        agent_queues_by_consumer = {}
+        try:
+            from waldur_core.logging import utils as logging_utils
+
+            vhost_data = rmq_backend.list_all_subscription_queues()
+            for vhost in vhost_data:
+                for queue in vhost.get("queues", []):
+                    parsed = logging_utils.parse_subscription_queue_name(queue["name"])
+                    if parsed and parsed.get("offering_uuid"):
+                        offering_uuid = parsed["offering_uuid"]
+                        if offering_uuid not in queues_by_offering:
+                            queues_by_offering[offering_uuid] = []
+                        queues_by_offering[offering_uuid].append(
+                            {
+                                "name": queue["name"],
+                                "messages": queue.get("messages", 0),
+                                "consumers": queue.get("consumers", 0),
+                                "object_type": parsed.get("object_type"),
+                                "kind": logging_enums.QueueKind.LEGACY,
+                            }
+                        )
+                    consumer_uuid = logging_utils.parse_consumer_queue_name(
+                        queue["name"]
+                    )
+                    if consumer_uuid:
+                        agent_queues_by_consumer[consumer_uuid] = {
+                            "name": queue["name"],
+                            "messages": queue.get("messages", 0),
+                            "consumers": queue.get("consumers", 0),
+                            "object_type": None,
+                            "kind": logging_enums.QueueKind.CONSUMER,
+                        }
+        except Exception as e:
+            logger.warning("Failed to get RMQ queues: %s", e)
+
+        # Get all agent identities with their offerings
+        agents_data = []
+        total_queued_messages = 0
+        connected_count = 0
+
+        # Group legacy subscriptions by owning user once. Previously this query
+        # ran inside the per-identity loop (O(identities x subscriptions)) and,
+        # because it was unfiltered, showed every subscription on every agent
+        # and set agent_connected from any connection at all. Scope each agent's
+        # list to its own owner instead.
+        subs_by_user = defaultdict(list)
+        for subscription in logging_models.EventSubscription.objects.all():
+            subs_by_user[subscription.user_id].append(subscription)
+
+        # Legacy subscriptions attach to an agent by OFFERING (via their queues),
+        # the only reliable link. Keying a legacy agent's list on
+        # identity.created_by misattributed it: created_by differs from the
+        # subscription's actual user whenever a staff/customer-owner/offering
+        # manager registered on an identity they didn't create, and is SET_NULL
+        # once the creator is deleted — either way the list came back wrongly
+        # empty for a healthy unmigrated agent.
+        subs_by_offering = defaultdict(list)
+        seen_by_offering = defaultdict(set)
+        for queue in logging_models.EventSubscriptionQueue.objects.select_related(
+            "event_subscription"
+        ):
+            off_hex = (
+                queue.offering_uuid.hex
+                if hasattr(queue.offering_uuid, "hex")
+                else str(queue.offering_uuid).replace("-", "")
+            )
+            sub = queue.event_subscription
+            if sub.id not in seen_by_offering[off_hex]:
+                seen_by_offering[off_hex].add(sub.id)
+                subs_by_offering[off_hex].append(sub)
+
+        agent_identities = models.AgentIdentity.objects.select_related(
+            "offering", "event_consumer__user"
+        ).prefetch_related(
+            "agentservice_set",
+            # The bindings back delivery_blocked_reason below. This loads the
+            # bound entity, not its ancestor chain, so scope_keys_for still
+            # walks the parent FKs — the reason costs roughly two queries per
+            # agent. This endpoint is support-only and unpaginated; batching
+            # that walk across agents is the obvious next step if it grows.
+            "event_consumer__scopes__content_type",
+            "event_consumer__scopes__scope",
         )
+
+        for identity in agent_identities:
+            # Get services for this identity
+            services_data = []
+            for service in identity.agentservice_set.all():
+                services_data.append(
+                    {
+                        "uuid": service.uuid,
+                        "name": service.name,
+                        "state": service.get_state_display(),
+                        "modified": service.modified,
+                    }
+                )
+
+            # Find event subscriptions that could be related to this agent
+            # We look for subscriptions where the user has access to this offering
+            # and the subscription was created for relevant object types
+            event_subscriptions_data = []
+            agent_connected = False
+
+            # Migrated agent: its unified consumer owns delivery, so any legacy
+            # subscriptions still around are the consumer owner's (transition
+            # window). Legacy agent: match by the agent's offering, the reliable
+            # link (see subs_by_offering above).
+            if identity.event_consumer:
+                identity_subscriptions = subs_by_user.get(
+                    identity.event_consumer.user_id, []
+                )
+            else:
+                identity_subscriptions = subs_by_offering.get(
+                    identity.offering.uuid.hex, []
+                )
+
+            for subscription in identity_subscriptions:
+                rmq_username = subscription.uuid.hex
+                connections = rmq_connections_by_user.get(rmq_username, [])
+
+                rmq_connection = None
+                if connections:
+                    conn = connections[0]  # Take first active connection
+                    rmq_connection = {
+                        "connected": True,
+                        "source_ip": conn.get("source_ip"),
+                        "connected_at": conn.get("connected_at"),
+                        "state": conn.get("state"),
+                        "recv_oct": conn.get("recv_oct"),
+                        "send_oct": conn.get("send_oct"),
+                    }
+                    agent_connected = True
+                else:
+                    rmq_connection = {
+                        "connected": False,
+                        "source_ip": None,
+                        "connected_at": None,
+                        "state": None,
+                        "recv_oct": None,
+                        "send_oct": None,
+                    }
+
+                event_subscriptions_data.append(
+                    {
+                        "uuid": subscription.uuid,
+                        "created": subscription.created,
+                        "observable_objects": subscription.observable_objects,
+                        "rmq_connection": rmq_connection,
+                    }
+                )
+
+            # Get queues for this offering (legacy path)
+            offering_uuid_hex = identity.offering.uuid.hex
+            queues = list(queues_by_offering.get(offering_uuid_hex, []))
+
+            # Add consumer queue if present (unified path)
+            if identity.event_consumer:
+                consumer_uuid_hex = identity.event_consumer.uuid.hex
+                if consumer_uuid_hex in agent_queues_by_consumer:
+                    consumer_queue = agent_queues_by_consumer[consumer_uuid_hex]
+                    queues.append(consumer_queue)
+                    # A migrated agent holds no legacy subscription, so the loop
+                    # above never sees it connected. Its consumer queue does:
+                    # draining it means a live STOMP consumer on the broker.
+                    if consumer_queue.get("consumers", 0) >= 1:
+                        agent_connected = True
+
+            if agent_connected:
+                connected_count += 1
+
+            for queue in queues:
+                total_queued_messages += queue.get("messages", 0)
+
+            # Who the queue runs as and on what credential. All null for an
+            # agent still on the legacy path, which has no consumer at all.
+            consumer = identity.event_consumer
+            consumer_info = dict.fromkeys(CONSUMER_INFO_FIELDS)
+            if consumer:
+                consumer_info = {
+                    "event_consumer_uuid": consumer.uuid,
+                    "user_uuid": consumer.user.uuid,
+                    "user_username": consumer.user.username,
+                    "user_full_name": consumer.user.full_name,
+                    "user_is_staff": consumer.user.is_staff,
+                    "auth_kind": consumer.auth_kind,
+                    "auth_token_prefix": consumer.auth_token_prefix,
+                    "auth_token_name": consumer.auth_token_name,
+                    "authorized_via": consumer.authorized_via,
+                    "delivery_blocked_reason": event_dispatch.delivery_blocked_reason(
+                        consumer
+                    ),
+                }
+
+            agents_data.append(
+                {
+                    "uuid": identity.uuid,
+                    "name": identity.name,
+                    "offering_uuid": identity.offering.uuid,
+                    "offering_name": identity.offering.name,
+                    "version": identity.version,
+                    "last_restarted": identity.last_restarted,
+                    **consumer_info,
+                    "services": services_data,
+                    "event_subscriptions": event_subscriptions_data,
+                    "queues": queues,
+                }
+            )
+
+        total_agents = len(agents_data)
+        summary = {
+            "total_agents": total_agents,
+            "connected_agents": connected_count,
+            "disconnected_agents": total_agents - connected_count,
+            "total_queued_messages": total_queued_messages,
+        }
+
+        output = {"agents": agents_data, "summary": summary}
+
+        output_serializer = serializers.AgentConnectionStatsResponseSerializer(
+            instance=output
+        )
+        return Response(output_serializer.data, status=status.HTTP_200_OK)
+
+
+class SiteAgentLogViewSet(ActionsViewSet):
+    """Endpoint for site agents to push diagnostic logs to Waldur Mastermind."""
+
+    queryset = models.SiteAgentLog.objects.all()
+    serializer_class = serializers.SiteAgentLogSerializer
+    filterset_class = filters.SiteAgentLogFilter
+    filter_backends = (DjangoFilterBackend,)
+    lookup_field = "uuid"
+    disabled_actions = ["update", "partial_update", "destroy", "retrieve"]
+
+    def get_queryset(self):
+        qs = super().get_queryset().select_related("agent_identity__offering")
+        offerings = marketplace_models.Offering.objects.filter(
+            type__in=marketplace_enums.SITE_AGENT_COMPATIBLE_OFFERING_TYPES
+        ).filter_for_user(self.request.user)
+        return qs.filter(agent_identity__offering__in=offerings)
+
+    @extend_schema(
+        summary="Push site agent logs",
+        description="Receive a batch of log entries from a site agent. Send a list where each entry includes agent_identity_uuid.",
+        request=serializers.SiteAgentLogCreateSerializer(many=True),
+        responses={201: serializers.SiteAgentLogSerializer(many=True)},
+    )
+    def create(self, request, *args, **kwargs):
+        input_serializer = serializers.SiteAgentLogCreateSerializer(
+            data=request.data, many=True, context={"request": request}
+        )
+        input_serializer.is_valid(raise_exception=True)
+
+        logs = models.SiteAgentLog.objects.bulk_create(
+            [
+                models.SiteAgentLog(
+                    agent_identity=entry["agent_identity_uuid"],
+                    timestamp=entry["timestamp"],
+                    level=entry["level"],
+                    message=entry["message"],
+                    module=entry["module"],
+                )
+                for entry in input_serializer.validated_data
+            ],
+            batch_size=500,
+        )
+        output_serializer = self.get_serializer(logs, many=True)
+        return Response(output_serializer.data, status=status.HTTP_201_CREATED)

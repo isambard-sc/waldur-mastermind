@@ -4,18 +4,37 @@ from ddt import data, ddt
 from django.test import override_settings
 from rest_framework import status, test
 
+from waldur_core.core.enums import CoreStates
+from waldur_core.logging import models as logging_models
+from waldur_core.logging.enums import EventType
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
+from waldur_core.structure.tests import factories as structure_factories
+from waldur_openstack import models
+from waldur_openstack.backend import OpenStackBackend
+from waldur_openstack.enums import Ipv6Modes
+from waldur_openstack.exceptions import OpenStackBackendError
+
 from . import factories, fixtures
 
 
-class BaseRouterTest(test.APITransactionTestCase):
+class BaseRouterTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.OpenStackFixture()
         self.client.force_authenticate(user=self.fixture.owner)
-        self.mock = mock.patch("waldur_openstack.backend.OpenStackBackend.get_free_ip")
-        self.mock_get_free_ip = self.mock.start()
+        # Both patches used to be started and never stopped -- the second
+        # assignment even dropped the handle of the first -- so every test that
+        # ran later in the same process got a fake `get_free_ip` returning
+        # "1.1.1.1" and a `create_port` that does nothing. That is invisible
+        # until something actually exercises those methods (test_subnet_allocation_pools
+        # does), and then it fails for reasons that have nothing to do with it.
+        patcher = mock.patch("waldur_openstack.backend.OpenStackBackend.get_free_ip")
+        self.mock_get_free_ip = patcher.start()
+        self.addCleanup(patcher.stop)
         self.mock_get_free_ip.return_value = "1.1.1.1"
-        self.mock = mock.patch("waldur_openstack.backend.OpenStackBackend.create_port")
-        self.mock_create_port = self.mock.start()
+        patcher = mock.patch("waldur_openstack.backend.OpenStackBackend.create_port")
+        self.mock_create_port = patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 class SetRoutesTest(BaseRouterTest):
@@ -42,6 +61,7 @@ class SetRoutesTest(BaseRouterTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+@ddt
 class RouterInterfaceTest(BaseRouterTest):
     def setUp(self):
         super().setUp()
@@ -93,6 +113,99 @@ class RouterInterfaceTest(BaseRouterTest):
         mock_add.assert_called_once()
         mock_pull.assert_called_once()
 
+    def _make_ipv6_subnet(self, mode):
+        self.subnet.cidr = "2001:db8:1::/64"
+        self.subnet.ip_version = 6
+        self.subnet.ipv6_ra_mode = mode
+        self.subnet.ipv6_address_mode = mode
+        self.subnet.is_connected = False
+        self.subnet.save()
+
+    def _created_port_fixed_ips(self):
+        self.mock_create_port.assert_called_once()
+        return self.mock_create_port.call_args[0][0].fixed_ips
+
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.add_router_interface")
+    def test_ipv4_subnet_gets_a_free_address(self, mock_add, mock_pull):
+        self.mock_get_free_ip.return_value = "192.168.1.10"
+
+        response = self.client.post(
+            self.url_add, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+        self.assertEqual(
+            self._created_port_fixed_ips(),
+            [{"subnet_id": self.subnet.backend_id, "ip_address": "192.168.1.10"}],
+        )
+        mock_add.assert_called_once()
+
+    @data(Ipv6Modes.SLAAC, Ipv6Modes.DHCPV6_STATELESS)
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.add_router_interface")
+    def test_address_from_prefix_subnet_lets_neutron_pick_the_address(
+        self, mode, mock_add, mock_pull
+    ):
+        self._make_ipv6_subnet(mode)
+
+        response = self.client.post(
+            self.url_add, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+        self.mock_get_free_ip.assert_not_called()
+        self.assertEqual(
+            self._created_port_fixed_ips(), [{"subnet_id": self.subnet.backend_id}]
+        )
+        mock_add.assert_called_once()
+        self.subnet.refresh_from_db()
+        self.assertTrue(self.subnet.is_connected)
+
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.add_router_interface")
+    def test_stateful_ipv6_subnet_gets_a_free_address(self, mock_add, mock_pull):
+        self._make_ipv6_subnet(Ipv6Modes.DHCPV6_STATEFUL)
+        self.mock_get_free_ip.return_value = "2001:db8:1::2"
+
+        response = self.client.post(
+            self.url_add, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+        self.assertEqual(
+            self._created_port_fixed_ips(),
+            [{"subnet_id": self.subnet.backend_id, "ip_address": "2001:db8:1::2"}],
+        )
+        mock_add.assert_called_once()
+
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.add_router_interface")
+    def test_port_creation_failure_is_a_bad_request(self, mock_add):
+        self._make_ipv6_subnet(Ipv6Modes.SLAAC)
+        self.mock_create_port.side_effect = OpenStackBackendError(
+            "IPv6 address cannot be directly assigned to a port on subnet"
+        )
+
+        response = self.client.post(
+            self.url_add, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("cannot be directly assigned", str(response.data))
+        mock_add.assert_not_called()
+
+    def test_free_address_lookup_failure_is_a_bad_request(self):
+        self.mock_get_free_ip.side_effect = OpenStackBackendError(
+            "Subnet has an invalid allocation pool"
+        )
+
+        response = self.client.post(
+            self.url_add, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("invalid allocation pool", str(response.data))
+
     def test_add_router_interface_missing_params(self):
         response = self.client.post(self.url_add, {})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -115,27 +228,61 @@ class RouterInterfaceTest(BaseRouterTest):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    # Both pulls have to be mocked. remove_router_interface_safely calls
+    # pull_tenant_ports as well, and leaving it real made it raise on a session
+    # with no auth_url -- harmlessly, because eager Celery swallowed it after
+    # the assertions below had already run against the pull that came first.
+    # That hid whether the second pull happened at all.
     @override_settings(task_always_eager=True)
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_ports")
     @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
     @mock.patch("waldur_openstack.backend.OpenStackBackend.remove_router_interface")
-    def test_remove_router_interface_with_subnet(self, mock_remove, mock_pull):
+    def test_remove_router_interface_with_subnet(
+        self, mock_remove, mock_pull_routers, mock_pull_ports
+    ):
         response = self.client.post(
             self.url_remove, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
         )
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_remove.assert_called_once()
-        mock_pull.assert_called_once()
+        mock_pull_ports.assert_called_once()
+        mock_pull_routers.assert_called_once()
 
     @override_settings(task_always_eager=True)
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_ports")
     @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
     @mock.patch("waldur_openstack.backend.OpenStackBackend.remove_router_interface")
-    def test_remove_router_interface_with_port(self, mock_remove, mock_pull):
+    def test_remove_router_interface_with_port(
+        self, mock_remove, mock_pull_routers, mock_pull_ports
+    ):
         response = self.client.post(
             self.url_remove, {"port": factories.PortFactory.get_url(self.port)}
         )
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_remove.assert_called_once()
-        mock_pull.assert_called_once()
+        mock_pull_ports.assert_called_once()
+        mock_pull_routers.assert_called_once()
+
+    @override_settings(task_always_eager=True)
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_ports")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.remove_router_interface")
+    def test_removal_refreshes_ports_before_routers(
+        self, mock_remove, mock_pull_routers, mock_pull_ports
+    ):
+        """Order matters: pull_tenant_routers rebuilds the router's port set
+        from local Port rows, so it has to run after the sweep that drops the
+        port just removed -- otherwise the stale one stays attached."""
+        manager = mock.Mock()
+        manager.attach_mock(mock_pull_ports, "ports")
+        manager.attach_mock(mock_pull_routers, "routers")
+
+        response = self.client.post(
+            self.url_remove, {"port": factories.PortFactory.get_url(self.port)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual([call[0] for call in manager.mock_calls], ["ports", "routers"])
 
     def test_remove_router_interface_missing_params(self):
         response = self.client.post(self.url_remove, {})
@@ -201,3 +348,884 @@ class RouterCreateTest(BaseRouterTest):
         response = self.client.post(self.url, data)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         create_port_executor_mock.assert_not_called()
+
+
+class BaseExternalGatewayTest(BaseRouterTest):
+    def setUp(self):
+        super().setUp()
+        self.router = factories.RouterFactory(
+            tenant=self.fixture.tenant,
+            project=self.fixture.project,
+            service_settings=self.fixture.settings,
+        )
+        self.external_network = factories.ExternalNetworkFactory(
+            settings=self.fixture.settings,
+            backend_id="ext-net-backend-id-1",
+        )
+        self.set_url = factories.RouterFactory.get_url(
+            self.router, action="set_external_gateway"
+        )
+        self.remove_url = factories.RouterFactory.get_url(
+            self.router, action="remove_external_gateway"
+        )
+        self.available_url = factories.RouterFactory.get_url(
+            self.router, action="available_external_networks"
+        )
+
+
+@ddt
+@mock.patch("waldur_openstack.executors.RouterSetExternalGatewayExecutor.execute")
+class SetExternalGatewayPermissionTest(BaseExternalGatewayTest):
+    @data("owner", "admin", "manager", "staff")
+    def test_set_gateway_allowed(self, user, executor_mock):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(
+            self.set_url,
+            {"external_network_id": self.external_network.backend_id},
+        )
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_202_ACCEPTED,
+            response.data,
+        )
+
+    def test_set_gateway_denied_for_member(self, executor_mock):
+        self.client.force_authenticate(self.fixture.member)
+        response = self.client.post(
+            self.set_url,
+            {"external_network_id": self.external_network.backend_id},
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        executor_mock.assert_not_called()
+
+    def test_set_gateway_denied_for_user(self, executor_mock):
+        """User without any role on the project gets 404 (resource not visible)."""
+        self.client.force_authenticate(self.fixture.user)
+        response = self.client.post(
+            self.set_url,
+            {"external_network_id": self.external_network.backend_id},
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        executor_mock.assert_not_called()
+
+
+@ddt
+@mock.patch("waldur_openstack.executors.RouterRemoveExternalGatewayExecutor.execute")
+class RemoveExternalGatewayPermissionTest(BaseExternalGatewayTest):
+    def setUp(self):
+        super().setUp()
+        self.router.external_network_id = self.external_network.backend_id
+        self.router.external_network_ref = self.external_network
+        self.router.save()
+
+    @data("owner", "admin", "manager", "staff")
+    def test_remove_gateway_allowed(self, user, executor_mock):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(self.remove_url)
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_202_ACCEPTED,
+            response.data,
+        )
+
+    def test_remove_gateway_denied_for_member(self, executor_mock):
+        self.client.force_authenticate(self.fixture.member)
+        response = self.client.post(self.remove_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        executor_mock.assert_not_called()
+
+    def test_remove_gateway_denied_for_user(self, executor_mock):
+        self.client.force_authenticate(self.fixture.user)
+        response = self.client.post(self.remove_url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        executor_mock.assert_not_called()
+
+
+@mock.patch("waldur_openstack.executors.RouterSetExternalGatewayExecutor.execute")
+class SetExternalGatewayGlobalNetworkTest(BaseExternalGatewayTest):
+    def test_set_gateway_basic(self, executor_mock):
+        response = self.client.post(
+            self.set_url,
+            {"external_network_id": self.external_network.backend_id},
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.router.refresh_from_db()
+        self.assertEqual(
+            self.router.external_network_id, self.external_network.backend_id
+        )
+        self.assertEqual(self.router.external_network_ref, self.external_network)
+        self.assertIsNone(self.router.enable_snat)
+        executor_mock.assert_called_once()
+
+    def test_set_gateway_with_invalid_network_id(self, executor_mock):
+        response = self.client.post(
+            self.set_url,
+            {"external_network_id": "non-existent-network-id"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        executor_mock.assert_not_called()
+
+    def test_set_gateway_updates_existing(self, executor_mock):
+        # Set initial gateway
+        self.router.external_network_id = "old-network-id"
+        self.router.save()
+
+        response = self.client.post(
+            self.set_url,
+            {"external_network_id": self.external_network.backend_id},
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.router.refresh_from_db()
+        self.assertEqual(
+            self.router.external_network_id, self.external_network.backend_id
+        )
+
+    def test_set_gateway_snat_disabled_as_provider(self, executor_mock):
+        """Provider (service settings customer owner) can disable SNAT on global network."""
+        # fixture.owner is the customer owner which is also service_settings.customer owner
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.external_network.backend_id,
+                "enable_snat": False,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+        self.router.refresh_from_db()
+        self.assertFalse(self.router.enable_snat)
+
+    def test_set_gateway_snat_disabled_as_project_admin_denied(self, executor_mock):
+        """Project admin without provider role cannot disable SNAT on global network."""
+        self.client.force_authenticate(self.fixture.admin)
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.external_network.backend_id,
+                "enable_snat": False,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        executor_mock.assert_not_called()
+
+    def test_set_gateway_fixed_ips_as_staff(self, executor_mock):
+        """Staff can set fixed IPs on global network."""
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.external_network.backend_id,
+                "external_fixed_ips": [{"ip_address": "10.0.0.5"}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+
+    def test_set_gateway_fixed_ips_as_project_admin_denied(self, executor_mock):
+        """Project admin cannot set fixed IPs on global network."""
+        self.client.force_authenticate(self.fixture.admin)
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.external_network.backend_id,
+                "external_fixed_ips": [{"ip_address": "10.0.0.5"}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        executor_mock.assert_not_called()
+
+    def test_set_gateway_fixed_ips_missing_ip_address(self, executor_mock):
+        """Fixed IP entries must contain ip_address field."""
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.external_network.backend_id,
+                "external_fixed_ips": [{"subnet_id": "some-subnet"}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        executor_mock.assert_not_called()
+
+    def test_set_gateway_fixed_ips_with_valid_subnet_id_and_ip(self, executor_mock):
+        subnet = factories.ExternalSubnetFactory(
+            network=self.external_network,
+            cidr="192.168.240.96/28",
+            backend_id="ext-subnet-belongs",
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.external_network.backend_id,
+                "external_fixed_ips": [
+                    {"ip_address": "192.168.240.104", "subnet_id": subnet.backend_id}
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+
+    def test_set_gateway_fixed_ips_rejects_subnet_from_different_network(
+        self, executor_mock
+    ):
+        other_network = factories.ExternalNetworkFactory(
+            settings=self.fixture.settings, backend_id="ext-net-other"
+        )
+        foreign_subnet = factories.ExternalSubnetFactory(
+            network=other_network,
+            cidr="10.10.10.0/24",
+            backend_id="ext-subnet-foreign",
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.external_network.backend_id,
+                "external_fixed_ips": [
+                    {
+                        "ip_address": "10.10.10.5",
+                        "subnet_id": foreign_subnet.backend_id,
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            b"does not belong to the chosen external network", response.content
+        )
+        executor_mock.assert_not_called()
+
+    def test_set_gateway_fixed_ips_rejects_ip_outside_subnet_cidr(self, executor_mock):
+        subnet = factories.ExternalSubnetFactory(
+            network=self.external_network,
+            cidr="192.168.240.96/28",
+            backend_id="ext-subnet-cidr-check",
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.external_network.backend_id,
+                "external_fixed_ips": [
+                    {"ip_address": "10.10.10.5", "subnet_id": subnet.backend_id}
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(b"is not inside subnet", response.content)
+        executor_mock.assert_not_called()
+
+
+@mock.patch("waldur_openstack.executors.RouterSetExternalGatewayExecutor.execute")
+class SetExternalGatewayRBACNetworkTest(BaseExternalGatewayTest):
+    def setUp(self):
+        super().setUp()
+        # Create a source tenant/network with RBAC policy
+        self.source_fixture = fixtures.OpenStackFixture()
+        self.source_network = factories.NetworkFactory(
+            tenant=self.source_fixture.tenant,
+            project=self.source_fixture.project,
+            service_settings=self.source_fixture.settings,
+            backend_id="rbac-net-backend-id",
+        )
+        # Create RBAC policy granting external access to our router's tenant
+        self.rbac_policy = factories.NetworkRBACPolicyFactory(
+            network=self.source_network,
+            target_tenant=self.fixture.tenant,
+            policy_type=models.NetworkRBACPolicy.NetworkShareType.EXTERNAL,
+        )
+
+    def test_set_gateway_rbac_basic(self, executor_mock):
+        """User can set RBAC network as gateway (basic, no SNAT control)."""
+        response = self.client.post(
+            self.set_url,
+            {"external_network_id": self.source_network.backend_id},
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+        self.router.refresh_from_db()
+        self.assertEqual(
+            self.router.external_network_id, self.source_network.backend_id
+        )
+        # RBAC networks don't set external_network_ref
+        self.assertIsNone(self.router.external_network_ref)
+
+    def test_set_gateway_rbac_snat_disabled_with_both_tenant_admin(self, executor_mock):
+        """User admin on both source and target projects can disable SNAT."""
+        # Make fixture.owner admin on the source project too
+        self.source_fixture.project.add_user(self.fixture.owner, ProjectRole.ADMIN)
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.source_network.backend_id,
+                "enable_snat": False,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+
+    def test_set_gateway_rbac_snat_disabled_without_source_admin_denied(
+        self, executor_mock
+    ):
+        """User without admin/manager on source project cannot disable SNAT."""
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.source_network.backend_id,
+                "enable_snat": False,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        executor_mock.assert_not_called()
+
+    def test_set_gateway_rbac_fixed_ips_with_both_tenant_admin(self, executor_mock):
+        """User admin on both projects can set fixed IPs for RBAC network."""
+        self.source_fixture.project.add_user(self.fixture.owner, ProjectRole.ADMIN)
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.source_network.backend_id,
+                "external_fixed_ips": [{"ip_address": "10.0.0.5"}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+
+    def test_set_gateway_rbac_fixed_ips_without_source_admin_denied(
+        self, executor_mock
+    ):
+        """User without admin on source cannot set fixed IPs."""
+        response = self.client.post(
+            self.set_url,
+            {
+                "external_network_id": self.source_network.backend_id,
+                "external_fixed_ips": [{"ip_address": "10.0.0.5"}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        executor_mock.assert_not_called()
+
+    def test_set_gateway_rbac_network_without_policy_denied(self, executor_mock):
+        """Network without RBAC policy is not available as external."""
+        self.rbac_policy.delete()
+        response = self.client.post(
+            self.set_url,
+            {"external_network_id": self.source_network.backend_id},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        executor_mock.assert_not_called()
+
+
+@ddt
+@mock.patch("waldur_openstack.executors.RouterSetExternalGatewayExecutor.execute")
+class ExternalGatewayTenantScopeTest(test.APITestCase):
+    """Regression tests for WAL-9987: consumer-side users must not be able to
+    attach a router to a provider-internal (non-shared) external network, even
+    by calling the API directly and bypassing the homeport dropdown.
+    """
+
+    def setUp(self):
+        # Provider side: a customer owning the OpenStack service settings.
+        self.provider_customer = structure_factories.CustomerFactory()
+        self.provider_owner = structure_factories.UserFactory()
+        self.provider_customer.add_user(self.provider_owner, CustomerRole.OWNER)
+
+        # Consumer side: a different customer + project under it.
+        self.consumer_customer = structure_factories.CustomerFactory()
+        self.consumer_project = structure_factories.ProjectFactory(
+            customer=self.consumer_customer
+        )
+        self.consumer_owner = structure_factories.UserFactory()
+        self.consumer_customer.add_user(self.consumer_owner, CustomerRole.OWNER)
+        self.consumer_admin = structure_factories.UserFactory()
+        self.consumer_project.add_user(self.consumer_admin, ProjectRole.ADMIN)
+        self.consumer_manager = structure_factories.UserFactory()
+        self.consumer_project.add_user(self.consumer_manager, ProjectRole.MANAGER)
+        self.staff = structure_factories.UserFactory(is_staff=True)
+
+        # Roles need the gateway permission for the role check to reach the
+        # network-scope validation we want to exercise.
+        CustomerRole.OWNER.add_permission(
+            PermissionEnum.CAN_MANAGE_OPENSTACK_ROUTER_GATEWAY
+        )
+        ProjectRole.ADMIN.add_permission(
+            PermissionEnum.CAN_MANAGE_OPENSTACK_ROUTER_GATEWAY
+        )
+        ProjectRole.MANAGER.add_permission(
+            PermissionEnum.CAN_MANAGE_OPENSTACK_ROUTER_GATEWAY
+        )
+
+        # Service settings owned by the provider, shared with consumers.
+        self.settings = factories.SettingsFactory(
+            customer=self.provider_customer,
+            shared=True,
+            state=CoreStates.OK,
+        )
+        self.tenant = factories.TenantFactory(
+            service_settings=self.settings, project=self.consumer_project
+        )
+        self.router = factories.RouterFactory(
+            tenant=self.tenant,
+            project=self.consumer_project,
+            service_settings=self.settings,
+        )
+
+        # Two global external networks on the provider's deployment:
+        # one explicitly shared with tenants, one provider-internal.
+        self.shared_net = factories.ExternalNetworkFactory(
+            settings=self.settings, backend_id="shared-ext", is_shared=True
+        )
+        self.private_net = factories.ExternalNetworkFactory(
+            settings=self.settings, backend_id="private-ext", is_shared=False
+        )
+
+        self.set_url = factories.RouterFactory.get_url(
+            self.router, action="set_external_gateway"
+        )
+        self.available_url = factories.RouterFactory.get_url(
+            self.router, action="available_external_networks"
+        )
+
+    def _post_set(self, network):
+        return self.client.post(
+            self.set_url, {"external_network_id": network.backend_id}
+        )
+
+    @data("consumer_owner", "consumer_admin", "consumer_manager")
+    def test_consumer_user_can_attach_shared_external_network(
+        self, user, executor_mock
+    ):
+        self.client.force_authenticate(getattr(self, user))
+        response = self._post_set(self.shared_net)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+
+    @data("consumer_owner", "consumer_admin", "consumer_manager")
+    def test_consumer_user_cannot_attach_non_shared_external_network(
+        self, user, executor_mock
+    ):
+        """Direct API call bypassing the dropdown must still be rejected."""
+        self.client.force_authenticate(getattr(self, user))
+        response = self._post_set(self.private_net)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("external_network_id", response.data)
+        executor_mock.assert_not_called()
+        self.router.refresh_from_db()
+        self.assertEqual(self.router.external_network_id, "")
+
+    def test_staff_can_attach_non_shared_external_network(self, executor_mock):
+        self.client.force_authenticate(self.staff)
+        response = self._post_set(self.private_net)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+
+    def test_provider_owner_can_attach_non_shared_external_network(self, executor_mock):
+        """Provider's customer owner can attach a non-shared global network on
+        consumer's router when they are also granted access to the project
+        (the typical Waldur configuration for service-provider operators)."""
+        self.consumer_project.add_user(self.provider_owner, ProjectRole.ADMIN)
+        self.client.force_authenticate(self.provider_owner)
+        response = self._post_set(self.private_net)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+
+    def test_consumer_user_can_attach_rbac_shared_network(self, executor_mock):
+        """RBAC-shared networks remain attachable regardless of is_shared."""
+        rbac_source = fixtures.OpenStackFixture()
+        rbac_network = factories.NetworkFactory(
+            tenant=rbac_source.tenant,
+            project=rbac_source.project,
+            service_settings=rbac_source.settings,
+            backend_id="rbac-ext",
+        )
+        factories.NetworkRBACPolicyFactory(
+            network=rbac_network,
+            target_tenant=self.tenant,
+            policy_type=models.NetworkRBACPolicy.NetworkShareType.EXTERNAL,
+        )
+        self.client.force_authenticate(self.consumer_admin)
+        response = self.client.post(
+            self.set_url, {"external_network_id": rbac_network.backend_id}
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+
+    def test_available_external_networks_hides_non_shared_from_consumer(
+        self, executor_mock
+    ):
+        self.client.force_authenticate(self.consumer_admin)
+        response = self.client.get(self.available_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        backend_ids = {n["backend_id"] for n in response.data}
+        self.assertIn(self.shared_net.backend_id, backend_ids)
+        self.assertNotIn(self.private_net.backend_id, backend_ids)
+
+    def test_available_external_networks_shows_non_shared_to_staff(self, executor_mock):
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(self.available_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        backend_ids = {n["backend_id"] for n in response.data}
+        self.assertIn(self.shared_net.backend_id, backend_ids)
+        self.assertIn(self.private_net.backend_id, backend_ids)
+
+    def test_available_external_networks_shows_non_shared_to_provider_owner(
+        self, executor_mock
+    ):
+        self.consumer_project.add_user(self.provider_owner, ProjectRole.ADMIN)
+        self.client.force_authenticate(self.provider_owner)
+        response = self.client.get(self.available_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        backend_ids = {n["backend_id"] for n in response.data}
+        self.assertIn(self.shared_net.backend_id, backend_ids)
+        self.assertIn(self.private_net.backend_id, backend_ids)
+
+
+@mock.patch("waldur_openstack.executors.RouterRemoveExternalGatewayExecutor.execute")
+class RemoveExternalGatewayTest(BaseExternalGatewayTest):
+    def test_remove_gateway_success(self, executor_mock):
+        self.router.external_network_id = self.external_network.backend_id
+        self.router.external_network_ref = self.external_network
+        self.router.save()
+
+        response = self.client.post(self.remove_url)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        executor_mock.assert_called_once()
+
+    def test_remove_gateway_no_gateway(self, executor_mock):
+        response = self.client.post(self.remove_url)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        executor_mock.assert_not_called()
+
+    def test_remove_gateway_floating_ips_exist(self, executor_mock):
+        self.router.external_network_id = self.external_network.backend_id
+        self.router.external_network_ref = self.external_network
+        self.router.save()
+
+        factories.FloatingIPFactory(
+            tenant=self.fixture.tenant,
+            project=self.fixture.project,
+            service_settings=self.fixture.settings,
+            backend_network_id=self.external_network.backend_id,
+        )
+
+        response = self.client.post(self.remove_url)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        executor_mock.assert_not_called()
+
+
+@mock.patch("waldur_openstack.executors.RouterSetExternalGatewayExecutor.execute")
+@mock.patch("waldur_openstack.executors.RouterRemoveExternalGatewayExecutor.execute")
+class ExternalGatewayAuditTest(BaseExternalGatewayTest):
+    def _events(self):
+        return logging_models.Event.objects.filter(
+            event_type=EventType.OPENSTACK_ROUTER_UPDATED
+        ).order_by("id")
+
+    def test_set_gateway_emits_event(self, remove_mock, set_mock):
+        response = self.client.post(
+            self.set_url,
+            {"external_network_id": self.external_network.backend_id},
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        event = self._events().last()
+        self.assertIsNotNone(event)
+        self.assertEqual(
+            event.context["new_external_network_id"],
+            self.external_network.backend_id,
+        )
+
+    def test_remove_gateway_emits_event(self, remove_mock, set_mock):
+        self.router.external_network_id = self.external_network.backend_id
+        self.router.external_network_ref = self.external_network
+        self.router.save()
+
+        response = self.client.post(self.remove_url)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        event = self._events().last()
+        self.assertIsNotNone(event)
+        self.assertEqual(
+            event.context["old_external_network_id"],
+            self.external_network.backend_id,
+        )
+        self.assertEqual(event.context["new_external_network_id"], "")
+
+
+class AvailableExternalNetworksTest(BaseExternalGatewayTest):
+    def test_lists_global_external_networks(self):
+        response = self.client.get(self.available_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(
+            response.data[0]["backend_id"], self.external_network.backend_id
+        )
+        self.assertEqual(response.data[0]["source"], "global")
+
+    def test_lists_rbac_external_networks(self):
+        source_fixture = fixtures.OpenStackFixture()
+        source_network = factories.NetworkFactory(
+            tenant=source_fixture.tenant,
+            project=source_fixture.project,
+            service_settings=source_fixture.settings,
+            backend_id="rbac-net-1",
+        )
+        factories.NetworkRBACPolicyFactory(
+            network=source_network,
+            target_tenant=self.fixture.tenant,
+            policy_type=models.NetworkRBACPolicy.NetworkShareType.EXTERNAL,
+        )
+
+        response = self.client.get(self.available_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 2)
+        sources = {r["source"] for r in response.data}
+        self.assertEqual(sources, {"global", "rbac"})
+
+    def test_deduplicates_networks(self):
+        """If a network appears in both global and RBAC, only show once (global)."""
+        # Create an RBAC policy for the same backend_id as the global external network
+        source_fixture = fixtures.OpenStackFixture()
+        source_network = factories.NetworkFactory(
+            tenant=source_fixture.tenant,
+            project=source_fixture.project,
+            service_settings=source_fixture.settings,
+            backend_id=self.external_network.backend_id,
+        )
+        factories.NetworkRBACPolicyFactory(
+            network=source_network,
+            target_tenant=self.fixture.tenant,
+            policy_type=models.NetworkRBACPolicy.NetworkShareType.EXTERNAL,
+        )
+
+        response = self.client.get(self.available_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["source"], "global")
+
+
+class RouterSerializerGatewayFieldsTest(BaseExternalGatewayTest):
+    def test_gateway_fields_in_response(self):
+        self.router.external_network_id = self.external_network.backend_id
+        self.router.external_network_ref = self.external_network
+        self.router.enable_snat = True
+        self.router.external_fixed_ips = [{"ip_address": "10.0.0.5"}]
+        self.router.save()
+
+        url = factories.RouterFactory.get_url(self.router)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["external_network_id"], self.external_network.backend_id
+        )
+        self.assertTrue(response.data["has_external_gateway"])
+        self.assertTrue(response.data["enable_snat"])
+        self.assertEqual(
+            response.data["external_fixed_ips"], [{"ip_address": "10.0.0.5"}]
+        )
+
+    def test_no_gateway_fields(self):
+        url = factories.RouterFactory.get_url(self.router)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["external_network_id"], "")
+        self.assertFalse(response.data["has_external_gateway"])
+        self.assertIsNone(response.data["enable_snat"])
+
+
+class PullTenantRoutersGatewayTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.tenant = self.fixture.tenant
+        self.external_network = factories.ExternalNetworkFactory(
+            settings=self.fixture.settings,
+            backend_id="ext-net-id-for-pull",
+        )
+
+    @mock.patch("waldur_openstack.backend.get_neutron_client")
+    @mock.patch("waldur_openstack.backend.get_tenant_session")
+    def test_pull_syncs_gateway_fields(self, mock_session, mock_neutron_client):
+        neutron = mock_neutron_client.return_value
+        neutron.list_routers.return_value = {
+            "routers": [
+                {
+                    "id": "router-backend-1",
+                    "name": "test-router",
+                    "description": "",
+                    "routes": [],
+                    "external_gateway_info": {
+                        "network_id": self.external_network.backend_id,
+                        "enable_snat": True,
+                        "external_fixed_ips": [
+                            {
+                                "ip_address": "192.168.1.1",
+                                "subnet_id": "subnet-1",
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        neutron.list_ports.return_value = {"ports": []}
+
+        backend = OpenStackBackend(self.fixture.settings)
+        backend.pull_tenant_routers(self.tenant)
+
+        router = models.Router.objects.get(
+            tenant=self.tenant, backend_id="router-backend-1"
+        )
+        self.assertEqual(router.external_network_id, self.external_network.backend_id)
+        self.assertEqual(router.external_network_ref, self.external_network)
+        self.assertTrue(router.enable_snat)
+        self.assertEqual(len(router.external_fixed_ips), 1)
+
+    @mock.patch("waldur_openstack.backend.get_neutron_client")
+    @mock.patch("waldur_openstack.backend.get_tenant_session")
+    def test_pull_clears_gateway_fields_when_no_gateway(
+        self, mock_session, mock_neutron_client
+    ):
+        # Create a router that currently has a gateway
+        router = factories.RouterFactory(
+            tenant=self.tenant,
+            project=self.fixture.project,
+            service_settings=self.fixture.settings,
+            backend_id="router-backend-2",
+            external_network_id="old-net-id",
+        )
+
+        neutron = mock_neutron_client.return_value
+        # When called with a specific router_backend_id, pull uses show_router
+        neutron.show_router.return_value = {
+            "router": {
+                "id": "router-backend-2",
+                "name": "test-router-2",
+                "description": "",
+                "routes": [],
+                "external_gateway_info": None,
+            }
+        }
+        neutron.list_ports.return_value = {"ports": []}
+
+        backend = OpenStackBackend(self.fixture.settings)
+        backend.pull_tenant_routers(self.tenant, "router-backend-2")
+
+        router.refresh_from_db()
+        self.assertEqual(router.external_network_id, "")
+        self.assertIsNone(router.external_network_ref)
+        self.assertIsNone(router.enable_snat)
+
+
+class PullTenantRoutersStateTest(test.APITestCase):
+    """Pull must not overwrite a transitional FSM state with OK.
+
+    Regression test: a user-initiated DELETE moves the router from OK to
+    DELETION_SCHEDULED via schedule_deleting() before the delete task is
+    queued. If pull_tenant_routers runs in the gap before the worker fires
+    begin_deleting (DELETION_SCHEDULED -> DELETING), an unconditional
+    state=OK overwrite in update_or_create defaults reverts the state and
+    causes TransitionNotAllowed when the worker finally runs.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.tenant = self.fixture.tenant
+
+    def _mock_neutron(self, mock_neutron_client, backend_id):
+        neutron = mock_neutron_client.return_value
+        neutron.show_router.return_value = {
+            "router": {
+                "id": backend_id,
+                "name": "test-router",
+                "description": "",
+                "routes": [],
+                "external_gateway_info": None,
+            }
+        }
+        neutron.list_routers.return_value = {
+            "routers": [neutron.show_router.return_value["router"]]
+        }
+        neutron.list_ports.return_value = {"ports": []}
+        return neutron
+
+    @mock.patch("waldur_openstack.backend.get_neutron_client")
+    @mock.patch("waldur_openstack.backend.get_tenant_session")
+    def test_pull_preserves_deletion_scheduled_state(
+        self, mock_session, mock_neutron_client
+    ):
+        router = factories.RouterFactory(
+            tenant=self.tenant,
+            project=self.fixture.project,
+            service_settings=self.fixture.settings,
+            backend_id="router-to-delete",
+            state=CoreStates.DELETION_SCHEDULED,
+        )
+        self._mock_neutron(mock_neutron_client, "router-to-delete")
+
+        OpenStackBackend(self.fixture.settings).pull_tenant_routers(
+            self.tenant, "router-to-delete"
+        )
+
+        router.refresh_from_db()
+        self.assertEqual(router.state, CoreStates.DELETION_SCHEDULED)
+
+    @mock.patch("waldur_openstack.backend.get_neutron_client")
+    @mock.patch("waldur_openstack.backend.get_tenant_session")
+    def test_pull_preserves_deleting_state(self, mock_session, mock_neutron_client):
+        router = factories.RouterFactory(
+            tenant=self.tenant,
+            project=self.fixture.project,
+            service_settings=self.fixture.settings,
+            backend_id="router-deleting",
+            state=CoreStates.DELETING,
+        )
+        self._mock_neutron(mock_neutron_client, "router-deleting")
+
+        OpenStackBackend(self.fixture.settings).pull_tenant_routers(self.tenant)
+
+        router.refresh_from_db()
+        self.assertEqual(router.state, CoreStates.DELETING)
+
+    @mock.patch("waldur_openstack.backend.get_neutron_client")
+    @mock.patch("waldur_openstack.backend.get_tenant_session")
+    def test_pull_preserves_update_scheduled_state(
+        self, mock_session, mock_neutron_client
+    ):
+        router = factories.RouterFactory(
+            tenant=self.tenant,
+            project=self.fixture.project,
+            service_settings=self.fixture.settings,
+            backend_id="router-updating",
+            state=CoreStates.UPDATE_SCHEDULED,
+        )
+        self._mock_neutron(mock_neutron_client, "router-updating")
+
+        OpenStackBackend(self.fixture.settings).pull_tenant_routers(self.tenant)
+
+        router.refresh_from_db()
+        self.assertEqual(router.state, CoreStates.UPDATE_SCHEDULED)
+
+    @mock.patch("waldur_openstack.backend.get_neutron_client")
+    @mock.patch("waldur_openstack.backend.get_tenant_session")
+    def test_pull_recovers_erred_router_to_ok(self, mock_session, mock_neutron_client):
+        router = factories.RouterFactory(
+            tenant=self.tenant,
+            project=self.fixture.project,
+            service_settings=self.fixture.settings,
+            backend_id="router-erred",
+            state=CoreStates.ERRED,
+        )
+        self._mock_neutron(mock_neutron_client, "router-erred")
+
+        OpenStackBackend(self.fixture.settings).pull_tenant_routers(self.tenant)
+
+        router.refresh_from_db()
+        self.assertEqual(router.state, CoreStates.OK)
+
+    @mock.patch("waldur_openstack.backend.get_neutron_client")
+    @mock.patch("waldur_openstack.backend.get_tenant_session")
+    def test_pull_creates_new_router_in_ok_state(
+        self, mock_session, mock_neutron_client
+    ):
+        self._mock_neutron(mock_neutron_client, "router-new")
+
+        OpenStackBackend(self.fixture.settings).pull_tenant_routers(self.tenant)
+
+        router = models.Router.objects.get(tenant=self.tenant, backend_id="router-new")
+        self.assertEqual(router.state, CoreStates.OK)

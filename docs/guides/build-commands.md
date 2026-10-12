@@ -2,7 +2,7 @@
 
 ## Development Setup
 
-- **Install dev dependencies**: `uv sync --extra dev`
+- **Install dev dependencies**: `uv sync --group dev`
 
 ## Testing Commands
 
@@ -13,9 +13,9 @@
 
 ## Code Quality Commands
 
-- **Lint code**: `uv run pre-commit run --all-files`
-- **Format code**: `uv run pre-commit run --all-files`
-- **Check code style**: `uv run pre-commit run --all-files`
+- **Lint code**: `uvx prek run --all-files`
+- **Format code**: `uvx prek run --all-files`
+- **Check code style**: `uvx prek run --all-files`
 
 ## Markdown Linting
 
@@ -39,3 +39,31 @@
 - Use `sed -n 'Xp' file | hexdump -C` to see exact spacing (look for `20 20` = 2 spaces)
 - Run `mdl --verbose` to see which specific rule is processing
 - Check markdownlint-style.rb for custom rule configurations
+
+## Running the tests in Docker
+
+The deployment image cannot run the suite: `Dockerfile` deletes every `tests`
+directory during the build, and `test_settings` adds test-only apps to
+`INSTALLED_APPS`, so Django will not start against the image as built. The dev
+dependency group *is* installed, so `docker-compose.test.yml` mounts the source
+tree over `/usr/src/waldur` to restore the tests and runs pytest against a
+throwaway PostgreSQL:
+
+```bash
+docker compose -f docker-compose.test.yml run --rm test
+```
+
+Arguments after the service name go to pytest:
+
+```bash
+docker compose -f docker-compose.test.yml run --rm test src/waldur_openportal -q
+```
+
+The first run spends ~15 minutes building the test database; it is kept in a
+volume and reused. `docker compose -f docker-compose.test.yml down -v` starts
+clean.
+
+The database connection comes from the environment via
+`waldur_core/server/my_test_settings.py` (`WALDUR_TEST_DB_HOST`, `_PORT`,
+`_NAME`, `_USER`, `_PASSWORD`), so the same settings module serves Docker, a
+local PostgreSQL and CI.

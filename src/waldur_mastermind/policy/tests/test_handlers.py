@@ -1,16 +1,18 @@
 from unittest import mock
 
+import pytest
 from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.exceptions import PolicyException
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.policy import models
 from waldur_mastermind.policy.models import ProjectEstimatedCostPolicy
 from waldur_mastermind.policy.tests import factories
 
 
-class TestCostPolicyDeletionHandler(test.APITransactionTestCase):
+class TestCostPolicyDeletionHandler(test.APITestCase):
     def setUp(self):
         self.url = factories.ProjectEstimatedCostPolicyFactory.get_url()
         self.client = test.APIClient()
@@ -61,7 +63,7 @@ class TestCostPolicyDeletionHandler(test.APITransactionTestCase):
         )
 
 
-class TestIsMockedSkipsPolicyCheck(test.APITransactionTestCase):
+class TestIsMockedSkipsPolicyCheck(test.APITestCase):
     def setUp(self):
         self.project = structure_factories.ProjectFactory()
         self.policy = factories.ProjectEstimatedCostPolicyFactory(scope=self.project)
@@ -84,3 +86,93 @@ class TestIsMockedSkipsPolicyCheck(test.APITransactionTestCase):
             )
             new_resource.save()
             actions_mock.assert_called_once()
+
+
+class TestSyncBookkeepingSaveSkipsPolicyCheck(test.APITestCase):
+    def setUp(self):
+        self.project = structure_factories.ProjectFactory()
+        self.policy = factories.ProjectEstimatedCostPolicyFactory(scope=self.project)
+        self.resource = marketplace_factories.ResourceFactory(project=self.project)
+
+    def test_last_sync_only_save_skips_policy_check(self):
+        with mock.patch.object(
+            ProjectEstimatedCostPolicy,
+            "get_scope_from_observable_object",
+            return_value=None,
+        ) as scope_mock:
+            self.resource.save(update_fields=["last_sync"])
+            scope_mock.assert_not_called()
+
+    def test_save_with_other_fields_runs_policy_check(self):
+        with mock.patch.object(
+            ProjectEstimatedCostPolicy,
+            "get_scope_from_observable_object",
+            return_value=None,
+        ) as scope_mock:
+            self.resource.save(update_fields=["last_sync", "limits"])
+            scope_mock.assert_called_once()
+
+    def test_no_info_log_when_no_policies_match(self):
+        self.policy.delete()
+        with self.assertNoLogs("waldur_mastermind.policy.handlers", level="INFO"):
+            self.resource.save()
+
+
+class TestPolicySignalHandlerIsRegistered(test.APITestCase):
+    """
+    Test that policy signal handlers are properly registered and fire.
+
+    This validates that the signal handler closure is not garbage collected.
+    The fix requires weak=False in apps.py signal registration.
+    """
+
+    def test_customer_policy_blocks_resource_creation_via_signal(self):
+        """
+        When a CustomerEstimatedCostPolicy has fired with block_creation action,
+        creating a new Resource should raise PolicyException via the signal handler.
+        """
+        customer = structure_factories.CustomerFactory()
+        project = structure_factories.ProjectFactory(customer=customer)
+        offering = marketplace_factories.OfferingFactory()
+
+        # Create policy with has_fired=True and blocking action
+        factories.CustomerEstimatedCostPolicyFactory(
+            scope=customer,
+            actions="block_creation_of_new_resources",
+            has_fired=True,
+        )
+
+        # Saving a new Resource should trigger the signal handler
+        # which should raise PolicyException
+        with pytest.raises(PolicyException):
+            resource = marketplace_models.Resource(
+                project=project,
+                offering=offering,
+                name="test-resource",
+            )
+            resource.save()
+
+    def test_project_policy_blocks_resource_creation_via_signal(self):
+        """
+        When a ProjectEstimatedCostPolicy has fired with block_creation action,
+        creating a new Resource should raise PolicyException via the signal handler.
+        """
+        project = structure_factories.ProjectFactory()
+        offering = marketplace_factories.OfferingFactory()
+
+        # Create policy with has_fired=True and blocking action
+        factories.ProjectEstimatedCostPolicyFactory(
+            scope=project,
+            actions="block_creation_of_new_resources",
+            has_fired=True,
+        )
+
+        # Saving a new Resource should trigger the signal handler
+        # which should raise PolicyException
+        with pytest.raises(PolicyException):
+            resource = marketplace_models.Resource(
+                project=project,
+                offering=offering,
+                name="test-resource",
+            )
+            resource.save()

@@ -33,13 +33,12 @@ PROJECT_DETAILS_STEP = {
         "q_name": "name",
         "q_summary": "project_summary",
     },
-    "integer_field_map": {
-        "q_duration": "duration_in_days",
-    },
-    "boolean_field_map": {
-        "q_confidential": "project_is_confidential",
-        "q_civilian": "project_has_civilian_purpose",
-    },
+    # No integer_field_map/boolean_field_map: duration/confidentiality/
+    # civilian-purpose questions are still asked (and still snapshotted in
+    # FormStepResponse for reviewers), but devel's rewrite removed their
+    # backing Proposal fields (duration is now call-level fixed_duration_in_days,
+    # set by the call manager; the other two were dropped as unused flags) -
+    # see test_project_details_step_leaves_unmapped_questions_in_snapshot_only.
     "resource_question_id": "q_resources",
     # Answers are Formbricks choice *labels*, not slugs - deliberately
     # distinct from the "test-offering" slug key below, to exercise the
@@ -131,8 +130,8 @@ class FormbricksTestCase(test.APITransactionTestCase):
         )
 
         # Not granted by any migration - every test suite that exercises
-        # is_proposal_manager-gated actions (submit/destroy/add_user/here)
-        # must grant this itself, same as test_invitation.py does.
+        # MANAGE_PROPOSAL-gated actions must grant this itself, same as
+        # test_invitation.py does.
         ProposalRole.MANAGER.add_permission(PermissionEnum.MANAGE_PROPOSAL)
 
         patcher = mock.patch.object(formbricks_flows, "FORM_FLOWS", TEST_FORM_FLOWS)
@@ -209,10 +208,10 @@ class WebhookMappingTest(FormbricksTestCase):
             "proposal_uuid": str(self.proposal.uuid),
             "q_name": "My project",
             "q_summary": "A summary",
-            # Formbricks sends every answer as a string (or list of
-            # strings), regardless of the question type - this exercises
-            # the integer_field_map/boolean_field_map coercion, not just
-            # the plain field_map passthrough.
+            # The survey still asks these - duration/confidentiality/civilian
+            # purpose - but PROJECT_DETAILS_STEP no longer maps any of them
+            # to a Proposal field (see the step dict's comment), so they
+            # should land in the raw snapshot only, untouched by the mapper.
             "q_duration": "30",
             "q_confidential": "Yes",
             "q_civilian": "No",
@@ -227,9 +226,6 @@ class WebhookMappingTest(FormbricksTestCase):
         self.proposal.refresh_from_db()
         self.assertEqual(self.proposal.name, "My project")
         self.assertEqual(self.proposal.project_summary, "A summary")
-        self.assertEqual(self.proposal.duration_in_days, 30)
-        self.assertTrue(self.proposal.project_is_confidential)
-        self.assertFalse(self.proposal.project_has_civilian_purpose)
         # project_details is not the last step - proposal must stay DRAFT.
         self.assertEqual(self.proposal.state, ProposalStates.DRAFT)
 
@@ -244,78 +240,42 @@ class WebhookMappingTest(FormbricksTestCase):
         self.assertEqual(form_step_response.response_id, "resp-1")
         self.assertEqual(form_step_response.raw_response, answers)
         self.assertEqual(form_step_response.question_labels["q_name"], "Project title")
+        # Unmapped answers are preserved verbatim in the snapshot - reviewers
+        # still see them via serialize_form_responses, even though nothing
+        # on Proposal/RequestedResource reflects them.
+        self.assertEqual(form_step_response.raw_response["q_duration"], "30")
+        self.assertEqual(form_step_response.raw_response["q_confidential"], "Yes")
+        self.assertEqual(form_step_response.raw_response["q_civilian"], "No")
 
-    @mock.patch.object(formbricks_client, "get_survey")
-    def test_boolean_field_accepts_true_false_as_well_as_yes_no(
-        self, mock_get_survey
-    ):
+    # The three tests below used to go through the full webhook pipeline,
+    # since PROJECT_DETAILS_STEP's boolean_field_map/integer_field_map wired
+    # q_confidential/q_civilian/q_duration into real Proposal fields. Those
+    # fields no longer exist on Proposal (devel's rewrite dropped them -
+    # see PROJECT_DETAILS_STEP's comment), so boolean_field_map/
+    # integer_field_map aren't configured for anything anymore. The
+    # underlying coercion helpers remain in formbricks_mapper.py for any
+    # future field that needs them, so they're tested directly here instead
+    # of via a webhook round-trip that no longer exercises them.
+
+    def test_coerce_bool_accepts_true_false_as_well_as_yes_no(self):
         # Real Formbricks multipleChoiceSingle questions can use "True"/
-        # "False" as their choice labels rather than "Yes"/"No" - this
-        # broke project_details end-to-end in production: the mapper raised
-        # partway through boolean_field_map, so proposal.save() and the
-        # resource-creation code below it never ran at all, even though the
-        # step's raw_response had already been snapshotted successfully.
-        mock_get_survey.return_value = {}
-        answers = {
-            "proposal_uuid": str(self.proposal.uuid),
-            "q_name": "My project",
-            "q_summary": "A summary",
-            "q_duration": "30",
-            "q_confidential": "False",
-            "q_civilian": "True",
-            "q_resources": [],
-        }
-        response = self.post_webhook(
-            build_payload("survey-project-details", "resp-true-false", answers)
+        # "False" as their choice labels rather than "Yes"/"No" - this once
+        # broke project_details end-to-end in production before _YES_NO was
+        # extended to accept both spellings.
+        self.assertTrue(formbricks_mapper._coerce_bool("True", "q_x", "project_details"))
+        self.assertFalse(
+            formbricks_mapper._coerce_bool("False", "q_x", "project_details")
         )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(formbricks_mapper._coerce_bool("Yes", "q_x", "project_details"))
+        self.assertFalse(formbricks_mapper._coerce_bool("No", "q_x", "project_details"))
 
-        self.proposal.refresh_from_db()
-        self.assertEqual(self.proposal.name, "My project")
-        self.assertFalse(self.proposal.project_is_confidential)
-        self.assertTrue(self.proposal.project_has_civilian_purpose)
+    def test_coerce_bool_with_unexpected_value_fails_loudly(self):
+        with self.assertRaises(formbricks_mapper.FormbricksMappingError):
+            formbricks_mapper._coerce_bool("Maybe", "q_x", "project_details")
 
-    @mock.patch.object(formbricks_client, "get_survey")
-    def test_boolean_field_with_unexpected_value_fails_loudly(self, mock_get_survey):
-        mock_get_survey.return_value = {}
-        answers = {
-            "proposal_uuid": str(self.proposal.uuid),
-            "q_name": "My project",
-            "q_summary": "A summary",
-            "q_duration": "30",
-            "q_confidential": "Maybe",  # not "Yes"/"No" - question type may
-            "q_civilian": "No",  # have changed without updating the config.
-            "q_resources": [],
-        }
-        # Django's test client re-raises uncaught view exceptions by default
-        # (to surface the real traceback in test output) instead of turning
-        # them into a 500 response - opt out so this test can observe what a
-        # real caller (Formbricks) would actually get back.
-        self.client.raise_request_exception = False
-        response = self.post_webhook(
-            build_payload("survey-project-details", "resp-bad-bool", answers)
-        )
-        # Uncaught FormbricksMappingError surfaces as a 500 - deliberate:
-        # fail loudly rather than silently mis-map a confidentiality flag.
-        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @mock.patch.object(formbricks_client, "get_survey")
-    def test_integer_field_with_unexpected_value_fails_loudly(self, mock_get_survey):
-        mock_get_survey.return_value = {}
-        answers = {
-            "proposal_uuid": str(self.proposal.uuid),
-            "q_name": "My project",
-            "q_summary": "A summary",
-            "q_duration": "thirty",  # not parseable as an int
-            "q_confidential": "Yes",
-            "q_civilian": "No",
-            "q_resources": [],
-        }
-        self.client.raise_request_exception = False
-        response = self.post_webhook(
-            build_payload("survey-project-details", "resp-bad-int", answers)
-        )
-        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+    def test_coerce_int_with_unexpected_value_fails_loudly(self):
+        with self.assertRaises(formbricks_mapper.FormbricksMappingError):
+            formbricks_mapper._coerce_int("thirty", "q_x", "project_details")
 
     @mock.patch.object(formbricks_client, "get_survey")
     def test_step_without_mapper_is_snapshotted_but_not_mapped(self, mock_get_survey):

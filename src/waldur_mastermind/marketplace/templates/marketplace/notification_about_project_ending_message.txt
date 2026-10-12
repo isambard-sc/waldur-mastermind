@@ -1,16 +1,14 @@
-Dear {{ user.full_name }},
+Hello {{ user.full_name }}!
 
-The following projects are ending {% if delta == 1 %} tomorrow {% else %} in {{ delta }} days{% endif %}:
+The following projects will have their resources terminated {% if delta == 1 %} tomorrow {% else %} in {{ delta }} days{% endif %} (on {{ end_date|date:'d/m/Y' }}):
 
 {% for project in projects %}
-    - {{ project.name }} ({{ project.url }})
+    - {{ project.name }} ({{ project.url }}){% if project.grace_period_days %}
+      End date: {{ project.end_date|date:'d/m/Y' }} | Grace period: {{ project.grace_period_days }} days | Termination date: {{ project.effective_end_date|date:'d/m/Y' }}{% endif %}
 {% endfor %}
 
-At this date, the project will go into a "grace period" of 30 days.
-You will be able to log in and copy your data, but not run any jobs.
-At the end of the grace period this project and all data will be deleted.
+End of the project will lead to termination of all resources in the project.
+If you are aware of that, then no actions are needed from your side.
+If you need to update project end date, please update it in project details.
 
-
-BriCS do not award projects and do not have the power to issue extensions.
-Please contact the body that awarded your project if you wish to request
-an extension or have any questions.
+Thank you!

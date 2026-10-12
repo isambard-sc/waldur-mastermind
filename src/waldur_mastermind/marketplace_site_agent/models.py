@@ -19,6 +19,13 @@ class AgentIdentity(
     """Identity created for each running Waldur Site Agent."""
 
     offering = models.ForeignKey(marketplace_models.Offering, on_delete=models.CASCADE)
+    created_by = models.ForeignKey(
+        core_models.User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
     version = models.CharField(max_length=100, blank=True, null=True)
     dependencies = models.JSONField(default=list)
     config_file_path = models.CharField(
@@ -31,10 +38,19 @@ class AgentIdentity(
     )
     config_file_content = models.TextField(blank=True, null=True)
     last_restarted = models.DateTimeField(_("Last restarted at"), default=timezone.now)
+    # Pub/sub state lives on the generic EventConsumer (waldur_core.logging), not
+    # on this site-agent model. A site agent owns at most one consumer.
+    event_consumer = models.OneToOneField(
+        "logging.EventConsumer",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="agent_identity",
+    )
 
     class Meta:
         verbose_name = _("Agent identity")
-        ordering = ["created"]
+        ordering = ["created", "id"]
 
     def __str__(self):
         return self.name
@@ -53,7 +69,7 @@ class AgentService(core_models.UuidMixin, TimeStampedModel, core_models.NameMixi
 
     class Meta:
         verbose_name = _("Agent service")
-        ordering = ["created"]
+        ordering = ["created", "id"]
         unique_together = ("identity", "name")
 
     def __str__(self) -> str:
@@ -78,8 +94,36 @@ class AgentProcessor(core_models.UuidMixin, TimeStampedModel, core_models.NameMi
 
     class Meta:
         verbose_name = _("Agent processor")
-        ordering = ["created"]
+        ordering = ["created", "id"]
         unique_together = ("service", "name")
 
     def __str__(self) -> str:
         return f"{self.service.name} - {self.name}"
+
+
+class SiteAgentLog(core_models.UuidMixin, TimeStampedModel):
+    """Log entry shipped from a Waldur Site Agent."""
+
+    agent_identity = models.ForeignKey(
+        AgentIdentity,
+        on_delete=models.CASCADE,
+        related_name="logs",
+    )
+    timestamp = models.FloatField(
+        help_text=_("Unix timestamp of the log entry"),
+        db_index=True,
+    )
+    level = models.CharField(
+        max_length=20,
+        choices=enums.LogLevel.CHOICES,
+        db_index=True,
+    )
+    message = models.TextField()
+    module = models.CharField(max_length=255)
+
+    class Permissions:
+        customer_path = "agent_identity__offering__customer"
+
+    class Meta:
+        verbose_name = _("Site agent log")
+        ordering = ["-timestamp", "id"]

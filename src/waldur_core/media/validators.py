@@ -1,6 +1,5 @@
 import os
 
-import magic
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.utils.deconstruct import deconstructible
@@ -42,6 +41,8 @@ class FileTypeValidator:
         self.allowed_exts = allowed_extensions
 
     def __call__(self, fileobj):
+        import magic
+
         detected_type = magic.from_buffer(fileobj.read(READ_SIZE), mime=True)
         root, extension = os.path.splitext(fileobj.name.lower())
 
@@ -118,7 +119,24 @@ CertificateValidator = FileTypeValidator(
         "application/x-x509-ca-cert",
         "text/plain",
     ],
-    allowed_extensions=["pem"],
+    allowed_extensions=[".pem"],
+)
+
+
+# Document uploads, matching the file types homeport's upload dialogs offer.
+# Deliberately excludes SVG, an image format that can carry script.
+DocumentValidator = FileTypeValidator(
+    allowed_types=[
+        "application/pdf",
+        "image/jpeg",
+        "image/png",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+        # libmagic reports some .doc files by their OLE container type.
+        "application/x-ole-storage",
+        "application/vnd.oasis.opendocument.text",
+    ],
+    allowed_extensions=[".pdf", ".jpg", ".jpeg", ".png", ".docx", ".doc", ".odt"],
 )
 
 

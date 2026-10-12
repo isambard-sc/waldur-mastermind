@@ -17,6 +17,10 @@ This is a Django-based cloud orchestration platform. When working on this codeba
 - Disable tests instead of fixing them
 - Commit code that doesn't compile
 - Make assumptions - verify with existing code
+- Import modules inside functions - all imports must be at the top of the file
+  (narrow exception: lazy imports of heavy dependencies of optional features that
+  would otherwise load at startup — see "Lazy imports for heavy optional
+  dependencies" below)
 
 **ALWAYS**:
 
@@ -27,6 +31,78 @@ This is a Django-based cloud orchestration platform. When working on this codeba
 
 ## Key Waldur Patterns
 
+### Lazy imports for heavy optional dependencies
+
+The default rule is imports-at-top-of-file. The **only** sanctioned exception is
+a heavy dependency of an **optional** feature that most deployments never exercise
+but which loads in **every** process at Django startup. Referenced at module top,
+such a dependency is pulled in via one of the startup import paths — `apps.py`
+`ready()` (signal/plugin registration), URLconf resolution (`urls.py` → `views.py`
+→ `serializers.py`), or a `WaldurExtension`. That permanently inflates the resident
+memory of API and Celery pods for a feature they don't run.
+
+When (and only when) **all** of these hold, defer the import:
+
+- the dependency is large (rule of thumb ≳ 3 MB resident or a big transitive graph);
+- the feature is **optional** — gated by config/Constance, an optional provider
+  backend, or an integration many deployments disable;
+- deployments that don't use it should not pay for it.
+
+Scope note: this is **not** limited to `client.py` / `backend.py`. It legitimately
+applies to `views.py`, `serializers.py`, `handlers.py`, and app `extension.py`
+whenever they sit on a startup import path — that is exactly where the wins in the
+`-102 MB` startup sweep came from (see reference implementations below).
+
+**How to defer** (keep it disciplined — this is not licence for ad-hoc local imports):
+
+- **Function-local import** — put `from heavy_pkg import X` inside the method that
+  uses it. This is the default; prefer it.
+- **`except` clauses across many methods** — add one lazy helper returning the
+  exception tuple: `def _sdk_exceptions(): from heavy_sdk.exceptions import
+  SdkError, HttpResponseError; return SdkError, HttpResponseError`.
+- **Annotation-only symbols** — add `from __future__ import annotations` and import
+  them under `if TYPE_CHECKING:` (also silences ruff `F821` for the runtime names).
+- **A symbol used pervasively across one module** (dozens of names) — a single
+  idempotent loader that populates module globals on first use, plus a
+  `TYPE_CHECKING` import block so the linter sees the names as bound. Ref:
+  `matrix_chat/matrix_client.py` (`_load_nio()`).
+- **A module-level data structure keyed by the dep's types** (e.g. an
+  `exc-type -> message` map) — build it lazily in a cached function. Ref:
+  `chat/llm_streamer.py` (`_llm_error_messages()`).
+- **A base class, or a module attribute referenced by string / mocked in tests**,
+  that cannot be a function-local import — use a PEP 562 module `__getattr__` that
+  imports on attribute access. Refs: `waldur_auth_saml2/utils.py`
+  (`DatabaseMetadataLoader` base class) and `chat/llm_streamer.py` (exposes
+  `llm_streamer.openai` for `mock.patch(...)` without a startup import).
+- Leave a comment at the top of the file pointing back to this section.
+
+**Two gotchas that will bite you:**
+
+- **Thread-safety.** A patch/singleton installed at *module import* is implicitly
+  serialised by the import lock; moving it to lazy first-use loses that. Under a
+  threaded/gevent Celery pool two callers can race. Guard it with a module-level
+  `threading.Lock` + double-checked flag. Ref: `_patch_robot_account_states()` in
+  `marketplace_remote/tasks.py` — without the lock a second thread captured the
+  already-patched `__new__` and recursed infinitely.
+- **Test mocks.** `mock.patch("some.module.Symbol")` breaks once `Symbol` is no
+  longer imported at that module's top. Either retarget the mock to the symbol's
+  **source** module (the function-local import resolves there — ref the
+  `support/tests/test_jira_web_hooks.py` change), or expose the name via a PEP 562
+  `__getattr__` so the patch target still resolves (ref `llm_streamer.openai`).
+- Note: module `__getattr__` is **not** consulted for bare-name lookups inside the
+  module's own functions — those still need a function-local import.
+
+**Verify.** After the change, no module of the dep may load at startup. Run
+`waldur check`, then assert the dep is absent from `sys.modules` (e.g. no
+`waldur_api_client*` / `nio*` / `openai*` entries). Measure before/after with
+`scripts/measure_startup_memory.py` — the per-component CSV/heatmap shows whether
+the dep still loads. The `Check startup memory budget` CI job runs this and can
+gate on `MEMORY_BUDGET_MB`.
+
+Reference implementations (the startup sweep): `marketplace_remote` (`waldur_api_client`),
+`waldur_auth_saml2` (`pysaml2`/`xmlschema`), `support` (`atlassian-python-api`),
+`matrix_chat` (`matrix-nio`), `chat/llm_streamer.py` (`openai`).
+
 ### Permissions
 
 ```python
@@ -34,12 +110,43 @@ This is a Django-based cloud orchestration platform. When working on this codeba
 list_permissions = [permission_factory(PermissionEnum.VIEW_RESOURCE)]
 ```
 
+**Adding new permissions:**
+1. Add to `PermissionEnum` in `src/waldur_core/permissions/enums.py`
+2. Assign to roles in `docker/rootfs/etc/waldur/permissions.yaml` (NOT via data migrations)
+3. The `import_roles` management command loads permissions.yaml on deployment
+
+See `docs/guides/waldur-permissions.md` for details.
+
+### Media access
+
+Every `FileField`/`ImageField` is served by one endpoint, `/api/media/<uuid>/`,
+which is **deny by default**. Adding a file field therefore means also declaring
+who may download it, in your app's `media_access.py`:
+
+```python
+access.register(
+    access.upload_prefix(Payment, "proof"),
+    access.queryset_rule(Payment, ["proof"], filter_queryset_for_user),
+)
+```
+
+Derive the prefix with `upload_prefix()` / `image_prefix()` -- never hardcode the
+`upload_to` string. `CoverageTest` fails until every file field has a rule.
+See `docs/guides/media-access.md`.
+
 ### Serializers
 
 ```python
 # Use SlugRelatedField for UUIDs
 project = serializers.SlugRelatedField(slug_field="uuid", queryset=Project.objects.all())
+
+# CRITICAL: Nullable FKs MUST use allow_null=True on SlugRelatedField
+# Without it, the OpenAPI spec won't mark the field as nullable,
+# and auto-generated SDK clients will crash on null values (e.g. UUID(None))
+created_by = serializers.SlugRelatedField(slug_field="uuid", read_only=True, allow_null=True)
 ```
+
+**Adding an offering `plugin_options` / `secret_options` key:** these are validated by strict nested serializers (`MergedPluginOptionsSerializer` / `MergedSecretOptionsSerializer`), NOT free-form `JSONField`. You **must** declare the new field on the relevant `*PluginOptionsSerializer` — DRF silently drops undeclared keys, so the write returns 200 but never persists (Homeport toggles "stay disabled"). Reading the key in the model/validator/views is not enough. See the **backend-conventions** skill for the full rule and the frontend↔serializer cross-check.
 
 ### Testing
 
@@ -48,6 +155,173 @@ project = serializers.SlugRelatedField(slug_field="uuid", queryset=Project.objec
 fixture = fixtures.ProjectFixture()
 # Use real roles
 role = CustomerRole.SUPPORT  # Not MANAGER (doesn't exist)
+```
+
+### Demo Presets
+
+Demo presets are JSON files in `src/waldur_mastermind/marketplace/demo_presets/presets/` that define complete marketplace ecosystems for testing and demos.
+
+**UUID Format Rules** (CRITICAL):
+
+- UUIDs must be **exactly 32 hexadecimal characters** (0-9, a-f only)
+- **NO hyphens** - use continuous string format
+- **NO letters g-z** - these are not valid hex characters
+- All `*_uuid` reference fields must match the referenced entity's UUID exactly
+
+```python
+# CORRECT UUID format
+"uuid": "afc00000000000000000000000000001"  # 32 hex chars
+
+# WRONG - contains non-hex letters
+"uuid": "afk00000000000000000000000000001"  # 'k' is not hex
+"uuid": "af3plan0000000000000000000000001"  # 'p', 'l', 'n' are not hex
+
+# WRONG - wrong length
+"uuid": "afc0000000000000000000000000001"   # 31 chars (missing one)
+```
+
+**Reference Consistency**: When referencing entities via `*_uuid` fields (e.g., `customer_uuid`, `offering_uuid`, `plan_uuid`), ensure the UUID exactly matches the target entity's `uuid` field.
+
+**Commands**:
+
+```bash
+# List available presets
+waldur demo_presets list
+
+# Load a preset (destructive - clears existing data)
+DJANGO_SETTINGS_MODULE=waldur_core.server.test_settings_local waldur demo_presets load <name> -y
+
+# Dry run (preview without changes)
+waldur demo_presets load <name> --dry-run
+```
+
+**Generating Billing Data**:
+
+Use the billing data generator script to add realistic invoices, credits, and usage data to presets:
+
+```bash
+# Generate 12 months of billing data (invoices, credits, usages)
+python scripts/generate_preset_billing_data.py src/waldur_mastermind/marketplace/demo_presets/presets/<preset>.json
+
+# Generate with specific months and reproducible seed
+python scripts/generate_preset_billing_data.py preset.json --months 6 --seed 42
+
+# Save to a different file
+python scripts/generate_preset_billing_data.py input.json --output output_with_billing.json
+```
+
+The script generates:
+
+- Invoices (monthly for each consuming customer)
+- Invoice items (per-resource cost breakdown)
+- Customer credits (organization-level allocations)
+- Project credits (project-level allocations)
+- Component usages (resource usage with growth trends)
+- Component user usages (per-user breakdown for reporting)
+
+## REST API Development (DRF)
+
+### ViewSet Structure
+
+```python
+class MyViewSet(ActionsViewSet):
+    queryset = MyModel.objects.all()
+    serializer_class = MySerializer
+    filterset_class = MyFilter
+    lookup_field = "uuid"
+
+    # Permissions per action
+    list_permissions = [permission_factory(PermissionEnum.VIEW_X)]
+    create_permissions = [permission_factory(PermissionEnum.CREATE_X)]
+
+    # Disable unwanted actions
+    disabled_actions = ["destroy"]
+```
+
+### Custom Actions
+
+**ALWAYS use serializers** for ViewSet actions - for both input validation and output schema generation.
+This ensures proper OpenAPI documentation and consistent API contracts.
+
+```python
+# Define serializers for your action responses
+class MyActionResponseSerializer(serializers.Serializer):
+    """Serializer for MyAction response - used for OpenAPI schema."""
+    field_name = serializers.CharField()
+    count = serializers.IntegerField()
+
+# In the ViewSet:
+@extend_schema(
+    summary="Perform my action",
+    responses={200: MyActionResponseSerializer(many=True)},
+    description="Description for OpenAPI docs.",
+)
+@action(detail=True, methods=["post"])
+def my_action(self, request, uuid=None):
+    """Docstring becomes OpenAPI description."""
+    instance = self.get_object()
+    serializer = MyActionSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    # ... implementation
+    response_data = [{"field_name": "value", "count": 42}]
+    response_serializer = MyActionResponseSerializer(response_data, many=True)
+    return Response(response_serializer.data)
+
+# Define permissions for custom action
+my_action_permissions = [permission_factory(PermissionEnum.ACTION_X)]
+# Link serializer class for the action
+my_action_serializer_class = MyActionSerializer
+```
+
+### OpenAPI Schema Customization
+
+**Quick decision guide:**
+
+- Endpoint-specific parameters → `@extend_schema` decorator
+- Custom field types → Extension in `openapi_extensions.py`
+- Hide endpoints → `disabled_actions` list on ViewSet
+- Schema-wide changes → Hook in `schema_hooks.py`
+- Count (`*Count` SDK method) for a detail list action → `@count_action` decorator (collections get one automatically)
+
+```python
+from drf_spectacular.utils import extend_schema, OpenApiParameter
+
+@extend_schema(
+    parameters=[
+        OpenApiParameter("o", {"type": "string", "enum": ["name", "-name"]},
+                        location=OpenApiParameter.QUERY,
+                        description="Ordering field"),
+    ],
+)
+@action(detail=True)
+def items(self, request, uuid=None):
+    ...
+```
+
+**Validate schema:** `uv run waldur spectacular --validate`
+
+See `docs/guides/openapi.md` for detailed patterns.
+
+**IMPORTANT: No database access during schema generation**
+
+When customizing serializer `get_fields()` or similar methods, **never access the database
+or Constance config** without first checking for schema generation context. Schema generation
+runs without a database connection.
+
+The OpenAPI schema should show **all possible fields** that could be returned, not a minimal
+set. This allows API consumers to see the maximum possible response shape.
+
+```python
+def get_fields(self):
+    fields = super().get_fields()
+
+    # ALWAYS check for schema generation FIRST, before any DB/Constance access
+    if getattr(self.context.get("view"), "swagger_fake_view", False):
+        return fields  # Return ALL fields for OpenAPI schema
+
+    # Now safe to access database or Constance config
+    some_config = config.MY_SETTING
+    # ... filter fields based on config
 ```
 
 ## Documentation Structure
@@ -59,19 +333,29 @@ Detailed guides are in `docs/guides/`:
 - **Testing Guide**: `waldur-testing-guide.md` - Test writing best practices
 - **Code Style**: `waldur-code-style.md` - Formatting and conventions
 - **Permissions**: `waldur-permissions.md` - Permission system details
+- **Media Access**: `media-access.md` - Who may download an uploaded file
+- **Production Data**: `production-data-sanitisation.md` - Turning a production dump into local test data
+- **Awards Site**: `awards-site-upgrade-plan.md` - Archiving the old proposals and upgrading the awards deployment
+- **Resource Projects**: `resource-projects.md` - ResourceProject model, offering roles, invitations, and RoleAvailability
 - **Build Commands**: `build-commands.md` - Test/lint/build commands
+- **OpenAPI Schema**: `openapi.md` - drf-spectacular customization patterns
 
 ## Quick Commands
 
 ```bash
-# Run tests
-DJANGO_SETTINGS_MODULE=waldur_core.server.my_test_settings uv run pytest
+# Run tests (--no-migrations matches CI: the schema is built from the models,
+# and some tests -- e.g. GenerateSlugTest, test_no_missing_migrations -- only
+# pass in that mode)
+DJANGO_SETTINGS_MODULE=waldur_core.server.test_settings_local uv run pytest --no-migrations
 
 # Lint/format
-uv run pre-commit run --all-files
+uvx prek run --all-files
 
 # Lint markdown
 mdl --style markdownlint-style.rb docs/
+
+# Validate OpenAPI schema
+uv run waldur spectacular --validate
 ```
 
 ## Development Workflows
@@ -122,6 +406,71 @@ mcp__playwright__browser_take_screenshot --element "Submit button"
 mcp__playwright__browser_resize --width 375 --height 667
 ```
 
+### Issue Workflow
+
+Issues live in GitLab, in the tracker of the repo they belong to — this repo's are at
+`waldur/waldur-mastermind`. Jira (`WAL-1234`) was the tracker until August 2026; its unresolved
+backlog was migrated here under the `jira-migrated` label, and no new Jira issues are opened.
+
+#### 1. Analyze the Issue
+
+- Fetch issue details with `glab issue view <n>` (`-c` for comments, `-F json` to parse). Use
+  `glab` for all GitLab access — not the `mcp__gitlab__*` tools
+- Determine issue type: **bug** (fix) or **feature/improvement** (other)
+- Check if the issue is already resolved or needs work
+- Comment the analysis on the issue before starting, and set `workflow::in-progress`
+
+#### 2. Prepare the Branch
+
+```bash
+# Ensure on latest develop branch
+git checkout develop
+git pull origin develop
+
+# Create appropriate branch, numbered after the issue in THIS repo:
+git checkout -b fix/46-short-desc        # bugs
+git checkout -b feature/46-short-desc    # features/improvements
+```
+
+Do not use GitLab's "create branch from issue" default (`46-project-credit-ledger`) — it carries
+no repo context, and copying such a name into homeport or docs points it at a different issue.
+When the driving issue lives in **another** repo, leave the number out of the branch name
+entirely (`feature/short-desc`) and qualify it in the commit subject instead.
+
+#### 3. Implement Changes
+
+- Follow TDD workflow (tests first)
+- Study existing patterns before coding
+- Make minimal, focused changes
+
+#### 4. Commit Changes
+
+```bash
+# Only add files created/modified as part of this work
+git add <specific-files>
+
+# Commit with proper descriptive message, issue reference at end of first line
+git commit -m "Add validation for resource quota limits [#46]"
+
+# ...or, when the issue lives in another repo, qualify it — a bare #46 would
+# autolink to THIS project's issue 46, which is unrelated work
+git commit -m "Expose the country list in settings metadata [waldur/waldur-homeport#50]"
+```
+
+`Closes #46` belongs in the MR description, and only in the MR of the repo that owns the issue,
+so that a docs or frontend MR merging first cannot close a half-finished issue.
+
+**Important**: Do NOT add unrelated files to the commit.
+
+#### 5. Report to User
+
+Provide a summary including:
+
+- What was analyzed
+- What changes were made (files modified/created)
+- How to test the changes
+- Any follow-up actions needed
+
 ### Multi-Agent Coordination
 
 - **Planning**: implementation agent creates feature plan
@@ -149,6 +498,51 @@ Subagents are automatically available. When you need specialized help, Claude wi
 - "Use the docs-writer subagent to document the new API endpoints"
 
 See `CLAUDE_SUBAGENT_USAGE.md` for detailed examples and workflows.
+
+## Demo Preset UUIDs
+
+When creating or modifying JSON files in `src/waldur_mastermind/marketplace/demo_presets/presets/`:
+
+### UUID Format Rules
+
+UUIDs must be **exactly 32 hexadecimal characters** (0-9, a-f only). Invalid characters cause import failures:
+
+```text
+✓ Valid:   "a3000000000000000000000000000001"
+✓ Valid:   "f3000000000000000000000000000005"
+✗ Invalid: "p3000000000000000000000000000001"  (p is not hex)
+✗ Invalid: "o3000000000000000000000000000001"  (o is not hex)
+```
+
+### Entity Prefix Convention
+
+Use hex-safe prefixes to organize UUIDs by entity type:
+
+| Entity Type | Prefix | Example |
+|-------------|--------|---------|
+| Users | `00` | `00000000000000000000000000000001` |
+| Customers | `a3` | `a3000000000000000000000000000001` |
+| Projects | `c3` | `c3000000000000000000000000000001` |
+| Resources | `d3` | `d3000000000000000000000000000001` |
+| Offerings | `f3` | `f3000000000000000000000000000001` |
+| Orders | `73` | `73000000000000000000000000000001` |
+| Policies | `93` | `93000000000000000000000000000001` |
+| Plans | `b3` | `b3000000000000000000000000000001` |
+| Categories | `e3` | `e3000000000000000000000000000001` |
+
+### Generating Valid UUIDs
+
+```python
+# Generate a valid preset UUID with a prefix
+def make_preset_uuid(prefix: str, number: int) -> str:
+    """Generate a 32-char hex UUID for presets."""
+    suffix = f"{number:030x}"  # 30 hex digits, zero-padded
+    return f"{prefix}{suffix}"[-32:]
+
+# Examples:
+make_preset_uuid("a3", 1)   # "a3000000000000000000000000000001"
+make_preset_uuid("f3", 10)  # "f300000000000000000000000000000a"
+```
 
 ## Remember
 

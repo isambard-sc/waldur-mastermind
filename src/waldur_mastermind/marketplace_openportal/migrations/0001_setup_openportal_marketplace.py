@@ -6,9 +6,7 @@ def sync_limits(apps, schema_editor):
     Allocation = apps.get_model("waldur_openportal", "Allocation")
     Resource = apps.get_model("marketplace", "Resource")
 
-    for resource in Resource.objects.filter(
-        offering__type="Marketplace.OpenPortal"
-    ):
+    for resource in Resource.objects.filter(offering__type="Marketplace.OpenPortal"):
         if not resource.object_id:
             continue
         try:
@@ -25,9 +23,7 @@ def sync_usages(apps, schema_editor):
     Allocation = apps.get_model("waldur_openportal", "Allocation")
     Resource = apps.get_model("marketplace", "Resource")
 
-    for resource in Resource.objects.filter(
-        offering__type="Marketplace.OpenPortal"
-    ):
+    for resource in Resource.objects.filter(offering__type="Marketplace.OpenPortal"):
         if not resource.object_id:
             continue
         try:
@@ -43,7 +39,7 @@ def sync_usages(apps, schema_editor):
 class Migration(migrations.Migration):
     dependencies = [
         ("marketplace", "0001_squashed_0076"),
-        ("waldur_openportal", "0001_setup_openportal"),
+        ("waldur_openportal", "0001_squashed_0028_delete_remoteallocationuserusage"),
     ]
 
     operations = [

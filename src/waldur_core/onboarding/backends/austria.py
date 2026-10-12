@@ -11,8 +11,11 @@ from typing import Any
 import requests
 from constance import config
 
+from waldur_core.onboarding import enums
+
 from .base import (
     CompanyRegistryBackend,
+    ErrorCode,
     ValidationRequest,
     ValidationResult,
     backend_registry,
@@ -75,11 +78,49 @@ class AustriaRegisterBackend(CompanyRegistryBackend):
 
     @classmethod
     def get_validation_method(cls) -> str:
-        return "wirtschaftscompass"
+        return enums.ValidationMethod.WIRTSCHAFTSCOMPASS
 
     @classmethod
     def get_required_fields(cls) -> list[str]:
         return ["legal_person_identifier", "person_identifier"]
+
+    @classmethod
+    def get_person_identifier_fields(cls) -> dict[str, Any]:
+        """
+        Austrian backend requires composite person identifier with name and birth date.
+
+        Returns object-type specification with multiple fields.
+        """
+        return {
+            "type": "object",
+            "description": "Personal identification data for Austrian business validation",
+            "fields": {
+                "first_name": {
+                    "type": "string",
+                    "label": "First Name",
+                    "description": "Legal first name as registered",
+                    "required": True,
+                    "example": "Johann",
+                    "max_length": 150,
+                },
+                "last_name": {
+                    "type": "string",
+                    "label": "Last Name",
+                    "description": "Legal last name as registered",
+                    "required": True,
+                    "example": "Schmidt",
+                    "max_length": 150,
+                },
+                "birth_date": {
+                    "type": "date",
+                    "label": "Date of Birth",
+                    "description": "Date of birth in YYYY-MM-DD format",
+                    "required": True,
+                    "format": "YYYY-MM-DD",
+                    "example": "1980-01-08",
+                },
+            },
+        }
 
     @classmethod
     def get_priority(cls) -> int:
@@ -133,14 +174,20 @@ class AustriaRegisterBackend(CompanyRegistryBackend):
             )
 
             normalized_data = self._normalize_company_data(verified_company_data)
+            company_data_dict = normalized_data.__dict__.copy()
+
+            if is_authorized:
+                address_data = self._extract_address_details(verified_company_data)
+                if address_data:
+                    company_data_dict.update(address_data)
 
             return ValidationResult(
                 is_valid=is_authorized,
                 method_used=self.get_validation_method(),
-                company_data=normalized_data.__dict__,
+                company_data=company_data_dict,
                 user_roles=verified_user_roles,
                 raw_response=verified_company_data,
-                error_code=None if is_authorized else "NOT_AUTHORIZED",
+                error_code=None if is_authorized else ErrorCode.NOT_AUTHORIZED,
                 error_message=None
                 if is_authorized
                 else f"User {request.person_identifier} is not listed as authorized representative",
@@ -149,11 +196,11 @@ class AustriaRegisterBackend(CompanyRegistryBackend):
         except Exception as e:
             if isinstance(e, WiCoError):
                 logger.error(f"WirtschaftsCompass API request error: {str(e)}")
-                error_code = "API_ERROR"
+                error_code = ErrorCode.API_ERROR
                 error_message = f"WirtschaftsCompass API error: {str(e)}"
             else:
                 logger.exception("Unexpected error during company validation")
-                error_code = "UNKNOWN_ERROR"
+                error_code = ErrorCode.UNKNOWN_ERROR
                 error_message = f"An unexpected error occurred: {str(e)}"
 
             return ValidationResult(
@@ -230,6 +277,47 @@ class AustriaRegisterBackend(CompanyRegistryBackend):
         )
 
         return bool(verified_user_roles), verified_user_roles
+
+    def _extract_address_details(
+        self, verified_company_data: dict[str, Any]
+    ) -> dict[str, str] | None:
+        """
+        Extract address and postal code from WirtschaftsCompass company profile.
+        Args:
+            verified_company_data: Raw response from WirtschaftsCompass API
+        Returns:
+            Dict containing address and postal fields, or None if extraction fails
+        """
+        try:
+            data = verified_company_data.get("data", {})
+            basic_data = data.get("basicData", {})
+            communication_data = basic_data.get("communicationData", {})
+            address_data = communication_data.get("address", {})
+            current_value = address_data.get("currentValue", {})
+            address = current_value.get("address", {})
+            # Extract address components
+            street_address = address.get("streetAddress", "")
+            house_number = address.get("houseNumber", "")
+            place = address.get("place", "")
+            postal_code = address.get("postalCode", "")
+            # Build full address string
+            address_parts = []
+            if street_address:
+                address_str = street_address
+                if house_number:
+                    address_str = f"{street_address} {house_number}"
+                address_parts.append(address_str)
+            if place:
+                address_parts.append(place)
+            full_address = ", ".join(address_parts) if address_parts else None
+            result = {}
+            if full_address:
+                result["address"] = full_address
+            if postal_code:
+                result["postal"] = postal_code
+            return result if result else None
+        except (KeyError, TypeError, AttributeError):
+            return None
 
     def _normalize_company_data(
         self, raw_data: dict[str, Any]

@@ -8,25 +8,37 @@ from collections.abc import Iterable, Mapping
 from constance import LazyConfig, settings
 from django import forms
 from django.conf import settings as django_settings
+from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import (
+    FieldDoesNotExist,
     ImproperlyConfigured,
     MultipleObjectsReturned,
     ObjectDoesNotExist,
 )
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files.storage import default_storage
-from django.core.validators import RegexValidator, URLValidator
+from django.core.validators import MaxLengthValidator, RegexValidator, URLValidator
 from django.urls import Resolver404, reverse
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema_field
 from modeltranslation.manager import get_translatable_fields_for_model
 from rest_framework import serializers
 from rest_framework import serializers as rf_serializers
-from rest_framework.fields import Field, ReadOnlyField
+from rest_framework.fields import Field, ReadOnlyField, lazy_format
 from rest_framework.serializers import ListSerializer
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.clean_html import clean_html
-from waldur_core.core.models import generate_slug
+from waldur_core.core.models import PersonalAccessToken, UserDetailsMatchMixin
 from waldur_core.core.signals import pre_serializer_fields
+from waldur_core.core.validators import (
+    normalize_network_acl,
+    validate_access_email_patterns,
+)
+from waldur_core.permissions.enums import TYPE_KEY_BY_CT, TYPE_MAP, PermissionEnum
+from waldur_core.permissions.utils import get_scope_ancestors, has_any_permission
+from waldur_core.users.scim.server import matching as scim_matching
 from waldur_mastermind.common.serializers import StringListSerializer
 
 from . import fields as core_fields
@@ -76,8 +88,39 @@ class ListField(forms.CharField):
         if value is None:
             return ""
         if isinstance(value, list):
-            return ", ".join(value)
+            return ", ".join(str(item) for item in value)
         return str(value)
+
+
+class JsonListField(forms.CharField):
+    """
+    A form field for handling JSON lists that can contain dictionaries or any JSON-serializable items.
+    Used by constance admin for settings that need to store lists of objects.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs["widget"] = forms.Textarea
+        super().__init__(*args, **kwargs)
+
+    def to_python(self, value):
+        if not value:
+            return []
+        try:
+            if isinstance(value, str):
+                return json.loads(value)
+            return value
+        except ValueError as e:
+            raise forms.ValidationError(f"Invalid JSON format: {str(e)}")
+
+    def prepare_value(self, value):
+        if value is None:
+            return "[]"
+        if isinstance(value, list):
+            try:
+                return json.dumps(value, indent=2)
+            except (TypeError, ValueError) as e:
+                raise forms.ValidationError(f"Could not serialize list: {str(e)}")
+        return value
 
 
 class DictSerializerField(serializers.CharField):
@@ -102,6 +145,96 @@ class DictSerializerField(serializers.CharField):
         return value
 
 
+class JsonListSerializerField(serializers.ListField):
+    """
+    A field for handling JSON lists that can contain dictionaries or any JSON-serializable items.
+    Unlike StringListSerializer which only accepts strings, this accepts any JSON array.
+    """
+
+    def to_internal_value(self, data):
+        """Convert JSON string to Python list or pass through if already a list."""
+        if not data:
+            return []
+        try:
+            if isinstance(data, str):
+                return json.loads(data)
+            return data
+        except ValueError as e:
+            raise serializers.ValidationError(f"Invalid JSON format: {str(e)}")
+
+    def to_representation(self, value):
+        """Return the list as-is for JSON serialization."""
+        if value is None:
+            return []
+        return value
+
+
+class ClearableImageField(serializers.ImageField):
+    """
+    ImageField that accepts empty string or null to clear the value.
+    """
+
+    def to_internal_value(self, data):
+        if data is None or data == "":
+            return None
+        return super().to_internal_value(data)
+
+
+class MultilingualImageSerializerField(serializers.DictField):
+    """
+    A field for handling language-specific image uploads.
+
+    Accepts a dictionary where keys are language codes and values are image files.
+    Example: {"de": <UploadedFile>, "et": <UploadedFile>}
+
+    Returns a dictionary of language codes to stored file paths.
+    """
+
+    child = serializers.ImageField(allow_null=True, required=False)
+
+    def to_internal_value(self, data):
+        if not data:
+            return {}
+
+        # Handle JSON string input (for compatibility with existing data)
+        if isinstance(data, str):
+            try:
+                return json.loads(data)
+            except ValueError as e:
+                raise serializers.ValidationError(f"Invalid JSON format: {str(e)}")
+
+        if not isinstance(data, dict):
+            raise serializers.ValidationError(
+                "Expected a dictionary of language codes to images."
+            )
+
+        result = {}
+        for lang_code, image in data.items():
+            if not isinstance(lang_code, str) or len(lang_code) > 10:
+                raise serializers.ValidationError(
+                    f"Invalid language code '{lang_code}'. Must be a string (max 10 chars)."
+                )
+            # Allow None/empty to remove a language entry
+            if image is None or image == "":
+                continue
+            # If it's already a string path, keep it (for partial updates)
+            if isinstance(image, str):
+                result[lang_code] = image
+            else:
+                # Validate it's a proper image file
+                validated_image = self.child.run_validation(image)
+                result[lang_code] = validated_image
+
+        return result
+
+    def to_representation(self, value):
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        return {}
+
+
 class ObtainAuthTokenSerializer(serializers.Serializer):
     """
     API token serializer loosely based on DRF's default AuthTokenSerializer.
@@ -109,12 +242,55 @@ class ObtainAuthTokenSerializer(serializers.Serializer):
     """
 
     # Fields are both required, non-blank and don't allow nulls by default
-    username = serializers.CharField(max_length=128)
-    password = serializers.CharField(max_length=128)
+    username = serializers.CharField(
+        max_length=128, help_text="Username for authentication"
+    )
+    password = serializers.CharField(
+        max_length=128, help_text="Password for authentication"
+    )
 
 
 class CoreAuthTokenSerializer(serializers.Serializer):
-    token = serializers.CharField(read_only=True)
+    token = serializers.CharField(
+        read_only=True, help_text="Authentication token for API access"
+    )
+
+
+class AuthTokenChallengeSerializer(serializers.Serializer):
+    """Body of a 401 from the password login endpoint.
+
+    A 401 here covers several cases — wrong credentials, a locked-out
+    username, a disabled account, and a correct password that still owes a
+    second factor. ``detail`` is always present; the passkey fields appear
+    only in the last case, which is why they are optional.
+
+    The second factor deliberately returns 401 rather than a 200 carrying a
+    handle. A 200 would have to make ``token`` optional in the shared response
+    schema, which changes the generated clients for every consumer including
+    the ones that never enable passkeys. A non-browser client cannot satisfy a
+    passkey anyway, so a loud error status is the honest answer for it, and
+    the browser can read the body to tell the two cases apart.
+    """
+
+    detail = serializers.CharField(
+        help_text="Human-readable reason the token was not issued."
+    )
+    passkey_required = serializers.BooleanField(
+        required=False,
+        help_text="True when the password was accepted but a passkey "
+        "assertion is still outstanding. Discriminates this case from a "
+        "rejected password, which is also a 401.",
+    )
+    pending_passkey_ceremony = serializers.UUIDField(
+        required=False,
+        help_text="Handle for the passkey challenge that must be satisfied "
+        "before a token is issued. Not a credential: it grants nothing on its "
+        "own and cannot be used for authentication.",
+    )
+
+
+class TokenExchangeSerializer(serializers.Serializer):
+    code = serializers.UUIDField()
 
 
 class Base64Field(serializers.CharField):
@@ -241,6 +417,14 @@ class GenericRelatedField(Field):
             raise serializers.ValidationError(message)
 
         return obj
+
+
+class UserEmailPatternsValidatorMixin:
+    """Provides validate_user_email_patterns for serializers with a user_email_patterns field."""
+
+    def validate_user_email_patterns(self, value):
+        UserDetailsMatchMixin.validate_user_email_patterns(value)
+        return value
 
 
 class AugmentedSerializerMixin:
@@ -436,22 +620,12 @@ class RestrictedSerializerMixin:
 
         keys = query_params.getlist(self.FIELDS_PARAM_NAME)
         keys = set(key for key in keys if key in fields.keys())
-        optional_fields = set(self.get_optional_fields()) - keys
-        fields = OrderedDict(
-            (
-                (key, value)
-                for key, value in fields.items()
-                if key not in optional_fields
-            )
-        )
+        fields = OrderedDict(((key, value) for key, value in fields.items()))
         if not keys:
             return fields
         return OrderedDict(
             ((key, value) for key, value in fields.items() if key in keys)
         )
-
-    def get_optional_fields(self):
-        return []
 
 
 class UnicodeIntegerField(serializers.IntegerField):
@@ -462,8 +636,12 @@ class UnicodeIntegerField(serializers.IntegerField):
 
 
 class DateRangeFilterSerializer(serializers.Serializer):
-    start = core_fields.YearMonthField(required=False)
-    end = core_fields.YearMonthField(required=False)
+    start = core_fields.YearMonthField(
+        required=False, help_text="Start date in YYYY-MM format"
+    )
+    end = core_fields.YearMonthField(
+        required=False, help_text="End date in YYYY-MM format"
+    )
 
     def validate(self, data):
         if "start" in data and "end" in data and data["start"] > data["end"]:
@@ -477,7 +655,9 @@ class DateRangeFilterSerializer(serializers.Serializer):
 
 
 class ReviewCommentSerializer(serializers.Serializer):
-    comment = serializers.CharField(required=False)
+    comment = serializers.CharField(
+        required=False, help_text="Optional comment for review"
+    )
 
 
 COLOR_HEX_RE = re.compile("^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$")
@@ -488,15 +668,23 @@ color_hex_validator = RegexValidator(
 )
 
 
+ISSUE_KEY_PREFIX_RE = re.compile("^[A-Z]{3,5}$")
+issue_key_prefix_validator = RegexValidator(
+    ISSUE_KEY_PREFIX_RE,
+    _("Enter three to five capital latin letters, eg. WLD"),
+    "invalid",
+)
+
+
 class ConstanceSettingsSerializer(serializers.Serializer):
     def get_fields(self):
         fields = OrderedDict()
         for name, options in settings.CONFIG.items():
             default = options[0]
-            if len(options) == 3:
+            if len(options) >= 3:
                 config_type = options[2]
                 if config_type not in settings.ADDITIONAL_FIELDS and not isinstance(
-                    default, config_type
+                    default, config_type if isinstance(config_type, type) else str
                 ):
                     raise ImproperlyConfigured(
                         _(
@@ -514,7 +702,7 @@ class ConstanceSettingsSerializer(serializers.Serializer):
             if config_type is str:
                 field_class = serializers.CharField
             if config_type == "image_field":
-                field_class = serializers.ImageField
+                field_class = ClearableImageField
             if config_type == "email_field":
                 field_class = serializers.EmailField
             if config_type is int:
@@ -523,16 +711,27 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                 field_class = serializers.BooleanField
             if config_type == "dict_field":
                 field_class = DictSerializerField
+            if config_type == "multilingual_image_field":
+                field_class = MultilingualImageSerializerField
             if config_type == "list_field":
                 field_class = StringListSerializer
+            if config_type == "json_list_field":
+                field_class = JsonListSerializerField
+            if config_type == "choice_field":
+                field_class = serializers.ChoiceField
+            if config_type == "multiple_choice_field":
+                field_class = serializers.MultipleChoiceField
             if config_type == "country_list_field":
                 field_class = StringListSerializer
             if config_type in (
                 "color_field",
                 "html_field",
                 "text_field",
+                "markdown_field",
                 "url_field",
                 "secret_field",
+                "non_empty_field",
+                "issue_key_prefix_field",
             ):
                 field_class = serializers.CharField
             if not field_class:
@@ -544,14 +743,53 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                 kwargs["allow_null"] = True
             if config_type == "secret_field":
                 kwargs["allow_blank"] = True
+            if config_type == "markdown_field":
+                kwargs["allow_blank"] = True
+            if config_type == "issue_key_prefix_field":
+                kwargs["allow_blank"] = False
+                kwargs["validators"] = [issue_key_prefix_validator]
+            if config_type == "non_empty_field":
+                # The setting stays optional in the payload, but it cannot be
+                # blanked out once it is submitted.
+                kwargs["allow_blank"] = False
             if config_type == "color_field":
                 kwargs["validators"] = [color_hex_validator]
                 kwargs["allow_blank"] = True
             if config_type == "url_field":
                 kwargs["validators"] = [URLValidator()]
                 kwargs["allow_blank"] = True
+            if config_type == "choice_field":
+                kwargs["choices"] = getattr(
+                    django_settings, "CONSTANCE_CONFIG_CHOICES", {}
+                ).get(name, [])
+            if config_type == "multiple_choice_field":
+                kwargs["choices"] = getattr(
+                    django_settings, "CONSTANCE_CONFIG_CHOICES", {}
+                ).get(name, [])
+                kwargs["allow_blank"] = True
             fields[name] = field_class(**kwargs)
         return fields
+
+    def validate_WALDUR_SUPPORT_ISSUE_KEY_PREFIX(self, value):
+        # The prefix is pasted into every ticket key, so a stray space or a
+        # lowercase letter would show up in mail subjects forever.
+        issue_key_prefix_validator(value)
+        return value
+
+    def validate_SCIM_USER_MATCH_WALDUR_ATTRIBUTE(self, value):
+        # Matching links SCIM identities to existing accounts, so only an
+        # enabled identifying attribute may be used.
+        try:
+            scim_matching.validate_waldur_attribute(value or "username")
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
+        return value
+
+    def validate_OIDC_ALLOWED_USER_EMAIL_PATTERNS(self, value):
+        # An unusable pattern never matches, so a silently accepted typo would
+        # lock users out instead of letting them in - reject it on write.
+        validate_access_email_patterns(value)
+        return value
 
     def save(self):
         for name in self.validated_data.keys():
@@ -561,8 +799,22 @@ class ConstanceSettingsSerializer(serializers.Serializer):
             current = getattr(config, name)
             new = self.validated_data[name]
             if current != new:
+                # Handle single image file
                 if hasattr(new, "name"):
                     new = default_storage.save(new.name, new)
+                # Handle dict of image files (multilingual_image_field)
+                elif isinstance(new, dict):
+                    processed = {}
+                    for key, value in new.items():
+                        if hasattr(value, "name"):
+                            # It's an uploaded file, save it
+                            processed[key] = default_storage.save(value.name, value)
+                        else:
+                            # It's already a path string
+                            processed[key] = value
+                    new = processed
+                if isinstance(new, set):
+                    new = list(new)
                 setattr(config, name, new)
 
 
@@ -587,7 +839,12 @@ class SlugSerializerMixin(serializers.Serializer):
     Ensures that slug is editable only by staff
     """
 
-    slug = serializers.SlugField(required=False, allow_blank=True, max_length=50)
+    slug = serializers.SlugField(
+        required=False,
+        allow_blank=True,
+        max_length=50,
+        help_text="URL-friendly identifier. Only editable by staff users.",
+    )
 
     def get_fields(self):
         fields = super().get_fields()
@@ -637,14 +894,11 @@ class SlugSerializerMixin(serializers.Serializer):
 
         return value
 
-    def generate_slug(self, validated_data):
-        klass = self.Meta.model
-        slug_source = validated_data[klass.get_slug_source_field()]
-        return generate_slug(slug_source, klass)
-
     def create(self, validated_data):
-        if "slug" not in validated_data:
-            validated_data["slug"] = self.generate_slug(validated_data)
+        # Strip empty slug so the model's generate_slug() is used on save.
+        # This ensures model-level slug templates (e.g. project_slug_template) are respected.
+        if "slug" in validated_data and not validated_data["slug"]:
+            validated_data.pop("slug")
         return super().create(validated_data)
 
 
@@ -653,14 +907,22 @@ class EmptySerializer(rf_serializers.Serializer):
 
 
 class TableSizeSerializer(serializers.Serializer):
-    table_name = serializers.CharField(read_only=True)
-    total_size = serializers.IntegerField(read_only=True)
-    data_size = serializers.IntegerField(read_only=True)
-    external_size = serializers.IntegerField(read_only=True)
+    table_name = serializers.CharField(
+        read_only=True, help_text="Name of the database table"
+    )
+    total_size = serializers.IntegerField(
+        read_only=True, help_text="Total size of the table in bytes"
+    )
+    data_size = serializers.IntegerField(
+        read_only=True, help_text="Size of the actual data in bytes"
+    )
+    external_size = serializers.IntegerField(
+        read_only=True, help_text="Size of external data (e.g., TOAST) in bytes"
+    )
 
 
 class QuerySerializer(serializers.Serializer):
-    query = serializers.CharField()
+    query = serializers.CharField(help_text="Search query string")
 
 
 class VersionSerializer(serializers.Serializer):
@@ -668,12 +930,207 @@ class VersionSerializer(serializers.Serializer):
         help_text="Current installed version of the application"
     )
     latest_version = serializers.CharField(
-        help_text="Latest available version from GitHub, if available.", required=False
+        help_text=(
+            "Latest available version from GitHub. Only included for staff or "
+            "support users when update checks are enabled."
+        ),
+        required=False,
+    )
+    changelog_summary = serializers.DictField(
+        help_text="Compact changelog summary with version count, risk info, and security alerts.",
+        required=False,
     )
 
 
 class LogoutSerializer(serializers.Serializer):
-    logout_url = serializers.URLField(read_only=True)
+    logout_url = serializers.URLField(
+        read_only=True, help_text="URL to redirect to after logout"
+    )
+
+
+class CeleryTaskSerializer(serializers.Serializer):
+    """Serializer for a single Celery task."""
+
+    id = serializers.CharField(read_only=True, help_text="Unique task identifier")
+    name = serializers.CharField(read_only=True, help_text="Name of the task")
+    args = serializers.ListField(
+        child=serializers.JSONField(),
+        read_only=True,
+        help_text="Positional arguments passed to the task",
+        required=False,
+    )
+    kwargs = serializers.DictField(
+        read_only=True,
+        help_text="Keyword arguments passed to the task",
+        required=False,
+    )
+    type = serializers.CharField(read_only=True, help_text="Task type", required=False)
+    hostname = serializers.CharField(
+        read_only=True, help_text="Worker hostname executing the task", required=False
+    )
+    time_start = serializers.FloatField(
+        read_only=True, help_text="Unix timestamp when task started", required=False
+    )
+    acknowledged = serializers.BooleanField(
+        read_only=True, help_text="Whether task has been acknowledged", required=False
+    )
+    delivery_info = serializers.DictField(
+        read_only=True, help_text="Message delivery information", required=False
+    )
+    worker_pid = serializers.IntegerField(
+        read_only=True, help_text="Worker process ID", required=False
+    )
+
+
+class CeleryScheduledTaskSerializer(serializers.Serializer):
+    """Serializer for a scheduled Celery task with ETA information."""
+
+    eta = serializers.CharField(
+        read_only=True, help_text="Estimated time of arrival for the task"
+    )
+    priority = serializers.IntegerField(
+        read_only=True, help_text="Task priority level", required=False
+    )
+    request = CeleryTaskSerializer(read_only=True, help_text="Task request details")
+
+
+class CeleryWorkerPoolSerializer(serializers.Serializer):
+    """Serializer for Celery worker pool statistics."""
+
+    max_concurrency = serializers.IntegerField(
+        read_only=True, help_text="Maximum number of concurrent processes"
+    )
+    processes = serializers.ListField(
+        child=serializers.IntegerField(),
+        read_only=True,
+        help_text="List of worker process IDs",
+    )
+    max_tasks_per_child = serializers.IntegerField(
+        read_only=True, help_text="Maximum tasks per child process", required=False
+    )
+    put_guarded_by_semaphore = serializers.BooleanField(read_only=True, required=False)
+    timeouts = serializers.ListField(
+        child=serializers.IntegerField(),
+        read_only=True,
+        help_text="Timeout values",
+        required=False,
+    )
+    writes = serializers.DictField(
+        read_only=True, help_text="Write statistics", required=False
+    )
+
+
+class CeleryBrokerSerializer(serializers.Serializer):
+    """Serializer for Celery broker connection information."""
+
+    hostname = serializers.CharField(
+        read_only=True, help_text="Broker hostname", required=False
+    )
+    userid = serializers.CharField(
+        read_only=True, help_text="Broker user ID", required=False
+    )
+    virtual_host = serializers.CharField(
+        read_only=True, help_text="Virtual host", required=False
+    )
+    port = serializers.IntegerField(
+        read_only=True, help_text="Broker port", required=False
+    )
+    insist = serializers.BooleanField(read_only=True, required=False)
+    ssl = serializers.BooleanField(read_only=True, required=False)
+    transport = serializers.CharField(
+        read_only=True, help_text="Transport protocol", required=False
+    )
+    connect_timeout = serializers.IntegerField(
+        read_only=True, help_text="Connection timeout in seconds", required=False
+    )
+    transport_options = serializers.DictField(
+        read_only=True, help_text="Additional transport options", required=False
+    )
+    login_method = serializers.CharField(
+        read_only=True, help_text="Authentication method", required=False
+    )
+    uri_prefix = serializers.CharField(read_only=True, required=False)
+    heartbeat = serializers.FloatField(
+        read_only=True, help_text="Heartbeat interval", required=False
+    )
+    failover_strategy = serializers.CharField(read_only=True, required=False)
+    alternates = serializers.ListField(
+        child=serializers.CharField(), read_only=True, required=False
+    )
+
+
+class CeleryWorkerStatsSerializer(serializers.Serializer):
+    """Serializer for individual Celery worker statistics."""
+
+    broker = CeleryBrokerSerializer(
+        read_only=True, help_text="Broker connection information", required=False
+    )
+    clock = serializers.CharField(
+        read_only=True, help_text="Logical clock value", required=False
+    )
+    uptime = serializers.FloatField(
+        read_only=True, help_text="Worker uptime in seconds", required=False
+    )
+    pid = serializers.IntegerField(
+        read_only=True, help_text="Worker process ID", required=False
+    )
+    pool = CeleryWorkerPoolSerializer(
+        read_only=True, help_text="Worker pool statistics", required=False
+    )
+    prefetch_count = serializers.IntegerField(
+        read_only=True, help_text="Number of tasks prefetched", required=False
+    )
+    rusage = serializers.DictField(
+        read_only=True, help_text="Resource usage statistics", required=False
+    )
+    total = serializers.DictField(
+        read_only=True, help_text="Total task counts by type", required=False
+    )
+
+
+class CeleryStatsResponseSerializer(serializers.Serializer):
+    """
+    Response serializer for Celery worker statistics.
+
+    Each field is a dictionary where keys are worker names (e.g., 'celery@hostname')
+    and values contain the respective task or statistics information.
+    """
+
+    active = serializers.DictField(
+        child=serializers.ListField(child=CeleryTaskSerializer()),
+        read_only=True,
+        allow_null=True,
+        help_text="Currently executing tasks per worker. Keys are worker names, values are lists of active tasks.",
+    )
+    scheduled = serializers.DictField(
+        child=serializers.ListField(child=CeleryScheduledTaskSerializer()),
+        read_only=True,
+        allow_null=True,
+        help_text="Tasks scheduled for future execution per worker. Keys are worker names, values are lists of scheduled tasks with ETA.",
+    )
+    reserved = serializers.DictField(
+        child=serializers.ListField(child=CeleryTaskSerializer()),
+        read_only=True,
+        allow_null=True,
+        help_text="Tasks that have been received but not yet started per worker. Keys are worker names, values are lists of reserved tasks.",
+    )
+    revoked = serializers.DictField(
+        child=serializers.ListField(child=serializers.CharField()),
+        read_only=True,
+        allow_null=True,
+        help_text="IDs of revoked (cancelled) tasks per worker. Keys are worker names, values are lists of task IDs.",
+    )
+    query_task = serializers.DictField(
+        read_only=True,
+        allow_null=True,
+        help_text="Query results for specific tasks. May be null if no query was performed.",
+    )
+    stats = serializers.DictField(
+        child=CeleryWorkerStatsSerializer(),
+        read_only=True,
+        allow_null=True,
+        help_text="Detailed statistics per worker including uptime, pool info, and resource usage. Keys are worker names.",
+    )
 
 
 class HTMLCleanField(serializers.CharField):
@@ -682,6 +1139,14 @@ class HTMLCleanField(serializers.CharField):
 
     This field ensures consistent HTML sanitization across the application by
     automatically cleaning any HTML content that is provided to it.
+
+    When no explicit ``max_length`` is given and the field is declared on a
+    ``ModelSerializer``, the limit is inferred from the backing model field.
+    Without this, redeclaring a bounded column (e.g. ``CharField(max_length=4096)``)
+    as an ``HTMLCleanField`` would silently drop the length validator that a plain
+    ``ModelSerializer`` would have generated, and an oversized value would reach
+    the database and blow up with a ``DataError`` (HTTP 500) instead of a clean 400.
+    Fields backed by an unbounded column (``TextField``) stay unbounded.
 
     Usage:
         class MySerializer(serializers.ModelSerializer):
@@ -693,12 +1158,835 @@ class HTMLCleanField(serializers.CharField):
                 fields = ('description', 'content')
     """
 
+    def bind(self, field_name, parent):
+        super().bind(field_name, parent)
+        if self.max_length is not None:
+            return
+        max_length = self._get_model_field_max_length()
+        if max_length is None:
+            return
+        self.max_length = max_length
+        self.validators.append(
+            MaxLengthValidator(
+                max_length,
+                message=lazy_format(
+                    self.error_messages["max_length"], max_length=max_length
+                ),
+            )
+        )
+
+    def _get_model_field_max_length(self):
+        """Return max_length of the model field backing this serializer field."""
+        model = getattr(getattr(self.parent, "Meta", None), "model", None)
+        if model is None:
+            return None
+        source = self.source
+        if not source or source == "*" or "." in source:
+            return None
+        try:
+            model_field = model._meta.get_field(source)
+        except (FieldDoesNotExist, AttributeError):
+            return None
+        return getattr(model_field, "max_length", None)
+
     def to_internal_value(self, data):
         # First, let the parent CharField handle basic validation
         value = super().to_internal_value(data)
-
+        if not value:
+            return value
         # Then clean the HTML content if it's not empty
-        if value:
-            return clean_html(value.strip())
+        stripped = value.strip()
+        cleaned = clean_html(stripped)
+        if (
+            self.max_length is not None
+            and len(cleaned) > self.max_length
+            and len(stripped) <= self.max_length
+        ):
+            # The input itself fits, so it only overflowed because sanitisation
+            # expanded it: & -> &amp; and so on. Say so explicitly, otherwise a
+            # user staring at a 4004-character box is told it exceeds 4096.
+            raise serializers.ValidationError(
+                _(
+                    "Value is too long after HTML sanitisation: %(length)s characters, "
+                    "maximum is %(max_length)s. Characters such as &, < and > are "
+                    "escaped during sanitisation and count as several characters."
+                )
+                % {"length": len(cleaned), "max_length": self.max_length}
+            )
+        # An input that was already over the limit is reported by the regular
+        # max_length validator, which runs on the value returned from here.
+        return cleaned
+
+
+class ConnectionStatsSerializer(serializers.Serializer):
+    """Serializer for database connection statistics."""
+
+    active = serializers.IntegerField(
+        read_only=True, help_text="Number of active connections"
+    )
+    idle = serializers.IntegerField(
+        read_only=True, help_text="Number of idle connections"
+    )
+    idle_in_transaction = serializers.IntegerField(
+        read_only=True, help_text="Number of connections idle in transaction"
+    )
+    waiting = serializers.IntegerField(
+        read_only=True, help_text="Number of connections waiting for a lock"
+    )
+    max_connections = serializers.IntegerField(
+        read_only=True, help_text="Maximum allowed connections"
+    )
+    utilization_percent = serializers.FloatField(
+        read_only=True, help_text="Percentage of max connections in use"
+    )
+
+
+class DatabaseSizeStatsSerializer(serializers.Serializer):
+    """Serializer for database size statistics."""
+
+    database_name = serializers.CharField(
+        read_only=True, help_text="Name of the database"
+    )
+    total_size_bytes = serializers.IntegerField(
+        read_only=True, help_text="Total database size in bytes"
+    )
+    data_size_bytes = serializers.IntegerField(
+        read_only=True, help_text="Size of data excluding indexes in bytes"
+    )
+    index_size_bytes = serializers.IntegerField(
+        read_only=True, help_text="Total size of all indexes in bytes"
+    )
+
+
+class CachePerformanceSerializer(serializers.Serializer):
+    """Serializer for cache performance statistics."""
+
+    buffer_cache_hit_ratio = serializers.FloatField(
+        read_only=True,
+        help_text="Buffer cache hit ratio percentage (should be >99%)",
+        allow_null=True,
+    )
+    index_hit_ratio = serializers.FloatField(
+        read_only=True,
+        help_text="Index cache hit ratio percentage",
+        allow_null=True,
+    )
+    shared_buffers = serializers.CharField(
+        read_only=True, help_text="Configured shared_buffers setting"
+    )
+    effective_cache_size = serializers.CharField(
+        read_only=True, help_text="Configured effective_cache_size setting"
+    )
+
+
+class TransactionStatsSerializer(serializers.Serializer):
+    """Serializer for transaction statistics."""
+
+    committed = serializers.IntegerField(
+        read_only=True, help_text="Total committed transactions"
+    )
+    rolled_back = serializers.IntegerField(
+        read_only=True, help_text="Total rolled back transactions"
+    )
+    rollback_ratio_percent = serializers.FloatField(
+        read_only=True, help_text="Percentage of transactions that were rolled back"
+    )
+    deadlocks = serializers.IntegerField(
+        read_only=True, help_text="Total number of deadlocks detected"
+    )
+
+
+class LockStatsSerializer(serializers.Serializer):
+    """Serializer for lock statistics."""
+
+    total_locks = serializers.IntegerField(
+        read_only=True, help_text="Total number of locks currently held"
+    )
+    waiting_locks = serializers.IntegerField(
+        read_only=True, help_text="Number of locks being waited for"
+    )
+    access_exclusive_locks = serializers.IntegerField(
+        read_only=True, help_text="Number of AccessExclusive locks (blocks all access)"
+    )
+
+
+class MaintenanceStatsSerializer(serializers.Serializer):
+    """Serializer for maintenance and vacuum statistics."""
+
+    oldest_transaction_age = serializers.IntegerField(
+        read_only=True,
+        help_text="Age of the oldest transaction in transactions",
+        allow_null=True,
+    )
+    tables_needing_vacuum = serializers.IntegerField(
+        read_only=True, help_text="Number of tables with high dead tuple ratio"
+    )
+    total_dead_tuples = serializers.IntegerField(
+        read_only=True, help_text="Total estimated dead tuples across all tables"
+    )
+    total_live_tuples = serializers.IntegerField(
+        read_only=True, help_text="Total estimated live tuples across all tables"
+    )
+    dead_tuple_ratio_percent = serializers.FloatField(
+        read_only=True,
+        help_text="Ratio of dead tuples to total tuples",
+        allow_null=True,
+    )
+
+
+class ActiveQuerySerializer(serializers.Serializer):
+    """Serializer for a single active query."""
+
+    pid = serializers.IntegerField(read_only=True, help_text="Process ID")
+    duration_seconds = serializers.FloatField(
+        read_only=True, help_text="Query duration in seconds"
+    )
+    state = serializers.CharField(read_only=True, help_text="Query state")
+    wait_event_type = serializers.CharField(
+        read_only=True,
+        help_text="Type of event the query is waiting for",
+        allow_null=True,
+    )
+    query_preview = serializers.CharField(
+        read_only=True, help_text="First 100 characters of the query"
+    )
+
+
+class ActiveQueriesStatsSerializer(serializers.Serializer):
+    """Serializer for active queries statistics."""
+
+    count = serializers.IntegerField(
+        read_only=True, help_text="Number of currently active queries"
+    )
+    longest_duration_seconds = serializers.FloatField(
+        read_only=True, help_text="Duration of the longest running query in seconds"
+    )
+    waiting_on_locks = serializers.IntegerField(
+        read_only=True, help_text="Number of queries waiting on locks"
+    )
+    queries = ActiveQuerySerializer(
+        many=True, read_only=True, help_text="List of active queries"
+    )
+
+
+class QueryPerformanceSerializer(serializers.Serializer):
+    """Serializer for query performance indicators."""
+
+    seq_scan_count = serializers.IntegerField(
+        read_only=True, help_text="Total sequential scans (potentially expensive)"
+    )
+    seq_scan_rows = serializers.IntegerField(
+        read_only=True, help_text="Total rows fetched by sequential scans"
+    )
+    index_scan_count = serializers.IntegerField(
+        read_only=True, help_text="Total index scans"
+    )
+    index_scan_rows = serializers.IntegerField(
+        read_only=True, help_text="Total rows fetched by index scans"
+    )
+    temp_files_count = serializers.IntegerField(
+        read_only=True, help_text="Number of temporary files created"
+    )
+    temp_files_bytes = serializers.IntegerField(
+        read_only=True, help_text="Total size of temporary files in bytes"
+    )
+
+
+class ReplicationStatsSerializer(serializers.Serializer):
+    """Serializer for replication statistics (if applicable)."""
+
+    is_replica = serializers.BooleanField(
+        read_only=True, help_text="Whether this database is a replica"
+    )
+    wal_bytes = serializers.IntegerField(
+        read_only=True, help_text="Write-ahead log size in bytes", allow_null=True
+    )
+    replication_lag_bytes = serializers.IntegerField(
+        read_only=True,
+        help_text="Replication lag in bytes (only for replicas)",
+        allow_null=True,
+    )
+
+
+class DatabaseStatsResponseSerializer(serializers.Serializer):
+    """Complete database statistics response serializer."""
+
+    table_stats = TableSizeSerializer(
+        many=True, read_only=True, help_text="Top largest tables by size"
+    )
+    connections = ConnectionStatsSerializer(
+        read_only=True, help_text="Connection statistics"
+    )
+    database_size = DatabaseSizeStatsSerializer(
+        read_only=True, help_text="Database size information"
+    )
+    cache_performance = CachePerformanceSerializer(
+        read_only=True, help_text="Cache hit ratios and memory settings"
+    )
+    transactions = TransactionStatsSerializer(
+        read_only=True, help_text="Transaction commit/rollback statistics"
+    )
+    locks = LockStatsSerializer(read_only=True, help_text="Current lock statistics")
+    maintenance = MaintenanceStatsSerializer(
+        read_only=True, help_text="Vacuum and maintenance statistics"
+    )
+    active_queries = ActiveQueriesStatsSerializer(
+        read_only=True, help_text="Currently running queries"
+    )
+    query_performance = QueryPerformanceSerializer(
+        read_only=True, help_text="Query performance indicators"
+    )
+    replication = ReplicationStatsSerializer(
+        read_only=True, help_text="Replication status (if applicable)"
+    )
+
+
+class VersionHistoryUserSerializer(serializers.Serializer):
+    """Serializer for user information in version history."""
+
+    uuid = serializers.UUIDField(help_text="User UUID")
+    username = serializers.CharField(help_text="Username")
+    full_name = serializers.CharField(help_text="Full name of the user")
+
+
+# Field names stripped from version history payloads. A version holds the raw
+# serialized model, so returning it verbatim bypasses whatever that model's own
+# serializer withholds: User.password would hand out the password hash, and
+# Offering.secret_options is restricted by can_see_secret_options to holders of
+# the permission that edits integration settings - while the history endpoint is
+# open to support users too. Keep this in sync with any field a serializer
+# deliberately hides.
+REDACTED_VERSION_FIELDS = frozenset(
+    {
+        "password",
+        "secret_options",
+    }
+)
+
+# Values a JSON response can carry as-is. Model defaults are only substituted
+# below when they are one of these; anything richer (dates, files, Decimals)
+# is left absent rather than risking a render error on a read-only endpoint.
+JSON_NATIVE_TYPES = (str, int, float, bool, list, dict, type(None))
+
+
+class VersionHistorySerializer(serializers.Serializer):
+    """
+    Generic serializer for django-reversion Version objects.
+
+    Can be used with any model registered with django-reversion to provide
+    a consistent API for version history.
+    """
+
+    id = serializers.IntegerField(help_text="Version ID")
+    revision_date = serializers.DateTimeField(
+        source="revision.date_created", help_text="When this revision was created"
+    )
+    revision_user = serializers.SerializerMethodField(
+        help_text="User who created this revision"
+    )
+    revision_comment = serializers.CharField(
+        source="revision.comment",
+        allow_blank=True,
+        help_text="Comment describing the revision",
+    )
+    serialized_data = serializers.SerializerMethodField(
+        help_text="Serialized model fields at this revision"
+    )
+
+    def get_revision_user(self, obj) -> dict | None:
+        user = obj.revision.user
+        if user:
+            return {
+                "uuid": str(user.uuid),
+                "username": user.username,
+                "full_name": user.full_name,
+            }
+        return None
+
+    def get_serialized_data(self, obj) -> dict:
+        fields = json.loads(obj.serialized_data)[0]["fields"]
+        data = {
+            name: value
+            for name, value in fields.items()
+            if name not in REDACTED_VERSION_FIELDS
+        }
+        self._add_missing_fields(obj, data)
+        return data
+
+    def _add_missing_fields(self, obj, data) -> None:
+        """Fill in fields the model gained after this snapshot was taken.
+
+        A snapshot only carries the columns that existed when it was written.
+        Left absent, every field added since reads as a change when two versions
+        are compared, so a single rename can appear to have altered dozens of
+        fields - the older the snapshot, the worse it looks. Substituting the
+        model default keeps the comparison about what the user actually changed.
+        """
+        model = obj._model
+        if model is None:
+            return
+        for field in model._meta.concrete_fields:
+            if field.primary_key or field.name in data:
+                continue
+            if field.name in REDACTED_VERSION_FIELDS:
+                continue
+            default = field.get_default()
+            if isinstance(default, JSON_NATIVE_TYPES):
+                data[field.name] = default
+
+
+class TableGrowthStatsSerializer(serializers.Serializer):
+    """Serializer for individual table growth statistics."""
+
+    table_name = serializers.CharField(help_text="Name of the database table")
+    current_total_size = serializers.IntegerField(
+        help_text="Current total size including indexes in bytes"
+    )
+    current_data_size = serializers.IntegerField(
+        help_text="Current data-only size in bytes"
+    )
+    current_row_estimate = serializers.IntegerField(
+        allow_null=True, help_text="Current estimated row count"
+    )
+    week_ago_total_size = serializers.IntegerField(
+        allow_null=True, help_text="Total size from 7 days ago in bytes"
+    )
+    week_ago_row_estimate = serializers.IntegerField(
+        allow_null=True, help_text="Row estimate from 7 days ago"
+    )
+    month_ago_total_size = serializers.IntegerField(
+        allow_null=True, help_text="Total size from 30 days ago in bytes"
+    )
+    month_ago_row_estimate = serializers.IntegerField(
+        allow_null=True, help_text="Row estimate from 30 days ago"
+    )
+    weekly_growth_percent = serializers.FloatField(
+        allow_null=True, help_text="Percentage growth over the past week"
+    )
+    monthly_growth_percent = serializers.FloatField(
+        allow_null=True, help_text="Percentage growth over the past month"
+    )
+    weekly_row_growth_percent = serializers.FloatField(
+        allow_null=True, help_text="Percentage row count growth over the past week"
+    )
+    monthly_row_growth_percent = serializers.FloatField(
+        allow_null=True, help_text="Percentage row count growth over the past month"
+    )
+
+
+class TableGrowthAlertSerializer(serializers.Serializer):
+    """Serializer for individual table growth alert."""
+
+    table_name = serializers.CharField(
+        help_text="Name of the table triggering the alert"
+    )
+    period = serializers.ChoiceField(
+        choices=["weekly", "monthly"],
+        help_text="Growth period that exceeded the threshold",
+    )
+    growth_percent = serializers.FloatField(
+        help_text="Actual growth percentage observed"
+    )
+    threshold = serializers.IntegerField(
+        help_text="Configured threshold that was exceeded"
+    )
+
+
+class TableGrowthStatsResponseSerializer(serializers.Serializer):
+    """Response serializer for table growth statistics endpoint."""
+
+    date = serializers.DateField(help_text="Current date of the statistics")
+    weekly_threshold_percent = serializers.IntegerField(
+        help_text="Configured weekly growth alert threshold"
+    )
+    monthly_threshold_percent = serializers.IntegerField(
+        help_text="Configured monthly growth alert threshold"
+    )
+    tables = TableGrowthStatsSerializer(
+        many=True, help_text="Table growth statistics sorted by growth rate"
+    )
+    alerts = TableGrowthAlertSerializer(
+        many=True,
+        help_text="List of tables that exceeded configured growth thresholds",
+    )
+
+
+class TableGrowthTriggerResponseSerializer(serializers.Serializer):
+    """Response serializer for triggering table size sampling."""
+
+    detail = serializers.CharField(help_text="Status message about the triggered task")
+
+
+# --- Personal Access Token serializers ---
+
+
+class AllowedScopeInputSerializer(serializers.Serializer):
+    """Single PAT binding entry on create.
+
+    `type` is a key of :data:`waldur_core.permissions.enums.TYPE_MAP`;
+    `uuid` is the target entity's UUID.
+    """
+
+    type = serializers.CharField()
+    uuid = serializers.UUIDField()
+
+    def validate_type(self, value):
+        if value not in TYPE_MAP:
+            raise serializers.ValidationError(
+                f"Unknown scope type '{value}'. Expected one of: {sorted(TYPE_MAP)}."
+            )
+        return value
+
+
+class AllowedScopeOutputSerializer(serializers.Serializer):
+    """Single PAT binding entry on read.
+
+    `name` falls back to ``"(deleted)"`` if the bound entity no longer exists.
+    """
+
+    type = serializers.CharField()
+    uuid = serializers.UUIDField(allow_null=True)
+    name = serializers.CharField(allow_null=True)
+
+
+def _serialize_allowed_scopes(stored):
+    """Turn the stored list of {content_type_id, object_id} into output dicts.
+
+    Resolves each binding to ``{type, uuid, name}``; surfaces deleted
+    entities with ``uuid=None`` and ``name="(deleted)"`` rather than
+    dropping them. Issues one query per distinct ContentType (not per
+    binding) — important when the PAT list endpoint renders many tokens.
+    """
+    bindings = list(stored or [])
+    if not bindings:
+        return []
+
+    # Group object_ids by content_type to do one query per type.
+    ids_by_ct: dict[int, set[int]] = {}
+    for entry in bindings:
+        ids_by_ct.setdefault(entry["content_type_id"], set()).add(entry["object_id"])
+
+    # Bulk-fetch each batch.
+    instances_by_ct: dict[int, dict[int, object]] = {}
+    type_key_by_ct: dict[int, str | None] = {}
+    for ct_id, ids in ids_by_ct.items():
+        try:
+            ct = ContentType.objects.get_for_id(ct_id)
+        except ContentType.DoesNotExist:
+            type_key_by_ct[ct_id] = None
+            continue
+        type_key_by_ct[ct_id] = TYPE_KEY_BY_CT.get((ct.app_label, ct.model))
+        model = ct.model_class()
+        instances_by_ct[ct_id] = {
+            obj.pk: obj for obj in model.objects.filter(pk__in=ids)
+        }
+
+    out = []
+    for entry in bindings:
+        ct_id = entry["content_type_id"]
+        type_key = type_key_by_ct.get(ct_id)
+        if not type_key:
+            continue
+        instance = instances_by_ct.get(ct_id, {}).get(entry["object_id"])
+        if instance is None:
+            out.append({"type": type_key, "uuid": None, "name": "(deleted)"})
+        else:
+            out.append(
+                {
+                    "type": type_key,
+                    "uuid": getattr(instance, "uuid", None),
+                    "name": getattr(instance, "name", None) or str(instance),
+                }
+            )
+    return out
+
+
+class NetworkAclValidationMixin:
+    """Validate + canonicalise ``allowed_networks`` and enforce the entry cap."""
+
+    def validate_allowed_networks(self, value):
+        try:
+            normalized = normalize_network_acl(value)
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(e.messages)
+
+        max_entries = config.PAT_MAX_ACL_ENTRIES
+        if len(normalized) > max_entries:
+            raise serializers.ValidationError(
+                f"A token can have at most {max_entries} network ACL entries."
+            )
+        return normalized
+
+
+class PersonalAccessTokenCreateSerializer(
+    NetworkAclValidationMixin, serializers.Serializer
+):
+    name = serializers.CharField(max_length=150)
+    scopes = serializers.ListField(child=serializers.CharField())
+    # Use ``Serializer(many=True)`` (a ListSerializer under the hood) rather
+    # than ``ListField(child=Serializer())`` — the latter reports per-item
+    # validation errors as ``OrderedDict[int, ...]`` (index keys), which the
+    # orjson renderer rejects with ``TypeError: Dict key must be str``.
+    allowed_scopes = AllowedScopeInputSerializer(
+        many=True,
+        required=False,
+        default=list,
+        help_text=(
+            "Optional list of entity bindings restricting where this token "
+            "can act. Empty list = no entity restriction."
+        ),
+    )
+    allowed_networks = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+        help_text=(
+            "Optional list of CIDR networks the token may be used from. "
+            "Bare addresses are widened to /32 or /128. Empty list = no "
+            "network restriction."
+        ),
+    )
+    expires_at = serializers.DateTimeField()
+
+    def validate_scopes(self, value):
+        valid_values = {e.value for e in PermissionEnum}
+        invalid = [s for s in value if s not in valid_values]
+        if invalid:
+            raise serializers.ValidationError(f"Invalid scope(s): {invalid}")
+        if not value:
+            raise serializers.ValidationError("At least one scope is required.")
+
+        user = self.context["request"].user
+        if PermissionEnum.STAFF_ACCESS.value in value and not user.is_staff:
+            raise serializers.ValidationError(
+                "Only staff users can request the STAFF.ACCESS scope."
+            )
+        if PermissionEnum.SUPPORT_ACCESS.value in value and not (
+            user.is_staff or user.is_support
+        ):
+            raise serializers.ValidationError(
+                "Only staff or support users can request the SUPPORT.ACCESS scope."
+            )
 
         return value
+
+    def validate_expires_at(self, value):
+        if value <= timezone.now():
+            raise serializers.ValidationError("Expiration must be in the future.")
+        max_days = config.PAT_MAX_LIFETIME_DAYS
+        max_expiry = timezone.now() + timezone.timedelta(days=max_days)
+        if value > max_expiry:
+            raise serializers.ValidationError(
+                f"Expiration cannot exceed {max_days} days from now."
+            )
+        return value
+
+    def validate(self, attrs):
+        user = self.context["request"].user
+
+        if not user.can_use_personal_access_tokens:
+            raise serializers.ValidationError(
+                "You are not allowed to create personal access tokens."
+            )
+
+        # Check token count limit
+        active_count = PersonalAccessToken.objects.filter(
+            user=user, is_active=True
+        ).count()
+        if active_count >= config.PAT_MAX_TOKENS_PER_USER:
+            raise serializers.ValidationError(
+                f"Maximum number of active tokens ({config.PAT_MAX_TOKENS_PER_USER}) reached."
+            )
+
+        bindings_input = attrs.get("allowed_scopes") or []
+        scopes = attrs.get("scopes") or []
+
+        # STAFF.ACCESS / SUPPORT.ACCESS are global by design — entity binding
+        # would be meaningless. Reject the combination.
+        global_scopes = {
+            PermissionEnum.STAFF_ACCESS.value,
+            PermissionEnum.SUPPORT_ACCESS.value,
+        }
+        if bindings_input and any(s in global_scopes for s in scopes):
+            raise serializers.ValidationError(
+                {
+                    "allowed_scopes": (
+                        "Entity bindings cannot be combined with STAFF.ACCESS "
+                        "or SUPPORT.ACCESS — those scopes are global."
+                    )
+                }
+            )
+
+        # Resolve each binding to a concrete entity and verify the caller has
+        # at least one of the requested permissions on it (or an ancestor).
+        # Storage form: list of {content_type_id, object_id}.
+        permission_enums = [PermissionEnum(s) for s in scopes if s not in global_scopes]
+        request = self.context["request"]
+        resolved = []
+        errors = []
+        for idx, entry in enumerate(bindings_input):
+            type_key = entry["type"]
+            uuid_value = entry["uuid"]
+            app_label, model_name = TYPE_MAP[type_key]
+            try:
+                ct = ContentType.objects.get_by_natural_key(app_label, model_name)
+            except ContentType.DoesNotExist:
+                errors.append(
+                    {
+                        "type": f"Unknown scope type '{type_key}'.",
+                    }
+                )
+                continue
+            model = ct.model_class()
+            instance = model.objects.filter(uuid=uuid_value).first()
+            if instance is None:
+                errors.append(f"{type_key} with uuid {uuid_value} does not exist.")
+                continue
+            # Staff already passes has_any_permission unconditionally — the
+            # PAT scope-check kicks in at request time, not here. For non-
+            # staff users we ensure they cannot bind to entities they have
+            # no relevant authority on (privilege escalation guard).
+            if not user.is_staff and permission_enums:
+                allowed_here = any(
+                    has_any_permission(request, permission_enums, ancestor)
+                    for ancestor in get_scope_ancestors(instance)
+                )
+                if not allowed_here:
+                    errors.append(
+                        f"You do not hold any of the requested permissions "
+                        f"on {type_key} {uuid_value}."
+                    )
+                    continue
+            resolved.append({"content_type_id": ct.id, "object_id": instance.id})
+
+        if errors:
+            raise serializers.ValidationError({"allowed_scopes": errors})
+
+        attrs["allowed_scopes"] = resolved
+        return attrs
+
+    def create(self, validated_data):
+        user = self.context["request"].user
+        expires_at = validated_data["expires_at"]
+        full_token, prefix, token_hash = PersonalAccessToken.generate_token(expires_at)
+
+        pat = PersonalAccessToken.objects.create(
+            user=user,
+            name=validated_data["name"],
+            token_prefix=prefix,
+            token_hash=token_hash,
+            scopes=validated_data["scopes"],
+            allowed_scopes=validated_data.get("allowed_scopes", []),
+            allowed_networks=validated_data.get("allowed_networks", []),
+            expires_at=expires_at,
+        )
+        # Attach plaintext for one-time response
+        pat._plaintext_token = full_token
+        return pat
+
+
+class PersonalAccessTokenCreatedSerializer(serializers.Serializer):
+    """Returned once at creation — includes the plaintext token."""
+
+    uuid = serializers.UUIDField()
+    name = serializers.CharField()
+    token = serializers.CharField(help_text="Plaintext token — shown only once.")
+    scopes = serializers.ListField(child=serializers.CharField())
+    allowed_scopes = AllowedScopeOutputSerializer(many=True)
+    allowed_networks = serializers.ListField(child=serializers.CharField())
+    expires_at = serializers.DateTimeField()
+    created = serializers.DateTimeField()
+
+
+class PersonalAccessTokenSerializer(serializers.Serializer):
+    """List / retrieve — never exposes the token or hash."""
+
+    uuid = serializers.UUIDField()
+    name = serializers.CharField()
+    token_prefix = serializers.CharField()
+    scopes = serializers.ListField(child=serializers.CharField())
+    allowed_scopes = serializers.SerializerMethodField()
+    allowed_networks = serializers.ListField(child=serializers.CharField())
+    expires_at = serializers.DateTimeField()
+    is_active = serializers.BooleanField()
+    last_used_at = serializers.DateTimeField()
+    last_used_ip = serializers.IPAddressField()
+    use_count = serializers.IntegerField()
+    created = serializers.DateTimeField()
+
+    @extend_schema_field(AllowedScopeOutputSerializer(many=True))
+    def get_allowed_scopes(self, obj):
+        return _serialize_allowed_scopes(getattr(obj, "allowed_scopes", []) or [])
+
+
+class PersonalAccessTokenNetworkAclSerializer(
+    NetworkAclValidationMixin, serializers.Serializer
+):
+    allowed_networks = serializers.ListField(
+        child=serializers.CharField(), allow_empty=True
+    )
+
+
+class AvailableScopeSerializer(serializers.Serializer):
+    permission = serializers.CharField()
+    description = serializers.CharField()
+
+
+class AvailableBindingTargetSerializer(serializers.Serializer):
+    """Which entity types the caller could bind a given permission to."""
+
+    permission = serializers.CharField()
+    types = serializers.ListField(child=serializers.CharField())
+
+
+class DetailSerializer(serializers.Serializer):
+    detail = serializers.CharField()
+
+
+class StatusSerializer(serializers.Serializer):
+    status = serializers.CharField()
+
+
+class AccessSubnetMixin:
+    """Shared mask and provenance rules for the access-subnet serializers.
+
+    Two rules, both of which need to know who is acting and therefore cannot
+    live on the model field:
+
+    * mask width — non-staff may only enter single hosts, staff any width but
+      ``/0`` (see ``core_utils.validate_access_subnet_for_user``);
+    * provenance — an entry staff created is flagged ``is_staff_managed`` and
+      becomes read-only for everyone else whatever its width, so a consumer
+      cannot quietly remove a range an operator pinned. Deletion is guarded
+      separately in the viewset, which the serializer never sees.
+
+    ``is_staff_managed`` is derived from the acting user on create and is never
+    writable through the API.
+    """
+
+    def validate_inet(self, value):
+        return core_utils.validate_access_subnet_for_user(
+            value, self.context["request"].user
+        )
+
+    def validate_staff_managed(self):
+        """Reject an update to an entry staff created when the caller is not staff."""
+        if self.instance is None or not self.instance.is_staff_managed:
+            return
+        if not self.context["request"].user.is_staff:
+            raise rf_serializers.ValidationError(
+                _("This entry is managed by staff and cannot be modified.")
+            )
+
+    def create(self, validated_data):
+        validated_data["is_staff_managed"] = self.context["request"].user.is_staff
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # Staff may widen an entry a consumer originally created. Without this
+        # the entry would keep is_staff_managed=False, leaving the consumer able
+        # to delete a range only staff could have entered — so any staff write of
+        # `inet` takes ownership. Editing only a description does not.
+        if "inet" in validated_data and self.context["request"].user.is_staff:
+            validated_data["is_staff_managed"] = True
+        return super().update(instance, validated_data)

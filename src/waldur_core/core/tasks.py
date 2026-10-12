@@ -1,5 +1,9 @@
+import copy
+import hashlib
+import json
 import logging
 import traceback
+from io import StringIO
 from uuid import uuid4
 
 from celery import Task as CeleryTask
@@ -8,20 +12,64 @@ from celery.app.task import _reprtask
 from celery.local import Proxy
 from celery.result import AsyncResult
 from celery.worker.request import Request
-from django.db import IntegrityError
+from constance import config
+from django.core.cache import cache
+from django.core.management import call_command
+from django.db import IntegrityError, OperationalError, close_old_connections
 from django.db import models as django_models
 from django.db.models import ObjectDoesNotExist
-from django_fsm import TransitionNotAllowed
+from django.utils import timezone
+from django_fsm import FSMFieldMixin, TransitionNotAllowed
+from model_utils.fields import AutoLastModifiedField
 
 from waldur_core.core import models, utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.exceptions import RuntimeStateException
+from waldur_core.structure.exceptions import ServiceBackendRateLimited
 
 logger = logging.getLogger(__name__)
 
 
 class StateChangeError(RuntimeError):
     pass
+
+
+def _field_values(instance):
+    """Values of the concrete fields loaded on `instance`.
+
+    Dicts and lists are copied, so a transition that mutates one in place still
+    shows up as a change.
+    """
+    deferred = instance.get_deferred_fields()
+    values = {}
+    for field in instance._meta.concrete_fields:
+        if field.primary_key or field.attname in deferred:
+            continue
+        value = getattr(instance, field.attname)
+        values[field.attname] = (
+            copy.deepcopy(value) if isinstance(value, dict | list) else value
+        )
+    return values
+
+
+def _transition_update_fields(instance, before):
+    """Fields a state transition has to write.
+
+    The state field always, so a transition into the state the row is already in
+    still saves and signals as before; timestamps maintained on save; and every
+    other field the transition method or the task changed.
+    """
+    fields = set()
+    for field in instance._meta.concrete_fields:
+        if field.attname not in before:
+            continue
+        if (
+            isinstance(field, FSMFieldMixin | AutoLastModifiedField)
+            or getattr(field, "auto_now", False)
+            or getattr(instance, field.attname) != before[field.attname]
+        ):
+            fields.add(field.name)
+    return fields
 
 
 class TaskType(type):
@@ -161,12 +209,16 @@ class StateTransitionTask(Task):
         )
         old_state = instance.get_state_display()
         try:
+            before = _field_values(instance)
             getattr(instance, transition_method)()
             if action is not None:
                 instance.action = action
             if action_details is not None:
                 instance.action_details = action_details
-            instance.save()
+            # Only what the transition changed: the instance was loaded when the
+            # task started, and a full save would write every other column back
+            # as it was then, reverting whatever a request committed meanwhile.
+            instance.save(update_fields=_transition_update_fields(instance, before))
         except IntegrityError:
             message = f"Could not change state of {instance_description}, using method `{transition_method}` due to concurrent update"
             raise StateChangeError(message)
@@ -318,6 +370,10 @@ class ErrorMessageTask(Task):
                 error_message = f"Internal error: {ex}"
                 error_traceback = traceback.format_exc()
 
+            # AsyncResult.result is the raised exception so we need to stringify it.
+            if not isinstance(error_message, str):
+                error_message = str(error_message)
+
             instance.error_message = error_message
             instance.error_traceback = error_traceback
 
@@ -385,50 +441,112 @@ class BackgroundTask(CeleryTask, metaclass=TaskType):
     Background task features:
      - background task does not start if previous task with the same name
        and input parameters is not completed yet;
-     - all background tasks are scheduled in separate queue "background";
+     - all background tasks are scheduled in separate queue "background-durable";
      - by default we do not log background tasks in celery logs. So tasks
        should log themselves explicitly and make sure that they will not
-       spam error messages.
-
-    Implement "is_equal" method to define what tasks are equal and should
-    be executed simultaneously.
+       spam error messages;
+     - prevents queue overflow and eliminates O(N) worker inspection by using cache with TTL.
     """
 
     is_background = True
 
-    def is_equal(self, other_task, *args, **kwargs):
-        """Return True if task do the same operation as other_task.
+    # Safety net: If worker crashes hard (SIGKILL), lock auto-expires after this time.
+    # Set generously above CELERY_TASK_TIME_LIMIT to account for queue wait time
+    # and scheduling delays. Current CELERY_TASK_TIME_LIMIT is 30 min.
+    lock_timeout = 60 * 60 * 2  # 2 hours default
 
-        Note! Other task is represented as serialized celery task - dictionary.
+    def get_unique_key(self, args, kwargs):
         """
-        raise NotImplementedError(
-            'BackgroundTask should implement "is_equal" method to avoid queue overload.'
-        )
+        Generate a unique lock ID.
+        Override this in subclasses to ignore specific args.
+        """
+        # Default: Hash task name + args. Ignore kwargs by default to be safe.
+        # For Waldur resources, usually args[0] (serialized resource) is enough.
+        # Safe JSON serialization
+        try:
+            payload_str = json.dumps(args, sort_keys=True)
+        except (TypeError, ValueError):
+            payload_str = str(args)
 
-    def is_previous_task_processing(self, *args, **kwargs):
-        """Return True if exist task that is equal to current and is uncompleted"""
-        app = self._get_app()
-        inspect = app.control.inspect()
-        active = inspect.active() or {}
-        scheduled = inspect.scheduled() or {}
-        reserved = inspect.reserved() or {}
-        uncompleted = sum(
-            list(active.values()) + list(scheduled.values()) + list(reserved.values()),
-            [],
-        )
-        return any(self.is_equal(task, *args, **kwargs) for task in uncompleted)
+        payload_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+        return f"celery-lock:{self.name}:{payload_hash}"
 
     def apply_async(self, args=None, kwargs=None, **options):
-        """Do not run background task if previous task is uncompleted"""
-        if self.is_previous_task_processing(*args, **kwargs):
-            message = (
-                "Background task %s was not scheduled, because its predecessor is not completed yet."
-                % self.name
+        args = args or ()
+        kwargs = kwargs or {}
+
+        # 1. Generate Key
+        lock_key = self.get_unique_key(args, kwargs)
+
+        # 2. Check Lock (Atomic ADD)
+        # We store the task_id inside the lock for debugging purposes
+        task_id = options.get("task_id") or str(uuid4())
+        options["task_id"] = task_id
+
+        # cache.add returns True if key was set, False if key already existed.
+        # celery-beat is long-lived and has no HTTP request boundary, so Django
+        # does not recycle its DB connection. If Postgres drops it (idle
+        # timeout, restart, pgbouncer recycle), DatabaseCache calls raise
+        # OperationalError forever. Recycle once and retry transparently.
+        acquired = self._cache_add_with_retry(lock_key, task_id)
+        if not acquired:
+            logger.info(
+                "Skipping task %s (args=%s) - Lock exists: %s",
+                self.name,
+                args,
+                lock_key,
             )
-            logger.info(message)
-            # It is expected by Celery that apply_async return AsyncResult, otherwise celerybeat dies
-            return self.AsyncResult(options.get("task_id") or str(uuid4()))
-        return super().apply_async(args=args, kwargs=kwargs, **options)
+            # Return dummy result to satisfy Celery Beat
+            return self.AsyncResult(task_id)
+
+        # 3. Schedule Task
+        try:
+            # We inject the lock key into headers so the worker knows what to delete
+            headers = options.get("headers", {})
+            headers["__waldur_lock_key"] = lock_key
+            options["headers"] = headers
+
+            return super().apply_async(args=args, kwargs=kwargs, **options)
+        except Exception:
+            # If connection to Broker fails, release lock immediately
+            cache.delete(lock_key)
+            raise
+
+    def _cache_add_with_retry(self, lock_key, task_id):
+        try:
+            return cache.add(lock_key, task_id, timeout=self.lock_timeout)
+        except OperationalError:
+            logger.warning(
+                "Stale DB connection while acquiring lock for %s; recycling and retrying",
+                self.name,
+            )
+            close_old_connections()
+            return cache.add(lock_key, task_id, timeout=self.lock_timeout)
+
+    def after_return(self, status, retval, task_id, args, kwargs, einfo):
+        """
+        Cleanup handler.
+        Runs on Success, Failure, and SoftTimeLimitExceeded.
+        Does NOT run on SIGKILL (Hard Crash).
+        """
+        lock_key = self.request.headers.get("__waldur_lock_key")
+
+        if lock_key:
+            # Check if we own the lock before deleting
+            # (prevents race condition if lock expired and was re-acquired by another worker)
+            current_lock_holder = cache.get(lock_key)
+            if current_lock_holder == task_id:
+                cache.delete(lock_key)
+                logger.debug("Released lock for task %s: %s", self.name, lock_key)
+            else:
+                logger.debug(
+                    "Lock not owned by task %s (owner: %s), skipping release: %s",
+                    task_id,
+                    current_lock_holder,
+                    lock_key,
+                )
+
+        super().after_return(status, retval, task_id, args, kwargs, einfo)
 
 
 def log_celery_task(request):
@@ -544,6 +662,9 @@ class PollStateTask(Task):
 class PollBackendCheckTask(Task):
     max_retries = 600
     default_retry_delay = 5
+    # Upper bound on a backend-requested pause, so a bogus Retry-After
+    # cannot park the poll for hours.
+    max_rate_limit_delay = 300
 
     @classmethod
     def get_description(cls, instance, backend_check_method, *args, **kwargs):
@@ -555,8 +676,47 @@ class PollBackendCheckTask(Task):
     def execute(self, instance, backend_check_method):
         # backend_check_method should return True if object does not exist at backend
         backend = self.get_backend(instance)
-        if not getattr(backend, backend_check_method)(instance):
+        retries = getattr(self.request, "retries", 0) or 0
+        try:
+            is_deleted = getattr(backend, backend_check_method)(instance)
+        except ServiceBackendRateLimited as e:
+            # Throttling says nothing about the object itself, so keep polling
+            # instead of failing the whole operation. Each retry still counts
+            # toward max_retries; once exhausted, the rate-limit error is raised.
+            countdown = min(
+                max(e.retry_after, self.default_retry_delay),
+                self.max_rate_limit_delay,
+            )
+            logger.warning(
+                "Backend check `%s` for `%s` was rate limited, retrying in %ds.",
+                backend_check_method,
+                instance,
+                countdown,
+            )
+            raise self.retry(exc=e, countdown=countdown)
+        if not is_deleted:
+            if retries == 0:
+                logger.info(
+                    "Polling backend check `%s` for `%s` started "
+                    "(interval=%ds, max_retries=%d).",
+                    backend_check_method,
+                    instance,
+                    self.default_retry_delay,
+                    self.max_retries,
+                )
             self.retry()
+        # Approximate elapsed wall time as polls * interval; not exact because
+        # Celery retry scheduling has small jitter and queue delays, but close
+        # enough to distinguish "OpenStack was slow" from "we polled a lot".
+        if retries > 0:
+            logger.info(
+                "Polling backend check `%s` for `%s` completed after %d poll(s) "
+                "(~%ds wall time).",
+                backend_check_method,
+                instance,
+                retries + 1,
+                (retries + 1) * self.default_retry_delay,
+            )
         return instance
 
 
@@ -580,6 +740,41 @@ class ExtensionTaskMixin(CeleryTask, metaclass=TaskType):
         return super().apply_async(args=args, kwargs=kwargs, **options)
 
 
+@shared_task(name="waldur_core.core.cleanup_expired_personal_access_tokens")
+def cleanup_expired_personal_access_tokens():
+    """Deactivate expired PATs."""
+    from waldur_core.core.models import PersonalAccessToken
+    from waldur_core.logging import event_logger
+    from waldur_core.logging.enums import EventType
+
+    expired = PersonalAccessToken.objects.filter(
+        expires_at__lte=timezone.now(), is_active=True
+    )
+    for pat in expired.select_related("user"):
+        event_logger.emit(
+            "Personal access token {pat_name} for user {affected_user_username} has expired.",
+            event_type=EventType.PAT_EXPIRED,
+            event_context={"affected_user": pat.user, "pat_name": pat.name},
+            scopes=[pat.user],
+        )
+    count = expired.update(is_active=False)
+    if count:
+        logger.info("Deactivated %d expired personal access tokens.", count)
+
+
+@shared_task(name="waldur_core.core.cleanup_stale_token_exchange_codes")
+def cleanup_stale_token_exchange_codes():
+    """Delete TokenExchangeCode rows that were never redeemed."""
+    from datetime import timedelta
+
+    from waldur_core.core.models import TokenExchangeCode
+
+    cutoff = timezone.now() - timedelta(minutes=5)
+    deleted, _ = TokenExchangeCode.objects.filter(created__lt=cutoff).delete()
+    if deleted:
+        logger.info("Deleted %d stale token exchange codes.", deleted)
+
+
 @shared_task(name="waldur_core.reset_updating_resources")
 def reset_updating_resources():
     """Reset resources stuck in UPDATING state when their Celery tasks are completed."""
@@ -597,3 +792,252 @@ def reset_updating_resources():
                 instance.set_ok()
                 instance.task_id = None
                 instance.save(update_fields=["state", "task_id"])
+
+
+@shared_task(name="waldur_core.sample_table_sizes")
+def sample_table_sizes():
+    """
+    Sample all database table sizes and store them for trend analysis.
+    This task runs daily to collect historical data for detecting abnormal growth patterns.
+    """
+    from django.db import connection
+
+    if not config.TABLE_GROWTH_MONITORING_ENABLED:
+        logger.info("Table growth monitoring is disabled, skipping sample_table_sizes")
+        return
+
+    today = timezone.now().date()
+    min_size_bytes = config.TABLE_GROWTH_MIN_SIZE_BYTES
+
+    # Query PostgreSQL for table sizes and row estimates
+    sql = """
+    SELECT
+        pg_statio_user_tables.relname AS table_name,
+        pg_total_relation_size(pg_statio_user_tables.relid) AS total_size,
+        pg_relation_size(pg_statio_user_tables.relid) AS data_size,
+        pg_stat_user_tables.n_live_tup AS row_estimate
+    FROM
+        pg_catalog.pg_statio_user_tables
+    LEFT JOIN
+        pg_stat_user_tables ON pg_statio_user_tables.relid = pg_stat_user_tables.relid
+    WHERE
+        pg_total_relation_size(pg_statio_user_tables.relid) >= %s
+    ORDER BY
+        pg_total_relation_size(pg_statio_user_tables.relid) DESC;
+    """
+
+    with connection.cursor() as cursor:
+        cursor.execute(sql, [min_size_bytes])
+        rows = cursor.fetchall()
+
+    count = 0
+    for row in rows:
+        table_name, total_size, data_size, row_estimate = row
+        models.DailyTableSizeHistory.objects.update_or_create(
+            table_name=table_name,
+            date=today,
+            defaults={
+                "total_size": total_size,
+                "data_size": data_size,
+                "row_estimate": row_estimate,
+            },
+        )
+        count += 1
+
+    logger.info(
+        "Sampled table sizes for %d tables on %s",
+        count,
+        today,
+    )
+
+    # Clean up old history entries
+    retention_days = config.TABLE_GROWTH_RETENTION_DAYS
+    cutoff_date = today - timezone.timedelta(days=retention_days)
+    deleted_count, _ = models.DailyTableSizeHistory.objects.filter(
+        date__lt=cutoff_date
+    ).delete()
+    if deleted_count:
+        logger.info(
+            "Deleted %d old table size history entries older than %s",
+            deleted_count,
+            cutoff_date,
+        )
+
+
+@shared_task(name="waldur_core.check_table_growth_alerts")
+def check_table_growth_alerts():
+    """
+    Check for tables that have grown abnormally fast and send alerts.
+    Compares current sizes against 7-day and 30-day historical data.
+    """
+    from waldur_core.core.utils import broadcast_mail
+
+    if not config.TABLE_GROWTH_MONITORING_ENABLED:
+        logger.info(
+            "Table growth monitoring is disabled, skipping check_table_growth_alerts"
+        )
+        return
+
+    today = timezone.now().date()
+    week_ago = today - timezone.timedelta(days=7)
+    month_ago = today - timezone.timedelta(days=30)
+
+    weekly_threshold = config.TABLE_GROWTH_WEEKLY_THRESHOLD_PERCENT
+    monthly_threshold = config.TABLE_GROWTH_MONTHLY_THRESHOLD_PERCENT
+
+    # Get current table sizes
+    current_sizes = {
+        entry.table_name: entry
+        for entry in models.DailyTableSizeHistory.objects.filter(date=today)
+    }
+
+    # Get week-ago sizes
+    week_ago_sizes = {
+        entry.table_name: entry
+        for entry in models.DailyTableSizeHistory.objects.filter(date=week_ago)
+    }
+
+    # Get month-ago sizes
+    month_ago_sizes = {
+        entry.table_name: entry
+        for entry in models.DailyTableSizeHistory.objects.filter(date=month_ago)
+    }
+
+    alerts = []
+
+    for table_name, current in current_sizes.items():
+        # Check weekly growth
+        if table_name in week_ago_sizes:
+            week_ago_entry = week_ago_sizes[table_name]
+            if week_ago_entry.total_size > 0:
+                weekly_growth = (
+                    (current.total_size - week_ago_entry.total_size)
+                    / week_ago_entry.total_size
+                    * 100
+                )
+                if weekly_growth > weekly_threshold:
+                    alerts.append(
+                        {
+                            "table_name": table_name,
+                            "period": "weekly",
+                            "growth_percent": round(weekly_growth, 1),
+                            "threshold": weekly_threshold,
+                            "old_size": week_ago_entry.total_size,
+                            "current_size": current.total_size,
+                            "old_rows": week_ago_entry.row_estimate,
+                            "current_rows": current.row_estimate,
+                        }
+                    )
+
+        # Check monthly growth
+        if table_name in month_ago_sizes:
+            month_ago_entry = month_ago_sizes[table_name]
+            if month_ago_entry.total_size > 0:
+                monthly_growth = (
+                    (current.total_size - month_ago_entry.total_size)
+                    / month_ago_entry.total_size
+                    * 100
+                )
+                if monthly_growth > monthly_threshold:
+                    alerts.append(
+                        {
+                            "table_name": table_name,
+                            "period": "monthly",
+                            "growth_percent": round(monthly_growth, 1),
+                            "threshold": monthly_threshold,
+                            "old_size": month_ago_entry.total_size,
+                            "current_size": current.total_size,
+                            "old_rows": month_ago_entry.row_estimate,
+                            "current_rows": current.row_estimate,
+                        }
+                    )
+
+    if alerts:
+        logger.warning(
+            "Table growth alerts triggered for %d table(s): %s",
+            len(alerts),
+            [a["table_name"] for a in alerts],
+        )
+
+        # Get staff/support users to notify
+        from django.db.models import Q
+
+        from waldur_core.core.models import User
+
+        recipients = list(
+            User.objects.filter(is_active=True, notifications_enabled=True)
+            .filter(Q(is_staff=True) | Q(is_support=True))
+            .values_list("email", flat=True)
+            .distinct()
+        )
+
+        # Filter out empty emails
+        recipients = [email for email in recipients if email]
+
+        if recipients:
+            context = {
+                "alerts": alerts,
+                "date": today,
+                "site_name": config.SITE_NAME,
+            }
+            broadcast_mail(
+                "core",
+                "table_growth_alert",
+                context,
+                recipients,
+            )
+            logger.info(
+                "Sent table growth alert notification to %d recipients",
+                len(recipients),
+            )
+    else:
+        logger.info("No table growth alerts triggered")
+
+
+@shared_task(name="waldur_core.delete_stale_user_revisions")
+def delete_stale_user_revisions():
+    """Prune reversion history for users.
+
+    Every audited change to a user opens a revision, and federated deployments
+    sync users on every login, so core.User is the fastest-growing versioned
+    table. USER_REVISION_KEEP_MINIMUM guarantees each user keeps a usable trail
+    however old it is: without it, a quiet account would eventually lose its
+    history entirely.
+
+    Note that a revision is deleted whole, taking every version it holds with
+    it. Revisions written by the per-user signal handler hold exactly one user,
+    but an admin bulk action writes one revision covering all users it touched -
+    those are pruned together, which is fine as they share an age.
+    """
+    retention_days = config.USER_REVISION_RETENTION_DAYS
+    if not retention_days:
+        logger.debug(
+            "USER_REVISION_RETENTION_DAYS is 0, skipping user revision cleanup"
+        )
+        return
+
+    keep = config.USER_REVISION_KEEP_MINIMUM
+    if keep < 1:
+        logger.warning(
+            "USER_REVISION_KEEP_MINIMUM is %s, which would allow a user's whole "
+            "history to be deleted. Skipping user revision cleanup.",
+            keep,
+        )
+        return
+
+    output = StringIO()
+    call_command(
+        "deleterevisions",
+        "core.User",
+        days=retention_days,
+        keep=keep,
+        verbosity=1,
+        stdout=output,
+    )
+    logger.info(
+        "Pruned user revisions older than %s days, keeping the %s most recent "
+        "per user. %s",
+        retention_days,
+        keep,
+        output.getvalue().strip().replace("\n", " "),
+    )

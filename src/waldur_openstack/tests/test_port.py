@@ -1,8 +1,14 @@
 from unittest import mock
 
+from ddt import data, ddt
+from neutronclient.client import exceptions as neutron_exceptions
 from rest_framework import status, test
 
-from waldur_openstack.models import Port
+from waldur_core.core.enums import CoreStates
+from waldur_openstack.backend import OpenStackBackend
+from waldur_openstack.enums import Ipv6Modes
+from waldur_openstack.exceptions import OpenStackBackendError
+from waldur_openstack.models import NetworkRBACPolicy, Port
 from waldur_openstack.serializers import (
     OpenStackPortIPUpdateSerializer,
     OpenStackPortSerializer,
@@ -11,7 +17,7 @@ from waldur_openstack.serializers import (
 from . import factories, fixtures
 
 
-class BasePortTest(test.APITransactionTestCase):
+class BasePortTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.OpenStackFixture()
         self.client.force_authenticate(user=self.fixture.owner)
@@ -69,12 +75,16 @@ class PortCreateTest(BasePortTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         create_port_executor_mock.assert_not_called()
 
-    @mock.patch("waldur_openstack.session.neutron_client.Client")
-    @mock.patch("waldur_openstack.backend.get_tenant_session")
+    @mock.patch("neutronclient.v2_0.client.Client")
+    @mock.patch("waldur_openstack.backend.get_keystone_session")
     def test_port_creation_passes_fixed_ips_to_backend(
-        self, mock_get_tenant_session, mock_get_neutron_client
+        self, mock_get_keystone_session, mock_neutron_client
     ):
-        mock_neutron_instance = mock_get_neutron_client.return_value
+        # Mock the session to avoid OpenStack authentication
+        mock_session = mock.MagicMock()
+        mock_get_keystone_session.return_value = mock_session
+
+        mock_neutron_instance = mock_neutron_client.return_value
 
         mock_neutron_instance.create_port.return_value = {
             "port": {
@@ -104,6 +114,61 @@ class PortCreateTest(BasePortTest):
                     "description": port.description,
                     "network_id": port.network.backend_id,
                     "tenant_id": port.tenant.backend_id,
+                    "port_security_enabled": True,
+                    "fixed_ips": self.fixed_ips,
+                }
+            }
+        )
+
+    @mock.patch("waldur_openstack.executors.PortCreateExecutor.execute")
+    def test_port_create_with_port_security_disabled(self, create_port_executor_mock):
+        data = self.valid_data.copy()
+        data["port_security_enabled"] = False
+        response = self.client.post(self.url, data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        port = Port.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(port.port_security_enabled, False)
+
+    @mock.patch("neutronclient.v2_0.client.Client")
+    @mock.patch("waldur_openstack.backend.get_keystone_session")
+    def test_port_creation_with_port_security_disabled_passes_to_backend(
+        self, mock_get_keystone_session, mock_neutron_client
+    ):
+        mock_session = mock.MagicMock()
+        mock_get_keystone_session.return_value = mock_session
+
+        mock_neutron_instance = mock_neutron_client.return_value
+        mock_neutron_instance.create_port.return_value = {
+            "port": {
+                "id": "backend_id_from_mock",
+                "status": "ACTIVE",
+                "mac_address": "fa:16:3e:ab:cd:ef",
+                "fixed_ips": [
+                    {"ip_address": "192.168.42.100", "subnet_id": "subnet-backend-id"}
+                ],
+                "admin_state_up": True,
+                "port_security_enabled": False,
+                "device_owner": "",
+            }
+        }
+
+        data = self.valid_data.copy()
+        data["port_security_enabled"] = False
+        response = self.client.post(self.url, data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        port = Port.objects.get(uuid=response.data["uuid"])
+        port.get_backend().create_port(port)
+
+        mock_neutron_instance.create_port.assert_called_once_with(
+            {
+                "port": {
+                    "name": port.name,
+                    "description": port.description,
+                    "network_id": port.network.backend_id,
+                    "tenant_id": port.tenant.backend_id,
+                    "port_security_enabled": False,
                     "fixed_ips": self.fixed_ips,
                 }
             }
@@ -165,7 +230,7 @@ class PortDeleteTest(BasePortTest):
         delete_port_executor_mock.assert_called_once()
 
 
-class PortSerializerTest(test.APITransactionTestCase):
+class PortSerializerTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.subnet = self.fixture.subnet
@@ -204,7 +269,7 @@ class PortSerializerTest(test.APITransactionTestCase):
         self.assertFalse(serializer.is_valid())
 
 
-class PortNetworkValidationTest(test.APITransactionTestCase):
+class PortNetworkValidationTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         # Create two different tenants to test cross-tenant validation
@@ -257,7 +322,7 @@ class PortNetworkValidationTest(test.APITransactionTestCase):
         self.assertIn("subnet", serializer.errors)
 
 
-class PortExecutorTest(test.APITransactionTestCase):
+class PortExecutorTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.port = self.fixture.port
@@ -351,3 +416,439 @@ class PortIPUpdateValidationTest(BasePortTest):
         )
         self.assertFalse(serializer.is_valid())
         self.assertIn("subnet", serializer.errors)
+
+
+@ddt
+class PortIPUpdateTest(BasePortTest):
+    """``POST /api/openstack-ports/{uuid}/update_port_ip/`` on IPv6 and
+    dual-stack ports."""
+
+    V4_SUBNET_ID = "subnet-v4"
+    V6_SUBNET_ID = "subnet-v6"
+
+    def setUp(self):
+        super().setUp()
+        self.port = self.fixture.port
+        self.v4_subnet = self.fixture.subnet
+        self.v4_subnet.backend_id = self.V4_SUBNET_ID
+        self.v4_subnet.cidr = "192.168.42.0/24"
+        self.v4_subnet.save()
+        self.v6_subnet = factories.SubNetFactory(
+            network=self.fixture.network,
+            tenant=self.fixture.tenant,
+            service_settings=self.fixture.settings,
+            project=self.fixture.project,
+            state=CoreStates.OK,
+            backend_id=self.V6_SUBNET_ID,
+            cidr="2001:db8:1::/64",
+            ip_version=6,
+            ipv6_ra_mode=Ipv6Modes.DHCPV6_STATEFUL,
+            ipv6_address_mode=Ipv6Modes.DHCPV6_STATEFUL,
+        )
+        self.url = factories.PortFactory.get_url(self.port, "update_port_ip")
+        patcher = mock.patch("waldur_openstack.backend.OpenStackBackend.update_port_ip")
+        self.backend_mock = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _post(self, subnet, ip):
+        return self.client.post(
+            self.url,
+            {"subnet": factories.SubNetFactory.get_url(subnet), "ip_address": ip},
+        )
+
+    @data(
+        (Ipv6Modes.SLAAC, Ipv6Modes.SLAAC),
+        (Ipv6Modes.DHCPV6_STATELESS, Ipv6Modes.DHCPV6_STATELESS),
+        # Router advertisements from outside OpenStack leave ra_mode unset.
+        (None, Ipv6Modes.SLAAC),
+    )
+    def test_address_from_prefix_subnet_is_refused(self, modes):
+        self.v6_subnet.ipv6_ra_mode, self.v6_subnet.ipv6_address_mode = modes
+        self.v6_subnet.save()
+
+        response = self._post(self.v6_subnet, "2001:db8:1::10")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("prefix", str(response.data["subnet"]))
+        self.backend_mock.assert_not_called()
+
+    def test_stateful_ipv6_subnet_accepts_an_address_in_its_prefix(self):
+        kept = {"subnet_id": self.V4_SUBNET_ID, "ip_address": "192.168.42.5"}
+        changed = {"subnet_id": self.V6_SUBNET_ID, "ip_address": "2001:db8:1::10"}
+        self.backend_mock.return_value = [kept, changed]
+
+        response = self._post(self.v6_subnet, "2001:db8:1::10")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.backend_mock.assert_called_once_with(
+            self.port, self.V6_SUBNET_ID, "2001:db8:1::10"
+        )
+        self.port.refresh_from_db()
+        self.assertEqual(self.port.fixed_ips, [kept, changed])
+
+    def test_address_of_the_other_family_is_refused(self):
+        response = self._post(self.v6_subnet, "192.168.42.10")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("ip_address", response.data)
+        self.backend_mock.assert_not_called()
+
+    def test_address_outside_the_subnet_is_refused(self):
+        response = self._post(self.v6_subnet, "2001:db8:2::10")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("ip_address", response.data)
+        self.backend_mock.assert_not_called()
+
+    def test_address_outside_an_ipv4_subnet_is_refused(self):
+        response = self._post(self.v4_subnet, "10.0.0.10")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("ip_address", response.data)
+        self.backend_mock.assert_not_called()
+
+    def test_backend_error_is_a_bad_request(self):
+        self.backend_mock.side_effect = OpenStackBackendError(
+            "IP address 192.168.42.10 already allocated in subnet"
+        )
+
+        response = self._post(self.v4_subnet, "192.168.42.10")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already allocated", str(response.data))
+
+
+class PortIPUpdateBackendTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.port = self.fixture.port
+        self.backend = OpenStackBackend(self.fixture.settings)
+        self.v4 = {"subnet_id": "subnet-v4", "ip_address": "192.168.42.5"}
+        self.v6 = {"subnet_id": "subnet-v6", "ip_address": "2001:db8:1::5"}
+
+        patcher = mock.patch(
+            "waldur_openstack.backend.OpenStackBackend.admin_session",
+            new_callable=mock.PropertyMock,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch("waldur_openstack.backend.get_neutron_client")
+        self.client_mock = patcher.start().return_value
+        self.addCleanup(patcher.stop)
+        self.client_mock.show_port.return_value = {
+            "port": {"fixed_ips": [self.v4, self.v6]}
+        }
+        self.client_mock.update_port.side_effect = lambda port_id, body: {
+            "port": {"fixed_ips": body["port"]["fixed_ips"]}
+        }
+
+    def _sent_fixed_ips(self):
+        return self.client_mock.update_port.call_args[0][1]["port"]["fixed_ips"]
+
+    def test_changing_one_family_keeps_the_other(self):
+        new_v6 = {"subnet_id": "subnet-v6", "ip_address": "2001:db8:1::10"}
+
+        fixed_ips = self.backend.update_port_ip(
+            self.port, "subnet-v6", "2001:db8:1::10"
+        )
+
+        self.assertEqual(self._sent_fixed_ips(), [self.v4, new_v6])
+        self.assertEqual(fixed_ips, [self.v4, new_v6])
+
+    def test_a_subnet_the_port_is_not_on_yet_is_added(self):
+        self.client_mock.show_port.return_value = {"port": {"fixed_ips": [self.v4]}}
+
+        self.backend.update_port_ip(self.port, "subnet-v6", "2001:db8:1::10")
+
+        self.assertEqual(
+            self._sent_fixed_ips(),
+            [self.v4, {"subnet_id": "subnet-v6", "ip_address": "2001:db8:1::10"}],
+        )
+
+    def test_neutron_refusal_is_a_backend_error(self):
+        self.client_mock.update_port.side_effect = neutron_exceptions.BadRequest(
+            "IPv6 address cannot be directly assigned to a port on subnet"
+        )
+
+        with self.assertRaises(OpenStackBackendError):
+            self.backend.update_port_ip(self.port, "subnet-v6", "2001:db8:1::10")
+
+
+class PortSharedNetworkTest(test.APITestCase):
+    """Tests for shared network port creation functionality."""
+
+    def setUp(self):
+        # Create two separate fixtures for shared network scenario
+        self.network_owner_fixture = fixtures.OpenStackFixture()
+        self.instance_owner_fixture = fixtures.OpenStackFixture()
+
+        # Network owner setup
+        self.network_owner_tenant = self.network_owner_fixture.tenant
+        self.shared_network = self.network_owner_fixture.network
+        self.shared_subnet = self.network_owner_fixture.subnet
+
+        # Instance owner setup
+        self.instance_owner_tenant = self.instance_owner_fixture.tenant
+
+        # Create RBAC policy to share network from owner to instance tenant
+        self.rbac_policy = NetworkRBACPolicy.objects.create(
+            network=self.shared_network,
+            target_tenant=self.instance_owner_tenant,
+            policy_type="access_as_shared",
+        )
+
+        # Set up URL and auth
+        self.url = factories.PortFactory.get_list_url()
+        self.client.force_authenticate(user=self.instance_owner_fixture.owner)
+
+    @mock.patch("waldur_openstack.executors.PortCreateExecutor.execute")
+    def test_shared_network_port_creation_with_target_tenant(
+        self, create_port_executor_mock
+    ):
+        """Test creating port in shared network with target_tenant parameter."""
+        port_data = {
+            "name": "Shared Network Port",
+            "description": "Port in shared network",
+            "network": factories.NetworkFactory.get_url(self.shared_network),
+            "target_tenant": factories.TenantFactory.get_url(
+                self.instance_owner_tenant
+            ),
+            "fixed_ips": [{"subnet_id": self.shared_subnet.backend_id}],
+            "port_security_enabled": True,
+        }
+
+        response = self.client.post(self.url, port_data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        create_port_executor_mock.assert_called_once()
+
+        # Verify port was created with correct tenant assignment
+        port = Port.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(port.name, "Shared Network Port")
+        self.assertEqual(port.network, self.shared_network)
+        self.assertEqual(
+            port.tenant, self.instance_owner_tenant
+        )  # Should be target tenant, not network owner
+        self.assertEqual(port.project, self.instance_owner_tenant.project)
+
+    @mock.patch("waldur_openstack.executors.PortCreateExecutor.execute")
+    def test_shared_network_port_creation_without_target_tenant_uses_network_tenant(
+        self, create_port_executor_mock
+    ):
+        """Test that creating port in shared network without target_tenant defaults to network owner."""
+        port_data = {
+            "name": "Shared Network Port No Target",
+            "network": factories.NetworkFactory.get_url(self.shared_network),
+            "fixed_ips": [{"subnet_id": self.shared_subnet.backend_id}],
+        }
+
+        response = self.client.post(self.url, port_data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        # Without target_tenant, should default to network owner's tenant
+        port = Port.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(port.tenant, self.network_owner_tenant)
+
+    def test_shared_network_target_tenant_rbac_validation(self):
+        """Test that target_tenant must have RBAC access to the network."""
+        # Create a third tenant without RBAC access
+        unauthorized_fixture = fixtures.OpenStackFixture()
+        unauthorized_tenant = unauthorized_fixture.tenant
+
+        port_data = {
+            "name": "Unauthorized Port",
+            "network": factories.NetworkFactory.get_url(self.shared_network),
+            "target_tenant": factories.TenantFactory.get_url(unauthorized_tenant),
+            "fixed_ips": [{"subnet_id": self.shared_subnet.backend_id}],
+        }
+
+        serializer = OpenStackPortSerializer(data=port_data)
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("target_tenant", serializer.errors)
+
+    def test_shared_network_same_tenant_as_network_owner_allowed(self):
+        """Test that network owner can specify themselves as target_tenant."""
+        port_data = {
+            "name": "Owner Network Port",
+            "network": factories.NetworkFactory.get_url(self.shared_network),
+            "target_tenant": factories.TenantFactory.get_url(
+                self.network_owner_tenant
+            ),  # Same as network owner
+            "fixed_ips": [{"subnet_id": self.shared_subnet.backend_id}],
+        }
+
+        serializer = OpenStackPortSerializer(data=port_data)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+
+class PortBackendSharedNetworkTest(test.APITestCase):
+    """Tests for backend methods handling shared networks."""
+
+    def setUp(self):
+        # Create shared network scenario
+        self.network_owner_fixture = fixtures.OpenStackFixture()
+        self.instance_owner_fixture = fixtures.OpenStackFixture()
+
+        self.network_owner_tenant = self.network_owner_fixture.tenant
+        self.shared_network = self.network_owner_fixture.network
+        self.shared_subnet = self.network_owner_fixture.subnet
+        self.instance_owner_tenant = self.instance_owner_fixture.tenant
+
+        # Create two ports for different tests
+        self.port_for_create_port = factories.PortFactory(
+            network=self.shared_network,
+            subnet=self.shared_subnet,
+            tenant=self.instance_owner_tenant,
+            project=self.instance_owner_tenant.project,
+            service_settings=self.shared_network.service_settings,
+            state=CoreStates.CREATION_SCHEDULED,  # Initial state for testing
+        )
+
+        self.port_for_instance_port = factories.PortFactory(
+            network=self.shared_network,
+            subnet=self.shared_subnet,
+            tenant=self.instance_owner_tenant,
+            project=self.instance_owner_tenant.project,
+            service_settings=self.shared_network.service_settings,
+            state=CoreStates.CREATION_SCHEDULED,  # Initial state for testing
+        )
+
+    @mock.patch("waldur_openstack.backend.get_neutron_client")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.admin_session")
+    def test_create_port_uses_admin_session_for_shared_networks(
+        self, mock_admin_session, mock_get_neutron_client
+    ):
+        """Test that create_port uses admin session for shared networks."""
+        mock_neutron = mock_get_neutron_client.return_value
+        mock_neutron.create_port.return_value = {
+            "port": {
+                "id": "backend-port-id",
+                "mac_address": "fa:16:3e:ab:cd:ef",
+                "fixed_ips": [
+                    {"subnet_id": "subnet-id", "ip_address": "192.168.1.100"}
+                ],
+                "admin_state_up": True,
+                "port_security_enabled": True,
+                "device_owner": "",
+                "status": "ACTIVE",
+            }
+        }
+
+        backend = self.port_for_create_port.get_backend()
+        backend.create_port(self.port_for_create_port)
+
+        # Verify admin session was used
+        mock_get_neutron_client.assert_called_once_with(mock_admin_session)
+
+        # Verify port was updated with backend data
+        self.port_for_create_port.refresh_from_db()
+        self.assertEqual(self.port_for_create_port.backend_id, "backend-port-id")
+
+    @mock.patch("waldur_openstack.backend.get_neutron_client")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.admin_session")
+    def test_create_instance_port_uses_admin_session_and_sets_state(
+        self, mock_admin_session, mock_get_neutron_client
+    ):
+        """Test that create_instance_port uses admin session and sets state to OK."""
+        mock_neutron = mock_get_neutron_client.return_value
+        mock_neutron.create_port.return_value = {
+            "port": {
+                "id": "instance-port-backend-id",
+                "mac_address": "fa:16:3e:12:34:56",
+                "fixed_ips": [
+                    {"subnet_id": "subnet-id", "ip_address": "192.168.1.101"}
+                ],
+                "admin_state_up": True,
+                "port_security_enabled": True,
+                "device_owner": "",
+                "status": "ACTIVE",
+            }
+        }
+
+        backend = self.port_for_instance_port.get_backend()
+        backend.create_instance_port(self.port_for_instance_port, ["security-group-id"])
+
+        # Verify admin session was used
+        mock_get_neutron_client.assert_called_once_with(mock_admin_session)
+
+        # Verify port was updated with backend data
+        self.port_for_instance_port.refresh_from_db()
+        self.assertEqual(
+            self.port_for_instance_port.backend_id, "instance-port-backend-id"
+        )
+
+    @mock.patch("waldur_openstack.backend.get_neutron_client")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.admin_session")
+    def test_create_instance_port_with_port_security_disabled_skips_security_groups(
+        self, mock_admin_session, mock_get_neutron_client
+    ):
+        """Test that create_instance_port skips security groups when port_security_enabled is False."""
+        self.port_for_instance_port.port_security_enabled = False
+        self.port_for_instance_port.save()
+
+        mock_neutron = mock_get_neutron_client.return_value
+        mock_neutron.create_port.return_value = {
+            "port": {
+                "id": "instance-port-backend-id",
+                "mac_address": "fa:16:3e:12:34:56",
+                "fixed_ips": [
+                    {"subnet_id": "subnet-id", "ip_address": "192.168.1.101"}
+                ],
+                "admin_state_up": True,
+                "port_security_enabled": False,
+                "device_owner": "",
+                "status": "ACTIVE",
+            }
+        }
+
+        backend = self.port_for_instance_port.get_backend()
+        backend.create_instance_port(self.port_for_instance_port, ["security-group-id"])
+
+        # Verify port payload does NOT include security_groups
+        call_args = mock_neutron.create_port.call_args[0][0]["port"]
+        self.assertNotIn("security_groups", call_args)
+        self.assertEqual(call_args["port_security_enabled"], False)
+
+
+class InstancePortCreationTest(test.APITestCase):
+    """Tests for port creation during instance provisioning in shared networks."""
+
+    def setUp(self):
+        # Create shared network scenario
+        self.network_owner_fixture = fixtures.OpenStackFixture()
+        self.instance_owner_fixture = fixtures.OpenStackFixture()
+
+        self.network_owner_tenant = self.network_owner_fixture.tenant
+        self.shared_network = self.network_owner_fixture.network
+        self.shared_subnet = self.network_owner_fixture.subnet
+        self.instance_owner_tenant = self.instance_owner_fixture.tenant
+
+    def test_instance_creation_assigns_ports_to_instance_tenant(self):
+        """Test that ports created during instance creation are assigned to instance tenant."""
+
+        # Create an instance with ports in shared network
+        instance = factories.InstanceFactory(
+            tenant=self.instance_owner_tenant,
+            project=self.instance_owner_tenant.project,
+            service_settings=self.shared_network.service_settings,
+        )
+
+        # Create a port in the shared network assigned to instance tenant
+        port = factories.PortFactory(
+            network=self.shared_network,
+            subnet=self.shared_subnet,
+            tenant=self.instance_owner_tenant,  # This should be instance tenant
+            project=self.instance_owner_tenant.project,
+            service_settings=self.shared_network.service_settings,
+            instance=instance,
+        )
+
+        # Verify instance was created in correct tenant
+        self.assertEqual(instance.tenant, self.instance_owner_tenant)
+
+        # Verify port was assigned to instance tenant (not network owner)
+        self.assertEqual(port.network, self.shared_network)  # Shared network
+        self.assertEqual(
+            port.tenant, self.instance_owner_tenant
+        )  # Instance tenant (not network owner)
+        self.assertEqual(port.project, self.instance_owner_tenant.project)
+        self.assertEqual(port.instance, instance)

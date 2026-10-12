@@ -1,11 +1,35 @@
+from constance import config
 from rest_framework.permissions import SAFE_METHODS, BasePermission
+
+from waldur_core.core.exceptions import IncompleteProfileException
+from waldur_core.core.user_attributes import get_user_missing_mandatory_attributes
+from waldur_core.permissions.utils import check_pat_staff_scope, check_pat_support_scope
 
 
 class IsAdminOrReadOnly(BasePermission):
     def has_permission(self, request, view):
-        return request.method in SAFE_METHODS or (
-            request.user.is_authenticated and request.user.is_staff
+        if request.method in SAFE_METHODS:
+            return True
+        return (
+            request.user.is_authenticated
+            and request.user.is_staff
+            and check_pat_staff_scope(request)
         )
+
+
+def requires_object(check) -> bool:
+    """Whether a permission check is scoped to an object (permission_factory with sources)."""
+    return bool(getattr(check, "sources", None))
+
+
+def has_lookup(view) -> bool:
+    """Whether the request URL names the single object view.get_object() looks up."""
+    if not hasattr(view, "get_object"):
+        return False
+    lookup = getattr(view, "lookup_url_kwarg", None) or getattr(
+        view, "lookup_field", None
+    )
+    return bool(lookup) and lookup in (getattr(view, "kwargs", None) or {})
 
 
 class ActionsPermission(BasePermission):
@@ -67,7 +91,7 @@ class ActionsPermission(BasePermission):
         if hasattr(view, view.action + "_permissions"):
             return getattr(view, view.action + "_permissions")
         # otherwise return view-level permissions + extra view permissions
-        extra_permissions = getattr(view, view.action + "extra_permissions", [])
+        extra_permissions = getattr(view, view.action + "_extra_permissions", [])
         if request.method in SAFE_METHODS:
             return getattr(view, "safe_methods_permissions", []) + extra_permissions
         else:
@@ -76,29 +100,21 @@ class ActionsPermission(BasePermission):
     def has_permission(self, request, view):
         checks = self.get_permission_checks(request, view)
 
-        # For detail actions, we need to get the object and pass it to permission checks
-        # that require object-level context (i.e., have 'sources' attribute)
-        if hasattr(view, "get_object") and getattr(view, "action", None):
-            # Check if any permission function requires object scope
-            needs_object = any(
-                hasattr(check, "sources") and check.sources for check in checks
-            )
+        # Checks with 'sources' need the object. Resolve it only when the URL
+        # names one: that is what get_object() requires, and it also covers
+        # routes wired by hand with as_view(), where DRF leaves view.detail None.
+        if has_lookup(view) and any(requires_object(check) for check in checks):
+            obj = view.get_object()
+            for check in checks:
+                if requires_object(check):
+                    check(request, view, obj)
+                else:
+                    check(request, view)
+            return True
 
-            if needs_object:
-                try:
-                    obj = view.get_object()
-                    # Call checks with object for those that need it
-                    for check in checks:
-                        if hasattr(check, "sources") and check.sources:
-                            check(request, view, obj)
-                        else:
-                            check(request, view)
-                    return True
-                except Exception:
-                    # Permission check failed, re-raise the exception
-                    raise
-
-        # Regular permission check without object
+        # On a collection route an object-scoped check has nothing to test and
+        # passes; such routes must scope their queryset instead.
+        # ActionsPermissionRoutesTest keeps them from being declared at all.
         for check in checks:
             check(request, view)
         return True
@@ -111,11 +127,65 @@ class ActionsPermission(BasePermission):
 
 class IsSupport(BasePermission):
     def has_permission(self, request, view):
-        return request.user.is_active and (
-            request.user.is_staff or request.user.is_support
+        return (
+            request.user.is_active
+            and (request.user.is_staff or request.user.is_support)
+            and check_pat_support_scope(request)
+        )
+
+
+class IsSupportOrReadOnly(BasePermission):
+    def has_permission(self, request, view):
+        if request.method in SAFE_METHODS:
+            return True
+        return (
+            request.user.is_authenticated
+            and (request.user.is_staff or request.user.is_support)
+            and check_pat_support_scope(request)
         )
 
 
 class IsStaff(BasePermission):
     def has_permission(self, request, view):
-        return request.user.is_active and request.user.is_staff
+        return (
+            request.user.is_active
+            and request.user.is_staff
+            and check_pat_staff_scope(request)
+        )
+
+
+class PATScopeAwareIsAdminUser(BasePermission):
+    """Drop-in replacement for DRF's IsAdminUser that also enforces PAT scopes."""
+
+    def has_permission(self, request, view):
+        return request.user and request.user.is_staff and check_pat_staff_scope(request)
+
+
+class RequiresCompleteProfile(BasePermission):
+    """
+    Permission class that requires users to have a complete profile.
+
+    When ENFORCE_MANDATORY_USER_ATTRIBUTES is True, users with missing
+    mandatory attributes will be blocked from accessing the view.
+    Staff users bypass this check.
+
+    Note: This permission class is created for future use but is not
+    applied to any ViewSets by default. To enable enforcement, add it
+    to the permission_classes of specific ViewSets.
+    """
+
+    def has_permission(self, request, view):
+        if not config.ENFORCE_MANDATORY_USER_ATTRIBUTES:
+            return True
+
+        if not request.user.is_authenticated:
+            return True
+
+        if request.user.is_staff:
+            return True
+
+        missing = get_user_missing_mandatory_attributes(request.user)
+        if missing:
+            raise IncompleteProfileException(missing_fields=missing)
+
+        return True

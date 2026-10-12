@@ -1,23 +1,16 @@
-import logging
-import os
 import datetime
+import logging
 
-from . import op as openportal
-from . import utils as openportal_utils
+import openportal
 
-from waldur_slurm.structures import Account
 from waldur_core.structure import models as structure_models
 
-from .client import OpenPortalRunner
+from . import exceptions
+from . import utils as openportal_utils
+from .client import OpenPortalRunner, _trim_cmd
+from .structures import Account
 
 logger = logging.getLogger(__name__)
-
-
-def _trim_cmd(cmd: str, max_len: int = 128) -> str:
-    if len(cmd) <= max_len:
-        return cmd
-    half = (max_len - 3) // 2
-    return f"{cmd[:half]}...{cmd[-(max_len - 3 - half) :]}"
 
 
 class RemoteOpenPortalClient:
@@ -29,7 +22,7 @@ class RemoteOpenPortalClient:
 
     def __init__(self, instance_name, project_template):
         if instance_name is None:
-            raise openportal.OpenPortalError("Instance name cannot be None")
+            raise exceptions.OpenPortalError("Instance name cannot be None")
 
         if project_template is None:
             logger.debug(
@@ -53,12 +46,12 @@ class RemoteOpenPortalClient:
 
         return project
 
-    def _to_project_details(self, details) -> openportal.ProjectDetails:
+    def _to_project_details(self, details) -> openportal.AwardDetails:
         """
-        Convert the passed (any) object into a ProjectDetails object
+        Convert the passed (any) object into a AwardDetails object
         """
-        if not isinstance(details, openportal.ProjectDetails):
-            details = openportal.ProjectDetails(str(details))
+        if not isinstance(details, openportal.AwardDetails):
+            details = openportal.AwardDetails(str(details))
 
         details.project_template = self._project_template
 
@@ -101,44 +94,9 @@ class RemoteOpenPortalClient:
             logger.error(
                 f"Failed to get portal name from destination {self._destination}: {e}"
             )
-            raise openportal.OpenPortalError(
+            raise exceptions.OpenPortalError(
                 f"Failed to get portal name from destination {self._destination}: {e}"
             )
-
-    def add_user(
-        self, shortname: str, project: openportal.ProjectIdentifier
-    ) -> openportal.UserMapping:
-        """
-        Tell OpenPortal to add the specified short (unix) name to the project.
-        The username should be unique on the caller
-        side. OpenPortal will derive its own internal username for this user,
-        based on the passed username and project, which will be returned by
-        this method once the user has been added
-        """
-        project = self._to_project_identifier(project)
-
-        if (not shortname) or (not shortname.strip()):
-            raise openportal.OpenPortalError(f"Invalid empty username '{shortname}'")
-
-        user = openportal.UserIdentifier(f"{shortname}.{project}")
-
-        mapping = self.run(f"{self.destination()} add_user {user}")
-
-        logger.debug(
-            f"Added OpenPortal user to project {project} with mapping {mapping}"
-        )
-
-        return mapping
-
-    def delete_user(self, user: openportal.UserIdentifier) -> None:
-        """
-        Remove the OpenPortal user with specified UserIdentifier
-        """
-        user = self._to_user_identifier(user)
-
-        self.run(f"{self.destination()} remove_user {user}")
-
-        logger.debug(f"Deleted OpenPortal user '{user}'")
 
     def _get_project_shortname(self, project: structure_models.Project) -> str:
         """
@@ -154,7 +112,7 @@ class RemoteOpenPortalClient:
 
         if shortname is None or len(shortname.strip()) == 0:
             logger.error(f"Empty shortname for project: {project}")
-            raise openportal.OpenPortalOtherError(
+            raise exceptions.OpenPortalOtherError(
                 f"Project {project} does not have a valid shortname set."
             )
 
@@ -164,22 +122,22 @@ class RemoteOpenPortalClient:
         self, project: structure_models.Project
     ) -> openportal.ProjectIdentifier:
         if project is None:
-            raise openportal.OpenPortalOtherError("Project cannot be None")
+            raise exceptions.OpenPortalOtherError("Project cannot be None")
 
         project_shortname = self._get_project_shortname(project)
 
         if project_shortname is None or not project_shortname.strip():
             logger.error(
-                f"Empty project_shortname for allocation: {allocation} - cannot create in OpenPortal"
+                f"Empty project_shortname for project: {project} - cannot create in OpenPortal"
             )
-            raise openportal.OpenPortalOtherError(
-                f"Empty project_shortname for allocation. Please set a short name for {allocation.project}"
+            raise exceptions.OpenPortalOtherError(
+                f"Empty project_shortname for project. Please set a short name for {project}"
             )
 
         return self._to_project_identifier(project_shortname)
 
     def add_project(
-        self, project: openportal.ProjectIdentifier, details: openportal.ProjectDetails
+        self, project: openportal.ProjectIdentifier, details: openportal.AwardDetails
     ) -> openportal.ProjectMapping:
         """
         Tell OpenPortal to create a project with the specified name.
@@ -205,7 +163,7 @@ class RemoteOpenPortalClient:
     def update_project(
         self,
         project: openportal.ProjectIdentifier,
-        details: openportal.ProjectDetails,
+        details: openportal.AwardDetails,
     ) -> openportal.ProjectMapping:
         """
         Update the project with the specified name and details.
@@ -308,7 +266,7 @@ class RemoteOpenPortalClient:
     ) -> openportal.AwardDetails:
         """
         Fetch the current AwardDetails for the given project from the remote portal.
-        Raises openportal.OpenPortalError on failure.
+        Raises exceptions.OpenPortalError on failure.
         """
         project = self._to_project_identifier(project)
         return self.run(f"{self.destination()} get_award {project}")
@@ -341,11 +299,11 @@ class RemoteOpenPortalClient:
         # Give the job another 100ms to finish...
         if not op_job.wait(100):
             logger.error(f"Job {cmd_label} timed out - skipping!")
-            raise openportal.OpenPortalError(f"Job '{cmd_label}' timed out - skipping!")
+            raise exceptions.OpenPortalError(f"Job '{cmd_label}' timed out - skipping!")
 
         if op_job.is_error:
             logger.error(f"Job {cmd_label} has failed: {op_job.error_message}")
-            raise openportal.convert_to_openportal_error(op_job.error_message)
+            raise exceptions.convert_to_openportal_error(op_job.error_message)
         else:
             logger.debug(f"Job finished: {cmd_label} - SUCCESS")
             return op_job.result

@@ -3,17 +3,23 @@ import logging
 from django.db import models as django_models
 from django.db import transaction
 from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers, status
 from rest_framework.reverse import reverse
 
 from waldur_mastermind.common import utils as common_utils
 from waldur_mastermind.marketplace import models, signals
 from waldur_mastermind.marketplace.callbacks import (
+    apply_new_options,
     resource_creation_succeeded,
     resource_update_failed,
     resource_update_succeeded,
 )
-from waldur_mastermind.marketplace.utils import parse_date, validate_limits
+from waldur_mastermind.marketplace.utils import (
+    derived_limit_inputs,
+    parse_date,
+    validate_limits,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -185,11 +191,24 @@ class AbstractUpdateResourceProcessor(BaseOrderProcessor):
 
     def validate_order(self, request):
         if self.is_update_limit_order() or self.is_renewal_order():
-            # For both limit updates and renewals, we must validate the final limits.
-            validate_limits(
+            # For both limit updates and renewals, we must validate the final
+            # limits. Every such order passes here before it is priced and
+            # saved, so the limits the server derives are stored on it here.
+            resource = self.order.resource
+            attributes = fallback = None
+            new_options = self.order.attributes.get("new_options")
+            if new_options:
+                # The order changes a formula input: derive from the new
+                # value, not the one the resource still holds.
+                attributes = derived_limit_inputs(resource, new_options)
+                fallback = resource.limits
+            self.order.limits = validate_limits(
                 self.order.limits,
                 self.order.offering,
-                self.order.resource,
+                resource,
+                plan=self.order.plan,
+                attributes=attributes,
+                fallback=fallback,
             )
             return
 
@@ -227,6 +246,71 @@ class AbstractUpdateResourceProcessor(BaseOrderProcessor):
         """
         Unified handler for processing both renewals and limit updates.
         """
+        # Validate renewal duration constraints from the offering component
+        if is_renewal:
+            raw_extension_months = self.order.attributes.get("extension_months")
+            if raw_extension_months is not None:
+                try:
+                    extension_months = int(raw_extension_months)
+                except (TypeError, ValueError):
+                    extension_months = None
+            else:
+                extension_months = None
+            if extension_months is not None:
+                resource = self.order.resource
+                for component in resource.offering.components.filter(is_prepaid=True):
+                    min_dur = component.min_renewal_duration
+                    max_dur = component.max_renewal_duration
+                    step = component.renewal_duration_step or 1
+
+                    if min_dur is not None and extension_months < min_dur:
+                        signals.resource_limit_update_failed.send(
+                            sender=resource.__class__,
+                            order=self.order,
+                            error_message=_(
+                                "Renewal of {d} months is less than the minimum "
+                                "of {min} months for component '{name}'."
+                            ).format(
+                                d=extension_months,
+                                min=min_dur,
+                                name=component.name,
+                            ),
+                        )
+                        return
+
+                    if max_dur is not None and extension_months > max_dur:
+                        signals.resource_limit_update_failed.send(
+                            sender=resource.__class__,
+                            order=self.order,
+                            error_message=_(
+                                "Renewal of {d} months exceeds the maximum "
+                                "of {max} months for component '{name}'."
+                            ).format(
+                                d=extension_months,
+                                max=max_dur,
+                                name=component.name,
+                            ),
+                        )
+                        return
+
+                    if step > 1:
+                        base = min_dur or 0
+                        if (extension_months - base) % step != 0:
+                            signals.resource_limit_update_failed.send(
+                                sender=resource.__class__,
+                                order=self.order,
+                                error_message=_(
+                                    "Renewal of {d} months is not a valid step for "
+                                    "component '{name}' (step={step}, base={base})."
+                                ).format(
+                                    d=extension_months,
+                                    name=component.name,
+                                    step=step,
+                                    base=base,
+                                ),
+                            )
+                            return
+
         try:
             # The underlying `update_limits_process` method in the plugin-specific
             # processor will handle the backend call. It might need to be
@@ -252,6 +336,12 @@ class AbstractUpdateResourceProcessor(BaseOrderProcessor):
                 # Update limits for both renewals and limit updates
                 resource.limits = self.order.limits
 
+                # A changed formula input is ordered with the limits it
+                # derives; the new value is applied with them.
+                new_options = self.order.attributes.get("new_options")
+                if new_options:
+                    apply_new_options(resource, new_options)
+
                 if is_renewal:
                     # For renewals, also update end_date and history
                     new_end_date_str = self.order.attributes.get("new_end_date")
@@ -270,7 +360,9 @@ class AbstractUpdateResourceProcessor(BaseOrderProcessor):
                             "new_limits": resource.limits,
                             "old_end_date": self.order.attributes.get("old_end_date"),
                             "new_end_date": new_end_date_str,
-                            "cost": self.order.attributes.get("renewal_cost"),
+                            "cost": float(self.order.cost)
+                            if self.order.cost is not None
+                            else None,
                         }
                     )
                     resource.attributes["renewal_history"] = history
@@ -281,12 +373,6 @@ class AbstractUpdateResourceProcessor(BaseOrderProcessor):
                 sender=self.order.resource.__class__,
                 order=self.order,
             )
-        else:
-            # If the operation is asynchronous, just set the state to updating.
-            # The changes will be applied later by a callback or webhook.
-            with transaction.atomic():
-                self.order.resource.set_state_updating()
-                self.order.resource.save(update_fields=["state"])
 
     def _process_plan_switch(self, user):
         """
@@ -300,43 +386,30 @@ class AbstractUpdateResourceProcessor(BaseOrderProcessor):
         done = self.send_request(user)
 
         if done:
-            with transaction.atomic():
-                if self.order.resource.plan != self.order.plan:
-                    logger.info(
-                        f"Changing plan of a resource {self.order.resource.name} "
-                        f"from {self.order.resource.plan} to {self.order.plan}. "
-                        f"Order ID: {self.order.pk}"
-                    )
-                    self.order.resource.plan = self.order.plan
-                    self.order.resource.save(update_fields=["plan"])
-
-                self.order.complete()
-                self.order.save(update_fields=["state"])
-        else:
-            with transaction.atomic():
-                self.order.resource.set_state_updating()
-                self.order.resource.save(update_fields=["state"])
+            try:
+                resource_update_succeeded(self.order.resource)
+            except Exception as e:
+                self.order.error_message = str(e)
+                self.order.save(update_fields=["error_message"])
+                resource_update_failed(self.order.resource)
+                logger.error(
+                    f"Error switching plan for resource {self.order.resource.name}. "
+                    f"Order ID: {self.order.pk}. "
+                    f"Exception: {e}."
+                )
 
     def _process_options_update(self, user):
         """
         Process an UPDATE order for resource options.
+
+        Options handling is delegated to resource_update_succeeded which:
+        - Locks the resource with select_for_update() for atomic updates
+        - Updates options from order.attributes["new_options"]
+        - Sets resource state to OK
+        - Marks order as DONE
         """
         try:
-            new_options = self.order.attributes.get("new_options", {})
-
-            with transaction.atomic():
-                current_options = self.order.resource.options or {}
-                current_options.update(new_options)
-                self.order.resource.options = current_options
-                self.order.resource.save(update_fields=["options"])
-
-                resource_update_succeeded(self.order.resource)
-
-                logger.info(
-                    f"Updated options for resource {self.order.resource.name} "
-                    f"Order ID: {self.order.pk}"
-                )
-
+            resource_update_succeeded(self.order.resource)
         except Exception as e:
             # Set error message on order before calling callback
             self.order.error_message = str(e)
@@ -435,9 +508,7 @@ class AbstractDeleteResourceProcessor(BaseOrderProcessor):
                 self.order.complete()
                 self.order.save(update_fields=["state"])
         else:
-            with transaction.atomic():
-                self.order.resource.set_state_terminating()
-                self.order.resource.save(update_fields=["state"])
+            pass
 
 
 class DeleteScopedResourceProcessor(AbstractDeleteResourceProcessor):

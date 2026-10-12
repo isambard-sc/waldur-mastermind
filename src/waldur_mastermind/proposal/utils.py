@@ -1,684 +1,625 @@
+import datetime
 import logging
-from datetime import datetime, timedelta
+import uuid
+from collections import Counter
 from typing import cast
 
+from constance import config
+from dateutil.relativedelta import relativedelta
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
-from django.db.models import OuterRef
+from django.utils import timezone
+from rest_framework import serializers
 
-from waldur_core.core.utils import SubqueryCount, get_system_robot
+from waldur_core.core import utils as core_utils
+from waldur_core.core.fields import StringUUID
+from waldur_core.core.models import NAME_LENGTH
+from waldur_core.core.utils import get_system_robot
+from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import permissions as marketplace_permissions
+from waldur_mastermind.marketplace import utils as marketplace_utils
+from waldur_mastermind.marketplace.enums import OrderStates
+from waldur_mastermind.proposal import award_ids
+from waldur_mastermind.proposal import event_publishing
 from waldur_mastermind.proposal import models as proposal_models
-from waldur_mastermind.proposal import tasks
 from waldur_mastermind.proposal.enums import (
-    ProposalStates,
+    AllocationTimes,
+    AssignmentItemStatuses,
+    BulkRoundCadence,
+    CallStates,
+    OrderAuthors,
+    ProposalDisclosureLevels,
     RequestedOfferingStates,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _scramble_sequence_number(n: int) -> int:
+def requested_months(
+    requested_resource: proposal_models.RequestedResource,
+) -> int | None:
+    """How many whole months the request asks for, or None when it names none.
+
+    The length is the contract. ``attributes.end_date`` is the older form of the
+    same answer, kept for requests written before the form asked for months, and
+    measured from the day that request was created because that is the day its
+    date was computed from.
     """
-    Scramble a sequence number using Linear Congruential Generator (LCG).
+    attributes = requested_resource.attributes or {}
 
-    This creates a bijective (one-to-one) mapping that makes sequential
-    numbers appear random while remaining deterministic and reversible.
-    Maps integers from 0-9999999 to other integers in the same range.
-
-    Uses LCG parameters chosen for good distribution over 7-digit range:
-    - Modulus: 10000000 (our range)
-    - Multiplier: 2743019 (coprime with modulus)
-    - Increment: 4788887 (odd number for full period)
-
-    Args:
-        n: Sequence number from 0 to 9999999
-
-    Returns:
-        Scrambled sequence number from 0 to 9999999
-
-    Example:
-        >>> _scramble_sequence_number(0)
-        4788887
-        >>> _scramble_sequence_number(1)
-        7531906
-        >>> _scramble_sequence_number(2)
-        274925
-    """
-    # LCG parameters for 10 million range
-    modulus = 10000000  # Our range (0-9999999)
-    multiplier = 2743019  # Carefully chosen for good distribution
-    increment = 4788887  # Odd number ensures full period
-
-    # Apply LCG formula: (a * n + c) mod m
-    scrambled = (multiplier * n + increment) % modulus
-    return scrambled
-
-
-def _unscramble_sequence_number(scrambled: int) -> int:
-    """
-    Reverse the scrambling to get original sequence number.
-
-    This inverts the LCG transformation using modular multiplicative inverse.
-    Useful for debugging or verification.
-
-    Args:
-        scrambled: Scrambled sequence number from 0 to 9999999
-
-    Returns:
-        Original sequence number from 0 to 9999999
-
-    Example:
-        >>> _unscramble_sequence_number(4788887)
-        0
-        >>> _unscramble_sequence_number(7531906)
-        1
-    """
-    modulus = 10000000
-    multiplier = 2743019
-    increment = 4788887
-
-    # Calculate modular multiplicative inverse of multiplier
-    # Using extended Euclidean algorithm
-    inv_multiplier = pow(multiplier, -1, modulus)
-
-    # Reverse LCG: n = (scrambled - c) * a^(-1) mod m
-    original = (inv_multiplier * (scrambled - increment)) % modulus
-    return original
-
-
-def generate_proposal_id(
-    sequence_number: int,
-    proposal_version: int = 1,
-    year: int | None = None,
-    scramble: bool = True,
-) -> str:
-    """
-    Generate a unique proposal ID in the format: YYYV-NNNN-NNNNC-V
-
-    Format breakdown:
-    - YYY: Last 3 digits of the year (e.g., 025 for 2025)
-    - V: Scheme version (always 1)
-    - NNNN-NNNN: 7-digit sequence number with hyphen separator (0000-000 to 9999-999)
-    - C: Checksum digit (0-9) calculated using Luhn algorithm
-    - V: Proposal version (1, 2, 3, etc.)
-
-    The sequence number is scrambled using LCG to avoid revealing
-    sequential patterns (0, 1, 2, etc.). This is reversible and bijective.
-
-    Args:
-        sequence_number: Integer from 0 to 9999999 representing the proposal sequence
-        proposal_version: Version of this proposal (defaults to 1, minimum 1)
-        year: Year to use (defaults to current year)
-        scramble: Whether to scramble the sequence number (default True)
-
-    Returns:
-        Formatted proposal ID string (e.g., "0251-4788-8877-1")
-
-    Raises:
-        ValueError: If sequence_number is out of range or proposal_version is less than 1
-
-    Example:
-        >>> generate_proposal_id(0, proposal_version=1)
-        '0251-4788-8877-1'  # Scrambled from 0 -> 4788887
-        >>> generate_proposal_id(1, proposal_version=1)
-        '0251-7531-9069-1'  # Scrambled from 1 -> 7531906
-    """
-    # Validate inputs
-    if not 0 <= sequence_number <= 9999999:
-        raise ValueError("sequence_number must be between 0 and 9999999")
-
-    if proposal_version < 1:
-        raise ValueError("proposal_version must be at least 1")
-
-    # Use current year if not provided
-    if year is None:
-        year = datetime.now().year
-
-    # Extract last 3 digits of year
-    year_suffix = year % 1000  # e.g., 2025 -> 25, then we'll format as 025
-
-    # Scheme version is always 1
-    scheme_version = 1
-
-    # Scramble the sequence number to avoid obvious patterns
-    if scramble:
-        display_sequence = _scramble_sequence_number(sequence_number)
-    else:
-        display_sequence = sequence_number
-
-    # Format the sequence number as 7 digits with hyphen: NNNN-NNN
-    sequence_str = f"{display_sequence:07d}"
-    sequence_formatted = f"{sequence_str[:4]}-{sequence_str[4:]}"
-
-    # Calculate checksum using Luhn algorithm on the digits
-    # Combine year, scheme version, and sequence number for checksum calculation
-    checksum_input = f"{year_suffix:03d}{scheme_version}{sequence_str}"
-    checksum = _calculate_luhn_checksum(checksum_input)
-
-    # Build the final ID
-    proposal_id = f"{year_suffix:03d}{scheme_version}-{sequence_formatted}{checksum}-{proposal_version}"
-
-    return proposal_id
-
-
-def _calculate_luhn_checksum(digits: str) -> int:
-    """
-    Calculate Luhn checksum digit for the given string of digits.
-
-    The Luhn algorithm is a checksum formula used to validate identification numbers.
-    It works by:
-    1. Starting from the rightmost digit, double every second digit
-    2. If doubling results in a two-digit number, subtract 9
-    3. Sum all digits
-    4. The checksum is (10 - (sum % 10)) % 10
-
-    Args:
-        digits: String of digits to calculate checksum for
-
-    Returns:
-        Single digit checksum (0-9)
-
-    Example:
-        >>> _calculate_luhn_checksum("0251234567")
-        8
-    """
-
-    def luhn_double(digit: int) -> int:
-        """Double a digit and subtract 9 if result is >= 10."""
-        doubled = digit * 2
-        return doubled - 9 if doubled >= 10 else doubled
-
-    # Convert string to list of integers
-    digit_list = [int(d) for d in digits]
-
-    # Process from right to left, doubling every second digit
-    total = 0
-    for i, digit in enumerate(reversed(digit_list)):
-        if i % 2 == 1:  # Every second digit from the right
-            total += luhn_double(digit)
-        else:
-            total += digit
-
-    # Calculate checksum
-    checksum = (10 - (total % 10)) % 10
-    return checksum
-
-
-def migrate_proposal_and_project_ids():
-    """
-    Migrate existing proposals to use new ID format and sync project slugs.
-
-    This function:
-    1. Finds all proposals without the new ID format
-    2. Generates unique IDs for them using ProposalIDGenerator
-    3. If proposal is accepted and has a project, copies slug to project
-
-    Safe to run multiple times - only processes proposals without new format.
-
-    Returns:
-        Dict with counts of proposals and projects updated
-    """
-    from waldur_mastermind.proposal.models import Proposal, ProposalIDGenerator
-
-    # Regex pattern to match new ID format: YYYV-NNNN-NNNNC-V
-    # Example: 0251-4788-8877-1
-    import re
-
-    new_id_pattern = re.compile(r"^\d{4}-\d{4}-\d{4}-\d+$")
-
-    proposals_updated = 0
-    projects_updated = 0
-    errors = []
-
-    # Get all proposals
-    all_proposals = Proposal.objects.all().order_by("created")
-
-    logger.info(f"Starting migration of {all_proposals.count()} proposals")
-
-    for proposal in all_proposals:
+    stored_length = attributes.get("prepaid_duration_months")
+    if stored_length is not None:
         try:
-            # Check if proposal already has new format
-            if proposal.slug and new_id_pattern.match(proposal.slug):
-                # Already has new format - check if project needs updating
-                if proposal.project and proposal.project.slug != proposal.slug:
-                    old_project_slug = proposal.project.slug
-                    proposal.project.slug = proposal.slug
-                    proposal.project.save(update_fields=["slug"])
-                    projects_updated += 1
-                    logger.info(
-                        f"Updated project {proposal.project.id} slug: "
-                        f"{old_project_slug} -> {proposal.slug}"
-                    )
-                continue
-
-            # Proposal needs new ID - get year from creation date
-            year = proposal.created.year
-
-            # Get or create generator for this year
-            generator, created = ProposalIDGenerator.objects.get_or_create(year=year)
-
-            if created:
-                logger.info(f"Created ProposalIDGenerator for year {year}")
-
-            # Generate new ID with retry logic
-            max_retries = 100
-            new_slug = None
-
-            for attempt in range(max_retries):
-                sequence_number = generator.increment_count()
-                proposal_id = generate_proposal_id(
-                    sequence_number, proposal_version=1, year=year
-                )
-
-                # Check uniqueness
-                if (
-                    not Proposal.objects.filter(slug=proposal_id)
-                    .exclude(pk=proposal.pk)
-                    .exists()
-                ):
-                    new_slug = proposal_id
-                    break
-
-            if not new_slug:
-                error_msg = (
-                    f"Failed to generate unique ID for proposal "
-                    f"{proposal.pk} after {max_retries} attempts"
-                )
-                logger.error(error_msg)
-                errors.append(error_msg)
-                continue
-
-            # Update proposal slug using queryset update to avoid triggering save()
-            # and updating the modified timestamp
-            old_slug = proposal.slug
-            Proposal.objects.filter(pk=proposal.pk).update(slug=new_slug)
-            proposals_updated += 1
-
-            logger.info(
-                f"Updated proposal {proposal.pk} slug: {old_slug} -> {new_slug}"
-            )
-
-            # If proposal has a project, update project slug too
-            if proposal.project:
-                old_project_slug = proposal.project.slug
-                proposal.project.slug = new_slug
-                proposal.project.save(update_fields=["slug"])
-                projects_updated += 1
-                logger.info(
-                    f"Updated project {proposal.project.id} slug: "
-                    f"{old_project_slug} -> {new_slug}"
-                )
-
-        except Exception as e:
-            error_msg = f"Error migrating proposal {proposal.pk}: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            errors.append(error_msg)
-
-    result = {
-        "proposals_processed": all_proposals.count(),
-        "proposals_updated": proposals_updated,
-        "projects_updated": projects_updated,
-        "errors": errors,
-    }
-
-    logger.info(
-        f"Migration complete: {proposals_updated} proposals updated, "
-        f"{projects_updated} projects updated, {len(errors)} errors"
-    )
-
-    return result
-
-
-def get_available_reviewer(proposal: proposal_models.Proposal):
-    reviewer_ids = proposal.review_set.values_list("reviewer_id", flat=True)
-    reviews = proposal_models.Review.objects.filter(
-        reviewer_id=OuterRef("pk"), proposal__round__call=proposal.round.call
-    ).exclude(state=proposal_models.Review.States.REJECTED)
-    available_reviewer = (
-        proposal.round.call.reviewers.exclude(id__in=reviewer_ids)
-        .annotate(reviewers_count=SubqueryCount(reviews))
-        .order_by("reviewers_count")
-    )
-    number_of_needed_reviewers = max(
-        0,
-        proposal.round.minimum_number_of_reviewers
-        or 0
-        - proposal.review_set.exclude(
-            state=proposal_models.Review.States.REJECTED
-        ).count(),
-    )
-    return available_reviewer[:number_of_needed_reviewers]
-
-
-def process_proposals_pending_reviewers(proposal: proposal_models.Proposal):
-    logger.warning(f"Skipping processing proposal {proposal.uuid} for reviewers")
-    return proposal
-
-    for reviewer in get_available_reviewer(proposal):
-        proposal_models.Review.objects.create(reviewer=reviewer, proposal=proposal)
-
-    # Only update state and send notification if the state is actually changing
-    if proposal.state != ProposalStates.IN_REVIEW:
-        old_state = proposal.state
-        proposal.state = ProposalStates.IN_REVIEW
-        tasks.notify_user_about_proposal_state_update.delay(
-            proposal.uuid, old_state, proposal.state
+            months = int(stored_length)
+        except (TypeError, ValueError):
+            months = 0
+        if months > 0:
+            return months
+        logger.warning(
+            "Requested resource %s carries an unusable subscription length %r; "
+            "falling back to its end date.",
+            requested_resource.uuid,
+            stored_length,
         )
-        return proposal.save()
-    return proposal
+
+    if not attributes.get("end_date"):
+        return None
+
+    try:
+        requested_end = marketplace_utils.parse_date(attributes["end_date"])
+    except serializers.ValidationError:
+        logger.warning(
+            "Requested resource %s carries an unparseable end date %r; the "
+            "allocated resource is left without one.",
+            requested_resource.uuid,
+            attributes["end_date"],
+        )
+        return None
+    if requested_end is None:
+        return None
+
+    return core_utils.calculate_duration_months(
+        requested_resource.created.date(), requested_end
+    )
 
 
-def allocate_proposal(proposal: proposal_models.Proposal):
+def _is_prepaid(requested_resource: proposal_models.RequestedResource) -> bool:
+    """Whether this request buys a subscription at all.
+
+    The stored length means nothing on an offering with no prepaid component —
+    only such an offering is bought by the month.
+    """
+    return requested_resource.requested_offering.offering.components.filter(
+        is_prepaid=True
+    ).exists()
+
+
+def get_proposal_duration_months(proposal: proposal_models.Proposal) -> int | None:
+    """The longest subscription the proposal asks for, in whole months.
+
+    The project cannot end before its longest subscription does. Returns None
+    when the proposal asks for no subscription at all — a call may accept
+    prepaid and non-prepaid offerings side by side, and a proposal that requested
+    only the latter has no length to derive anything from.
+    """
+    lengths = [
+        months
+        for requested_resource in proposal.requestedresource_set.filter(
+            requested_offering__state=RequestedOfferingStates.ACCEPTED
+        ).select_related("requested_offering__offering")
+        if _is_prepaid(requested_resource)
+        and (months := requested_months(requested_resource)) is not None
+    ]
+    return max(lengths) if lengths else None
+
+
+def allocation_start_date(
+    proposal_round: proposal_models.Round,
+) -> datetime.date | None:
+    """The day allocation is scheduled for, where the call dates it forward.
+
+    None for a call that allocates on decision: the project then starts the
+    day it is created. ``Project.start_date`` is a DateField and the round's
+    ``allocation_date`` a DateTimeField, hence the coercion.
+    """
+    # Allocation timing is a call-level policy on the allocation_decision step;
+    # the concrete date stays per-round.
+    allocation_step = proposal_models.CallWorkflowStep.objects.filter(
+        call=proposal_round.call, step="allocation_decision"
+    ).first()
+    allocation_time = (
+        allocation_step.allocation_time
+        if allocation_step
+        else AllocationTimes.ON_DECISION
+    )
+    if allocation_time == AllocationTimes.FIXED_DATE and proposal_round.allocation_date:
+        return proposal_round.allocation_date.date()
+    return None
+
+
+def max_prepaid_duration_months(
+    call: proposal_models.Call, anchor: datetime.date
+) -> int | None:
+    """The longest subscription, in whole months, the call's fixed duration admits.
+
+    A call's fixed duration is the length of every project it awards, so a
+    subscription requested under it may not outlast it. Months and days are
+    only comparable once resolved against a date, so the answer depends on the
+    anchor: the largest N with ``anchor + N months <= anchor + fixed days``.
+    None when the call fixes nothing.
+    """
+    fixed_days = call.fixed_duration_in_days
+    if not fixed_days:
+        return None
+
+    project_end = anchor + datetime.timedelta(days=fixed_days)
+    months = 0
+    while anchor + relativedelta(months=months + 1) <= project_end:
+        months += 1
+    return months
+
+
+def project_end_date(
+    proposal: proposal_models.Proposal, start_date: datetime.date
+) -> datetime.date | None:
+    """When the allocated project should end, measured from its own start.
+
+    The call's fixed duration is the length of every project it awards, so it
+    decides whenever it is set — the subscriptions requested under it are
+    bounded by it (see :func:`max_prepaid_duration_months`) and clamped to the
+    project by :func:`_requested_end_date`. The longest subscription sets the
+    length only for a call that fixes none. The two units are never converted
+    into each other — a length in months and a length in days are only
+    comparable once each has been resolved against a date, because a day count
+    is true only relative to the anchor it was measured from.
+    """
+    fixed_days = proposal.round.call.fixed_duration_in_days
+    if fixed_days:
+        return start_date + datetime.timedelta(days=fixed_days)
+
+    months = get_proposal_duration_months(proposal)
+    if months is not None:
+        return start_date + relativedelta(months=months)
+
+    return None
+
+
+def requested_duration_label(proposal: proposal_models.Proposal) -> str | None:
+    """The project length as the applicant can be told it, unit included.
+
+    In order of truthfulness: what was granted (once allocated), the call's
+    fixed length, and the subscription the proposal asks for. Months
+    and days are never converted into each other (see :func:`project_end_date`),
+    so the unit travels with the number. None when nothing is known — the
+    template drops the line rather than printing "None".
+    """
+    granted_days = granted_duration_in_days(proposal)
+    if granted_days:
+        return f"{granted_days} days"
+
+    fixed_days = proposal.round.call.fixed_duration_in_days
+    if fixed_days:
+        return f"{fixed_days} days"
+
+    months = get_proposal_duration_months(proposal)
+    if months:
+        return "1 month" if months == 1 else f"{months} months"
+
+    return None
+
+
+def granted_duration_in_days(
+    proposal: proposal_models.Proposal,
+) -> int | None:
+    """How long the granted project runs, in whole days.
+
+    The counterpart of :func:`project_end_date`: that decides when the project
+    ends, this reads the decision back so the applicant can be told.
+
+    Deliberately what was *granted*, not what was asked for: the applicant is
+    not asked for a length at all any more (the retired
+    ``Proposal.duration_in_days`` recorded one), and the request's own length —
+    a subscription in months — is resolved against a date at allocation.
+
+    Returns None when there is nothing truthful to say — no project yet, or a
+    project with no end date, which is a grant that does not expire. The
+    template drops the line rather than printing a blank.
+    """
+    project = proposal.project
+    if project is None or project.end_date is None:
+        return None
+
+    # The anchor allocation itself measured from: the project's own start where
+    # it has one, otherwise the day it was created (allocate_proposal passes
+    # `start_date or today` to project_end_date and stores start_date as-is).
+    start_date = project.start_date or timezone.localdate(project.created)
+    days = (project.end_date - start_date).days
+    return days if days > 0 else None
+
+
+def _allocated_resource_name(
+    project_name: str, offering_name: str, index: int | None = None
+) -> str:
+    """Name a granted resource after its project and offering.
+
+    The offering tells apart the resources of one allocation; a request for an
+    offering already requested is numbered. The project part is cut to fit, as
+    a project name may be longer than a resource name.
+    """
+    suffix = f" - {offering_name}" + (f" ({index})" if index else "")
+    return (project_name[: max(0, NAME_LENGTH - len(suffix))] + suffix)[:NAME_LENGTH]
+
+
+def _requested_end_date(
+    requested_resource: proposal_models.RequestedResource,
+    project: structure_models.Project,
+    today: datetime.date,
+) -> datetime.date | None:
+    """The end date for the allocated resource, anchored on its project's start.
+
+    A resource request names a length, not a date: the day the resource is
+    granted is unknown while the proposal is being written and reviewed. Running
+    the grant for that many months from the day allocation is scheduled for
+    keeps both the period the applicant chose and the cost the reviewer priced,
+    where an absolute date would quietly deliver a shorter grant and invoice less
+    than the approved figure — and, once review outlasts the period, would have
+    passed altogether, which ``validate_end_date`` rejects outright.
+
+    Returns None when no period was requested, or when the anchored date breaks
+    the offering's own termination rules — allocation must not fail over a date,
+    so the resource is left open and the operator gets a warning.
+    """
+    months = requested_months(requested_resource)
+    if months is None:
+        return None
+
+    # Measured from the day allocation is scheduled for, not from the day the
+    # decision happened to be taken. A call that dates allocation forward would
+    # otherwise spend the whole interval before the project even opens: a grant
+    # approved in August and allocated in December expired in the following
+    # August rather than the following December. What happens after that date —
+    # the provider approving the order, the backend taking its time — eats into
+    # the usable period without moving it.
+    anchor = project.start_date or today
+    end_date = anchor + relativedelta(months=months)
+
+    # Clamped, not left to be rejected. ``validate_end_date`` raises when a
+    # resource outlasts its project, and the handler below turns any rejection
+    # into "no end date at all" — which bills a prepaid resource for a single
+    # month. A resource that would outrun its project should be shortened to it,
+    # not silently un-dated.
+    if project.end_date and end_date > project.end_date:
+        logger.info(
+            "End date %s for requested resource %s is capped at the project's "
+            "own end date %s.",
+            end_date,
+            requested_resource.uuid,
+            project.end_date,
+        )
+        end_date = project.end_date
+
+    offering = requested_resource.requested_offering.offering
+    try:
+        return marketplace_utils.validate_end_date(
+            offering,
+            today,
+            end_date,
+            # The offering's own termination offset is measured from the same
+            # anchor the period is, or a date only N months from the project's
+            # start reads as N months plus the wait before it. The marketplace's
+            # own path says the same thing in validate_end_date_for_resource.
+            start_date=project.start_date,
+            project_end_date=project.end_date,
+        )
+    except serializers.ValidationError as exc:
+        logger.warning(
+            "End date %s for requested resource %s was rejected by offering %s "
+            "(%s); the allocated resource is left without one, so prepaid "
+            "components are charged for a single month.",
+            end_date,
+            requested_resource.uuid,
+            offering.uuid,
+            exc.detail,
+        )
+        return None
+
+
+def resolve_order_author(proposal: proposal_models.Proposal, project):
+    """Whose name the orders for this proposal's granted resources carry.
+
+    The call review authorised the spend; this only decides who the resulting
+    orders are attributed to. That matters because it is who the service desk
+    talks to for an offering fulfilled by raising a helpdesk ticket, and who
+    Waldur addresses its order mail to -- neither of which a robot can be.
+
+    It grants nothing: the orders are still carried out with system authority
+    (``marketplace_utils.get_order_processing_user``), and reading the ticket
+    in Waldur still needs a role on the project.
+
+    A configured choice has to land on somebody who can actually be reached,
+    since being told about the order is the whole point of naming them; an
+    unreachable one is skipped in favour of the applicant, and a proposal
+    with no active applicant leaves the robot. The applicant is taken as they
+    are -- they authored the proposal whether or not they have an address,
+    and ``marketplace_support.resolve_issue_caller`` still finds somebody on
+    the project to raise the ticket for.
+    """
+    call = proposal.round.call
+    choice = call.order_author
+
+    if choice == OrderAuthors.APPLICANT:
+        author = proposal.created_by
+    elif choice == OrderAuthors.SPECIFIC_USER:
+        author = _reachable(call.order_author_user)
+    elif choice == OrderAuthors.PROJECT_MANAGER:
+        author = _first_reachable_holder(project, RoleEnum.PROJECT_MANAGER)
+    elif choice == OrderAuthors.CALL_MANAGER:
+        author = _first_reachable_holder(call, RoleEnum.CALL_MANAGER)
+    else:
+        author = None
+
+    if author is not None and author.is_active:
+        return author
+
+    if choice != OrderAuthors.APPLICANT:
+        # A call configured to attribute its orders somewhere specific and
+        # then quietly not doing so is worth a line: shared mailboxes get
+        # closed, and the fallback is invisible from the settings page.
+        logger.warning(
+            "Call %s attributes its orders to '%s', but nobody reachable "
+            "holds it. Falling back to the applicant for proposal %s.",
+            call.uuid.hex,
+            choice,
+            proposal.uuid.hex,
+        )
+        applicant = proposal.created_by
+        if applicant is not None and applicant.is_active:
+            return applicant
+
+    logger.warning(
+        "Proposal %s has no active applicant to attribute its orders to; "
+        "they are recorded against the system robot.",
+        proposal.uuid.hex,
+    )
+    return get_system_robot()
+
+
+def _reachable(user):
+    """The user, if they can be told about an order in their name, else None."""
+    if user and user.is_active and user.email:
+        return user
+    return None
+
+
+def _first_reachable_holder(scope, role_name):
+    """First active holder of ``role_name`` on ``scope`` with an email, or None.
+
+    Ordered by id so the pick is stable: a project with several managers must
+    not attribute consecutive orders to different people. ``get_users`` reads
+    through ``User.objects``, which already excludes deactivated accounts.
+    """
+    return get_users(scope, role_name).exclude(email="").order_by("id").first()
+
+
+def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
+    # Idempotency guard: a proposal is provisioned exactly once. Without this a
+    # second allocation (e.g. re-driving the workflow, or a stale caller) would
+    # create a duplicate project + resources + orders. The workflow terminal
+    # already checks project_id, but the guard belongs here so no caller can
+    # double-provision.
+    if proposal.project is not None:
+        logger.info(
+            "Proposal %s is already allocated to project %s; skipping.",
+            proposal.uuid,
+            proposal.project,
+        )
+        return
     proposal_round = proposal.round
     name = proposal.name
     start_date = None
-    end_date = None
     call_prefix = proposal_round.call.backend_id or proposal_round.call.slug
     project_name = " - ".join(
         [call_prefix, proposal_round.start_time.strftime("%Y-%m-%d"), name]
     )[: structure_models.PROJECT_NAME_LENGTH]
 
-    if (
-        proposal.round.allocation_time
-        == proposal_models.Round.AllocationTimes.FIXED_DATE
-    ):
-        start_date = proposal.round.allocation_date
-    else:
-        # today is the start date
-        start_date = datetime.today().date()
+    start_date = allocation_start_date(proposal_round)
 
-    # Calculate end_date based on duration_in_days and start_date
-    # Priority: call.fixed_duration_in_days > proposal.duration_in_days
-    duration_in_days = None
-    if proposal_round.call.fixed_duration_in_days:
-        duration_in_days = proposal_round.call.fixed_duration_in_days
-    elif proposal.duration_in_days:
-        duration_in_days = proposal.duration_in_days
+    # The project runs for the call's fixed duration, or, for a call that fixes
+    # none, for as long as the longest subscription it holds. Measured from the
+    # project's own start so that a call which
+    # dates allocation forward does not spend the period before it opens.
+    # One reading of the clock for the whole allocation: the project and every
+    # resource in it must be measured from the same day, or a run that crosses
+    # midnight leaves a resource outlasting its own project.
+    today = datetime.date.today()
+    end_date = project_end_date(proposal, start_date or today)
 
-    if duration_in_days and start_date:
-        end_date = start_date + timedelta(days=duration_in_days)
-
-    # need to create a unique short name for the project
-    short_name = f"{call_prefix}_{proposal.uuid}".replace(" ", "").lower()
-
-    # Remove everything except lower-case letters, digits, underscores, hyphens
-    short_name = "".join(c for c in short_name if c.isalnum() or c in ("_", "-"))
-
-    if len(short_name) > 50:
-        short_name = short_name[:50]
-
-    logger.info(f"Start date for project {project_name} is {start_date}.")
-    logger.info(f"End date for project {project_name} is {end_date}.")
-    logger.info(f"Duration in days is {duration_in_days}.")
-    logger.info(
-        f"Copying slug '{proposal.slug}' from proposal to project "
-        f"for consistent tracking."
-    )
-
-    project = structure_models.Project.objects.create(
+    project_fields = dict(
         customer=proposal_round.call.manager.customer,
         name=project_name,
-        description=proposal.project_summary,
         start_date=start_date,
         end_date=end_date,
-        short_name=short_name,
-        slug=proposal.slug,  # Copy slug from proposal for consistent tracking ID
     )
+    # The project carries the proposal's award ID as its slug, set explicitly.
+    # Left empty, SlugMixin would fill it via generate_slug(), which
+    # de-duplicates by appending "-N" -- the same syntax as an award's
+    # follow-on version. A collision suffix and a genuine follow-on award would
+    # then be indistinguishable: 0261-7825-6844-4 could mean "fourth award in
+    # this sequence" or "the generator hit a clash". An explicit slug bypasses
+    # generate_slug() entirely, and the award ID is already unique because
+    # issue_award_id() checked it against every project.
+    #
+    # Only a slug that really is an award ID is carried over: a proposal
+    # created before the flag was turned on has an upstream-style slug, and
+    # its project should get the ordinary one rather than a copy of that.
+    if award_ids.is_enabled() and award_ids.is_award_id(proposal.slug):
+        project_fields["slug"] = proposal.slug
+
+    project = structure_models.Project.objects.create(**project_fields)
     project = cast(structure_models.Project, project)
 
     if start_date:
         logger.info(
-            f"Field start_date of {project} has been changed to "
-            f"{proposal.round.allocation_date}."
+            f"Field start_date of {project} has been changed to {proposal.round.allocation_date}."
         )
-
     if end_date:
         logger.info(
-            f"Field end_date of {project} has been set to {end_date} "
-            f"based on duration of {duration_in_days} days."
+            "Project %s ends on %s, derived from %s.",
+            project,
+            end_date,
+            "the longest requested subscription"
+            if get_proposal_duration_months(proposal) is not None
+            else "the call's fixed duration",
         )
 
     proposal.project = project
+    if approved_by is not None:
+        proposal.approved_by = approved_by
     proposal.save()
 
-    requested_resources = proposal.requestedresource_set.filter(
-        requested_offering__state=RequestedOfferingStates.ACCEPTED
+    # Oldest first, so repeated offerings are numbered in the order requested.
+    requested_resources = list(
+        proposal.requestedresource_set.filter(
+            requested_offering__state=RequestedOfferingStates.ACCEPTED
+        )
+        .select_related("requested_offering__offering")
+        .order_by("created", "id")
     )
+    # Model instances hash and compare by primary key.
+    offering_counts = Counter(
+        requested.requested_offering.offering for requested in requested_resources
+    )
+    offering_seen = Counter()
 
     for mapping in proposal.round.call.proposalprojectrolemapping_set.all():  # type: ignore
-        users = get_users(proposal, mapping.proposal_role)
+        users = get_users(proposal, mapping.proposal_role.name)
         for user in users:
             if mapping.project_role:
-                project.add_user(user, mapping.project_role)
+                project.add_user_or_skip(user, mapping.project_role)
             else:
                 continue
 
-    created_offerings = []
+    # Resolved once for the whole allocation: every order the call places
+    # carries the same author, and the roles it reads were assigned just above.
+    order_author = resolve_order_author(proposal, project)
+    # Whoever accepted the proposal decided on behalf of the call's managing
+    # organisation, which owns the granted project -- so they are the consumer
+    # reviewer. An automatic acceptance passes the robot, as it does for
+    # Proposal.approved_by.
+    consumer_reviewer = approved_by or get_system_robot()
 
     for requested_resource in requested_resources:
+        offering = requested_resource.requested_offering.offering
+        offering_seen[offering] += 1
+        index = offering_seen[offering] if offering_counts[offering] > 1 else None
         with transaction.atomic():
-            # Check for adjustments on this resource - there can only be a single
-            # adjustment per resource
-            adjustment = requested_resource.adjustments.order_by("-created").first()
-            logger.info(f"Latest adjustment: {adjustment}")
-
-            # Skip removed resources
-            if (
-                adjustment
-                and adjustment.action
-                == proposal_models.ProposalResourceAdjustment.Actions.REMOVE
-            ):
-                logger.info(
-                    f"Skipping resource {requested_resource.uuid} due to REMOVE adjustment"
-                )
-                continue
-
-            # Determine effective attributes and limits
-            if (
-                adjustment
-                and adjustment.action
-                == proposal_models.ProposalResourceAdjustment.Actions.MODIFY
-            ):
-                effective_attributes = dict(adjustment.adjusted_attributes)
-                effective_limits = dict(adjustment.adjusted_limits)
-                logger.info(
-                    f"Using adjusted values for resource {requested_resource.uuid}"
-                )
-            else:
-                effective_attributes = dict(requested_resource.attributes)
-                effective_limits = dict(requested_resource.limits)
-
-            if "name" not in effective_attributes:
-                effective_attributes["name"] = str(
-                    requested_resource.requested_offering.offering.name
-                )
-
             attrs = dict(
                 project=project,
-                offering=requested_resource.requested_offering.offering,
+                offering=offering,
                 plan=requested_resource.requested_offering.plan,
-                attributes=effective_attributes,
-                limits=effective_limits,
+                attributes=requested_resource.attributes,
+                limits=requested_resource.limits,
             )
-
-            logger.info(
-                f"Creating resource for requested resource {requested_resource.uuid}"
-            )
-            logger.info(f"Resource attributes: {attrs}")
-
             resource = marketplace_models.Resource(
                 **attrs,
-                name=project.name,
+                name=_allocated_resource_name(project.name, offering.name, index),
             )
+            # Before init_cost: the prepaid multiplier in Plan.get_estimate and
+            # in the invoice item builder both read this field, so setting it
+            # afterwards would price and bill a six-month grant as one month.
+            # The marketplace order path sets it in the same order and says so.
+            resource.end_date = _requested_end_date(requested_resource, project, today)
             resource.init_cost()
             resource.save()
-
-            created_offerings.append(resource.offering.uuid)
 
             order = marketplace_models.Order(
                 **attrs,
                 resource=resource,
-                created_by=get_system_robot(),
+                created_by=order_author,
+                placed_automatically=True,
             )
+            # Hand the purchase order to the order, so the approval gate in
+            # marketplace.permissions is already satisfied. Without this the
+            # applicant supplies it during the proposal and is asked again the
+            # moment the allocation lands.
+            if requested_resource.attachment:
+                # Point at the stored file rather than assigning the FieldFile:
+                # the document is already committed, so this records the same
+                # path without re-uploading a copy.
+                order.attachment.name = requested_resource.attachment.name
+            if requested_resource.purchase_order_reference:
+                order.request_comment = requested_resource.purchase_order_reference
+            # Record the consumer approval up front rather than leaning on a
+            # staff creator to bypass it. Accepting the proposal *is* the
+            # consumer-side decision: the granted project belongs to the call's
+            # managing organisation, so the person who accepted it is deciding
+            # on that organisation's behalf. The stamp has to be on the
+            # unsaved order -- notify_approvers_when_order_is_created reads it
+            # the moment save() fires and owns the routing from there.
+            #
+            # Not when a purchase order is still owed: that control belongs to
+            # the provider, and the gate must be free to hold the order at
+            # PENDING_CONSUMER. The call snapshots the requirement when the
+            # offering is added, so one introduced later reaches existing
+            # calls uncollected.
+            if not marketplace_permissions.order_is_held_for_purchase_order(order):
+                order.consumer_reviewed_by = consumer_reviewer
+                order.consumer_reviewed_at = timezone.now()
             order.init_cost()
             order.save()
 
             requested_resource.resource = resource
             requested_resource.save()
 
-            if "allocation" in effective_attributes:
-                try:
-                    allocation = float(effective_attributes["allocation"])
-                except Exception as e:
-                    logger.warning(f"Invalid allocation value: {e}")
-                    continue
-
-                if allocation >= 0:
-                    options = resource.options or {}
-
-                    if "allocation" in options:
-                        # make sure that the used allocation is reflected in
-                        # the resource options
-                        try:
-                            if float(options["allocation"]) != allocation:
-                                logger.info(
-                                    f"Updating allocation for resource {resource} to {allocation} units"
-                                )
-                                options["allocation"] = allocation
-                                resource.options = options
-                                resource.save(update_fields=["options"])
-                        except Exception as e:
-                            logger.warning(f"Failed to set allocation: {e}")
-                    else:
-                        try:
-                            logger.info(
-                                f"Recording default allocation {allocation} units for resource {resource}"
-                            )
-                            options["allocation"] = allocation
-                            resource.options = options
-                            resource.save(update_fields=["options"])
-                        except Exception as e:
-                            logger.warning(f"Failed to set allocation: {e}")
-
-    # Process ADD adjustments (new resources not in original request)
-    add_adjustments = proposal.resource_adjustments.filter(
-        action=proposal_models.ProposalResourceAdjustment.Actions.ADD
-    )
-
-    logger.info(
-        f"Processing {add_adjustments.count()} ADD adjustments for proposal {proposal.uuid}"
-    )
-
-    for adjustment in add_adjustments:
-        with transaction.atomic():
-            logger.info(f"Creating resource for ADD adjustment {adjustment}")
-            effective_attributes = dict(adjustment.adjusted_attributes)
-            effective_limits = dict(adjustment.adjusted_limits)
-
-            if "name" not in effective_attributes:
-                effective_attributes["name"] = str(
-                    adjustment.call_offering.offering.name
-                )
-
-            attrs = dict(
-                project=project,
-                offering=adjustment.call_offering.offering,
-                plan=adjustment.call_offering.plan,
-                attributes=effective_attributes,
-                limits=effective_limits,
-            )
-
-            logger.info(f"Resource attributes: {attrs}")
-
-            if adjustment.call_offering.offering.uuid in created_offerings:
-                logger.info(
-                    f"Skipping creation of duplicate offering "
-                    f"{adjustment.call_offering.offering.name} "
-                    f"for ADD adjustment {adjustment.uuid}"
-                )
-                continue
-
-            resource = marketplace_models.Resource(
-                **attrs,
-                name=project.name,
-            )
-            resource.init_cost()
-            resource.save()
-
-            created_offerings.append(resource.offering.uuid)
-
-            order = marketplace_models.Order(
-                **attrs,
-                resource=resource,
-                created_by=get_system_robot(),
-            )
-            order.init_cost()
-            order.save()
-
-            if "allocation" in effective_attributes:
-                try:
-                    allocation = float(effective_attributes["allocation"])
-                except Exception as e:
-                    logger.warning(f"Invalid allocation value: {e}")
-                    continue
-
-                if allocation >= 0:
-                    options = resource.options or {}
-
-                    if "allocation" in options:
-                        # make sure that the used allocation is reflected in
-                        # the resource options
-                        try:
-                            if float(options["allocation"]) != allocation:
-                                logger.info(
-                                    f"Updating allocation for resource {resource} to {allocation} units"
-                                )
-                                options["allocation"] = allocation
-                                resource.options = options
-                                resource.save(update_fields=["options"])
-                        except Exception as e:
-                            logger.warning(f"Failed to set allocation: {e}")
-                    else:
-                        try:
-                            logger.info(
-                                f"Recording default allocation {allocation} units for resource {resource}"
-                            )
-                            options["allocation"] = allocation
-                            resource.options = options
-                            resource.save(update_fields=["options"])
-                        except Exception as e:
-                            logger.warning(f"Failed to set allocation: {e}")
-
+            # No second approval here: order.save() above has already fired
+            # notify_approvers_when_order_is_created, and that handler owns the
+            # routing to provider review, PENDING_PROJECT or EXECUTING.
+            # Approving again raised TransitionNotAllowed on orders the handler
+            # had taken to EXECUTING, and queued a duplicate provider
+            # notification for the rest.
             logger.info(
-                f"Created resource from ADD adjustment {adjustment.uuid} "
-                f"for offering {adjustment.call_offering.offering.name}"
+                "Order %s allocated from proposal %s is %s.",
+                order.uuid,
+                proposal.uuid,
+                dict(OrderStates.CHOICES).get(order.state, order.state),
             )
-
-
-def cancel_draft_proposals_in_round(call_round: proposal_models.Round):
-    """Cancel all draft proposals in a round that has ended."""
-    call_round.proposal_set.filter(state=ProposalStates.DRAFT).update(
-        state=ProposalStates.CANCELED
-    )
-
-
-def create_reviews_for_submitted_proposals(call_round: proposal_models.Round):
-    """Create reviews for submitted/in-review proposals in a round."""
-    for proposal in call_round.proposal_set.filter(
-        state__in=(
-            ProposalStates.SUBMITTED,
-            ProposalStates.IN_REVIEW,
-        )
-    ):
-        process_proposals_pending_reviewers(proposal)
 
 
 def process_closed_round(call_round: proposal_models.Round):
-    """Process a closed round: cancel draft proposals and create reviews for submitted ones."""
-    cancel_draft_proposals_in_round(call_round)
-    create_reviews_for_submitted_proposals(call_round)
+    """Process a closed round: cancel draft proposals."""
+    from waldur_mastermind.proposal.enums import ProposalStates
+
+    # Lock the drafts while reading them, so the proposals announced are exactly
+    # the rows updated: a concurrent submit holds the same row lock, and if it
+    # wins the draft is no longer selected here — no bogus draft → canceled.
+    # of=("self",) keeps the lock off the joined call and customer rows.
+    with transaction.atomic():
+        drafts = list(
+            call_round.proposal_set.select_for_update(of=("self",))
+            .filter(state=ProposalStates.DRAFT)
+            .select_related("round__call__manager__customer")
+        )
+        # A bulk update skips post_save, so announce each cancellation explicitly.
+        proposal_models.Proposal.objects.filter(
+            pk__in=[proposal.pk for proposal in drafts]
+        ).update(state=ProposalStates.CANCELED)
+        for proposal in drafts:
+            proposal.state = ProposalStates.CANCELED
+
+    # Announced outside the lock. The rows are committed as canceled by now, so
+    # the announcement is accurate either way, and the dispatcher's per-proposal
+    # consumer matching no longer runs while every draft is held FOR UPDATE --
+    # which is exactly the submit this lock exists to serialise against.
+    # Everything the payloads read is covered by the select_related above, so
+    # nothing is re-fetched here. ATOMIC_REQUESTS is off, so the block above is
+    # the outermost transaction and leaving it really does release the locks;
+    # under a future outer transaction this stays correct, just no longer shorter.
+    event_publishing.publish_proposal_state_changes(
+        (proposal, ProposalStates.DRAFT) for proposal in drafts
+    )
 
 
 def get_proposal_review_counts(proposal: proposal_models.Proposal) -> dict:
@@ -693,10 +634,7 @@ def get_proposal_review_counts(proposal: proposal_models.Proposal) -> dict:
     ).count()
 
     pending_reviews = base_queryset.filter(
-        state__in=[
-            proposal_models.Review.States.CREATED,
-            proposal_models.Review.States.IN_REVIEW,
-        ]
+        state=proposal_models.Review.States.IN_REVIEW,
     ).count()
 
     return {
@@ -706,27 +644,287 @@ def get_proposal_review_counts(proposal: proposal_models.Proposal) -> dict:
     }
 
 
-def fix_submitted_at_field():
-    """Fix submitted_at field for proposals in submitted or later states."""
-    from waldur_mastermind.proposal.models import Proposal
+# Fields managed by Django or set explicitly during duplication.
+_DUPLICATE_CALL_OVERRIDE_FIELDS = frozenset(
+    {"id", "uuid", "slug", "name", "state", "created_by", "created", "modified"}
+)
 
-    proposals_to_fix = Proposal.objects.filter(
-        state__in=[
-            ProposalStates.SUBMITTED,
-            ProposalStates.IN_REVIEW,
-            ProposalStates.ACCEPTED,
-            ProposalStates.REJECTED,
-            ProposalStates.CANCELED,
-        ],
-        submitted_at__isnull=True,
+# call/step are the upsert lookup keys; id/uuid/created/modified are
+# identity/timestamp fields that must not be carried over from the source row.
+_DUPLICATE_WORKFLOW_STEP_OVERRIDE_FIELDS = frozenset(
+    {"id", "uuid", "call", "call_id", "step", "created", "modified"}
+)
+
+# Sections the user can include in or exclude from a duplicate. Each key maps
+# to a default value; the API surface mirrors marketplace offering import.
+DUPLICATE_CALL_SECTION_DEFAULTS: dict[str, bool] = {
+    "copy_documents": True,
+    "copy_offerings": True,
+    "copy_rounds": True,
+    "copy_workflow_steps": True,
+    "copy_resource_templates": True,
+    "copy_role_mappings": True,
+    "copy_applicant_visibility_config": True,
+    "copy_proposal_field_config": True,
+    "copy_coi_configuration": True,
+    "copy_matching_configuration": True,
+    "copy_assignment_configuration": True,
+}
+
+
+def _clone_concrete_fields(instance, exclude: frozenset[str]) -> dict:
+    return {
+        f.attname: getattr(instance, f.attname)
+        for f in instance._meta.concrete_fields
+        if f.name not in exclude and f.attname not in exclude
+    }
+
+
+def _prepare_clone(instance) -> None:
+    """Reset id/pk/uuid on an instance so the next ``save()`` inserts a new row."""
+    instance.pk = None
+    instance.id = None
+    if hasattr(instance, "uuid"):
+        instance.uuid = StringUUID(uuid.uuid4().hex)
+
+
+def _resolve_sections(overrides: dict[str, bool] | None) -> dict[str, bool]:
+    sections = dict(DUPLICATE_CALL_SECTION_DEFAULTS)
+    if overrides:
+        sections.update({k: bool(v) for k, v in overrides.items() if k in sections})
+    return sections
+
+
+@transaction.atomic
+def duplicate_call(
+    source: proposal_models.Call,
+    new_name: str,
+    created_by,
+    sections: dict[str, bool] | None = None,
+) -> proposal_models.Call:
+    """Create a draft copy of ``source`` with the chosen configuration sections.
+
+    ``sections`` is a mapping of `copy_*` flags (see
+    ``DUPLICATE_CALL_SECTION_DEFAULTS``); missing keys default to ``True``.
+    Proposals, reviews, team permissions, and reviewer-pool memberships are
+    never copied regardless of options.
+    """
+    opts = _resolve_sections(sections)
+
+    kwargs = _clone_concrete_fields(source, _DUPLICATE_CALL_OVERRIDE_FIELDS)
+    new_call = proposal_models.Call.objects.create(
+        name=new_name,
+        state=CallStates.DRAFT,
+        created_by=created_by,
+        **kwargs,
     )
 
-    for proposal in proposals_to_fix:
-        # Set submitted_at to last modified time if available, else to created time
-        proposal.submitted_at = proposal.modified or proposal.created
-        proposal.save(update_fields=["submitted_at"])
-        logger.info(
-            f"Set submitted_at for proposal {proposal} to {proposal.submitted_at}."
+    if opts["copy_documents"]:
+        new_call.documents.set(source.documents.all())
+
+    # RequestedOfferings: copy with state reset; build old→new map so dependent
+    # CallResourceTemplate rows can remap their foreign key.
+    requested_offering_map: dict[int, proposal_models.RequestedOffering] = {}
+    if opts["copy_offerings"]:
+        for src_ro in source.requestedoffering_set.all():  # type: ignore
+            src_pk = src_ro.pk
+            _prepare_clone(src_ro)
+            src_ro.call = new_call
+            src_ro.state = RequestedOfferingStates.REQUESTED
+            src_ro.approved_by = None
+            src_ro.save()
+            requested_offering_map[src_pk] = src_ro
+
+    if opts["copy_rounds"]:
+        for src_round in source.round_set.all():  # type: ignore
+            _prepare_clone(src_round)
+            src_round.slug = ""
+            src_round.call = new_call
+            src_round.save()
+
+    if opts["copy_workflow_steps"]:
+        # Mandatory steps (e.g. allocation_decision) are pre-seeded on the new
+        # call by the post_save signal, so a blind insert would collide on the
+        # (call, step) unique constraint. Upsert keyed on (call, step) instead.
+        for src_step in source.workflow_steps.all():  # type: ignore
+            step_fields = _clone_concrete_fields(
+                src_step, _DUPLICATE_WORKFLOW_STEP_OVERRIDE_FIELDS
+            )
+            proposal_models.CallWorkflowStep.objects.update_or_create(
+                call=new_call,
+                step=src_step.step,
+                defaults=step_fields,
+            )
+
+    # Resource templates depend on RequestedOffering FKs — only copy when the
+    # parent offerings were copied too.
+    if opts["copy_resource_templates"] and opts["copy_offerings"]:
+        for src_template in source.resource_templates.all():  # type: ignore
+            src_template.requested_offering = requested_offering_map.get(
+                src_template.requested_offering_id
+            )
+            _prepare_clone(src_template)
+            src_template.call = new_call
+            src_template.save()
+
+    if opts["copy_role_mappings"]:
+        for src_mapping in source.proposalprojectrolemapping_set.all():  # type: ignore
+            _prepare_clone(src_mapping)
+            src_mapping.call = new_call
+            src_mapping.save()
+
+    # Not part of the loop below: the new call already has a field config, seeded
+    # by the post_save handler, so cloning the source row would collide on the
+    # one-to-one constraint. Overwrite the seeded columns instead.
+    if opts["copy_proposal_field_config"]:
+        source_states = proposal_models.CallProposalFieldConfig.get_states_for_call(
+            source
+        )
+        proposal_models.CallProposalFieldConfig.objects.update_or_create(
+            call=new_call,
+            defaults={
+                proposal_models.CallProposalFieldConfig.column_for(field_name): state
+                for field_name, state in source_states.items()
+            },
         )
 
-    logger.info(f"Fixed submitted_at field for {proposals_to_fix.count()} proposal(s).")
+    onetoone_targets = (
+        ("copy_applicant_visibility_config", "applicant_visibility_config"),
+        ("copy_coi_configuration", "coi_configuration"),
+        ("copy_matching_configuration", "matching_configuration"),
+        ("copy_assignment_configuration", "assignment_configuration"),
+    )
+    for flag, related_name in onetoone_targets:
+        if not opts[flag]:
+            continue
+        try:
+            src_config = getattr(source, related_name)
+        except ObjectDoesNotExist:
+            continue
+        _prepare_clone(src_config)
+        src_config.call = new_call
+        src_config.save()
+
+    return new_call
+
+
+def _bulk_round_interval_months(validated_data: dict) -> int:
+    cadence = validated_data["cadence"]
+    if cadence == BulkRoundCadence.CUSTOM:
+        return int(validated_data["custom_interval_months"])
+    return BulkRoundCadence.INTERVAL_MONTHS[cadence]
+
+
+@transaction.atomic
+def bulk_create_rounds(
+    call: proposal_models.Call, validated_data: dict
+) -> list[proposal_models.Round]:
+    """Create ``number_of_rounds`` rounds on ``call`` spaced by ``cadence``.
+
+    ``validated_data`` comes from
+    :class:`BulkRoundCreateRequestSerializer`. The whole batch is atomic:
+    a single overlap with an existing round aborts everything.
+    """
+    interval_months = _bulk_round_interval_months(validated_data)
+    start_time: datetime.datetime = validated_data["start_time"]
+    submission_window_days: int = validated_data["submission_window_days"]
+    number_of_rounds: int = validated_data["number_of_rounds"]
+    window = datetime.timedelta(days=submission_window_days)
+
+    # Per-round fields shared across the whole batch.
+    shared_kwargs = {
+        k: v
+        for k, v in validated_data.items()
+        if k
+        not in {
+            "start_time",
+            "cadence",
+            "custom_interval_months",
+            "submission_window_days",
+            "number_of_rounds",
+        }
+    }
+    # Mirror ProtectedRoundSerializer.create()'s fallback.
+    shared_kwargs.setdefault("review_duration_in_days", config.PROPOSAL_REVIEW_DURATION)
+
+    created: list[proposal_models.Round] = []
+    for i in range(number_of_rounds):
+        round_start = start_time + relativedelta(months=interval_months * i)
+        round_cutoff = round_start + window
+
+        # Overlap check against pre-existing rounds AND siblings created
+        # earlier in this loop (those don't have IDs yet, so compare
+        # against the in-memory list too).
+        if proposal_models.Round.objects.filter(
+            call=call,
+            start_time__lt=round_cutoff,
+            cutoff_time__gt=round_start,
+        ).exists() or any(
+            r.start_time < round_cutoff and r.cutoff_time > round_start for r in created
+        ):
+            raise serializers.ValidationError(
+                {
+                    "start_time": (
+                        f"Round {i + 1} ({round_start.date()} – "
+                        f"{round_cutoff.date()}) overlaps with an existing "
+                        f"round on this call."
+                    )
+                }
+            )
+
+        round_obj = proposal_models.Round.objects.create(
+            call=call,
+            start_time=round_start,
+            cutoff_time=round_cutoff,
+            **shared_kwargs,
+        )
+        created.append(round_obj)
+
+    return created
+
+
+def proposal_disclosure_for_reviewer(call: proposal_models.Call) -> str:
+    """How much of a proposal the call reveals to a reviewer before acceptance.
+
+    A call without a COI configuration discloses titles only, the same as the
+    configuration's default.
+    """
+    try:
+        return call.coi_configuration.invitation_proposal_disclosure
+    except proposal_models.CallCOIConfiguration.DoesNotExist:
+        return ProposalDisclosureLevels.TITLES_ONLY
+
+
+def disclosed_proposal_fields(
+    item: proposal_models.AssignmentItem, disclosure: str | None = None
+) -> dict:
+    """The proposal fields a reviewer may see for an assignment they have not
+    accepted yet.
+
+    The title (name, uuid and slug) is always shown. The summary is shown for
+    ``titles_and_summaries`` and ``full_details``; ``full_details`` currently
+    reveals nothing beyond the summary here, since the full proposal becomes
+    readable through proposal access once the assignment is accepted.
+
+    A COI-blocked item never carries more than its title, whatever the level:
+    the reviewer was kept away from that proposal because of the conflict.
+    ``proposal_summary`` is always present, empty when it is not disclosed.
+
+    Pass ``disclosure`` to avoid resolving the call's level once per item.
+    """
+    proposal = item.proposal
+    if disclosure is None:
+        disclosure = proposal_disclosure_for_reviewer(item.batch.call)
+    show_summary = item.status != AssignmentItemStatuses.COI_BLOCKED and (
+        disclosure
+        in (
+            ProposalDisclosureLevels.TITLES_AND_SUMMARIES,
+            ProposalDisclosureLevels.FULL_DETAILS,
+        )
+    )
+    return {
+        "proposal_uuid": proposal.uuid,
+        "proposal_name": proposal.name,
+        "proposal_slug": proposal.slug,
+        "proposal_summary": (proposal.project_summary or "") if show_summary else "",
+    }

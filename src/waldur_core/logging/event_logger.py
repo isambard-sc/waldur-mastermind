@@ -3,8 +3,11 @@
 import logging
 from decimal import Decimal
 
+import structlog
 from constance import config
+from django.dispatch import Signal
 
+from waldur_core.core.middleware import get_skip_side_effects
 from waldur_core.logging import models
 from waldur_core.logging.enums import (
     EVENT_GROUP_MAPPING,
@@ -18,6 +21,8 @@ from waldur_core.logging.mixins import LoggableMixin
 
 logger = logging.getLogger(__name__)
 
+event_emitted = Signal()
+
 event_logger = EventLoggerAdapter(logger)
 
 
@@ -27,6 +32,13 @@ def compile_context(**kwargs):
     event_context = get_event_context()
     if event_context:
         context.update(event_context)
+
+    # request_id is bound onto structlog contextvars by django_structlog's
+    # RequestMiddleware, which runs after CaptureEventContextMiddleware, so we
+    # have to read it at emit time rather than at request entry.
+    request_id = structlog.contextvars.get_contextvars().get("request_id")
+    if request_id and "request_id" not in context:
+        context["request_id"] = str(request_id)
 
     for entity_name, entity in kwargs.items():
         if isinstance(entity, LoggableMixin):
@@ -54,6 +66,10 @@ def emit(
     scopes=None,
     level="info",
 ):
+    # Skip event logging during bulk operations (e.g., cleanup, import)
+    if get_skip_side_effects():
+        return
+
     if not config.NOTIFY_ABOUT_RESOURCE_CHANGE and event_type in RESOURCE_CHANGE_EVENTS:
         return
 
@@ -63,7 +79,7 @@ def emit(
     context = compile_context(**event_context)
     msg = str(message_template).format(**context)
     log = getattr(event_logger, level)
-    log(msg, extra={"event_type": event_type, "event_context": context})
+    log(f"EVENT_LOG: {msg}", extra={"event_type": event_type, "event_context": context})
 
     event = models.Event.objects.create(
         event_type=event_type,
@@ -74,6 +90,8 @@ def emit(
         for scope in scopes or []:
             if scope and scope.id:
                 models.Feed.objects.create(scope=scope, event=event)
+
+    event_emitted.send(sender=type(event), instance=event)
 
 
 def get_valid_events():

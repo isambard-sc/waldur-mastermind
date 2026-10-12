@@ -15,12 +15,27 @@ def get_secret_attributes():
 
 
 def components_filter(offering, qs):
+    # These imports must stay inside the function:
+    # - waldur_openstack.utils imports models which require app registry
+    # - same-package import would cause circular import at module level
+    from waldur_openstack.utils import is_valid_volume_type_name
+
     from . import AVAILABLE_LIMITS, STORAGE_MODE_FIXED, STORAGE_TYPE
 
     storage_mode = offering.plugin_options.get("storage_mode") or STORAGE_MODE_FIXED
     if storage_mode == STORAGE_MODE_FIXED:
-        qs = qs.filter(type__in=AVAILABLE_LIMITS)
+        # Include builtin infrastructure limits (cores, ram, storage)
+        # Exclude volume type components (gigabytes_*) — they're for dynamic mode
+        # Include any custom provider-added components
+        all_types = set(qs.values_list("type", flat=True))
+        allowed_types = set(AVAILABLE_LIMITS)
+        for t in all_types:
+            if t not in allowed_types and not is_valid_volume_type_name(t):
+                allowed_types.add(t)
+        qs = qs.filter(type__in=allowed_types)
     else:
+        # Dynamic storage mode: exclude fixed "storage" component,
+        # keep volume types (gigabytes_*) and custom components
         qs = qs.exclude(type=STORAGE_TYPE)
     return qs
 
@@ -80,6 +95,9 @@ class MarketplaceOpenStackConfig(AppConfig):
             available_limits=AVAILABLE_LIMITS,
             can_update_limits=True,
             limits_validator=utils.tenant_limits_validator,
+            # map_limits_to_quotas casts to int before pushing: the OpenStack API
+            # rejects a fractional quota, so a fraction would be truncated.
+            max_limit_decimal_places=0,
             get_importable_resources_backend_method="get_importable_tenants",
             import_resource_backend_method="import_tenant",
             import_resource_executor=openstack_executors.TenantImportExecutor,
@@ -242,6 +260,13 @@ class MarketplaceOpenStackConfig(AppConfig):
             "import_instances_and_volumes_if_tenant_has_been_imported_if_tenant_has_been_pulled",
         )
 
+        openstack_signals.tenant_quotas_pulled.connect(
+            handlers.import_usage_on_tenant_quotas_pulled,
+            sender=openstack_models.Tenant,
+            dispatch_uid="waldur_mastermind.marketplace_openstack."
+            "import_usage_on_tenant_quotas_pulled",
+        )
+
         signals.post_save.connect(
             handlers.synchronize_router_backend_metadata,
             sender=openstack_models.Router,
@@ -287,4 +312,16 @@ class MarketplaceOpenStackConfig(AppConfig):
             handlers.handle_openstack_tenant_order_termination,
             sender=marketplace_models.Order,
             dispatch_uid="waldur_mastermind.marketplace_openstack.handle_openstack_tenant_order_termination",
+        )
+
+        signals.post_save.connect(
+            handlers.synchronize_volume_metadata_on_resource_post_save,
+            sender=marketplace_models.Resource,
+            dispatch_uid="waldur_mastermind.marketplace_openstack.synchronize_volume_metadata_on_resource_post_save",
+        )
+
+        signals.post_save.connect(
+            handlers.populate_volume_metadata_on_resource_creation,
+            sender=marketplace_models.Resource,
+            dispatch_uid="waldur_mastermind.marketplace_openstack.populate_volume_metadata_on_resource_creation",
         )

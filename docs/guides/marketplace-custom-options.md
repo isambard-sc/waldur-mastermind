@@ -98,13 +98,14 @@ Add the new type to the frontend constants:
 **File**: `src/marketplace/offerings/update/options/constants.ts`
 
 ```typescript
-export const FIELD_TYPES: Array<{ value: OptionFieldTypeEnum; label: string }> = [
-  // ... existing types ...
-  {
-    value: 'your_custom_type',
-    label: 'Your Custom Type',
-  },
-];
+export const FIELD_TYPES: Array<{ value: OptionFieldTypeEnum; label: string }> =
+  [
+    // ... existing types ...
+    {
+      value: "your_custom_type",
+      label: "Your Custom Type",
+    },
+  ];
 ```
 
 ### 5. Frontend: Create Configuration Component
@@ -114,7 +115,7 @@ Create an admin configuration component:
 **File**: `src/marketplace/offerings/update/options/YourCustomConfiguration.tsx`
 
 ```typescript
-import { Field } from 'redux-form';
+import { Field } from 'react-final-form';
 import { InputField } from '@waldur/form/InputField';
 import { translate } from '@waldur/i18n';
 import { FormGroup } from '../../FormGroup';
@@ -207,8 +208,8 @@ Add your type to the option configuration form:
 import { YourCustomConfiguration } from './YourCustomConfiguration';
 
 export const OptionForm = ({ resourceType }) => {
-  const optionValue = useSelector(selector) as any;
-  const type = optionValue.type.value;
+  const {values} = useFormState();
+  const type = values.type.value;
 
   return (
     <>
@@ -229,7 +230,7 @@ Add your field to the order form renderer:
 **File**: `src/marketplace/common/OptionsForm.tsx`
 
 ```typescript
-import { YourCustomField } from './YourCustomField';
+import { YourCustomField } from "./YourCustomField";
 
 const getComponentAndParams = (option, key, customer, finalForm = false) => {
   let OptionField: FC<Partial<FormGroupProps>> = StringField;
@@ -238,7 +239,7 @@ const getComponentAndParams = (option, key, customer, finalForm = false) => {
   switch (option.type) {
     // ... existing cases ...
 
-    case 'your_custom_type':
+    case "your_custom_type":
       OptionField = YourCustomField;
       params = {
         field: option,
@@ -265,7 +266,7 @@ export const formatOption = (option: OptionFormData) => {
   };
 
   // Handle your custom configuration
-  if (your_custom_config && item.type === 'your_custom_type') {
+  if (your_custom_config && item.type === "your_custom_type") {
     item.your_custom_config = your_custom_config;
   }
 
@@ -276,19 +277,19 @@ export const formatOption = (option: OptionFormData) => {
 **File**: `src/marketplace/details/utils.ts`
 
 ```typescript
-const formatAttributes = (props): OrderCreateRequest['attributes'] => {
+const formatAttributes = (props): OrderCreateRequest["attributes"] => {
   // ... existing logic ...
 
   for (const [key, value] of Object.entries(attributes)) {
     const optionConfig = props.offering.options?.options?.[key];
 
-    if (optionConfig?.type === 'your_custom_type') {
+    if (optionConfig?.type === "your_custom_type") {
       // Handle your custom type's data format
-      newAttributes[key] = value;  // Keep as-is or transform as needed
-    } else if (optionConfig?.type === 'conditional_cascade') {
-      newAttributes[key] = value;  // Existing cascade handling
-    } else if (typeof value === 'object' && !Array.isArray(value)) {
-      newAttributes[key] = value['value'];  // Regular select handling
+      newAttributes[key] = value; // Keep as-is or transform as needed
+    } else if (optionConfig?.type === "conditional_cascade") {
+      newAttributes[key] = value; // Existing cascade handling
+    } else if (typeof value === "object" && !Array.isArray(value)) {
+      newAttributes[key] = value["value"]; // Regular select handling
     } else {
       newAttributes[key] = value;
     }
@@ -360,8 +361,7 @@ class YourCustomTypeTest(test.APITestCase):
 
 ### Form Integration
 
-- **Redux-form compatibility**: For admin configuration interfaces
-- **React-final-form compatibility**: For some user interfaces (when `finalForm=true`)
+- **React-final-form compatibility**: For configuration and user interfaces
 - **FormContainer integration**: For most user order forms
 
 ### Performance
@@ -382,9 +382,9 @@ The `conditional_cascade` type demonstrates all these concepts:
 
 ### Frontend Components
 
-- `ConditionalCascadeConfiguration` - Admin configuration interface (redux-form)
-- `ConditionalCascadeWidget` - Admin form component (redux-form)
-- `ConditionalCascadeField` - User order form component (FormContainer/redux-form)
+- `ConditionalCascadeConfiguration` - Admin configuration interface
+- `ConditionalCascadeWidget` - Admin form component
+- `ConditionalCascadeField` - User order form component
 
 ### Key Features
 
@@ -493,6 +493,10 @@ Perfect for scenarios where users need to specify resources in user-friendly uni
 3. **Automatic Limit Setting**: The calculated value (100,000) is automatically set as the limit for the specified component (`storage_inodes`)
 4. **Validation**: Frontend validates user input against `min_limit` and `max_limit` before multiplication
 
+The multiplication happens in the order form only; the server stores the
+entered value as an attribute and does not recalculate any limit from it. To
+derive limits the server enforces, use [Component Formula](#component-formula).
+
 #### Requirements
 
 - **Component Dependency**: Must reference an existing limit-based component (`billing_type: "limit"`)
@@ -503,3 +507,143 @@ Perfect for scenarios where users need to specify resources in user-friendly uni
 
 - **Configuration**: `ComponentMultiplierConfiguration.tsx` - Admin interface for setting up the multiplier
 - **User Field**: `ComponentMultiplierField.tsx` - User input field that handles multiplication and limit updates
+
+### Component Formula
+
+The `component_formula` option type asks the customer for one number and sets
+one or more limit-based components from it. The customer orders in their own
+terms, such as net database capacity, and the offering derives the gross
+quantities it bills for.
+
+#### Configuration
+
+```json
+{
+  "storage": {
+    "type": "component_formula",
+    "label": "Required database storage (GB)",
+    "required": true,
+    "min": 10,
+    "max": 5000,
+    "component_formula_config": {
+      "targets": [
+        {"component_type": "data_primary", "formula": "input * 2"},
+        {"component_type": "wal_primary", "formula": "input * 2 * 0.25"},
+        {"component_type": "data_replica", "formula": "input * 2"},
+        {"component_type": "wal_replica", "formula": "input * 2 * 0.25"}
+      ]
+    }
+  }
+}
+```
+
+`min` and `max` bound the value the customer enters, not the results.
+
+#### Formula language
+
+A formula may use only `input` (the entered value), numbers such as `2` or
+`0.25`, the operators `+ - * /`, unary minus and parentheses. There are no
+functions and no other names. Formulas are at most 255 characters long.
+
+### Component Sum
+
+The `component_sum` option type sets a limit-based component to the sum of
+other limit-based components. The customer does not fill it in; any value sent
+for it is dropped.
+
+```json
+{
+  "backup": {
+    "type": "component_sum",
+    "label": "Daily full backup",
+    "component_sum_config": {
+      "target_component": "backup",
+      "components": ["data_primary", "wal_primary", "data_replica", "wal_replica"]
+    }
+  }
+}
+```
+
+The summed components may be formula targets, components the customer enters
+directly, or the targets of other sums.
+
+#### Derived limit behaviour
+
+- **The server calculates the limits.** When an order is created, Waldur
+  evaluates the formulas and then the sums, and writes the results into the
+  order's limits. It replaces any value the client sent for a derived
+  component, so the price and the provisioned quantity always follow the
+  configuration. Changing the formula input of a pending order recalculates
+  them the same way.
+- **Rounding**: each result is rounded up to the target component's
+  `limit_decimal_places`. It then passes the component's usual checks
+  (minimum, maximum, maximum available), and an error names the component.
+- **No input, no limit**: an optional formula left empty, or hidden by
+  `visible_if`, derives nothing. A sum is written only when at least one of its
+  components has a value.
+- **Division by zero or a negative result** is an order validation error.
+- **Existing resources**: every later change to a resource's limits (limit
+  update, limit change request, renewal, plan switch) recalculates the derived
+  limits from the inputs recorded on the resource. A derived value sent by the
+  client is replaced and one left out is put back, and a sum follows the
+  components it adds up. A resource ordered before the option existed has no
+  recorded input and keeps its current derived values. Derived limits cannot
+  be reallocated between resources.
+- **Provider approval**: a provider who changes a formula input while
+  approving an order changes its derived limits and price with it.
+- **Order options only**: `component_sum` cannot be a resource option;
+  `component_formula` can only as described below.
+
+#### Changing the input after ordering
+
+To let customers change the value after ordering, add a **resource option**
+of type `component_formula` with the same internal name as the order option:
+
+```json
+{
+  "resource_options": {
+    "order": ["storage"],
+    "options": {
+      "storage": {"type": "component_formula", "label": "Required database storage (GB)"}
+    }
+  }
+}
+```
+
+- It has no formulas of its own: the order option's are used, and its `min`
+  and `max` are copied from the order option when the offering is saved. A
+  `component_formula` resource option without such an order option is
+  refused, and so is removing or retyping an order option that one pairs with.
+  The resource option itself cannot be removed, or re-paired under another
+  name, while a resource of the offering holds a value changed since
+  ordering: without the pairing, that resource's limits would fall back to
+  the ordered value on their next change.
+- The value entered at order time is copied onto the resource, so it shows on
+  the resource's Options tab (resources ordered earlier show the value from
+  their order).
+- Changing it through `update_options` always creates an UPDATE order, whatever
+  `create_orders_on_resource_option_change` says, carrying the new value
+  (`new_options`) and the recalculated limits (`old_limits` and `limits`), so
+  it is priced, approved and provisioned like any limit change. When
+  completed, the new value and the new limits are applied together.
+- A provider who changes the value while approving the order changes the
+  limits and price with it. `update_options_direct` refuses to change it,
+  since that would bypass the order.
+- Later limit changes calculate from the current value: the resource option
+  when set, otherwise the value from the order.
+- **Defaults and bounds**: a formula option's `default` is used when the input
+  is omitted, and `min`/`max` are enforced on every path that changes the
+  input, not only on order creation.
+
+#### Validation when the offering is saved
+
+- Every formula must parse under the language above.
+- Every component a formula or sum names must be a limit-based component of
+  the offering (`billing_type: limit`; prepaid one-time components are not
+  accepted).
+- While an option refers to a component, the component cannot be removed,
+  renamed or switched to another billing type. If a plan's billing mode stops
+  billing it as a limit, orders on that plan are refused with an error naming
+  the option.
+- A component may be derived by only one option.
+- A sum may not include its own target, and sums may not form a cycle.

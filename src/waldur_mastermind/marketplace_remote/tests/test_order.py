@@ -39,7 +39,7 @@ from waldur_mastermind.marketplace_remote.tests.dns_utils import (
 )
 
 
-class OrderReviewByProviderTest(test.APITransactionTestCase):
+class OrderReviewByProviderTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -67,7 +67,7 @@ class OrderReviewByProviderTest(test.APITransactionTestCase):
         self.assertFalse(order_should_not_be_reviewed_by_provider(self.order))
 
 
-class LimitsUpdateTest(test.APITransactionTestCase):
+class LimitsUpdateTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -83,6 +83,7 @@ class LimitsUpdateTest(test.APITransactionTestCase):
         self.offering_component.billing_type = BillingTypes.LIMIT
         self.offering_component.save()
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
         ServiceProviderRole.MANAGER.add_permission(
             PermissionEnum.UPDATE_RESOURCE_LIMITS
         )
@@ -146,7 +147,7 @@ class LimitsUpdateTest(test.APITransactionTestCase):
         process_order.assert_not_called()
 
 
-class OrderPullTest(test.APITransactionTestCase):
+class OrderPullTest(test.APITestCase):
     def setUp(self) -> None:
         self.dns_patcher = create_selective_dns_mock()
         self.dns_patcher.start()
@@ -231,7 +232,7 @@ class OrderPullTest(test.APITransactionTestCase):
         self.assertEqual(ResourceStates.OK, self.order.resource.state)
 
 
-class RemoteUpdateResourceProcessorTest(test.APITransactionTestCase):
+class RemoteUpdateResourceProcessorTest(test.APITestCase):
     def setUp(self):
         self.dns_patcher = create_selective_dns_mock()
         self.dns_patcher.start()
@@ -303,6 +304,7 @@ class RemoteUpdateResourceProcessorTest(test.APITransactionTestCase):
             "Remote limits already match requested limits. No update needed.",
             self.order.output,
         )
+        self.assertIsNotNone(self.order.output_updated_at)
         self.assertEqual(self.get_mock.call_count, 1)
         self.assertEqual(self.post_mock.call_count, 0)
 
@@ -353,6 +355,7 @@ class RemoteUpdateResourceProcessorTest(test.APITransactionTestCase):
             "Remote limits already match requested limits. No update needed.",
             self.order.output,
         )
+        self.assertIsNotNone(self.order.output_updated_at)
         self.assertEqual(self.get_mock.call_count, 1)
         self.assertEqual(self.post_mock.call_count, 1)
 

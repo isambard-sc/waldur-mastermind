@@ -1,11 +1,12 @@
-from enum import Enum
+from enum import StrEnum
 from typing import Literal
 
 
-class RoleEnum(str, Enum):
+class RoleEnum(StrEnum):
     CUSTOMER_OWNER = "CUSTOMER.OWNER"
     CUSTOMER_SUPPORT = "CUSTOMER.SUPPORT"
     CUSTOMER_MANAGER = "CUSTOMER.MANAGER"
+    CUSTOMER_READER = "CUSTOMER.READER"
 
     PROJECT_ADMIN = "PROJECT.ADMIN"
     PROJECT_MANAGER = "PROJECT.MANAGER"
@@ -14,9 +15,37 @@ class RoleEnum(str, Enum):
     OFFERING_MANAGER = "OFFERING.MANAGER"
     CALL_REVIEWER = "CALL.REVIEWER"
     CALL_MANAGER = "CALL.MANAGER"
+    CALL_PANEL_MEMBER = "CALL.PANEL_MEMBER"
 
     PROPOSAL_MEMBER = "PROPOSAL.MEMBER"
     PROPOSAL_MANAGER = "PROPOSAL.MANAGER"
+
+
+# Descriptions for every system role, keyed by role name. get_system_role()
+# applies these when it creates a row, so a role first touched at runtime
+# (rather than seeded by a migration) still has a human-readable label instead
+# of falling back to the raw enum name in the UI. Kept in sync with
+# permissions.yaml, which import_roles replays over these on every deployment;
+# a test fails if the two drift in either direction.
+ROLE_DESCRIPTIONS: dict[str, str] = {
+    RoleEnum.CUSTOMER_OWNER: "Organization owner",
+    RoleEnum.CUSTOMER_SUPPORT: "Organization support",
+    RoleEnum.CUSTOMER_MANAGER: "Service provider manager",
+    RoleEnum.CUSTOMER_READER: "Organization reader",
+    RoleEnum.PROJECT_ADMIN: "Project administrator",
+    RoleEnum.PROJECT_MANAGER: "Project manager",
+    RoleEnum.PROJECT_MEMBER: "Project member",
+    RoleEnum.OFFERING_MANAGER: "Offering manager",
+    RoleEnum.CALL_REVIEWER: "Call reviewer",
+    RoleEnum.CALL_MANAGER: "Call manager",
+    RoleEnum.CALL_PANEL_MEMBER: "Call panel member",
+    RoleEnum.PROPOSAL_MEMBER: "Proposal member",
+    RoleEnum.PROPOSAL_MANAGER: "Proposal manager",
+    # Declared in permissions.yaml but deliberately absent from RoleEnum:
+    # adding a member there would extend the role choices published in the
+    # OpenAPI schema, so it is keyed by name here instead.
+    "CUSTOMER.CALL_ORGANIZER": "Organization call organizer",
+}
 
 
 SYSTEM_CUSTOMER_ROLES = (
@@ -38,9 +67,16 @@ TYPE_MAP = {
     "call_organizer": ("proposal", "callmanagingorganisation"),
     "project": ("structure", "project"),
     "offering": ("marketplace", "offering"),
+    "resource": ("marketplace", "resource"),
+    "resource_project": ("marketplace", "resourceproject"),
     "call": ("proposal", "call"),
     "proposal": ("proposal", "proposal"),
 }
+
+# Inverse of TYPE_MAP — (app_label, model) → type key. Used by PAT
+# serialization and the list-filter backend to map a ContentType back to
+# its TYPE_KEYS string without rebuilding the dict on every call.
+TYPE_KEY_BY_CT = {pair: key for key, pair in TYPE_MAP.items()}
 
 TYPE_KEYS = Literal[
     "customer",
@@ -48,12 +84,14 @@ TYPE_KEYS = Literal[
     "call_organizer",
     "project",
     "offering",
+    "resource",
+    "resource_project",
     "call",
     "proposal",
 ]
 
 
-class PermissionEnum(str, Enum):
+class PermissionEnum(StrEnum):
     REGISTER_SERVICE_PROVIDER = "SERVICE_PROVIDER.REGISTER"
 
     CREATE_OFFERING = "OFFERING.CREATE"
@@ -84,16 +122,19 @@ class PermissionEnum(str, Enum):
     UPDATE_OFFERING_USER = "OFFERING.UPDATE_USER"
     DELETE_OFFERING_USER = "OFFERING.DELETE_USER"
     MANAGE_OFFERING_USER_ROLE = "OFFERING.MANAGE_USER_ROLE"
+    MANAGE_POSIX_ID_POOL = "POSIX_ID_POOL.MANAGE"
     CREATE_RESOURCE_ROBOT_ACCOUNT = "RESOURCE.CREATE_ROBOT_ACCOUNT"
     UPDATE_RESOURCE_ROBOT_ACCOUNT = "RESOURCE.UPDATE_ROBOT_ACCOUNT"
     DELETE_RESOURCE_ROBOT_ACCOUNT = "RESOURCE.DELETE_ROBOT_ACCOUNT"
 
     LIST_ORDERS = "ORDER.LIST"
+    CREATE_ORDER = "ORDER.CREATE"
     APPROVE_PRIVATE_ORDER = "ORDER.APPROVE_PRIVATE"
     APPROVE_ORDER = "ORDER.APPROVE"
     REJECT_ORDER = "ORDER.REJECT"
     DESTROY_ORDER = "ORDER.DESTROY"
     CANCEL_ORDER = "ORDER.CANCEL"
+    SET_CONSUMER_ORDER_INFO = "ORDER.SET_CONSUMER_INFO"
 
     LIST_RESOURCES = "RESOURCE.LIST"
     UPDATE_RESOURCE = "RESOURCE.UPDATE"
@@ -106,11 +147,18 @@ class PermissionEnum(str, Enum):
     SET_RESOURCE_BACKEND_ID = "RESOURCE.SET_BACKEND_ID"
     SUBMIT_RESOURCE_REPORT = "RESOURCE.SUBMIT_REPORT"
     SET_RESOURCE_BACKEND_METADATA = "RESOURCE.SET_BACKEND_METADATA"
+    MANAGE_RESOURCE_API_KEY = "RESOURCE.MANAGE_API_KEY"
     SET_RESOURCE_STATE = "RESOURCE.SET_STATE"
     UPDATE_RESOURCE_OPTIONS = "RESOURCE.UPDATE_OPTIONS"
     ACCEPT_BOOKING_REQUEST = "RESOURCE.ACCEPT_BOOKING_REQUEST"
     REJECT_BOOKING_REQUEST = "RESOURCE.REJECT_BOOKING_REQUEST"
     MANAGE_RESOURCE_USERS = "RESOURCE.MANAGE_USERS"
+    CREATE_RESOURCE_PERMISSION = "RESOURCE.CREATE_PERMISSION"
+    UPDATE_RESOURCE_PERMISSION = "RESOURCE.UPDATE_PERMISSION"
+    DELETE_RESOURCE_PERMISSION = "RESOURCE.DELETE_PERMISSION"
+    CREATE_RESOURCE_PROJECT_PERMISSION = "RESOURCE_PROJECT.CREATE_PERMISSION"
+    UPDATE_RESOURCE_PROJECT_PERMISSION = "RESOURCE_PROJECT.UPDATE_PERMISSION"
+    DELETE_RESOURCE_PROJECT_PERMISSION = "RESOURCE_PROJECT.DELETE_PERMISSION"
     RESOURCE_CONSUMPTION_LIMITATION = "RESOURCE.CONSUMPTION_LIMITATION"
     MANAGE_OFFERING_BACKEND_RESOURCES = "OFFERING.MANAGE_BACKEND_RESOURCES"
 
@@ -138,6 +186,9 @@ class PermissionEnum(str, Enum):
     GET_SERVICE_PROVIDER_ROBOT_ACCOUNT_PROJECTS = (
         "SERVICE_PROVIDER.GET_ROBOT_ACCOUNT_PROJECTS"
     )
+    MANAGE_MAINTENANCE_ANNOUNCEMENT = "SERVICE_PROVIDER.MANAGE_MAINTENANCE_ANNOUNCEMENT"
+
+    CREATE_MATRIX_ROOM = "MATRIX_ROOM.CREATE"
 
     CREATE_PROJECT_PERMISSION = "PROJECT.CREATE_PERMISSION"
     CREATE_CUSTOMER_PERMISSION = "CUSTOMER.CREATE_PERMISSION"
@@ -170,8 +221,15 @@ class PermissionEnum(str, Enum):
     REVIEW_PROJECT_MEMBERSHIP = "PROJECT.REVIEW_MEMBERSHIP"
 
     UPDATE_CUSTOMER = "CUSTOMER.UPDATE"
+    CUSTOMER_CONTACT_UPDATE = "CUSTOMER.CONTACT_UPDATE"
 
     LIST_CUSTOMER_USERS = "CUSTOMER.LIST_USERS"
+
+    # Team visibility (list_users). A customer-scoped role needs
+    # VIEW_CUSTOMER_TEAM and a project-scoped role needs VIEW_PROJECT_TEAM
+    # before its holder may enumerate the organization's or project's members.
+    VIEW_CUSTOMER_TEAM = "CUSTOMER.VIEW_TEAM"
+    VIEW_PROJECT_TEAM = "PROJECT.VIEW_TEAM"
 
     ACCEPT_REQUESTED_OFFERING = "OFFERING.ACCEPT_CALL_REQUEST"
     APPROVE_AND_REJECT_PROPOSALS = "CALL.APPROVE_AND_REJECT_PROPOSALS"
@@ -180,6 +238,10 @@ class PermissionEnum(str, Enum):
     CREATE_ACCESS_SUBNET = "ACCESS_SUBNET.CREATE"
     UPDATE_ACCESS_SUBNET = "ACCESS_SUBNET.UPDATE"
     DELETE_ACCESS_SUBNET = "ACCESS_SUBNET.DELETE"
+
+    CREATE_OFFERING_ACCESS_SUBNET = "OFFERING_ACCESS_SUBNET.CREATE"
+    UPDATE_OFFERING_ACCESS_SUBNET = "OFFERING_ACCESS_SUBNET.UPDATE"
+    DELETE_OFFERING_ACCESS_SUBNET = "OFFERING_ACCESS_SUBNET.DELETE"
 
     UPDATE_OFFERING_USER_RESTRICTION = "OFFERINGUSER.UPDATE_RESTRICTION"
 
@@ -206,6 +268,13 @@ class PermissionEnum(str, Enum):
     CAN_MANAGE_OPENSTACK_INSTANCE_POWER = "OPENSTACK_INSTANCE.MANAGE_POWER"
     CAN_MANAGE_OPENSTACK_INSTANCE = "OPENSTACK_INSTANCE.MANAGE"
 
+    # OpenStack Router permissions
+    CAN_MANAGE_OPENSTACK_ROUTER_GATEWAY = "OPENSTACK_ROUTER.MANAGE_GATEWAY"
+
+    # Staff/support access scopes for PATs
+    STAFF_ACCESS = "STAFF.ACCESS"
+    SUPPORT_ACCESS = "SUPPORT.ACCESS"
+
 
 CREATE_PERMISSIONS = {
     "customer": PermissionEnum.CREATE_CUSTOMER_PERMISSION,
@@ -213,8 +282,14 @@ CREATE_PERMISSIONS = {
     "offering": PermissionEnum.CREATE_OFFERING_PERMISSION,
     "call": PermissionEnum.CREATE_CALL_PERMISSION,
     "proposal": PermissionEnum.MANAGE_PROPOSAL,
-    "call_organizer": PermissionEnum.CREATE_CALL_PERMISSION,
+    # Keyed by model_name (see get_create_permission); CallManagingOrganisation's
+    # model_name is "callmanagingorganisation", not the scope-type alias
+    # "call_organizer", so the alias key never resolved and granting the
+    # organizer role 403'd for everyone but staff.
+    "callmanagingorganisation": PermissionEnum.CREATE_CALL_PERMISSION,
     "service_provider": PermissionEnum.CREATE_CUSTOMER_PERMISSION,
+    "resource": PermissionEnum.CREATE_RESOURCE_PERMISSION,
+    "resourceproject": PermissionEnum.CREATE_RESOURCE_PROJECT_PERMISSION,
 }
 
 
@@ -224,8 +299,10 @@ UPDATE_PERMISSIONS = {
     "offering": PermissionEnum.UPDATE_OFFERING_PERMISSION,
     "call": PermissionEnum.UPDATE_CALL_PERMISSION,
     "proposal": PermissionEnum.UPDATE_PROPOSAL_PERMISSION,
-    "call_organizer": PermissionEnum.UPDATE_CALL_PERMISSION,
+    "callmanagingorganisation": PermissionEnum.UPDATE_CALL_PERMISSION,
     "service_provider": PermissionEnum.UPDATE_CUSTOMER_PERMISSION,
+    "resource": PermissionEnum.UPDATE_RESOURCE_PERMISSION,
+    "resourceproject": PermissionEnum.UPDATE_RESOURCE_PROJECT_PERMISSION,
 }
 
 
@@ -234,10 +311,131 @@ DELETE_PERMISSIONS = {
     "project": PermissionEnum.DELETE_PROJECT_PERMISSION,
     "offering": PermissionEnum.DELETE_OFFERING_PERMISSION,
     "call": PermissionEnum.DELETE_CALL_PERMISSION,
-    "proposal": PermissionEnum.MANAGE_PROPOSAL,  # Use MANAGE_PROPOSAL so managers can delete team members
-    "call_organizer": PermissionEnum.DELETE_CALL_PERMISSION,
+    "proposal": PermissionEnum.DELETE_PROPOSAL_PERMISSION,
+    "callmanagingorganisation": PermissionEnum.DELETE_CALL_PERMISSION,
     "service_provider": PermissionEnum.DELETE_CUSTOMER_PERMISSION,
+    "resource": PermissionEnum.DELETE_RESOURCE_PERMISSION,
+    "resourceproject": PermissionEnum.DELETE_RESOURCE_PROJECT_PERMISSION,
 }
+
+
+# Permission a role must carry for its holder to see the team, keyed by the
+# (app_label, model) of the scope the role is held on. See
+# _user_can_view_scope_team in permissions/views.py.
+TEAM_VIEW_PERMISSIONS: dict[tuple[str, str], PermissionEnum] = {
+    TYPE_MAP["customer"]: PermissionEnum.VIEW_CUSTOMER_TEAM,
+    TYPE_MAP["project"]: PermissionEnum.VIEW_PROJECT_TEAM,
+}
+
+
+# Canonical scope of every system role this release defines, mirroring the
+# content types passed to Role.objects.get_system_role in fixtures.py. Note
+# CUSTOMER.MANAGER lives on ServiceProvider, not Customer.
+SYSTEM_ROLE_SCOPES: dict[str, tuple[str, str]] = {
+    RoleEnum.CUSTOMER_OWNER: TYPE_MAP["customer"],
+    RoleEnum.CUSTOMER_SUPPORT: TYPE_MAP["customer"],
+    RoleEnum.CUSTOMER_READER: TYPE_MAP["customer"],
+    RoleEnum.CUSTOMER_MANAGER: TYPE_MAP["service_provider"],
+    RoleEnum.PROJECT_ADMIN: TYPE_MAP["project"],
+    RoleEnum.PROJECT_MANAGER: TYPE_MAP["project"],
+    RoleEnum.PROJECT_MEMBER: TYPE_MAP["project"],
+    RoleEnum.OFFERING_MANAGER: TYPE_MAP["offering"],
+    RoleEnum.CALL_REVIEWER: TYPE_MAP["call"],
+    RoleEnum.CALL_MANAGER: TYPE_MAP["call"],
+    RoleEnum.CALL_PANEL_MEMBER: TYPE_MAP["call"],
+    RoleEnum.PROPOSAL_MEMBER: TYPE_MAP["proposal"],
+    RoleEnum.PROPOSAL_MANAGER: TYPE_MAP["proposal"],
+    # Shipped in permissions.yaml with a migration of its own, but never given
+    # a RoleEnum member. Keyed by the name it is imported under, which is all
+    # this table is looked up by.
+    "CUSTOMER.CALL_ORGANIZER": TYPE_MAP["call_organizer"],
+}
+
+
+# Scope prefix a role name is expected to carry for each scope type. Only used
+# to spot a name claiming a scope it does not have (PROJECT. on a customer
+# role); a name with a prefix outside this table makes no scope claim.
+SCOPE_NAME_PREFIXES: dict[str, str] = {
+    "customer": "CUSTOMER",
+    "service_provider": "SERVICE_PROVIDER",
+    "project": "PROJECT",
+    "offering": "OFFERING",
+    "resource": "RESOURCE",
+    "resource_project": "RESOURCE_PROJECT",
+    "call_organizer": "CALL_ORGANIZER",
+    "call": "CALL",
+    "proposal": "PROPOSAL",
+}
+
+
+# Scope types each scope type is nested under, ordered outward. A role granted
+# on an ancestor governs the scopes below it, which is why a permission is
+# meaningful on its target scope *and* on every ancestor of that target.
+SCOPE_ANCESTORS: dict[str, tuple[str, ...]] = {
+    "customer": (),
+    "service_provider": ("customer",),
+    "project": ("customer",),
+    "offering": ("service_provider", "customer"),
+    "resource": ("offering", "project", "service_provider", "customer"),
+    "resource_project": (
+        "resource",
+        "offering",
+        "project",
+        "service_provider",
+        "customer",
+    ),
+    "call_organizer": ("customer",),
+    "call": ("call_organizer", "customer"),
+    "proposal": ("call", "call_organizer", "customer"),
+}
+
+
+# The scope type each permission category acts on, keyed by the part of the
+# permission name before the dot. A role carrying a permission whose target is
+# neither its own scope nor a scope below it can never exercise it. STAFF and
+# SUPPORT are personal access token scopes and are inert on any role, hence the
+# empty tuple.
+PERMISSION_TARGET_SCOPES: dict[str, tuple[str, ...]] = {
+    "ACCESS_SUBNET": ("customer",),
+    "CALL": ("call",),
+    "CUSTOMER": ("customer",),
+    "INVITATION": ("customer",),
+    "LEXIS_LINK": ("customer",),
+    "OFFERING": ("offering",),
+    "OFFERINGUSER": ("offering",),
+    "OFFERING_ACCESS_SUBNET": ("offering",),
+    "OPENSTACK_INSTANCE": ("project",),
+    "OPENSTACK_ROUTER": ("project",),
+    "ORDER": ("project", "offering"),
+    "POSIX_ID_POOL": ("customer", "service_provider"),
+    "PROJECT": ("project",),
+    "PROPOSAL": ("proposal",),
+    "RESOURCE": ("resource",),
+    "RESOURCE_PROJECT": ("resource_project",),
+    "ROUND": ("call",),
+    "SERVICE_ACCOUNT": ("project",),
+    "SERVICE_PROVIDER": ("service_provider",),
+    "STAFF": (),
+    "SUPPORT": (),
+}
+
+
+def get_permission_scope_types(permission: str) -> tuple[str, ...] | None:
+    """Scope types on which ``permission`` can actually be exercised.
+
+    Returns ``None`` when the permission category is unknown, so callers can
+    stay silent rather than guess.
+    """
+    category = permission.split(".")[0]
+    targets = PERMISSION_TARGET_SCOPES.get(category)
+    if targets is None:
+        return None
+    scopes: list[str] = []
+    for target in targets:
+        for scope in (target, *SCOPE_ANCESTORS.get(target, ())):
+            if scope not in scopes:
+                scopes.append(scope)
+    return tuple(scopes)
 
 
 def generate_permission_description():
@@ -299,7 +497,9 @@ def categorize_permission(category, action):
     category_mapping = {
         "OFFERING": "Offering",
         "ORDER": "Order",
-        "RESOURCE": "Provider actions"
+        "RESOURCE": "Team members"
+        if "PERMISSION" in action
+        else "Provider actions"
         if action
         in [
             "SET_USAGE",
@@ -324,7 +524,11 @@ def categorize_permission(category, action):
         "SERVICE_ACCOUNT": "Provider actions",
         "LEXIS_LINK": "Other",
         "ACCESS_SUBNET": "Other",
+        "OFFERING_ACCESS_SUBNET": "Offering",
         "OFFERINGUSER": "Offering",
+        "OPENSTACK_INSTANCE": "Openstack",
+        "OPENSTACK_ROUTER": "Openstack",
+        "RESOURCE_PROJECT": "Team members",
     }
 
     return category_mapping.get(category, category.capitalize())

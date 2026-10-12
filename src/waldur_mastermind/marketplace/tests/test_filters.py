@@ -1,5 +1,8 @@
+import datetime
+import json
 import unittest
 
+from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
 
@@ -7,15 +10,20 @@ from waldur_core.core import utils as core_utils
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.common.utils import parse_datetime
-from waldur_mastermind.marketplace import plugins
-from waldur_mastermind.marketplace.enums import OfferingStates, OrderTypes
+from waldur_mastermind.marketplace import models, plugins
+from waldur_mastermind.marketplace.enums import (
+    OfferingStates,
+    OrderStates,
+    OrderTypes,
+    ResourceStates,
+)
 from waldur_mastermind.marketplace.tests import factories, fixtures
 from waldur_mastermind.marketplace.tests import utils as test_utils
 from waldur_mastermind.proposal.enums import CallStates, RequestedOfferingStates
 from waldur_mastermind.proposal.tests import factories as proposal_factories
 
 
-class CustomerResourcesFilterTest(test.APITransactionTestCase):
+class CustomerResourcesFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture1 = structure_fixtures.ServiceFixture()
         self.customer1 = self.fixture1.customer
@@ -42,7 +50,7 @@ class CustomerResourcesFilterTest(test.APITransactionTestCase):
         self.assertEqual(2, len(self.list_customers(False)))
 
 
-class ServiceProviderFilterTest(test.APITransactionTestCase):
+class ServiceProviderFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture1 = structure_fixtures.ServiceFixture()
         self.service_provider1 = self.fixture1.customer
@@ -89,8 +97,26 @@ class ServiceProviderFilterTest(test.APITransactionTestCase):
         self.assertEqual(1, len(response.data))
         self.assertEqual(response.data[0]["uuid"], provider_1.uuid.hex)
 
+    def test_filter_created(self):
+        list_url = factories.ServiceProviderFactory.get_list_url()
+        with freeze_time("2020-01-01"):
+            old_provider = factories.ServiceProviderFactory()
+        with freeze_time("2021-01-01"):
+            recent_provider = factories.ServiceProviderFactory()
+        self.client.force_authenticate(self.fixture1.staff)
 
-class ResourceFilterTest(test.APITransactionTestCase):
+        response = self.client.get(list_url, {"created": "2020-06-01"})
+        uuids = [provider["uuid"] for provider in response.data]
+        self.assertIn(recent_provider.uuid.hex, uuids)
+        self.assertNotIn(old_provider.uuid.hex, uuids)
+
+        response = self.client.get(list_url, {"created_before": "2020-06-01"})
+        uuids = [provider["uuid"] for provider in response.data]
+        self.assertIn(old_provider.uuid.hex, uuids)
+        self.assertNotIn(recent_provider.uuid.hex, uuids)
+
+
+class ResourceFilterTest(test.APITestCase):
     def setUp(self):
         with freeze_time("2020-01-01"):
             self.fixture = fixtures.MarketplaceFixture()
@@ -125,6 +151,28 @@ class ResourceFilterTest(test.APITransactionTestCase):
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["uuid"], self.resource_1.uuid.hex)
 
+    def test_flavor_name_filter(self):
+        self.client.force_authenticate(self.fixture.staff)
+        matching = factories.ResourceFactory(
+            backend_metadata={"flavor_name": "m1.large"}
+        )
+        other = factories.ResourceFactory(backend_metadata={"flavor_name": "m1.small"})
+        response = self.client.get(self.url, {"flavor_name": "large"})
+        uuids = [r["uuid"] for r in response.data]
+        self.assertIn(matching.uuid.hex, uuids)
+        self.assertNotIn(other.uuid.hex, uuids)
+
+    def test_image_name_filter(self):
+        self.client.force_authenticate(self.fixture.staff)
+        matching = factories.ResourceFactory(
+            backend_metadata={"image_name": "Ubuntu 22.04"}
+        )
+        other = factories.ResourceFactory(backend_metadata={"image_name": "CentOS 9"})
+        response = self.client.get(self.url, {"image_name": "ubuntu"})
+        uuids = [r["uuid"] for r in response.data]
+        self.assertIn(matching.uuid.hex, uuids)
+        self.assertNotIn(other.uuid.hex, uuids)
+
     def test_field_filter(self):
         self.client.force_authenticate(self.fixture.staff)
 
@@ -147,8 +195,109 @@ class ResourceFilterTest(test.APITransactionTestCase):
         )
         self.assertEqual(len(response.data), 1)
 
+    def test_filter_visible_to_providers(self):
+        self.client.force_authenticate(self.fixture.staff)
 
-class FilterByScopeUUIDTest(test.APITransactionTestCase):
+        # Case 1: Resource is Creating, Order is Pending Provider. Should be visible.
+        resource1 = factories.ResourceFactory(state=ResourceStates.CREATING)
+        factories.OrderFactory(
+            resource=resource1,
+            state=OrderStates.PENDING_PROVIDER,
+            project=resource1.project,
+        )
+
+        # Case 2: Resource is Creating, Order is Pending Consumer. Should be hidden.
+        resource2 = factories.ResourceFactory(state=ResourceStates.CREATING)
+        factories.OrderFactory(
+            resource=resource2,
+            state=OrderStates.PENDING_CONSUMER,
+            project=resource2.project,
+        )
+
+        # Case 3: Resource is Creating, Order is Pending Project. Should be hidden.
+        resource3 = factories.ResourceFactory(state=ResourceStates.CREATING)
+        factories.OrderFactory(
+            resource=resource3,
+            state=OrderStates.PENDING_PROJECT,
+            project=resource3.project,
+        )
+
+        # Case 4: Resource is Creating, Order is Executing. Should be visible.
+        resource4 = factories.ResourceFactory(state=ResourceStates.CREATING)
+        factories.OrderFactory(
+            resource=resource4,
+            state=OrderStates.EXECUTING,
+            project=resource4.project,
+        )
+
+        response = self.client.get(self.url, {"visible_to_providers": "true"})
+
+        uuids = [r["uuid"] for r in response.data]
+        self.assertIn(resource1.uuid.hex, uuids)
+        self.assertNotIn(resource2.uuid.hex, uuids)
+        self.assertNotIn(resource3.uuid.hex, uuids)
+        self.assertIn(resource4.uuid.hex, uuids)
+
+    def test_is_attached_filter(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        # Create attached resource
+        attached_resource = factories.ResourceFactory(
+            backend_metadata={"instance_name": "VM-1"}
+        )
+
+        # Create unattached resource
+        unattached_resource = factories.ResourceFactory(
+            backend_metadata={"volume_size": 100}
+        )
+
+        # Filter by is_attached=true
+        response = self.client.get(self.url, {"is_attached": "true"})
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["uuid"], attached_resource.uuid.hex)
+
+        # Filter by is_attached=false
+        # Note: self.resource_1 and fixture resources are also unattached
+        response = self.client.get(self.url, {"is_attached": "false"})
+
+        uuids = [r["uuid"] for r in response.data]
+        self.assertIn(unattached_resource.uuid.hex, uuids)
+        self.assertNotIn(attached_resource.uuid.hex, uuids)
+
+    def test_resource_attributes_exact_match(self):
+        self.client.force_authenticate(self.fixture.staff)
+        resource = factories.ResourceFactory(
+            attributes={"storage_data_type": "store", "tier": "hot"},
+        )
+        response = self.client.get(
+            self.url,
+            {"resource_attributes": json.dumps({"storage_data_type": "store"})},
+        )
+        uuids = [r["uuid"] for r in response.data]
+        self.assertIn(resource.uuid.hex, uuids)
+
+    def test_resource_attributes_no_match(self):
+        self.client.force_authenticate(self.fixture.staff)
+        factories.ResourceFactory(
+            attributes={"storage_data_type": "store"},
+        )
+        response = self.client.get(
+            self.url,
+            {"resource_attributes": json.dumps({"storage_data_type": "archive"})},
+        )
+        uuids = [r["uuid"] for r in response.data]
+        self.assertEqual(len(uuids), 0)
+
+    def test_resource_attributes_invalid_json(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            self.url,
+            {"resource_attributes": "not-valid-json"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class FilterByScopeUUIDTest(test.APITestCase):
     def setUp(self):
         plugins.manager.register(
             offering_type="TEST_TYPE",
@@ -172,7 +321,7 @@ class FilterByScopeUUIDTest(test.APITransactionTestCase):
         self.assertEqual(response.data[0]["uuid"], self.fixture.resource.uuid.hex)
 
 
-class OrderFilterTest(test.APITransactionTestCase):
+class OrderFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.url = factories.OrderFactory.get_list_url()
@@ -194,7 +343,7 @@ class OrderFilterTest(test.APITransactionTestCase):
         self.assertEqual(len(response.json()), 0)
 
 
-class CategoryFilterTest(test.APITransactionTestCase):
+class CategoryFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -288,7 +437,49 @@ class CategoryFilterTest(test.APITransactionTestCase):
         self.assertEqual(len(response.data), 1)
 
 
-class PlanComponentFilterTest(test.APITransactionTestCase):
+class CategoryOrderingTest(test.APITestCase):
+    def setUp(self):
+        self.url = factories.CategoryFactory.get_list_url()
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        models.Category.objects.all().delete()
+
+        self.group_a = factories.CategoryGroupFactory(title="Alpha")
+        self.group_b = factories.CategoryGroupFactory(title="Beta")
+        self.cat_b_storage = factories.CategoryFactory(
+            title="Storage", group=self.group_b
+        )
+        self.cat_a_storage = factories.CategoryFactory(
+            title="Storage", group=self.group_a
+        )
+        self.cat_a_compute = factories.CategoryFactory(
+            title="Compute", group=self.group_a
+        )
+
+    def _uuids(self, response):
+        return [row["uuid"] for row in response.data if row["group"]]
+
+    def test_default_ordering_is_by_group_then_title(self):
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            self._uuids(response),
+            [
+                self.cat_a_compute.uuid.hex,
+                self.cat_a_storage.uuid.hex,
+                self.cat_b_storage.uuid.hex,
+            ],
+        )
+
+    def test_ordering_by_title_desc(self):
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(self.url, {"o": "-title"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        titles = [row["title"] for row in response.data]
+        self.assertEqual(titles, sorted(titles, reverse=True))
+
+
+class PlanComponentFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture_1 = fixtures.MarketplaceFixture()
         self.fixture_2 = fixtures.MarketplaceFixture()
@@ -311,38 +502,98 @@ class PlanComponentFilterTest(test.APITransactionTestCase):
         self.assertEqual(len(response.json()), 1)
 
 
-class AccessibleViaCallsFilterTest(test.APITransactionTestCase):
+class CallsFilterBaseTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
         self.url = factories.OfferingFactory.get_public_list_url()
 
-    def test_accessible_via_calls(self):
-        self.client.force_authenticate(self.fixture.staff)
-        response = self.client.get(self.url, {"accessible_via_calls": "true"})
-        self.assertEqual(len(response.json()), 0)
-
-        self.client.force_authenticate(self.fixture.staff)
-        response = self.client.get(self.url, {"accessible_via_calls": "false"})
-        self.assertEqual(len(response.json()), 1)
-
+    def accept_on_active_call(self):
         requested_offering = proposal_factories.RequestedOfferingFactory(
             offering=self.offering,
             state=RequestedOfferingStates.ACCEPTED,
         )
         requested_offering.call.state = CallStates.ACTIVE
         requested_offering.call.save()
+        return requested_offering
+
+    def assert_filtered(self, param: str, matches: bool):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {param: "true"})
+        self.assertEqual(len(response.json()), 1 if matches else 0)
+
+        response = self.client.get(self.url, {param: "false"})
+        self.assertEqual(len(response.json()), 0 if matches else 1)
+
+
+class AccessibleViaCallsFilterTest(CallsFilterBaseTest):
+    """The deprecated filter keeps the meaning it shipped with.
+
+    It is published API surface (offering endpoints in the OpenAPI schema, the
+    CLI reference), so narrowing it in place would silently drop rows for
+    existing consumers. ``open_for_proposals`` is the narrow one.
+    """
+
+    def test_accessible_via_calls(self):
+        self.assert_filtered("accessible_via_calls", matches=False)
+
+        self.accept_on_active_call()
+
+        self.assert_filtered("accessible_via_calls", matches=True)
+
+    def test_still_matches_when_call_has_no_rounds(self):
+        self.accept_on_active_call()
+
+        self.assert_filtered("accessible_via_calls", matches=True)
+        self.assert_filtered("open_for_proposals", matches=False)
+
+    def test_still_matches_when_all_rounds_ended(self):
+        requested_offering = self.accept_on_active_call()
+        proposal_factories.RoundFactory(
+            call=requested_offering.call,
+            start_time=timezone.now() - datetime.timedelta(days=10),
+            cutoff_time=timezone.now() - datetime.timedelta(days=5),
+        )
+
+        self.assert_filtered("accessible_via_calls", matches=True)
+        self.assert_filtered("open_for_proposals", matches=False)
+
+
+class OpenForProposalsFilterTest(CallsFilterBaseTest):
+    def test_open_for_proposals(self):
+        self.assert_filtered("open_for_proposals", matches=False)
+
+        requested_offering = self.accept_on_active_call()
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+
+        self.assert_filtered("open_for_proposals", matches=True)
+
+    def test_not_open_when_call_has_no_rounds(self):
+        self.accept_on_active_call()
+
+        self.assert_filtered("open_for_proposals", matches=False)
+
+    def test_not_open_when_all_rounds_ended(self):
+        requested_offering = self.accept_on_active_call()
+        proposal_factories.RoundFactory(
+            call=requested_offering.call,
+            start_time=timezone.now() - datetime.timedelta(days=10),
+            cutoff_time=timezone.now() - datetime.timedelta(days=5),
+        )
+
+        self.assert_filtered("open_for_proposals", matches=False)
+
+    def test_filter_agrees_with_serializer_field(self):
+        requested_offering = self.accept_on_active_call()
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
 
         self.client.force_authenticate(self.fixture.staff)
-        response = self.client.get(self.url, {"accessible_via_calls": "true"})
+        response = self.client.get(self.url, {"open_for_proposals": "true"})
         self.assertEqual(len(response.json()), 1)
-
-        self.client.force_authenticate(self.fixture.staff)
-        response = self.client.get(self.url, {"accessible_via_calls": "false"})
-        self.assertEqual(len(response.json()), 0)
+        self.assertTrue(response.json()[0]["open_for_proposals"])
 
 
-class ResourceBillingTypeFilterTest(test.APITransactionTestCase):
+class ResourceBillingTypeFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.url = factories.ResourceFactory.get_list_url()
@@ -478,7 +729,7 @@ class ResourceBillingTypeFilterTest(test.APITransactionTestCase):
         self.assertIn(self.fixed_resource.uuid.hex, resource_uuids)
 
 
-class ComponentCountFilterTest(test.APITransactionTestCase):
+class ComponentCountFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.url = factories.ResourceFactory.get_list_url()
@@ -646,7 +897,7 @@ class ComponentCountFilterTest(test.APITransactionTestCase):
         self.assertGreaterEqual(len(response.data), 5)
 
 
-class OnlyUsageBasedFilterRealWorldTest(test.APITransactionTestCase):
+class OnlyUsageBasedFilterRealWorldTest(test.APITestCase):
     """Test the only_usage_based filter with real-world scenario to ensure the fix works"""
 
     def setUp(self):
@@ -696,7 +947,7 @@ class OnlyUsageBasedFilterRealWorldTest(test.APITransactionTestCase):
         self.assertIn(self.limit_only_resource.uuid.hex, resource_uuids)
 
 
-class ComponentUsageFilterTest(test.APITransactionTestCase):
+class ComponentUsageFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.url = factories.ComponentUsageFactory.get_list_url()
@@ -760,7 +1011,7 @@ class ComponentUsageFilterTest(test.APITransactionTestCase):
         self.assertGreaterEqual(len(response.data), 3)
 
 
-class OfferingQueryFilterTest(test.APITransactionTestCase):
+class OfferingQueryFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.offering1 = factories.OfferingFactory(
@@ -814,7 +1065,7 @@ class OfferingQueryFilterTest(test.APITransactionTestCase):
         self.assertEqual(response.data[0]["uuid"], self.offering1.uuid.hex)
 
 
-class OrderQueryFilterTest(test.APITransactionTestCase):
+class OrderQueryFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.order1 = factories.OrderFactory(project=self.fixture.project)
@@ -862,7 +1113,7 @@ class OrderQueryFilterTest(test.APITransactionTestCase):
         self.assertEqual(response.data[0]["uuid"], self.order1.uuid.hex)
 
 
-class ResourceQueryFilterSlugTest(test.APITransactionTestCase):
+class ResourceQueryFilterSlugTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.resource1 = factories.ResourceFactory(

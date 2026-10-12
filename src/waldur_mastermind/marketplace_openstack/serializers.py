@@ -1,9 +1,12 @@
 from django.db import transaction
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from waldur_core.core import signals as core_signals
+from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_mastermind.marketplace_openstack.utils import _apply_quotas
 from waldur_openstack import models as openstack_models
 from waldur_openstack import serializers as openstack_serializers
@@ -17,12 +20,14 @@ class MarketplaceTenantCreateSerializer(
     quotas = serializers.JSONField(required=False, default=dict)
     skip_connection_extnet = serializers.BooleanField(default=False)
     skip_creation_of_default_router = serializers.BooleanField(default=False)
+    skip_creation_of_default_subnet = serializers.BooleanField(default=False)
     mtu = serializers.IntegerField(min_value=68, max_value=9000, required=False)
 
     class Meta(openstack_serializers.OpenStackTenantSerializer.Meta):
         fields = openstack_serializers.OpenStackTenantSerializer.Meta.fields + (
             "skip_connection_extnet",
             "skip_creation_of_default_router",
+            "skip_creation_of_default_subnet",
             "quotas",
             "mtu",
         )
@@ -85,6 +90,35 @@ def add_router_external_ips(sender, fields, **kwargs):
 core_signals.pre_serializer_fields.connect(
     sender=openstack_serializers.OpenStackRouterSerializer,
     receiver=add_router_external_ips,
+)
+
+
+@extend_schema_field(serializers.BooleanField())
+def get_config_drive_default(serializer, offering: marketplace_models.Offering) -> bool:
+    try:
+        service = offering.scope
+    except AttributeError:
+        return False
+    if isinstance(service, structure_models.BaseResource):
+        service = service.service_settings
+    if not isinstance(service, structure_models.ServiceSettings):
+        return False
+    return bool(service.options.get("config_drive", False))
+
+
+def add_openstack_config_drive_default(sender, fields, **kwargs):
+    """Expose the OpenStack-wide config_drive default on public offering details.
+
+    Kept here (not in marketplace core) so that OpenStack-specific concerns
+    do not leak into the generic marketplace offering serializer.
+    """
+    fields["config_drive_default"] = serializers.SerializerMethodField()
+    setattr(sender, "get_config_drive_default", get_config_drive_default)
+
+
+core_signals.pre_serializer_fields.connect(
+    sender=marketplace_serializers.PublicOfferingDetailsSerializer,
+    receiver=add_openstack_config_drive_default,
 )
 
 
@@ -158,3 +192,56 @@ class ImageCreateResponseSerializer(serializers.Serializer):
 class ImageUploadResponseSerializer(serializers.Serializer):
     status = serializers.CharField()
     message = serializers.CharField()
+
+
+class DuplicateOfferingCandidateSerializer(serializers.Serializer):
+    """One offering in a duplicate per-tenant group (read-only diagnostics)."""
+
+    id = serializers.IntegerField()
+    uuid = serializers.UUIDField()
+    name = serializers.CharField()
+    state = serializers.CharField()
+    active_resources = serializers.IntegerField()
+    total_resources = serializers.IntegerField()
+    is_recommended_keeper = serializers.BooleanField()
+
+
+class DuplicateOfferingGroupSerializer(serializers.Serializer):
+    """A tenant + offering type that has more than one per-tenant offering.
+
+    Shape produced by ``utils.build_duplicate_offering_report``; surfaces the
+    duplicate offerings, the recommended keeper and the count of orphaned
+    resources so a staff user can see the problem without reading logs, and
+    what the offering merge form needs to resolve the group: the keeper as the
+    merge target, the duplicates as its sources, the suggested mapping, and the
+    blockers and warnings of that merge.
+    """
+
+    tenant_id = serializers.IntegerField()
+    tenant_uuid = serializers.UUIDField(allow_null=True)
+    tenant_name = serializers.CharField(allow_null=True)
+    customer_name = serializers.CharField(allow_null=True)
+    customer_uuid = serializers.UUIDField(allow_null=True)
+    offering_type = serializers.CharField()
+    recommended_keeper_id = serializers.IntegerField()
+    keeper_uuid = serializers.UUIDField(
+        help_text="The recommended keeper: the target of the merge that "
+        "resolves the group."
+    )
+    duplicate_uuids = serializers.ListField(
+        child=serializers.UUIDField(),
+        help_text="Every other offering of the group: the sources of that merge.",
+    )
+    suggested_mapping = marketplace_serializers.OfferingMergeSuggestedMappingSerializer(
+        help_text="Plan and component mappings suggested by name and type."
+    )
+    blockers = marketplace_serializers.OfferingMergeIssueSerializer(
+        many=True,
+        help_text="What would refuse that merge with the suggested mapping.",
+    )
+    warnings = marketplace_serializers.OfferingMergeIssueSerializer(
+        many=True,
+        help_text="What that merge would ask staff to acknowledge.",
+    )
+    orphan_count = serializers.IntegerField()
+    candidates = DuplicateOfferingCandidateSerializer(many=True)

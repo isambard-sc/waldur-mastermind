@@ -8,9 +8,10 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from waldur_core.checklist import enums as checklist_enums
+from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist.tests import factories as checklist_factories
 from waldur_core.onboarding import enums, models
-from waldur_core.onboarding.backends.base import ValidationRequest
+from waldur_core.onboarding.backends.base import ErrorCode, ValidationRequest
 from waldur_core.onboarding.backends.estonia import EstonianAriregisterBackend
 from waldur_core.structure.tests import factories as structure_factories
 
@@ -34,62 +35,56 @@ class EstonianAriregisterAPITest(APITestCase):
         self.client.force_authenticate(user=self.user)
         self.legal_person_identifier = "70000310"
 
-        # Create Estonia onboarding checklist
-        self.checklist = self._create_estonia_checklist()
+        # Create INTENT checklist
+        self.checklist_intent = self._create_intent_checklist()
 
-        # Create country configuration
-        self.country_config = (
-            models.OnboardingCountryChecklistConfiguration.objects.create(
-                country="EE",
-                checklist=self.checklist,
-                is_active=True,
-            )
-        )
-
-    def _create_estonia_checklist(self):
-        """Create a basic Estonia onboarding checklist with optional supplemental questions."""
+    def _create_intent_checklist(self):
+        """Create portal-wide ONBOARDING_INTENT_DATA checklist."""
         checklist = checklist_factories.ChecklistFactory(
-            name="Estonia SME Onboarding",
-            description="Onboarding form for Estonian companies",
-            checklist_type=checklist_enums.ChecklistTypes.CUSTOMER_ONBOARDING,
+            name="Intent Checklist for Onboarding",
+            description="Intent/purpose questions for all onboarding",
+            checklist_type=checklist_enums.ChecklistTypes.ONBOARDING_INTENT_DATA,
         )
 
-        # Question 1: Company Email (optional customer field)
+        # Question 1: Intended Use / Purpose (optional intent field)
         q1 = checklist_factories.QuestionFactory(
             checklist=checklist,
-            description="Company Email Address",
+            description="What is your intended use of the platform?",
             question_type=checklist_enums.QuestionTypes.TEXT_INPUT,
             required=False,
             order=1,
         )
         models.OnboardingQuestionMetadata.objects.create(
             question=q1,
-            maps_to_customer_field="email",
+            intent_field="intended_use",
         )
 
-        # Question 2: VAT Code (optional customer field)
+        # Question 2: Research Purpose (optional intent field)
         q2 = checklist_factories.QuestionFactory(
             checklist=checklist,
-            description="VAT Registration Number (KMKR)",
+            description="Describe your research or business purpose",
             question_type=checklist_enums.QuestionTypes.TEXT_INPUT,
             required=False,
             order=2,
         )
         models.OnboardingQuestionMetadata.objects.create(
             question=q2,
-            maps_to_customer_field="vat_code",
+            intent_field="research_purpose",
         )
 
         return checklist
 
     def _start_verification(
-        self, country="EE", legal_person_identifier=None, legal_name=None
+        self,
+        validation_method=enums.ValidationMethod.ARIREGISTER,
+        legal_person_identifier=None,
+        legal_name=None,
     ):
         """Start a new verification by calling start_verification action."""
         url = factories.OnboardingVerificationFactory.get_list_url(
             action="start_verification"
         )
-        data = {"country": country}
+        data = {"validation_method": validation_method}
         if legal_person_identifier:
             data["legal_person_identifier"] = legal_person_identifier
         if legal_name:
@@ -177,7 +172,6 @@ class EstonianAriregisterAPITest(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         verification_uuid = response.data["uuid"]
         self.assertEqual(response.data["status"], "pending")
-        self.assertEqual(response.data["country"], "EE")
         self.assertEqual(
             response.data["legal_person_identifier"], self.legal_person_identifier
         )
@@ -262,7 +256,7 @@ class EstonianAriregisterAPITest(APITestCase):
         )
 
         # Verify API was called with correct parameters
-        mock_post.assert_called_once()
+        mock_post.assert_called()
         call_args = mock_post.call_args
         self.assertIn("username", call_args[1]["data"].decode("utf-8"))
         self.assertIn("password", call_args[1]["data"].decode("utf-8"))
@@ -297,7 +291,7 @@ class EstonianAriregisterAPITest(APITestCase):
         verification = response.data
 
         self._assert_verification_status(
-            verification, enums.VerificationStatus.ESCALATED, "NOT_AUTHORIZED"
+            verification, enums.VerificationStatus.ESCALATED, ErrorCode.NOT_AUTHORIZED
         )
         self.assertEqual(verification["validation_method"], "ariregister")
         self.assertEqual(verification["verified_user_roles"], [])
@@ -333,7 +327,7 @@ class EstonianAriregisterAPITest(APITestCase):
         verification = response.data
 
         self._assert_verification_status(
-            verification, enums.VerificationStatus.ESCALATED, "NOT_AUTHORIZED"
+            verification, enums.VerificationStatus.ESCALATED, ErrorCode.NOT_AUTHORIZED
         )
         self.assertEqual(verification["validation_method"], "ariregister")
         self.assertEqual(verification["verified_user_roles"], ["KOAS"])
@@ -362,7 +356,7 @@ class EstonianAriregisterAPITest(APITestCase):
         verification = response.data
 
         self._assert_verification_status(
-            verification, enums.VerificationStatus.ESCALATED, "API_ERROR"
+            verification, enums.VerificationStatus.ESCALATED, ErrorCode.API_ERROR
         )
         self.assertEqual(verification["validation_method"], "ariregister")
         self.assertIn("Äriregister API error", verification["error_traceback"])
@@ -389,7 +383,9 @@ class EstonianAriregisterAPITest(APITestCase):
         verification = response.data
 
         self._assert_verification_status(
-            verification, enums.VerificationStatus.ESCALATED, "COMPANY_NOT_FOUND"
+            verification,
+            enums.VerificationStatus.ESCALATED,
+            ErrorCode.COMPANY_NOT_FOUND,
         )
         self.assertEqual(verification["validation_method"], "ariregister")
         self.assertIn("not found", verification["error_traceback"])
@@ -413,7 +409,9 @@ class EstonianAriregisterAPITest(APITestCase):
         )
 
         # Create checklist completion for this verification
-        completion = verification.get_or_create_checklist_completion()
+        completion = verification.get_or_create_checklist_completion(
+            checklist_enums.ChecklistTypes.ONBOARDING_INTENT_DATA
+        )
         self.assertIsNotNone(completion)
 
         url = factories.OnboardingVerificationFactory.get_url(
@@ -435,7 +433,12 @@ class EstonianAriregisterAPITest(APITestCase):
     def test_create_customer_blocked_when_required_checklist_incomplete(
         self, mock_post
     ):
-        """Test that customer creation is blocked when required checklist fields are not completed."""
+        """
+        Test that customer creation is blocked when required INTENT checklist fields are not completed.
+
+        INTENT checklist is ALWAYS checked (both automatic and manual validation)
+        If required intent questions are not answered, customer creation fails
+        """
         self._mock_ariregister_response(
             mock_post,
             get_estonian_ariregister_success_response(self.legal_person_identifier),
@@ -443,15 +446,15 @@ class EstonianAriregisterAPITest(APITestCase):
 
         # Add a required question to the checklist
         q_purpose = checklist_factories.QuestionFactory(
-            checklist=self.checklist,
-            description="What is your intended use? (Required)",
+            checklist=self.checklist_intent,
+            description="Please specify your primary business purpose (Required)",
             question_type=checklist_enums.QuestionTypes.TEXT_INPUT,
             required=True,
             order=3,
         )
         models.OnboardingQuestionMetadata.objects.create(
             question=q_purpose,
-            intent_field="intended_use",
+            intent_field="primary_business_purpose",
         )
 
         response = self._start_verification(
@@ -478,21 +481,26 @@ class EstonianAriregisterAPITest(APITestCase):
         response = self._submit_answers(verification_uuid, answers)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        # Run validation - should succeed and set status to verified
+        # Run validation - should succeed and set status to verified with validation_method set
         response = self._run_validation(verification_uuid)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         verification = response.data
         self._assert_verification_status(verification, "verified")
 
-        # create customer should FAIL because checklist is incomplete
+        # Verify that validation_method is set (automatic validation)
+        self.assertIsNotNone(verification.get("validation_method"))
+
+        # create customer should FAIL because INTENT checklist has incomplete required fields
+        # (INTENT checklist is always checked, even for automatic validation)
         create_customer_url = self._get_verification_url(
             verification_uuid, "create_customer"
         )
         response = self.client.post(create_customer_url)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("checklist", str(response.data).lower())
-        self.assertIn("required", str(response.data).lower())
+        # Check that the error message mentions required intent questions
+        error_message = str(response.data)
+        self.assertIn("required intent questions", error_message)
 
     @override_config(
         ONBOARDING_ARIREGISTER_BASE_URL="https://demo-ariregxmlv6.rik.ee/",
@@ -504,22 +512,46 @@ class EstonianAriregisterAPITest(APITestCase):
     def test_create_customer_succeeds_when_required_checklist_completed(
         self, mock_post
     ):
-        """Test that customer creation succeeds when required checklist fields are completed."""
+        """
+        Test that customer creation succeeds when required INTENT checklist is completed.
+
+        Also verifies that automatic validation BYPASSES customer checklist completion check,
+        even if customer checklist has incomplete required questions.
+        """
         self._mock_ariregister_response(
             mock_post,
             get_estonian_ariregister_success_response(self.legal_person_identifier),
         )
 
+        # Add required INTENT question (will be answered)
         q_purpose = checklist_factories.QuestionFactory(
-            checklist=self.checklist,
-            description="What is your intended use? (Required)",
+            checklist=self.checklist_intent,
+            description="Describe your specific research purpose (Required)",
             question_type=checklist_enums.QuestionTypes.TEXT_INPUT,
             required=True,
             order=3,
         )
         models.OnboardingQuestionMetadata.objects.create(
             question=q_purpose,
-            intent_field="intended_use",
+            intent_field="specific_purpose",
+        )
+
+        # Create CUSTOMER checklist with required question (will NOT be answered)
+        customer_checklist = checklist_factories.ChecklistFactory(
+            name="Customer checklist for Onboarding",
+            description="Customer data checklist for manual validation",
+            checklist_type=checklist_enums.ChecklistTypes.ONBOARDING_CUSTOMER_DATA,
+        )
+        q_customer_required = checklist_factories.QuestionFactory(
+            checklist=customer_checklist,
+            description="Company Registration Address (Required for customer)",
+            question_type=checklist_enums.QuestionTypes.TEXT_INPUT,
+            required=True,
+            order=1,
+        )
+        models.OnboardingQuestionMetadata.objects.create(
+            question=q_customer_required,
+            maps_to_customer_field="address",
         )
 
         response = self._start_verification(
@@ -534,10 +566,13 @@ class EstonianAriregisterAPITest(APITestCase):
 
         intent_question = None
         for q in questions:
-            if "intended use" in q["description"].lower():
+            if "specific research purpose" in q["description"].lower():
                 intent_question = q
                 break
 
+        # Answer only INTENT checklist questions
+        # NOTE: We intentionally do NOT answer the CUSTOMER checklist required question
+        # to verify that automatic validation bypasses CUSTOMER checklist completion check
         answers = [
             {
                 "question_uuid": questions[0]["uuid"],
@@ -569,39 +604,16 @@ class EstonianAriregisterAPITest(APITestCase):
         self.assertIn("uuid", response.data)
         self.assertIn("name", response.data)
 
-    def test_no_backend_available_for_unsupported_country(self):
+    def test_no_backend_available_for_unsupported_method(self):
         """Test that unsupported countries create verification with escalated status for manual review."""
-        # Create checklist for unsupported country (US doesn't have auto-validation backend)
-        unsupported_checklist = self._create_estonia_checklist()
-        models.OnboardingCountryChecklistConfiguration.objects.create(
-            country="US",
-            checklist=unsupported_checklist,
-            is_active=True,
-        )
 
         # Start verification for unsupported country with required fields - should succeed
         response = self._start_verification(
-            country="US",
+            validation_method="unsupported_method",
             legal_person_identifier="12345678",
             legal_name="Test Company Inc",
         )
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        verification_uuid = response.data["uuid"]
-        self.assertEqual(response.data["country"], "US")
-        self.assertEqual(response.data["status"], "pending")
-
-        # Run validation - should escalate because no backend available for US
-        response = self._run_validation(verification_uuid)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        verification = response.data
-
-        self._assert_verification_status(
-            verification, enums.VerificationStatus.ESCALATED, "NO_BACKEND_AVAILABLE"
-        )
-        self.assertIn(
-            "No validation backend available", verification["error_traceback"]
-        )
-        self.assertIn("US", verification["error_traceback"])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     @override_config(
         ONBOARDING_ARIREGISTER_BASE_URL="https://demo-ariregxmlv6.rik.ee/",
@@ -617,19 +629,22 @@ class EstonianAriregisterAPITest(APITestCase):
             get_estonian_ariregister_success_response(self.legal_person_identifier),
         )
 
-        # Delete checklist configuration
-        models.OnboardingCountryChecklistConfiguration.objects.filter(
-            country="EE"
+        # Delete portal-wide checklists to test without checklists
+        checklist_models.Checklist.objects.filter(
+            checklist_type__in=[
+                checklist_enums.ChecklistTypes.ONBOARDING_INTENT_DATA,
+                checklist_enums.ChecklistTypes.ONBOARDING_CUSTOMER_DATA,
+            ]
         ).delete()
 
         # Should succeed even without checklist - checklist is now optional
         response = self._start_verification(
-            country="EE",
+            validation_method="ariregister",
             legal_person_identifier=self.legal_person_identifier,
             legal_name="Test Company OÜ",
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data["country"], "EE")
+        self.assertEqual(response.data["validation_method"], "ariregister")
         self.assertEqual(
             response.data["legal_person_identifier"], self.legal_person_identifier
         )
@@ -651,7 +666,8 @@ class EstonianAriregisterAPITest(APITestCase):
         """Test that research groups without legal_person_identifier can still create verification and get escalated status."""
         # Start verification without legal_person_identifier (e.g., research group)
         response = self._start_verification(
-            country="EE", legal_name="University Research Group"
+            validation_method=enums.ValidationMethod.ARIREGISTER,
+            legal_name="University Research Group",
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         verification_uuid = response.data["uuid"]
@@ -664,7 +680,9 @@ class EstonianAriregisterAPITest(APITestCase):
         verification = response.data
 
         self._assert_verification_status(
-            verification, enums.VerificationStatus.ESCALATED, "NO_BACKEND_AVAILABLE"
+            verification,
+            enums.VerificationStatus.ESCALATED,
+            ErrorCode.NO_BACKEND_AVAILABLE,
         )
 
     @override_config(
@@ -686,8 +704,8 @@ class EstonianAriregisterAPITest(APITestCase):
 
         # Add intent field as multi-select with options
         q3 = checklist_factories.QuestionFactory(
-            checklist=self.checklist,
-            description="What is your intended use of the platform?",
+            checklist=self.checklist_intent,
+            description="Select your platform usage types",
             question_type=checklist_enums.QuestionTypes.MULTI_SELECT,
             required=True,
             order=3,
@@ -728,7 +746,7 @@ class EstonianAriregisterAPITest(APITestCase):
         # Find the intent question
         intent_question = None
         for q in questions:
-            if q["description"] == "What is your intended use of the platform?":
+            if q["description"] == "Select your platform usage types":
                 intent_question = q
                 break
 
@@ -761,9 +779,10 @@ class EstonianAriregisterAPITest(APITestCase):
         self._assert_verification_status(verification, "verified")
 
         self.assertIn("intent", verification["onboarding_metadata"])
+        expected_intent = f'"{opt1.label}", "{opt3.label}"'
         self.assertEqual(
-            set(verification["onboarding_metadata"]["intent"]),
-            {str(opt1.uuid), str(opt3.uuid)},
+            verification["onboarding_metadata"]["intent"],
+            expected_intent,
         )
         self.assertNotIn("intent", verification["verified_company_data"])
 
@@ -865,7 +884,7 @@ class EstonianAriregisterBackendTest(TestCase):
         self.assertEqual(result.company_data["registry"], "Estonian Business Register")
 
         # Verify API was called with correct parameters
-        mock_post.assert_called_once()
+        mock_post.assert_called()
         call_args = mock_post.call_args
         self.assertIn("username", call_args[1]["data"].decode("utf-8"))
         self.assertIn("password", call_args[1]["data"].decode("utf-8"))
@@ -896,7 +915,7 @@ class EstonianAriregisterBackendTest(TestCase):
         self.assertFalse(result.is_valid)
         self.assertEqual(result.method_used, "ariregister")
         self.assertEqual(result.user_roles, [])
-        self.assertEqual(result.error_code, "NOT_AUTHORIZED")
+        self.assertEqual(result.error_code, ErrorCode.NOT_AUTHORIZED)
         self.assertIn("not listed as authorized representative", result.error_message)
 
     @override_config(
@@ -924,7 +943,7 @@ class EstonianAriregisterBackendTest(TestCase):
         self.assertFalse(result.is_valid)
         self.assertEqual(result.method_used, "ariregister")
         self.assertEqual(result.user_roles, ["KOAS"])
-        self.assertEqual(result.error_code, "NOT_AUTHORIZED")
+        self.assertEqual(result.error_code, ErrorCode.NOT_AUTHORIZED)
         self.assertIn("not listed as authorized representative", result.error_message)
 
     @override_config(
@@ -948,7 +967,7 @@ class EstonianAriregisterBackendTest(TestCase):
 
         self.assertFalse(result.is_valid)
         self.assertEqual(result.method_used, "ariregister")
-        self.assertEqual(result.error_code, "API_ERROR")
+        self.assertEqual(result.error_code, ErrorCode.API_ERROR)
         self.assertIn("Äriregister API error", result.error_message)
 
     @override_config(
@@ -973,5 +992,5 @@ class EstonianAriregisterBackendTest(TestCase):
         result = self.backend.validate_company(request)
         self.assertFalse(result.is_valid)
         self.assertEqual(result.method_used, "ariregister")
-        self.assertEqual(result.error_code, "COMPANY_NOT_FOUND")
+        self.assertEqual(result.error_code, ErrorCode.COMPANY_NOT_FOUND)
         self.assertIn("not found", result.error_message)

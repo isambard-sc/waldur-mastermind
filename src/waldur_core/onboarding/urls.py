@@ -15,11 +15,6 @@ def register_in(router):
         basename="onboarding-justification",
     )
     router.register(
-        r"onboarding-country-configs",
-        views.OnboardingCountryChecklistConfigurationViewSet,
-        basename="onboarding-country-config",
-    )
-    router.register(
         r"onboarding-question-metadata",
         views.OnboardingQuestionMetadataViewSet,
         basename="onboarding-question-metadata",
@@ -31,5 +26,10 @@ urlpatterns = [
         "onboarding/supported-countries/",
         views.SupportedCountriesView.as_view(),
         name="onboarding-supported-countries",
+    ),
+    path(
+        "onboarding/person-identifier-fields/",
+        views.PersonIdentifierFieldsView.as_view(),
+        name="onboarding-person-identifier-fields",
     ),
 ]

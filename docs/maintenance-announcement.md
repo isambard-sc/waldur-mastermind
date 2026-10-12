@@ -39,9 +39,121 @@ CANCELLED   IN_PROGRESS → COMPLETED
 - **COMPLETED**: Maintenance has finished successfully
 - **CANCELLED**: Maintenance was cancelled before completion
 
+### Audit Events
+
+CRUD and lifecycle changes emit standard Waldur audit events (scoped to the
+maintenance announcement and the service provider customer). Actor details
+(`user_uuid`, etc.) are included in the event context for API-driven actions.
+
+| Action | Event type |
+|--------|------------|
+| Create | `maintenance_announcement_created` |
+| Update | `maintenance_announcement_updated` |
+| Delete | `maintenance_announcement_deleted` |
+| Schedule | `maintenance_announcement_scheduled` |
+| Unschedule | `maintenance_announcement_unscheduled` |
+| Start | `maintenance_announcement_started` |
+| Complete | `maintenance_announcement_completed` |
+| Cancel | `maintenance_announcement_cancelled` |
+
+These appear under the `providers` event group and can be queried via
+`/api/events/?scope=.../maintenance-announcements/{uuid}/`.
+
 ## REST API Operations
 
-### Standard CRUD Operations
+Waldur exposes two API surfaces for maintenance announcements:
+
+| Surface | Base path | Authentication | Purpose |
+|---------|-----------|----------------|---------|
+| Public read-only | `/api/public-maintenance-announcements/` | None | External status checks, status pages, integrations |
+| Management | `/api/maintenance-announcements/` | Required | Service provider CRUD and state transitions |
+
+Request/response schemas are documented in the OpenAPI schema (`waldur spectacular`).
+
+### Public Read-Only API
+
+Use these endpoints when an external service, status page, or unauthenticated
+client needs to check whether maintenance is scheduled or in progress. No token
+is required.
+
+#### List Public Maintenance Announcements
+
+```http
+GET /api/public-maintenance-announcements/
+```
+
+Returns announcements in **Scheduled**, **In progress**, or **Completed**
+state only. Draft and cancelled announcements are excluded.
+
+**Query Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `state` | String | State label, e.g. `Scheduled`, `In progress`, `Completed` |
+| `service_provider_uuid` | UUID | Limit to a specific service provider |
+| `maintenance_type` | Integer | Numeric maintenance type (see [Maintenance Types](#maintenance-types)) |
+| `scheduled_start_after` / `scheduled_start_before` | DateTime | Filter by planned start window |
+| `scheduled_end_after` / `scheduled_end_before` | DateTime | Filter by planned end window |
+| `o` | String | Ordering, e.g. `scheduled_start`, `-scheduled_start` |
+
+**Example Requests:**
+
+```http
+# Is any maintenance currently in progress?
+GET /api/public-maintenance-announcements/?state=In progress
+
+# Upcoming maintenance for a provider
+GET /api/public-maintenance-announcements/?state=Scheduled&service_provider_uuid={uuid}
+```
+
+#### Retrieve Public Maintenance Announcement
+
+```http
+GET /api/public-maintenance-announcements/{uuid}/
+```
+
+Returns `404` for draft or cancelled announcements, even if the UUID exists.
+
+**Response:**
+
+```json
+{
+  "url": "http://localhost:8000/api/public-maintenance-announcements/{uuid}/",
+  "uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "Database Server Upgrade",
+  "message": "We will be upgrading our database servers to improve performance...",
+  "maintenance_type": 4,
+  "maintenance_type_display": "Upgrade",
+  "external_reference_url": "https://maintenance.example.com/ticket/12345",
+  "state": "Scheduled",
+  "scheduled_start": "2024-01-15T02:00:00Z",
+  "scheduled_end": "2024-01-15T04:00:00Z",
+  "actual_start": null,
+  "actual_end": null,
+  "service_provider_name": "Example Cloud Services",
+  "affected_offerings": [
+    {
+      "impact_level": 3,
+      "impact_level_display": "Partial outage",
+      "impact_description": "API endpoints will be unavailable during database migration",
+      "offering_name": "My Service API"
+    }
+  ]
+}
+```
+
+**Not exposed on the public API:** `created_by`, `service_provider` URL,
+`internal_notes`, audit timestamps, and other management-only fields. Write
+methods (`POST`, `PATCH`, `DELETE`) return `405 Method Not Allowed`.
+
+There is no separate public aggregate maintenance status endpoint. Poll the
+list endpoint (optionally filtered by `state`) or retrieve individual records.
+
+The management endpoints below require authentication. List and retrieve are
+available to users connected to the service provider's customer; create,
+update, delete, and state transitions require
+`SERVICE_PROVIDER.MANAGE_MAINTENANCE_ANNOUNCEMENT` (see
+[Permission System](#permission-system)).
 
 #### List Maintenance Announcements
 
@@ -522,11 +634,13 @@ GET /api/maintenance-announcements/{uuid}/
 
 ### Authorization Model
 
-MaintenanceAnnouncement uses Waldur's standard permission system:
+Maintenance announcements use Waldur's permission system:
 
-- **Service Provider Path**: `service_provider__customer`
-- **Automatic Filtering**: `GenericRoleFilter` handles visibility
-- **Role-Based Access**: Permissions tied to service provider ownership
+- **Permission**: `SERVICE_PROVIDER.MANAGE_MAINTENANCE_ANNOUNCEMENT`
+- **Default roles**: Organization Owner (`CUSTOMER.OWNER`) and Service Provider Manager (`CUSTOMER.MANAGER`)
+- **Service Provider Path**: `service_provider__customer` (and the service provider itself for managers)
+- **List/retrieve**: any user connected to the service provider's customer (via `GenericRoleFilter`)
+- **Create/update/delete/state transitions**: require `MANAGE_MAINTENANCE_ANNOUNCEMENT`
 
 ### User Permissions
 
@@ -536,16 +650,26 @@ MaintenanceAnnouncement uses Waldur's standard permission system:
 - Can perform all state transitions
 - Can create/update/delete any announcement
 
-**Service Provider Owners:**
+**Service Provider Owners / Managers (with manage permission):**
 
-- Full access to their service provider's maintenance announcements
+- Full write access to their service provider's maintenance announcements
 - Can perform all state transitions on their announcements
 - Can create/update/delete their announcements
 
-**Other Users:**
+**Other users connected to the SP customer (without manage permission):**
 
-- No access to maintenance announcements (404 Not Found)
-- Cannot view or modify any maintenance data
+- Can list and retrieve announcements for that service provider
+- Cannot create, update, delete, or change state
+
+**Unrelated Users:**
+
+- No access to management endpoints at `/api/maintenance-announcements/` (empty list / 404)
+- Published announcements remain readable at `/api/public-maintenance-announcements/` without authentication
+
+**Personal Access Tokens:**
+
+- A PAT can restrict API access to `SERVICE_PROVIDER.MANAGE_MAINTENANCE_ANNOUNCEMENT` only,
+  so automation can manage announcements without broader Owner permissions.
 
 ## Key Points
 

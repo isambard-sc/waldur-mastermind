@@ -3,13 +3,14 @@ from rest_framework import status, test
 
 from waldur_core.core.enums import CoreStates
 from waldur_core.permissions.fixtures import ProjectRole
+from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_openstack.models import Instance, Tenant
 
 from . import factories, fixtures
 
 
 @ddt
-class FlavorListRetrieveTestCase(test.APITransactionTestCase):
+class FlavorListRetrieveTestCase(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.flavor = self.fixture.flavor
@@ -24,7 +25,7 @@ class FlavorListRetrieveTestCase(test.APITransactionTestCase):
 
 
 @ddt
-class FlavorChangeInstanceTestCase(test.APITransactionTestCase):
+class FlavorChangeInstanceTestCase(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.instance = self.fixture.instance
@@ -195,9 +196,9 @@ class FlavorChangeInstanceTestCase(test.APITransactionTestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertDictContainsSubset(
-            {"flavor": ["New flavor is not visible in tenant."]},
-            response.data,
+        self.assertIn("flavor", response.data)
+        self.assertEqual(
+            response.data["flavor"], ["New flavor is not visible in tenant."]
         )
 
         reread_instance = Instance.objects.get(pk=self.instance.pk)
@@ -250,7 +251,7 @@ class FlavorChangeInstanceTestCase(test.APITransactionTestCase):
         # Check all states but deleted and offline
         forbidden_states = [
             state
-            for (state, _) in CoreStates.CHOICES
+            for (state, _) in CoreStates.choices
             if state not in (CoreStates.DELETING, CoreStates.OK)
         ]
 
@@ -291,3 +292,63 @@ class FlavorChangeInstanceTestCase(test.APITransactionTestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class FlavorOfferingFilterTestCase(test.APITestCase):
+    """Filtering service properties by offering must handle both scope kinds.
+
+    An offering's scope is a generic relation. The tenant-provisioning offering
+    points at the service settings, while the per-tenant instance and volume
+    offerings Waldur creates alongside a tenant point at the tenant. Assuming
+    settings meant a tenant-scoped offering hit a Tenant queryset with a Tenant
+    instance, which Django rejects — the endpoint answered 500.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.flavor = self.fixture.flavor
+        self.tenant = self.fixture.tenant
+        self.flavor.tenants.add(self.tenant)
+        self.url = factories.FlavorFactory.get_list_url()
+        self.client.force_authenticate(self.fixture.staff)
+
+    def _offering(self, scope):
+        return marketplace_factories.OfferingFactory(
+            customer=self.fixture.customer, scope=scope
+        )
+
+    def test_offering_scoped_to_a_tenant_is_filtered_not_an_error(self):
+        offering = self._offering(self.tenant)
+
+        response = self.client.get(self.url, {"offering_uuid": offering.uuid.hex})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [flavor["uuid"] for flavor in response.data], [self.flavor.uuid.hex]
+        )
+
+    def test_offering_scoped_to_service_settings_still_works(self):
+        offering = self._offering(self.fixture.settings)
+
+        response = self.client.get(self.url, {"offering_uuid": offering.uuid.hex})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [flavor["uuid"] for flavor in response.data], [self.flavor.uuid.hex]
+        )
+
+    def test_offering_with_an_unrelated_scope_returns_nothing(self):
+        offering = self._offering(self.fixture.project)
+
+        response = self.client.get(self.url, {"offering_uuid": offering.uuid.hex})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, [])
+
+    def test_offering_without_a_scope_returns_nothing(self):
+        offering = self._offering(None)
+
+        response = self.client.get(self.url, {"offering_uuid": offering.uuid.hex})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, [])

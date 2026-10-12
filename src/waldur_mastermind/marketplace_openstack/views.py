@@ -1,3 +1,5 @@
+import logging
+
 from django.core.exceptions import ValidationError
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
@@ -9,19 +11,31 @@ from drf_spectacular.utils import (
 )
 from rest_framework import response, status
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 
 from waldur_core.core import views as core_views
+from waldur_core.core.mixins import ExecutorMixin
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.utils import has_permission
 from waldur_core.structure import filters
+from waldur_core.structure.permissions import (
+    is_administrator,
+    is_staff_or_support,
+)
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace_openstack import serializers
+from waldur_mastermind.marketplace_openstack import serializers, utils
 from waldur_openstack import models as openstack_models
 from waldur_openstack.exceptions import OpenStackBackendError
-from waldur_openstack.executors import TenantCreateExecutor
+from waldur_openstack.executors import TenantCreateExecutor, TenantDeleteExecutor
+
+logger = logging.getLogger(__name__)
 
 
-class MarketplaceTenantViewSet(core_views.ActionsViewSet):
+class MarketplaceTenantViewSet(ExecutorMixin, core_views.ActionsViewSet):
+    queryset = openstack_models.Tenant.objects.all().order_by("name")
+    lookup_field = "uuid"
+
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -41,6 +55,27 @@ class MarketplaceTenantViewSet(core_views.ActionsViewSet):
         )
 
     serializer_class = serializers.MarketplaceTenantCreateSerializer
+
+    def delete_permission_check(request, view, obj=None):
+        if not obj:
+            return
+        if obj.service_settings.shared:
+            if has_permission(
+                request, PermissionEnum.APPROVE_ORDER, obj.project
+            ) or has_permission(
+                request, PermissionEnum.APPROVE_ORDER, obj.project.customer
+            ):
+                return
+            raise PermissionDenied()
+        else:
+            is_administrator(
+                request,
+                view,
+                obj,
+            )
+
+    delete_executor = TenantDeleteExecutor
+    destroy_permissions = [delete_permission_check]
 
 
 class MarketplaceTenantActionsViewSet(core_views.ReadOnlyActionsViewSet):
@@ -211,3 +246,36 @@ class MarketplaceTenantActionsViewSet(core_views.ReadOnlyActionsViewSet):
             return response.Response(
                 {"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST
             )
+
+
+class DuplicateTenantOfferingViewSet(core_views.ReadOnlyActionsViewSet):
+    """Staff/support read-only diagnostics for duplicate per-tenant offerings.
+
+    Surfaces tenants that have more than one per-tenant OpenStack.Instance or
+    OpenStack.Volume offering — the state that makes self-heal give up and
+    leaves VMs/volumes orphaned from the marketplace. Read-only: each group is
+    resolved by an offering merge of its duplicates into the keeper, created
+    and run through ``/api/marketplace-offering-merges/`` with the UUIDs and
+    suggested mapping this list returns.
+    """
+
+    # The report is computed in-memory (a scan across offerings), not a plain
+    # queryset; list() overrides the default. `queryset` only satisfies the
+    # router/schema machinery. There is no per-object detail view.
+    queryset = marketplace_models.Offering.objects.none()
+    serializer_class = serializers.DuplicateOfferingGroupSerializer
+    filter_backends = ()
+    disabled_actions = ["create", "update", "partial_update", "destroy", "retrieve"]
+    list_permissions = [is_staff_or_support]
+
+    @extend_schema(
+        responses={200: serializers.DuplicateOfferingGroupSerializer(many=True)},
+    )
+    def list(self, request, *args, **kwargs):
+        report = utils.build_duplicate_offering_report()
+        page = self.paginate_queryset(report)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(report, many=True)
+        return response.Response(serializer.data)

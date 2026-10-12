@@ -5,7 +5,11 @@ from waldur_mastermind.marketplace.enums import (
     OPENSTACK_TENANT_OFFERING,
     SLURM_OFFERING,
 )
-from waldur_mastermind.marketplace.models import PlanComponent, Resource
+from waldur_mastermind.marketplace.models import (
+    OfferingComponent,
+    PlanComponent,
+    Resource,
+)
 from waldur_mastermind.marketplace_openstack import CORES_TYPE, RAM_TYPE, STORAGE_TYPE
 from waldur_openstack.utils import is_valid_volume_type_name
 
@@ -22,7 +26,7 @@ def convert_slurm_usage(usage: int | float | Decimal, component_type: str) -> in
     return quantity
 
 
-def convert_quantity(usage, offering_type, component_type: str):
+def convert_quantity(usage, offering_type, component_type: str, billing_type=None):
     """
     Convert usage quantity for billing purposes.
 
@@ -32,16 +36,25 @@ def convert_quantity(usage, offering_type, component_type: str):
     Args:
         usage: Raw usage quantity
         component_type: Type of component being processed
+        billing_type: Optional billing type for precision control.
+            When USAGE, returns Decimal instead of int to preserve
+            fractional component-hours.
 
     Returns:
         Converted quantity for billing
     """
+    from waldur_mastermind.marketplace.enums import BillingTypes
+
     if offering_type == SLURM_OFFERING:
         return convert_slurm_usage(usage, component_type)
     if offering_type == OPENSTACK_TENANT_OFFERING:
         if component_type in (STORAGE_TYPE, RAM_TYPE):
-            return int(usage / 1024)
-        return int(usage)
+            result = Decimal(str(usage)) / 1024
+        else:
+            result = Decimal(str(usage))
+        if billing_type == BillingTypes.USAGE:
+            return result.quantize(Decimal("0.01"))
+        return int(result)
     return usage
 
 
@@ -70,7 +83,9 @@ def get_component_name(plan_component: PlanComponent) -> str:
 
 def get_component_details(
     resource: Resource,
-    plan_component: PlanComponent,
+    plan_component: PlanComponent | None,
+    offering_component: OfferingComponent | None = None,
+    plan=None,
 ):
     """
     Generate detailed metadata for invoice items.
@@ -81,19 +96,38 @@ def get_component_details(
 
     Args:
         resource: Marketplace resource being billed
-        plan_component: Plan component being billed
+        plan_component: Plan component being billed (can be None if not found)
+        offering_component: Offering component (used when plan_component is None)
 
     Returns:
         Dictionary containing detailed metadata for the invoice item
     """
     customer = resource.offering.customer
     service_provider = getattr(customer, "serviceprovider", None)
+    # The plan the item is priced with: after a plan switch, usage accrued
+    # under the previous period is still billed by the previous plan.
+    if plan is None:
+        plan = plan_component.plan if plan_component else resource.plan
+
+    # Determine component details from plan_component or offering_component
+    if plan_component:
+        component_id = plan_component.id
+        component_type = plan_component.component.type
+        component_name = plan_component.component.name
+    elif offering_component:
+        component_id = None
+        component_type = offering_component.type
+        component_name = offering_component.name
+    else:
+        component_id = None
+        component_type = ""
+        component_name = ""
 
     return {
         "resource_name": resource.name,
         "resource_uuid": resource.uuid.hex,
-        "plan_name": resource.plan.name if resource.plan else "",
-        "plan_uuid": resource.plan.uuid.hex if resource.plan else "",
+        "plan_name": plan.name if plan else "",
+        "plan_uuid": plan.uuid.hex if plan else "",
         "offering_type": resource.offering.type,
         "offering_name": resource.offering.name,
         "offering_uuid": resource.offering.uuid.hex,
@@ -101,9 +135,9 @@ def get_component_details(
         "service_provider_uuid": ""
         if not service_provider
         else service_provider.uuid.hex,
-        "plan_component_id": plan_component.id,
-        "offering_component_type": plan_component.component.type,
-        "offering_component_name": plan_component.component.name,
+        "plan_component_id": component_id,
+        "offering_component_type": component_type,
+        "offering_component_name": component_name,
     }
 
 

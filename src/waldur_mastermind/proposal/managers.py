@@ -1,12 +1,27 @@
+from datetime import timedelta
+
 from django.contrib.contenttypes.models import ContentType
 from django.db import models as django_models
+from django.db.models import DateTimeField, ExpressionWrapper, F, OuterRef, Q
+from django.db.models.functions import Coalesce, Greatest
+from django.utils import timezone
 
 from waldur_core.core.models import User
+from waldur_core.core.utils import SubqueryCount
+from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.utils import get_scope_ids
 from waldur_core.structure.managers import get_connected_customers
+from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.managers import MixinManager
 
 from . import models
+from .enums import (
+    AssignmentBatchStatuses,
+    AssignmentItemStatuses,
+    CallStates,
+    ProposalStates,
+    RequestedOfferingStates,
+)
 
 
 class CallQuerySet(django_models.QuerySet):
@@ -25,6 +40,178 @@ class CallManager(MixinManager):
         return CallQuerySet(self.model, using=self._db)
 
 
+class ReviewQuerySet(django_models.QuerySet):
+    def with_deadline(self):
+        """Reviews that have a deadline, with it aliased as ``review_deadline``.
+
+        Same rule as ``Review.review_end_date``: created + the round's review
+        duration, where an unset or zero duration means no deadline, pushed
+        back to the assignment batch's deadline when the review was accepted
+        from a batch that ends later. Evaluated in SQL so callers can filter
+        and order on it.
+        """
+        round_deadline = ExpressionWrapper(
+            F("created")
+            + timedelta(days=1) * F("proposal__round__review_duration_in_days"),
+            output_field=DateTimeField(),
+        )
+        return self.filter(proposal__round__review_duration_in_days__gt=0).alias(
+            review_deadline=Greatest(
+                round_deadline,
+                Coalesce(
+                    F("assignment_item__batch__expires_at"),
+                    round_deadline,
+                    output_field=DateTimeField(),
+                ),
+                output_field=DateTimeField(),
+            )
+        )
+
+    def due_within(self, days):
+        """Reviews in progress whose deadline is at most ``days`` from now.
+
+        Past deadlines are included: the hourly expiry task rejects those
+        reviews, and until it runs they are the most urgent ones. The call
+        manager dashboard count and the reviews list filter both use this.
+        """
+        return self.with_deadline().filter(
+            state=models.Review.States.IN_REVIEW,
+            review_deadline__lte=timezone.now() + timedelta(days=days),
+        )
+
+
+def open_assignment_items_q():
+    """Assignment items that still occupy a reviewer's workload.
+
+    A pending item counts unless its batch was cancelled or has expired; an
+    accepted item counts until its review is submitted or rejected. Declined,
+    expired, reassigned and COI-blocked items never count.
+    """
+    pending = Q(status=AssignmentItemStatuses.PENDING) & ~Q(
+        batch__status__in=[
+            AssignmentBatchStatuses.CANCELLED,
+            AssignmentBatchStatuses.EXPIRED,
+        ]
+    )
+    accepted = Q(status=AssignmentItemStatuses.ACCEPTED) & (
+        Q(review__isnull=True) | Q(review__state=models.Review.States.IN_REVIEW)
+    )
+    return pending | accepted
+
+
+class CallReviewerPoolQuerySet(django_models.QuerySet):
+    def with_open_assignments(self):
+        """Annotate each pool entry with ``open_assignments``.
+
+        The count is the entry's open assignment items (see
+        ``open_assignment_items_q``) plus reviews in progress by the same
+        reviewer on the call's proposals that were created directly rather
+        than from an assignment item, so a review is never counted twice.
+        """
+        items = models.AssignmentItem.objects.filter(
+            open_assignment_items_q(),
+            batch__reviewer_pool_entry=OuterRef("pk"),
+        ).values("pk")
+        direct_reviews = models.Review.objects.filter(
+            proposal__round__call=OuterRef("call_id"),
+            reviewer=OuterRef("reviewer__user_id"),
+            state=models.Review.States.IN_REVIEW,
+            assignment_item__isnull=True,
+        ).values("pk")
+        return self.annotate(
+            open_assignments=SubqueryCount(items) + SubqueryCount(direct_reviews)
+        )
+
+
+class RequestedOfferingQuerySet(django_models.QuerySet):
+    def open_for_proposals(self):
+        """Rows through which a proposal can be submitted right now.
+
+        An accepted offering on an active call with a round that is **open**,
+        and, when the call defines resource templates, one that covers the
+        offering. Keep this the single definition — the ``open_for_proposals``
+        field and filter and ``open_for_offering_uuid`` all build on it and must
+        agree.
+
+        Matches the write path exactly: ``ProposalSerializer.validate`` accepts
+        a proposal only while its round is open, and ``ProposalViewSet.submit``
+        applies the same rule. So nothing advertised here can be refused on
+        creation, and nothing refused here would have been accepted.
+        """
+        # Subquery rather than a call__round join, which repeats the row per round.
+        now = timezone.now()
+        # Mirrors Round.status == OPEN: started, and not yet past its cutoff.
+        call_has_open_round = models.Round.objects.filter(
+            call=django_models.OuterRef("call"),
+            start_time__lte=now,
+            cutoff_time__gte=now,
+        )
+        call_defines_templates = models.CallResourceTemplate.objects.filter(
+            call=django_models.OuterRef("call")
+        )
+        # A template's call FK may differ from its requested offering's, so scope
+        # coverage to the row's own call.
+        covered_by_template = models.CallResourceTemplate.objects.filter(
+            call=django_models.OuterRef("call"),
+            requested_offering=django_models.OuterRef("pk"),
+        )
+        return (
+            self.filter(
+                django_models.Exists(call_has_open_round),
+                state=RequestedOfferingStates.ACCEPTED,
+                call__state=CallStates.ACTIVE,
+            )
+            # alias() rather than annotate(): these are filter-only, and annotate()
+            # would push them into the SELECT list of every caller's values().
+            .alias(
+                _call_defines_templates=django_models.Exists(call_defines_templates),
+                _covered_by_template=django_models.Exists(covered_by_template),
+            )
+            .filter(
+                django_models.Q(_call_defines_templates=False)
+                | django_models.Q(_covered_by_template=True)
+            )
+        )
+
+    def offering_ids_open_for_proposals(self):
+        return self.open_for_proposals().values_list("offering_id", flat=True)
+
+    def offering_ids_in_active_calls(self):
+        """Deprecated predicate behind the ``accessible_via_calls`` filter.
+
+        Broader than ``open_for_proposals()``: it ignores rounds and resource
+        template coverage, so it surfaces offerings no proposal can actually be
+        submitted for. Kept so the published filter keeps its shipped meaning;
+        drop it once no consumer remains.
+        """
+        return self.filter(
+            state=RequestedOfferingStates.ACCEPTED,
+            call__state=CallStates.ACTIVE,
+        ).values_list("offering_id", flat=True)
+
+    def call_ids_open_for_offering(self, offering_uuid):
+        return (
+            self.open_for_proposals()
+            .filter(offering__uuid=offering_uuid)
+            .values_list("call_id", flat=True)
+        )
+
+
+def annotate_offerings_open_for_proposals(queryset):
+    """Resolve ``open_for_proposals`` for a marketplace Offering queryset.
+
+    Every view serving offerings through ``PublicOfferingDetailsSerializer``
+    should apply this; without it the serializer queries once per offering.
+    """
+    return queryset.annotate(
+        open_for_proposals=django_models.Exists(
+            models.RequestedOffering.objects.open_for_proposals().filter(
+                offering=django_models.OuterRef("pk")
+            )
+        )
+    )
+
+
 def get_connected_call_organizers(user):
     ctype = ContentType.objects.get_for_model(models.CallManagingOrganisation)
     return get_scope_ids(user, ctype)
@@ -33,3 +220,45 @@ def get_connected_call_organizers(user):
 def get_connected_calls(user, role=None):
     ctype = ContentType.objects.get_for_model(models.Call)
     return get_scope_ids(user, ctype, role)
+
+
+def get_offering_manager_proposals(user):
+    """Proposal ids an offering manager (technical reviewer) may read.
+
+    Offering managers hold OFFERING.MANAGER on the Offering, not on the Call, so
+    they are invisible to ``get_connected_calls``. They are the responsible role
+    for the ``technical_assessment`` step, so they need read access — but only to
+    the **non-draft** proposals that actually **requested one of their accepted
+    offerings**, not to every (possibly unsubmitted, cross-provider) proposal on
+    the call.
+    """
+    offering_ctype = ContentType.objects.get_for_model(marketplace_models.Offering)
+    offering_ids = get_scope_ids(user, offering_ctype, RoleEnum.OFFERING_MANAGER)
+    return (
+        models.RequestedResource.objects.filter(
+            requested_offering__offering_id__in=offering_ids,
+            requested_offering__state=RequestedOfferingStates.ACCEPTED,
+        )
+        .exclude(proposal__state=ProposalStates.DRAFT)
+        .values_list("proposal_id", flat=True)
+    )
+
+
+def get_live_reviews(user):
+    """The user's reviews that are in review or submitted.
+
+    A rejected review is one that was cancelled or expired, so it no longer
+    gives the reviewer a reason to read the proposal.
+    """
+    return models.Review.objects.filter(reviewer=user).exclude(
+        state=models.Review.States.REJECTED
+    )
+
+
+def get_reviewed_proposals(user):
+    """Proposal ids the user holds a live review for."""
+    return get_live_reviews(user).values_list("proposal_id", flat=True)
+
+
+def holds_live_review(user, proposal) -> bool:
+    return get_live_reviews(user).filter(proposal=proposal).exists()

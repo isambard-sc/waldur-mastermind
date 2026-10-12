@@ -7,6 +7,7 @@ from django.conf import settings
 from django.contrib.contenttypes import fields as ct_fields
 from django.contrib.contenttypes import models as ct_models
 from django.contrib.postgres.fields import ArrayField
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import models
 from django.template.loader import render_to_string
 from django.utils import timezone
@@ -14,10 +15,13 @@ from django.utils.translation import gettext_lazy as _
 from model_utils.fields import AutoCreatedField
 from model_utils.models import TimeStampedModel
 
+from waldur_core.core import auth_utils
 from waldur_core.core import models as core_models
 from waldur_core.core.fields import JSONField, UUIDField
 from waldur_core.core.managers import GenericKeyMixin
-from waldur_core.core.utils import send_mail
+from waldur_core.core.utils import send_mail, validate_outbound_url
+from waldur_core.logging.enums import ConsumerAuthorization, ObservableObjectType
+from waldur_core.logging.log import scrub_sensitive
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +55,7 @@ class EventTypesMixin(models.Model):
 
 class BaseHook(EventTypesMixin, UuidMixin, TimeStampedModel):
     class Meta:
-        abstract = True
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     user = models.ForeignKey[core_models.User](
         on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL
@@ -105,43 +108,70 @@ class WebHook(BaseHook):
         FORM = 2
         CHOICES = ((JSON, "json"), (FORM, "form"))
 
-    destination_url = models.URLField()
+    destination_url = models.URLField(validators=[validate_outbound_url])
     content_type = models.SmallIntegerField(
         choices=ContentTypeChoices.CHOICES, default=ContentTypeChoices.JSON
     )
+
+    # Hard cap on outbound webhook latency. Operators can lower this via
+    # settings.WEBHOOK_REQUEST_TIMEOUT (defaults applied below).
+    _DEFAULT_TIMEOUT_SECONDS = 10
 
     def process(self, event):
         logger.debug(
             "Submitting web hook to URL %s, payload: %s", self.destination_url, event
         )
+        # Re-validate at request time to defeat DNS rebinding between
+        # validation (at save) and connect (here). Skip the call if the
+        # destination is no longer safe.
+        try:
+            validate_outbound_url(self.destination_url)
+        except DjangoValidationError as exc:
+            logger.warning(
+                "Skipping webhook %s — destination %s is no longer safe: %s",
+                self.uuid,
+                self.destination_url,
+                exc,
+            )
+            return
+
+        # Scrub credential-named keys from the context before it leaves for an
+        # external URL — defence in depth against a secret ever reaching a context.
         payload = dict(
             created=event.created.isoformat(),
             message=event.message,
-            context=event.context,
+            context=scrub_sensitive(event.context),
             event_type=event.event_type,
         )
 
-        # encode event as JSON
-        if self.content_type == WebHook.ContentTypeChoices.JSON:
-            requests.post(
-                self.destination_url,
-                json=payload,
-                verify=settings.VERIFY_WEBHOOK_REQUESTS,
-            )
+        timeout = getattr(
+            settings, "WEBHOOK_REQUEST_TIMEOUT", self._DEFAULT_TIMEOUT_SECONDS
+        )
+        # `allow_redirects=False` prevents a public destination from
+        # redirecting (302/307) to an internal address mid-flight.
+        common_kwargs = dict(
+            verify=settings.VERIFY_WEBHOOK_REQUESTS,
+            timeout=timeout,
+            allow_redirects=False,
+        )
 
-        # encode event as form
+        if self.content_type == WebHook.ContentTypeChoices.JSON:
+            requests.post(self.destination_url, json=payload, **common_kwargs)
         elif self.content_type == WebHook.ContentTypeChoices.FORM:
-            requests.post(
-                self.destination_url,
-                data=payload,
-                verify=settings.VERIFY_WEBHOOK_REQUESTS,
-            )
+            requests.post(self.destination_url, data=payload, **common_kwargs)
 
 
 class EmailHook(BaseHook):
     email = models.EmailField(max_length=320)
 
     def process(self, event):
+        if (event.context or {}).get("suppress_email"):
+            logger.info(
+                "Skipping email hook (PK=%s) for event %s: its source asked for no email",
+                self.pk,
+                event.uuid.hex,
+            )
+            return
         if not self.email:
             logger.info(
                 "Skipping processing of email hook (PK=%s) because email is not defined"
@@ -196,7 +226,7 @@ class Event(UuidMixin):
     context = models.JSONField(blank=True)
 
     class Meta:
-        ordering = ("-created",)
+        ordering = ["-created", "id"]
         indexes = [
             models.Index(fields=["-created", "event_type"]),
         ]
@@ -227,6 +257,12 @@ class Feed(models.Model):
         return f"{self.event} for {self.scope}"
 
 
+# DEPRECATED: EventSubscription + EventSubscriptionQueue are the legacy
+# per-(subscription x offering x object_type) queue model, superseded by the
+# unified EventConsumer path (one consumer_{uuid} queue, demultiplexed on the
+# envelope's object_type). Kept running untouched during the deprecation window.
+# Removal is tracked in WAL-10111 and gated on drain telemetry, not a date.
+# See "The legacy path" in docs/design/pubsub-architecture.md.
 class EventSubscription(UuidMixin, TimeStampedModel, core_models.DescribableMixin):
     user = models.ForeignKey(to=core_models.User, on_delete=models.CASCADE)
     source_ip = models.GenericIPAddressField(protocol="IPv4", null=True, blank=True)
@@ -239,6 +275,187 @@ class EventSubscription(UuidMixin, TimeStampedModel, core_models.DescribableMixi
     )
 
 
+class EventSubscriptionQueue(UuidMixin, TimeStampedModel):
+    """Represents a RabbitMQ queue for an event subscription.
+
+    This model tracks queues that have been explicitly created via the API.
+    Receivers must create queues before subscribing via STOMP to ensure
+    queues are created with correct arguments (DLX, max-length, etc.).
+    """
+
+    event_subscription = models.ForeignKey(
+        EventSubscription,
+        on_delete=models.CASCADE,
+        related_name="queues",
+    )
+    offering_uuid = models.UUIDField(
+        help_text=_("UUID of the offering this queue receives events for"),
+    )
+    object_type = models.CharField(
+        max_length=50,
+        help_text=_("Observable object type (e.g., 'resource', 'order')"),
+    )
+
+    class Meta:
+        unique_together = ("event_subscription", "offering_uuid", "object_type")
+        verbose_name = _("Subscription queue")
+        ordering = ["-created", "id"]
+
+    @property
+    def queue_name(self) -> str:
+        """Generate the RabbitMQ queue name."""
+        return f"subscription_{self.event_subscription.uuid.hex}_offering_{self.offering_uuid.hex}_{self.object_type}"
+
+    @property
+    def vhost(self) -> str:
+        """Get the RabbitMQ vhost (user UUID hex)."""
+        return self.event_subscription.user.uuid.hex
+
+    def __str__(self):
+        return self.queue_name
+
+
+def validate_observable_object_types(value):
+    valid_values = {member.value for member in ObservableObjectType}
+    for item in value:
+        if item not in valid_values:
+            raise DjangoValidationError(
+                f"Invalid object type '{item}'. Valid types: {sorted(valid_values)}"
+            )
+
+
+class EventConsumer(UuidMixin, TimeStampedModel):
+    """A generic pub/sub consumer draining a single unified queue.
+
+    One RabbitMQ queue (``consumer_{uuid}``) per consumer. Scope is expressed as
+    a *list* of entity bindings in :class:`EventConsumerScope` (PAT-style) —
+    a consumer may be bound to several projects, a customer, an offering, etc.
+    Bindings are GenericForeignKeys so ``waldur_core`` stays free of marketplace
+    imports. Any external integration (a site agent, an IdM/IGA sync, the
+    keycloak operator) owns an EventConsumer; the site-agent case links it from
+    ``AgentIdentity.event_consumer``.
+
+    **An empty ``scopes`` set means global (unrestricted) and is staff/support
+    only** — it receives the all-user PII firehose, so a consumer must never be
+    left bindingless by accident. Create the consumer and its bindings in one
+    transaction.
+    """
+
+    user = models.ForeignKey(
+        to=core_models.User,
+        on_delete=models.CASCADE,
+        related_name="event_consumers",
+        help_text=_("Owner/registrant; the RabbitMQ vhost is the user UUID hex."),
+    )
+    rmq_username = models.CharField(
+        max_length=32,
+        blank=True,
+        help_text=_("RabbitMQ username (UUID hex) for the consumer queue."),
+    )
+    queue_created = models.BooleanField(default=False)
+    object_types = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_(
+            "List of observable object types this consumer receives. "
+            "Empty list means all types."
+        ),
+        validators=[validate_observable_object_types],
+    )
+    # How and by what right the consumer was registered. Refreshed on EVERY
+    # (re-)registration: these describe the credential the queue currently runs
+    # on, not the one it was first created with. Blank on rows that predate the
+    # attribution, and on any path that does not record it.
+    auth_kind = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        choices=auth_utils.auth_method_choices(),
+        help_text=_(
+            "How the registering request authenticated: pat, token (DRF), "
+            "session, oidc or unknown."
+        ),
+    )
+    auth_token_prefix = models.CharField(
+        # The Personal Access Token is referenced by its denormalized prefix and
+        # name rather than by FK on purpose: tracing a consumer back to a
+        # credential matters most once that credential has been revoked or
+        # deleted, which is exactly when a FK would be gone.
+        max_length=10,
+        blank=True,
+        default="",
+        help_text=_("Prefix of the Personal Access Token used, when auth_kind is pat."),
+    )
+    auth_token_name = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+        help_text=_("Name of the Personal Access Token used, when auth_kind is pat."),
+    )
+    authorized_via = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        choices=ConsumerAuthorization.choices(),
+        help_text=_(
+            "Which permission branch authorised the registration "
+            "(see ConsumerAuthorization)."
+        ),
+    )
+
+    @property
+    def queue_name(self) -> str:
+        return f"consumer_{self.uuid.hex}"
+
+    @property
+    def vhost(self) -> str:
+        return self.user.uuid.hex
+
+    @property
+    def is_global(self) -> bool:
+        """No bindings = unrestricted (staff/support only)."""
+        return not self.scopes.exists()
+
+    def __str__(self):
+        return f"EventConsumer {self.uuid.hex} (user={self.user_id})"
+
+
+class EventConsumerScope(models.Model):
+    """One entity binding of an :class:`EventConsumer`.
+
+    Normalized rather than JSON (which is how ``PersonalAccessToken`` stores
+    ``allowed_scopes``) because pub/sub fan-out is the inverse problem: one
+    event is matched against *many* consumers, so the dispatcher needs an
+    indexed ``(content_type, object_id)`` to intersect against the event's
+    scope-keys.
+    """
+
+    consumer = models.ForeignKey(
+        EventConsumer,
+        on_delete=models.CASCADE,
+        related_name="scopes",
+    )
+    content_type = models.ForeignKey(
+        on_delete=models.CASCADE, to=ct_models.ContentType, db_index=True
+    )
+    object_id = models.PositiveIntegerField(db_index=True)
+    scope = ct_fields.GenericForeignKey("content_type", "object_id")
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["content_type", "object_id"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["consumer", "content_type", "object_id"],
+                name="unique_event_consumer_scope",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.consumer} -> {self.scope}"
+
+
 class EmailLog(UuidMixin):
     sent_at = models.DateTimeField(auto_now_add=True)
     subject = models.CharField(max_length=255)
@@ -249,4 +466,117 @@ class EmailLog(UuidMixin):
         return f"Email to {self.emails} at {self.sent_at}"
 
     class Meta:
-        ordering = ["-sent_at"]
+        ordering = ["-sent_at", "id"]
+        # The table is append-only and grows with every notification ever sent,
+        # so both the log listing and the email diagnostics — which read the
+        # most recent row and count the last week — would otherwise sort or
+        # scan the whole of it.
+        indexes = [models.Index(fields=["-sent_at"])]
+
+
+class SystemLog(TimeStampedModel):
+    """Stores system logs from API, Worker, and Beat processes for staff viewing."""
+
+    class SourceChoices(models.TextChoices):
+        API = "api", "API"
+        WORKER = "worker", "Worker"
+        BEAT = "beat", "Beat"
+
+    class Meta:
+        ordering = ["-created", "id"]
+        indexes = [
+            models.Index(
+                fields=["-created", "source"], name="logging_syslog_created_idx"
+            ),
+            models.Index(
+                fields=["source", "instance", "-created"],
+                name="logging_syslog_instance_idx",
+            ),
+        ]
+
+    source = models.CharField(max_length=10, choices=SourceChoices.choices)
+    instance = models.CharField(
+        max_length=255,
+        help_text=_("Pod name (K8s) or container name (Docker)"),
+    )
+    level = models.CharField(max_length=10)
+    level_number = models.PositiveSmallIntegerField()
+    logger_name = models.CharField(max_length=255)
+    message = models.TextField()
+    context = models.JSONField(default=dict, blank=True)
+
+    def __str__(self):
+        return f"[{self.level}] {self.source}/{self.instance}: {self.message[:50]}"
+
+
+class UserDataAccessLog(UuidMixin):
+    """
+    Log of user profile data access events.
+
+    Tracks when and by whom a user's profile data was accessed via the API.
+    Used for GDPR compliance and audit purposes.
+    """
+
+    class AccessorType:
+        STAFF = "staff"
+        SUPPORT = "support"
+        ORGANIZATION_MEMBER = "organization_member"
+        SERVICE_PROVIDER = "service_provider"
+        SELF = "self"
+
+        CHOICES = (
+            (STAFF, "Staff"),
+            (SUPPORT, "Support"),
+            (ORGANIZATION_MEMBER, "Organization member"),
+            (SERVICE_PROVIDER, "Service provider"),
+            (SELF, "Self"),
+        )
+
+    target_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="data_access_logs",
+        help_text=_("The user whose data was accessed"),
+    )
+    accessor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="performed_data_accesses",
+        help_text=_("The user who accessed the data"),
+    )
+    timestamp = models.DateTimeField(
+        auto_now_add=True,
+        db_index=True,
+        help_text=_("When the access occurred"),
+    )
+    ip_address = models.GenericIPAddressField(
+        null=True,
+        blank=True,
+        help_text=_("IP address of the accessor"),
+    )
+    accessor_type = models.CharField(
+        max_length=50,
+        choices=AccessorType.CHOICES,
+        help_text=_("Type of accessor"),
+    )
+    accessed_fields = models.JSONField(
+        default=list,
+        help_text=_("List of user profile fields that were accessed"),
+    )
+    context = models.JSONField(
+        default=dict,
+        help_text=_("Additional context (endpoint, offering UUID for providers, etc.)"),
+    )
+
+    class Meta:
+        ordering = ["-timestamp", "id"]
+        indexes = [
+            models.Index(fields=["target_user", "-timestamp"]),
+        ]
+        verbose_name = _("User data access log")
+        verbose_name_plural = _("User data access logs")
+
+    def __str__(self):
+        accessor_name = self.accessor.username if self.accessor else "Unknown"
+        return f"{accessor_name} accessed {self.target_user.username} data at {self.timestamp}"

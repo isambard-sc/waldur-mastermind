@@ -1,56 +1,36 @@
+import os
+
 from waldur_core.server.base_settings import *  # noqa
 
 DEBUG = True
 ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 SECRET_KEY = "..."
 
+# Keep local stacks out of the deployment statistics.
+TELEMETRY_ENABLED = False
+
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
-        "NAME": "postgres",
-        "USER": "postgres",
-        "PASSWORD": "postgres",
-        "HOST": "db",
-        "PORT": "5432",
+        "NAME": os.environ.get("WALDUR_DB_NAME", "postgres"),
+        "USER": os.environ.get("WALDUR_DB_USER", "postgres"),
+        "PASSWORD": os.environ.get("WALDUR_DB_PASSWORD", "postgres"),
+        "HOST": os.environ.get("WALDUR_DB_HOST", "db"),
+        "PORT": os.environ.get("WALDUR_DB_PORT", "5432"),
     }
 }
 
-CELERY_BROKER_URL = "amqp://rabbitmq:rabbitmq@queue:5672"
+CELERY_BROKER_URL = os.environ.get(
+    "CELERY_BROKER_URL", "amqp://rabbitmq:rabbitmq@queue:5672"
+)
 
-CELERY_RESULT_BACKEND = f"db+postgresql+psycopg://{DATABASES['default']['USER']}:{DATABASES['default']['PASSWORD']}@{DATABASES['default']['HOST']}:{DATABASES['default']['PORT']}/{DATABASES['default']['NAME']}"
+CELERY_RESULT_BACKEND = os.environ.get(
+    "CELERY_RESULT_BACKEND",
+    f"db+postgresql+psycopg://{DATABASES['default']['USER']}:{DATABASES['default']['PASSWORD']}@{DATABASES['default']['HOST']}:{DATABASES['default']['PORT']}/{DATABASES['default']['NAME']}",
+)
 
 STATIC_ROOT = "static"
 
-LOGGING = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "filters": {
-        "is-event": {
-            "()": "waldur_core.logging.log.RequireEvent",
-        },
-        "is-not-event": {
-            "()": "waldur_core.logging.log.RequireNotEvent",
-        },
-    },
-    "formatters": {
-        "message-only": {
-            "format": "%(message)s",
-        },
-        "simple": {
-            "format": "%(asctime)s %(levelname)s %(message)s",
-        },
-    },
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "formatter": "simple",
-        },
-    },
-    "root": {
-        "level": "INFO",
-        "handlers": ["console"],
-    },
-}
 
 DEFAULT_FROM_EMAIL = "noreply@example.com"
 DEFAULT_REPLY_TO_EMAIL = "support@example.com"

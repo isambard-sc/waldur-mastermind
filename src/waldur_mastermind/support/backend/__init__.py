@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class SupportBackendType:
+    BASIC = "basic"
     ATLASSIAN = "atlassian"
     ZAMMAD = "zammad"
     SMAX = "smax"
@@ -19,6 +20,30 @@ class SupportedFormat:
     TEXT = "text"
 
 
+#: Fallback when the operator blanked the setting out of the database. The
+#: same value is the Constance default.
+DEFAULT_ISSUE_KEY_PREFIX = "WLD"
+
+
+def build_backend_id(uuid, marker: str = "") -> str:
+    """Compose the id of a locally-created ticket, comment or attachment.
+
+    Shape is ``<PREFIX>[-<marker>]-<8 hex chars>``, e.g. ``WLD-A1B2C3D4`` for a
+    ticket and ``WLD-C-A1B2C3D4`` for its comment. The prefix is operator
+    configurable; ids already stored on an object are never recomputed, so a
+    changed prefix only affects objects created after the change.
+    """
+    # Normalised rather than trusted: the setting is validated on write, but a
+    # value stored before that validation existed, or written straight into the
+    # database, would otherwise end up inside every ticket key. A stray newline
+    # there reaches the mail subject and makes every support notification raise.
+    prefix = (
+        config.WALDUR_SUPPORT_ISSUE_KEY_PREFIX or ""
+    ).strip().upper() or DEFAULT_ISSUE_KEY_PREFIX
+    parts = [prefix, marker, uuid.hex[:8].upper()]
+    return "-".join(part for part in parts if part)
+
+
 def get_active_backend() -> "SupportBackend":
     backend_type = config.WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE
     if backend_type == SupportBackendType.ATLASSIAN:
@@ -27,6 +52,8 @@ def get_active_backend() -> "SupportBackend":
         path = "waldur_mastermind.support.backend.zammad:ZammadServiceBackend"
     elif backend_type == SupportBackendType.SMAX:
         path = "waldur_mastermind.support.backend.smax:SmaxServiceBackend"
+    elif backend_type == SupportBackendType.BASIC:
+        path = "waldur_mastermind.support.backend.basic:BasicBackend"
     else:
         path = "waldur_mastermind.support.backend.basic:BasicBackend"
 
@@ -46,6 +73,13 @@ class SupportBackend:
     backend_name = None
     summary_max_length = 255
     message_format = SupportedFormat.TEXT
+
+    #: May the author of a comment change or remove it themselves? Off unless
+    #: Waldur is the system of record: on a remote service desk the comment has
+    #: already reached the agents, and a change made through the integration
+    #: account would rewrite it under that account's name.
+    comment_author_update_is_supported = False
+    comment_author_destroy_is_supported = False
 
     def create_issue(self, issue):
         return
@@ -91,6 +125,34 @@ class SupportBackend:
     def destroy_is_available(self, issue=None):
         return False
 
+    def get_available_statuses(self, issue) -> list[str]:
+        """Statuses Waldur may move this issue to.
+
+        Empty whenever the remote service desk owns the ticket lifecycle: for
+        Jira, Zammad and SMAX the status only ever travels inbound, through
+        `sync_single_issue` and the webhook receivers. Only a backend that
+        answers `update_is_available` with True has any business offering
+        transitions here.
+        """
+        return []
+
+    def issue_is_active(self, issue) -> bool:
+        """Is the ticket still open for changes?
+
+        `resolved` comes from `IssueStatus.check_success_status`, which answers
+        None both while a ticket is being worked on and whenever the status
+        registry cannot classify it: a missing terminal type, an unknown status
+        name, an unexpected type value. Every one of those reads as active, so
+        this predicate fails open on a misconfigured registry rather than
+        locking a deployment out of its own tickets.
+
+        Each call costs several queries, since `resolved` is an uncached
+        property. `BasicBackend` overrides this with the stored resolution date,
+        which it keeps in step itself; a backend that cannot do the same should
+        keep using this.
+        """
+        return issue is not None and issue.resolved is None
+
     def comment_create_is_available(self, issue=None):
         return True
 
@@ -124,6 +186,13 @@ class SupportBackend:
                 return
         return tmpl.template
 
+    def sync_single_issue(self, issue):
+        """
+        Synchronize a single issue's data from backend.
+        Used by both webhooks and manual sync for consistency.
+        """
+        return
+
     def sync_issues(self, *args, **kwargs):
         return
 
@@ -135,3 +204,68 @@ class SupportBackend:
 
     def create_confirmation_comment(self, issue, comment_tmpl=""):
         return
+
+
+def issue_is_routed(issue) -> bool:
+    """Is the ticket part of a provider routing, as a parent or as a child?"""
+    return issue.parent_issue_id is not None or issue.child_issues.exists()
+
+
+def comment_change_is_permitted(
+    user, comment, author_may_change: bool, is_routed=issue_is_routed
+) -> bool:
+    """Staff may change any comment; its author only where the backend allows.
+
+    A comment pulled in from a remote service desk has no local user behind its
+    author, so it never matches and stays with staff.
+
+    Nor may the author change a comment that has been copied to another ticket.
+    Routing to a provider helpdesk copies public comments between the parent
+    ticket and its children, and only on creation: the copy carries no link back,
+    so an edit or a deletion would leave the provider holding the original text
+    while the author is told it is gone.
+
+    `is_routed` answers that for the comment's ticket. A caller checking many
+    comments of one ticket passes a cached one, to avoid a query per comment.
+    """
+    if user.is_staff:
+        return True
+    author_user_id = comment.author.user_id
+    if not author_may_change or author_user_id is None or author_user_id != user.id:
+        return False
+    return not (comment.is_forwarded or is_routed(comment.issue))
+
+
+def get_backend_for_provider(provider_helpdesk) -> SupportBackend:
+    """Factory to create a backend instance for a given ProviderHelpdesk.
+
+    For each backend type, creates a provider-scoped backend using the
+    provider's settings dict. If settings are empty/incomplete, backends
+    fall back to global Constance settings — so a provider with no custom
+    settings effectively uses the operator's global backend config.
+    """
+    backend_type = provider_helpdesk.backend_type
+    settings_dict = provider_helpdesk.settings or {}
+
+    if backend_type == "basic":
+        from .basic import BasicBackend
+
+        return BasicBackend.from_settings(settings_dict)
+    elif backend_type == "email":
+        from .email_backend import EmailSupportBackend
+
+        return EmailSupportBackend.from_settings(settings_dict, provider_helpdesk)
+    elif backend_type == SupportBackendType.ATLASSIAN:
+        from .atlassian import ServiceDeskBackend
+
+        return ServiceDeskBackend.from_settings(settings_dict)
+    elif backend_type == SupportBackendType.ZAMMAD:
+        from .zammad import ZammadServiceBackend
+
+        return ZammadServiceBackend.from_settings(settings_dict)
+    elif backend_type == SupportBackendType.SMAX:
+        from .smax import SmaxServiceBackend
+
+        return SmaxServiceBackend.from_settings(settings_dict)
+    else:
+        raise SupportBackendError(f"Unknown provider backend type: {backend_type}")

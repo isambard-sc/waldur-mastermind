@@ -33,8 +33,14 @@ class VirtualMachineMixin(models.Model):
 
 
 class VirtualMachine(
-    VirtualMachineMixin, core_models.RuntimeStateMixin, structure_models.BaseResource
+    VirtualMachineMixin,
+    core_models.RuntimeStateMixin,
+    structure_models.BaseResource,
+    core_models.AvailableMixin,
 ):
+    class Meta(structure_models.BaseResource.Meta):
+        pass
+
     disks: models.Manager["Disk"]
 
     class RuntimeStates:
@@ -131,6 +137,9 @@ class VirtualMachine(
 
 
 class Port(core_models.RuntimeStateMixin, structure_models.BaseResource):
+    class Meta(structure_models.BaseResource.Meta):
+        pass
+
     vm = models.ForeignKey(on_delete=models.CASCADE, to=VirtualMachine)
     network = models.ForeignKey(on_delete=models.CASCADE, to="Network")
     mac_address = models.CharField(
@@ -172,6 +181,11 @@ class Template(
 ):
     created = models.DateTimeField()
     modified = models.DateTimeField()
+    # Null until the template is next pulled, so a template synced before this
+    # field existed is not mistaken for one without network adapters.
+    nic_count = models.PositiveSmallIntegerField(
+        null=True, help_text=_("Number of network adapters in the template")
+    )
 
     @classmethod
     def get_url_name(cls):
@@ -238,10 +252,12 @@ class CustomerNetworkPair(models.Model):
 
 class Datastore(structure_models.ServiceProperty):
     type = models.CharField(max_length=255)
-    capacity = models.PositiveIntegerField(
+    # 64-bit: a 32-bit column holding megabytes tops out at ~2 PB per datastore,
+    # which cluster-backed datastores already exceed.
+    capacity = models.PositiveBigIntegerField(
         help_text="Capacity, in MB.", null=True, blank=True
     )
-    free_space = models.PositiveIntegerField(
+    free_space = models.PositiveBigIntegerField(
         help_text="Available space, in MB.", null=True, blank=True
     )
 

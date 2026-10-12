@@ -1,12 +1,9 @@
 import logging
 
-from django.core import exceptions as django_exceptions
-from django.utils import timezone
+from django.db.models.signals import post_save
 
-from waldur_core.core.utils import month_start
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
-from waldur_mastermind.marketplace.plugins import manager
 from waldur_mastermind.marketplace_openportal_remote import PLUGIN_NAME
 
 logger = logging.getLogger(__name__)
@@ -24,83 +21,7 @@ def update_component_quota(sender, instance, created=False, **kwargs):
     if not set(instance.tracker.changed()) & COMPONENT_FIELDS:
         return
 
-    allocation = instance
-
-    try:
-        resource = marketplace_models.Resource.objects.get(scope=allocation)
-    except django_exceptions.ObjectDoesNotExist:
-        return
-
-    new_limits = {}
-    new_usages = {}
-    for component in manager.get_components(PLUGIN_NAME):
-        usage = float(getattr(allocation, component.type + "_usage"))
-        limit = float(getattr(allocation, component.type + "_limit"))
-
-        try:
-            offering_component = marketplace_models.OfferingComponent.objects.get(
-                offering=resource.offering, type=component.type
-            )
-        except marketplace_models.OfferingComponent.DoesNotExist:
-            logger.warning(
-                "Skipping Allocation synchronization because this "
-                "marketplace.OfferingComponent does not exist."
-                "Allocation ID: %s",
-                allocation.id,
-            )
-        else:
-            new_limits[component.type] = limit
-            new_usages[component.type] = usage
-            marketplace_models.ComponentQuota.objects.update_or_create(
-                resource=resource,
-                component=offering_component,
-                defaults={"limit": limit, "usage": usage},
-            )
-
-            plan_period = marketplace_models.ResourcePlanPeriod.objects.filter(
-                resource=resource, end=None
-            )
-
-            if not plan_period.exists():
-                logger.warning(
-                    "Skipping component usage synchronization because valid "
-                    "ResourcePlanPeriod is not found. "
-                    f"Allocation: {allocation}, Resource: {resource}",
-                )
-                continue
-
-            if plan_period.count() > 1:
-                logger.warning(
-                    f"More than one active ResourcePlanPeriod found for Allocation: {allocation}, Resource: {resource}. "
-                    "Using the first plan only."
-                )
-
-            plan_period = plan_period.first()
-
-            date = timezone.now()
-            marketplace_models.ComponentUsage.objects.update_or_create(
-                resource=resource,
-                component=offering_component,
-                billing_period=month_start(date),
-                plan_period=plan_period,
-                defaults={"usage": usage, "date": date},
-            )
-
-    logger.info(f"Old limits: {resource.limits}, new limits: {new_limits}")
-
-    if resource.limits != new_limits:
-        logger.debug(
-            f"Syncing limits for OpenPortal Remote. Allocation: {allocation}. Old limits: {resource.limits}. New limits: {new_limits}",
-        )
-        resource.limits = new_limits
-        resource.save(update_fields=["limits"])
-
-    if resource.current_usages != new_usages:
-        logger.debug(
-            f"Syncing usages for OpenPortal Remote. Allocation: {allocation}. Old usages: {resource.current_usages}. New usages: {new_usages}",
-        )
-        resource.current_usages = new_usages
-        resource.save(update_fields=["current_usages"])
+    marketplace_utils.update_component_quota(instance, PLUGIN_NAME)
 
 
 def create_offering_user_for_openportal_remote_user(sender, allocation, user, **kwargs):
@@ -119,10 +40,9 @@ def create_offering_user_for_openportal_remote_user(sender, allocation, user, **
         )
         return
 
-    marketplace_models.OfferingUser.objects.update_or_create(
-        offering=offering,
-        user=user,
-    )
+    # Through the shared creator so a provider-scoped offering gets a backed
+    # account rather than one that stays unbacked until an adoption run.
+    marketplace_utils.create_offering_user(user, offering)
 
 
 def drop_offering_user_for_openportal_remote_user(sender, allocation, user, **kwargs):
@@ -153,21 +73,26 @@ def sync_component_user_usage_when_allocation_user_usage_is_submitted(
 
 
 def sync_offering_resource_options(sender, instance, **kwargs):
-    logger.info(
+    logger.debug(
         f"Synchronizing OpenPortal Remote resource options for Offering {instance}"
     )
 
-    offering = instance
+    offering: marketplace_models.Offering = instance
     if offering.type != PLUGIN_NAME:
-        logger.info(f"Skipping as {offering.type} is not {PLUGIN_NAME}")
+        logger.debug(f"Skipping as {offering.type} is not {PLUGIN_NAME}")
         return
 
     # check to make sure that the offering has the right resource_options
-    must_update = False
+    is_dirty = False
 
-    if offering.resource_options is None:
+    if (
+        offering.resource_options is None
+        or not isinstance(offering.resource_options, dict)
+        or not isinstance(offering.resource_options.get("options"), dict)
+        or not isinstance(offering.resource_options.get("order"), list)
+    ):
         # this is the default from Waldur
-        must_update = True
+        is_dirty = True
         offering.resource_options = {"options": {}, "order": []}
 
     if "allocation" not in offering.resource_options["order"]:
@@ -199,11 +124,11 @@ def sync_offering_resource_options(sender, instance, **kwargs):
 
     if "options" not in offering.resource_options:
         # initialize options if not present
-        must_update = True
+        is_dirty = True
         offering.resource_options["options"] = {}
 
     if (
-        must_update
+        is_dirty
         or offering.resource_options["options"].get("allocation") != allocation_options
     ):
         # update allocation options if they are different
@@ -212,4 +137,19 @@ def sync_offering_resource_options(sender, instance, **kwargs):
         )
 
         offering.resource_options["options"]["allocation"] = allocation_options
-        offering.save(update_fields=["resource_options"])
+
+        # 1. Disconnect the receiver
+        post_save.disconnect(
+            sync_offering_resource_options,
+            sender=marketplace_models.Offering,
+        )
+
+        try:
+            # 2. Save the instance
+            offering.save(update_fields=["resource_options"])
+        finally:
+            # 3. Reconnect the receiver
+            post_save.connect(
+                sync_offering_resource_options,
+                sender=marketplace_models.Offering,
+            )

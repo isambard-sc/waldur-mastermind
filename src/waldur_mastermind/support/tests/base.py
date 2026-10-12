@@ -17,7 +17,7 @@ from . import fixtures
     ATLASSIAN_AFFECTED_RESOURCE_FIELD="Affected resource",
     ATLASSIAN_TEMPLATE_FIELD="Waldur template",
 )
-class BaseTest(test.APITransactionTestCase):
+class BaseTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.SupportFixture()
         mock_patch = mock.patch("waldur_mastermind.support.backend.get_active_backend")
@@ -30,6 +30,8 @@ class BaseTest(test.APITransactionTestCase):
             True
         )
         self.mock_get_active_backend().comment_create_is_available.return_value = True
+        self.mock_get_active_backend().comment_author_update_is_supported = False
+        self.mock_get_active_backend().comment_author_destroy_is_supported = False
         self.mock_get_active_backend().attachment_create_is_available.return_value = (
             True
         )
@@ -39,6 +41,7 @@ class BaseTest(test.APITransactionTestCase):
         )
         self.mock_get_active_backend().get_users.return_value = [1]
         self.mock_get_active_backend().get_issue_details.return_value = {}
+        self.mock_get_active_backend().get_available_statuses.return_value = []
         self.mock_get_active_backend().summary_max_length = 255
 
         models.IssueStatus.objects.create(

@@ -1,16 +1,19 @@
 import datetime
+from decimal import Decimal
+from types import SimpleNamespace
 from unittest import mock
 
-from django.test import TransactionTestCase
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from django.utils import timezone
 from freezegun import freeze_time
 
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_mastermind.common.enums import Units
-from waldur_mastermind.invoices import models, tasks
+from waldur_mastermind.invoices import models, serializers, tasks
 from waldur_mastermind.invoices import utils as invoices_utils
 from waldur_mastermind.invoices.tasks import format_invoice_csv
 from waldur_mastermind.invoices.tests import factories, fixtures, utils
+from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
 class BaseReportFormatterTest(TransactionTestCase):
@@ -106,6 +109,133 @@ class SafReportFormatterTest(BaseReportFormatterTest):
         report = format_invoice_csv(self.invoice)
         lines = report.splitlines()[1:]
         self.assertEqual(0, len(lines))
+
+
+class SAPReportCondValueTest(SimpleTestCase):
+    def test_cond_value_uses_comma_decimal_separator_without_system_locale(self):
+        serializer = serializers.SAPReportSerializer()
+        item = SimpleNamespace(unit_price=Decimal("1234.5"))
+        self.assertEqual(serializer.get_cond_value(item), "1234,5000")
+
+
+class ReportItemTextTest(TestCase):
+    """SAF ARTNIMI and SAP tekst_2 show the plan name once."""
+
+    def setUp(self):
+        self.fixture = fixtures.InvoiceFixture()
+        self.resource = self.fixture.resource
+        self.resource.name = "demo-cluster"
+        self.resource.save()
+        self.offering = self.fixture.offering
+        self.offering.name = "Kubernetes"
+        self.offering.save()
+        self.plan = self.fixture.plan
+        self.plan.name = "Basic"
+        self.plan.save()
+        self.saf = serializers.SAFReportSerializer()
+        self.sap = serializers.SAPReportSerializer()
+
+    def make_item(self, name, **details):
+        return factories.InvoiceItemFactory(
+            name=name,
+            resource=self.resource,
+            project=self.fixture.project,
+            invoice=self.fixture.invoice,
+            details=details,
+        )
+
+    def add_second_plan(self):
+        marketplace_factories.PlanFactory(offering=self.offering, name="Premium")
+
+    def usage_item(self, suffix="", name=None):
+        return self.make_item(
+            name or "demo-cluster (Kubernetes / Basic) / K8s nodes" + suffix,
+            plan_name="Basic",
+            resource_name="demo-cluster",
+            offering_name="Kubernetes",
+            offering_component_name="K8s nodes",
+        )
+
+    def assert_texts(self, item, expected_saf, expected_sap):
+        self.assertEqual(self.saf.get_artnimi_field(item), expected_saf)
+        self.assertEqual(self.sap.get_tekst_2_field(item), expected_sap)
+
+    def test_generated_name_of_multi_plan_offering_is_not_suffixed_again(self):
+        self.add_second_plan()
+        item = self.usage_item()
+        self.assert_texts(item, item.name, item.name)
+
+    def test_fixed_item_of_multi_plan_offering_is_not_suffixed_again(self):
+        self.add_second_plan()
+        item = self.make_item(
+            "demo-cluster (Kubernetes / Basic) / Support", plan_name="Basic"
+        )
+        self.assert_texts(item, item.name, item.name)
+
+    def test_name_without_plan_gets_plan_suffix(self):
+        self.add_second_plan()
+        item = self.make_item("Manual consultation", plan_name="Basic")
+        expected = "Manual consultation / Basic"
+        self.assert_texts(item, expected, expected)
+
+    def test_name_is_kept_without_plan_details(self):
+        self.add_second_plan()
+        item = self.make_item("Manual consultation")
+        self.assert_texts(item, item.name, item.name)
+
+    def test_single_plan_offering_drops_plan_from_sap_text(self):
+        item = self.usage_item()
+        self.assert_texts(item, item.name, "demo-cluster (Kubernetes) / K8s nodes")
+
+    def test_single_plan_sap_text_uses_stored_name_after_rename(self):
+        item = self.usage_item()
+        self.resource.name = "renamed-cluster"
+        self.resource.save()
+        self.offering.name = "Renamed offering"
+        self.offering.save()
+        item.refresh_from_db()
+        self.assertEqual(
+            self.sap.get_tekst_2_field(item),
+            "demo-cluster (Kubernetes) / K8s nodes",
+        )
+
+    def test_single_plan_sap_text_keeps_overage_marker(self):
+        item = self.usage_item(" (Overage)")
+        self.assertEqual(
+            self.sap.get_tekst_2_field(item),
+            "demo-cluster (Kubernetes) / K8s nodes (Overage)",
+        )
+
+    def test_single_plan_sap_text_of_legacy_usage_item_keeps_offering(self):
+        # Usage items created before the plan was part of their name.
+        item = self.usage_item(name="demo-cluster / K8s nodes")
+        self.assertEqual(
+            self.sap.get_tekst_2_field(item),
+            "demo-cluster (Kubernetes) / K8s nodes",
+        )
+
+    def test_single_plan_sap_text_uses_component_name_from_details(self):
+        # Fixed items of OpenStack tenants carry display names such as "CPU".
+        item = self.make_item(
+            "demo-cluster (Kubernetes / Basic) / CPU",
+            plan_name="Basic",
+            resource_name="demo-cluster",
+            offering_name="Kubernetes",
+            offering_component_name="Cores",
+        )
+        self.assertEqual(
+            self.sap.get_tekst_2_field(item),
+            "demo-cluster (Kubernetes) / Cores",
+        )
+
+    def test_single_plan_sap_text_falls_back_to_live_names(self):
+        item = self.make_item(
+            "demo-cluster / K8s nodes", offering_component_name="K8s nodes"
+        )
+        self.assertEqual(
+            self.sap.get_tekst_2_field(item),
+            "demo-cluster (Kubernetes) / K8s nodes",
+        )
 
 
 @freeze_time("2017-11-01")

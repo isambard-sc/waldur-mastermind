@@ -7,7 +7,7 @@ from waldur_core.structure.tests.factories import UserFactory
 
 
 @ddt
-class TestProjectQuotas(test.APITransactionTestCase):
+class TestProjectQuotas(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -31,3 +31,19 @@ class TestProjectQuotas(test.APITransactionTestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data, [])
+
+    def test_filter_by_customer_uuid(self):
+        other_project = structure_fixtures.ProjectFixture().project
+        other_project.set_quota_usage("nc_resource_count", 5)
+        self.client.force_login(self.fixture.staff)
+        response = self.client.get(
+            reverse("project-quotas-list"),
+            {
+                "quota_name": "nc_resource_count",
+                "customer_uuid": self.fixture.customer.uuid.hex,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [row["project_name"] for row in response.data], [self.project.name]
+        )

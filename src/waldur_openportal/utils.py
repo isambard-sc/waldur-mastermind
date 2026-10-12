@@ -4,15 +4,16 @@ import decimal
 import json
 import logging
 import re
+from typing import NamedTuple
 
-from constance import config
+from constance import config as constance_config
 from django.utils import timezone
 
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import add_user as grant_role
-from waldur_core.permissions.utils import get_permissions
+from waldur_core.permissions.utils import get_permissions, validate_role_grant
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import (
     get_connected_customers,
@@ -20,11 +21,13 @@ from waldur_core.structure.managers import (
     get_project_users,
 )
 from waldur_core.users import models as user_models
+from waldur_core.users import tasks as user_tasks
 from waldur_core.users.enums import InvitationState
+from waldur_core.users.utils import get_invitation_duplicates
+from waldur_mastermind.invoices import ledger as invoice_ledger
 from waldur_mastermind.invoices import models as invoice_models
 
-from . import models
-
+from . import config, exceptions, models, utils
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +160,7 @@ def get_openportal_robot():
             ),
             "first_name": "OpenPortal",
             "last_name": "Robot",
-            "email": config.SITE_EMAIL,
+            "email": constance_config.SITE_EMAIL,
         },
     )
     if created:
@@ -290,14 +293,12 @@ def get_user_shortname(user):
 
     user = user_info.user
 
-    # if this is not set, then copy it in from the user.unix_username
-    # property (which may disappear in the future)
-    if user_info.shortname is None and hasattr(user, "unix_username"):
-        if user.unix_username is not None:
-            logger.debug(f"Copying shortname from the user's unix_username for {user}")
-            user_info.set_shortname(user.unix_username)
-            user_info.save()
-
+    # There used to be a fallback here copying core.User.unix_username in
+    # when the shortname was unset. That field is gone ("which may disappear
+    # in the future" - it did), and UserInfo.shortname is now the only place a
+    # user's local username lives. So an unset shortname is simply unset: the
+    # user has not chosen one yet, through
+    # PUT /api/openportal-userinfo/<user>/set_shortname/.
     if user_info.shortname is None:
         logger.error(f"Empty shortname for user: {user}")
 
@@ -437,7 +438,28 @@ def fix_total_allocation(project):
 
     allocation = project_template.convert_to_credits(details.allocation)
 
-    set_project_credits(project, allocation, silent=True)
+    # Declare what this movement IS before writing it. Every change to
+    # ProjectCredit.value is recorded in the credit ledger by a signal handler,
+    # and an untyped one is filed as STAFF_GRANT - so without this block a
+    # nightly reconciliation reads, in the ledger, as a person handing out
+    # credit. ADJUSTMENT is the existing type for an automated correction
+    # (invoices/handlers.py uses it the same way); nothing new is added to
+    # CreditTransaction.Types, so no migration in upstream's app.
+    #
+    # billing_period is the current month because that is what this corrects:
+    # set_project_credits derives the START-OF-MONTH balance, from the award
+    # total minus spend excluding the current month. Leaving it open would drop
+    # the correction out of any per-month total.
+    today = timezone.now().date()
+    with invoice_ledger.credit_transaction_type(
+        invoice_models.CreditTransaction.Types.ADJUSTMENT,
+        comment=(
+            "OpenPortal reconciliation: project credit recomputed from the "
+            "award total and lifetime consumption."
+        ),
+        billing_period=today.replace(day=1),
+    ):
+        set_project_credits(project, allocation, silent=True)
 
 
 def infer_allocation_from_accounting(
@@ -604,6 +626,434 @@ def get_project_credits(project, silent: bool = False) -> decimal.Decimal:
     )
 
     return total_credits + total_spend
+
+
+def _get_managed_project_windows(
+    managed_project: "models.ManagedProject",
+) -> list[tuple[datetime.date, datetime.date | None]]:
+    """
+    Return the list of (start_date, end_date) windows during which the passed
+    ManagedProject was attached to a Waldur project, merged so that windows
+    sharing a boundary day (e.g. detached and reattached on the same day)
+    become a single window. end_date is None for the current, still-open
+    window.
+
+    Backed by ManagedProject.get_attachments() (ManagedProjectAttachment
+    rows), which reconstructs history from ManagedProjectAuditEntry on first
+    read for a ManagedProject that predates that tracking.
+    """
+    windows = [
+        (
+            attachment.attached_at.date(),
+            attachment.detached_at.date() if attachment.detached_at else None,
+        )
+        for attachment in managed_project.get_attachments().order_by("attached_at")
+    ]
+
+    return _merge_adjacent_windows(windows)
+
+
+def _merge_adjacent_windows(
+    windows: list[tuple[datetime.date, datetime.date | None]],
+) -> list[tuple[datetime.date, datetime.date | None]]:
+    """
+    Merge windows that touch or overlap (end_date of one is on or after
+    start_date of the next) so that a shared boundary day - e.g. detached and
+    reattached on the same day - is only counted once.
+    """
+    if not windows:
+        return []
+
+    merged = [windows[0]]
+
+    for start, end in windows[1:]:
+        last_start, last_end = merged[-1]
+
+        if last_end is not None and start <= last_end:
+            merged[-1] = (last_start, end)
+        else:
+            merged.append((start, end))
+
+    return merged
+
+
+def _clip_window_to_range(
+    start: datetime.date,
+    end: datetime.date | None,
+    range_start: datetime.date,
+    range_end: datetime.date,
+) -> tuple[datetime.date, datetime.date] | None:
+    """
+    Clip a (start, end) window - end may be None for a still-open window -
+    to [range_start, range_end]. Returns (clip_start, clip_end), or None if
+    the window and the range don't overlap at all.
+    """
+    window_end = end or range_end
+    clip_start = max(range_start, start)
+    clip_end = min(range_end, window_end)
+
+    if clip_start > clip_end:
+        return None
+
+    return (clip_start, clip_end)
+
+
+def get_managed_project_attached_date_ranges(
+    managed_project: "models.ManagedProject",
+    range_start: datetime.date,
+    range_end: datetime.date,
+) -> list[tuple[datetime.date, datetime.date]]:
+    """
+    Return the closed [start, end] date sub-ranges within
+    [range_start, range_end] during which managed_project was attached to a
+    project, clipped to that range. Sub-ranges with no overlap are dropped -
+    an empty result means the award was not connected to any project at any
+    point during the requested range.
+
+    Used to trim an OpenPortal usage/storage report down to only the days an
+    award was actually connected, rather than every day in a requested
+    range: report.filter() one DateRange per returned sub-range, then
+    combine() the results back into a single report.
+    """
+    windows = _get_managed_project_windows(managed_project)
+
+    clipped_ranges = []
+    for start, end in windows:
+        clipped = _clip_window_to_range(start, end, range_start, range_end)
+        if clipped is not None:
+            clipped_ranges.append(clipped)
+
+    return clipped_ranges
+
+
+def _sum_usage_over_windows(
+    windows: list[tuple[datetime.date, datetime.date | None]],
+    project_identifier: str | None,
+    resource: str | None = None,
+) -> float:
+    """
+    Sum the node-hours from cached usage reports that fall within the passed
+    windows. Each cached report covers a calendar month; where a window
+    starts or ends partway through a month, the report is filtered down to
+    the exact overlapping days before summing.
+
+    project_identifier is the key; resource narrows further and is optional.
+    Every other reader of these reports (board._get_cached_report_for_month,
+    the two reconciliation sweeps below) keys on project_identifier alone,
+    because that already scopes the reports to one project.
+
+    A resource here is the LOCAL destination the usage was recorded against -
+    what backfill writes as str(backend.client.destination()), e.g.
+    "brics.aip2.clusters.shared". It is not interchangeable with
+    ManagedProject.destination, which is the REMOTE portal that manages the
+    award; passing one where the other belongs matches nothing at all.
+    """
+    if not windows or not project_identifier:
+        return 0.0
+
+    import openportal
+
+    total_hours = 0.0
+
+    cached_reports = models.CachedProjectUsageReport.objects.filter(
+        project_identifier=project_identifier
+    )
+    if resource:
+        cached_reports = cached_reports.filter(resource=resource)
+
+    for cached_report in cached_reports:
+        month_start = datetime.date(cached_report.year, cached_report.month, 1)
+        month_end = get_last_day_of_month(month_start)
+
+        for start_date, end_date in windows:
+            clipped = _clip_window_to_range(
+                start_date, end_date, month_start, month_end
+            )
+            if clipped is None:
+                continue
+            overlap_start, overlap_end = clipped
+
+            report = cached_report.get_report()
+            date_range = openportal.DateRange(overlap_start, overlap_end)
+            total_hours += float(report.filter(date_range).total_usage.hours)
+
+    return total_hours
+
+
+def _remote_attachment_key(attachment: "models.RemoteProjectAttachment") -> str | None:
+    """The key an attachment's usage is cached under, or None if unknowable.
+
+    Recorded on the attachment when it opened. For one that predates that,
+    recomputed from its project: the key is the project's local identifier,
+    "{shortname}.{portal}", and a project's shortname is set once, so the
+    recomputed key is exactly the one used at the time.
+    """
+    if attachment.project_identifier:
+        return attachment.project_identifier
+    if attachment.project is None:
+        return None
+    try:
+        return str(get_local_project_identifier(attachment.project))
+    except (ValueError, RuntimeError) as exc:
+        logger.warning(
+            "No usage key for attachment %s of %s: %s",
+            attachment.pk,
+            attachment.remote_project,
+            exc,
+        )
+        return None
+
+
+class AwardWindow(NamedTuple):
+    """One period an award was attached to a project: when, where, and whose."""
+
+    start: datetime.date
+    end: datetime.date | None  # None while still attached; otherwise inclusive
+    key: str | None  # the project identifier its usage is cached under
+    project: "structure_models.Project | None"
+
+
+def get_remote_project_windows(
+    remote_project: "models.RemoteProject",
+) -> list[AwardWindow]:
+    """Each period an award was attached to a project.
+
+    end is None for the current, still-open window. Dates are inclusive.
+
+    The rule on a day the award moves is the ManagedProject one: the
+    last-attached project claims the entire day. So an attachment stops the
+    day before the next one starts, and one wholly claimed by a later
+    attachment on the same day contributes nothing. The windows are therefore
+    disjoint, and no day's usage can be counted twice.
+
+    Unlike a ManagedProject, each window carries its own key. A ManagedProject's
+    usage lives under one identifier however often it moves, so its windows
+    only say *when*. An award's usage is cached under the identifier of
+    whichever project held it, so these windows also say *where*.
+    """
+    attachments = list(remote_project.attachments.order_by("attached_at", "id"))
+    windows = []
+    for index, attachment in enumerate(attachments):
+        start = attachment.attached_at.date()
+        end = attachment.detached_at.date() if attachment.detached_at else None
+        if index + 1 < len(attachments):
+            cutoff = attachments[index + 1].attached_at.date() - datetime.timedelta(
+                days=1
+            )
+            if end is None or end > cutoff:
+                end = cutoff
+        if end is not None and end < start:
+            continue
+        windows.append(
+            AwardWindow(
+                start, end, _remote_attachment_key(attachment), attachment.project
+            )
+        )
+    return windows
+
+
+def get_remote_project_usage_report(
+    remote_project: "models.RemoteProject",
+    range_start: datetime.date,
+    range_end: datetime.date,
+):
+    """The award's usage over [range_start, range_end], as one report.
+
+    For each window: the reports cached under that window's key, for this
+    award's destination, filtered to exactly the window's days. The pieces are
+    then combined.
+
+    Each piece is remapped to one common project identifier first, and this is
+    not cosmetic: ProjectUsageReport.combine() of reports with different
+    project identifiers does not raise, it silently keeps only the first
+    report's usage. Every award that had ever moved would be under-reported,
+    with nothing to say so.
+
+    resource is RemoteProject.destination, and here the two really are the same
+    string - both come from the remote client's destination(). That is worth
+    stating because on the ManagedProject side they are not, and treating them
+    as the same once made every award report zero usage.
+
+    Returns None if the award has no identity to report under yet (a pending
+    award with no key), which also means it can have no usage.
+    """
+    import openportal
+
+    windows = get_remote_project_windows(remote_project)
+    label = remote_project.identifier or next(
+        (window.key for window in reversed(windows) if window.key), None
+    )
+    if label is None:
+        return None
+    common = openportal.ProjectIdentifier(label)
+
+    pieces = []
+    for window in windows:
+        if not window.key:
+            continue
+        clipped = _clip_window_to_range(
+            window.start, window.end, range_start, range_end
+        )
+        if clipped is None:
+            continue
+        cached_reports = models.CachedProjectUsageReport.objects.filter(
+            project_identifier=window.key, resource=remote_project.destination
+        )
+        for cached_report in cached_reports:
+            month_start = datetime.date(cached_report.year, cached_report.month, 1)
+            overlap = _clip_window_to_range(
+                clipped[0], clipped[1], month_start, get_last_day_of_month(month_start)
+            )
+            if overlap is None:
+                continue
+            piece = cached_report.get_report().filter(openportal.DateRange(*overlap))
+            piece.remap_project(common)
+            pieces.append(piece)
+
+    if not pieces:
+        return openportal.ProjectUsageReport(common)
+    if len(pieces) == 1:
+        return pieces[0]
+    return openportal.ProjectUsageReport.combine(pieces)
+
+
+def get_remote_project_storage_report(
+    remote_project: "models.RemoteProject",
+    range_start: datetime.date,
+    range_end: datetime.date,
+):
+    """The award's storage snapshots over [range_start, range_end], as one report.
+
+    The storage equivalent of get_remote_project_usage_report(), with the same
+    windows, keys and resource. A storage report is not a sum but a series of
+    dated snapshots (quota limit and usage per volume), so for each window
+    this keeps the snapshots generated on the window's days, and the combined
+    report's top-level snapshot is the latest of those.
+
+    Two ways this differs from the usage side, both learned from the library:
+
+    - Snapshots are picked by date from daily_reports(), not with filter().
+      ProjectStorageReport.filter() keeps the report's top-level (latest)
+      snapshot even when it falls outside the range, so the old project's
+      storage after the award left it would show up as the award's.
+    - combine() of reports with different project identifiers raises
+      Incompatible, so each snapshot is remapped to one common identifier.
+
+    Returns None if the award has no identity to report under yet.
+    """
+    import openportal
+
+    windows = get_remote_project_windows(remote_project)
+    label = remote_project.identifier or next(
+        (window.key for window in reversed(windows) if window.key), None
+    )
+    if label is None:
+        return None
+    common = openportal.ProjectIdentifier(label)
+
+    snapshots = []
+    for window in windows:
+        if not window.key:
+            continue
+        clipped = _clip_window_to_range(
+            window.start, window.end, range_start, range_end
+        )
+        if clipped is None:
+            continue
+        cached_reports = models.CachedProjectStorageReport.objects.filter(
+            project_identifier=window.key, resource=remote_project.destination
+        )
+        for cached_report in cached_reports:
+            month_start = datetime.date(cached_report.year, cached_report.month, 1)
+            if (
+                _clip_window_to_range(
+                    clipped[0],
+                    clipped[1],
+                    month_start,
+                    get_last_day_of_month(month_start),
+                )
+                is None
+            ):
+                continue
+            for snapshot in cached_report.get_report().daily_reports():
+                if clipped[0] <= snapshot.generated_at.date() <= clipped[1]:
+                    snapshot.remap_project(common)
+                    snapshots.append(snapshot)
+
+    if not snapshots:
+        return openportal.ProjectStorageReport(common)
+    snapshots.sort(key=lambda snapshot: snapshot.generated_at)
+    if len(snapshots) == 1:
+        return snapshots[0]
+    return openportal.ProjectStorageReport.combine(snapshots)
+
+
+def get_remote_project_total_hours(remote_project: "models.RemoteProject") -> float:
+    """Every hour of usage the award has had, across every project it was on."""
+    windows = get_remote_project_windows(remote_project)
+    if not windows:
+        return 0.0
+    report = get_remote_project_usage_report(
+        remote_project, windows[0].start, datetime.date.today()
+    )
+    return float(report.total_usage.hours) if report is not None else 0.0
+
+
+def get_award_usage_info(project) -> tuple[float | None, float]:
+    """
+    Return (allocation_credits, usage_credits) for the award (ManagedProject)
+    currently attached to the passed project, both on the same credits scale
+    used elsewhere for accounting (ProjectCredit, InvoiceItem prices).
+
+    allocation_credits is the award's AwardDetails.allocation converted via
+    the award's ProjectTemplate.convert_to_credits(). It is None if there is
+    no attached ManagedProject, or if it has no resolvable ProjectTemplate or
+    allocation to convert. Note this deliberately reads project_template
+    directly rather than calling ManagedProject.get_project_template(),
+    which can delete the ManagedProject as a side effect of failing to
+    resolve one - not something a read-only report should risk triggering.
+
+    usage_credits is the sum of cached usage report node-hours over exactly
+    the dates the award was connected to the project - see
+    _get_managed_project_windows for how those dates are determined.
+    """
+    if not isinstance(project, structure_models.Project):
+        raise TypeError("project must be an instance of Project")
+
+    try:
+        managed_project = models.ManagedProject.objects.get(project=project)
+    except models.ManagedProject.DoesNotExist:
+        return (None, 0.0)
+
+    allocation_credits = None
+    project_template = managed_project.project_template
+    if project_template is None:
+        logger.warning(
+            f"Managed project {managed_project} has no project template set; "
+            "cannot convert its allocation to credits."
+        )
+    else:
+        details = managed_project.get_details()
+        if details.allocation is None:
+            logger.warning(
+                f"Managed project {managed_project} has no allocation in its details."
+            )
+        else:
+            allocation_credits = project_template.convert_to_credits(details.allocation)
+
+    # Keyed on local_identifier alone. An earlier version also passed
+    # resource=managed_project.destination, which never matched: the reports'
+    # resource is the local cluster the usage happened on
+    # ("brics.aip2.clusters.shared"), while ManagedProject.destination is the
+    # remote portal that sends instructions about the award
+    # ("airr.brics.isambard-ai"). Both fields are called a destination and
+    # they are different endpoints, so every award reported zero usage.
+    usage_credits = _sum_usage_over_windows(
+        _get_managed_project_windows(managed_project),
+        project_identifier=managed_project.local_identifier,
+    )
+
+    return (allocation_credits, usage_credits)
 
 
 def set_project_credits(
@@ -815,6 +1265,52 @@ def get_project_members(project) -> dict[str, str]:
     return members
 
 
+def invite_user_to_project(project, email, role, send_email: bool = True):
+    """
+    Invite a user to the project with the specified email and role.
+    If a matching pending invitation already exists, do nothing.
+    If send_email is True, send an invitation email.
+    """
+    if not isinstance(project, structure_models.Project):
+        raise TypeError("project must be an instance of Project")
+
+    if not isinstance(email, str) or not email:
+        raise ValueError("email must be a non-empty string")
+
+    duplicates = get_invitation_duplicates(project, [{"email": email, "role": role}])
+    if duplicates:
+        logger.info(
+            "Skipping invitation for %s to project %s with role %s: "
+            "pending invitation %s already exists.",
+            email,
+            project,
+            role,
+            duplicates[0]["existing_invitation_uuid"],
+        )
+        return
+
+    invitation = user_models.Invitation.objects.create(
+        scope=project,
+        email=email,
+        role=role,
+        created_by=utils.get_openportal_robot(),
+        state=InvitationState.PENDING,
+        customer=project.customer,
+    )
+
+    if project.start_date and project.start_date > timezone.now().date():
+        invitation.state = InvitationState.PENDING_PROJECT
+
+    invitation.save()
+
+    logger.info(
+        f"Created invitation {invitation} for user {email} to project {project} with role {role}"
+    )
+
+    if send_email:
+        user_tasks.process_invitation.delay(invitation.uuid.hex, "OpenPortal")
+
+
 def get_or_create_user_by_email(email: str) -> core_models.User:
     """
     Return the User with the given email, creating one if none exists.
@@ -824,7 +1320,10 @@ def get_or_create_user_by_email(email: str) -> core_models.User:
     by the identity provider), and an unusable password.
     """
     email = email.strip().lower()
-    user = core_models.User.objects.filter(email__iexact=email).first()
+    # all_objects, not objects: the default manager hides inactive accounts, so
+    # looking through it would miss a deactivated user and then fail to create a
+    # replacement, because username is unique and already taken by that account.
+    user = core_models.User.all_objects.filter(email__iexact=email).first()
     if user is not None:
         return user
 
@@ -849,6 +1348,10 @@ def set_project_member_role(project, email, role, is_existing_member: bool = Fal
 
     If is_existing_member is False, the user is looked up (or created) by email and
     added directly.
+
+    Raises ValidationError if the role cannot be granted. This path bypasses the
+    serializer, so it validates the same invariants explicitly, as
+    Invitation.accept does for the invitation path.
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
@@ -862,6 +1365,7 @@ def set_project_member_role(project, email, role, is_existing_member: bool = Fal
         for perm in get_permissions(project, user):
             perm.revoke(current_user=robot)
 
+    validate_role_grant(project, user, role)
     grant_role(project, user, role, created_by=robot)
     logger.debug(f"Set role {role.name} for {email} on project {project}.")
 
@@ -879,7 +1383,9 @@ def remove_project_member(project, email: str) -> None:
     email = str(email).strip().lower()
     robot = get_openportal_robot()
 
-    user = core_models.User.objects.filter(email__iexact=email).first()
+    # all_objects, not objects: deactivating a user already revokes their roles,
+    # so this is normally moot, but the removal should not depend on that.
+    user = core_models.User.all_objects.filter(email__iexact=email).first()
     if user is not None:
         for perm in get_permissions(project, user):
             perm.revoke(current_user=robot)
@@ -905,15 +1411,15 @@ def get_local_project_identifier(project):
         logger.error(f"Project {project} has no shortname; cannot get identifier.")
         raise ValueError(f"Project {project} has no shortname; cannot get identifier.")
 
-    from . import op as openportal
+    import openportal
 
-    if not openportal.have_openportal():
+    if not config.ensure_config_loaded():
         logger.error("OpenPortal is not configured; cannot get project identifier.")
         raise RuntimeError(
             "OpenPortal is not configured; cannot get project identifier."
         )
 
-    openportal.ensure_config_loaded()
+    config.ensure_config_loaded()
 
     return openportal.ProjectIdentifier(f"{shortname}.{openportal.get_portal()}")
 
@@ -926,7 +1432,8 @@ def refresh_remote_project(remote_project):
     Returns the AwardDetails on success, or None if OpenPortal is not configured
     or the fetch fails.
     """
-    from . import op as openportal
+    import openportal
+
     from . import remote_project_service
     from .board import OpenPortalBoard
 
@@ -937,11 +1444,11 @@ def refresh_remote_project(remote_project):
         )
         return None
 
-    if not openportal.have_openportal():
+    if not config.ensure_config_loaded():
         logger.warning("refresh_remote_project: OpenPortal is not configured.")
         return None
 
-    openportal.ensure_config_loaded()
+    config.ensure_config_loaded()
 
     destination = openportal.Destination(str(remote_project.destination))
 
@@ -959,7 +1466,7 @@ def refresh_remote_project(remote_project):
 
         try:
             details = board.refetch_award(local_id)
-        except openportal.OpenPortalUnsupportedCommandError as e:
+        except exceptions.OpenPortalUnsupportedCommandError as e:
             logger.warning(
                 f"refresh_remote_project: remote portal does not support get_award"
                 f" for {remote_project.identifier!r} (older portal) — skipping refresh: {e}"
@@ -1157,8 +1664,9 @@ def set_membership_control(
     dry_run=True (default) logs intended changes without applying them.
     The function is idempotent — re-running after a partial failure is safe.
     """
+    import openportal
+
     from . import models as op_models
-    from . import op as openportal
     from . import tasks as op_tasks
 
     if new_control is None:
@@ -1269,10 +1777,10 @@ def _resolve_useridentifier_from_slugs(identifier: str):
     by their slugs and confirm the user is still a member of that project.
     Returns a user info dict or None.
     """
+    import openportal
+
     from waldur_core.permissions.models import UserRole
     from waldur_core.structure import models as structure_models
-
-    from . import op as openportal
 
     try:
         portal = str(openportal.get_portal())
@@ -1379,7 +1887,8 @@ def backfill_usage_report_cache():
     Skips any month for which a complete CachedProjectUsageReport already
     exists, so it is safe to re-run.
     """
-    from . import op as openportal
+    import openportal
+
     from .backend import OpenPortalBackend
 
     today = timezone.now().date()
@@ -1621,7 +2130,8 @@ def backfill_remote_usage_report_cache():
     Skips any month for which a complete CachedProjectUsageReport already
     exists, so it is safe to re-run.
     """
-    from . import op as openportal
+    import openportal
+
     from .remotebackend import RemoteOpenPortalBackend
 
     today = timezone.now().date()
@@ -1846,6 +2356,110 @@ def compare_historical_remote_usage_with_cache():
     return results
 
 
+def sync_user_slugs():
+    """
+    Make every User.slug match the user's OpenPortal username.
+
+    The slug is a copy: waldur_openportal UserInfo.shortname is where a user's
+    OpenPortal username actually lives, and set_shortname() writes both at the
+    moment it is chosen. This reconciles the copy for everything that write
+    cannot see - a shortname set before the copying existed, a slug generated
+    from the account name by SlugMixin, a row repaired by hand.
+
+    A user who has not chosen a username gets a NULL slug rather than a
+    generated one, because homeport shows the slug *as* the OpenPortal
+    username: a plausible-looking slug there is not a missing answer, it is a
+    wrong one.
+
+    Gated on the portal-wide user.show_openportal_identifier feature. With it
+    off the slug means what it means everywhere else in Waldur, and this does
+    nothing at all.
+
+    Projects are deliberately not touched. For them the dependency runs the
+    other way - set_default_project_shortname() derives ProjectInfo.shortname
+    *from* Project.slug, and raises without one - so nulling a project slug
+    would break the shortname it is supposed to feed.
+
+    Returns:
+        dict: {"updated": int, "cleared": int, "unchanged": int,
+               "errors": list[str], "skipped": bool}
+    """
+    if not core_models.is_feature_enabled(core_models.OPENPORTAL_IDENTIFIER_FEATURE):
+        logger.debug(
+            "%s is off, leaving user slugs alone",
+            core_models.OPENPORTAL_IDENTIFIER_FEATURE,
+        )
+        return {
+            "updated": 0,
+            "cleared": 0,
+            "unchanged": 0,
+            "errors": [],
+            "skipped": True,
+        }
+
+    shortnames = dict(
+        models.UserInfo.objects.exclude(shortname=None)
+        .exclude(shortname="")
+        .values_list("user_id", "shortname")
+    )
+
+    updated = 0
+    cleared = 0
+    unchanged = 0
+    errors = []
+
+    for user in core_models.User.objects.all().only("id", "slug", "username"):
+        shortname = shortnames.get(user.id)
+        wanted = shortname.strip() if shortname else None
+
+        if user.slug == wanted:
+            unchanged += 1
+            continue
+
+        old_slug = user.slug
+        try:
+            # The flag marks this as a sanctioned write: core.User.save()
+            # refuses a slug change that comes from a user renaming
+            # themselves, which is the whole point of the copy being fixed.
+            user._syncing_to_userinfo = True
+            try:
+                user.slug = wanted
+                user.save(update_fields=["slug"])
+            finally:
+                user._syncing_to_userinfo = False
+        except Exception as e:
+            error = f"Failed to sync slug for user {user.username} ({user.uuid}): {e}"
+            errors.append(error)
+            logger.error(error, exc_info=True)
+            continue
+
+        if wanted is None:
+            cleared += 1
+            logger.info(
+                f"Cleared slug '{old_slug}' for user {user.username} ({user.uuid}): "
+                f"no OpenPortal username set"
+            )
+        else:
+            updated += 1
+            logger.info(
+                f"Updated user {user.username} ({user.uuid}) slug: "
+                f"'{old_slug}' -> '{wanted}'"
+            )
+
+    logger.info(
+        f"User slug sync complete. {updated} updated, {cleared} cleared, "
+        f"{unchanged} unchanged, {len(errors)} errors."
+    )
+
+    return {
+        "updated": updated,
+        "cleared": cleared,
+        "unchanged": unchanged,
+        "errors": errors,
+        "skipped": False,
+    }
+
+
 def sync_openportal_shortnames_to_slugs():
     """
     Synchronize shortnames from ProjectInfo and UserInfo to their respective
@@ -1876,8 +2490,29 @@ def sync_openportal_shortnames_to_slugs():
 
     logger.info("Starting sync of OpenPortal shortnames to slugs...")
 
-    # Sync ProjectInfo shortnames to Project slugs
+    # Sync ProjectInfo shortnames to Project slugs.
+    #
+    # Refused outright on an application portal. There, Project.slug holds the
+    # award identifier (0251-4064-4677-1) and has nothing to do with OpenPortal
+    # shortnames, so overwriting it would destroy the identifier every link and
+    # every award refers to. ProjectInfo.set_shortname() has always made this
+    # distinction; this function did not, and it is the more dangerous of the
+    # two because it acts on every project at once.
+    application_portal_only = core_models.is_feature_enabled(
+        core_models.APPLICATION_PORTAL_FEATURE
+    )
+    if application_portal_only:
+        logger.info(
+            "%s is on, so Project.slug is an award identifier rather than a "
+            "copy of the shortname: leaving project slugs alone",
+            core_models.APPLICATION_PORTAL_FEATURE,
+        )
+
     for project_info in models.ProjectInfo.objects.all().select_related("project"):
+        if application_portal_only:
+            projects_skipped += 1
+            continue
+
         try:
             # Skip if no shortname or project doesn't exist
             if not project_info.shortname or not project_info.project:
@@ -1943,10 +2578,16 @@ def sync_openportal_shortnames_to_slugs():
                 )
                 continue
 
-            # Update the slug
+            # Update the slug. The flag is what distinguishes a sanctioned
+            # write from a user renaming themselves - core.User.save()
+            # refuses the latter once the slug is set.
             old_slug = user.slug
-            user.slug = shortname
-            user.save(update_fields=["slug"])
+            user._syncing_to_userinfo = True
+            try:
+                user.slug = shortname
+                user.save(update_fields=["slug"])
+            finally:
+                user._syncing_to_userinfo = False
             users_updated += 1
 
             logger.info(
@@ -2405,3 +3046,131 @@ def fix_managed_project_destinations():
         f"fixed={fixed}, skipped={skipped}, errors={errors}"
     )
     return fixed, skipped, errors
+
+
+def backfill_remote_project_attachments(dry_run: bool = False) -> dict:
+    """Give every award's attachments a usage key and a true start date.
+
+    Three repairs, all needed before get_remote_project_usage_report() can
+    see an award's history:
+
+    1. Keys. An attachment opened before keys were recorded has none. The open
+       one takes its allocation's backend_id - the key that is live right now.
+       A closed one is recomputed from its project, which is exact because a
+       project's shortname is set once.
+
+    2. Missing attachments. An award with no attachment row at all gets one
+       for its current project.
+
+    3. Start dates. The first attachment of an award whose history predates
+       tracking was stamped with the moment tracking began, not the moment the
+       award arrived - so its window would start then, and every earlier day
+       of usage would be clipped away. It is moved back to the earliest
+       evidence of arrival: the creation of the allocation that brought the
+       award to that project, else the award's own creation. Only the first
+       attachment is ever moved; later ones were recorded as they happened.
+
+    The earliest cached report under the key is deliberately not used as
+    evidence: if that project held a different award on the same destination
+    earlier, its usage is under the same key, and this would claim it.
+
+    Each open attachment's key is also checked against the project identifier
+    computed from its project. They should agree; a disagreement means the two
+    derivations have drifted, and is reported rather than guessed at.
+    """
+    summary = {
+        "remote projects": 0,
+        "attachments created": 0,
+        "keys filled from allocation": 0,
+        "keys filled from project": 0,
+        "keys with cached usage": 0,
+        "keys with no cached usage": 0,
+        "first attachments backdated": 0,
+        "open keys disagreeing with project": 0,
+        "keys unrecoverable": 0,
+        "first attachments with only the award's creation as evidence": 0,
+    }
+
+    for remote_project in models.RemoteProject.objects.select_related(
+        "remote_allocation", "current_project"
+    ):
+        summary["remote projects"] += 1
+        allocation = remote_project.remote_allocation
+
+        if not remote_project.attachments.exists() and remote_project.current_project:
+            summary["attachments created"] += 1
+            if not dry_run:
+                models.RemoteProjectAttachment.objects.create(
+                    remote_project=remote_project,
+                    project=remote_project.current_project,
+                    note="Reconstructed by backfill_remote_project_attachments.",
+                )
+
+        for attachment in remote_project.attachments.order_by("attached_at", "id"):
+            is_open = attachment.detached_at is None
+            if not attachment.project_identifier:
+                if is_open and allocation is not None and allocation.backend_id:
+                    key, source = allocation.backend_id, "keys filled from allocation"
+                else:
+                    key, source = (
+                        _remote_attachment_key(attachment),
+                        "keys filled from project",
+                    )
+                if key is None:
+                    summary["keys unrecoverable"] += 1
+                    continue
+                summary[source] += 1
+                attachment.project_identifier = key
+                if not dry_run:
+                    attachment.save(update_fields=["project_identifier"])
+
+            if is_open and attachment.project is not None:
+                try:
+                    expected = str(get_local_project_identifier(attachment.project))
+                except (ValueError, RuntimeError):
+                    expected = None
+                if expected and expected != attachment.project_identifier:
+                    summary["open keys disagreeing with project"] += 1
+                    logger.warning(
+                        "Attachment %s of %s has key %s, but its project's "
+                        "identifier is %s",
+                        attachment.pk,
+                        remote_project,
+                        attachment.project_identifier,
+                        expected,
+                    )
+
+            has_usage = models.CachedProjectUsageReport.objects.filter(
+                project_identifier=attachment.project_identifier,
+                resource=remote_project.destination,
+            ).exists()
+            summary[
+                "keys with cached usage" if has_usage else "keys with no cached usage"
+            ] += 1
+
+        first = remote_project.attachments.order_by("attached_at", "id").first()
+        if first is not None:
+            evidence = [remote_project.created]
+            if allocation is not None and allocation.project_id == first.project_id:
+                evidence.append(allocation.created)
+            else:
+                # The award moved on from this first project, and the
+                # allocation that brought it there has gone. Only the award's
+                # own creation remains as evidence, which may itself be late.
+                summary[
+                    "first attachments with only the award's creation as evidence"
+                ] += 1
+            arrived = min(evidence)
+            # Compared by date. A record made at the time is seconds after its
+            # allocation, and windows are whole days: moving it by seconds
+            # changes nothing but would rewrite every healthy record's note.
+            if arrived.date() < first.attached_at.date():
+                summary["first attachments backdated"] += 1
+                if not dry_run:
+                    first.attached_at = arrived
+                    first.note = (
+                        f"{first.note}\n" if first.note else ""
+                    ) + "attached_at backdated by backfill_remote_project_attachments."
+                    first.save(update_fields=["attached_at", "note"])
+
+    return summary

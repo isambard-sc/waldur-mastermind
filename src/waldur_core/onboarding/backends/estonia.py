@@ -12,8 +12,11 @@ from typing import Any
 import requests
 from constance import config
 
+from waldur_core.onboarding import enums
+
 from .base import (
     CompanyRegistryBackend,
+    ErrorCode,
     ValidationRequest,
     ValidationResult,
     backend_registry,
@@ -48,11 +51,28 @@ class EstonianAriregisterBackend(CompanyRegistryBackend):
 
     @classmethod
     def get_validation_method(cls) -> str:
-        return "ariregister"
+        return enums.ValidationMethod.ARIREGISTER
 
     @classmethod
     def get_required_fields(cls) -> list[str]:
         return ["legal_person_identifier", "person_identifier"]
+
+    @classmethod
+    def get_person_identifier_fields(cls) -> dict[str, Any]:
+        """
+        Estonian backend requires civil_number (isikukood) for validation.
+
+        Returns simple string identifier specification.
+        """
+        return {
+            "type": "string",
+            "field": "civil_number",
+            "label": "Personal ID (isikukood)",
+            "description": "Estonian personal identification code obtained via TARA authentication",
+            "example": "38001085718",
+            "pattern": r"^[1-6]\d{10}$",
+            "help_text": "11-digit Estonian personal identification code starting with 1-6",
+        }
 
     @classmethod
     def get_priority(cls) -> int:
@@ -94,7 +114,7 @@ class EstonianAriregisterBackend(CompanyRegistryBackend):
                     company_data={},
                     user_roles=[],
                     raw_response={},
-                    error_code="COMPANY_NOT_FOUND",
+                    error_code=ErrorCode.COMPANY_NOT_FOUND,
                     error_message=f"Company with registration code {request.legal_person_identifier} not found",
                 )
 
@@ -103,13 +123,42 @@ class EstonianAriregisterBackend(CompanyRegistryBackend):
             )
             normalized_data = self._normalize_company_data(verified_company_data)
 
+            # If authorized, fetch additional company details (address, postal)
+            address_details = None
+            if is_authorized:
+                address_details = self._fetch_company_address_details(
+                    request.legal_person_identifier
+                )
+
+            company_data_dict = normalized_data.__dict__.copy()
+
+            # If authorized, fetch and extract address details
+            if is_authorized and address_details:
+                keha = address_details.get("keha", {})
+                ettevotjad = keha.get("ettevotjad", {})
+                companies = ettevotjad.get("item", [])
+
+                if companies and len(companies) > 0:
+                    company = companies[0]
+                    evaadressid = company.get("evaadressid", {})
+
+                    address = evaadressid.get(
+                        "aadress_ads__ads_normaliseeritud_taisaadress"
+                    )
+                    postal = evaadressid.get("indeks_ettevotja_aadressis")
+
+                    if address:
+                        company_data_dict["address"] = address
+                    if postal:
+                        company_data_dict["postal"] = postal
+
             return ValidationResult(
                 is_valid=is_authorized,
                 method_used=self.get_validation_method(),
-                company_data=normalized_data.__dict__,
+                company_data=company_data_dict,
                 user_roles=verified_user_roles,
                 raw_response=verified_company_data,
-                error_code=None if is_authorized else "NOT_AUTHORIZED",
+                error_code=None if is_authorized else ErrorCode.NOT_AUTHORIZED,
                 error_message=None
                 if is_authorized
                 else f"User {request.person_identifier} is not listed as authorized representative",
@@ -127,7 +176,7 @@ class EstonianAriregisterBackend(CompanyRegistryBackend):
                 company_data={},
                 user_roles=[],
                 raw_response={},
-                error_code="API_ERROR",
+                error_code=ErrorCode.API_ERROR,
                 error_message=f"Äriregister API error: {str(e)}",
             )
         except Exception as e:
@@ -138,9 +187,81 @@ class EstonianAriregisterBackend(CompanyRegistryBackend):
                 company_data={},
                 user_roles=[],
                 raw_response={},
-                error_code="UNKNOWN_ERROR",
+                error_code=ErrorCode.UNKNOWN_ERROR,
                 error_message=f"An unexpected error occurred: {str(e)}",
             )
+
+    def _fetch_company_address_details(
+        self, legal_person_identifier: str
+    ) -> dict[str, Any] | None:
+        """
+        Fetch detailed company data including address from Estonian Business Register API.
+
+        Args:
+            legal_person_identifier: Company registration code
+
+        Returns:
+            Dict containing company details including address, or None if fetch fails
+        """
+        # Get configuration from Constance
+        base_url = config.ONBOARDING_ARIREGISTER_BASE_URL
+        timeout = config.ONBOARDING_ARIREGISTER_TIMEOUT
+        username = config.ONBOARDING_ARIREGISTER_USERNAME
+        password = config.ONBOARDING_ARIREGISTER_PASSWORD
+
+        if not username or not password:
+            logger.error("Äriregister credentials not configured")
+            return None
+
+        legal_person_identifier = str(legal_person_identifier).strip()
+
+        xml_data = f"""<?xml version="1.0" encoding="UTF-8"?>
+        <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:iden="http://x-road.eu/xsd/identifiers" xmlns:prod="http://arireg.x-road.eu/producer/" xmlns:xro="http://x-road.eu/xsd/xroad.xsd">
+         <soapenv:Body>
+         <prod:lihtandmed_v2>
+         <prod:keha>
+         <prod:ariregister_kasutajanimi>{username}</prod:ariregister_kasutajanimi>
+         <prod:ariregister_parool>{password}</prod:ariregister_parool>
+         <prod:ariregister_valjundi_formaat>json</prod:ariregister_valjundi_formaat>
+         <prod:ariregistri_kood>{legal_person_identifier}</prod:ariregistri_kood>
+         <prod:keel>eng</prod:keel>
+         </prod:keha>
+         </prod:lihtandmed_v2>
+         </soapenv:Body>
+        </soapenv:Envelope>
+        """
+
+        headers = {
+            "Content-Type": "text/xml; charset=utf-8",
+            "SOAPAction": '""',
+        }
+
+        try:
+            response = requests.post(
+                base_url,
+                data=xml_data.encode("utf-8"),
+                headers=headers,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            response_data = response.json()
+
+            if "keha" not in response_data:
+                logger.warning(
+                    f"Invalid API response structure for address details: {legal_person_identifier}"
+                )
+                return None
+
+            return response_data
+
+        except requests.exceptions.JSONDecodeError:
+            logger.error(
+                f"Invalid JSON response from Äriregister address API for code: {legal_person_identifier}"
+            )
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching company address details: {str(e)}")
+            return None
 
     def _fetch_company_from_ariregister(
         self, legal_person_identifier: str
@@ -219,7 +340,8 @@ class EstonianAriregisterBackend(CompanyRegistryBackend):
                 )
                 return None
 
-            return response_data
+            # Return only body in raw_response
+            return {"keha": keha}
 
         except requests.exceptions.JSONDecodeError:
             logger.error(

@@ -5,11 +5,8 @@ from reversion.models import Version
 
 from waldur_core.core.admin import UserAdmin
 from waldur_core.core.models import User
-from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.core.utils import make_random_password
-from waldur_core.structure.admin import CustomerAdmin
-from waldur_core.structure.models import Customer
-from waldur_core.structure.tests.factories import CustomerFactory, UserFactory
+from waldur_core.structure.tests.factories import UserFactory
 
 
 class MockRequest:
@@ -58,46 +55,6 @@ class UserAdminTest(TestCase):
         self.assertEqual(user.civil_number, None)
 
 
-class NativeNameAdminTest(TestCase):
-    @override_waldur_core_settings(NATIVE_NAME_ENABLED=False)
-    def test_native_name_is_omitted_in_user_admin_if_feature_is_not_enabled(self):
-        user = UserFactory()
-        ma = UserAdmin(User, AdminSite())
-        self.assertFalse("native_name" in ma.get_list_display(request))
-        self.assertFalse("native_name" in ma.get_search_fields(request))
-        self.assertTrue(
-            all(
-                "native_name" not in fieldset[1]["fields"]
-                for fieldset in ma.get_fieldsets(request, user)
-            )
-        )
-
-    @override_waldur_core_settings(NATIVE_NAME_ENABLED=True)
-    def test_native_name_is_rendered_in_user_admin_if_feature_is_enabled(self):
-        user = UserFactory()
-        ma = UserAdmin(User, AdminSite())
-        self.assertTrue("native_name" in ma.get_list_display(request))
-        self.assertTrue("native_name" in ma.get_search_fields(request))
-        self.assertTrue(
-            any(
-                "native_name" in fieldset[1]["fields"]
-                for fieldset in ma.get_fieldsets(request, user)
-            )
-        )
-
-    @override_waldur_core_settings(NATIVE_NAME_ENABLED=False)
-    def test_native_name_is_omitted_in_customer_admin_if_feature_is_disabled(self):
-        customer = CustomerFactory()
-        ma = CustomerAdmin(Customer, AdminSite())
-        self.assertFalse("native_name" in ma.get_fields(request, customer))
-
-    @override_waldur_core_settings(NATIVE_NAME_ENABLED=True)
-    def test_native_name_is_rendered_in_customer_admin_if_feature_is_enabled(self):
-        customer = CustomerFactory()
-        ma = CustomerAdmin(Customer, AdminSite())
-        self.assertTrue("native_name" in ma.get_fields(request, customer))
-
-
 class UserReversionTest(TestCase):
     @override_settings(
         AUTHENTICATION_BACKENDS=("django.contrib.auth.backends.ModelBackend",)
@@ -127,11 +84,17 @@ class UserReversionTest(TestCase):
             Version.objects.filter(object_id=user.id, content_type=ct).count(), 1
         )
 
+        # Granting staff is an audited change, so it does add a revision.
         user.is_staff = True
         user.save()
+        self.assertEqual(
+            Version.objects.filter(object_id=user.id, content_type=ct).count(), 2
+        )
+
+        # Authenticating only touches last_login, which must never open one.
         self.assertTrue(
             self.client.login(username=user.username, password=user_password)
         )
         self.assertEqual(
-            Version.objects.filter(object_id=user.id, content_type=ct).count(), 1
+            Version.objects.filter(object_id=user.id, content_type=ct).count(), 2
         )

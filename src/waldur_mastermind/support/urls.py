@@ -1,12 +1,32 @@
-from django.urls import re_path
+from django.urls import include, re_path
+from rest_framework.routers import SimpleRouter
 
 from waldur_mastermind.support import views
+
+# Create a dedicated router for settings discovery
+# This creates the hierarchical URL structure: /api/support/settings/atlassian/
+settings_router = SimpleRouter()
+settings_router.register(
+    r"atlassian",
+    views.AtlassianSettingsDiscoveryViewSet,
+    basename="support-settings-atlassian",
+)
 
 
 def register_in(router):
     router.register(r"support-issues", views.IssueViewSet, basename="support-issue")
     router.register(
         r"support-priorities", views.PriorityViewSet, basename="support-priority"
+    )
+    router.register(
+        r"support-request-types",
+        views.RequestTypeViewSet,
+        basename="support-request-type",
+    )
+    router.register(
+        r"support-request-types-admin",
+        views.RequestTypeAdminViewSet,
+        basename="support-request-type-admin",
     )
     router.register(
         r"support-comments", views.CommentViewSet, basename="support-comment"
@@ -28,9 +48,51 @@ def register_in(router):
         views.IssueStatusViewSet,
         basename="support-issue-status",
     )
+    router.register(
+        r"provider-helpdesks",
+        views.ProviderHelpdeskViewSet,
+        basename="provider-helpdesk",
+    )
+    router.register(
+        r"provider-tickets",
+        views.ProviderTicketViewSet,
+        basename="provider-ticket",
+    )
+    router.register(
+        r"provider-support-users",
+        views.ProviderSupportUserViewSet,
+        basename="provider-support-user",
+    )
+    router.register(
+        r"provider-canned-responses",
+        views.ProviderCannedResponseViewSet,
+        basename="provider-canned-response",
+    )
+    router.register(
+        r"support-issue-tags",
+        views.IssueTagViewSet,
+        basename="support-issue-tag",
+    )
+    router.register(
+        r"support-issue-links",
+        views.IssueLinkViewSet,
+        basename="support-issue-link",
+    )
+    router.register(
+        r"support-saved-filters",
+        views.SavedFilterViewSet,
+        basename="support-saved-filter",
+    )
+    router.register(
+        r"support-canned-responses",
+        views.CannedResponseViewSet,
+        basename="support-canned-response",
+    )
 
 
 urlpatterns = [
+    # Settings discovery endpoints under /api/support/settings/
+    re_path(r"^api/support/settings/", include(settings_router.urls)),
     re_path(
         r"^api/support-jira-webhook/$",
         views.WebHookReceiverView.as_view(),
@@ -65,5 +127,20 @@ urlpatterns = [
         r"^api/support-statistics/$",
         views.SupportStatsViewSet.as_view(),
         name="support-statistics",
+    ),
+    re_path(
+        r"^api/helpdesk-stats/$",
+        views.HelpdeskStatsViewSet.as_view(),
+        name="helpdesk-stats",
+    ),
+    re_path(
+        r"^api/helpdesk-health/$",
+        views.HelpdeskHealthViewSet.as_view(),
+        name="helpdesk-health",
+    ),
+    re_path(
+        r"^api/support-provider-webhook/(?P<provider_uuid>[a-f0-9]+)/(?P<backend_type>[a-z_]+)/$",
+        views.ProviderWebhookView.as_view(),
+        name="provider-webhook",
     ),
 ]

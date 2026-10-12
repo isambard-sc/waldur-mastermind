@@ -25,6 +25,58 @@ class BillingTypes:
     )
 
 
+class BillingModes:
+    """How a plan bills the offering's builtin components.
+
+    Custom components always keep their own ``OfferingComponent.billing_type``;
+    the plan mode overrides only the components the plugin registers
+    (for OpenStack: cores, ram, storage and the per-volume-type quotas).
+    """
+
+    INHERIT = "inherit"
+    LIMIT = "limit"
+    USAGE = "usage"
+
+    CHOICES = (
+        # builtin components keep the billing type stored on the offering component
+        (INHERIT, "Inherit from components"),
+        # builtin components are billed monthly on the requested limits
+        (LIMIT, "Limit-based"),
+        # builtin components are billed on accumulated usage (component-hours)
+        (USAGE, "Usage-based"),
+    )
+    # Prepaid is deliberately absent. It is not a third way of counting a
+    # component -- it is limit-based billing paid upfront for a fixed term --
+    # and it stays where it already lives, on OfferingComponent.is_prepaid,
+    # which providers set per component through the component API and the
+    # offering-level switch.
+
+
+class SwitchBillingModes:
+    """Offering-level switch of the builtin components' billing type."""
+
+    MONTHLY = "monthly"
+    PREPAID = "prepaid"
+    USAGE = "usage"
+
+    CHOICES = (
+        (MONTHLY, "Monthly (Limit-based)"),
+        (PREPAID, "Prepaid (One-time)"),
+        (USAGE, "Usage-based"),
+    )
+
+
+# The offering-level switch says the same thing as a plan mode, in the older
+# vocabulary, and applies it to the offering's plans. Prepaid has no plan mode,
+# so the plans are set to inherit and the components govern, which is what
+# prepaid has always meant.
+PLAN_MODE_BY_SWITCH_MODE = {
+    SwitchBillingModes.MONTHLY: BillingModes.LIMIT,
+    SwitchBillingModes.PREPAID: BillingModes.INHERIT,
+    SwitchBillingModes.USAGE: BillingModes.USAGE,
+}
+
+
 class LimitPeriods:
     MONTH = "month"
     QUARTERLY = "quarterly"
@@ -55,18 +107,91 @@ class LimitPeriods:
     )
 
 
+class MissingUsagePolicies:
+    """What to record for a component when a period passes with no usage report.
+
+    Stored on ``ComponentUsage`` and carried onto the row created for the next
+    billing period by
+    ``invoices.handlers.create_carried_over_usage_if_invoice_has_been_created``.
+    """
+
+    NONE = "none"
+    REUSE = "reuse"
+    ZERO = "zero"
+
+    CHOICES = (
+        # nothing is recorded — the period stays unreported
+        (NONE, "Leave the period unreported."),
+        # the last reported value is repeated until the provider reports a new one
+        (REUSE, "Reuse the reported value every month until changed."),
+        # silence is treated as an explicit zero
+        (ZERO, "Record zero when no usage is reported."),
+    )
+
+    # Policies that materialize a row for the following billing period.
+    CARRIED_OVER = (REUSE, ZERO)
+
+
+class UsageLimitAction:
+    """Restriction applied to a resource when reported usage reaches a component limit.
+
+    Configured per offering via ``plugin_options["action_on_usage_limit"]``.
+    A single value keeps the two restrictions mutually exclusive.
+    """
+
+    PAUSE = "pause"
+    DOWNSCALE = "downscale"
+
+    CHOICES = (
+        (PAUSE, "Pause resources when reported usage reaches the component limit."),
+        (
+            DOWNSCALE,
+            "Downscale resources when reported usage reaches the component limit.",
+        ),
+    )
+
+    # Maps a configured action to the Resource boolean flag it drives.
+    FLAG = {
+        PAUSE: "paused",
+        DOWNSCALE: "downscaled",
+    }
+
+    # Reverse: the flag stored in Resource.usage_limit_restriction.
+    FLAG_CHOICES = (
+        ("paused", "Paused"),
+        ("downscaled", "Downscaled"),
+    )
+
+
+class DiscountAggregations:
+    # each resource of the offering is discounted on its own component usage
+    PER_RESOURCE = "resource"
+    # the component usage is summed across all of the customer's resources of
+    # the offering and a single discount percentage is applied to the total
+    PER_CUSTOMER = "customer"
+
+    CHOICES = (
+        (PER_RESOURCE, "Per resource"),
+        (PER_CUSTOMER, "Aggregated per customer"),
+    )
+
+
 class OfferingStates:
     DRAFT = 1
     ACTIVE = 2
     PAUSED = 3
     ARCHIVED = 4
+    UNAVAILABLE = 5
 
     CHOICES = (
         (DRAFT, "Draft"),
         (ACTIVE, "Active"),
         (PAUSED, "Paused"),
         (ARCHIVED, "Archived"),
+        (UNAVAILABLE, "Unavailable"),
     )
+
+    ISD_ALLOWED_STATES = (ACTIVE, PAUSED, UNAVAILABLE)
 
     VALUES = [val for (_, val) in CHOICES]
 
@@ -89,6 +214,39 @@ class RobotAccountStates:
     )
 
     VALUES = [val for (_, val) in CHOICES]
+
+
+class AccountScopes:
+    """Where a user's login/POSIX account is held.
+
+    ``OFFERING`` is the historical behaviour: one account row, and one set of
+    values, per offering. ``PROVIDER`` holds one account per user per service
+    provider, which is what a directory shared across several offerings needs.
+    """
+
+    OFFERING = "offering"
+    PROVIDER = "provider"
+
+    CHOICES = (
+        (OFFERING, "Per offering"),
+        (PROVIDER, "Per service provider"),
+    )
+
+    VALUES = (OFFERING, PROVIDER)
+
+
+class AccountSettingSources:
+    """Where an offering's effective account setting comes from."""
+
+    OFFERING = "offering"
+    PROVIDER = "provider"
+    DEFAULT = "default"
+
+    CHOICES = (
+        (OFFERING, "Set on the offering"),
+        (PROVIDER, "Inherited from the service provider"),
+        (DEFAULT, "Built-in default"),
+    )
 
 
 class OfferingUserStates:
@@ -121,6 +279,19 @@ class OfferingUserStates:
 
     VALUES = [val for (_, val) in CHOICES]
 
+    # States in which the account is (or is about to be) present at the provider.
+    LIVE_STATES = (
+        CREATION_REQUESTED,
+        CREATING,
+        PENDING_ACCOUNT_LINKING,
+        PENDING_ADDITIONAL_VALIDATION,
+        OK,
+        ERROR_CREATING,
+    )
+    # States an account passes through on its way out; a returning member is
+    # restored from any of them.
+    DELETION_FLOW_STATES = (DELETION_REQUESTED, DELETING, ERROR_DELETING, DELETED)
+
 
 OfferingUserStatesType = Literal[
     "Requested",
@@ -136,15 +307,49 @@ OfferingUserStatesType = Literal[
 ]
 
 
+class OfferingUserRuntimeStates:
+    """Runtime/operational state of an offering user account.
+
+    Separate from the lifecycle state, this tracks whether the user can
+    actually access the service (e.g. TOU accepted, account linked).
+    Can be set freely by the service provider at any lifecycle state
+    except Deleted.
+
+    String values are stored in the DB and used directly in the API,
+    matching the RuntimeStateMixin pattern used by VMs.
+    """
+
+    ACTIVE = "Active"
+    PENDING_ACCOUNT_LINKING = "Pending account linking"
+    PENDING_ADDITIONAL_VALIDATION = "Pending additional validation"
+
+    CHOICES = (
+        (ACTIVE, ACTIVE),
+        (PENDING_ACCOUNT_LINKING, PENDING_ACCOUNT_LINKING),
+        (PENDING_ADDITIONAL_VALIDATION, PENDING_ADDITIONAL_VALIDATION),
+    )
+
+    VALUES = [val for (val, _) in CHOICES]
+
+
+OfferingUserRuntimeStatesType = Literal[
+    "Active",
+    "Pending account linking",
+    "Pending additional validation",
+]
+
+
 class OrderTypes:
     CREATE = 1
     UPDATE = 2
     TERMINATE = 3
+    RESTORE = 4
 
     CHOICES = (
         (CREATE, "Create"),
         (UPDATE, "Update"),
         (TERMINATE, "Terminate"),
+        (RESTORE, "Restore"),
     )
 
     VALUES = [val for (_, val) in CHOICES]
@@ -182,6 +387,13 @@ class OrderStates:
     )
 
     TERMINAL_STATES = {DONE, ERRED, CANCELED, REJECTED}
+    PENDING_STATES = {
+        PENDING_CONSUMER,
+        PENDING_PROVIDER,
+        PENDING_PROJECT,
+        PENDING_START_DATE,
+        EXECUTING,
+    }
     VALUES = [val for (_, val) in CHOICES]
 
 
@@ -273,6 +485,25 @@ class ImpactLevel:
     )
 
 
+class MaintenanceTimingBucket:
+    """Classification of a maintenance's start/end timing (see
+    MaintenanceAnnouncement.timing_bucket)."""
+
+    PENDING = "pending"
+    OVERRUN = "overrun"
+    LATE_START = "late_start"
+    EARLY = "early"
+    ON_TIME = "on_time"
+
+    CHOICES = (
+        (PENDING, "Pending"),
+        (OVERRUN, "Overrun"),
+        (LATE_START, "Late start"),
+        (EARLY, "Early"),
+        (ON_TIME, "On time"),
+    )
+
+
 class RemoteResourceSyncStatus:
     IN_SYNC = "in_sync"
     OUT_OF_SYNC = "out_of_sync"
@@ -298,6 +529,27 @@ class ServiceAccountState:
     VALUES = [val for (_, val) in CHOICES]
 
 
+class ResourceApiKeyStates:
+    # Reuses the resource state vocabulary so the portal renders keys with the
+    # standard StateIndicator: Creating/Updating show a spinner, OK is green,
+    # Erred is red. There is no Terminating: the key count is fixed at
+    # provisioning and rotation replaces a value in place, so no consumer action
+    # removes a key.
+    CREATING = "Creating"
+    OK = "OK"
+    UPDATING = "Updating"
+    ERRED = "Erred"
+
+    CHOICES = (
+        (CREATING, CREATING),
+        (OK, OK),
+        (UPDATING, UPDATING),
+        (ERRED, ERRED),
+    )
+
+    VALUES = [val for (_, val) in CHOICES]
+
+
 ServiceAccountStatesType = Literal[
     "OK",
     "Closed",
@@ -309,6 +561,15 @@ class CourseAccountState(models.IntegerChoices):
     OK = 1, _("OK")
     CLOSED = 2, _("Closed")
     ERRED = 3, _("Erred")
+    PENDING = 4, _("Pending")
+
+
+# Ceiling on OfferingComponent.limit_decimal_places. ComponentQuota and
+# ResourceComponentUsageSummary store limits as DecimalField(decimal_places=2),
+# so a finer limit would be rounded there while InvoiceItem.quantity, which has
+# ten places, kept it — the reported allocation and the invoice would disagree.
+# Raising this means migrating those columns first.
+MAX_LIMIT_DECIMAL_PLACES = 2
 
 
 SUPPORT_OFFERING = "Support.OfferingTemplate"
@@ -323,3 +584,128 @@ REMOTE_OFFERING = "Waldur.RemoteOffering"
 SCRIPT_OFFERING = "Marketplace.Script"
 SLURM_OFFERING = "SlurmInvoices.SlurmPackage"
 SITE_AGENT_OFFERING = "Marketplace.Slurm"
+
+# Offering types whose users get accounts (offering users) at the provider.
+OFFERING_USER_ALLOWED_OFFERING_TYPES = [
+    BASIC_OFFERING,
+    SITE_AGENT_OFFERING,
+    SCRIPT_OFFERING,
+]
+
+# Offering types that can be swapped between each other in-place via the
+# `update_type` action. The site-agent processors inherit from the Basic
+# processors and only no-op the send paths (delegating to the external
+# waldur-site-agent), so the persisted data shape is interchangeable.
+SWAPPABLE_OFFERING_TYPES = frozenset({BASIC_OFFERING, SITE_AGENT_OFFERING})
+
+# Offering types a site agent may be attached to: it registers an identity and
+# ships logs against one of these. Keep this list in one place.
+SITE_AGENT_COMPATIBLE_OFFERING_TYPES = frozenset(
+    {
+        SITE_AGENT_OFFERING,
+        SCRIPT_OFFERING,
+        OPENSTACK_TENANT_OFFERING,
+        BASIC_OFFERING,
+        SUPPORT_OFFERING,
+    }
+)
+
+
+class ResourceAction:
+    TERMINATE = "terminate"
+    SWITCH_PLAN = "switch_plan"
+    UPDATE_LIMITS = "update_limits"
+    EDIT_TERMINATION_DATE = "edit_termination_date"
+    UPDATE_BACKEND_ID = "update_backend_id"
+    UNLINK = "unlink"
+    MOVE_RESOURCE = "move_resource"
+    SET_SLUG = "set_slug"
+    SHOW_USAGE = "show_usage"
+    SET_AS_ERRED = "set_as_erred"
+    CREATE_ROBOT_ACCOUNT = "create_robot_account"
+    SUBMIT_REPORT = "submit_report"
+    REPORT_USAGE = "report_usage"
+    VIEW_DETAILS = "view_details"
+    SYNCHRONIZE = "synchronize"
+    VERSION_HISTORY = "version_history"
+
+    CHOICES = (
+        (TERMINATE, _("Terminate")),
+        (SWITCH_PLAN, _("Switch plan")),
+        (UPDATE_LIMITS, _("Update limits")),
+        (EDIT_TERMINATION_DATE, _("Edit termination date")),
+        (UPDATE_BACKEND_ID, _("Update backend ID")),
+        (UNLINK, _("Unlink")),
+        (MOVE_RESOURCE, _("Move resource")),
+        (SET_SLUG, _("Set slug")),
+        (SHOW_USAGE, _("Show usage")),
+        (SET_AS_ERRED, _("Set as erred")),
+        (CREATE_ROBOT_ACCOUNT, _("Create robot account")),
+        (SUBMIT_REPORT, _("Submit report")),
+        (REPORT_USAGE, _("Report usage")),
+        (VIEW_DETAILS, _("View details")),
+        (SYNCHRONIZE, _("Synchronize")),
+        (VERSION_HISTORY, _("Version history")),
+    )
+
+
+class KpiAggregations:
+    """How a KPI's datapoints roll up into one project-level figure.
+
+    The names match the OpenTelemetry aggregations a metric already carries, so
+    a service emitting OTel metrics maps onto these directly instead of
+    learning a second vocabulary for the same idea.
+    """
+
+    SUM = "sum"
+    AVERAGE = "avg"
+    LAST = "last"
+    MIN = "min"
+    MAX = "max"
+
+    CHOICES = (
+        (SUM, _("Sum")),
+        (AVERAGE, _("Average")),
+        (LAST, _("Last value")),
+        (MIN, _("Minimum")),
+        (MAX, _("Maximum")),
+    )
+
+
+class KpiDirections:
+    """Which way a KPI has to move to count as an improvement.
+
+    A dashboard cannot infer this: more course completions is good, more
+    unresolved tickets is not, and the same number carries either meaning
+    depending on what it measures.
+    """
+
+    HIGHER_IS_BETTER = "up"
+    LOWER_IS_BETTER = "down"
+    NEUTRAL = "neutral"
+
+    CHOICES = (
+        (HIGHER_IS_BETTER, _("Higher is better")),
+        (LOWER_IS_BETTER, _("Lower is better")),
+        (NEUTRAL, _("Neutral")),
+    )
+
+
+class KpiCadences:
+    """How often the service is expected to report a KPI.
+
+    The dashboard shows this next to the figure and uses it to say when a
+    declared KPI is overdue its first report.
+    """
+
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    QUARTERLY = "quarterly"
+
+    CHOICES = (
+        (DAILY, _("Daily")),
+        (WEEKLY, _("Weekly")),
+        (MONTHLY, _("Monthly")),
+        (QUARTERLY, _("Quarterly")),
+    )

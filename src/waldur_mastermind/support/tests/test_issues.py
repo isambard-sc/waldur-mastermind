@@ -4,7 +4,6 @@ from unittest import mock
 # Mock objects for testing - will be replaced with proper mocks
 from unittest.mock import MagicMock
 
-from constance import config
 from constance.test.unittest import override_config
 from ddt import data, ddt
 from django.conf import settings
@@ -14,6 +13,8 @@ from rest_framework import status, test
 from rest_framework.authtoken.models import Token
 
 from waldur_core.core.tests.helpers import load_json_resource
+from waldur_core.permissions.fixtures import ProjectRole
+from waldur_core.permissions.serializers import clone_role_for_customer
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.marketplace.tests.factories import ResourceFactory
 from waldur_mastermind.support import models, utils
@@ -81,7 +82,11 @@ class IssueRetrieveTest(base.BaseTest):
     @data("user")
     def test_user_can_see_a_list_of_all_issues_where_user_is_a_caller(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
-        issue = factories.IssueFactory(caller=getattr(self.fixture, user))
+        # Unscoped: a ticket raised against a project is seen through the roles
+        # held there, not through having raised it.
+        issue = factories.IssueFactory(
+            caller=getattr(self.fixture, user), customer=None, project=None
+        )
         url = factories.IssueFactory.get_list_url()
 
         response = self.client.get(url)
@@ -92,7 +97,9 @@ class IssueRetrieveTest(base.BaseTest):
     @data("user")
     def test_user_can_not_see_link_to_jira_if_he_is_not_staff_or_support(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
-        issue = factories.IssueFactory(caller=getattr(self.fixture, user))
+        issue = factories.IssueFactory(
+            caller=getattr(self.fixture, user), customer=None, project=None
+        )
         url = factories.IssueFactory.get_url(issue=issue)
 
         response = self.client.get(url)
@@ -146,7 +153,10 @@ class IssueCreateBaseTest(base.BaseTest):
         service_desk_response = {
             "issueKey": issue_data["key"],  # Map key to issueKey for Service Desk API
             "issueId": issue_data["id"],
-            "requestFieldValues": [],
+            "requestFieldValues": [
+                {"fieldId": "summary", "value": "test_issue"},
+                {"fieldId": "description", "value": ""},
+            ],
             "currentStatus": {"status": "Open"},
             "_links": {"agent": f"https://example.com/browse/{issue_data['key']}"},
         }
@@ -160,13 +170,18 @@ class IssueCreateBaseTest(base.BaseTest):
         self.mock_service_desk_instance.create_issue.return_value = issue_data
 
         # Mock additional API calls used in the backend
-        self.mock_service_desk_instance.get.return_value = [
-            {"id": "customfield_10001", "clauseNames": ["Waldur project"]},
-            {"id": "customfield_10002", "clauseNames": ["Reporter organization"]},
-            {"id": "customfield_10003", "clauseNames": ["Affected resource"]},
-            {"id": "customfield_10004", "clauseNames": ["Waldur template"]},
-            {"id": "customfield_10005", "clauseNames": ["Original Reporter"]},
-        ]
+        def mock_get(url, *args, **kwargs):
+            if url.endswith("?fields=resolution"):
+                return {"fields": {"resolution": {"name": "Done"}}}
+            return [
+                {"id": "customfield_10001", "clauseNames": ["Waldur project"]},
+                {"id": "customfield_10002", "clauseNames": ["Reporter organization"]},
+                {"id": "customfield_10003", "clauseNames": ["Affected resource"]},
+                {"id": "customfield_10004", "clauseNames": ["Waldur template"]},
+                {"id": "customfield_10005", "clauseNames": ["Original Reporter"]},
+            ]
+
+        self.mock_service_desk_instance.get.side_effect = mock_get
 
         # Mock user response
         mock_backend_users = [
@@ -182,11 +197,14 @@ class IssueCreateBaseTest(base.BaseTest):
 
     def _get_valid_payload(self, **additional):
         is_reported_manually = additional.get("is_reported_manually")
-        issue_type = utils.get_atlassian_issue_type()
-        # Map frontend type to backend type using configuration
-        type_mapping = config.ATLASSIAN_SUPPORT_TYPE_MAPPING or {}
-        backend_type = type_mapping.get(issue_type, issue_type)
-        factories.RequestTypeFactory(name=backend_type, issue_type_name=issue_type)
+        issue_type = utils.get_default_request_type()
+        # Create the request type if it doesn't exist
+        if issue_type:
+            factories.RequestTypeFactory(name=issue_type, is_active=True)
+        else:
+            # If no default, create one
+            rt = factories.RequestTypeFactory(name="Test Request", is_active=True)
+            issue_type = rt.name
         payload = {
             "summary": "test_issue",
             "type": issue_type,
@@ -242,6 +260,83 @@ class IssueCreateTest(IssueCreateBaseTest):
         response = self.client.post(self.url, data=self._get_valid_payload())
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    @data("staff", "global_support")
+    def test_staff_or_support_can_report_issue_on_behalf_of_another_user(self, user):
+        factories.SupportUserFactory(user=getattr(self.fixture, user))
+        self.client.force_authenticate(getattr(self.fixture, user))
+
+        response = self.client.post(self.url, data=self._get_valid_payload())
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        issue = models.Issue.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(issue.caller, self.caller)
+
+    @data("owner", "admin", "manager", "user")
+    def test_other_user_cannot_report_issue_on_behalf_of_another_user(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        payload = self._get_valid_payload()
+
+        response = self.client.post(self.url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(
+            models.Issue.objects.filter(summary=payload["summary"]).exists()
+        )
+
+    def test_other_user_cannot_name_themselves_as_caller(self):
+        """Reporting for oneself goes through is_reported_manually.
+
+        The on-behalf branch is refused even when the caller resolves to the
+        requesting user, so it has one meaning rather than two spellings.
+        """
+        self.client.force_authenticate(self.fixture.user)
+        payload = self._get_valid_payload(
+            caller=structure_factories.UserFactory.get_url(self.fixture.user)
+        )
+
+        response = self.client.post(self.url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(
+            models.Issue.objects.filter(summary=payload["summary"]).exists()
+        )
+
+    def test_other_user_cannot_specify_assignee(self):
+        self.client.force_authenticate(self.fixture.user)
+        payload = self._get_valid_payload(
+            assignee=factories.SupportUserFactory.get_url()
+        )
+
+        response = self.client.post(self.url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(
+            models.Issue.objects.filter(summary=payload["summary"]).exists()
+        )
+
+    def test_assignee_cannot_be_specified_when_issue_is_reported_manually(self):
+        self.client.force_authenticate(self.fixture.user)
+        payload = self._get_valid_payload(
+            is_reported_manually=True,
+            assignee=factories.SupportUserFactory.get_url(),
+        )
+
+        response = self.client.post(self.url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("assignee", response.data)
+
+    @data("owner", "admin", "manager", "user")
+    def test_other_user_can_still_report_their_own_issue(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        payload = self._get_valid_payload(is_reported_manually=True)
+
+        response = self.client.post(self.url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        issue = models.Issue.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(issue.caller, getattr(self.fixture, user))
 
     @data("staff", "global_support")
     @override_config(ATLASSIAN_MAP_WALDUR_USERS_TO_SERVICEDESK_AGENTS=True)
@@ -308,6 +403,25 @@ class IssueCreateTest(IssueCreateBaseTest):
         self.assertTrue(
             models.Issue.objects.filter(customer=self.fixture.customer).exists()
         )
+
+    def test_user_with_org_scoped_clone_role_can_create_project_issue(self):
+        # Regression for issue #316: a user whose only project role is an
+        # organization-scoped clone of PROJECT.MEMBER must be able to report
+        # a project issue just like a stock member.
+        clone_holder = structure_factories.UserFactory()
+        clone = clone_role_for_customer(
+            ProjectRole.MEMBER, self.fixture.customer, conceal_template=False
+        )
+        self.fixture.project.add_user(clone_holder, clone)
+        self.client.force_authenticate(clone_holder)
+        payload = self._get_valid_payload(
+            project=structure_factories.ProjectFactory.get_url(self.fixture.project),
+            is_reported_manually=True,
+        )
+
+        response = self.client.post(self.url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
     @data("user")
     def test_user_without_access_to_project_cannot_create_project_issue(self, user):
@@ -447,8 +561,10 @@ class IssueCreateTest(IssueCreateBaseTest):
             reporter=None, backend_id=None, type="Informational"
         )
         factories.SupportCustomerFactory(user=issue.caller)
-        # Create RequestType for the mapped backend type (Informational -> Get IT help)
-        factories.RequestTypeFactory(name="Get IT help", issue_type_name="Get IT help")
+        # Create RequestType with the same name as issue.type (no mapping anymore)
+        factories.RequestTypeFactory(
+            name="Informational", issue_type_name="Informational"
+        )
         ServiceDeskBackend().create_issue(issue)
         # Check that create_customer_request was called without Original Reporter field
         call_args = self.mock_service_desk_instance.create_customer_request.call_args
@@ -467,8 +583,8 @@ class IssueCreateTest(IssueCreateBaseTest):
             "id": "1",
         }
         issue_type = utils.get_atlassian_issue_type()  # Returns "Informational"
-        # Create RequestType for the mapped backend type (Informational -> Get IT help)
-        factories.RequestTypeFactory(name="Get IT help", issue_type_name="Get IT help")
+        # Create RequestType with the same name as issue.type (no mapping anymore)
+        factories.RequestTypeFactory(name=issue_type, issue_type_name=issue_type)
         issue = factories.IssueFactory(reporter=None, backend_id=None, type=issue_type)
         factories.SupportCustomerFactory(user=issue.caller)
         ServiceDeskBackend().create_issue(issue)
@@ -476,8 +592,6 @@ class IssueCreateTest(IssueCreateBaseTest):
 
     def test_create_issue_if_exist_several_backend_users_with_same_email(self):
         self._mock_jira()
-        # Create RequestType for the mapped backend type (Informational -> Get IT help)
-        factories.RequestTypeFactory(name="Get IT help", issue_type_name="Get IT help")
         factories.SupportUserFactory(user=self.fixture.staff)
         self.client.force_authenticate(self.fixture.staff)
         mock_backend_users = [
@@ -661,7 +775,7 @@ class IssueDeleteTest(base.BaseTest):
         self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
 
 
-class IssueOrderingTest(test.APITransactionTestCase):
+class IssueOrderingTest(test.APITestCase):
     @override_config(WALDUR_SUPPORT_ENABLED=True)
     def test_issue_ordering(self):
         factories.IssueFactory(key="TST")
@@ -788,3 +902,128 @@ class GetIssueScopesTest(base.BaseTest):
         self.assertIn(resource, scopes)
         self.assertIn(self.project, scopes)
         self.assertIn(self.customer, scopes)
+
+    def test_get_issue_scopes_with_stale_resource_content_type(self):
+        """When ``resource_content_type`` points at a model that is no longer
+        registered, ``ContentType.model_class()`` returns ``None`` and
+        accessing the GenericForeignKey raises
+        ``AttributeError("'NoneType' object has no attribute '_base_manager'")``.
+        ``get_issue_scopes`` must tolerate this and fall back to the issue's
+        project/customer.
+        """
+        from django.contrib.contenttypes.models import ContentType
+
+        resource = ResourceFactory(project=self.project)
+        self.issue.resource = resource
+        self.issue.save()
+        self.issue.refresh_from_db()
+
+        with mock.patch.object(ContentType, "model_class", return_value=None):
+            scopes = get_issue_scopes(self.issue)
+
+        self.assertIn(self.project, scopes)
+        self.assertIn(self.customer, scopes)
+
+
+class IssueSerializerSafeResourceTest(base.BaseTest):
+    """Regression test for production crash on ``GET /api/support-issues/``
+    when an issue's ``resource_content_type`` points at a model whose class
+    is no longer registered.
+    """
+
+    def test_list_does_not_crash_when_resource_content_type_is_stale(self):
+        from django.contrib.contenttypes.models import ContentType
+
+        self.client.force_authenticate(self.fixture.staff)
+        resource = ResourceFactory(project=self.fixture.project)
+        issue = factories.IssueFactory(
+            customer=self.fixture.customer, project=self.fixture.project
+        )
+        issue.resource = resource
+        issue.save()
+
+        with mock.patch.object(ContentType, "model_class", return_value=None):
+            response = self.client.get(factories.IssueFactory.get_list_url())
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class ScopedTicketFollowsItsRolesTest(base.BaseTest):
+    """A ticket raised in a project or an organization belongs to that scope.
+
+    Whoever raised it sees it through the roles they hold there, not through
+    having raised it, so losing the role takes the ticket with it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.member = self.fixture.member
+        self.issue = factories.IssueFactory(
+            caller=self.member,
+            customer=self.fixture.customer,
+            project=self.fixture.project,
+        )
+        self.comment = factories.CommentFactory(issue=self.issue, is_public=True)
+        self.client.force_authenticate(self.member)
+
+    def issue_uuids(self):
+        response = self.client.get(factories.IssueFactory.get_list_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return {row["uuid"] for row in response.data}
+
+    def comment_uuids(self):
+        response = self.client.get(factories.CommentFactory.get_list_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return {row["uuid"] for row in response.data}
+
+    def test_the_caller_sees_their_ticket_while_they_are_in_the_project(self):
+        self.assertIn(self.issue.uuid.hex, self.issue_uuids())
+        self.assertIn(self.comment.uuid.hex, self.comment_uuids())
+        self.assertEqual(
+            self.client.get(factories.IssueFactory.get_url(self.issue)).status_code,
+            status.HTTP_200_OK,
+        )
+
+    def test_leaving_the_project_takes_the_ticket_out_of_the_list(self):
+        self.fixture.project.remove_user(self.member)
+
+        self.assertNotIn(self.issue.uuid.hex, self.issue_uuids())
+
+    def test_leaving_the_project_hides_the_ticket_itself(self):
+        self.fixture.project.remove_user(self.member)
+
+        self.assertEqual(
+            self.client.get(factories.IssueFactory.get_url(self.issue)).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_leaving_the_project_hides_the_comments_on_it(self):
+        self.fixture.project.remove_user(self.member)
+
+        self.assertNotIn(self.comment.uuid.hex, self.comment_uuids())
+
+    def test_losing_the_organization_role_hides_an_organization_scoped_ticket(self):
+        owner = self.fixture.owner
+        issue = factories.IssueFactory(
+            caller=owner, customer=self.fixture.customer, project=None
+        )
+        self.client.force_authenticate(owner)
+        self.assertIn(issue.uuid.hex, self.issue_uuids())
+
+        self.fixture.customer.remove_user(owner)
+
+        self.assertNotIn(issue.uuid.hex, self.issue_uuids())
+        self.assertEqual(
+            self.client.get(factories.IssueFactory.get_url(issue)).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_a_ticket_raised_against_nothing_stays_with_its_caller(self):
+        # No scope to inherit from, so the caller is the only non-privileged
+        # person who can see it, whatever roles they hold elsewhere.
+        unscoped = factories.IssueFactory(
+            caller=self.member, customer=None, project=None
+        )
+        self.fixture.project.remove_user(self.member)
+
+        self.assertIn(unscoped.uuid.hex, self.issue_uuids())

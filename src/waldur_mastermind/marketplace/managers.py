@@ -39,12 +39,79 @@ class OfferingQuerySet(django_models.QuerySet):
         connected_customers = get_connected_customers(user)
         connected_projects = get_connected_projects(user)
         connected_offerings = get_connected_offerings(user)
+        # A service provider manager holds their role on the ServiceProvider,
+        # not on its customer, so the customer clause alone misses them.
+        connected_service_providers = get_connected_serviceproviders(user)
 
         return self.filter(
             Q(customer__in=connected_customers)
+            | Q(customer__serviceprovider__in=connected_service_providers)
             | Q(project__in=connected_projects)
             | Q(id__in=connected_offerings)
         ).distinct()
+
+    @staticmethod
+    def _restricted_forbidden_ids(queryset, user):
+        """Ids of offerings in queryset that restrict access via
+        plugin_options['restricted_to_roles'] to roles the user does not hold.
+        Empty for staff and support, who are not subject to the restriction.
+        The check is coarse (role held in any scope); precise per-project
+        authorization happens at order creation."""
+        # Staff and support outrank offering-level role restrictions, exactly as
+        # they do in filter_by_ordering_availability_for_user. Without this the
+        # `accessible` filter hides restricted offerings from staff, who then
+        # cannot reach them in the catalog to order from at all.
+        if not user.is_anonymous and (user.is_staff or user.is_support):
+            return set()
+
+        restricted = queryset.filter(
+            plugin_options__has_key="restricted_to_roles"
+        ).values_list("id", "plugin_options")
+
+        if user.is_anonymous:
+            user_role_names = set()
+        else:
+            user_role_names = set(
+                UserRole.objects.filter(is_active=True, user=user).values_list(
+                    "role__name", flat=True
+                )
+            )
+
+        return {
+            offering_id
+            for offering_id, plugin_options in restricted
+            if plugin_options.get("restricted_to_roles")
+            and not set(plugin_options["restricted_to_roles"]) & user_role_names
+        }
+
+    def _exclude_restricted_offerings(self, queryset, user):
+        """Hide offerings that restrict access via
+        plugin_options['restricted_to_roles'] from users who do not hold one of
+        the listed roles, except offerings the user already consumes resources
+        from. Catalog visibility is coarse (role held in any scope); precise
+        per-project authorization happens at order creation."""
+        forbidden_ids = self._restricted_forbidden_ids(queryset, user)
+        if not forbidden_ids:
+            return queryset
+        if not user.is_anonymous:
+            # Keep offerings the user already consumes resources from.
+            connected = models.Resource.objects.filter(
+                project__in=get_connected_projects(user),
+                offering_id__in=forbidden_ids,
+            ).values_list("offering_id", flat=True)
+            forbidden_ids -= set(connected)
+        return queryset.exclude(id__in=forbidden_ids)
+
+    def filter_accessible_for_user(self, user):
+        """Drop restricted offerings the user is not allowed to order.
+
+        Unlike the catalog default (filter_by_ordering_availability_for_user),
+        this does NOT keep offerings the user merely consumes a resource from:
+        it returns only offerings the user could actually order. Backs the
+        `accessible` query filter so the marketplace catalog can request only
+        orderable offerings while resource-driven detail/retrieve keeps showing
+        the rest."""
+        return self.exclude(id__in=self._restricted_forbidden_ids(self, user))
 
     def filter_by_ordering_availability_for_user(self, user):
         """Returns offerings available to the user to create an order"""
@@ -55,36 +122,84 @@ class OfferingQuerySet(django_models.QuerySet):
             if not config.ANONYMOUS_USER_CAN_VIEW_OFFERINGS:
                 return self.none()
             else:
-                return queryset.filter(shared=True)
+                return self._exclude_restricted_offerings(
+                    queryset.filter(shared=True), user
+                )
 
+        # Staff/support ALWAYS see all offerings regardless of visibility setting
         if user.is_staff or user.is_support:
             plans = models.Plan.objects.filter(archived=False)
             return queryset.filter(
                 Q(shared=True) | Q(plans__in=plans) | Q(parent__plans__in=plans)
             ).distinct()
 
-        # filtering by available plans
-        plans = models.Plan.objects.filter(
+        # Get user's organization groups
+        user_organization_groups = get_organization_groups(user)
+
+        # Filter plans by user's organization groups
+        accessible_plans = models.Plan.objects.filter(
             Q(organization_groups__isnull=True)
-            | Q(organization_groups__in=get_organization_groups(user))
+            | Q(organization_groups__in=user_organization_groups)
         ).filter(archived=False)
 
-        # filtering by customers and projects
+        # Get user connections
         connected_projects = get_connected_projects(user)
         connected_customers = get_connected_customers(user)
         connected_offerings = get_connected_offerings(user)
 
-        return queryset.filter(
-            Q(shared=True)
-            | (
-                (
-                    Q(customer__in=connected_customers)
-                    | Q(project__in=connected_projects)
-                    | Q(id__in=connected_offerings)
-                )
-                & (Q(plans__in=plans) | Q(parent__plans__in=plans))
+        visibility_mode = getattr(
+            config, "RESTRICTED_OFFERING_VISIBILITY_MODE", "show_all"
+        )
+
+        # require_membership: user must belong to at least one org/project
+        if visibility_mode == "require_membership":
+            has_membership = (
+                connected_customers.exists()
+                or connected_projects.exists()
+                or connected_offerings.exists()
             )
-        ).distinct()
+            if not has_membership:
+                return self.none()
+            # Fall through to hide_inaccessible logic for members
+            visibility_mode = "hide_inaccessible"
+
+        if visibility_mode == "hide_inaccessible":
+            # Shared offerings: must match org groups AND have accessible plans
+            shared_filter = (
+                Q(shared=True, organization_groups__isnull=True)
+                | Q(shared=True, organization_groups__in=user_organization_groups)
+            ) & (Q(plans__in=accessible_plans) | Q(parent__plans__in=accessible_plans))
+
+            # Private offerings: user connected AND has plan access
+            private_filter = (
+                Q(customer__in=connected_customers)
+                | Q(project__in=connected_projects)
+                | Q(id__in=connected_offerings)
+            ) & (Q(plans__in=accessible_plans) | Q(parent__plans__in=accessible_plans))
+
+            return self._exclude_restricted_offerings(
+                queryset.filter(shared_filter | private_filter).distinct(), user
+            )
+        else:
+            # "show_all" or "show_restricted_disabled" - return all shared offerings
+            # (show_restricted_disabled is handled by frontend marking)
+            return self._exclude_restricted_offerings(
+                queryset.filter(
+                    Q(shared=True)
+                    | (
+                        (
+                            Q(customer__in=connected_customers)
+                            | Q(project__in=connected_projects)
+                            | Q(id__in=connected_offerings)
+                        )
+                        & (
+                            Q(plans__in=accessible_plans)
+                            | Q(parent__plans__in=accessible_plans)
+                        )
+                    )
+                ).distinct(),
+                user,
+            )
 
     def filter_for_customer(self, value):
         if not is_uuid_like(value):
@@ -148,9 +263,16 @@ class ResourceQuerySet(django_models.QuerySet["models.Resource"]):
         connected_customers = get_connected_customers_by_permission(
             user, PermissionEnum.LIST_RESOURCES
         )
+        # Direct UserRole on Resource or ResourceProject grants read-only
+        # visibility of the parent Resource regardless of the LIST_RESOURCES
+        # permission on the project / customer chain.
+        direct_resource_ids = get_user_direct_resource_ids(user)
+        rp_resource_ids = get_user_resource_project_resource_ids(user)
         return self.filter(
             Q(project__in=connected_projects)
             | Q(project__customer__in=connected_customers)
+            | Q(id__in=direct_resource_ids)
+            | Q(id__in=rp_resource_ids)
         ).distinct()
 
     def filter_for_service_provider(self, user):
@@ -159,19 +281,98 @@ class ResourceQuerySet(django_models.QuerySet["models.Resource"]):
 
         connected_customers = get_connected_customers(user)
         connected_service_providers = get_connected_serviceproviders(user)
+        connected_offerings = get_connected_offerings(user)
 
         return self.filter(
             Q(offering__customer__in=connected_customers)
             | Q(offering__customer__serviceprovider__in=connected_service_providers)
+            | Q(offering__in=connected_offerings)
         ).distinct()
 
     def filter_for_user(self, user):
         if user.is_staff or user.is_support:
             return self
+        direct_resource_ids = get_user_direct_resource_ids(user)
+        rp_resource_ids = get_user_resource_project_resource_ids(user)
         return self.filter(
-            project__in=get_connected_projects(user),
-            project__customer__in=get_connected_customers(user),
-        )
+            Q(project__in=get_connected_projects(user))
+            | Q(project__customer__in=get_connected_customers(user))
+            | Q(id__in=direct_resource_ids)
+            | Q(id__in=rp_resource_ids)
+        ).distinct()
+
+
+def get_user_direct_resource_ids(user):
+    """IDs of Resources where the user has a direct UserRole."""
+    resource_ct = ContentType.objects.get_for_model(models.Resource)
+    return get_scope_ids(user, resource_ct)
+
+
+def get_user_resource_project_ids(user):
+    """IDs of ResourceProjects where the user has a direct UserRole."""
+    rp_ct = ContentType.objects.get_for_model(models.ResourceProject)
+    return get_scope_ids(user, rp_ct)
+
+
+def get_user_resource_project_resource_ids(user):
+    """IDs of Resources whose ResourceProjects the user has a UserRole on."""
+    return models.ResourceProject.available_objects.filter(
+        id__in=get_user_resource_project_ids(user)
+    ).values_list("resource_id", flat=True)
+
+
+def _user_resource_descended_resource_ids_qs(user):
+    """Lazy QuerySet of Resource IDs reachable via the user's Resource OR
+    ResourceProject UserRoles. Filters by content-type app_label/model
+    directly to avoid a per-call ``ContentType.objects.get_for_model`` round
+    trip — the join folds into the outer SQL as a subquery."""
+    direct_role_ids = UserRole.objects.filter(
+        user=user,
+        is_active=True,
+        content_type__app_label="marketplace",
+        content_type__model="resource",
+    ).values_list("object_id", flat=True)
+    rp_role_ids = UserRole.objects.filter(
+        user=user,
+        is_active=True,
+        content_type__app_label="marketplace",
+        content_type__model="resourceproject",
+    ).values_list("object_id", flat=True)
+    rp_resource_ids = models.ResourceProject.available_objects.filter(
+        id__in=rp_role_ids
+    ).values_list("resource_id", flat=True)
+    return models.Resource.objects.filter(
+        Q(id__in=direct_role_ids) | Q(id__in=rp_resource_ids)
+    )
+
+
+def get_user_resource_descended_project_ids(user):
+    """Lazy QuerySet of structure Project IDs reachable via the user's
+    Resource or ResourceProject UserRoles. Returned as a single QuerySet so
+    callers can fold it into ``Q(id__in=...)`` as a SQL subquery without
+    forcing evaluation."""
+    return _user_resource_descended_resource_ids_qs(user).values_list(
+        "project_id", flat=True
+    )
+
+
+def get_user_resource_descended_customer_ids(user):
+    """Lazy QuerySet of Customer IDs reachable via the user's Resource or
+    ResourceProject UserRoles. See ``get_user_resource_descended_project_ids``."""
+    return _user_resource_descended_resource_ids_qs(user).values_list(
+        "project__customer_id", flat=True
+    )
+
+
+def get_user_managed_service_provider_customer_ids(user):
+    """Lazy QuerySet of Customer IDs whose ServiceProvider the user holds any
+    active role on. The role sits on the provider, not on its customer, so
+    ``get_connected_customers`` never sees it; it lets the user find the
+    organization in the portal, nothing more. Uses the same notion of a
+    provider-side role as ``OfferingQuerySet.filter_for_user``."""
+    return models.ServiceProvider.objects.filter(
+        id__in=get_connected_serviceproviders(user)
+    ).values_list("customer_id", flat=True)
 
 
 class ResourceManager(MixinManager):
@@ -232,9 +433,74 @@ def get_connected_offerings(user, role=None):
     return get_scope_ids(user, content_type, role)
 
 
+def get_connected_offerings_by_permission(user, permission):
+    from waldur_core.permissions.models import Role
+
+    content_type = ContentType.objects.get_for_model(models.Offering)
+    roles = list(
+        Role.objects.filter(
+            content_type=content_type,
+            is_active=True,
+            permissions__permission=permission,
+        ).values_list("name", flat=True)
+    )
+    if not roles:
+        return models.Offering.objects.none().values_list("id", flat=True)
+    return get_connected_offerings(user, roles)
+
+
+def filter_orders_for_user(queryset, user):
+    """Restrict an Order queryset to the rows the user is allowed to list.
+
+    Orders are visible to both the service consumer and the service provider.
+    Shared by OrderViewSet and by the media access rule for order attachments,
+    so a download cannot outlive the permission that the API itself enforces.
+    """
+    if not user.is_authenticated:
+        return queryset.none()
+
+    if user.is_staff or user.is_support:
+        return queryset
+
+    connected_projects = get_connected_projects_by_permission(
+        user, PermissionEnum.LIST_ORDERS
+    )
+    connected_customers = get_connected_customers_by_permission(
+        user, PermissionEnum.LIST_ORDERS
+    )
+    connected_offerings = get_connected_offerings_by_permission(
+        user, PermissionEnum.LIST_ORDERS
+    )
+    return queryset.filter(
+        Q(project__in=connected_projects)
+        | Q(project__customer__in=connected_customers)
+        | Q(offering__customer__in=connected_customers)
+        | Q(offering__in=connected_offerings)
+    )
+
+
 def get_connected_serviceproviders(user, role=None):
     content_type = ContentType.objects.get_for_model(models.ServiceProvider)
     return get_scope_ids(user, content_type, role)
+
+
+def get_connected_provider_customers_by_permission(user, permission):
+    """Ids of the provider organizations on which the user holds ``permission``.
+
+    A provider-side right can come from a role on the organization (an owner,
+    or a custom least-privilege provider role) or from a role on its
+    ServiceProvider (a service provider manager), so both are collected.
+
+    Each grant is matched on its own role's permissions, as ``has_permission``
+    does. Matching role names instead would let an organization clone that
+    staff narrowed keep a permission its template still holds.
+    """
+    customer_ct = ContentType.objects.get_for_model(structure_models.Customer)
+    provider_ct = ContentType.objects.get_for_model(models.ServiceProvider)
+    return structure_models.Customer.objects.filter(
+        Q(id__in=get_scope_ids(user, customer_ct, permission=permission))
+        | Q(serviceprovider__in=get_scope_ids(user, provider_ct, permission=permission))
+    ).values_list("id", flat=True)
 
 
 def filter_offering_permissions(user, is_active=True):

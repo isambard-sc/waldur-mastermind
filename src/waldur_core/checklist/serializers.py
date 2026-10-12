@@ -2,39 +2,15 @@ from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from waldur_core.core import serializers as core_serializers
+from waldur_core.core.openapi_extensions import AnyJSONField
 
 from . import enums, models, utils
-
-
-class ChecklistCategorySerializer(serializers.HyperlinkedModelSerializer):
-    checklists_count = serializers.IntegerField(
-        source="checklists.count", read_only=True
-    )
-
-    class Meta:
-        model = models.Category
-        fields = ("uuid", "icon", "url", "name", "description", "checklists_count")
-        extra_kwargs = {
-            "url": {
-                "lookup_field": "uuid",
-                "view_name": "checklists-admin-categories-detail",
-            },
-        }
 
 
 class ChecklistSerializer(
     core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
     questions_count = serializers.IntegerField(source="questions.count", read_only=True)
-    category_name = serializers.ReadOnlyField(source="category.name")
-    category_uuid = serializers.UUIDField(source="category.uuid", read_only=True)
-    category = serializers.SlugRelatedField(
-        slug_field="uuid",
-        queryset=models.Category.objects.all(),
-        required=False,
-        allow_null=True,
-        help_text="Category of the checklist",
-    )
 
     class Meta:
         model = models.Checklist
@@ -46,9 +22,6 @@ class ChecklistSerializer(
             "description",
             "checklist_type",
             "questions_count",
-            "category_name",
-            "category_uuid",
-            "category",
         ]
 
         extra_kwargs = {
@@ -56,6 +29,26 @@ class ChecklistSerializer(
                 "lookup_field": "uuid",
             },
         }
+
+    def validate_checklist_type(self, value):
+        """
+        Validate that only one checklist of type ONBOARDING_CUSTOMER_DATA or
+        ONBOARDING_INTENT_DATA can exist in the database.
+        """
+        # Only validate for onboarding checklist types
+        if value in [
+            enums.ChecklistTypes.ONBOARDING_CUSTOMER_DATA,
+            enums.ChecklistTypes.ONBOARDING_INTENT_DATA,
+        ]:
+            queryset = models.Checklist.objects.filter(checklist_type=value)
+
+            if not self.instance and queryset.exists():
+                raise serializers.ValidationError(
+                    f"'{value}' type checklist already exists. "
+                    f"Please either update the existing checklist or remove to create a new one."
+                )
+
+        return value
 
 
 class QuestionOptionsSerializer(
@@ -93,6 +86,7 @@ class QuestionOptionsAdminSerializer(QuestionOptionsSerializer):
 class QuestionDependencySerializer(
     core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
+    required_answer_value = AnyJSONField(required=False)
     question = serializers.HyperlinkedRelatedField(
         queryset=models.Question.objects.all(),
         required=True,
@@ -161,16 +155,99 @@ class QuestionDependencySerializer(
 class QuestionSerializer(
     core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
+    review_answer_value = AnyJSONField(required=False)
+    allowed_file_types = serializers.ListField(
+        child=serializers.CharField(), required=False
+    )
+    allowed_mime_types = serializers.ListField(
+        child=serializers.CharField(), required=False
+    )
     question_options = QuestionOptionsSerializer(many=True, read_only=True)
 
     class Meta:
         model = models.Question
         fields = [
             "uuid",
+            "required",
             "description",
             "user_guidance",
             "question_options",
+            "question_type",
+            "order",
+            "min_value",
+            "max_value",
+            "allowed_file_types",
+            "allowed_mime_types",
+            "max_file_size_mb",
+            "max_files_count",
+            "likert_scale_length",
+            "likert_low_label",
+            "likert_high_label",
+            "likert_allow_na",
+            "rich_text_char_limit",
+            "rich_text_toolbar_level",
+            "operator",
+            "review_answer_value",
+            "always_requires_review",
+            "guidance_answer_value",
+            "guidance_operator",
+            "always_show_guidance",
+            "dependency_logic_operator",
         ]
+
+
+class AnswerSerializer(serializers.ModelSerializer):
+    """Comprehensive serializer for checklist answers with question details."""
+
+    question_uuid = serializers.UUIDField(write_only=True)
+    question_description = serializers.CharField(
+        source="question.description", read_only=True
+    )
+    question_type = serializers.CharField(
+        source="question.question_type", read_only=True
+    )
+    question_required = serializers.BooleanField(
+        source="question.required", read_only=True
+    )
+    user_name = serializers.CharField(source="user.full_name", read_only=True)
+
+    class Meta:
+        model = models.Answer
+        fields = (
+            "uuid",
+            "question_uuid",
+            "question_description",
+            "question_type",
+            "question_required",
+            "answer_data",
+            "requires_review",
+            "user",
+            "user_name",
+            "created",
+            "modified",
+        )
+        read_only_fields = (
+            "uuid",
+            "question_description",
+            "question_type",
+            "question_required",
+            "requires_review",
+            "user",
+            "user_name",
+            "created",
+            "modified",
+        )
+
+
+class QuestionConditionSerializer(serializers.Serializer):
+    question_description = serializers.CharField()
+    operator = serializers.CharField()
+    required_value = serializers.JSONField()
+
+
+class QuestionDependencyInfoSerializer(serializers.Serializer):
+    logic = serializers.CharField()
+    conditions = QuestionConditionSerializer(many=True)
 
 
 class QuestionWithAnswerSerializer(serializers.ModelSerializer):
@@ -179,6 +256,7 @@ class QuestionWithAnswerSerializer(serializers.ModelSerializer):
     existing_answer = serializers.SerializerMethodField()
     question_options = serializers.SerializerMethodField()
     user_guidance = serializers.SerializerMethodField()
+    dependencies_info = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Question
@@ -193,6 +271,17 @@ class QuestionWithAnswerSerializer(serializers.ModelSerializer):
             "question_options",
             "min_value",
             "max_value",
+            "allowed_file_types",
+            "allowed_mime_types",
+            "max_file_size_mb",
+            "max_files_count",
+            "likert_scale_length",
+            "likert_low_label",
+            "likert_high_label",
+            "likert_allow_na",
+            "rich_text_char_limit",
+            "rich_text_toolbar_level",
+            "dependencies_info",
         )
         read_only_fields = (
             "uuid",
@@ -205,9 +294,38 @@ class QuestionWithAnswerSerializer(serializers.ModelSerializer):
             "question_options",
             "min_value",
             "max_value",
+            "allowed_file_types",
+            "allowed_mime_types",
+            "max_file_size_mb",
+            "max_files_count",
+            "likert_scale_length",
+            "likert_low_label",
+            "likert_high_label",
+            "likert_allow_na",
+            "rich_text_char_limit",
+            "rich_text_toolbar_level",
+            "dependencies_info",
         )
 
-    @extend_schema_field(serializers.DictField(allow_null=True))
+    def _answers_by_question(self):
+        """The answer that stands for each question, loaded once per response.
+
+        The context dict is shared by every child of a ``many=True`` serializer, so
+        the map is cached there. It holds the latest answer per question (answers
+        are per-user rows). For multi-writer completions (e.g. a workflow step
+        answered by several reviewers) callers pass ``answer_user`` so each user
+        only sees/edits their OWN answer rather than an arbitrary peer's.
+        """
+        completion = self.context["completion"]
+        answer_user = self.context.get("answer_user")
+        key = ("_answers_by_question", completion.pk, getattr(answer_user, "pk", None))
+        if key not in self.context:
+            self.context[key] = (
+                completion.get_latest_answers(user=answer_user) if completion.pk else {}
+            )
+        return self.context[key]
+
+    @extend_schema_field(AnswerSerializer(allow_null=True))
     def get_existing_answer(self, obj):
         """Get existing answer for this question in the current completion context."""
         request = self.context.get("request")
@@ -216,17 +334,19 @@ class QuestionWithAnswerSerializer(serializers.ModelSerializer):
         if not request or not completion:
             return None
 
-        try:
-            answer = completion.answers.get(question=obj, user=request.user)
-            # For basic view, hide review flag from answer
-            answer_data = AnswerSerializer(answer, context=self.context).data
-            if hasattr(self, "_hide_review_flags") or not isinstance(
-                self, QuestionWithAnswerReviewerSerializer
-            ):
-                answer_data.pop("requires_review", None)
-            return answer_data
-        except models.Answer.DoesNotExist:
+        # If user has permission to view the completion, they should see all answers
+        # The permission check is done at the viewset level, so if we're here, user is authorized.
+        answer = self._answers_by_question().get(obj.id)
+        if not answer:
             return None
+
+        # For basic view, hide review flag from answer
+        answer_data = AnswerSerializer(answer, context=self.context).data
+        if hasattr(self, "_hide_review_flags") or not isinstance(
+            self, QuestionWithAnswerReviewerSerializer
+        ):
+            answer_data.pop("requires_review", None)
+        return answer_data
 
     @extend_schema_field(serializers.ListField(allow_null=True))
     def get_question_options(self, obj):
@@ -238,7 +358,8 @@ class QuestionWithAnswerSerializer(serializers.ModelSerializer):
                     "label": option.label,
                     "order": option.order,
                 }
-                for option in obj.question_options.all().order_by("order")
+                # QuestionOption.Meta orders by order; all() keeps a prefetch usable.
+                for option in obj.question_options.all()
             ]
         return []
 
@@ -254,24 +375,44 @@ class QuestionWithAnswerSerializer(serializers.ModelSerializer):
                 return obj.user_guidance if obj.user_guidance.strip() else None
             return None
 
-        try:
-            answer = completion.answers.get(question=obj, user=request.user)
-            answer_data = answer.answer_data
-
-            # Check if guidance should be shown for this answer
-            if obj.should_show_guidance(answer_data):
-                return obj.user_guidance if obj.user_guidance.strip() else None
-            return None
-
-        except models.Answer.DoesNotExist:
+        # Guidance follows the same answer existing_answer shows.
+        answer = self._answers_by_question().get(obj.id)
+        if answer is None:
             # No answer yet, show guidance only if always_show_guidance is True
             if obj.always_show_guidance:
                 return obj.user_guidance if obj.user_guidance.strip() else None
             return None
 
+        # Check if guidance should be shown for this answer
+        if obj.should_show_guidance(answer.answer_data):
+            return obj.user_guidance if obj.user_guidance.strip() else None
+        return None
+
+    @extend_schema_field(QuestionDependencyInfoSerializer(allow_null=True))
+    def get_dependencies_info(self, obj):
+        """Return dependency information for conditional questions."""
+        # all() rather than exists(): it is served from a prefetch.
+        dependencies = obj.dependencies.all()
+        if not dependencies:
+            return None
+
+        return {
+            "logic": obj.dependency_logic_operator,
+            "conditions": [
+                {
+                    "question_description": dep.depends_on_question.description,
+                    "operator": dep.operator,
+                    "required_value": dep.required_answer_value,
+                }
+                for dep in dependencies
+            ],
+        }
+
 
 class QuestionWithAnswerReviewerSerializer(QuestionWithAnswerSerializer):
     """Extended serializer for questions with review logic (reviewer view)."""
+
+    review_answer_value = AnyJSONField(required=False)
 
     class Meta(QuestionWithAnswerSerializer.Meta):
         fields = QuestionWithAnswerSerializer.Meta.fields + (
@@ -291,6 +432,9 @@ class QuestionAdminSerializer(QuestionSerializer):
     )
     checklist_name = serializers.CharField(read_only=True, source="checklist.name")
     checklist_uuid = serializers.UUIDField(read_only=True, source="checklist.uuid")
+    checklist_type = serializers.CharField(
+        read_only=True, source="checklist.checklist_type"
+    )
 
     def validate(self, attrs):
         operator = attrs.get("operator")
@@ -302,6 +446,22 @@ class QuestionAdminSerializer(QuestionSerializer):
         min_value = attrs.get("min_value")
         max_value = attrs.get("max_value")
         dependency_logic_operator = attrs.get("dependency_logic_operator")
+        allowed_file_types = attrs.get("allowed_file_types")
+        allowed_mime_types = attrs.get("allowed_mime_types")
+        max_file_size_mb = attrs.get("max_file_size_mb")
+        max_files_count = attrs.get("max_files_count")
+        likert_scale_length = attrs.get("likert_scale_length")
+        likert_low_label = attrs.get("likert_low_label")
+        likert_high_label = attrs.get("likert_high_label")
+        likert_allow_na = attrs.get("likert_allow_na")
+        rich_text_char_limit = attrs.get("rich_text_char_limit")
+        rich_text_toolbar_level = attrs.get("rich_text_toolbar_level")
+
+        # For PATCH, question_type may be absent from payload — fall back to the
+        # currently-persisted value so per-type whitelists still apply.
+        effective_question_type = question_type or (
+            self.instance.question_type if self.instance else None
+        )
 
         # Validate review trigger configuration
         # Check if both operator and review_answer_value are set together or both empty
@@ -360,11 +520,12 @@ class QuestionAdminSerializer(QuestionSerializer):
                 f"Guidance answer value '{guidance_answer_value}' is not valid for question type '{question_type}'."
             )
 
-        # Validate min/max values for NUMBER questions only
-        if question_type and question_type != "number":
+        # Validate min/max values for NUMBER, YEAR, and RATING questions only
+        numeric_types = ["number", "year", "rating"]
+        if effective_question_type and effective_question_type not in numeric_types:
             if min_value is not None or max_value is not None:
                 raise serializers.ValidationError(
-                    "Min and max values can only be set for NUMBER type questions."
+                    "Min and max values can only be set for NUMBER, YEAR, and RATING type questions."
                 )
 
         # Validate that min_value is not greater than max_value
@@ -382,6 +543,109 @@ class QuestionAdminSerializer(QuestionSerializer):
                 f"Must be one of: {[choice[0] for choice in enums.DependencyLogicOperators.CHOICES]}"
             )
 
+        # Validate file-specific fields for FILE and MULTIPLE_FILES questions only
+        if effective_question_type and effective_question_type not in [
+            "file",
+            "multiple_files",
+        ]:
+            if (
+                allowed_file_types
+                or allowed_mime_types
+                or max_file_size_mb is not None
+                or max_files_count is not None
+            ):
+                raise serializers.ValidationError(
+                    "File validation fields (allowed_file_types, allowed_mime_types, max_file_size_mb, max_files_count) "
+                    "can only be set for FILE or MULTIPLE_FILES type questions."
+                )
+
+        # Validate allowed_file_types format
+        if allowed_file_types is not None:
+            if not isinstance(allowed_file_types, list):
+                raise serializers.ValidationError(
+                    "allowed_file_types must be a list of file extensions."
+                )
+
+            for file_type in allowed_file_types:
+                if not isinstance(file_type, str) or not file_type.startswith("."):
+                    raise serializers.ValidationError(
+                        f"Invalid file type '{file_type}'. File types must be strings starting with '.' (e.g., '.pdf', '.doc')."
+                    )
+
+        # Validate allowed_mime_types format
+        if allowed_mime_types is not None:
+            if not isinstance(allowed_mime_types, list):
+                raise serializers.ValidationError(
+                    "allowed_mime_types must be a list of MIME types."
+                )
+
+            for mime_type in allowed_mime_types:
+                if not isinstance(mime_type, str):
+                    raise serializers.ValidationError(
+                        f"Invalid MIME type '{mime_type}'. MIME types must be strings."
+                    )
+
+                # Basic MIME type format validation
+                if "/" not in mime_type and not mime_type.endswith("/*"):
+                    raise serializers.ValidationError(
+                        f"Invalid MIME type '{mime_type}'. MIME types must be in format 'type/subtype' or 'type/*' (e.g., 'application/pdf', 'image/*')."
+                    )
+
+        # Validate max_file_size_mb
+        if max_file_size_mb is not None and max_file_size_mb <= 0:
+            raise serializers.ValidationError(
+                "max_file_size_mb must be a positive number."
+            )
+
+        # Validate max_files_count
+        if max_files_count is not None:
+            if max_files_count <= 0:
+                raise serializers.ValidationError(
+                    "max_files_count must be a positive number."
+                )
+            if effective_question_type == "file":
+                raise serializers.ValidationError(
+                    "max_files_count can only be set for MULTIPLE_FILES type questions, not FILE type."
+                )
+
+        # Validate Likert-specific fields are only set for LIKERT questions
+        if (
+            effective_question_type
+            and effective_question_type != enums.QuestionTypes.LIKERT
+        ):
+            if (
+                likert_scale_length is not None
+                or likert_low_label
+                or likert_high_label
+                or likert_allow_na
+            ):
+                raise serializers.ValidationError(
+                    "Likert fields (likert_scale_length, likert_low_label, likert_high_label, "
+                    "likert_allow_na) can only be set for LIKERT type questions."
+                )
+
+        # When question_type is LIKERT, scale length must be one of the allowed values
+        if question_type == enums.QuestionTypes.LIKERT and likert_scale_length is None:
+            raise serializers.ValidationError(
+                "likert_scale_length is required for LIKERT type questions."
+            )
+
+        # Validate rich-text-specific fields are only set for RICH_TEXT questions
+        if (
+            effective_question_type
+            and effective_question_type != enums.QuestionTypes.RICH_TEXT
+        ):
+            if rich_text_char_limit is not None or rich_text_toolbar_level:
+                raise serializers.ValidationError(
+                    "Rich text fields (rich_text_char_limit, rich_text_toolbar_level) "
+                    "can only be set for RICH_TEXT type questions."
+                )
+
+        if rich_text_char_limit is not None and rich_text_char_limit <= 0:
+            raise serializers.ValidationError(
+                "rich_text_char_limit must be a positive number."
+            )
+
         return attrs
 
     class Meta(QuestionSerializer.Meta):
@@ -390,20 +654,8 @@ class QuestionAdminSerializer(QuestionSerializer):
             "url",
             "checklist_name",
             "checklist_uuid",
+            "checklist_type",
             "checklist",
-            "order",
-            "required",
-            "question_type",
-            "question_options",
-            "operator",
-            "review_answer_value",
-            "always_requires_review",
-            "guidance_answer_value",
-            "guidance_operator",
-            "always_show_guidance",
-            "min_value",
-            "max_value",
-            "dependency_logic_operator",
         ]
         extra_kwargs = {
             "url": {
@@ -412,54 +664,11 @@ class QuestionAdminSerializer(QuestionSerializer):
         }
 
 
-class AnswerSerializer(serializers.ModelSerializer):
-    """Comprehensive serializer for checklist answers with question details."""
-
-    question_uuid = serializers.UUIDField(write_only=True)
-    question_description = serializers.CharField(
-        source="question.description", read_only=True
-    )
-    question_type = serializers.CharField(
-        source="question.question_type", read_only=True
-    )
-    question_required = serializers.BooleanField(
-        source="question.required", read_only=True
-    )
-    user_name = serializers.CharField(source="user.full_name", read_only=True)
-
-    class Meta:
-        model = models.Answer
-        fields = (
-            "uuid",
-            "question_uuid",
-            "question_description",
-            "question_type",
-            "question_required",
-            "answer_data",
-            "requires_review",
-            "user",
-            "user_name",
-            "created",
-            "modified",
-        )
-        read_only_fields = (
-            "uuid",
-            "question_description",
-            "question_type",
-            "question_required",
-            "requires_review",
-            "user",
-            "user_name",
-            "created",
-            "modified",
-        )
-
-
 class AnswerSubmitSerializer(serializers.Serializer):
     """Generic serializer for submitting checklist answers."""
 
     question_uuid = serializers.UUIDField()
-    answer_data = serializers.JSONField(allow_null=True)
+    answer_data = AnyJSONField(allow_null=True)
 
     def validate(self, attrs):
         """Validate answer data using the same logic as model's clean method"""
@@ -579,6 +788,13 @@ class AnswerSubmitResponseSerializer(serializers.Serializer):
     completion = ChecklistCompletionSerializer()
 
 
+class ChecklistShortSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField()
+    name = serializers.CharField()
+    description = serializers.CharField()
+    checklist_type = serializers.CharField()
+
+
 class ChecklistResponseSerializer(serializers.Serializer):
     """Generic response serializer for checklist with questions and completion (basic view)."""
 
@@ -586,7 +802,7 @@ class ChecklistResponseSerializer(serializers.Serializer):
     completion = ChecklistCompletionSerializer()
     questions = QuestionWithAnswerSerializer(many=True)
 
-    @extend_schema_field(serializers.DictField())
+    @extend_schema_field(ChecklistShortSerializer)
     def get_checklist(self, obj):
         """Get checklist basic information."""
         return {
@@ -604,7 +820,7 @@ class ChecklistReviewerResponseSerializer(serializers.Serializer):
     completion = ChecklistCompletionReviewerSerializer()
     questions = QuestionWithAnswerReviewerSerializer(many=True)
 
-    @extend_schema_field(serializers.DictField())
+    @extend_schema_field(ChecklistShortSerializer)
     def get_checklist(self, obj):
         """Get checklist basic information."""
         return {
@@ -622,7 +838,7 @@ class ChecklistTemplateSerializer(serializers.Serializer):
     questions = QuestionSerializer(many=True)
     initial_visible_questions = QuestionSerializer(many=True)
 
-    @extend_schema_field(serializers.DictField())
+    @extend_schema_field(ChecklistShortSerializer)
     def get_checklist(self, obj):
         """Get checklist basic information."""
         return {

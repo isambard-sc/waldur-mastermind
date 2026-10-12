@@ -6,8 +6,17 @@ from waldur_core.permissions.fixtures import (
     ProjectRole,
     ServiceProviderRole,
 )
+from waldur_mastermind.marketplace import tasks
 
 from . import factories
+
+
+def add_user_to_project(user, project, role=None):
+    """Helper to add user to project and trigger offering user creation task."""
+    if role is None:
+        role = ProjectRole.MANAGER
+    project.add_user(user, role)
+    tasks.create_or_restore_offering_users_for_user(user.uuid.hex, project.uuid.hex)
 
 
 class UserFixture:
@@ -39,6 +48,9 @@ class CustomerFixture(UserFixture):
         CustomerRole.OWNER.add_permission(PermissionEnum.LIST_INVITATIONS)
         CustomerRole.OWNER.add_permission(PermissionEnum.LIST_CUSTOMER_USERS)
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING)
+        CustomerRole.OWNER.add_permission(
+            PermissionEnum.MANAGE_MAINTENANCE_ANNOUNCEMENT
+        )
         return user
 
     @cached_property
@@ -55,6 +67,9 @@ class CustomerFixture(UserFixture):
     def service_manager(self):
         user = factories.UserFactory()
         self.customer.add_user(user, ServiceProviderRole.MANAGER)
+        ServiceProviderRole.MANAGER.add_permission(
+            PermissionEnum.MANAGE_MAINTENANCE_ANNOUNCEMENT
+        )
         return user
 
 
@@ -66,7 +81,7 @@ class ProjectFixture(CustomerFixture):
     @cached_property
     def admin(self):
         admin = factories.UserFactory()
-        self.project.add_user(admin, ProjectRole.ADMIN)
+        add_user_to_project(admin, self.project, ProjectRole.ADMIN)
         ProjectRole.ADMIN.add_permission(PermissionEnum.LIST_PROJECTS)
         ProjectRole.ADMIN.add_permission(PermissionEnum.LIST_ORDERS)
         ProjectRole.ADMIN.add_permission(PermissionEnum.LIST_RESOURCES)
@@ -75,7 +90,7 @@ class ProjectFixture(CustomerFixture):
     @cached_property
     def manager(self):
         manager = factories.UserFactory()
-        self.project.add_user(manager, ProjectRole.MANAGER)
+        add_user_to_project(manager, self.project, ProjectRole.MANAGER)
         ProjectRole.MANAGER.add_permission(PermissionEnum.LIST_PROJECTS)
         ProjectRole.MANAGER.add_permission(PermissionEnum.LIST_ORDERS)
         ProjectRole.MANAGER.add_permission(PermissionEnum.LIST_RESOURCES)
@@ -86,7 +101,7 @@ class ProjectFixture(CustomerFixture):
     @cached_property
     def member(self):
         member = factories.UserFactory()
-        self.project.add_user(member, ProjectRole.MEMBER)
+        add_user_to_project(member, self.project, ProjectRole.MEMBER)
         ProjectRole.MEMBER.add_permission(PermissionEnum.LIST_PROJECTS)
         ProjectRole.MEMBER.add_permission(PermissionEnum.LIST_ORDERS)
         ProjectRole.MEMBER.add_permission(PermissionEnum.LIST_RESOURCES)
