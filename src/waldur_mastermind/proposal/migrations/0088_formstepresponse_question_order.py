@@ -3,7 +3,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("proposal", "0054_call_formbricks_flow_key_formstepresponse"),
+        ("proposal", "0087_call_formbricks_flow_key_formstepresponse"),
     ]
 
     operations = [

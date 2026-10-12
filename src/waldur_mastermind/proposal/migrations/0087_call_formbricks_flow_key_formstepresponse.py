@@ -10,7 +10,7 @@ import waldur_core.core.fields
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("proposal", "0053_round_default_reapply_text_round_default_reapply_url"),
+        ("proposal", "0086_merge_proposal_id_generator"),
     ]
 
     operations = [
