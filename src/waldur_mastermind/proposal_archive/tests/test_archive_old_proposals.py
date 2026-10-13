@@ -480,3 +480,59 @@ class MembershipCaptureTest(OldProposalData, TestCase):
         self.copy()
         self.copy()
         self.assertEqual(models.ArchivedMembership.objects.count(), 1)
+
+    def drop_columns(self, table, *columns):
+        """Take ``table`` back to a release that predates ``columns``.
+
+        Inside the test's transaction, so it is rolled back with it. The
+        deferred foreign-key checks from the rows just inserted are fired
+        first: PostgreSQL refuses to ALTER a table with pending trigger events.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+            for column in columns:
+                cursor.execute(f'ALTER TABLE {table} DROP COLUMN "{column}"')
+
+    def test_a_release_before_the_optional_columns_is_copied_with_blanks(self):
+        """7.8.6 has no revoked_by_id or revoke_reason: they arrive with
+        permissions 0022, which only runs at the migrate step, after the copy.
+        Before 0022 no role could have been revoked by anyone or with a reason,
+        so a missing column is copied as a blank, not a failure."""
+        self.grant(self.manager_role, self.proposal_ct, self.proposal_id)
+        self.drop_columns(
+            "permissions_userrole",
+            "revoked_by_id",
+            "revoke_reason",
+            "expiration_time",
+            "created_by_id",
+        )
+        self.drop_columns("permissions_role", "description")
+
+        self.copy()
+
+        membership = models.ArchivedMembership.objects.get()
+        self.assertEqual(membership.role_name, "PROPOSAL.MANAGER")
+        self.assertEqual(membership.user_username, "applicant")
+        self.assertEqual(membership.revoked_by_username, "")
+        self.assertEqual(membership.revoke_reason, "")
+        self.assertEqual(membership.granted_by_username, "")
+        self.assertEqual(membership.role_description, "")
+        self.assertIsNone(membership.expiration_time)
+
+    def test_the_optional_columns_are_still_read_where_they_exist(self):
+        granter = structure_factories.UserFactory(username="granter")
+        revoker = structure_factories.UserFactory(username="revoker")
+        assignment = self.grant(
+            self.manager_role, self.proposal_ct, self.proposal_id, is_active=False
+        )
+        assignment.created_by = granter
+        assignment.revoked_by = revoker
+        assignment.revoke_reason = "left the project"
+        assignment.save()
+
+        self.copy()
+
+        membership = models.ArchivedMembership.objects.get()
+        self.assertEqual(membership.granted_by_username, "granter")
+        self.assertEqual(membership.revoked_by_username, "revoker")
+        self.assertEqual(membership.revoke_reason, "left the project")
