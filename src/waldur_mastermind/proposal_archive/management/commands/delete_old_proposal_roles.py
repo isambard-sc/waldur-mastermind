@@ -14,7 +14,7 @@ refuses to run until ``archive_old_proposals`` has captured them.
 from django.contrib.contenttypes.models import ContentType
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection, transaction
-from django.db.models import SET_NULL
+from django.db.models import SET_NULL, Count
 
 from waldur_core.permissions import models as permission_models
 from waldur_mastermind.proposal_archive import models, utils
@@ -40,31 +40,49 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        content_types = ContentType.objects.filter(app_label="proposal")
-        if not content_types.exists():
+        # This runs before migrate, against whatever release the database is
+        # on, while the models are already the new release's. Loading a whole
+        # row selects every column the *model* has, and the table may not
+        # have them yet: 7.8.6 has no permissions_role.description_hr, which
+        # permissions 0026 adds. So nothing here loads a model instance; each
+        # query names the columns it reads, all of which every release has.
+        content_type_ids = list(
+            ContentType.objects.filter(app_label="proposal").values_list(
+                "id", flat=True
+            )
+        )
+        if not content_type_ids:
             self.stdout.write("No proposal content types: nothing to delete.")
             return
 
-        roles = permission_models.Role.objects.filter(content_type__in=content_types)
-        if not roles.exists():
+        roles = list(
+            permission_models.Role.objects.filter(content_type_id__in=content_type_ids)
+            .order_by("name")
+            .values("id", "name", "content_type__model", "is_system_role")
+        )
+        if not roles:
             self.stdout.write("No proposal-scoped roles: nothing to delete.")
             return
+        role_ids = [role["id"] for role in roles]
 
-        assignments = permission_models.UserRole.objects.filter(role__in=roles)
+        counts = dict(
+            permission_models.UserRole.objects.filter(role_id__in=role_ids)
+            .values("role_id")
+            .annotate(count=Count("id"))
+            .values_list("role_id", "count")
+        )
         archived = models.ArchivedMembership.objects.count()
 
         self.stdout.write("Roles to delete:")
-        for role in roles.order_by("name"):
-            count = assignments.filter(role=role).count()
-            system = "system" if role.is_system_role else "custom"
+        for role in roles:
+            system = "system" if role["is_system_role"] else "custom"
             self.stdout.write(
-                f"  {role.name:<30} {role.content_type.model:<26} {system:<7} {count}"
+                f"  {role['name']:<30} {role['content_type__model']:<26} "
+                f"{system:<7} {counts.get(role['id'], 0)}"
             )
-        total = assignments.count()
+        total = sum(counts.values())
         self.stdout.write(f"\nAssignments that would be cascaded away: {total}")
         self.stdout.write(f"Memberships already archived:             {archived}")
-
-        role_ids = list(roles.values_list("id", flat=True))
 
         if options["dry_run"]:
             # Counted, not guessed: the cascade reaches further than the

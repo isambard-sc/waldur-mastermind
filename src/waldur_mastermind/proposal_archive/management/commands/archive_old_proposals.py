@@ -526,6 +526,19 @@ class Command(BaseCommand):
         for itself, and its rule queries its own (now empty) tables: leave the
         paths alone and every archived document 403s.
         """
+        if not utils.table_exists("media_file"):
+            # Every release this upgrade starts from (the fork at 7.8.6 and
+            # later) has the media app, so this is a guard, not a path anyone
+            # takes. It is not a safe one to take, either: media 0002 builds
+            # media_file from proposal_calldocument and
+            # proposal_proposaldocumentation, which by then are upstream's
+            # new, empty tables, so the archived documents' bytes would not
+            # be carried across. Say so rather than fail with a bare SQL error.
+            raise CommandError(
+                "media_file does not exist: this database predates the media "
+                "app, and the archived proposal documents would not be carried "
+                "into it. Upgrade to a release with waldur_core.media first."
+            )
         moved = 0
         with connection.cursor() as cursor:
             for old_prefix, new_prefix in (
