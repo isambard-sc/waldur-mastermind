@@ -19,7 +19,7 @@ from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.proposal_archive import models
 
 
-class DeleteOldProposalRolesTest(TestCase):
+class ProposalRoleFixture:
     def setUp(self):
         self.user = structure_factories.UserFactory()
         self.proposal_ct, _ = ContentType.objects.get_or_create(
@@ -38,6 +38,8 @@ class DeleteOldProposalRolesTest(TestCase):
     def run_command(self, **kwargs):
         call_command("delete_old_proposal_roles", verbosity=0, **kwargs)
 
+
+class DeleteOldProposalRolesTest(ProposalRoleFixture, TestCase):
     def test_it_refuses_while_the_assignments_are_unarchived(self):
         with self.assertRaises(CommandError):
             self.run_command()
@@ -152,3 +154,42 @@ class MidMigrationDatabaseTest(TestCase):
         call_command("delete_old_proposal_roles", verbosity=0, force=True)
         clone.refresh_from_db()
         self.assertIsNone(clone.template_id)
+
+
+class OlderRoleTableTest(ProposalRoleFixture, TestCase):
+    """The command runs before migrate, so the table can be behind the model.
+
+    7.8.6 has no permissions_role.description_hr (permissions 0026) or
+    description_mk/description_sq (0027). Loading a whole Role selects them,
+    and on the dev cluster that failed while listing the roles - so nothing at
+    all could be deleted. The listing has to name only the columns it reads.
+    """
+
+    def setUp(self):
+        super().setUp()
+        with connection.cursor() as cursor:
+            # Fire the deferred checks for the rows setUp inserted: PostgreSQL
+            # refuses to ALTER a table with pending trigger events.
+            cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+            for column in ("description_hr", "description_mk", "description_sq"):
+                cursor.execute(f'ALTER TABLE permissions_role DROP COLUMN "{column}"')
+
+    def role_rows(self):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT count(*) FROM permissions_role WHERE id = %s", [self.role.pk]
+            )
+            return cursor.fetchone()[0]
+
+    def test_the_listing_reads_only_columns_every_release_has(self):
+        out = StringIO()
+        call_command("delete_old_proposal_roles", dry_run=True, stdout=out)
+        listing = out.getvalue()
+        self.assertIn("PROPOSAL.MANAGER", listing)
+        self.assertIn("proposal", listing)
+        self.assertIn("Assignments that would be cascaded away: 1", listing)
+        self.assertEqual(self.role_rows(), 1)
+
+    def test_the_roles_are_deleted(self):
+        self.run_command(force=True)
+        self.assertEqual(self.role_rows(), 0)
