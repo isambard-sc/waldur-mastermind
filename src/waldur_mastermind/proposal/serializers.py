@@ -1565,6 +1565,16 @@ class ProtectedCallSerializer(PublicCallSerializer):
         help_text="Whether proposal applicants can see review comments and scores",
         required=False,
     )
+    formbricks_flow_key = serializers.CharField(
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        max_length=100,
+        help_text="Key into FORM_FLOWS selecting this call's Formbricks survey "
+        "chain. Leave blank/null to use the legacy Waldur-native proposal "
+        "form. See GET .../formbricks-flow-keys/ for the keys valid on this "
+        "deployment. Cannot be changed once the call has any proposals.",
+    )
     compliance_checklist = serializers.SlugRelatedField(
         slug_field="uuid",
         queryset=checklist_models.Checklist.objects.filter(
@@ -1694,7 +1704,7 @@ class ProtectedCallSerializer(PublicCallSerializer):
 
     @extend_schema_field(serializers.BooleanField())
     def get_has_proposals(self, obj) -> bool:
-        return models.Proposal.objects.filter(round__call=obj).exists()
+        return obj.has_proposals()
 
     class Meta(PublicCallSerializer.Meta):
         fields = PublicCallSerializer.Meta.fields + (
@@ -1780,6 +1790,32 @@ class ProtectedCallSerializer(PublicCallSerializer):
             and call.has_proposals_under_evaluation()
         ):
             raise serializers.ValidationError(models.EVALUATION_START_LOCKED_MESSAGE)
+        return value
+
+    def validate_formbricks_flow_key(self, value):
+        """Reject an unconfigured key, and refuse a switch once proposals exist.
+
+        formbricks_flow_key both enables Formbricks for this call and selects
+        which survey chain it uses - formbricks_progress/formbricks_redirect
+        resolve that chain live on every request rather than snapshotting it
+        onto the Proposal, so changing it (including clearing it, or flipping
+        it on) after proposals already exist would scramble in-flight
+        applicants' next-step resolution.
+        """
+        value = value or None
+        if value and value not in formbricks_flows.FORM_FLOWS:
+            raise serializers.ValidationError(
+                f"{value!r} is not a configured Formbricks flow key."
+            )
+        call = self.instance
+        if (
+            isinstance(call, models.Call)
+            and value != call.formbricks_flow_key
+            and call.has_proposals()
+        ):
+            raise serializers.ValidationError(
+                models.FORMBRICKS_FLOW_KEY_LOCKED_MESSAGE
+            )
         return value
 
     def _validate_order_author(self, attrs):
@@ -2500,6 +2536,16 @@ class RoundReviewerSerializer(serializers.Serializer):
 
     def get_full_name(self, obj) -> str:
         return f"{obj.first_name} {obj.last_name}"
+
+
+class FormbricksFlowKeySerializer(serializers.Serializer):
+    """A single valid Call.formbricks_flow_key, for the call-settings UI's
+    flow picker (ProtectedCallViewSet.formbricks_flow_keys). FORM_FLOWS
+    entries carry no separate human-readable label today, so the key itself
+    is all there is to show.
+    """
+
+    key = serializers.CharField()
 
 
 class StartFormbricksFlowSerializer(serializers.Serializer):

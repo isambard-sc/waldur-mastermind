@@ -1616,6 +1616,28 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     # already edit the step config.
     step_checklists_permissions = []
 
+    @extend_schema(
+        description=(
+            "List Formbricks flow keys valid on this deployment's FORM_FLOWS, "
+            "for the call-settings UI's flow picker."
+        ),
+        responses={
+            status.HTTP_200_OK: serializers.FormbricksFlowKeySerializer(many=True)
+        },
+    )
+    @decorators.action(detail=False, methods=["get"], url_path="formbricks-flow-keys")
+    def formbricks_flow_keys(self, request):
+        keys = sorted(formbricks_flows.FORM_FLOWS.keys())
+        serializer = serializers.FormbricksFlowKeySerializer(
+            [{"key": key} for key in keys], many=True
+        )
+        return response.Response(serializer.data, status=status.HTTP_200_OK)
+
+    # Non-sensitive catalogue data (flow key strings only, no survey IDs or
+    # question mappings); the field it configures is itself only writable by
+    # whoever already holds UPDATE_CALL (see ProtectedCallSerializer).
+    formbricks_flow_keys_permissions = []
+
     # Call Manager Compliance Endpoints
     compliance_overview_permissions = [
         proposal_permissions.support_can_read(

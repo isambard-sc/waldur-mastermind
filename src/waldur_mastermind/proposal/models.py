@@ -76,6 +76,10 @@ EVALUATION_START_LOCKED_MESSAGE = _(
     "are submitted or in review."
 )
 
+FORMBRICKS_FLOW_KEY_LOCKED_MESSAGE = _(
+    "Cannot change the Formbricks flow key once the call has any proposals."
+)
+
 
 class CallDocument(
     TimeStampedModel,
@@ -310,6 +314,11 @@ class Call(
             state__in=[ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW],
         ).exists()
 
+    def has_proposals(self):
+        # Proposal has no direct FK to Call (only to Round), so there is no
+        # real self.proposal_set - go through round__call instead.
+        return Proposal.objects.filter(round__call=self).exists()
+
     def clean(self):
         """Prevent changing checklist or slug template if proposals exist."""
         if (
@@ -329,7 +338,7 @@ class Call(
             and self.has_proposals_under_evaluation()
         ):
             raise ValidationError({"evaluation_start": EVALUATION_START_LOCKED_MESSAGE})
-        if self.pk and self.proposal_set.exists():
+        if self.pk and self.has_proposals():
             if self.tracker.has_changed("compliance_checklist"):
                 raise ValidationError(
                     "Cannot change compliance checklist when proposals exist"
@@ -337,6 +346,10 @@ class Call(
             if self.tracker.has_changed("proposal_slug_template"):
                 raise ValidationError(
                     "Cannot change proposal slug template when proposals exist"
+                )
+            if self.tracker.has_changed("formbricks_flow_key"):
+                raise ValidationError(
+                    {"formbricks_flow_key": FORMBRICKS_FLOW_KEY_LOCKED_MESSAGE}
                 )
 
 
