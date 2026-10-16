@@ -46,18 +46,37 @@ REDIRECT_TOKEN_SALT = "waldur_mastermind.proposal.formbricks_redirect_token"
 REDIRECT_TOKEN_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 
 
-def build_redirect_token(user):
-    return signing.TimestampSigner(salt=REDIRECT_TOKEN_SALT).sign(str(user.pk))
+def build_redirect_token(user, proposal):
+    """Sign (user, proposal) together, not just the user.
+
+    A token only ever needs to authenticate "this Lead, resuming/editing
+    this one proposal" - binding it to the proposal means a token leaked
+    from one application can't be replayed against a different proposal the
+    same Lead happens to have, even within the three actions it's scoped to
+    (see FormbricksRedirectTokenAuthentication).
+    """
+    return signing.TimestampSigner(salt=REDIRECT_TOKEN_SALT).sign(
+        f"{user.pk}:{proposal.uuid.hex}"
+    )
 
 
-def verify_redirect_token(token):
-    """Return the signed user pk, or None if the token is missing/invalid/expired."""
+def verify_redirect_token(token, proposal_uuid):
+    """Return the signed user pk, or None if the token is missing/invalid/
+    expired, or was issued for a different proposal than the one being
+    accessed (`proposal_uuid` is the raw hex string from the request URL -
+    see FormbricksRedirectTokenAuthentication).
+    """
     try:
-        return signing.TimestampSigner(salt=REDIRECT_TOKEN_SALT).unsign(
+        value = signing.TimestampSigner(salt=REDIRECT_TOKEN_SALT).unsign(
             token, max_age=REDIRECT_TOKEN_MAX_AGE_SECONDS
         )
     except signing.BadSignature:
         return None
+    user_pk, _, token_proposal_uuid = value.partition(":")
+    if not proposal_uuid or token_proposal_uuid != proposal_uuid:
+        return None
+    return user_pk
+
 
 # Standard Webhooks spec (https://www.standardwebhooks.com/) - Formbricks
 # sends all three of these on every webhook request.

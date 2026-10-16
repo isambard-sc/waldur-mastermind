@@ -146,14 +146,23 @@ class FormbricksRedirectTokenAuthentication(rf_authentication.BaseAuthentication
     """Authenticates via the signed redirect_token query param, carried as a
     Formbricks hidden field through the whole survey chain.
 
-    Only ever engages for formbricks_redirect: that action is hit by a plain
-    top-level browser GET (Formbricks' own "Redirect to URL" survey ending),
-    which can carry neither the SPA's Authorization header nor a Django
-    session cookie (ObtainAuthToken never establishes one - see
-    formbricks_client.build_redirect_token). Harmless to register on the
-    whole ViewSet: it simply returns None (deferring to the normal
-    authentication classes) whenever redirect_token isn't present, which is
-    every request except this one.
+    Used by formbricks_redirect/formbricks_progress/formbricks_edit_link:
+    formbricks_redirect in particular is hit by a plain top-level browser GET
+    (Formbricks' own "Redirect to URL" survey ending), which can carry
+    neither the SPA's Authorization header nor a Django session cookie
+    (ObtainAuthToken never establishes one - see
+    formbricks_client.build_redirect_token).
+
+    Deliberately NOT registered on the whole ViewSet (see
+    ProposalViewSet.get_authenticators) - DRF authenticates once per
+    request, before routing to the specific action, so a ViewSet-wide
+    registration would let a leaked token authenticate as that user for
+    every other action the ViewSet exposes (list, submit, team management,
+    ...), not just resuming/editing a Formbricks step. The token is also
+    bound to the specific proposal it was issued for (see
+    verify_redirect_token), via the uuid already resolved onto the request
+    by routing - so even within these three actions, a token can't be
+    replayed against a different proposal the same Lead happens to have.
     """
 
     def authenticate(self, request):
@@ -161,7 +170,10 @@ class FormbricksRedirectTokenAuthentication(rf_authentication.BaseAuthentication
         if not token:
             return None
 
-        user_pk = formbricks_client.verify_redirect_token(token)
+        resolver_match = getattr(request, "resolver_match", None)
+        proposal_uuid = (resolver_match.kwargs or {}).get("uuid") if resolver_match else None
+
+        user_pk = formbricks_client.verify_redirect_token(token, proposal_uuid)
         if user_pk is None:
             raise exceptions.AuthenticationFailed(
                 "Invalid or expired redirect token."
@@ -3154,20 +3166,40 @@ class ProposalViewSet(
     filterset_class = filters.ProposalFilter
     disabled_actions = ["update", "partial_update"]
     model = models.Proposal
-    # FormbricksRedirectTokenAuthentication only engages for requests
-    # carrying a redirect_token query param (formbricks_redirect) - it's a
-    # no-op addition for every other action, which never sends one. Must
-    # come AFTER the defaults, not before: DRF's handle_exception() only
-    # consults the FIRST authenticator's authenticate_header() to decide
-    # whether an unauthenticated request gets a 401 or is downgraded to a
-    # bare 403, and this class doesn't define one (there's no sensible
-    # WWW-Authenticate challenge for "pass a signed query param") - putting
-    # it first would silently turn every plain-401 case on this ViewSet
-    # into a 403 instead.
-    authentication_classes = (
-        *api_settings.DEFAULT_AUTHENTICATION_CLASSES,
-        FormbricksRedirectTokenAuthentication,
+
+    # FormbricksRedirectTokenAuthentication is scoped to only these three
+    # actions, via get_authenticators() below - not registered ViewSet-wide,
+    # since a leaked token would otherwise authenticate as that user for
+    # every other action this ViewSet exposes. See the class's own docstring.
+    _FORMBRICKS_REDIRECT_TOKEN_ACTIONS = frozenset(
+        {"formbricks_redirect", "formbricks_progress", "formbricks_edit_link"}
     )
+
+    def get_authenticators(self):
+        # Must come AFTER the defaults, not before: DRF's handle_exception()
+        # only consults the FIRST authenticator's authenticate_header() to
+        # decide whether an unauthenticated request gets a 401 or is
+        # downgraded to a bare 403, and FormbricksRedirectTokenAuthentication
+        # doesn't define one (there's no sensible WWW-Authenticate challenge
+        # for "pass a signed query param") - putting it first would silently
+        # turn every plain-401 case on these three actions into a 403 instead.
+        #
+        # Can't key off self.action here: DRF calls get_authenticators() from
+        # initialize_request(), and ViewSetMixin.initialize_request() only
+        # sets self.action *after* calling super().initialize_request() (the
+        # method that calls this one) - self.action is always still unset at
+        # this point. self.action_map and self.request (the raw, not-yet-
+        # DRF-wrapped request) are both already set by the as_view() wrapper
+        # before dispatch() runs, so derive the action the same way
+        # ViewSetMixin itself will, one step early.
+        action_map = getattr(self, "action_map", None) or {}
+        request = getattr(self, "request", None)
+        action = action_map.get(request.method.lower()) if request else None
+
+        authenticators = [cls() for cls in api_settings.DEFAULT_AUTHENTICATION_CLASSES]
+        if action in self._FORMBRICKS_REDIRECT_TOKEN_ACTIONS:
+            authenticators.append(FormbricksRedirectTokenAuthentication())
+        return authenticators
 
     def get_queryset(self):
         # Annotate the inputs to workflow_service.is_awaiting_manual_advance so
@@ -4063,7 +4095,9 @@ class ProposalViewSet(
             proposal_uuid=str(proposal.uuid),
             call_uuid=str(call.uuid),
             round_uuid=str(round_obj.uuid),
-            redirect_token=formbricks_client.build_redirect_token(request.user),
+            redirect_token=formbricks_client.build_redirect_token(
+                request.user, proposal
+            ),
             **formbricks_client.lead_hidden_fields(request.user),
         )
         return response.Response(
@@ -4118,7 +4152,9 @@ class ProposalViewSet(
             # FormbricksRedirectTokenAuthentication) - each survey in the
             # chain must declare redirect_token as one of its own Hidden
             # Fields for it to keep propagating through the whole flow.
-            redirect_token=formbricks_client.build_redirect_token(request.user),
+            redirect_token=formbricks_client.build_redirect_token(
+                request.user, proposal
+            ),
             **formbricks_client.lead_hidden_fields(request.user),
         )
         return redirect(redirect_url)
@@ -4162,6 +4198,12 @@ class ProposalViewSet(
                 proposal_uuid=str(proposal.uuid),
                 call_uuid=str(call.uuid),
                 round_uuid=str(proposal.round.uuid),
+                # Without this, the survey can't carry authentication forward
+                # to its own "Redirect to URL" ending afterward - see
+                # formbricks_redirect's identical comment.
+                redirect_token=formbricks_client.build_redirect_token(
+                    request.user, proposal
+                ),
                 **formbricks_client.lead_hidden_fields(request.user),
             )
             next_step_data = {"key": next_step["key"], "redirect_url": redirect_url}

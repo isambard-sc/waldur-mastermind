@@ -534,7 +534,7 @@ class FormbricksRedirectTokenAuthTest(FormbricksTestCase):
         )
 
     def test_valid_redirect_token_authenticates_without_session_or_auth_header(self):
-        token = formbricks_client.build_redirect_token(self.lead)
+        token = formbricks_client.build_redirect_token(self.lead, self.proposal)
         response = self.client.get(
             self.url, {"current_step": "project_details", "redirect_token": token}
         )
@@ -562,11 +562,39 @@ class FormbricksRedirectTokenAuthTest(FormbricksTestCase):
         # FormbricksRedirectTest.test_unrelated_user_gets_404_not_403: a
         # user with no connection to the proposal can't see it at all.
         other_user = structure_factories.UserFactory()
-        token = formbricks_client.build_redirect_token(other_user)
+        token = formbricks_client.build_redirect_token(other_user, self.proposal)
         response = self.client.get(
             self.url, {"current_step": "project_details", "redirect_token": token}
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_token_issued_for_a_different_proposal_is_rejected(self):
+        # Same Lead, genuine token - just minted for a different proposal of
+        # theirs. Must not authenticate here: binding the token to the
+        # proposal it was issued for is what stops a leaked link from being
+        # replayed against anything else the same Lead has access to.
+        other_proposal = factories.ProposalFactory(
+            round=self.fixture.round, state=ProposalStates.DRAFT
+        )
+        other_proposal.add_user(
+            self.lead, ProposalRole.MANAGER, created_by=self.lead
+        )
+        token = formbricks_client.build_redirect_token(self.lead, other_proposal)
+        response = self.client.get(
+            self.url, {"current_step": "project_details", "redirect_token": token}
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_redirect_token_does_not_authenticate_unrelated_actions(self):
+        # FormbricksRedirectTokenAuthentication is scoped to only
+        # formbricks_redirect/formbricks_progress/formbricks_edit_link (see
+        # ProposalViewSet.get_authenticators) - a leaked token must not
+        # authenticate as the Lead for anything else this ViewSet exposes,
+        # such as a plain retrieve of the proposal.
+        token = formbricks_client.build_redirect_token(self.lead, self.proposal)
+        detail_url = factories.ProposalFactory.get_url(self.proposal)
+        response = self.client.get(detail_url, {"redirect_token": token})
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
 class StartFormbricksFlowRedirectTokenTest(FormbricksTestCase):
@@ -578,8 +606,11 @@ class StartFormbricksFlowRedirectTokenTest(FormbricksTestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
         params = query_params(response.data["redirect_url"])
+        proposal = models.Proposal.objects.get(uuid=response.data["proposal_uuid"])
         self.assertEqual(
-            formbricks_client.verify_redirect_token(params["redirect_token"]),
+            formbricks_client.verify_redirect_token(
+                params["redirect_token"], proposal.uuid.hex
+            ),
             str(lead.pk),
         )
 
@@ -682,6 +713,15 @@ class FormbricksProgressTest(FormbricksTestCase):
         params = query_params(response.data["next_step"]["redirect_url"])
         self.assertEqual(params["lead_name"], self.lead.full_name)
         self.assertEqual(params["lead_email"], self.lead.email)
+        # Without a redirect_token here, the survey the Lead is sent to
+        # couldn't carry authentication forward to its own "Redirect to URL"
+        # ending afterward - see formbricks_progress's own comment.
+        self.assertEqual(
+            formbricks_client.verify_redirect_token(
+                params["redirect_token"], self.proposal.uuid.hex
+            ),
+            str(self.lead.pk),
+        )
 
     def test_partial_completion_reports_next_incomplete_step_in_flow_order(self):
         self._create_response("project_details", "survey-project-details")
