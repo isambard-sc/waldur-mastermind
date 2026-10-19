@@ -270,6 +270,14 @@ globals().update(WaldurConfiguration().dict())
 # FIELD_ENCRYPTION_KEY is the primary Fernet key used to encrypt/decrypt secret
 # columns. It is deliberately a separate setting from SECRET_KEY: leaking Django
 # settings must not, by itself, unlock encrypted DB fields.
+# Base URL of the AI reporting harness's HTTP wrapper (http_service.py in the
+# waldur-ai-harness repo). Reachable only from this pod's own network per the
+# harness's NetworkPolicy - see harness_manual_loop/manifests/network-policy.yaml.
+AI_REPORTING_HARNESS_URL = os.environ.get(
+    "AI_REPORTING_HARNESS_URL",
+    "http://waldur-harness.waldur-harness.svc.cluster.local:8000",
+)
+
 FIELD_ENCRYPTION_KEY = os.environ.get("FIELD_ENCRYPTION_KEY", "")
 # Rotating the encryption key: to replace FIELD_ENCRYPTION_KEY, set the new key
 # as the primary and move the OLD key(s) here (comma-separated). New writes use

@@ -100,6 +100,7 @@ Documentation = "https://docs.waldur.com"
 waldur = "waldur_core.server.manage:main"
 
 [project.entry-points.waldur_extensions]
+waldur_ai_reporting = "waldur_mastermind.ai_reporting.extension:AIReportingExtension"
 waldur_analytics = "waldur_mastermind.analytics.extension:AnalyticsExtension"
 waldur_auth_saml2 = "waldur_auth_saml2.extension:SAML2Extension"
 waldur_auth_social = "waldur_auth_social.extension:AuthSocialExtension"
