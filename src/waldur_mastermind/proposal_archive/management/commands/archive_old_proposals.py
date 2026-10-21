@@ -526,6 +526,19 @@ class Command(BaseCommand):
         for itself, and its rule queries its own (now empty) tables: leave the
         paths alone and every archived document 403s.
         """
+        if not utils.table_exists("media_file"):
+            # Every release this upgrade starts from (the fork at 7.8.6 and
+            # later) has the media app, so this is a guard, not a path anyone
+            # takes. It is not a safe one to take, either: media 0002 builds
+            # media_file from proposal_calldocument and
+            # proposal_proposaldocumentation, which by then are upstream's
+            # new, empty tables, so the archived documents' bytes would not
+            # be carried across. Say so rather than fail with a bare SQL error.
+            raise CommandError(
+                "media_file does not exist: this database predates the media "
+                "app, and the archived proposal documents would not be carried "
+                "into it. Upgrade to a release with waldur_core.media first."
+            )
         moved = 0
         with connection.cursor() as cursor:
             for old_prefix, new_prefix in (
@@ -565,20 +578,46 @@ class Command(BaseCommand):
             "callmanagingorganisation": models.ArchivedMembership.Scopes.ORGANISATION,
         }
         ids = [content_types[m] for m in wanted if m in content_types]
+
+        # This runs before migrate, on whatever release the database is on,
+        # and not every optional column is there on every release: 7.8.6 has
+        # no revoked_by_id or revoke_reason, which permissions 0022 adds. An
+        # absent column reads as NULL - before 0022 no role could have been
+        # revoked by anyone, or with a reason, so NULL is the true value, not
+        # a guess. The rest are checked the same way, so an older release
+        # degrades to blanks rather than failing the whole transaction.
+        userrole = utils.existing_columns("permissions_userrole")
+        role = utils.existing_columns("permissions_role")
+
+        def userrole_column(name):
+            return f"ur.{name}" if name in userrole else "NULL"
+
+        def user_join(alias, column):
+            if column not in userrole:
+                return "NULL", ""
+            return (
+                f"{alias}.username",
+                f"LEFT JOIN core_user {alias} ON {alias}.id = ur.{column}",
+            )
+
+        granted_by, granted_by_join = user_join("cb", "created_by_id")
+        revoked_by, revoked_by_join = user_join("rb", "revoked_by_id")
         with connection.cursor() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT ur.uuid, ur.created, ur.modified, ur.object_id,
-                       ct.model, r.name, r.description,
+                       ct.model, r.name,
+                       {"r.description" if "description" in role else "NULL"},
                        u.uuid, u.username, u.first_name, u.last_name,
-                       ur.is_active, ur.expiration_time, ur.revoke_reason,
-                       cb.username, rb.username
+                       ur.is_active, {userrole_column("expiration_time")},
+                       {userrole_column("revoke_reason")},
+                       {granted_by}, {revoked_by}
                 FROM permissions_userrole ur
                 JOIN django_content_type ct ON ct.id = ur.content_type_id
                 JOIN permissions_role r ON r.id = ur.role_id
                 JOIN core_user u ON u.id = ur.user_id
-                LEFT JOIN core_user cb ON cb.id = ur.created_by_id
-                LEFT JOIN core_user rb ON rb.id = ur.revoked_by_id
+                {granted_by_join}
+                {revoked_by_join}
                 WHERE ur.content_type_id = ANY(%s)
                 """,
                 [ids],

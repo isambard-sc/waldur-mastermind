@@ -11,6 +11,24 @@ def table_exists(name):
         return cursor.fetchone()[0] is not None
 
 
+def existing_columns(table):
+    """The names of the columns ``table`` has right now; empty if it has none.
+
+    The copy runs before ``migrate``, against whatever release the database is
+    on, so a column a later migration adds may not be there yet: 7.8.6 has no
+    ``permissions_userrole.revoked_by_id``, which arrives with permissions 0022.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT attname FROM pg_attribute
+            WHERE attrelid = to_regclass(%s) AND attnum > 0 AND NOT attisdropped
+            """,
+            [table],
+        )
+        return {row[0] for row in cursor.fetchall()}
+
+
 def detach_old_tables():
     """Drop every foreign key still held by the renamed ``old_proposal_*`` tables.
 
