@@ -65,7 +65,14 @@ from waldur_mastermind.proposal.enums import (
     WorkflowStepOutcomes,
 )
 
-from . import formbricks_flows, formbricks_mapper, models, notification_rules, utils, workflow_service
+from . import (
+    formbricks_flows,
+    formbricks_mapper,
+    models,
+    notification_rules,
+    utils,
+    workflow_service,
+)
 from .managers import get_connected_calls, holds_live_review
 
 logger = logging.getLogger(__name__)
@@ -1813,9 +1820,7 @@ class ProtectedCallSerializer(PublicCallSerializer):
             and value != call.formbricks_flow_key
             and call.has_proposals()
         ):
-            raise serializers.ValidationError(
-                models.FORMBRICKS_FLOW_KEY_LOCKED_MESSAGE
-            )
+            raise serializers.ValidationError(models.FORMBRICKS_FLOW_KEY_LOCKED_MESSAGE)
         return value
 
     def _validate_order_author(self, attrs):
@@ -5896,6 +5901,127 @@ class ProposalWorkflowStepInstanceSerializer(serializers.ModelSerializer):
         if not self.context.get("can_view_internal_notes"):
             return None
         return obj.internal_notes or None
+
+
+class ProposalResourceAdjustmentSerializer(
+    core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
+):
+    requested_resource = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.RequestedResource.objects.none(),
+        required=False,
+        allow_null=True,
+        help_text="Required for modify/remove actions.",
+    )
+    call_offering = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.RequestedOffering.objects.none(),
+        required=False,
+        allow_null=True,
+        help_text="Required for the add action; must be an accepted offering on this call.",
+    )
+    requested_resource_name = serializers.ReadOnlyField(
+        source="requested_resource.requested_offering.offering.name"
+    )
+    call_offering_name = serializers.ReadOnlyField(source="call_offering.offering.name")
+    proposal = serializers.SlugRelatedField(slug_field="uuid", read_only=True)
+    created_by = serializers.SlugRelatedField(
+        slug_field="uuid", read_only=True, allow_null=True
+    )
+    created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
+
+    class Meta:
+        model = models.ProposalResourceAdjustment
+        fields = [
+            "uuid",
+            "proposal",
+            "requested_resource",
+            "requested_resource_name",
+            "call_offering",
+            "call_offering_name",
+            "action",
+            "adjusted_attributes",
+            "adjusted_limits",
+            "comment",
+            "created_by",
+            "created_by_name",
+            "created",
+            "modified",
+        ]
+        read_only_fields = ("created_by",)
+
+    def get_fields(self):
+        # Queryset is narrowed per-proposal here (empty above) the same way
+        # order_author_user's is -- there's no proposal to scope against at
+        # schema-generation time.
+        fields = super().get_fields()
+        proposal = self.context.get("proposal") or getattr(
+            self.instance, "proposal", None
+        )
+        if proposal:
+            fields["requested_resource"].queryset = proposal.requestedresource_set.all()
+            fields[
+                "call_offering"
+            ].queryset = proposal.round.call.requestedoffering_set.filter(
+                state=RequestedOfferingStates.ACCEPTED
+            )
+        return fields
+
+    def validate(self, attrs):
+        action = attrs.get(
+            "action",
+            getattr(
+                self.instance,
+                "action",
+                models.ProposalResourceAdjustment.Actions.MODIFY,
+            ),
+        )
+        requested_resource = attrs.get("requested_resource") or getattr(
+            self.instance, "requested_resource", None
+        )
+        call_offering = attrs.get("call_offering") or getattr(
+            self.instance, "call_offering", None
+        )
+        if action in (
+            models.ProposalResourceAdjustment.Actions.MODIFY,
+            models.ProposalResourceAdjustment.Actions.REMOVE,
+        ):
+            if not requested_resource:
+                raise serializers.ValidationError(
+                    {"requested_resource": _("Required for modify/remove actions.")}
+                )
+        elif (
+            action == models.ProposalResourceAdjustment.Actions.ADD
+            and not call_offering
+        ):
+            raise serializers.ValidationError(
+                {"call_offering": _("Required for add action.")}
+            )
+        return attrs
+
+    def create(self, validated_data):
+        validated_data["proposal"] = self.context["proposal"]
+        validated_data["created_by"] = self.context["request"].user
+        return super().create(validated_data)
+
+
+class EffectiveAllocationItemSerializer(serializers.Serializer):
+    """Shape of one row in ProposalViewSet.effective_allocation's response --
+    not a ModelSerializer, since each row blends a RequestedResource (or
+    nothing, for an ADD) with its adjustment, not a single model instance."""
+
+    requested_resource_uuid = serializers.UUIDField(allow_null=True)
+    requested_resource_name = serializers.CharField(allow_null=True)
+    offering_uuid = serializers.UUIDField()
+    offering_name = serializers.CharField()
+    original_attributes = serializers.JSONField()
+    original_limits = serializers.JSONField()
+    effective_attributes = serializers.JSONField()
+    effective_limits = serializers.JSONField()
+    is_removed = serializers.BooleanField()
+    is_added = serializers.BooleanField()
+    has_modifications = serializers.BooleanField()
+    adjustment = serializers.JSONField()
 
 
 class CompleteWorkflowStepSerializer(serializers.Serializer):

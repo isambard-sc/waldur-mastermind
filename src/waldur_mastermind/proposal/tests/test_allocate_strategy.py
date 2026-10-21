@@ -11,8 +11,12 @@ from waldur_core.structure.tests.factories import UserFactory
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import SUPPORT_OFFERING, OrderStates
 from waldur_mastermind.proposal import models, utils
-from waldur_mastermind.proposal.enums import AllocationTimes, ProposalStates
-from waldur_mastermind.proposal.tests import fixtures
+from waldur_mastermind.proposal.enums import (
+    AllocationTimes,
+    ProposalStates,
+    RequestedOfferingStates,
+)
+from waldur_mastermind.proposal.tests import factories, fixtures
 
 
 # The legacy one-click approve/reject endpoints were removed; the workflow
@@ -82,6 +86,125 @@ class AllocateProposalTest(test.APITestCase):
             proposal_role=ProposalRole.MANAGER,
         )
         self.assertFalse(self._allocate_and_check_membership(ProposalRole.MANAGER))
+
+
+class AllocateProposalResourceAdjustmentTest(test.APITestCase):
+    """allocate_proposal is the one place a resource adjustment has a real
+    side effect, not just a preview - see models.ProposalResourceAdjustment."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.proposal = self.fixture.proposal
+        self.proposal.state = ProposalStates.IN_REVIEW
+        self.proposal.project = None
+        self.proposal.save()
+        self.requested_resource = self.fixture.requested_resource
+
+    def test_remove_adjustment_skips_resource_and_order_creation(self):
+        models.ProposalResourceAdjustment.objects.create(
+            proposal=self.proposal,
+            requested_resource=self.requested_resource,
+            action=models.ProposalResourceAdjustment.Actions.REMOVE,
+        )
+        original_resource = self.requested_resource.resource
+        utils.allocate_proposal(self.proposal, approved_by=self.fixture.staff)
+        self.requested_resource.refresh_from_db()
+
+        # Untouched: the factory-assigned stand-in resource (not a real
+        # allocation result) stays exactly as it was, since the REMOVE
+        # branch never writes requested_resource.resource at all.
+        self.assertEqual(self.requested_resource.resource, original_resource)
+        self.assertFalse(
+            marketplace_models.Resource.objects.filter(
+                project=self.proposal.project
+            ).exists()
+        )
+        self.assertFalse(
+            marketplace_models.Order.objects.filter(
+                resource__project=self.proposal.project
+            ).exists()
+        )
+
+    def test_remove_adjustment_does_not_consume_an_offering_index_slot(self):
+        # A second request for the same offering as the removed one must be
+        # named as if it were the only one of its kind, not "(2)".
+        other_resource = factories.RequestedResourceFactory(
+            proposal=self.proposal,
+            requested_offering=self.fixture.requested_offering_accepted,
+        )
+        models.ProposalResourceAdjustment.objects.create(
+            proposal=self.proposal,
+            requested_resource=self.requested_resource,
+            action=models.ProposalResourceAdjustment.Actions.REMOVE,
+        )
+        utils.allocate_proposal(self.proposal, approved_by=self.fixture.staff)
+        other_resource.refresh_from_db()
+
+        offering_name = self.fixture.requested_offering_accepted.offering.name
+        self.assertNotIn(f"{offering_name} (2)", other_resource.resource.name)
+        self.assertIn(offering_name, other_resource.resource.name)
+
+    def test_modify_adjustment_uses_adjusted_attributes_and_limits(self):
+        self.requested_resource.attributes = {"cpu": 2}
+        self.requested_resource.limits = {"storage": 100}
+        self.requested_resource.save()
+        models.ProposalResourceAdjustment.objects.create(
+            proposal=self.proposal,
+            requested_resource=self.requested_resource,
+            action=models.ProposalResourceAdjustment.Actions.MODIFY,
+            adjusted_attributes={"cpu": 8},
+        )
+        utils.allocate_proposal(self.proposal, approved_by=self.fixture.staff)
+        self.requested_resource.refresh_from_db()
+
+        self.assertEqual(self.requested_resource.resource.attributes, {"cpu": 8})
+        # adjusted_limits left empty -> falls back to the original limits
+        # (decision 2: the UI only lets a manager edit attributes).
+        self.assertEqual(self.requested_resource.resource.limits, {"storage": 100})
+
+    def test_add_adjustment_creates_a_new_resource_and_order(self):
+        other_offering = factories.RequestedOfferingFactory(
+            call=self.fixture.call, state=RequestedOfferingStates.ACCEPTED
+        )
+        models.ProposalResourceAdjustment.objects.create(
+            proposal=self.proposal,
+            call_offering=other_offering,
+            action=models.ProposalResourceAdjustment.Actions.ADD,
+            adjusted_attributes={"cpu": 1},
+        )
+        utils.allocate_proposal(self.proposal, approved_by=self.fixture.staff)
+        self.proposal.refresh_from_db()
+
+        added_resource = marketplace_models.Resource.objects.get(
+            project=self.proposal.project, offering=other_offering.offering
+        )
+        self.assertEqual(added_resource.attributes, {"cpu": 1})
+        self.assertTrue(
+            marketplace_models.Order.objects.filter(resource=added_resource).exists()
+        )
+
+    def test_add_adjustment_for_same_offering_as_a_regular_request_is_deduplicated(
+        self,
+    ):
+        # Both the regular request and the added resource target the same
+        # offering - both must be numbered (1)/(2), neither left bare.
+        models.ProposalResourceAdjustment.objects.create(
+            proposal=self.proposal,
+            call_offering=self.fixture.requested_offering_accepted,
+            action=models.ProposalResourceAdjustment.Actions.ADD,
+            adjusted_attributes={"cpu": 1},
+        )
+        utils.allocate_proposal(self.proposal, approved_by=self.fixture.staff)
+        self.requested_resource.refresh_from_db()
+
+        offering = self.fixture.requested_offering_accepted.offering
+        resources = marketplace_models.Resource.objects.filter(
+            project=self.proposal.project, offering=offering
+        )
+        self.assertEqual(resources.count(), 2)
+        names = set(resources.values_list("name", flat=True))
+        self.assertTrue(any(name.endswith(f"{offering.name} (1)") for name in names))
+        self.assertTrue(any(name.endswith(f"{offering.name} (2)") for name in names))
 
 
 class AllocatedOrderApprovalTest(test.APITestCase):

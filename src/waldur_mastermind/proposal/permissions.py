@@ -220,6 +220,29 @@ def can_advance_workflow_step(request, view, obj=None):
 can_advance_workflow_step.sources = ["*"]
 
 
+def can_manage_resource_adjustments(request, view, obj=None):
+    """Only call managers (or staff) may adjust a proposal's resources.
+
+    Modeled on can_advance_workflow_step rather than
+    can_act_on_active_workflow_step's full responsible_role routing: the
+    allocation_decision step's responsible_role is always call_manager, so
+    there's no other role to route to here.
+    """
+    if obj is None:
+        return
+    user = request.user
+    if user.is_staff:
+        return
+    call = obj.round.call
+    if not get_users(call, role_name=RoleEnum.CALL_MANAGER).filter(pk=user.pk).exists():
+        raise exceptions.PermissionDenied(
+            "Only call managers can manage resource adjustments."
+        )
+
+
+can_manage_resource_adjustments.sources = ["*"]
+
+
 def _get_step_query_param(request):
     query_params = getattr(request, "query_params", None) or request.GET
     return query_params.get("step")

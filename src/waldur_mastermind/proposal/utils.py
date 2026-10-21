@@ -22,8 +22,7 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import permissions as marketplace_permissions
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import OrderStates
-from waldur_mastermind.proposal import award_ids
-from waldur_mastermind.proposal import event_publishing
+from waldur_mastermind.proposal import award_ids, event_publishing
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal.enums import (
     AllocationTimes,
@@ -488,9 +487,22 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
         .select_related("requested_offering__offering")
         .order_by("created", "id")
     )
-    # Model instances hash and compare by primary key.
+    # A call manager may add a brand-new resource via an adjustment, on top of
+    # what the applicant actually requested - see models.ProposalResourceAdjustment.
+    add_adjustments = list(
+        proposal.resource_adjustments.filter(
+            action=proposal_models.ProposalResourceAdjustment.Actions.ADD
+        ).select_related("call_offering__offering", "call_offering__plan")
+    )
+    # Model instances hash and compare by primary key. Counted together, up
+    # front, so a regular request and an added resource of the same offering
+    # are numbered consistently against each other, regardless of which loop
+    # below creates which first.
     offering_counts = Counter(
         requested.requested_offering.offering for requested in requested_resources
+    )
+    offering_counts.update(
+        adjustment.call_offering.offering for adjustment in add_adjustments
     )
     offering_seen = Counter()
 
@@ -512,16 +524,37 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
     consumer_reviewer = approved_by or get_system_robot()
 
     for requested_resource in requested_resources:
+        adjustment = proposal_models.effective_adjustment(requested_resource)
+        if (
+            adjustment
+            and adjustment.action
+            == proposal_models.ProposalResourceAdjustment.Actions.REMOVE
+        ):
+            # No Resource/Order for this one - and no offering_seen increment
+            # either, so it doesn't consume an index slot a later
+            # same-offering resource would otherwise get.
+            continue
+
         offering = requested_resource.requested_offering.offering
         offering_seen[offering] += 1
         index = offering_seen[offering] if offering_counts[offering] > 1 else None
         with transaction.atomic():
+            if (
+                adjustment
+                and adjustment.action
+                == proposal_models.ProposalResourceAdjustment.Actions.MODIFY
+            ):
+                effective_attributes = adjustment.get_effective_attributes()
+                effective_limits = adjustment.get_effective_limits()
+            else:
+                effective_attributes = requested_resource.attributes
+                effective_limits = requested_resource.limits
             attrs = dict(
                 project=project,
                 offering=offering,
                 plan=requested_resource.requested_offering.plan,
-                attributes=requested_resource.attributes,
-                limits=requested_resource.limits,
+                attributes=effective_attributes,
+                limits=effective_limits,
             )
             resource = marketplace_models.Resource(
                 **attrs,
@@ -584,6 +617,50 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
                 "Order %s allocated from proposal %s is %s.",
                 order.uuid,
                 proposal.uuid,
+                dict(OrderStates.CHOICES).get(order.state, order.state),
+            )
+
+    for adjustment in add_adjustments:
+        offering = adjustment.call_offering.offering
+        offering_seen[offering] += 1
+        index = offering_seen[offering] if offering_counts[offering] > 1 else None
+        with transaction.atomic():
+            attrs = dict(
+                project=project,
+                offering=offering,
+                plan=adjustment.call_offering.plan,
+                attributes=adjustment.get_effective_attributes(),
+                limits=adjustment.get_effective_limits(),
+            )
+            resource = marketplace_models.Resource(
+                **attrs,
+                name=_allocated_resource_name(project.name, offering.name, index),
+            )
+            # No requested_months() to read a duration from here - an ADD
+            # adjustment has no backing RequestedResource, so there is no
+            # applicant-specified subscription length to anchor an end date
+            # on. Left open; the call manager can extend/terminate the
+            # resource afterwards through the normal marketplace flow.
+            resource.init_cost()
+            resource.save()
+
+            order = marketplace_models.Order(
+                **attrs,
+                resource=resource,
+                created_by=order_author,
+                placed_automatically=True,
+            )
+            if not marketplace_permissions.order_is_held_for_purchase_order(order):
+                order.consumer_reviewed_by = consumer_reviewer
+                order.consumer_reviewed_at = timezone.now()
+            order.init_cost()
+            order.save()
+
+            logger.info(
+                "Order %s allocated from proposal %s (resource adjustment %s) is %s.",
+                order.uuid,
+                proposal.uuid,
+                adjustment.uuid,
                 dict(OrderStates.CHOICES).get(order.state, order.state),
             )
 
