@@ -229,6 +229,30 @@ class EditAwardTest(AwardedResourcesBase):
         self.requested_resource.refresh_from_db()
         self.assertEqual(self.requested_resource.limits, {"cpu": 100})
 
+    def test_the_award_lists_the_offering_resource_options(self):
+        self.offering.resource_options = {
+            "order": ["allocation"],
+            "options": {"allocation": {"type": "integer", "label": "GPUh"}},
+        }
+        self.offering.save(update_fields=["resource_options"])
+        self.client.force_authenticate(self.call_manager)
+
+        response = self.client.get(self._list_url())
+
+        self.assertEqual(
+            response.data[0]["requested_offering"]["resource_options"],
+            self.offering.resource_options,
+        )
+
+    def test_call_manager_changes_an_awarded_resource_option(self):
+        response = self._patch_json({"attributes": {"allocation": 10000}})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.awarded.refresh_from_db()
+        self.assertEqual(self.awarded.attributes, {"allocation": 10000})
+        self.requested_resource.refresh_from_db()
+        self.assertEqual(self.requested_resource.attributes, {"name": "requested"})
+
     def test_limits_outside_the_component_bounds_are_refused(self):
         response = self._patch_json({"limits": {"cpu": 5000}})
 
@@ -603,6 +627,54 @@ class AllocateFromAwardTest(AwardedResourcesBase):
 
         offerings = [r.offering for r in self._provisioned()]
         self.assertEqual(offerings, [self.offering, self.other_offering])
+
+    def _with_allocation_option(self):
+        # The Formbricks GPUh amount: a resource option, not a limit.
+        self.offering.resource_options = {
+            "order": ["allocation"],
+            "options": {
+                "allocation": {"type": "integer", "label": "GPUh"},
+            },
+        }
+        self.offering.save(update_fields=["resource_options"])
+
+    def test_the_awarded_resource_option_reaches_the_resource_options(self):
+        self._with_allocation_option()
+        self.awarded.attributes = {"allocation": 10000, "name": "requested"}
+        self.awarded.save()
+
+        self._decide()
+
+        resource = self._provisioned().get()
+        # Only the offering's resource options, as an order sets them: the
+        # provider reads the awarded amount from here.
+        self.assertEqual(resource.options, {"allocation": 10000})
+        self.assertEqual(resource.attributes["allocation"], 10000)
+
+    def test_a_hidden_resource_option_is_not_copied(self):
+        self.offering.resource_options = {
+            "order": ["gpu", "allocation"],
+            "options": {
+                "gpu": {"type": "boolean", "label": "GPU"},
+                "allocation": {
+                    "type": "integer",
+                    "label": "GPUh",
+                    "visible_if": {"field": "gpu", "values": [True]},
+                },
+            },
+        }
+        self.offering.save(update_fields=["resource_options"])
+        self.awarded.attributes = {"gpu": False, "allocation": 10000}
+        self.awarded.save()
+
+        self._decide()
+
+        self.assertEqual(self._provisioned().get().options, {"gpu": False})
+
+    def test_an_offering_without_resource_options_gets_none(self):
+        self._decide()
+
+        self.assertEqual(self._provisioned().get().options, {})
 
     def test_an_award_on_an_offering_no_longer_accepted_is_skipped(self):
         # As with the request: an offering the provider withdrew is not

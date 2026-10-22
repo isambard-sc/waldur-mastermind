@@ -436,6 +436,12 @@ class NestedRequestedOfferingSerializer(serializers.HyperlinkedModelSerializer):
         source="call.manager.customer.name"
     )
     options = OfferingOptionsField(read_only=True, source="offering.options")
+    # Amounts some offerings take as resource options rather than limits (the
+    # Formbricks GPUh allocation): the award editor and the request/award
+    # tables label them from here.
+    resource_options = OfferingOptionsField(
+        read_only=True, source="offering.resource_options"
+    )
     plan_details = BasePublicPlanSerializer(read_only=True, source="plan")
     components = OfferingComponentSerializer(
         source="offering.components", many=True, read_only=True
@@ -458,6 +464,7 @@ class NestedRequestedOfferingSerializer(serializers.HyperlinkedModelSerializer):
             "plan",
             "plan_details",
             "options",
+            "resource_options",
             "components",
             "require_purchase_order",
             "created",
