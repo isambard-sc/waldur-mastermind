@@ -77,6 +77,26 @@ class AdminAnnouncementGetTest(test.APITestCase):
         )
         self.assertEqual(response.data["type"], self.admin_announcement.type)
 
+    @freeze_time("2025-01-01")
+    def test_anonymous_user_can_list_only_active_admin_announcements(self):
+        """The login page reads these before anyone has logged in (HomePort's
+        BriCS layout shows them as "Service status and news"), so the list,
+        filtered to what is live now, has to work anonymously too."""
+        active = factories.AdminAnnouncementFactory(
+            active_from="2024-01-01T00:00:00Z", active_to="2026-01-01T00:00:00Z"
+        )
+        expired = factories.AdminAnnouncementFactory(
+            active_from="2023-01-01T00:00:00Z", active_to="2024-01-01T00:00:00Z"
+        )
+        response = self.client.get(
+            factories.AdminAnnouncementFactory.get_list_url(), {"is_active": "true"}
+        )
+        self.assertEqual(response.status_code, 200)
+        listed = {item["uuid"] for item in response.data}
+        self.assertIn(active.uuid.hex, listed)
+        self.assertIn(self.admin_announcement.uuid.hex, listed)
+        self.assertNotIn(expired.uuid.hex, listed)
+
 
 @freeze_time("2025-01-01")
 class AdminAnnouncementFilterTest(test.APITestCase):

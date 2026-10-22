@@ -76,6 +76,8 @@ LOGIN_PAGE_LAYOUT_CHOICES = [
     ("brand-pattern", "Brand-pattern"),
     ("duotone", "Duotone"),
     ("diagonal", "Diagonal"),
+    # Fork-only: the BriCS login page, HomePort src/auth/layouts/brics/.
+    ("brics", "BriCS"),
     ("time-based", "Time-based"),
     ("seasonal", "Seasonal"),
     ("weather", "Weather"),
